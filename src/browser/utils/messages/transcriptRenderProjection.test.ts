@@ -502,6 +502,46 @@ describe("routine tool runs", () => {
     return computeOperationalBundleInfos(messages, { isTurnActive });
   }
 
+  // Two assistant messages with no prompt between them: compact density gives each its own
+  // work line, and each line opens alone. A run across both would put its summary row behind
+  // the first line and leave the second line with members that nothing visible can open.
+  test("stops a run where compact density's work line changes", () => {
+    const messages = [
+      tool({ id: "read-a1", historyId: "history-a" }),
+      tool({ id: "read-a2", historyId: "history-a" }),
+      tool({ id: "read-b1", historyId: "history-b" }),
+      tool({ id: "read-b2", historyId: "history-b" }),
+      assistant("reply", { historyId: "history-b" }),
+    ];
+    const workBundleInfos = computeWorkBundleInfos(messages, { isTurnActive: false });
+    const infos = computeOperationalBundleInfos(messages, { isTurnActive: false, workBundleInfos });
+
+    expect(infos.slice(0, 4).map((info) => [info?.key, info?.position])).toEqual([
+      ["routine:read-a1", "head"],
+      ["routine:read-a1", "member"],
+      ["routine:read-b1", "head"],
+      ["routine:read-b1", "member"],
+    ]);
+
+    // Detailed density has no work lines, and the four reads are one run.
+    expect(routine(messages).map((info) => info?.key)).toEqual([
+      "routine:read-a1",
+      "routine:read-a1",
+      "routine:read-a1",
+      "routine:read-a1",
+      undefined,
+    ]);
+
+    // One read on each side of the boundary is no run on either side: both stay plain rows.
+    const lone = [messages[0], messages[2], messages[4]];
+    expect(
+      computeOperationalBundleInfos(lone, {
+        isTurnActive: false,
+        workBundleInfos: computeWorkBundleInfos(lone, { isTurnActive: false }),
+      })
+    ).toEqual([undefined, undefined, undefined]);
+  });
+
   test("folds routine calls with interleaved reasoning but leaves trailing reasoning out", () => {
     const read = tool({ id: "read-a", toolName: "file_read" });
     const between = reasoning({ id: "think-between" });

@@ -666,18 +666,21 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [workspaceId, latestMessageId, onOpenTerminal]
   );
 
-  const transcriptRowDerivations = useTranscriptRowDerivations({
-    workspaceId,
-    messages: deferredMessages,
-  });
-  const { bashOutputGroupInfos, expandedBashGroups, expandBashGroup } = transcriptRowDerivations;
-
   const transcriptBundles = useTranscriptBundles({
     workspaceId,
     messages: deferredMessages,
     transcriptDensity,
     isTurnActive: isStreamStarting || canInterrupt,
   });
+
+  // After the bundles: bash_output poll groups stop at work-line boundaries.
+  const transcriptRowDerivations = useTranscriptRowDerivations({
+    workspaceId,
+    messages: deferredMessages,
+    workBundleInfos: transcriptBundles.workBundleInfos,
+  });
+  const { bashOutputGroupInfos, expandedBashGroups, expandBashGroup } = transcriptRowDerivations;
+
   const {
     workBundleInfos,
     operationalBundleInfos,

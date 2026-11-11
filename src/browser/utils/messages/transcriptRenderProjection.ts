@@ -493,8 +493,16 @@ function isRoutineToolMessage(
  */
 export function computeOperationalBundleInfos(
   messages: DisplayedMessage[],
-  options: ComputeBundleInfosOptions
+  options: ComputeBundleInfosOptions & {
+    /**
+     * Compact density's work bundles, indexed like `messages`. A run stops where the work line
+     * changes: each line opens on its own, so a run that spanned two of them would leave its
+     * summary row behind one line and its members, with no way to open them, behind the other.
+     */
+    workBundleInfos?: ReadonlyArray<WorkBundleInfo | undefined>;
+  }
 ): Array<OperationalBundleInfo | undefined> {
+  const workBundleInfos = options.workBundleInfos;
   const infos = new Array<OperationalBundleInfo | undefined>(messages.length);
   // Found once per projection (not per run) so live-tail detection stays linear in the transcript.
   let lastNonReasoningIndex = messages.length - 1;
@@ -517,6 +525,9 @@ export function computeOperationalBundleInfos(
     let toolCount = 0;
     for (let cursor = index; cursor < messages.length; cursor++) {
       const candidate = messages[cursor];
+      if (workBundleInfos?.[cursor]?.key !== workBundleInfos?.[headIndex]?.key) {
+        break;
+      }
       if (isRoutineToolMessage(candidate)) {
         lastToolIndex = cursor;
         toolCount += 1;

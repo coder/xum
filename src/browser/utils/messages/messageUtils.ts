@@ -283,7 +283,13 @@ function reuseEqualBashOutputGroupInfo(
  * scan per row turns long transcripts into O(n²) grouping work right on the critical path.
  */
 export function computeBashOutputGroupInfos(
-  messages: DisplayedMessage[]
+  messages: DisplayedMessage[],
+  /**
+   * Compact density's work bundles, indexed like `messages`. A group stops where the work line
+   * changes: its toggle sits with its first row, so a group that spanned two lines would hide
+   * the polls behind the second line with their toggle behind the first.
+   */
+  workBundleInfos?: ReadonlyArray<{ readonly key: string } | undefined>
 ): Array<BashOutputGroupInfo | undefined> {
   const groupInfos = new Array<BashOutputGroupInfo | undefined>(messages.length);
 
@@ -301,6 +307,9 @@ export function computeBashOutputGroupInfos(
     while (groupEnd < messages.length - 1) {
       const nextMsg = messages[groupEnd + 1];
       if (!isBashOutputTool(nextMsg) || nextMsg.args.process_id !== processId) {
+        break;
+      }
+      if (workBundleInfos?.[groupEnd + 1]?.key !== workBundleInfos?.[index]?.key) {
         break;
       }
       groupEnd++;

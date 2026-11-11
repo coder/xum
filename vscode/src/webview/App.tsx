@@ -1029,6 +1029,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   const transcriptRowDerivations = useTranscriptRowDerivations({
     workspaceId: selectedWorkspaceId ?? "",
     messages: renderedMessages,
+    workBundleInfos: transcriptBundles.workBundleInfos,
   });
   // Stable so the per-prompt navigation objects keep their identity across flushes. Every row is
   // mounted (no bounded reveal), so the target can be scrolled to directly; disabling auto-scroll

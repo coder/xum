@@ -72,8 +72,9 @@ export function useTranscriptBundles(params: {
   );
 
   const operationalBundleInfos = useMemo(
-    () => computeOperationalBundleInfos(messages, { isTurnActive }),
-    [isTurnActive, messages]
+    // Runs of routine calls stop at work-line boundaries, so each opened line holds whole runs.
+    () => computeOperationalBundleInfos(messages, { isTurnActive, workBundleInfos }),
+    [isTurnActive, messages, workBundleInfos]
   );
 
   const updateBundleExpansion = (kind: "work" | "operational", key: string, expanded: boolean) => {
