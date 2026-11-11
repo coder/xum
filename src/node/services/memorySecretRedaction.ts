@@ -47,14 +47,14 @@ function followPositions(positions: number[], edits: Edit[]): number[] {
 
 /**
  * `text.replace(pattern, ...)` for a global pattern, and what each match became. `edits` count the
- * whole match as replaced. `replaced` count only what the replacement changed, when it keeps the
- * first `kept(match)` characters of the match as they were.
+ * whole match as replaced. `replaced` count only what the replacement changed: it keeps the first
+ * `kept(match)` characters of the match as they were.
  */
 function replaceMatches(
   text: string,
   pattern: RegExp,
   replacer: (match: RegExpExecArray) => string,
-  kept: (match: RegExpExecArray) => number = () => 0
+  kept: (match: RegExpExecArray) => number
 ): { text: string; edits: Edit[]; replaced: Edit[] } {
   const parts: string[] = [];
   const edits: Edit[] = [];
@@ -78,6 +78,13 @@ function replaceMatches(
 
 // What a character of a JWT-like run is: a run is these characters and the dots between its parts.
 const RUN_CHAR = /[A-Za-z0-9_.-]/;
+
+/** True when a pass must log its edits: a `]` or a character of a run is tracked. */
+function tracking(artifacts: number[], runChars: number[]): boolean {
+  // mutation-equivalent: with nothing tracked the logged edits follow nothing, so a test that is
+  // true more often only costs time
+  return artifacts.length + runChars.length > 0;
+}
 
 /** True when `text` holds at `position` what the position was tracked for. */
 function holdsTracked(text: string, position: number, artifact: boolean): boolean {
@@ -105,6 +112,8 @@ function removeAt(text: string, artifacts: number[], runChars: number[] = []): s
   let a = 0;
   let r = 0;
   while (a < artifacts.length || r < runChars.length) {
+    // mutation-equivalent: the lists share no position, and past the end of `artifacts` the
+    // comparison is false whichever way it is written
     const artifact = r === runChars.length || (a < artifacts.length && artifacts[a] < runChars[r]);
     const position = artifact ? artifacts[a++] : runChars[r++];
     assert(
@@ -112,6 +121,7 @@ function removeAt(text: string, artifacts: number[], runChars: number[] = []): s
       position >= from && holdsTracked(text, position, artifact),
       "a tracked position is not one that it was tracked for"
     );
+    // mutation-equivalent: a piece of no characters joins as nothing
     if (position > from) parts.push(text.slice(from, position));
     from = position + 1;
   }
@@ -692,7 +702,7 @@ function redactStandalone(
   };
   for (const pattern of STANDALONE_SECRET_PATTERNS) {
     if (pattern === PROVIDER_KEY_PATTERN) runChars = keyHoldingRunChars(redacted, fromRun);
-    edits = artifacts.length + runChars.length === 0 ? null : [];
+    edits = tracking(artifacts, runChars) ? [] : null;
     added = null;
     shift = 0;
     redacted = redacted.replace(pattern, replaceStandalone);
@@ -744,7 +754,7 @@ function runRedactionPasses(
     fromRegex(match.slice(prefix.length));
     return `${prefix}${REDACTED}`;
   };
-  if (artifacts.length + runChars.length === 0) {
+  if (!tracking(artifacts, runChars)) {
     redacted = redacted.replace(SECRET_KEY_VALUE_PATTERN, replaceKeyValue);
   } else {
     const keyValue = replaceMatches(
@@ -766,7 +776,7 @@ function runRedactionPasses(
   redacted = redactCookieHeaders(
     redacted,
     (removed) => onRemoved(removed, "reader"),
-    artifacts.length + runChars.length === 0 ? undefined : (edit) => readerEdits.push(edit)
+    tracking(artifacts, runChars) ? (edit) => readerEdits.push(edit) : undefined
   );
   return {
     text: redacted,
