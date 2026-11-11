@@ -377,11 +377,12 @@ describe("workspaceHasNewLayoutIssueAtTurnEnd", () => {
     expect(audits).toEqual([]);
   });
 
-  test("does not list the artifacts when nothing is published", async () => {
+  test("looks nothing up when nothing is published", async () => {
     await fs.writeFile(path.join(artifactsDir, "scratch.html"), "<h1>hi</h1>");
+    const location = spyOn(artifactsOperations, "resolveArtifactsLocation");
     const list = spyOn(artifactsOperations, "listArtifactsAtLocation");
     expect(await run()).toBe(false);
-    expect(list).not.toHaveBeenCalled();
+    expect([location, probe, list].map((spy) => spy.mock.calls.length)).toEqual([0, 0, 0]);
     expect(audits).toEqual([]);
   });
 

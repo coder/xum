@@ -115,14 +115,19 @@ export interface WorkspaceTurnEndLayoutAudit {
 }
 
 /**
- * hasNewLayoutIssueAtTurnEnd for a real workspace. It lists nothing and audits nothing when the
- * workspace has no artifacts location, or when the probe the tab uses says agent-browser is
- * missing (a probe that could not answer does not stop the audit: it reports "not checked").
+ * hasNewLayoutIssueAtTurnEnd for a real workspace. It looks nothing up, lists nothing and audits
+ * nothing when the workspace has published nothing (most turn ends: no location lookup, which
+ * can be an exec on a remote runtime, and no probe), when it has no artifacts location, or when
+ * the probe the tab uses says agent-browser is missing (a probe that could not answer does not
+ * stop the audit: it reports "not checked").
  */
 export async function workspaceHasNewLayoutIssueAtTurnEnd(
   input: WorkspaceTurnEndLayoutAudit
 ): Promise<boolean> {
   const { workspaceId, metadata, abortSignal } = input;
+  const sessionDir = path.join(input.config.sessionsDir, workspaceId);
+  const records = await listArtifactRecords(sessionDir);
+  if (records.length === 0) return false;
   const location = await resolveArtifactsLocation(input.config.sessionsDir, workspaceId, metadata, {
     abortSignal,
   });
@@ -130,16 +135,11 @@ export async function workspaceHasNewLayoutIssueAtTurnEnd(
   const projects = input.config.loadConfigOrDefault().projects;
   const capabilities = await getWorkspaceArtifactCapabilities(workspaceId, metadata, projects);
   if (capabilities.agentBrowserAvailable === false) return false;
-  const sessionDir = path.join(input.config.sessionsDir, workspaceId);
   const trusted = isWorkspaceTrustedForSharedExecution(metadata, projects);
   return hasNewLayoutIssueAtTurnEnd({
     streamStartedAtMs: input.streamStartedAtMs,
     abortSignal,
     list: async () => {
-      const records = await listArtifactRecords(sessionDir);
-      // Nothing is published, so nothing can be audited: skip the listing, which is an exec on a
-      // remote runtime.
-      if (records.length === 0) return { entries: [], publishedPaths: [] };
       const listing = await listArtifactsAtLocation(location, abortSignal);
       return {
         entries: withPublishedKinds(listing.entries, records),
