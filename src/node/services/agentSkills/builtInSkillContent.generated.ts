@@ -3100,7 +3100,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "---",
       "# Identity",
       "name: My Agent # Required. Display name.",
-      "description: What this does # Optional. Shown in tooltips and tool descriptions.",
+      "description: What this does # Optional. Shown in tooltips and tool descriptions. Xum cuts one over 1,024 characters to that length, so the agent still loads.",
       "",
       "# Inheritance",
       "base: exec # Optional. Inherit from another agent (built-in or custom).",
