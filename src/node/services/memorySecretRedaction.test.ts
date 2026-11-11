@@ -1060,116 +1060,188 @@ describe("redactSecretLike", () => {
     expect(redactSecretLike(text)).toBe(text);
   });
 
-  // A marker is no end of a value. The key pattern skipped a value that starts with the marker, and
-  // the value patterns ended a value at the marker's `]`, so what went on behind a marker stayed
-  // readable, and the write guard accepted it. The marker is read as part of the value, and the
-  // value goes on through the characters that would continue it without the marker.
+  // The write guards also refuse a value that goes on after a marker. The key pattern skips a value
+  // that starts with the marker, and the value patterns end a value at the marker's `]`, so what goes
+  // on stayed readable, and the guards accepted it. The guards read these tails in the output of the
+  // passes. The output is main's, byte for byte: a pass that rewrote it after the others could make a
+  // text that main redacts stably unstable. SEKRIT stands for a credential.
   describe("a value that goes on after a marker", () => {
-    // SEKRIT stands for a credential; the tail must not survive in any pass.
+    // [what is behind the marker, the text, what redaction writes for it (as main does)]
     it.each([
-      ["a value that starts with the marker", "password=[redacted]SEKRIT", "password=[redacted]"],
-      ["an upper-case marker", "password=[REDACTED]SEKRIT", "password=[redacted]"],
-      ["a gap behind the separator", "token: [redacted]SEKRIT next", "token: [redacted] next"],
+      [
+        "a value that starts with the marker",
+        "password=[redacted]SEKRIT",
+        "password=[redacted]SEKRIT",
+      ],
+      ["an upper-case marker", "password=[REDACTED]SEKRIT", "password=[REDACTED]SEKRIT"],
+      [
+        "a gap behind the separator",
+        "token: [redacted]SEKRIT next",
+        "token: [redacted]SEKRIT next",
+      ],
       [
         "a JSON pair",
         '{"password":[redacted]SEKRIT,"user":"alice"}',
-        '{"password":[redacted],"user":"alice"}',
+        '{"password":[redacted]SEKRIT,"user":"alice"}',
       ],
       [
         "a JSON pair inside an escaped string",
         String.raw`{\"password\":[redacted]SEKRIT,\"user\":\"alice\"}`,
-        String.raw`{\"password\":[redacted],\"user\":\"alice\"}`,
+        String.raw`{\"password\":[redacted]SEKRIT,\"user\":\"alice\"}`,
       ],
       [
         "a value that an earlier pass cut in the middle",
         "password=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT",
-        "password=[redacted]",
+        "password=[redacted]].SEKRIT",
       ],
       // Punctuation is part of the value, as it is when no marker is there (`password=abc!`).
       [
         "punctuation behind the marker",
         "password=sk-ABCDEFGHIJKLMNOPQ!SEKRIT!",
-        "password=[redacted]",
+        "password=[redacted]!SEKRIT!",
       ],
-      ["markers inside the value", "token=[redacted]SEKRIT[redacted]MORE", "token=[redacted]"],
+      [
+        "markers inside the value",
+        "token=[redacted]SEKRIT[redacted]MORE",
+        "token=[redacted]SEKRIT[redacted]MORE",
+      ],
       [
         "the bracket that a pass left behind the marker",
         "password=[redacted]]SEKRIT",
-        "password=[redacted]",
+        "password=[redacted]]SEKRIT",
       ],
       // The bracket that closes a list around the value is not part of it.
-      ["a closing bracket after the value", "[token=[redacted]SEKRIT]", "[token=[redacted]]"],
-      // Stopping at the `]` would leave `[redacted]]d]Z` for a second pass to cut again.
-      ["a bracket inside the value", "token=d]d]Z", "token=[redacted]"],
+      ["a closing bracket after the value", "[token=[redacted]SEKRIT]", "[token=[redacted]SEKRIT]"],
+      ["a bracket inside the value", "token=d]d]Z", "token=[redacted]]d]Z"],
+      [
+        "a bracket inside the tail",
+        "password=[redacted]SE[KRIT next",
+        "password=[redacted]SE[KRIT next",
+      ],
+      [
+        "a bracket right after the marker",
+        "password=[redacted][SEKRIT",
+        "password=[redacted][SEKRIT",
+      ],
       [
         "a delimiter that ends the value",
         "password=[redacted]SEKRIT, user=alice; token=[redacted]SEKRIT&x=1",
-        "password=[redacted], user=alice; token=[redacted]&x=1",
+        "password=[redacted]SEKRIT, user=alice; token=[redacted]SEKRIT&x=1",
       ],
       // A key pair's value does not end at `<`, `>` or `#`, as a signed-URL value does.
-      ["angle brackets and a hash", "token=[redacted]SEKRIT<b>x#y next", "token=[redacted] next"],
-      ["a tail that starts at a hash", "token=[redacted]#SEKRIT next", "token=[redacted] next"],
-      ["a tail of digits", "password=[redacted]4711", "password=[redacted]"],
-      // A pass that swallowed the tail would take the key of this pair from the pass that reads it.
-      ["a pair behind the marker", 'password=[redacted]token="SEKRIT"', "password=[redacted]"],
+      [
+        "angle brackets and a hash",
+        "token=[redacted]SEKRIT<b>x#y next",
+        "token=[redacted]SEKRIT<b>x#y next",
+      ],
+      [
+        "a tail that starts at a hash",
+        "token=[redacted]#SEKRIT next",
+        "token=[redacted]#SEKRIT next",
+      ],
+      ["a tail of digits", "password=[redacted]4711", "password=[redacted]4711"],
+      [
+        "a pair behind the marker",
+        'password=[redacted]token="SEKRIT"',
+        "password=[redacted]token=[redacted]",
+      ],
       [
         "a cookie header behind the marker",
         "password=[redacted]Cookie: sid=SEKRIT",
-        "password=[redacted] [redacted]",
+        "password=[redacted]Cookie: [redacted]",
       ],
-    ])("redacts the tail of %s", (_label, text, expected) => {
-      const redacted = redactSecretLike(text);
-      expect(redacted).toBe(expected);
-      expect(redacted).not.toContain("SEKRIT");
-      expect(redactSecretLike(redacted)).toBe(redacted);
-      expect(containsSecretLike(text)).toBe(true);
-      expect(addsSecretLike("", text)).toBe(true);
-    });
-
-    // The signed-URL pattern writes `[redacted]]` for a marker it reads (the doubled bracket is
-    // main's own and out of scope here), so only the tail is checked on a second pass.
-    it.each([
       [
         "a signature behind a key that an earlier pass redacted",
         "see https://h/x?sig=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT end",
-        "see https://h/x?sig=[redacted] end",
+        "see https://h/x?sig=[redacted]].SEKRIT end",
       ],
       [
         "a signature that starts with the marker",
         "?sig=[redacted]SEKRIT&x=1",
-        "?sig=[redacted]&x=1",
+        "?sig=[redacted]]SEKRIT&x=1",
       ],
       [
         "a signature after an XML-escaped ampersand",
         "?a=1&amp;signature=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT&amp;sp=r",
-        "?a=1&amp;signature=[redacted]&amp;sp=r",
+        "?a=1&amp;signature=[redacted]].SEKRIT&amp;sp=r",
       ],
       [
         "a signature in a JSON string",
         '{"u": "https://h/p?X-Amz-Signature=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT"}',
-        '{"u": "https://h/p?X-Amz-Signature=[redacted]"}',
+        '{"u": "https://h/p?X-Amz-Signature=[redacted]].SEKRIT"}',
       ],
       [
         "a signature in parentheses",
         "(see https://h/p?sig=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT)",
-        "(see https://h/p?sig=[redacted])",
+        "(see https://h/p?sig=[redacted]].SEKRIT)",
       ],
       [
         "two keys inside one signature",
         "?sig=a.sk-AAAAAAAAAAAAAAAA.SEKRIT.sk-BBBBBBBBBBBBBBBB.MORE",
-        "?sig=[redacted]",
+        "?sig=[redacted]].SEKRIT.[redacted].MORE",
       ],
       // A signed-URL value ends at `<`, `>` and `#`, which a key pair's value does not end at.
       [
         "a signature that ends at an angle bracket and a hash",
         "<https://h/p?sig=[redacted]SEKRIT><a>#frag",
-        "<https://h/p?sig=[redacted]><a>#frag",
+        "<https://h/p?sig=[redacted]]SEKRIT><a>#frag",
       ],
-      ["a signature that ends at a hash", "?sig=[redacted]SEKRIT#frag", "?sig=[redacted]#frag"],
-    ])("redacts the tail of %s", (_label, text, expected) => {
-      const redacted = redactSecretLike(text);
-      expect(redacted).toBe(expected);
-      expect(redactSecretLike(redacted)).not.toMatch(/SEKRIT|MORE/);
+      [
+        "a signature that ends at a hash",
+        "?sig=[redacted]SEKRIT#frag",
+        "?sig=[redacted]]SEKRIT#frag",
+      ],
+      // A URL whose user holds a marker and a tail: the userinfo pattern takes none of it (it bounds
+      // its user at 64 characters), and the tail is the guards' to read.
+      [
+        "a long user in a URL",
+        `see https://token=[redacted]${"x".repeat(48)},:pw@db.example/x`,
+        `see https://token=[redacted]${"x".repeat(48)},:pw@db.example/x`,
+      ],
+    ])("refuses %s, and writes the text as main does", (_label, text, written) => {
+      expect(redactSecretLike(text)).toBe(written);
+      expect(containsSecretLike(text)).toBe(true);
+      expect(addsSecretLike("", text)).toBe(true);
+      // The guard reads the output too: a model that copies the text it was shown writes it again.
+      expect(containsSecretLike(written)).toBe(true);
+    });
+
+    // The inputs that made a text unstable when a pass rewrote the tail (a Cookie header behind it
+    // took another frame). Redaction writes main's text, which is stable.
+    it.each([
+      [
+        "a Cookie header in quotes behind a tail",
+        "token=[redacted]abc='Cookie: sid=1'",
+        "token=[redacted]abc='Cookie: [redacted]'",
+      ],
+      [
+        "a JSON-escaped Cookie header behind a bracket",
+        String.raw`ApiKey:D]Q:\\\"Cookie:SEKRIT\\\"`,
+        String.raw`ApiKey:[redacted]]Q:\\\"Cookie:[redacted]`,
+      ],
+    ])("writes main's stable text for %s", (_label, text, written) => {
+      expect(redactSecretLike(text)).toBe(written);
+      expect(redactSecretLike(written)).toBe(written);
+      expect(containsSecretLike(text)).toBe(true);
+    });
+
+    // The tail is any script's letters or digits: the readable word after a marker is a value there too.
+    it.each([
+      ["CJK letters", "password=[redacted]秘密"],
+      ["Cyrillic letters", "token=[redacted]пароль"],
+      ["one accented letter", "password=[redacted]é"],
+      ["a feminine ordinal indicator", "password=[redacted]ª"],
+      ["Arabic-Indic digits", "password=[redacted]٤٧١١"],
+      ["full-width digits", "password=[redacted]４７１１"],
+      ["a superscript digit", "password=[redacted]²"],
+      ["an astral letter", "password=[redacted]𝒜"],
+      ["an astral digit", "password=[redacted]𝟜"],
+      ["punctuation before the letters", "token=[redacted]。秘密"],
+      ["letters after a full-width bracket", "token=[redacted]」秘密"],
+      ["a signature of CJK letters", "?sig=[redacted]秘密&x=1"],
+      ["a signature of Cyrillic letters", "?sig=[redacted]пароль#frag"],
+      ["a JSON pair of CJK letters", '{"password":[redacted]秘密,"user":"alice"}'],
+    ])("refuses a tail of %s", (_label, text) => {
       expect(containsSecretLike(text)).toBe(true);
       expect(addsSecretLike("", text)).toBe(true);
     });
@@ -1189,12 +1261,42 @@ describe("redactSecretLike", () => {
       // digit goes on after it, so there is no value to take.
       ["a code span around the pair", "Deploy reads `GITHUB_TOKEN=[redacted]` from the vault."],
       ["a full stop after it", "The CI password=[redacted]. Ask ops for access."],
+      ["a full-width full stop after it", "The CI password=[redacted]。 Ask ops for access."],
+      ["a full-width comma after it", "password=[redacted]，"],
+      ["an ellipsis after it", "password=[redacted]…"],
+      ["a closing quotation mark after it", "password=[redacted]»"],
+      ["an emoji after it", "password=[redacted]🔒"],
+      ["a combining mark after it", "password=[redacted]\u0301"],
       ["punctuation only after it", "token=[redacted]..."],
       ["markers only after it", "password=[redacted][redacted]"],
+      ["an ideographic space and letters after it", "password=[redacted]\u3000秘密"],
+      ["a no-break space and letters after it", "password=[redacted]\u00a0秘密"],
     ])("leaves %s that holds a marker with nothing readable after it", (_label, text) => {
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
       expect(addsSecretLike("", text)).toBe(false);
+    });
+
+    // The scan reads one character at a time, and the Unicode check runs per character: a regex of
+    // the `u` flag over a tail this long fails silently in Bun.
+    it.each([
+      ["letters", `password=[redacted]${"a".repeat(100 * 1024)}`, true],
+      ["CJK letters", `password=[redacted]${"秘".repeat(50 * 1024)}`, true],
+      ["astral letters", `password=[redacted]${"𝒜".repeat(50 * 1024)}`, true],
+      [
+        "a long run of punctuation and a letter at the end",
+        `token=[redacted]${"。".repeat(100 * 1024)}秘`,
+        true,
+      ],
+      ["markers and a letter at the end", `token=${"[redacted]".repeat(10 * 1024)}x`, true],
+      ["a signature of letters", `?sig=[redacted]${"a".repeat(100 * 1024)}&x=1`, true],
+      ["a long run of punctuation", `password=[redacted]${"。".repeat(100 * 1024)}`, false],
+      ["a long run of dots", `password=[redacted]${".".repeat(100 * 1024)}`, false],
+      ["a long run of markers", `password=${"[redacted]".repeat(10 * 1024)}`, false],
+    ])("reads a tail of %s padded to 100 KiB", (_label, text, refused) => {
+      expect(text.length).toBeGreaterThan(50 * 1024);
+      expect(containsSecretLike(text)).toBe(refused);
+      expect(addsSecretLike("", text)).toBe(refused);
     });
 
     it("refuses an edit that adds or changes a tail, and passes one that leaves it as it was", () => {
@@ -1205,38 +1307,38 @@ describe("redactSecretLike", () => {
       expect(addsSecretLike("notes\n", held)).toBe(true);
     });
 
-    // The userinfo pattern bounds its user at 64 characters. The tail pass shortens the value in
-    // front of the user's `:`, so a URL that was too long to match before it matches after it, and
-    // a second pass would take the password: the userinfo pattern reads a text that a tail cut once more.
-    describe("a URL whose user the tail pass shortens into the userinfo bound", () => {
-      const long = `see https://token=[redacted]${"x".repeat(48)},:pw@db.example/x`;
-      const short = "see https://token=[redacted],:pw@db.example/x";
-
-      it("is redacted once, and a second pass changes nothing", () => {
-        const redacted = redactSecretLike(long);
-        expect(redacted).toBe("see https://[redacted]@db.example/x");
-        expect(redactSecretLike(redacted)).toBe(redacted);
-        expect(addsSecretLike("", redacted)).toBe(false);
-      });
-
-      // The userinfo pattern reads only a text that a tail cut. A URL with a credential behind a
-      // scheme is unstable on main (#8121: a second pass takes the user too), and stays as it is.
-      it("leaves a URL that no tail cut as main redacts it", () => {
-        expect(redactSecretLike("https://user:Bearer SEKRIT66666666@h")).toBe(
-          "https://user:[redacted]@h"
-        );
-      });
-
-      // Main takes the password out of the short form and not out of the long one, so the edit adds
-      // a credential. The value that the long form's cut text gives (`cut`) must not excuse it.
-      it("refuses the short form as an edit of the long one, as main does", () => {
-        expect(addsSecretLike(long, short)).toBe(true);
-        expect(addsSecretLike(long, long)).toBe(false);
-      });
+    // A marker that held no tail gets one.
+    it.each([
+      ["a key pair", "password=[redacted]", "password=[redacted]SEKRIT"],
+      ["a key pair behind a full stop", "password=[redacted].", "password=[redacted].SEKRIT"],
+      ["a key pair of a code span", "`API_KEY=[redacted]`", "`API_KEY=[redacted]秘密`"],
+      ["a signature", "?sig=[redacted]&x=1", "?sig=[redacted]SEKRIT&x=1"],
+      ["a signature behind a hash", "?sig=[redacted]#frag", "?sig=[redacted]пароль#frag"],
+    ])("refuses an edit that adds a tail to %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(true);
+      expect(addsSecretLike(updated, updated)).toBe(false);
     });
 
-    // The guard keeps each pass's values apart (see `RemovalSource`): a tail that the previous text
-    // held does not excuse the same text when the cookie reader takes it out of the new one.
+    // A signature that holds a marker is rewritten by main's pass (`[redacted]]`), so only an edit
+    // shows what the guards read: punctuation behind it is no tail.
+    it("accepts an edit that puts punctuation behind a signature's marker", () => {
+      expect(addsSecretLike("?sig=[redacted]&x=1", "?sig=[redacted]。&x=1")).toBe(false);
+      expect(addsSecretLike("?sig=[redacted]&x=1", "?sig=[redacted]...&x=1")).toBe(false);
+    });
+
+    // The same tail, counted with its repeats: a second copy is a value the previous text lacks.
+    it("counts the tails of the previous text with their repeats", () => {
+      const once = "a password=[redacted]SEKRIT b";
+      const twice = `${once}\n${once}`;
+      expect(addsSecretLike(once, twice)).toBe(true);
+      expect(addsSecretLike(twice, once)).toBe(false);
+      expect(addsSecretLike(twice, twice)).toBe(false);
+    });
+
+    // The guard keeps each pass's values apart (see `RemovalSource`), and the tails apart from them: a
+    // tail that the previous text held does not excuse the same text when the cookie reader takes it
+    // out of the new one, and a value that the cookie reader took out of the previous text does not
+    // excuse the same text as a tail in the new one.
     it("keeps the tails apart from the values of the other passes", () => {
       expect(addsSecretLike("password=[redacted]SEKRIT", "Cookie: [redacted]SEKRIT")).toBe(true);
       expect(addsSecretLike("Cookie: [redacted]SEKRIT", "password=[redacted]SEKRIT")).toBe(true);
@@ -1332,6 +1434,11 @@ describe("redactSecretLike", () => {
     ["a key and a marker followed by brackets", `token=[redacted]${"]x".repeat(10_000)}`],
     ["a signature and a run of markers", `?sig=${"[redacted]]".repeat(5_000)}x`],
     ["keys and half markers", "token=[redacted".repeat(10_000)],
+    [
+      "a marker and a tail of 100 KiB of full-width punctuation",
+      `token=[redacted]${"。".repeat(100 * 1024)}秘`,
+    ],
+    ["a marker and a tail of 50 Ki astral letters", `password=[redacted]${"𝒜".repeat(50 * 1024)}`],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
