@@ -1,12 +1,15 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
+import * as bashPath from "@/node/utils/main/bashPath";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { LocalRuntime } from "./LocalRuntime";
 import { setAgentCgroupEnrollmentTargets } from "./agentCgroupEnrollment";
+import type { AgentSandboxPolicy } from "./sandbox/agentSandboxTargets";
+import * as macosSandbox from "./sandbox/macosSandbox";
 import type {
   InitLogger,
   WorkspaceCreationParams,
@@ -259,6 +262,167 @@ describe("LocalBaseRuntime.exec hostEnv", () => {
       } else {
         process.env.XUM_TEST_HOST_SECRET = original;
       }
+    }
+  });
+});
+
+describe("LocalBaseRuntime.exec sandbox opt-out", () => {
+  const POLICY: AgentSandboxPolicy = {
+    writeRoots: [],
+    gitCommonDirs: [],
+    denyWrite: [],
+    denyRead: [],
+    allowRead: [],
+    network: "loopback",
+    allowedHosts: [],
+    allowLocalBinding: true,
+  };
+
+  /** A runtime whose agent sandbox applies (or not), so the test runs on every platform. */
+  class SandboxedRuntime extends TestLocalRuntime {
+    constructor(private readonly sandboxed: boolean) {
+      super();
+    }
+
+    override agentSandboxPolicy(): AgentSandboxPolicy | null {
+      return this.sandboxed ? POLICY : null;
+    }
+  }
+
+  // A sandboxed command can write the file that BASH_ENV names in the workspace.
+  it("does not source BASH_ENV in a call that opts out of a sandbox that applies", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-bash-env-"));
+    try {
+      const startup = path.join(dir, "startup.sh");
+      await fs.writeFile(startup, "echo sourced\n");
+      const run = async (runtime: LocalBaseRuntime) => {
+        const stream = await runtime.exec("echo ran", {
+          cwd: dir,
+          timeout: 5,
+          env: { BASH_ENV: startup },
+          sandbox: "off",
+        });
+        await stream.stdin.close();
+        return readStreamAsString(stream.stdout);
+      };
+
+      expect(await run(new SandboxedRuntime(true))).toBe("ran\n");
+      expect(await run(new SandboxedRuntime(false))).toBe("sourced\nran\n");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // An inherited PATH can hold a folder that sandboxed commands write, such as a .venv/bin.
+  it("runs Xum's own opt-out commands with system tools, and approved calls with the PATH", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-opt-out-path-"));
+    try {
+      const planted = path.join(dir, "rm");
+      await fs.writeFile(planted, "#!/bin/sh\necho planted\n", { mode: 0o755 });
+      const resolve = async (runtime: LocalBaseRuntime, sandbox: "off" | "internal") => {
+        const stream = await runtime.exec('command -v rm; echo "$BASH"; echo "$PATH"', {
+          cwd: dir,
+          timeout: 5,
+          env: { PATH: `${dir}:${process.env.PATH ?? ""}` },
+          sandbox,
+        });
+        await stream.stdin.close();
+        return (await readStreamAsString(stream.stdout)).trim().split("\n");
+      };
+
+      const [internalRm, internalBash, internalPath] = await resolve(
+        new SandboxedRuntime(true),
+        "internal"
+      );
+      expect(internalRm).not.toBe(planted);
+      expect(internalBash).toBe("/bin/bash");
+      // Only root can write a folder on it (an Intel Homebrew owns /usr/local/bin).
+      for (const folder of internalPath.split(":")) {
+        const stat = await fs.stat(folder);
+        expect({ folder, uid: stat.uid, groupOrOtherWrite: stat.mode & 0o022 }).toEqual({
+          folder,
+          uid: 0,
+          groupOrOtherWrite: 0,
+        });
+      }
+      expect((await resolve(new SandboxedRuntime(true), "off"))[0]).toBe(planted);
+      expect((await resolve(new SandboxedRuntime(false), "internal"))[0]).toBe(planted);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Bash defines an exported function whatever PATH is, and it can run a file in the workspace.
+  it("drops exported bash functions from every opt-out command while the sandbox applies", async () => {
+    const run = async (runtime: LocalBaseRuntime, sandbox: "off" | "internal") => {
+      const stream = await runtime.exec("rm -f ./xum-missing-file; echo ran", {
+        cwd: os.tmpdir(),
+        timeout: 5,
+        env: { "BASH_FUNC_rm%%": "() {  echo planted; }" },
+        sandbox,
+      });
+      await stream.stdin.close();
+      return readStreamAsString(stream.stdout);
+    };
+
+    expect(await run(new SandboxedRuntime(true), "internal")).toBe("ran\n");
+    expect(await run(new SandboxedRuntime(true), "off")).toBe("ran\n");
+    expect(await run(new SandboxedRuntime(false), "off")).toBe("planted\nran\n");
+  });
+
+  // getBashPath() takes the first bash on Xum's PATH, which can be in a .venv/bin in the workspace.
+  it("runs every opt-out command with the bash that macOS protects", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-opt-out-bash-"));
+    const planted = path.join(dir, "bash");
+    await fs.writeFile(planted, '#!/bin/sh\necho planted\nexec /bin/bash "$@"\n', { mode: 0o755 });
+    spyOn(bashPath, "getBashPath").mockReturnValue(planted);
+    try {
+      const run = async (runtime: LocalBaseRuntime, sandbox: "off" | "internal") => {
+        const stream = await runtime.exec("echo ran", { cwd: dir, timeout: 5, sandbox });
+        await stream.stdin.close();
+        return readStreamAsString(stream.stdout);
+      };
+
+      expect(await run(new SandboxedRuntime(true), "off")).toBe("ran\n");
+      expect(await run(new SandboxedRuntime(true), "internal")).toBe("ran\n");
+      expect(await run(new SandboxedRuntime(false), "off")).toBe("planted\nran\n");
+    } finally {
+      mock.restore();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("LocalBaseRuntime.exec sandbox wrap", () => {
+  // No process starts after the abort, so nothing else frees the wrap's network registration.
+  it("frees the sandbox wrap when the call is aborted while the wrap is set up", async () => {
+    const controller = new AbortController();
+    const dispose = mock(() => undefined);
+    const wrap = spyOn(macosSandbox, "wrapForAgentSandbox").mockImplementation(() => {
+      controller.abort();
+      return Promise.resolve({
+        command: "/usr/bin/true",
+        args: [],
+        env: {},
+        commandId: "c",
+        dispose,
+      });
+    });
+    try {
+      const run = new TestLocalRuntime().exec("echo ran", {
+        cwd: os.tmpdir(),
+        timeout: 5,
+        abortSignal: controller.signal,
+      });
+
+      const error = await run.then(
+        () => null,
+        (reason: unknown) => reason
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect(dispose).toHaveBeenCalledTimes(1);
+    } finally {
+      wrap.mockRestore();
     }
   });
 });

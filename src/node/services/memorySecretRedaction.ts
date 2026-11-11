@@ -93,7 +93,8 @@ function removeAt(text: string, positions: number[]): string {
 
 /**
  * Callers cut text at a cap. They scan this much past it, so a secret that starts inside the kept
- * text is matched whole before the cut, and not left as a readable prefix of it.
+ * text is matched whole before the cut, and not left as a readable prefix of it. `redactWithinCap`
+ * reads the window and keeps the lookahead out of what is shown.
  */
 export const REDACTION_LOOKAHEAD_CHARS = 512;
 
@@ -717,6 +718,30 @@ export function addsSecretLike(previous: string, updated: string): boolean {
     else held[source].set(removed, left - 1);
   });
   return added;
+}
+
+/**
+ * `text` redacted, and cut at its first `cap` characters, with the rest of `text` as a lookahead: a
+ * secret that starts inside the cap is matched whole, and no output from past the cap is shown.
+ * Redaction shortens text, so cutting its output at `cap` characters reaches the lookahead's end,
+ * where a key that the end cut is too short to match shows as it is. The cut is in the characters
+ * of `text` instead: redacting its first `cap` characters alone shows only those, except that it
+ * leaves the start of a secret that crosses the cap. Where the redacted whole differs from that,
+ * the whole has taken the secret, and its marker stands in for the start. Redaction can also
+ * lengthen text (a one-character value becomes a marker), so the result can be longer than `cap`.
+ */
+export function redactWithinCap(text: string, cap: number): string {
+  const whole = redactSecretLike(text);
+  // mutation-equivalent: at a length of exactly `cap` the head is the whole text, so either branch
+  // returns the same text; this one skips the second redaction
+  if (text.length <= cap) return whole;
+  const head = redactSecretLike(text.slice(0, cap));
+  let same = 0;
+  // mutation-equivalent: past the end of both texts `undefined === undefined` takes one more step,
+  // which returns the whole text, and then the whole text is the head
+  while (same < head.length && head[same] === whole[same]) same++;
+  if (same === head.length) return head;
+  return whole.slice(0, whole.startsWith(REDACTED, same) ? same + REDACTED.length : same);
 }
 
 /** True when `text` holds a credential shape: redacting it would change it. */

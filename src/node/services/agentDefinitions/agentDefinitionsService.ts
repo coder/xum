@@ -46,6 +46,7 @@ import {
   projectPluginContainerPaths,
 } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
+import { lazyFileToolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
 
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
@@ -214,6 +215,47 @@ interface AgentDefinitionScanCandidate {
    * and plugin reads of a host-local root that do not go through `runtime` (phase 5).
    */
   hostFs: PluginFs;
+}
+
+/**
+ * Whether a project agent file loads: a sandboxed command can replace one with a link to a file
+ * its sandbox hides, and the definition goes into the prompt, so it loads only where a command
+ * in `workspacePath` with the project's secrets (`sandboxEnv`) could read it (Codex review).
+ * Plugin folders are read-only to commands, and the global folder is in Xum's home.
+ */
+function projectAgentFileGate(
+  runtime: Runtime,
+  workspacePath: string,
+  sandboxEnv: NodeJS.ProcessEnv | undefined
+): (candidate: AgentDefinitionScanCandidate, filePath: string) => Promise<boolean> {
+  const gate = lazyFileToolSandboxGate(runtime, workspacePath, { env: sandboxEnv });
+  return async (candidate, filePath) => {
+    if (candidate.scope !== "project" || candidate.pluginRoot != null) return true;
+    try {
+      await gate(filePath, "read");
+      return true;
+    } catch (error) {
+      log.warn(`Skipping agent definition ${filePath}: ${getErrorMessage(error)}`);
+      return false;
+    }
+  };
+}
+
+/** Whether discovery reads `filePath`: a plugin agent inside its plugin, others past the gate. */
+async function discoveryReadsFile(
+  scan: AgentDefinitionScanCandidate,
+  filePath: string,
+  agentId: AgentId,
+  projectFileLoads: ReturnType<typeof projectAgentFileGate>
+): Promise<boolean> {
+  if (scan.pluginRoot == null) return projectFileLoads(scan, filePath);
+  const containment = await pluginAgentContainment({
+    pluginRoot: scan.pluginRoot,
+    filePath,
+    agentId,
+    pluginFs: candidateFs(scan),
+  });
+  return containment === "contained";
 }
 
 /** #6426: scan candidates for the plugin agents of a trusted remote checkout's snapshot. */
@@ -795,6 +837,8 @@ export async function discoverAgentDefinitions(
     projectPluginsTrusted?: boolean;
     /** Builds the host-local runtimes of the plugin and global scans. */
     runtimeFactory: RuntimeFactory;
+    /** See ReadAgentDefinitionOptions.sandboxEnv. */
+    sandboxEnv?: NodeJS.ProcessEnv;
   }
 ): Promise<AgentDefinitionDescriptor[]> {
   if (!workspacePath) {
@@ -809,6 +853,7 @@ export async function discoverAgentDefinitions(
 
   // Scan order encodes precedence: earlier roots win when ids collide.
   const scans = await buildScanCandidates(runtime, workspacePath, roots, options.runtimeFactory);
+  const projectFileLoads = projectAgentFileGate(runtime, workspacePath, options.sandboxEnv);
 
   for (const scan of scans) {
     let resolvedRoot: string;
@@ -838,15 +883,7 @@ export async function discoverAgentDefinitions(
 
       const filePath = scan.runtime.normalizePath(filename, resolvedRoot);
 
-      if (scan.pluginRoot != null) {
-        const containment = await pluginAgentContainment({
-          pluginRoot: scan.pluginRoot,
-          filePath,
-          agentId,
-          pluginFs: candidateFs(scan),
-        });
-        if (containment !== "contained") continue;
-      }
+      if (!(await discoveryReadsFile(scan, filePath, agentId, projectFileLoads))) continue;
 
       const descriptor = await readAgentDescriptorFromFile(
         scan.runtime,
@@ -926,14 +963,19 @@ export async function discoverAgentDefinitions(
  */
 export class AgentDefinitionRequestCache {
   private readonly definitions = new Map<string, Promise<AgentDefinitionPackage>>();
-  /** Identity keys: distinct runtime, roots or runtime factory objects never share entries. */
+  /**
+   * Identity keys: distinct runtime, roots, runtime factory or sandbox env objects never share
+   * entries.
+   */
   private readonly objectIds = new WeakMap<
-    Runtime | AgentDefinitionsRoots | RuntimeFactory,
+    Runtime | AgentDefinitionsRoots | RuntimeFactory | NodeJS.ProcessEnv,
     number
   >();
   private nextObjectId = 1;
 
-  private objectId(value: Runtime | AgentDefinitionsRoots | RuntimeFactory): number {
+  private objectId(
+    value: Runtime | AgentDefinitionsRoots | RuntimeFactory | NodeJS.ProcessEnv
+  ): number {
     let id = this.objectIds.get(value);
     if (id == null) {
       id = this.nextObjectId++;
@@ -959,6 +1001,8 @@ export class AgentDefinitionRequestCache {
       options.projectPluginsTrusted === true,
       this.objectId(options.runtimeFactory),
       options.refuseUnreachablePluginFolder === true,
+      // The sandbox gate skips a linked project file only with the project's secrets.
+      options.sandboxEnv != null ? this.objectId(options.sandboxEnv) : null,
     ]);
     let definition = this.definitions.get(key);
     if (definition == null) {
@@ -997,6 +1041,11 @@ export interface ReadAgentDefinitionOptions {
    * to its bases.
    */
   refuseUnreachablePluginFolder?: boolean;
+  /**
+   * The project's secrets, for reads whose definition reaches the model. The agent sandbox hides
+   * the credential files they name, so a project agent file that links to one does not load.
+   */
+  sandboxEnv?: NodeJS.ProcessEnv;
 }
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
@@ -1039,17 +1088,18 @@ function resolveAgentDefinitionsRoots(
 function pickInheritedReadOptions(
   options: Pick<
     ReadAgentDefinitionOptions,
-    "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory"
+    "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory" | "sandboxEnv"
   >
 ): Pick<
   ReadAgentDefinitionOptions,
-  "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory"
+  "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory" | "sandboxEnv"
 > {
   return {
     roots: options.roots,
     cache: options.cache,
     projectPluginsTrusted: options.projectPluginsTrusted,
     runtimeFactory: options.runtimeFactory,
+    sandboxEnv: options.sandboxEnv,
   };
 }
 
@@ -1106,6 +1156,7 @@ async function loadAgentDefinition(
   // skipped, as discovery skips it: a lower scope's agent of that ID starts. Its refusal is the
   // spawn error only when no scope has the ID (A4).
   const refusals: PluginAgentRefusalError[] = [];
+  const projectFileLoads = projectAgentFileGate(runtime, workspacePath, options.sandboxEnv);
   for (const candidate of candidates) {
     abortSignal?.throwIfAborted();
     if (skipScopes.has(candidate.scope)) {
@@ -1130,6 +1181,7 @@ async function loadAgentDefinition(
         workspaceRuntime: runtime,
         refuseUnreachablePluginFolder: options.refuseUnreachablePluginFolder === true,
         abortSignal,
+        projectFileLoads,
       });
       if (pkg !== undefined) return pkg;
     } catch (error) {
@@ -1171,6 +1223,7 @@ async function readCandidateDefinition(args: {
   workspaceRuntime: Runtime;
   refuseUnreachablePluginFolder: boolean;
   abortSignal: AbortSignal | undefined;
+  projectFileLoads: ReturnType<typeof projectAgentFileGate>;
 }): Promise<AgentDefinitionPackage | undefined> {
   const { candidate, agentId, abortSignal } = args;
   let filePath = candidate.runtime.normalizePath(`${agentId}.md`, args.resolvedRoot);
@@ -1214,6 +1267,7 @@ async function readCandidateDefinition(args: {
     if (sizeValidation) {
       throw new Error(sizeValidation.error);
     }
+    if (!(await args.projectFileLoads(candidate, filePath))) return undefined;
 
     content = await readFileString(candidate.runtime, filePath, abortSignal);
     byteSize = stat.size;
@@ -1288,6 +1342,8 @@ export async function resolveAgentBody(
     projectPluginsTrusted?: boolean;
     /** See ReadAgentDefinitionOptions.runtimeFactory. */
     runtimeFactory: RuntimeFactory;
+    /** See ReadAgentDefinitionOptions.sandboxEnv. */
+    sandboxEnv?: NodeJS.ProcessEnv;
   }
 ): Promise<string> {
   const visited = new Set<string>();

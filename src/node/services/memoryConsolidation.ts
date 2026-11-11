@@ -15,7 +15,8 @@
  * - pin protection: pinned files may be edited, never deleted or renamed —
  *   including via a delete/rename of an ancestor directory (subtree check)
  * - op budget: at most MEMORY_CONSOLIDATION_OP_BUDGET mutating commands per
- *   run (reads unlimited). Budget is consumed by accepted mutations only
+ *   run (reads unlimited), or the user's dream edit limit for an organizer run, never more than
+ *   MEMORY_DREAM_EDIT_LIMIT_MAX. Budget is consumed by accepted mutations only
  *   (applied, dry-run, and dispatch failures); guard rejections do not
  *   consume it — runaway retries are bounded by the step ceiling instead.
  * - dry-run: mutations are journaled as proposed but not applied
@@ -23,7 +24,8 @@
  * Every mutating command is journaled ({command, path, applied, rejected})
  * for the audit trail that feeds the Memory tab's "last consolidated" line.
  * Refused commands spend no budget, so their rows are capped
- * (MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES) and so is a path's length.
+ * (MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES), and so are a path's length and a
+ * row's note (MEMORY_CONSOLIDATION_NOTE_MAX_CHARS).
  * Global-scope writes are intentionally permitted (merging into global files
  * is core consolidation work); they remain auditable in the journal via the
  * /memories/global/ path prefix.
@@ -31,7 +33,15 @@
  * TODO(#3534, phase 2): net-shrink enforcement needs a byte-size API on
  * MemoryService; until then the journal is the only post-run signal.
  */
-import { tool, streamText, stepCountIs, type LanguageModel, type Tool } from "ai";
+import {
+  tool,
+  streamText,
+  stepCountIs,
+  type LanguageModel,
+  type StopCondition,
+  type Tool,
+  type ToolSet,
+} from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import assert from "@/common/utils/assert";
@@ -39,6 +49,9 @@ import {
   MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES,
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_DREAM_MAX_STEPS,
+  MEMORY_CONSOLIDATION_NOTE_MAX_CHARS,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   type MemoryScope,
 } from "@/common/constants/memory";
@@ -83,6 +96,12 @@ export interface MemoryConsolidationResult {
    * consolidated (no journal record, no debounce anchor).
    */
   streamError?: string;
+  /**
+   * The abort signal's reason when an abort, and nothing else, ended the stream; undefined after
+   * a provider error, even one that came as the signal fired. A caller that combined several
+   * signals compares it with each one's reason to know which fired (see organizerRunEnd).
+   */
+  abortReason?: unknown;
 }
 
 /** Scopes a consolidation run can be allowed to modify; the session scope is never one of them. */
@@ -93,6 +112,8 @@ const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "g
 const LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 const MUTATING_COMMANDS = MemoryConsolidationOpSchema.shape.command.options;
 const JOURNAL_FULL_NOTE = "The journal is full; later refusals of this run are not recorded.";
+/** Ends a journal note cut to its length cap (see clipJournalNote). */
+const JOURNAL_NOTE_CUT_MARKER = " [note cut]";
 
 interface MutationTarget {
   command: MemoryConsolidationOp["command"];
@@ -429,12 +450,27 @@ function refusalRow(
   return {
     ...persistedTarget(rails, target),
     applied: false,
-    note: persistedText(rails, note),
+    note: persistedNote(rails, note),
   };
 }
 
 function persistedText(rails: Pick<MutationRails, "rejectSecretLike">, text: string): string {
   return rails.rejectSecretLike === true ? redactSecretLike(text) : text;
+}
+
+/**
+ * A note cut to `max` characters, the marker included. Each row's note is bounded so the journal
+ * is: its rows are bounded in number and their paths in length, but a failed command's error is
+ * not (MEMORY_CONSOLIDATION_NOTE_MAX_CHARS).
+ */
+function clipJournalNote(note: string, max = MEMORY_CONSOLIDATION_NOTE_MAX_CHARS): string {
+  if (note.length <= max) return note;
+  return `${note.slice(0, max - JOURNAL_NOTE_CUT_MARKER.length)}${JOURNAL_NOTE_CUT_MARKER}`;
+}
+
+/** A note as a row stores it: redacted first (a cut could split a credential), then cut. */
+function persistedNote(rails: Pick<MutationRails, "rejectSecretLike">, note: string): string {
+  return clipJournalNote(persistedText(rails, note));
 }
 
 /**
@@ -466,7 +502,8 @@ const fullJournals = new WeakSet<MemoryConsolidationOp[]>();
 /**
  * Journal a refusal while the journal has room. The refusal that reaches the last slot carries the
  * note that later ones are dropped, and so does the first one after rows of budgeted commands
- * filled the journal past it: those are pushed directly and always (the budget bounds them), so
+ * filled the journal past it: those are pushed directly and always (the run's budget bounds them,
+ * at most MEMORY_DREAM_EDIT_LIMIT_MAX for an organizer run), so
  * the note is recorded once whatever the order, and the journal holds at most one refusal past
  * the cap. The cap reads the journal itself, so it holds for every tool that shares one (the
  * analyzer's chunks of a run).
@@ -478,7 +515,10 @@ function journalRefusal(journal: MemoryConsolidationOp[], row: RefusalRow): void
     return;
   }
   fullJournals.add(journal);
-  journal.push({ ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` });
+  // Cut so that the full note itself always fits under the note cap: a guarded run's redaction
+  // can lengthen a refusal note that quotes a path to the cap.
+  const roomForNote = MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - JOURNAL_FULL_NOTE.length - 1;
+  journal.push({ ...row, note: `${clipJournalNote(row.note, roomForNote)} ${JOURNAL_FULL_NOTE}` });
 }
 
 /**
@@ -613,11 +653,18 @@ export function createConsolidationMemoryTool(args: {
         const invalid = await validateMutationForStaging(memoryService, ctx, input, {
           rejectSecretLike: args.rejectSecretLike,
         });
+        // Stored like every other row (persistedTarget, persistedNote): a redacting dry run (the
+        // debug CLI's --dry-run) must not keep a credential that names a file, and the refusal
+        // note quotes the path.
         if (invalid !== null) {
-          journal.push({ ...target, applied: false, note: invalid });
+          journal.push({
+            ...persistedTarget(rails, target),
+            applied: false,
+            note: persistedNote(rails, invalid),
+          });
           return { success: false, error: invalid };
         }
-        journal.push({ ...target, applied: false, note: "dry-run" });
+        journal.push({ ...persistedTarget(rails, target), applied: false, note: "dry-run" });
         args.onStagedMutation?.(input, toolCallId);
         return { success: true, output: `[dry-run] recorded ${target.command} ${target.path}` };
       }
@@ -632,7 +679,7 @@ export function createConsolidationMemoryTool(args: {
       journal.push({
         ...persistedTarget(rails, target),
         applied: result.success,
-        note: result.success ? undefined : persistedText(rails, result.error),
+        note: result.success ? undefined : persistedNote(rails, result.error),
       });
       return result;
     },
@@ -642,6 +689,55 @@ export function createConsolidationMemoryTool(args: {
     getMutationCount: () => budget.used(),
     isBudgetExhausted: () => budget.used() >= budget.limit,
   };
+}
+
+/**
+ * What an organizer run's edit limit sets: the memory tool's budget, the line of the run prompt
+ * that states it (dream.md names no number, and a user's own dream definition may not either), and
+ * the step ceiling. Absent (the debug CLI) is the default limit; `null` is the user's unlimited.
+ *
+ * Unlimited, and any limit over it, runs at MEMORY_DREAM_EDIT_LIMIT_MAX: memory contents are
+ * untrusted model input, so the cap bounds the accepted writes of one run and its journal rows.
+ * The preference schema already refuses a larger value; Math.min guards every other caller. NaN
+ * (the schema drops it too) would make Math.min NaN and the budget endless, so it runs at the
+ * default, like an absent limit.
+ * The step ceiling is 4 steps for each edit (today's 32 steps for the default 8), never below
+ * MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent, and never above
+ * MEMORY_DREAM_MAX_STEPS, which no setting raises: read-only calls spend no edit, so the edit
+ * limit alone does not bound a run's model requests.
+ */
+export function organizerEditBudget(editLimit: number | null | undefined): {
+  budget: MutationBudget;
+  promptLine: string;
+  stepCeiling: Array<StopCondition<ToolSet>>;
+} {
+  const limit = Math.min(
+    editLimit === undefined || Number.isNaN(editLimit)
+      ? MEMORY_CONSOLIDATION_OP_BUDGET
+      : (editLimit ?? Number.POSITIVE_INFINITY),
+    MEMORY_DREAM_EDIT_LIMIT_MAX
+  );
+  return {
+    budget: createMutationBudget(limit),
+    promptLine: `You have ${limit} mutating commands this run.`,
+    stepCeiling: [
+      stepCountIs(
+        Math.min(MEMORY_DREAM_MAX_STEPS, Math.max(MEMORY_CONSOLIDATION_MAX_STEPS, 4 * limit))
+      ),
+    ],
+  };
+}
+
+/**
+ * The abort that alone ended a stream: the signal had aborted and the stream reported no error
+ * part. Undefined after a provider error, even one that came as the signal fired.
+ */
+function abortThatEndedStream(
+  streamErrors: readonly string[],
+  signal: AbortSignal | undefined
+): { reason: unknown } | undefined {
+  if (streamErrors.length > 0 || signal?.aborted !== true) return undefined;
+  return { reason: signal.reason as unknown };
 }
 
 /**
@@ -681,10 +777,18 @@ export async function runMemoryConsolidation(args: {
   pricingModel?: string;
   /** The run stops once its measured spend reaches this many USD; none when absent. */
   ceilingUsd?: number;
+  /**
+   * Mutating commands this run may make: the user's dream edit limit. `null` means unlimited, up
+   * to the safety cap MEMORY_DREAM_EDIT_LIMIT_MAX. Absent (the debug CLI) means
+   * MEMORY_CONSOLIDATION_OP_BUDGET.
+   */
+  editLimit?: number | null;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
+  const editBudget = organizerEditBudget(args.editLimit);
   const journal: MemoryConsolidationOp[] = [];
   const { tool: memoryTool, isBudgetExhausted } = createConsolidationMemoryTool({
+    budget: editBudget.budget,
     memoryService: args.memoryService,
     metaService: args.metaService,
     ctx: args.ctx,
@@ -716,10 +820,11 @@ export async function runMemoryConsolidation(args: {
     model: args.model,
     system: args.agentBody,
     prompt:
-      "Run a memory-consolidation pass now. Survey the memory directories, then apply the highest-value cleanups within budget." +
+      `Run a memory-consolidation pass now. ${editBudget.promptLine}` +
+      " Survey the memory directories, then apply the highest-value cleanups within budget." +
       finalPassPrompt,
     tools: { memory: memoryTool },
-    stopWhen: [stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS), meter.stopIfCeilingReached],
+    stopWhen: [...editBudget.stepCeiling, meter.stopIfCeilingReached],
     onStepEnd: meter.recordStep,
     maxOutputTokens: meter.maxOutputTokens,
     abortSignal: args.abortSignal,
@@ -737,7 +842,8 @@ export async function runMemoryConsolidation(args: {
   });
   // An abort ends the stream without an error part, so a pass cut short by its timeout or by
   // workspace removal would read as clean and be journaled as a success.
-  if (streamErrors.length === 0 && args.abortSignal?.aborted === true) {
+  const abortEnd = abortThatEndedStream(streamErrors, args.abortSignal);
+  if (abortEnd !== undefined) {
     streamErrors.push("memory consolidation was cut short by its timeout or by workspace removal");
   }
   // Set apart from `streamErrors`: only a stream that failed or was aborted has unreliable usage.
@@ -790,5 +896,6 @@ export async function runMemoryConsolidation(args: {
     spentUsd: meter.spentUsd(),
     note: meter.note(),
     streamError,
+    abortReason: abortEnd?.reason,
   };
 }

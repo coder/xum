@@ -78,6 +78,13 @@ export interface SSHRuntimeConfig extends SSHConnectionConfig {
   srcBaseDir: string;
   /** Directory on remote for background process output (default: /tmp/mux-bashes) */
   bgOutputDir?: string;
+  /**
+   * Workspace isolation on the host. Absent means "worktree" (a per-workspace checkout under
+   * srcBaseDir). "none" runs every workspace directly in `projectDir` (SSH+None).
+   */
+  workspaceIsolation?: "worktree" | "none";
+  /** Existing directory on the host that SSH+None workspaces use as-is. */
+  projectDir?: string;
 }
 
 /**

@@ -7734,6 +7734,46 @@ describe("MCPServerManager", () => {
     expect(servers.connectCount("cmd-1")).toBe(0);
   });
 
+  // Codex P1: a project-wide trust grant overwrote recorded options and overlaid later requests, so
+  // an SSH+None workspace's project-local servers started in a host directory the user never
+  // trusted. Its trust is project trust AND trust of that exact directory.
+  test("trusting the project does not enable an SSH+None workspace until its directory is trusted", async () => {
+    const workspaceId = "ws-ssh-none-trust";
+    const runtimeConfig = {
+      type: "ssh",
+      host: "devbox",
+      srcBaseDir: "~/xum",
+      workspaceIsolation: "none",
+      projectDir: "/srv/app",
+    };
+    configService.listServers = mock((_projectPath: string, trusted: boolean) =>
+      Promise.resolve(
+        trusted
+          ? { server: stdioConfig("cmd-1"), stable: stdioConfig("cmd-stable") }
+          : { stable: stdioConfig("cmd-stable") }
+      )
+    );
+    servers.serve("cmd-1", { tools: { echo: testTool() } });
+    servers.serve("cmd-stable", { tools: { echo: testTool() } });
+    const request = () => workspaceRequest(workspaceId, { trusted: false, runtimeConfig });
+
+    await manager.getToolsForWorkspace(request());
+    manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: true }]);
+    const afterProjectTrust = await manager.getToolsForWorkspace(request());
+    expect(Object.keys(afterProjectTrust.tools)).toEqual(["stable_echo"]);
+    expect(servers.connectCount("cmd-1")).toBe(0);
+
+    manager.applyProjectTrust([
+      {
+        projectPath: PROJECT_PATH,
+        trusted: true,
+        trustedSshDirectories: [{ host: "devbox", projectDir: "/srv/app" }],
+      },
+    ]);
+    const afterDirectoryTrust = await manager.getToolsForWorkspace(request());
+    expect(Object.keys(afterDirectoryTrust.tools).sort()).toEqual(["server_echo", "stable_echo"]);
+  });
+
   test("excludes servers reconfigured while leased from prompt discovery", async () => {
     const workspaceId = "ws-stale-prompt-discovery";
     let command = "cmd-1";

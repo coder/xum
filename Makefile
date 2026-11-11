@@ -124,7 +124,11 @@ ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --out
 # Common esbuild flags for server runtime Docker bundle.
 # Place runtime bundles under dist/runtime so frontend dist/*.js layers remain stable.
 # External native modules (node-pty, ssh2) and electron remain runtime dependencies.
-ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
+# A CJS bundle leaves import.meta empty, and @anthropic-ai/sandbox-runtime calls
+# fileURLToPath(import.meta.url) when it loads, which crashed the server at startup. So
+# import.meta.url is the bundle's own file URL. The banner repeats "use strict" because a
+# directive only counts before the first statement.
+ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify --define:import.meta.url=__xumBundleUrl --banner:js='"use strict";var __xumBundleUrl=require("url").pathToFileURL(__filename).href;'
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
 # Each encoding ships as its own bundle next to the worker, and the worker bundle requires it

@@ -438,12 +438,12 @@ export const DockerUnavailable: AppStory = {
     await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
-    // Wait for workspace type buttons to appear
-    await canvas.findByText("Workspace Type", {}, { timeout: 10000 });
+    // Wait for the isolation selects to appear
+    await canvas.findByLabelText("Workspace isolation", {}, { timeout: 10000 });
 
     // Wait for Docker option to become disabled (runtimeAvailability loads async).
     await waitFor(async () => {
-      const runtimeTrigger = canvas.getByLabelText("Workspace type");
+      const runtimeTrigger = canvas.getByLabelText("Workspace isolation");
       await userEvent.click(runtimeTrigger);
 
       const dockerOption = await within(document.body).findByRole("option", {

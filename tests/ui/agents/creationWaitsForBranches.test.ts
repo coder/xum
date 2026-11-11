@@ -38,11 +38,15 @@ function sendButton(container: HTMLElement): HTMLButtonElement {
   return button;
 }
 
-async function selectRuntime(container: HTMLElement, label: string): Promise<void> {
+async function selectRuntime(
+  container: HTMLElement,
+  axis: "Project isolation" | "Workspace isolation",
+  label: string
+): Promise<void> {
   const trigger = container.querySelector<HTMLElement>(
-    '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace type"]'
+    `[data-component="RuntimeTypeGroup"] button[aria-label="${axis}"]`
   );
-  if (!trigger) throw new Error("Workspace type trigger not found");
+  if (!trigger) throw new Error(`${axis} trigger not found`);
   fireEvent.click(trigger);
   const option = await waitFor(
     () => {
@@ -155,7 +159,7 @@ function runInitButtonNow(container: HTMLElement): HTMLButtonElement | null {
 function workspaceTypeLabel(container: HTMLElement): string {
   return (
     container.querySelector(
-      '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace type"]'
+      '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace isolation"]'
     )?.textContent ?? ""
   );
 }
@@ -385,7 +389,7 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
   test("a local workspace can be sent while the branches are still loading", async () => {
     const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches();
     try {
-      await selectRuntime(view.container, "Local");
+      await selectRuntime(view.container, "Workspace isolation", "None");
       await chat.typeWithoutSending("hello on the local runtime");
       await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
         timeout: 10_000,
@@ -432,7 +436,7 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
         timeout: 10_000,
       });
-      await selectRuntime(view.container, "Coder");
+      await selectRuntime(view.container, "Project isolation", "Coder");
       await waitFor(() => expect(presets).toHaveBeenCalled(), { timeout: 10_000 });
       // The composer reports from an effect, and the page renders the banner after it.
       await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {

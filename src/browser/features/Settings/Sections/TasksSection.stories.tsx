@@ -1,8 +1,9 @@
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import type { ComponentType } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, waitFor, within } from "storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { AgentSandboxSettings } from "./AgentSandboxSettings.js";
 import { TasksSection } from "./TasksSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
@@ -130,5 +131,47 @@ export const TasksPhone: Story = {
         await expect(reset.getBoundingClientRect().right).toBeLessThanOrEqual(frameRight + 1);
       }
     });
+  },
+};
+
+/** The agent sandbox section at phone width, with a project override and an edited host list. */
+export const AgentSandboxPhone: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          agentSandbox: {
+            global: { enabled: true, network: "allowlist", allowedHosts: ["registry.npmjs.org"] },
+            projects: { "/home/user/projects/my-app": { enabled: false } },
+            support: { state: "supported" },
+          },
+        })
+      }
+    >
+      <AgentSandboxSettings />
+    </SettingsSectionStory>
+  ),
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { exclude: true } },
+  decorators: [PhoneWidthDecorator],
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const off = await canvas.findByRole("button", { name: "Off" });
+    await waitFor(() => expect(off).toHaveAttribute("aria-pressed", "true"));
+    await userEvent.click(canvas.getByRole("button", { name: "Global" }));
+    await waitFor(() =>
+      expect(canvas.getByRole("button", { name: "Global" })).toHaveAttribute("aria-pressed", "true")
+    );
+
+    await userEvent.click(canvas.getByRole("button", { name: "Edit hosts" }));
+    await canvas.findByLabelText("Allowed hosts, one per line");
+
+    const frame = canvasElement.querySelector("[data-phone-frame]");
+    if (!(frame instanceof HTMLElement)) throw new Error("Phone frame did not render");
+    const frameRight = frame.getBoundingClientRect().right;
+    for (const name of ["Off", "Use defaults", "Save hosts"]) {
+      const button = canvas.getByRole("button", { name });
+      await expect(button.getBoundingClientRect().right).toBeLessThanOrEqual(frameRight + 1);
+    }
   },
 };

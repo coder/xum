@@ -1433,3 +1433,67 @@ describe("resolveAgentForStream with an unreachable foreign plugin agent (plugin
     }
   }, 60_000);
 });
+
+// Codex review: the agent sandbox hides a checkout file that a project secret names, so a turn
+// passes the secrets its commands start with to every agent definition read.
+describe("resolveAgentForStream with the project's secrets", () => {
+  test("skips a project agent that links to a file a project secret names", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-sandbox-env");
+    const root = await fs.realpath(tempDir.path);
+    const projectPath = path.join(root, "project");
+    const secret = path.join(projectPath, "secrets", "reviewer.md");
+    const projectAgents = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(path.dirname(secret), { recursive: true });
+    await fs.mkdir(projectAgents, { recursive: true });
+    await fs.writeFile(secret, "---\nname: Reviewer\n---\nSecret file.\n");
+    await fs.symlink(secret, path.join(projectAgents, "reviewer.md"));
+    const runtime = new LocalRuntime(projectPath);
+    runtime.agentSandboxPolicy = (input) => ({
+      writeRoots: [projectPath],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+      allowRead: [projectPath],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+    const metadata: WorkspaceMetadata = {
+      id: "sandbox-env-ws",
+      name: "sandbox-env-ws",
+      projectName: "project",
+      projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const resolve = (sandboxEnv?: NodeJS.ProcessEnv) =>
+      resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: metadata.id,
+        metadata,
+        runtime,
+        workspacePath: projectPath,
+        requestedAgentId: "reviewer",
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg: { projects: new Map([[projectPath, { trusted: true, workspaces: [] }]]) },
+        emitError: () => undefined,
+        sandboxEnv,
+      });
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = path.join(root, "xum-home");
+    try {
+      expect(await resolve()).toMatchObject({
+        success: true,
+        data: { effectiveAgentId: "reviewer" },
+      });
+      expect(await resolve({ HF_TOKEN_PATH: secret })).toMatchObject({
+        success: true,
+        data: { effectiveAgentId: "exec" },
+      });
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
+});

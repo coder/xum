@@ -13,7 +13,8 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { nodeClock } from "@/node/utils/hostClock";
 import { expectReproFailure } from "@/node/utils/repro.testHarness";
-import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
+import { localBgRecordsRoot, localBgWorkspaceDir } from "./backgroundProcessExecutor";
+import { realRecordPath } from "./backgroundRecordFiles";
 import { BackgroundProcessManager, SPAWN_NAME_LOCK_FILENAME } from "./backgroundProcessManager";
 import { HostClockTag } from "./di/hostClockLive";
 import { BackgroundProcessManagerLive } from "./di/layers/core";
@@ -574,11 +575,16 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     using _seal = failMigration ? undefined : manager.sealAdmissions(ws);
     const outputDir = path.join(localBgWorkspaceDir(ws), "dev");
     if (failMigration) {
-      const writeFile = fs.writeFile;
-      spyOn(fs, "writeFile").mockImplementation((file, data, options) =>
-        file === path.join(outputDir, "output.log")
+      // The migration opens the record by its real path (backgroundRecordFiles.ts).
+      const outputLog = await realRecordPath(
+        path.dirname(localBgRecordsRoot()),
+        path.join(outputDir, "output.log")
+      );
+      const open = fs.open;
+      spyOn(fs, "open").mockImplementation((file, flags, mode) =>
+        file === outputLog
           ? Promise.reject(new Error("ENOSPC: no space left on device"))
-          : writeFile(file, data, options)
+          : open(file, flags, mode)
       );
     }
     expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
@@ -625,7 +631,7 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     const deadline = Promise.withResolvers<() => void>();
     const publicationStarted = Promise.withResolvers<void>();
     const allowPublication = Promise.withResolvers<void>();
-    const writeFile = fs.writeFile;
+    const open = fs.open;
     const { manager, ws, pid, outputDir, releaseKill } = await refuseMigration(
       "failed-record-settlement",
       true,
@@ -644,12 +650,13 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     expect(await exists(marker)).toBe(false);
     expect(await manager.hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
     expect(isAlive(pid)).toBe(true);
-    spyOn(fs, "writeFile").mockImplementation(async (file, data, options) => {
-      if (file === marker) {
+    const realMarker = await realRecordPath(path.dirname(localBgRecordsRoot()), marker);
+    spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+      if (file === realMarker) {
         publicationStarted.resolve();
         await allowPublication.promise;
       }
-      return writeFile(file, data, options);
+      return open(file, flags, mode);
     });
     releaseKill();
     await publicationStarted.promise;

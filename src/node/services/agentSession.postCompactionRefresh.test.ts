@@ -197,6 +197,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
         Promise.resolve(Err(`Workspace ${workspaceId} not found`))
       ),
       getProvidersConfig: mock(() => null),
+      getWorkspaceSandboxEnv: mock(() => Promise.resolve({})),
       isExperimentEnabled: mock(() => false),
       streamMessage: mock(() =>
         Promise.resolve(Err({ type: "unknown" as const, raw: "no stream in this test" }))
