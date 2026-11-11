@@ -21,6 +21,17 @@ describe("claudeCommandSkillMarkdown", () => {
     expect(frontmatter["disable-model-invocation"]).toBe(true);
   });
 
+  // The description of a command without one is its first body line, cut to the description cap.
+  test.each([
+    ["a line over the cap", "a".repeat(1500), "a".repeat(1024)],
+    // The pair's first half is the 1024th unit: the cut must drop it, not leave it alone.
+    ["a surrogate pair at the cut", `${"a".repeat(1023)}😀tail`, "a".repeat(1023)],
+    ["a line at the cap", "a".repeat(1024), "a".repeat(1024)],
+  ])("cuts a first-line description for %s", (_case, line, expected) => {
+    const frontmatter = commandFrontmatter(`---\nargument-hint: x\n---\n${line}\n`);
+    expect(frontmatter.description).toBe(expected);
+  });
+
   test("leaves a quoted hint and other bracketed keys alone", () => {
     const markdown = claudeCommandSkillMarkdown(
       "review",
