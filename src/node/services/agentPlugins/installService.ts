@@ -1490,6 +1490,13 @@ const UPDATE_CHECK_CONCURRENCY = 4;
  */
 const STAGED_TREE_MAX_BYTES = 100 * 1024 * 1024;
 const STAGED_TREE_MAX_FILES = 10_000;
+/**
+ * Folder levels below a staged checkout's root. Resolving a path costs time that grows with the
+ * square of its depth (glibc realpath), and the staging walk resolves every symbolic link, so a
+ * hostile repository of links into a folder chain thousands of levels deep stalled every preview
+ * and marketplace listing. Real plugin repositories nest a few levels.
+ */
+export const STAGED_TREE_MAX_DEPTH = 64;
 
 /**
  * Map with a bounded worker pool, preserving input order. Rejections
@@ -2689,6 +2696,46 @@ export class AgentPluginInstallService {
    */
   private async assertStagedTreeWithinQuota(dir: string): Promise<void> {
     const quota = this.stagingQuota();
+    let bytes = 0;
+    let entryCount = 0;
+    // Links are resolved only after the whole tree passed the size and depth limits, so a link
+    // into a too-deep folder chain is never followed.
+    const links: string[] = [];
+    const pending: Array<{ folder: string; depth: number }> = [{ folder: dir, depth: 0 }];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      assert(current !== undefined, "assertStagedTreeWithinQuota: queue underflow");
+      for (const entry of await fsPromises.readdir(current.folder, { withFileTypes: true })) {
+        if (entry.name === ".git" && current.folder === dir) {
+          continue;
+        }
+        const entryPath = path.join(current.folder, entry.name);
+        entryCount += 1;
+        if (entry.isDirectory()) {
+          if (current.depth + 1 > STAGED_TREE_MAX_DEPTH) {
+            throw new Error(
+              `The repository nests folders more than ${STAGED_TREE_MAX_DEPTH} levels deep, which Xum does not install.`
+            );
+          }
+          pending.push({ folder: entryPath, depth: current.depth + 1 });
+        } else if (entry.isFile()) {
+          const stat = await fsPromises.lstat(entryPath);
+          bytes += stat.size;
+        } else if (entry.isSymbolicLink()) {
+          links.push(entryPath);
+        }
+        if (entryCount > quota.maxFiles || bytes > quota.maxBytes) {
+          throw new Error(
+            `The repository is too large to install as a plugin (limit: ${quota.maxFiles} files, ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB).`
+          );
+        }
+      }
+    }
+    await this.assertStagedLinksStay(dir, links);
+  }
+
+  /** The symbolic-link half of assertStagedTreeWithinQuota (see its comment). */
+  private async assertStagedLinksStay(dir: string, links: string[]): Promise<void> {
     const rootReal = await fsPromises.realpath(dir);
     // Both forms of the container path: the raw-target check must catch the
     // guessable lexical path even when nothing exists there yet, and the
@@ -2700,54 +2747,30 @@ export class AgentPluginInstallService {
       [this.containerDir, containerReal].some(
         (container) => candidate === container || candidate.startsWith(container + path.sep)
       );
-    let bytes = 0;
-    let entryCount = 0;
-    const pending: string[] = [dir];
-    while (pending.length > 0) {
-      const current = pending.pop();
-      assert(current !== undefined, "assertStagedTreeWithinQuota: queue underflow");
-      for (const entry of await fsPromises.readdir(current, { withFileTypes: true })) {
-        if (entry.name === ".git" && current === dir) {
-          continue;
-        }
-        const entryPath = path.join(current, entry.name);
-        entryCount += 1;
-        if (entry.isDirectory()) {
-          pending.push(entryPath);
-        } else if (entry.isFile()) {
-          const stat = await fsPromises.lstat(entryPath);
-          bytes += stat.size;
-        } else if (entry.isSymbolicLink()) {
-          const relative = path.relative(dir, entryPath);
-          const resolvedTarget = await fsPromises.realpath(entryPath).catch(() => undefined);
-          if (resolvedTarget === undefined) {
-            throw new Error(
-              `The repository ships a symbolic link that does not resolve (${relative}). Its target could appear at the install location AFTER the consent preview validated the tree, so unresolvable links are rejected.`
-            );
-          }
-          const rawTarget = await fsPromises.readlink(entryPath);
-          const withinStagedRoot =
-            resolvedTarget === rootReal || resolvedTarget.startsWith(rootReal + path.sep);
-          if (!path.isAbsolute(rawTarget) && !withinStagedRoot) {
-            throw new Error(
-              `The repository ships a relative symbolic link that escapes the plugin folder (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
-            );
-          }
-          if (
-            path.isAbsolute(rawTarget) &&
-            !withinStagedRoot &&
-            (withinContainer(path.resolve(rawTarget)) || withinContainer(resolvedTarget))
-          ) {
-            throw new Error(
-              `The repository ships an absolute symbolic link into the managed plugins directory (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
-            );
-          }
-        }
-        if (entryCount > quota.maxFiles || bytes > quota.maxBytes) {
-          throw new Error(
-            `The repository is too large to install as a plugin (limit: ${quota.maxFiles} files, ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB).`
-          );
-        }
+    for (const entryPath of links) {
+      const relative = path.relative(dir, entryPath);
+      const resolvedTarget = await fsPromises.realpath(entryPath).catch(() => undefined);
+      if (resolvedTarget === undefined) {
+        throw new Error(
+          `The repository ships a symbolic link that does not resolve (${relative}). Its target could appear at the install location AFTER the consent preview validated the tree, so unresolvable links are rejected.`
+        );
+      }
+      const rawTarget = await fsPromises.readlink(entryPath);
+      const withinStagedRoot =
+        resolvedTarget === rootReal || resolvedTarget.startsWith(rootReal + path.sep);
+      if (!path.isAbsolute(rawTarget) && !withinStagedRoot) {
+        throw new Error(
+          `The repository ships a relative symbolic link that escapes the plugin folder (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
+        );
+      }
+      if (
+        path.isAbsolute(rawTarget) &&
+        !withinStagedRoot &&
+        (withinContainer(path.resolve(rawTarget)) || withinContainer(resolvedTarget))
+      ) {
+        throw new Error(
+          `The repository ships an absolute symbolic link into the managed plugins directory (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
+        );
       }
     }
   }

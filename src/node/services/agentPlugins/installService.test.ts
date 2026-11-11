@@ -35,6 +35,7 @@ import {
 } from "./discovery";
 import {
   AgentPluginInstallService,
+  STAGED_TREE_MAX_DEPTH,
   describeSignInChanges,
   signInResetUrls,
   withDiskQuotaWatchdog,
@@ -5692,6 +5693,45 @@ describe("AgentPluginInstallService", () => {
       /too large to install/
     );
   });
+
+  test("folders nested deeper than the staging limit are refused before any link is followed", async () => {
+    // Resolving a link into a folder chain thousands of levels deep costs time that grows with
+    // the square of its depth, so the walk checks depth first and resolves links last.
+    const chain = (levels: number) => Array.from({ length: levels }, () => "d").join("/");
+    await fsPromises.mkdir(path.join(remoteDir, "ok", chain(STAGED_TREE_MAX_DEPTH - 1)), {
+      recursive: true,
+    });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "ok", chain(STAGED_TREE_MAX_DEPTH - 1), "f"),
+      "x"
+    );
+    await commitAll(remoteDir, `folders ${STAGED_TREE_MAX_DEPTH} levels deep`);
+    expect((await service.preview({ input: remoteDir })).manifest.name).toBe("demo-plugin");
+
+    await fsPromises.mkdir(path.join(remoteDir, "deep", chain(STAGED_TREE_MAX_DEPTH)), {
+      recursive: true,
+    });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "deep", chain(STAGED_TREE_MAX_DEPTH), "f"),
+      "x"
+    );
+    await fsPromises.symlink(
+      path.join("deep", chain(STAGED_TREE_MAX_DEPTH)),
+      path.join(remoteDir, "a-link")
+    );
+    await commitAll(remoteDir, "a link into folders one level too deep");
+    const realpath = spyOn(fsPromises, "realpath");
+    try {
+      await expect(service.preview({ input: remoteDir })).rejects.toThrow(
+        `The repository nests folders more than ${STAGED_TREE_MAX_DEPTH} levels deep, which Xum does not install.`
+      );
+      const followed = realpath.mock.calls.filter(([target]) => String(target).endsWith("a-link"));
+      expect(followed).toEqual([]);
+    } finally {
+      realpath.mockRestore();
+    }
+    expect(await stagingLeftovers()).toEqual([]);
+  }, 60_000);
 
   test("consent preview discloses full env assignments, not just key names", async () => {
     // NODE_OPTIONS=--require=./payload.js changes what executes without
