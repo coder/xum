@@ -1199,6 +1199,18 @@ describe("redactSecretLike", () => {
       String.raw`a\tCookie: XXXXXXXXXXXXX` + "\n?sig=[redacted]x]]",
       String.raw`a\tCookie: [redacted]` + "\n?sig=[redacted]x]]",
     ],
+    // The reader's edit is the value without the blanks it leaves: `removed` ends where the value is
+    // cut, and `at` is where it starts. A bound that is off by one moves or loses the tracked `]`.
+    [
+      "a reader value that ends in blanks",
+      String.raw`a\tCookie: v1 ` + "\n?sig=[redacted]",
+      String.raw`a\tCookie: [redacted] ` + "\n?sig=[redacted]",
+    ],
+    [
+      "a reader list that ends at it",
+      String.raw`a\tcookie": [token=?sig=[redacted]`,
+      String.raw`a\tcookie": [redacted]]`,
+    ],
   ])("follows the added bracket past another pass: %s", (_label, text, expected) => {
     const redacted = redactSecretLike(text);
     expect(redacted).toBe(expected);
