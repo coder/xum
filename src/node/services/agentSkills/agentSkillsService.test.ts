@@ -1210,6 +1210,39 @@ describe("agentSkillsService", () => {
     expect(resolved.package.frontmatter.name).toBe("poteto-mode");
   });
 
+  test("a skill with a description and when_to_use over the cap loads with both cut", async () => {
+    using project = new DisposableTempDir("agent-skills-long-text");
+    using global = new DisposableTempDir("agent-skills-long-text-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+    const longText = (length: number) =>
+      Array.from({ length }, (_, index) => String.fromCharCode(97 + (index % 26))).join("");
+    const description = longText(1069);
+    const whenToUse = longText(1100);
+    await fs.mkdir(path.join(projectSkillsRoot, "long-text"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectSkillsRoot, "long-text", "SKILL.md"),
+      `---\nname: long-text\ndescription: ${description}\nwhen_to_use: ${whenToUse}\n---\nBody\n`,
+      "utf-8"
+    );
+
+    const roots = { projectRoot: projectSkillsRoot, globalRoot: global.path };
+    const runtime = new LocalRuntime(project.path);
+    const result = await discoverAgentSkills(runtime, project.path, { roots, runtimeFactory });
+
+    expect(result.invalidSkills).toEqual([]);
+    const skill = result.skills.find((candidate) => candidate.name === "long-text");
+    expect(skill?.description).toHaveLength(1024);
+    expect(description.startsWith(skill?.description ?? "")).toBe(true);
+    expect(skill?.whenToUse).toHaveLength(1024);
+    expect(whenToUse.startsWith(skill?.whenToUse ?? "")).toBe(true);
+
+    const resolved = await readAgentSkill(runtime, project.path, "long-text", {
+      roots,
+      runtimeFactory,
+    });
+    expect(skill?.description).toBe(resolved.package.frontmatter.description);
+  });
+
   test("discoverAgentSkills reports invalid paths globs and keeps valid path-scoped skills", async () => {
     using project = new DisposableTempDir("agent-skills-paths");
     using global = new DisposableTempDir("agent-skills-paths-global");

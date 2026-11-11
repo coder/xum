@@ -1,4 +1,5 @@
 import { AgentSkillFrontmatterSchema } from "@/common/orpc/schemas";
+import { MAX_SKILL_DESCRIPTION_LENGTH } from "@/common/orpc/schemas/agentSkill";
 import type { AgentSkillFrontmatter, SkillName } from "@/common/types/agentSkill";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
@@ -69,6 +70,31 @@ function applyDisplayName(
     frontmatterInput: { ...raw, name: input.directoryName },
     displayField: { displayName },
   };
+}
+
+// Claude Code and Codex cut a description that is too long instead of dropping the skill, so
+// discovered skills do too. The descriptor schema keeps its cap on the model-facing text.
+const CUT_TO_CAP_KEYS = ["description", "when_to_use", "when-to-use"] as const;
+
+function cutToCap(text: string): string {
+  if (text.length <= MAX_SKILL_DESCRIPTION_LENGTH) return text;
+  const cut = text.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
+  // The cap counts UTF-16 units: do not leave half of a surrogate pair at the cut.
+  return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+
+/** Discovered skills only (see allowDisplayName): strict callers get `raw` back and the schema rejects it. */
+function cutLongText(
+  raw: Record<string, unknown>,
+  input: { allowDisplayName?: boolean }
+): Record<string, unknown> {
+  if (!input.allowDisplayName) return raw;
+  const cut = { ...raw };
+  for (const key of CUT_TO_CAP_KEYS) {
+    const value = cut[key];
+    if (typeof value === "string") cut[key] = cutToCap(value);
+  }
+  return cut;
 }
 
 /**
@@ -144,6 +170,7 @@ export function parseSkillMarkdown(input: {
    * differs from the directory name, load the skill under the directory name and return
    * the raw `name` as `displayName`. Skills from other harnesses need this, e.g. pstack's
    * `name: Poteto Mode`; Cursor and Claude Code take the skill ID from the folder.
+   * It also cuts a `description`, `when_to_use` or `when-to-use` over the schema's cap to the cap.
    * Built-in skills and agent_skill_write stay strict.
    */
   allowDisplayName?: boolean;
@@ -186,7 +213,7 @@ export function parseSkillMarkdown(input: {
 
   assertObject(raw, "SKILL.md YAML frontmatter must be a mapping/object.");
 
-  const { frontmatterInput, displayField } = applyDisplayName(raw, input);
+  const { frontmatterInput, displayField } = applyDisplayName(cutLongText(raw, input), input);
   const parsed = AgentSkillFrontmatterSchema.safeParse(frontmatterInput);
   if (!parsed.success) {
     throw new AgentSkillParseError(

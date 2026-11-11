@@ -101,6 +101,43 @@ describe("agent_skill_write", () => {
     expect(stored).toBe(content);
   });
 
+  // Discovery cuts a long description, but the skills agents write stay within the spec's 1024.
+  it.each([
+    ["description", { description: "d".repeat(1025) }],
+    ["when_to_use", { whenToUse: "w".repeat(1025) }],
+  ] as const)("rejects a %s over 1024 characters and writes nothing", async (field, options) => {
+    using tempDir = new TestTempDir("test-agent-skill-write-long-text");
+
+    const tool = await createWriteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", content: skillMarkdown("demo-skill", options) },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).toContain(field);
+    const written = await fs.stat(path.join(tempDir.path, "skills", "demo-skill")).then(
+      () => true,
+      () => false
+    );
+    expect(written).toBe(false);
+  });
+
+  it("writes a skill whose description is exactly 1024 characters", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-cap-text");
+
+    const tool = await createWriteTool(tempDir.path);
+    const result = (await tool.execute!(
+      {
+        name: "demo-skill",
+        content: skillMarkdown("demo-skill", { description: "d".repeat(1024) }),
+      },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(result.success).toBe(true);
+  });
+
   it("writes a global skill to the Xum home even when ~/.mux/skills has one of that name", async () => {
     using tempDir = new TestTempDir("test-agent-skill-write-legacy-mux");
     const xumHome = path.join(tempDir.path, "xum-home");
