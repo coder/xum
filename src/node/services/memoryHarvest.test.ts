@@ -907,6 +907,24 @@ describe("runMemoryHarvest", () => {
     expect(prompt.length).toBeLessThan(200_000);
   });
 
+  // A summary whose cut keeps nothing (it starts with a JWT that the window ends inside) is its
+  // note alone, with no blank line before it.
+  it("shows only the note of a compaction summary that its cut left empty", async () => {
+    using fixture = createFixture();
+    const blob = `eyJ${"Q".repeat(128_597)}`; // made up, no dot: not a match
+    fixture.summary = createMuxMessage("summary-1", "assistant", blob, {
+      historySequence: 2,
+      compactionBoundary: true,
+    });
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    expect(userPromptText(calls[0])).toContain(
+      "Compaction summary (summary-1):\n[truncated 600 more chars for memory harvest]\n"
+    );
+  });
+
   it.each([
     ["at the cap", 128_000, false],
     ["one character over the cap", 128_001, true],
@@ -1132,6 +1150,23 @@ describe("runMemoryHarvest", () => {
       expect(rows.map((row) => row.text).join("")).not.toContain(githubToken);
     });
 
+    // Redaction can lengthen a part (a one-character value becomes a marker), so a part that fits its
+    // cap in its own characters can be cut at the cap in what is shown. The note says so, in the
+    // characters that were cut from what is shown: no character of the part lies past its cap.
+    it("reports a cut for a part that redaction lengthened past its cap", () => {
+      using fixture = createFixture();
+      const text = "password=a ".repeat(Math.floor(TEXT_PART_LIMIT / 11));
+      expect(text.length).toBeLessThanOrEqual(TEXT_PART_LIMIT);
+      fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
+
+      const rows = buildHarvestChunks(fixture.messages).flatMap(
+        (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
+      );
+
+      const note = rows.at(-1)?.text.match(/\[truncated (\d+) more chars for memory harvest\]$/);
+      expect(Number(note?.[1])).toBeGreaterThan(0);
+    });
+
     // The scan window is the cap and a lookahead past it. Its end can cut a key, and what is left is
     // too short to match, so it shows as it is. Redaction shortens the text (a long value becomes one
     // marker), so a cut of the redacted window at the cap reached that end.
@@ -1168,6 +1203,108 @@ describe("runMemoryHarvest", () => {
         expect(shown).not.toContain("sk-QBND");
         // Only the first `TEXT_PART_LIMIT` characters of the part are shown, redacted.
         expect(shown).toStartWith(redactSecretLike(text.slice(0, TEXT_PART_LIMIT)));
+      });
+    });
+
+    // The JWT pattern needs both dots, so a JWT whose first parts run past the window is not matched.
+    // What lies inside the cap is cut off at the JWT's start.
+    it("shows no part of a JWT that the window ends inside", () => {
+      using fixture = createFixture();
+      const jwt = `eyJ${"Q".repeat(40)}.eyJ${"W".repeat(1_200)}.${"X".repeat(86)}`; // made up
+      const text = `${"z".repeat(TEXT_PART_LIMIT - 100)} ${jwt} tail`;
+      fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
+
+      const rows = buildHarvestChunks(fixture.messages).flatMap(
+        (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
+      );
+      const shown = rows.map((row) => row.text).join("");
+
+      expect(shown).not.toMatch(/eyJ|QQQQ|WWWW/);
+      // The text stops at the JWT's start, and the note counts every character past the cap.
+      expect(shown).toBe(
+        `${"z".repeat(TEXT_PART_LIMIT - 100)} \n[truncated ${text.length - TEXT_PART_LIMIT} more chars for memory harvest]`
+      );
+    });
+
+    // A part that fits the window is complete: a JWT-like run that ends it is no JWT, so what of it
+    // lies inside the cap is shown.
+    it("shows a JWT-like run that ends a complete part up to the cap", () => {
+      using fixture = createFixture();
+      const text = `${"z".repeat(TEXT_PART_LIMIT - 20)} eyJ${"A".repeat(30)}`;
+      fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
+
+      const rows = buildHarvestChunks(fixture.messages).flatMap(
+        (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
+      );
+
+      expect(rows.map((row) => row.text).join("")).toEndWith(
+        `${text.slice(TEXT_PART_LIMIT - 30, TEXT_PART_LIMIT)}\n[truncated ${text.length - TEXT_PART_LIMIT} more chars for memory harvest]`
+      );
+    });
+
+    // A part that starts with such a run keeps nothing of it, and still says it was cut: its row
+    // carries the note and the truncated flag, as a cut part with kept text does. As above, the note
+    // counts the characters past the cap.
+    describe("a cut part whose row is short", () => {
+      const blob = `eyJ${"Q".repeat(TEXT_PART_LIMIT + 597)}`; // made up, no dot: not a match
+      const rowsOf = (message: MuxMessage) =>
+        buildHarvestChunks([message]).flatMap(
+          (chunk) =>
+            JSON.parse(chunk.transcript) as Array<{
+              text: string;
+              truncated: boolean;
+              parts?: string;
+            }>
+        );
+
+      // Only a window cut from a longer part is cut at a JWT-like run: 513 characters past the cap
+      // is one past the window (the cap and its 512-character lookahead), the least such cut.
+      it.each([513, 600])(
+        "keeps its note when it is the message's only part, %d characters past the cap",
+        (pastCap) => {
+          const part = blob.slice(0, TEXT_PART_LIMIT + pastCap);
+          const rows = rowsOf(createMuxMessage("t1", "user", part, { historySequence: 0 }));
+
+          expect(rows).toHaveLength(1);
+          expect(rows[0]).toMatchObject({
+            text: `[truncated ${pastCap} more chars for memory harvest]`,
+            truncated: true,
+          });
+        }
+      );
+
+      // Only an empty part's note keeps a row of its own. A cut part that redaction shortened to a
+      // marker still packs behind the part before it.
+      it("packs a short cut part behind the part before it", () => {
+        const message = createMuxMessage("t1", "user", "here is the config", {
+          historySequence: 0,
+        });
+        message.parts.push({ type: "text", text: `sk-${"Lq".repeat(65_000)}` }); // made up
+
+        const rows = rowsOf(message);
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0].parts).toBeUndefined();
+        expect(rows[0].truncated).toBe(true);
+        expect(rows[0].text).toMatch(
+          /^here is the config\n\[redacted\]\n\[truncated \d+ more chars for memory harvest\]$/
+        );
+      });
+
+      it("keeps its place among the message's parts after a prose part", () => {
+        const message = createMuxMessage("t1", "user", "see the attached state blob", {
+          historySequence: 0,
+        });
+        message.parts.push({ type: "text", text: blob });
+
+        const rows = rowsOf(message);
+
+        expect(rows.map((row) => row.parts)).toEqual(["1-1 of 2", "2-2 of 2"]);
+        expect(rows[0]).toMatchObject({ text: "see the attached state blob", truncated: false });
+        expect(rows[1]).toMatchObject({
+          text: `[truncated ${blob.length - TEXT_PART_LIMIT} more chars for memory harvest]`,
+          truncated: true,
+        });
       });
     });
   });
