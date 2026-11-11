@@ -5529,12 +5529,9 @@ describe("MemoryConsolidationService", () => {
     /**
      * A model whose first step creates a workspace file (unless `editFirst` is false) and whose
      * next step hangs until its stream is aborted. Aborting `timeout` stands in for the run timeout
-     * firing; the hanging step aborts it itself once the edit has landed.
-     */
-    /**
-     * `beforeHang` runs before the call that hangs: a test that expects a run timeout throws from
-     * it when the run took none, so the run fails at once instead of hanging until the test's own
-     * timeout.
+     * firing; the hanging step aborts it itself once the edit has landed. `beforeHang` runs
+     * before the call that hangs: a test that expects a run timeout asserts there that the run
+     * took one, so a run without one fails at once instead of hanging until the test's timeout.
      */
     function hangingModel(
       timeout: AbortController,
