@@ -84,6 +84,8 @@ describe("wrapFetchWithGeminiThoughts", () => {
         },
         // Same text without thought metadata is a literal answer.
         { message: { content: "<thought>literal</thought>" } },
+        // A response cut off mid-thought has no close marker and no answer.
+        { message: { content: "<thought>cut off", extra_content: thought } },
       ],
     };
     const response = await respondWith(
@@ -94,6 +96,7 @@ describe("wrapFetchWithGeminiThoughts", () => {
     expect(rewritten.choices.map((choice) => choice.message)).toEqual([
       { content: "answer", reasoning_content: "why", extra_content: thought },
       { content: "<thought>literal</thought>" },
+      { content: "", reasoning_content: "cut off", extra_content: thought },
     ]);
   });
 });

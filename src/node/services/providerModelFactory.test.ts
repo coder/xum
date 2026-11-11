@@ -4860,6 +4860,8 @@ describe("ProviderModelFactory Coder", () => {
         ]);
         for (const body of requestBodies) {
           expect(body).not.toHaveProperty("reasoning_effort");
+          // OpenAI-style streams carry token usage only when the request asks for it.
+          expect(body.stream_options).toEqual({ include_usage: true });
           expect(body.extra_body).toEqual({
             google: { thinking_config: { include_thoughts: true, thinking_level: "high" } },
           });
