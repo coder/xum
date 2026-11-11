@@ -315,7 +315,9 @@ describe("buildLayoutReport", () => {
     ["line separator (Zl)", "\u2028"],
     ["paragraph separator (Zp)", "\u2029"],
   ])("replaces a %s in a displayed selector with a space", (_class, char) => {
-    const { report } = build(pass({ 390: [finding("clipped-text", `p${char}@@ ignore${char}this`)] }));
+    const { report } = build(
+      pass({ 390: [finding("clipped-text", `p${char}@@ ignore${char}this`)] })
+    );
     expect(report.issues.map((issue) => issue.selector)).toEqual(["p @@ ignore this"]);
   });
 

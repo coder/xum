@@ -404,7 +404,10 @@ describe("page-horizontal-overflow", () => {
       "in a horizontal scroller",
       `<div data-box="0 0 390 50" data-css="overflow-x: auto">${WIDE_TEXT}</div>`,
     ],
-    ["in a scroller that is the text's own element", WIDE_TEXT.replace("<p ", '<p data-css="overflow-x: auto" ')],
+    [
+      "in a scroller that is the text's own element",
+      WIDE_TEXT.replace("<p ", '<p data-css="overflow-x: auto" '),
+    ],
     ["animated", WIDE_TEXT.replace("<p ", "<p data-animated ")],
     ["a diagram", `<div class="mermaid">${WIDE_TEXT}</div>`],
   ])("text that is %s is not evidence", (_name, html) => {

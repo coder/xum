@@ -19,10 +19,10 @@ import { execBuffered, type ExecResult } from "@/node/utils/runtime/helpers";
  * machine where agent-browser and the artifact file are. Two execs, and a third only when the
  * second did not end well (it removes the run's folder, after the audit's budget):
  *
- * 1. RUN opens one fresh browser session and, for each width in run order, sets the viewport,
- *    loads the file anew, evaluates the script and prints one framed record. It stops at the
- *    first failure. Records printed before a timeout or an abort are kept; a record whose end
- *    line is missing is treated as not printed.
+ * 1. RUN opens one fresh browser session, turns its network off, and, for each width in run
+ *    order, sets the viewport, loads the file anew, evaluates the script and prints one framed
+ *    record. It stops at the first failure. Records printed before a timeout or an abort are
+ *    kept; a record whose end line is missing is treated as not printed.
  * 2. CLOSE closes this run's session by name and removes the run's socket folder, in its own
  *    exec with its own time reserve and no abort signal, so it runs after a timeout or a cancel
  *    too. agent-browser's daemon outlives a killed CLI. Never `close --all`: other sessions on
@@ -41,6 +41,11 @@ import { execBuffered, type ExecResult } from "@/node/utils/runtime/helpers";
 // owns a socket folder (so CLOSE, which removes that folder, is skipped for them).
 const EXIT_NO_AGENT_BROWSER = 127;
 const EXIT_SETUP_FAILED = 4;
+/**
+ * `set offline on` failed. Not a never-launched exit: that call starts the browser (measured on
+ * 0.33.2), so CLOSE must still run.
+ */
+const EXIT_OFFLINE_FAILED = 5;
 /** The exec itself failed (the runtime threw), so there is no real exit code. */
 const EXEC_FAILED_EXIT = -1;
 const NEVER_LAUNCHED_EXITS: ReadonlySet<number> = new Set([
@@ -121,6 +126,12 @@ cd / || exit ${EXIT_SETUP_FAILED}
 // A run that ends early (no agent-browser, a tool_env that fails) leaves the page script on
 // stdin unread. The exec is told that this is fine (`stdinMayGoUnread`), so the exit code still
 // says why nothing ran.
+//
+// The page is agent-written and its scripts run in a normal browser, so the network goes off
+// before the first `open`: a page script, image or style sheet cannot reach a host, and what the
+// page holds cannot leave the machine through them. file:// pages and relative files still load.
+// A run that cannot turn it off stops (fail closed) and every width reads "not checked". It does
+// not cover a window the page opens itself: that is another target, with its own network.
 const RUN_SCRIPT = String.raw`
 command -v agent-browser >/dev/null 2>&1 || exit ${EXIT_NO_AGENT_BROWSER}
 page_script=$(cat) || exit ${EXIT_SETUP_FAILED}
@@ -130,6 +141,7 @@ ${SHELL_COMMON}
 mkdir -m 700 "$XUM_LAYOUT_SOCKET_DIR" || exit ${EXIT_SETUP_FAILED}
 # This run made the folder, so it removes it when it cannot go on: CLOSE is skipped for this exit.
 printf '{}' > "$XUM_LAYOUT_SOCKET_DIR/config.json" || { rm -rf -- "$XUM_LAYOUT_SOCKET_DIR"; exit ${EXIT_SETUP_FAILED}; }
+ab set offline on </dev/null >/dev/null 2>&1 || exit ${EXIT_OFFLINE_FAILED}
 set -- $XUM_LAYOUT_VIEWPORTS
 while [ "$#" -ge 2 ]; do
   width=$1; height=$2; shift 2

@@ -7,11 +7,11 @@ import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 
 /**
  * A POSIX-sh stand-in for the `agent-browser` CLI, reached the way production reaches the real
- * one: a trusted project's `.xum/tool_env` puts its folder first on PATH. It answers the five
- * calls the layout audit makes (`set viewport`, `open`, `--json eval --stdin`, `close`) and logs
- * every call, so a test sees the exact argv, the opened URLs and the stdin of each eval. For
- * every call it also logs the NAMES of the AGENT_BROWSER_* variables it inherited, and of
- * SHELLOPTS and BASHOPTS (never a value), and the content of the file `--config` names.
+ * one: a trusted project's `.xum/tool_env` puts its folder first on PATH. It answers the calls
+ * the layout audit makes (`set offline on`, `set viewport`, `open`, `--json eval --stdin`,
+ * `close`) and logs every call, so a test sees the exact argv, the opened URLs and the stdin of
+ * each eval. For every call it also logs the NAMES of the AGENT_BROWSER_* variables it inherited,
+ * and of SHELLOPTS and BASHOPTS (never a value), and the content of the file `--config` names.
  */
 
 /** What `eval` prints and returns for one width. The default is a clean, complete pass. */
@@ -38,6 +38,8 @@ export interface FakeAgentBrowserScript {
   toolEnvFails?: boolean;
   /** Shell lines appended to a tool_env that sources, after the PATH line. */
   toolEnvLines?: string[];
+  /** `set offline on` exits 1. */
+  offlineFails?: boolean;
   /** `open` exits 1. */
   openFails?: boolean;
   /** `close` never answers, like a daemon that is still executing a command. */
@@ -146,7 +148,10 @@ command="$1"
 shift
 case "$command" in
   set)
-    printf '%s' "$2" > "$STATE/viewport"
+    case "$1" in
+      offline) [ -f "$STATE/offline-fails" ] && exit 1 ;;
+      viewport) printf '%s' "$2" > "$STATE/viewport" ;;
+    esac
     ;;
   open)
     [ -f "$STATE/open-fails" ] && exit 1
@@ -200,6 +205,7 @@ export async function installFakeAgentBrowser(
         "",
       ].join("\n");
   await fs.writeFile(path.join(projectDir, ".xum", "tool_env"), toolEnv);
+  if (script.offlineFails) await fs.writeFile(path.join(stateDir, "offline-fails"), "");
   if (script.openFails) await fs.writeFile(path.join(stateDir, "open-fails"), "");
   if (script.closeHangs) await fs.writeFile(path.join(stateDir, "close-hangs"), "");
   for (const { width } of LAYOUT_AUDIT_VIEWPORTS) {
