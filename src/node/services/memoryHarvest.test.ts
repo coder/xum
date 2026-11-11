@@ -1207,6 +1207,48 @@ describe("runMemoryHarvest", () => {
         `${"z".repeat(TEXT_PART_LIMIT - 100)} \n[truncated ${text.length - TEXT_PART_LIMIT} more chars for memory harvest]`
       );
     });
+
+    // A part that starts with such a run keeps nothing of it, and still says it was cut: its row
+    // carries the note and the truncated flag, as a cut part with kept text does. As above, the note
+    // counts the characters past the cap.
+    describe("a part that the cut at a JWT leaves empty", () => {
+      const blob = `eyJ${"Q".repeat(TEXT_PART_LIMIT + 600)}`; // made up, no dot: not a match
+      const rowsOf = (message: MuxMessage) =>
+        buildHarvestChunks([message]).flatMap(
+          (chunk) =>
+            JSON.parse(chunk.transcript) as Array<{
+              text: string;
+              truncated: boolean;
+              parts?: string;
+            }>
+        );
+
+      it("keeps its note when it is the message's only part", () => {
+        const rows = rowsOf(createMuxMessage("t1", "user", blob, { historySequence: 0 }));
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          text: `[truncated ${blob.length - TEXT_PART_LIMIT} more chars for memory harvest]`,
+          truncated: true,
+        });
+      });
+
+      it("keeps its place among the message's parts after a prose part", () => {
+        const message = createMuxMessage("t1", "user", "see the attached state blob", {
+          historySequence: 0,
+        });
+        message.parts.push({ type: "text", text: blob });
+
+        const rows = rowsOf(message);
+
+        expect(rows.map((row) => row.parts)).toEqual(["1-1 of 2", "2-2 of 2"]);
+        expect(rows[0]).toMatchObject({ text: "see the attached state blob", truncated: false });
+        expect(rows[1]).toMatchObject({
+          text: `[truncated ${blob.length - TEXT_PART_LIMIT} more chars for memory harvest]`,
+          truncated: true,
+        });
+      });
+    });
   });
 
   // A data URL in a message the user typed or the model wrote is attachment bytes like one in a
