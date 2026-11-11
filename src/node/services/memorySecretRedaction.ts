@@ -591,9 +591,26 @@ const TAIL_STARTS: ReadonlyArray<readonly [RegExp, RegExp]> = [
 ];
 const LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
 
-function isLetterOrDigit(code: number, char: string): boolean {
+/** The character at `i`: a surrogate pair is one character. */
+function characterAt(text: string, i: number): string {
+  const unit = text.charCodeAt(i);
+  const next = text.charCodeAt(i + 1);
+  const paired = unit >= 0xd800 && unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff;
+  return paired ? text.slice(i, i + 2) : text[i];
+}
+
+/** A letter or a digit of any script. The ASCII ones are decided without the regex. */
+function isLetterOrDigit(char: string): boolean {
+  const code = char.charCodeAt(0);
   if (code < 0x80) return (code >= 48 && code <= 57) || ((code | 32) >= 97 && (code | 32) <= 122);
   return LETTER_OR_DIGIT.test(char);
+}
+
+/** True when `char`, at `i` in `text`, ends a value: an end character, or a `]` that no value character follows. */
+function endsValue(text: string, i: number, char: string, valueEnd: RegExp): boolean {
+  if (char !== "]") return valueEnd.test(char);
+  const next = text[i + 1];
+  return next === undefined || valueEnd.test(next);
 }
 
 /** Where the tail that starts at `from` ends, and whether a letter or a digit stands in it. */
@@ -608,17 +625,10 @@ function scanTail(text: string, from: number, valueEnd: RegExp): { end: number; 
         continue;
       }
     }
-    const code = text.codePointAt(i) as number;
-    const width = code > 0xffff ? 2 : 1;
-    const char = width === 1 ? text[i] : text.slice(i, i + 2);
-    if (char === "]") {
-      const next = text[i + 1];
-      if (next === undefined || valueEnd.test(next)) break;
-    } else if (valueEnd.test(char)) {
-      break;
-    }
-    counts ||= isLetterOrDigit(code, char);
-    i += width;
+    const char = characterAt(text, i);
+    if (endsValue(text, i, char, valueEnd)) break;
+    counts ||= isLetterOrDigit(char);
+    i += char.length;
   }
   return { end: i, counts };
 }
