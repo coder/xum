@@ -144,20 +144,31 @@ while [ "$#" -ge 2 ]; do
 done
 `;
 
-// The folder is removed whether or not the close worked. A busy daemon does not answer the close
-// (see the top of this file), so where `timeout` exists the wait is cut short and the folder is
-// removed under the daemon, which then exits on its own. The removal is best effort: when this
-// exec is killed before it gets there (no `timeout` on stock macOS, or a host too loaded to
-// finish in the close reserve), or when Xum itself dies mid-audit, the folder stays in /tmp with
-// one small config file.
-const CLOSE_SCRIPT = String.raw`
-${SHELL_COMMON}
-command -v timeout >/dev/null 2>&1 && ab_wrap="timeout ${CLOSE_WAIT_SECONDS}"
-ab close </dev/null >/dev/null 2>&1
+// Removes the run's socket folder, and nothing that is not one. CLOSE ends with it. It also runs
+// by itself after a CLOSE that did not end well: it then sources no tool_env and calls no
+// agent-browser, so what made CLOSE lose (a loaded host, a close that never answers) cannot make
+// it lose the same way. That run has its own short time, after the audit's budget. Without it,
+// audits on a host with a load average above 50 left their folders behind.
+const REMOVE_SOCKET_DIR = String.raw`
 case "$XUM_LAYOUT_SOCKET_DIR" in
   ${SOCKET_DIR_PARENT}/${SESSION_PREFIX}*) rm -rf -- "$XUM_LAYOUT_SOCKET_DIR" ;;
 esac
 `;
+
+// The folder is removed whether or not the close worked. A busy daemon does not answer the close
+// (see the top of this file), so where `timeout` exists the wait is cut short and the folder is
+// removed under the daemon, which then exits on its own. When this exec is killed before it
+// gets there (no `timeout` on stock macOS, or a host too loaded to finish in the close reserve),
+// REMOVE_SOCKET_DIR runs again by itself. Only when that fails too, or when Xum itself dies
+// mid-audit, the folder stays in /tmp with one small config file.
+const CLOSE_SCRIPT = String.raw`
+${SHELL_COMMON}
+command -v timeout >/dev/null 2>&1 && ab_wrap="timeout ${CLOSE_WAIT_SECONDS}"
+ab close </dev/null >/dev/null 2>&1
+${REMOVE_SOCKET_DIR}`;
+
+/** The time of the removal that runs by itself after a failed CLOSE. */
+const REMOVE_TIMEOUT_SECONDS = 5;
 
 /**
  * The text that runs `script` in a new shell, in place of the shell that sourced tool_env: only
@@ -296,13 +307,21 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
     maxOutputBytes: MAX_RUN_OUTPUT_BYTES,
   });
   if (!NEVER_LAUNCHED_EXITS.has(run.exitCode)) {
-    await execOrFail(input.runtime, prelude + inNewShell(CLOSE_SCRIPT), {
+    const close = await execOrFail(input.runtime, prelude + inNewShell(CLOSE_SCRIPT), {
       cwd: input.cwd,
       pathEnv,
       env: sessionEnv,
       timeout: closeMs / 1000,
       maxOutputBytes: MAX_CLOSE_OUTPUT_BYTES,
     });
+    if (close.exitCode !== 0) {
+      await execOrFail(input.runtime, inNewShell(REMOVE_SOCKET_DIR), {
+        cwd: input.cwd,
+        env: sessionEnv,
+        timeout: REMOVE_TIMEOUT_SECONDS,
+        maxOutputBytes: MAX_CLOSE_OUTPUT_BYTES,
+      });
+    }
   }
   return outcomesOf(run);
 }
