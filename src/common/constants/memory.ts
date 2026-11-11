@@ -73,8 +73,8 @@ export const MEMORY_VIEW_MAX_DEPTH = 2;
 
 /**
  * Most line numbers that a refused `str_replace` names ("old_str matches N locations (lines ...)"),
- * so the error stays a few hundred bytes however many lines match: 100 KiB of newlines gave a
- * 708,207-byte error that went back to the model. 20 numbers of up to 6 digits take under 160
+ * so the error stays a few hundred bytes however many lines match: 100 KiB of newlines gave an
+ * error of about 708 KB that went back to the model. 20 numbers of up to 6 digits take under 160
  * bytes, and a model that sees 20 matching lines already knows old_str is far too short and needs
  * more of its surrounding text.
  */

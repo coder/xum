@@ -553,7 +553,7 @@ describe("MemoryService", () => {
     });
 
     // 100 KiB of newlines with old_str "\n" matches on every line. The error listed every line
-    // number and came to 708,207 bytes, all of it sent back to the model.
+    // number and came to about 708 KB, all of it sent back to the model.
     it("keeps the refusal of a file of newlines to a few hundred bytes", async () => {
       const content = "\n".repeat(MEMORY_MAX_FILE_BYTES);
       const expected = ambiguousError(
