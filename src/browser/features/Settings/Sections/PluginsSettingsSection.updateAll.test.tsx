@@ -650,6 +650,57 @@ test("uninstalling a plugin whose review is still queued drops it from the queue
   expect(shows("adds skill 'beta'")).toBe(false);
 });
 
+/** Holds every uninstall until `release`, so another plugin stays busy meanwhile. */
+function holdUninstalls(api: ReturnType<typeof createApi>["api"]) {
+  const released = Promise.withResolvers<void>();
+  const uninstall = api.agentPlugins.uninstall;
+  api.agentPlugins.uninstall = (async (input: Parameters<typeof uninstall>[0]) => {
+    await released.promise;
+    return uninstall(input);
+  }) as typeof uninstall;
+  return released.resolve;
+}
+
+test("an open update review cannot be applied while another plugin is busy, and can again when it settles", async () => {
+  const { api, uninstalls } = createApi({
+    names: ["beta", "epsilon"],
+    pending: { beta: capabilityChanging("beta") },
+  });
+  const release = holdUninstalls(api);
+  publishPluginsSectionIntent({ type: "review-updates", reviews: [capabilityChanging("beta")] });
+  const view = mount(api);
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  expect(openReviews(view)[0].disabled).toBe(false);
+
+  await uninstallPlugin(view, "epsilon");
+
+  await waitFor(() => expect(openReviews(view)[0].disabled).toBe(true));
+  release();
+  await waitFor(() => expect(uninstalls).toEqual(["epsilon"]));
+  await waitFor(() => expect(openReviews(view)[0].disabled).toBe(false));
+});
+
+test("an open component review cannot be approved while another plugin is busy, and can again when it settles", async () => {
+  const { api, uninstalls } = createApi({
+    names: ["beta", "epsilon"],
+    pending: {},
+    componentReviews: { beta: review("beta", [{ summary: "adds the hook 'audit'" }]) },
+  });
+  const release = holdUninstalls(api);
+  publishPluginsSectionIntent({ type: "review-components", name: "beta" });
+  const view = mount(api);
+  const approve = () => buttonNamed(view, "Approve components");
+  await waitFor(() => expect(approve()).toBeDefined());
+  expect(approve()!.disabled).toBe(false);
+
+  await uninstallPlugin(view, "epsilon");
+
+  await waitFor(() => expect(approve()!.disabled).toBe(true));
+  release();
+  await waitFor(() => expect(uninstalls).toEqual(["epsilon"]));
+  await waitFor(() => expect(approve()!.disabled).toBe(false));
+});
+
 test("starting Update all closes the component review that is open", async () => {
   const { api } = createApi({
     names: ["alpha"],

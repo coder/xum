@@ -1498,7 +1498,10 @@ const UpdateReviewPanel: React.FC<{
   review: AgentPluginUpdateReview;
   mode: ReviewPanelMode;
   selective: boolean;
+  /** This review's plugin has the action in flight: the confirm shows its progress. */
   busy: boolean;
+  /** Another plugin's action is in flight: the section ignores a confirm until it settles. */
+  locked: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1544,7 +1547,11 @@ const UpdateReviewPanel: React.FC<{
         </p>
       )}
       <div className="flex gap-2">
-        <Button size="sm" onClick={props.onConfirm} disabled={props.busy || mustExpand.length > 0}>
+        <Button
+          size="sm"
+          onClick={props.onConfirm}
+          disabled={props.busy || props.locked || mustExpand.length > 0}
+        >
           {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
           {props.busy ? copy.busy : copy.confirm}
         </Button>
@@ -1799,6 +1806,7 @@ const ComponentReviewRow: React.FC<{
   item: AgentPluginListItem;
   review: AgentPluginUpdateReview | null;
   busy: boolean;
+  locked: boolean;
   onConfirm: (review: AgentPluginUpdateReview) => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1810,6 +1818,7 @@ const ComponentReviewRow: React.FC<{
       mode="components"
       selective={false}
       busy={props.busy}
+      locked={props.locked}
       onConfirm={() => props.onConfirm(review)}
       onCancel={props.onCancel}
     />
@@ -2413,6 +2422,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       mode="update"
                       selective={item.importedComponents !== undefined}
                       busy={isBusy}
+                      locked={busyPlugin !== null}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
                       onCancel={() => updateReviews.settle(updateReview)}
                     />
@@ -2421,6 +2431,7 @@ export const PluginsSettingsSection: React.FC = () => {
                     item={item}
                     review={componentReview.review}
                     busy={isBusy}
+                    locked={busyPlugin !== null}
                     onConfirm={(review) => void componentReview.confirm(review)}
                     onCancel={componentReview.close}
                   />
