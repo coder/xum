@@ -215,13 +215,18 @@ describeIntegration("SSH+None directory trust (UI)", () => {
     try {
       await openSshNoneForm(view, projectPath, "/srv/app");
       await findButtonEventually(page(), "Set as default");
-      fireEvent.keyDown(window, {
+      const chord = new window.KeyboardEvent("keydown", {
         key: "D",
         code: "KeyD",
         ctrlKey: true,
         altKey: true,
         shiftKey: true,
+        bubbles: true,
+        cancelable: true,
       });
+      // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+      Object.defineProperty(chord, "getModifierState", { value: () => false });
+      fireEvent(window, chord);
 
       await waitFor(() => {
         const state = page().querySelector('[data-component="IsolationDefaultState"]');
