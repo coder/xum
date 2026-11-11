@@ -44,13 +44,11 @@ function parseRuleFrontmatter(yaml: string): Record<string, unknown> | undefined
 
 function ruleGlobs(value: unknown): string[] {
   const entries = Array.isArray(value) ? value : [value];
-  return (
-    entries
-      .filter((entry): entry is string => typeof entry === "string")
-      // Cut before trimming, so memory stays bounded when YAML aliases repeat a long glob.
-      .map((entry) => cutToCap(entry, MAX_SKILL_DESCRIPTION_LENGTH).trim())
-      .filter((entry) => entry.length > 0)
-  );
+  // Cut before trimming, so memory stays bounded when YAML aliases repeat a long glob.
+  return entries
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => cutToCap(entry, MAX_SKILL_DESCRIPTION_LENGTH).trim())
+    .filter((entry) => entry.length > 0);
 }
 
 function nonEmptyString(value: unknown): string | undefined {

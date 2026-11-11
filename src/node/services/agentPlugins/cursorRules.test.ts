@@ -85,6 +85,15 @@ describe("Cursor rule types", () => {
     expect(frontmatter["disable-model-invocation"]).not.toBe(true);
   });
 
+  test("a blank glob counts for nothing and a one-character glob counts", () => {
+    expect(ruleType(ruleSkill("blank", `---\nglobs: ["  "]\n---\nBody\n`).frontmatter)).toBe(
+      "manual"
+    );
+    const { frontmatter } = ruleSkill("star", `---\nglobs: [" ", "*"]\n---\nBody\n`);
+    expect(ruleType(frontmatter)).toBe("glob");
+    expect(frontmatter.description).toBe("Body\n\nApplies to files matching: *");
+  });
+
   test("globs win over a description", () => {
     const { frontmatter } = ruleSkill(
       "typescript",
