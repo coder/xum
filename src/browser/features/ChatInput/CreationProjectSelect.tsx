@@ -74,10 +74,12 @@ function ProjectSwitcher(props: {
   items: Array<{ value: string; label: string; detail: string }>;
 }) {
   const [open, setOpen] = useState(false);
+  // A lock that lands while the list is open (a send, a file read, a recording) closes it: the
+  // open rows would otherwise still switch projects under the draft the lock protects. The state
+  // is cleared, not masked, so the list does not reopen by itself when the lock lifts.
+  if (props.disabled && open) setOpen(false);
   return (
-    // A lock that lands while the list is open (a send, a file read, a recording) closes it: the
-    // open rows would otherwise still switch projects under the draft the lock protects.
-    <Popover open={open && !props.disabled} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={setOpen}>
       <Tooltip>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>

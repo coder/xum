@@ -48,6 +48,8 @@ interface CreationEnvironmentPanelProps {
   workspaceFields: ReactNode;
   branch: EnvironmentBranchPicker | null;
   fieldError: RuntimeFieldError | null;
+  /** Counts the sends refused for a required field; a new one reopens the panel. */
+  fieldErrorAttempt: number;
 }
 
 const COLUMN_SELECTOR = "[data-environment-column]";
@@ -319,12 +321,13 @@ function columnsClass(props: Pick<CreationEnvironmentPanelProps, "branch" | "iso
  */
 export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
   const [open, setOpen] = useState(false);
-  // A Send refused for an empty required field opens the panel on that field. The fields live in
-  // the panel, so a closed panel would hide what Send is waiting for. Adjusted during render
-  // (not in an effect): it is state derived from a prop change.
-  const [seenFieldError, setSeenFieldError] = useState(props.fieldError);
-  if (props.fieldError !== seenFieldError) {
-    setSeenFieldError(props.fieldError);
+  // Each Send refused for an empty required field opens the panel on that field. The fields live
+  // in the panel, so a closed panel would hide what Send is waiting for. Keyed on the attempt, not
+  // on the error: the error is the same for a second refused send. Adjusted during render (not in
+  // an effect): it is state derived from a prop change.
+  const [seenAttempt, setSeenAttempt] = useState(props.fieldErrorAttempt);
+  if (props.fieldErrorAttempt !== seenAttempt) {
+    setSeenAttempt(props.fieldErrorAttempt);
     if (props.fieldError !== null) setOpen(true);
   }
   const contentRef = useRef<HTMLDivElement>(null);

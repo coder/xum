@@ -168,6 +168,8 @@ interface CreationControlsProps {
   runtimeEnablement?: RuntimeEnablement;
   /** Which runtime field (if any) is in error state for visual feedback */
   runtimeFieldError?: RuntimeFieldError | null;
+  /** How many sends the runtime validation refused; each one reopens the environment panel. */
+  runtimeFieldErrorAttempt?: number;
 
   /** Coder CLI availability info (null while checking) */
   coderInfo?: CoderInfo | null;
@@ -1033,6 +1035,7 @@ function CreationControlsContent(props: CreationControlsProps) {
                 : null
             }
             fieldError={fieldError}
+            fieldErrorAttempt={props.runtimeFieldErrorAttempt ?? 0}
           />
           <SetDefaultIsolationButton
             projectPath={props.projectPath}
@@ -1146,6 +1149,7 @@ export function CreationControls(props: CreationControlsProps) {
       runtimeAvailabilityState={props.runtimeAvailabilityState}
       runtimeEnablement={runtimeEnablement}
       runtimeFieldError={props.runtimeFieldError}
+      runtimeFieldErrorAttempt={props.runtimeFieldErrorAttempt}
       coderInfo={props.coderInfo}
       coderProps={coderProps}
     />
