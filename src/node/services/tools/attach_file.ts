@@ -5,6 +5,7 @@ import { createDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnl
 import type { AttachFileToolResult } from "@/common/types/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { fileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { readAttachFileFromPath } from "@/node/utils/attachments/readAttachmentFromPath";
 
 function formatDisplayOnlyFileLabel(file: { filename?: string; mediaType: string }): string {
@@ -29,6 +30,7 @@ export const createAttachFileTool: ToolFactory = (config: ToolConfiguration) => 
           cwd: config.cwd,
           runtime: config.runtime,
           abortSignal,
+          sandbox: fileToolSandboxContext(config),
         });
 
         if (result.type === "display") {

@@ -25,13 +25,18 @@ function projectWithNoWorkspaces(path: string): [string, ProjectConfig] {
   return [path, { workspaces: [] }];
 }
 
-function getWorkspaceTypeTrigger(container: HTMLElement): HTMLButtonElement | null {
+type IsolationAxis = "Project isolation" | "Workspace isolation";
+
+function getIsolationTrigger(
+  container: HTMLElement,
+  axis: IsolationAxis
+): HTMLButtonElement | null {
   const group = container.querySelector('[data-component="RuntimeTypeGroup"]');
   if (!group) {
     return null;
   }
 
-  return group.querySelector('button[aria-label="Workspace type"]');
+  return group.querySelector(`button[aria-label="${axis}"]`);
 }
 
 function findRuntimeOption(label: string): HTMLElement | null {
@@ -39,10 +44,14 @@ function findRuntimeOption(label: string): HTMLElement | null {
   return options.find((option) => option.textContent?.includes(label)) ?? null;
 }
 
-async function selectRuntime(container: HTMLElement, label: string): Promise<void> {
-  const trigger = getWorkspaceTypeTrigger(container);
+async function selectRuntime(
+  container: HTMLElement,
+  axis: IsolationAxis,
+  label: string
+): Promise<void> {
+  const trigger = getIsolationTrigger(container, axis);
   if (!trigger) {
-    throw new Error("Workspace type trigger not found");
+    throw new Error(`${axis} trigger not found`);
   }
 
   fireEvent.click(trigger);
@@ -89,13 +98,13 @@ describeIntegration("Docker runtime selection (UI)", () => {
         { timeout: 5_000 }
       );
 
-      await selectRuntime(view.container, "Docker");
+      await selectRuntime(view.container, "Workspace isolation", "Docker");
 
       // Verify Docker runtime becomes active in the workspace-type trigger.
       await waitFor(
         () => {
-          const trigger = getWorkspaceTypeTrigger(view.container);
-          if (!trigger) throw new Error("Workspace type trigger not found");
+          const trigger = getIsolationTrigger(view.container, "Workspace isolation");
+          if (!trigger) throw new Error("Workspace isolation trigger not found");
           if (!trigger.textContent?.includes("Docker")) {
             throw new Error("Docker runtime not selected");
           }
@@ -127,7 +136,7 @@ describeIntegration("Docker runtime selection (UI)", () => {
       expect(imageInput.value).toBe("node:20");
 
       // Switching to SSH should hide Docker image input and show host input
-      await selectRuntime(view.container, "SSH");
+      await selectRuntime(view.container, "Project isolation", "SSH");
 
       await waitFor(
         () => {
@@ -185,16 +194,16 @@ describeIntegration("Docker runtime selection (UI)", () => {
       // Local should be forced when repo is not a git repository.
       await waitFor(
         () => {
-          const trigger = getWorkspaceTypeTrigger(view.container);
-          if (!trigger) throw new Error("Workspace type trigger not found");
-          if (!trigger.textContent?.includes("Local")) {
-            throw new Error("Local runtime not selected for non-git repo");
+          const trigger = getIsolationTrigger(view.container, "Workspace isolation");
+          if (!trigger) throw new Error("Workspace isolation trigger not found");
+          if (!trigger.textContent?.includes("None")) {
+            throw new Error("No workspace isolation not selected for non-git repo");
           }
         },
         { timeout: 2_000 }
       );
 
-      const trigger = getWorkspaceTypeTrigger(view.container);
+      const trigger = getIsolationTrigger(view.container, "Workspace isolation");
       expect(trigger).toBeTruthy();
       fireEvent.click(trigger!);
 

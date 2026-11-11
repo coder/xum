@@ -51,6 +51,13 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     return this.currentProjectPath;
   }
 
+  protected override sandboxCheckoutRoot(): string | undefined {
+    if (this.currentProjectPath === undefined || this.currentWorkspaceName === undefined) {
+      return undefined;
+    }
+    return this.getWorkspacePath(this.currentProjectPath, this.currentWorkspaceName);
+  }
+
   getWorkspacePath(projectPath: string, workspaceName: string): string {
     // Honor an explicit persisted path for this runtime's own workspace so callers (cwd resolution,
     // ensureReady, agent discovery) land in the shared parent checkout instead of a name-derived

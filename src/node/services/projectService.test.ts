@@ -6,6 +6,7 @@ import * as os from "os";
 import { execSync } from "child_process";
 import { createHash } from "crypto";
 import { Config } from "@/node/config";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { Ok } from "@/common/types/result";
 import { ORPCError } from "@orpc/server";
 import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
@@ -2459,6 +2460,55 @@ exit 1
           { projectPath: childPath, trusted: true },
         ],
       ]);
+    });
+
+    it("setSshDirectoryTrust persists once, revokes, refuses an untrusted project, and publishes", async () => {
+      const parentPath = path.join(tempDir, "project");
+      const childPath = path.join(parentPath, "packages", "api");
+      await config.editConfig((current) => {
+        current.projects.set(parentPath, { workspaces: [] });
+        current.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+        return current;
+      });
+      const updates: Array<Parameters<MCPServerManager["applyProjectTrust"]>[0]> = [];
+      service.setMcpServerManager({
+        applyProjectTrust: (value) => updates.push(value),
+        forgetProjectTrust: () => undefined,
+      });
+      const directory = { host: "dev@box", port: 2222, projectDir: "/srv/app" };
+      const grant = { projectPath: childPath, ...directory, trusted: true };
+
+      // The directory's trust only means something on a trusted project.
+      const refused = await service.setSshDirectoryTrust(grant);
+      expect(refused.success).toBe(false);
+      expect(config.loadConfigOrDefault().projects.get(parentPath)?.trustedSshDirectories).toBe(
+        undefined
+      );
+      expect(updates).toEqual([]);
+
+      await service.setTrust(parentPath, true);
+      updates.length = 0;
+      // Granted from a sub-project: stored on the trust owner, idempotently.
+      expect(await service.setSshDirectoryTrust(grant)).toEqual({
+        success: true,
+        data: { projectDir: "/srv/app" },
+      });
+      expect(
+        (await service.setSshDirectoryTrust({ ...grant, projectDir: " /srv/app " })).success
+      ).toBe(true);
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(parentPath)?.trustedSshDirectories
+      ).toEqual([directory]);
+      expect(updates.at(-1)).toEqual([
+        { projectPath: parentPath, trusted: true, trustedSshDirectories: [directory] },
+        { projectPath: childPath, trusted: true, trustedSshDirectories: [directory] },
+      ]);
+
+      expect((await service.setSshDirectoryTrust({ ...grant, trusted: false })).success).toBe(true);
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(parentPath)?.trustedSshDirectories
+      ).toBe(undefined);
+      expect(updates.at(-1)?.[0]).toEqual({ projectPath: parentPath, trusted: true });
     });
 
     it("setTrust drops remote plugin snapshots even when the MCP update throws (#6426)", async () => {

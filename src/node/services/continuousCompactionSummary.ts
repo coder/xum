@@ -103,6 +103,7 @@ export async function summarizeContinuousCompaction(args: {
     projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
   });
+  const sandboxEnv = await args.aiService.getWorkspaceSandboxEnv(metadata.data);
   args.signal.throwIfAborted();
   const cfg = args.config.loadConfigOrDefault();
   const agent = await resolveAgentForStream({
@@ -116,6 +117,7 @@ export async function summarizeContinuousCompaction(args: {
     callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
     cfg,
     emitError: () => undefined,
+    sandboxEnv,
   });
   if (!agent.success) throw new Error(`Cannot resolve compact agent: ${agent.error.type}`);
   // A summary is a Compact run, so it keeps Compact's prompt-cache TTL (its built-in 5m under a
@@ -133,6 +135,7 @@ export async function summarizeContinuousCompaction(args: {
       skipScopesAbove: getSkipScopesAboveForKnownScope(agent.data.agentDefinition.scope),
       projectPluginsTrusted: agent.data.projectPluginsTrusted,
       runtimeFactory,
+      sandboxEnv,
     }
   );
   args.signal.throwIfAborted();

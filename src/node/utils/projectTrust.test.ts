@@ -1,6 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import type { Config } from "@/node/config";
-import { isProjectTrusted, isWorkspaceProjectTrusted } from "./projectTrust";
+import type { ProjectsConfig } from "@/common/types/project";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import {
+  isChildWorkspaceAndParentDirTrustedIn,
+  isInitHookTrusted,
+  isProjectTrusted,
+  isWorkspaceDirTrusted,
+  isWorkspaceProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
+} from "./projectTrust";
+import type { Secret } from "@/common/types/secrets";
 
 function configWithProjects(projects: Map<string, { trusted?: boolean }>): Config {
   return { loadConfigOrDefault: () => ({ projects }) } as unknown as Config;
@@ -12,6 +25,7 @@ describe("isWorkspaceProjectTrusted", () => {
     const trusted = isWorkspaceProjectTrusted(config, {
       kind: "scratch",
       projectPath: "/home/user/.mux/scratch/ws-1",
+      runtimeConfig: undefined,
     });
     expect(trusted).toBe(true);
     // The raw path lookup alone would report untrusted; that is the bug this
@@ -26,7 +40,162 @@ describe("isWorkspaceProjectTrusted", () => {
         ["/repo/untrusted", {}],
       ])
     );
-    expect(isWorkspaceProjectTrusted(config, { projectPath: "/repo/trusted" })).toBe(true);
-    expect(isWorkspaceProjectTrusted(config, { projectPath: "/repo/untrusted" })).toBe(false);
+    expect(
+      isWorkspaceProjectTrusted(config, { projectPath: "/repo/trusted", runtimeConfig: undefined })
+    ).toBe(true);
+    expect(
+      isWorkspaceProjectTrusted(config, {
+        projectPath: "/repo/untrusted",
+        runtimeConfig: undefined,
+      })
+    ).toBe(false);
+  });
+});
+
+// An SSH+None workspace runs in a host directory that is not the local project: it is trusted only
+// when the project is trusted AND the user trusted that exact directory. An SSH worktree workspace
+// runs in Xum's own synced checkout, so project trust alone covers it.
+describe("SSH+None workspaces need their directory trusted", () => {
+  const projectPath = "/repo/trusted";
+  const subProjectPath = "/repo/trusted/sub";
+  const directory = { host: "devbox", projectDir: "/home/me/app" };
+  function projectsWith(project: Record<string, unknown>): ProjectsConfig["projects"] {
+    return new Map<string, unknown>([
+      [projectPath, project],
+      [subProjectPath, { workspaces: [], parentProjectPath: projectPath }],
+    ]) as unknown as ProjectsConfig["projects"];
+  }
+  const sshNone: RuntimeConfig = {
+    type: "ssh",
+    host: "devbox",
+    srcBaseDir: "~/xum",
+    workspaceIsolation: "none",
+    projectDir: "/home/me/app",
+  };
+  const sshWorktree: RuntimeConfig = { type: "ssh", host: "devbox", srcBaseDir: "~/xum" };
+
+  function metadataFor(runtimeConfig: RuntimeConfig, path = projectPath): WorkspaceMetadata {
+    const metadata: WorkspaceMetadata = {
+      id: "ws-1",
+      name: "feature",
+      projectName: "trusted",
+      projectPath: path,
+      runtimeConfig,
+    };
+    return metadata;
+  }
+
+  test.each([
+    ["SSH+None, directory untrusted", sshNone, { trusted: true }, false],
+    [
+      "SSH+None, directory trusted",
+      sshNone,
+      { trusted: true, trustedSshDirectories: [directory] },
+      true,
+    ],
+    // Directory trust applies only while the project itself is trusted.
+    ["SSH+None, project untrusted", sshNone, { trustedSshDirectories: [directory] }, false],
+    [
+      "SSH+None, another directory trusted",
+      sshNone,
+      { trusted: true, trustedSshDirectories: [{ ...directory, projectDir: "/home/me/other" }] },
+      false,
+    ],
+    ["SSH worktree", sshWorktree, { trusted: true }, true],
+  ] as const)("%s", (_label, runtimeConfig, project, expected) => {
+    const projects = projectsWith(project);
+    const config = configWithProjects(projects as Map<string, { trusted?: boolean }>);
+    const metadata = metadataFor(runtimeConfig);
+    expect(isWorkspaceProjectTrusted(config, metadata)).toBe(expected);
+    expect(isWorkspaceProjectTrustedIn(projects, metadata)).toBe(expected);
+    expect(isWorkspaceTrustedForSharedExecution(metadata, projects)).toBe(expected);
+  });
+
+  test("a sub-project's SSH+None directory is trusted through its parent", () => {
+    const projects = projectsWith({ trusted: true, trustedSshDirectories: [directory] });
+    expect(isWorkspaceProjectTrustedIn(projects, metadataFor(sshNone, subProjectPath))).toBe(true);
+    expect(isWorkspaceDirTrusted(projects, subProjectPath, sshNone)).toBe(true);
+  });
+
+  test.each([
+    ["SSH+None, directory untrusted", sshNone, true, false, false],
+    ["SSH+None, directory trusted", sshNone, true, true, true],
+    // Revoking project trust keeps the directory entry on disk; it must stop releasing secrets.
+    ["SSH+None, directory trusted but project revoked", sshNone, false, true, false],
+    ["SSH worktree", sshWorktree, true, false, true],
+    ["local", { type: "local" } satisfies RuntimeConfig, true, false, true],
+    ["unset", undefined, true, false, true],
+  ] as const)(
+    "%s workspace project secrets",
+    (_label, runtimeConfig, projectTrusted, dirTrusted, expected) => {
+      const projectSecrets: Secret[] = [{ key: "GH_TOKEN", value: "ghp_secret" }];
+      const secretsStore = {
+        getEffectiveSecrets: (path: string) => (path === projectPath ? projectSecrets : []),
+      };
+      const config = configWithProjects(
+        projectsWith({
+          trusted: projectTrusted,
+          ...(dirTrusted ? { trustedSshDirectories: [directory] } : {}),
+        }) as Map<string, { trusted?: boolean }>
+      );
+      expect(secretsForWorkspace(secretsStore, config, projectPath, runtimeConfig)).toEqual(
+        expected ? projectSecrets : []
+      );
+    }
+  );
+
+  test.each([
+    ["untrusted project", false, sshWorktree, true, false],
+    ["trusted project, worktree", true, sshWorktree, false, true],
+    ["trusted project, SSH+None directory untrusted", true, sshNone, false, false],
+    ["trusted project, SSH+None directory trusted", true, sshNone, true, true],
+  ] as const)(
+    "init hook trust: %s",
+    (_label, projectTrusted, runtimeConfig, dirTrusted, expected) => {
+      const config = configWithProjects(
+        projectsWith({
+          trusted: true,
+          ...(dirTrusted ? { trustedSshDirectories: [directory] } : {}),
+        }) as Map<string, { trusted?: boolean }>
+      );
+      expect(isInitHookTrusted(config, projectTrusted, projectPath, runtimeConfig)).toBe(expected);
+    }
+  );
+
+  test("init hook trust treats a missing project flag as untrusted without reading config", () => {
+    const config = {
+      loadConfigOrDefault: () => {
+        throw new Error("config must not be read for an untrusted project");
+      },
+    };
+    expect(isInitHookTrusted(config, undefined, projectPath, sshNone)).toBe(false);
+  });
+
+  describe("child workspace and parent directory trust", () => {
+    const entry = (runtimeConfig: RuntimeConfig | undefined) => ({
+      projectPath,
+      workspace: { runtimeConfig },
+    });
+
+    test("needs the child workspace trusted", () => {
+      const projects = projectsWith({ trusted: true });
+      expect(isChildWorkspaceAndParentDirTrustedIn(projects, entry(sshWorktree), null)).toBe(true);
+      expect(isChildWorkspaceAndParentDirTrustedIn(projects, entry(sshNone), null)).toBe(false);
+      expect(
+        isChildWorkspaceAndParentDirTrustedIn(projectsWith({}), entry(sshWorktree), null)
+      ).toBe(false);
+    });
+
+    test("an untrusted SSH+None parent directory keeps project plugins off", () => {
+      const untrustedDir = projectsWith({ trusted: true });
+      expect(
+        isChildWorkspaceAndParentDirTrustedIn(untrustedDir, entry(sshWorktree), entry(sshNone))
+      ).toBe(false);
+
+      const trustedDir = projectsWith({ trusted: true, trustedSshDirectories: [directory] });
+      expect(
+        isChildWorkspaceAndParentDirTrustedIn(trustedDir, entry(sshWorktree), entry(sshNone))
+      ).toBe(true);
+    });
   });
 });

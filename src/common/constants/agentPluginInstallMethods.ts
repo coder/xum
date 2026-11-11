@@ -9,4 +9,5 @@ export const AGENT_PLUGIN_INSTALL_METHOD_LABELS: Record<AgentPluginInstallMethod
     skills: "Skills",
     "claude-marketplace": "Claude Code marketplace entry",
     "cursor-marketplace": "Cursor marketplace entry",
+    "agents-marketplace": "Agent Plugins marketplace entry",
   };

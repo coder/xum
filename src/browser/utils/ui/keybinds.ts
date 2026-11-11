@@ -853,6 +853,10 @@ export const KEYBINDS = {
    */
   RUN_LATEST_PLAN_ACTION: { key: "Enter", alt: true },
 
+  /** Answer the latest pending sandbox approval card. A chord, so no stray key approves. */
+  RUN_OUTSIDE_SANDBOX: { key: "y", code: "KeyY", ctrl: true, alt: true, shift: true },
+  DENY_OUTSIDE_SANDBOX: { key: "n", code: "KeyN", ctrl: true, alt: true, shift: true },
+
   /** Copy image to clipboard (scoped to image lightbox / image context menu) */
   IMAGE_COPY: { key: "c", ctrl: true },
 

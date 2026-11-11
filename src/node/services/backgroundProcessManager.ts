@@ -2204,6 +2204,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       monitor?: BackgroundProcessMonitorConfig;
       /** Auto-terminate after this many seconds (background processes only) */
       timeoutSecs?: number;
+      /** "off" only for a bash call the user approved to run outside the macOS agent sandbox. */
+      sandbox?: "off";
     }
   ): Promise<
     | { success: true; processId: string; outputDir: string; pid: number }
@@ -2345,6 +2347,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       env: config.env,
       pathEnv: config.pathEnv,
       recordDirClaimed: !spawnRecordsAreHostLocal(runtime),
+      sandbox: config.sandbox,
     });
 
     if (!result.success) {
@@ -3411,7 +3414,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         ),
         `echo __MUX_SPAWN_NAME_HELD__`,
       ].join("\n");
-      const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 10 });
+      // Xum's own record keeping, not agent code: outside the macOS agent sandbox.
+      const result = await execBuffered(runtime, script, {
+        cwd: "/tmp",
+        timeout: 10,
+        sandbox: "internal",
+      });
       if (result.exitCode === 0) {
         const claimed = /__MUX_SPAWN_NAME_CLAIMED__:(\d+):/.exec(result.stdout);
         if (claimed) {
@@ -3450,9 +3458,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
       const marker = `${processDir}/${RUNTIME_SPAWN_CLAIM_MARKER_FILENAME}`;
       const script = `rm -f -- ${quotePathForShell(marker)}; rmdir -- ${quotePathForShell(processDir)}`;
+      // Xum's own record keeping, not agent code: outside the macOS agent sandbox.
       await execBuffered(runtime, script, {
         cwd: "/tmp",
         timeout: 10,
+        sandbox: "internal",
       });
     } catch (error) {
       log.debug(`Keeping claimed background record ${processId}: ${getErrorMessage(error)}`);
@@ -3517,7 +3527,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         `done`,
         `if [ "$unsettled" = 1 ]; then echo __MUX_BG_REMOTE_UNSETTLED__; else echo __MUX_BG_REMOTE_CLEAR__; fi`,
       ].join("\n");
-      const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 15 });
+      // Xum's own record keeping, not agent code: outside the macOS agent sandbox.
+      const result = await execBuffered(runtime, script, {
+        cwd: "/tmp",
+        timeout: 15,
+        sandbox: "internal",
+      });
       if (result.exitCode === 0) {
         if (result.stdout.includes("__MUX_BG_REMOTE_UNREADABLE__")) {
           return Err(

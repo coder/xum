@@ -244,7 +244,8 @@ Only managed plugins run Cursor hooks. Xum runs none in these cases:
 - `XUM_DISABLE_AGENT_TOOLS`, `XUM_DISABLE_TERMINALS`, or `XUM_DISABLE_PROJECT_AUTOMATION` is set to `1`.
 
 <Warning>
-  A Cursor hook runs as your OS user on the Xum host, with no sandbox. Trust only hooks whose
+  A Cursor hook runs as your OS user on the Xum host. Only the [agent
+  sandbox](/config/agent-sandbox), when it is on, limits what it can do. Trust only hooks whose
   commands and files you have read.
 </Warning>
 
