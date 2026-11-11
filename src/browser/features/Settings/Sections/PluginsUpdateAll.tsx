@@ -27,11 +27,11 @@ export function useUpdateReviewQueue(
   items: readonly AgentPluginListItem[] | null
 ) {
   const [reviews, setReviews] = useState(initial);
+  const hasManagedCard = (review: AgentPluginUpdateReview) =>
+    items?.some((item) => item.managed && item.name === review.name);
   return {
     // mutation-equivalent: a review is an object, so ?? and || agree
-    open:
-      reviews.find((review) => items?.some((item) => item.managed && item.name === review.name)) ??
-      null,
+    open: reviews.find(hasManagedCard) ?? null,
     waiting: reviews,
     show: (shown: Reviews) => setReviews(shown),
     // By identity, not position: a palette run can replace the queue while a confirm is in
