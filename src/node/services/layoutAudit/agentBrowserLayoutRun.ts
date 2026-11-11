@@ -9,7 +9,11 @@ import {
 import { LayoutAuditPagePassSchema } from "@/common/types/artifactLayoutAudit";
 import { shellQuote } from "@/common/utils/shell";
 import { TOOL_ENV_FAILED_EXIT, toolEnvPrelude } from "@/node/services/artifactCapabilities";
-import type { FailedReason, ViewportOutcome } from "@/node/services/layoutAudit/viewportOutcome";
+import {
+  failedOutcomes,
+  type FailedReason,
+  type ViewportOutcome,
+} from "@/node/services/layoutAudit/viewportOutcome";
 import { log } from "@/node/services/log";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered, type ExecResult } from "@/node/utils/runtime/helpers";
@@ -278,8 +282,10 @@ function isArtifactPage(href: string, fileUrl: string): boolean {
   try {
     const page = new URL(href);
     const artifact = new URL(fileUrl);
+    // The host too: a file URL with an authority (a UNC share) names another machine.
     return (
       page.protocol === artifact.protocol &&
+      page.host === artifact.host &&
       decodeURIComponent(page.pathname) === decodeURIComponent(artifact.pathname)
     );
   } catch {
@@ -344,6 +350,9 @@ async function execOrFail(
 
 export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOutcome[]> {
   const remainingMs = Math.max(input.deadlineMs - Date.now(), 0);
+  // Setup used the whole budget: a launch now would hand the runtime a zero timeout, which some
+  // runtimes read as no limit, so a page that hangs could hold the publish past its budget.
+  if (remainingMs <= 0) return failedOutcomes("timeout");
   // A third of a short budget, so a test budget still leaves the run most of its time.
   const closeMs = Math.min(LAYOUT_AUDIT_CLOSE_RESERVE_MS, remainingMs / 3);
   const session = `${SESSION_PREFIX}${crypto.randomBytes(6).toString("hex")}`;
