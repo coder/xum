@@ -1,8 +1,8 @@
 import React from "react";
-import { ChevronRight } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import {
   ExpandIcon,
+  FOLDED_ROW_TEXT_CLASS,
   LoadingDots,
   ToolContainer,
   ToolIcon,
@@ -40,9 +40,7 @@ export function OperationalBundleMessage(props: OperationalBundleMessageProps): 
           aria-expanded={props.expanded}
           onClick={props.onToggle}
         >
-          <ExpandIcon expanded={props.expanded} className="text-muted shrink-0">
-            ▶
-          </ExpandIcon>
+          <ExpandIcon expanded={props.expanded} />
           <ToolIcon toolName="task_await" className="text-task-mode" />
           <span
             data-component="OperationalBundleSummary"
@@ -66,34 +64,29 @@ export function OperationalBundleMessage(props: OperationalBundleMessageProps): 
   }
 
   // Other bundles read like Claude Code / Codex / Cursor summary lines: one muted sentence in the
-  // transcript's prose font ("Explored 3 files, 2 queries"), a chevron after it, nothing else.
-  // The chevron is quiet until hover or focus, except while the row is open.
+  // prose font ("Explored 3 files, 2 searches") behind the same leading chevron every other
+  // transcript row uses. It shares the reasoning row's type, so folded work has one look.
   return (
     <div className="my-1.5 px-1">
       <button
         type="button"
         data-testid="operational-bundle"
         className={cn(
-          "group text-muted hover:text-secondary inline-flex max-w-full cursor-pointer items-center gap-1 rounded-sm text-left text-[13px] leading-5 transition-colors select-none",
+          "text-muted hover:text-foreground inline-flex max-w-full cursor-pointer items-center gap-2 rounded-sm text-left transition-colors select-none",
+          FOLDED_ROW_TEXT_CLASS,
           FOCUS_RING
         )}
         aria-expanded={props.expanded}
         onClick={props.onToggle}
       >
+        <ExpandIcon expanded={props.expanded} />
         <span className="min-w-0 truncate">{props.item.summary.title}</span>
         {isActive && <LoadingDots aria-hidden="true" />}
         {props.item.summary.details && (
-          <span className="text-danger shrink-0">· {props.item.summary.details}</span>
+          <span className="-ml-1 shrink-0">
+            · <span className="text-danger">{props.item.summary.details}</span>
+          </span>
         )}
-        <ChevronRight
-          aria-hidden="true"
-          className={cn(
-            "size-3.5 shrink-0 transition-[transform,opacity]",
-            props.expanded
-              ? "rotate-90 opacity-100"
-              : "opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100 [@media(pointer:coarse)]:opacity-100"
-          )}
-        />
       </button>
     </div>
   );

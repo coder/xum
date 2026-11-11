@@ -231,7 +231,7 @@ export const GenericToolCall: React.FC<GenericToolCallProps> = ({
   return (
     <ToolContainer expanded={shouldShowDetails}>
       <ToolHeader onClick={() => hasDetails && toggleExpanded()}>
-        {hasDetails && <ExpandIcon expanded={shouldShowDetails}>▶</ExpandIcon>}
+        {hasDetails && <ExpandIcon expanded={shouldShowDetails} />}
         {mcpServer && <McpServerBadge mcpServer={mcpServer} />}
         {TOOL_NAME_TO_ICON[toolName] && <ToolIcon toolName={toolName} />}
         {/* Display only: a plugin's stable installation ID stays in the model-facing

@@ -99,7 +99,7 @@ export const DesktopScreenshotToolCall: React.FC<DesktopScreenshotToolCallProps>
   return (
     <ToolContainer expanded={shouldShowDetails}>
       <ToolHeader onClick={() => hasDetails && toggleExpanded()}>
-        {hasDetails && <ExpandIcon expanded={shouldShowDetails}>▶</ExpandIcon>}
+        {hasDetails && <ExpandIcon expanded={shouldShowDetails} />}
         <ToolIcon toolName="desktop_screenshot" />
         <ToolName>Desktop Screenshot</ToolName>
         {screenshotDimensions && (

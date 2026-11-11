@@ -27,14 +27,14 @@ describe("getHiddenNestedCallCount", () => {
 });
 
 describe("resolveCodeExecutionViewMode", () => {
-  test("collapses to the header immediately for successful completed executions with no nested tools", () => {
+  test("uses the code view immediately for successful completed executions with no nested tools", () => {
     expect(
       resolveCodeExecutionViewMode("tools", {
         isComplete: true,
         hasToolCalls: false,
-        noToolCallsDefaultView: "header",
+        noToolCallsDefaultView: "code",
       })
-    ).toBe("header");
+    ).toBe("code");
   });
 
   test("uses the result view immediately for failed completed executions with no nested tools", () => {
@@ -52,14 +52,14 @@ describe("resolveCodeExecutionViewMode", () => {
       resolveCodeExecutionViewMode("tools", {
         isComplete: true,
         hasToolCalls: true,
-        noToolCallsDefaultView: "header",
+        noToolCallsDefaultView: "code",
       })
     ).toBe("tools");
     expect(
       resolveCodeExecutionViewMode("tools", {
         isComplete: false,
         hasToolCalls: false,
-        noToolCallsDefaultView: "header",
+        noToolCallsDefaultView: "code",
       })
     ).toBe("tools");
   });

@@ -271,7 +271,7 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
           onClick={toggleExpanded}
           className="hover:text-text flex flex-1 cursor-pointer items-center gap-2"
         >
-          <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+          <ExpandIcon expanded={expanded} />
           <ToolIcon toolName={toolName} />
           <div className="text-text flex max-w-96 min-w-0 items-center gap-1.5">
             <FileIcon filePath={filePath} className="text-[15px] leading-none" />

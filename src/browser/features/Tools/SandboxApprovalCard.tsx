@@ -167,7 +167,7 @@ export function SandboxApprovalCard(props: SandboxApprovalCardProps) {
   useSandboxApprovalShortcuts(props.approval.workspaceId, props.isLatest, answer);
 
   return (
-    <ToolContainer expanded className="border-warning/40 bg-warning-overlay border">
+    <ToolContainer expanded className="border-warning/40 bg-warning-overlay border px-3 py-2">
       <div className="flex min-w-0 items-center gap-2">
         <ToolIcon toolName="bash" />
         <span className="text-text font-monospace min-w-0 flex-1 truncate">

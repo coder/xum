@@ -49,7 +49,7 @@ export function AskUserQuestionHeader(props: {
 }): JSX.Element {
   return (
     <ToolHeader onClick={props.onToggle}>
-      <ExpandIcon expanded={props.expanded}>▶</ExpandIcon>
+      <ExpandIcon expanded={props.expanded} />
       <ToolIcon toolName="ask_user_question" />
       <div className="flex min-w-0 flex-1 flex-col">
         <ToolName>ask_user_question</ToolName>
@@ -284,7 +284,9 @@ function QuestionBody(props: {
         </div>
       </div>
 
-      <div className="-mx-2 flex flex-col gap-0.5">
+      {/* The option rows' hover fill may bleed into the card's gutter, but no further: the
+          gutter is ToolContainer's 4px, and anything wider scrolls the dock sideways. */}
+      <div className="-mx-1 flex flex-col gap-0.5">
         {options.map((opt) => (
           <OptionRow
             key={opt.label}

@@ -1,10 +1,9 @@
-/** "header" shows only the one-line header: the succinct default for a run with no nested calls. */
-export type CodeExecutionViewMode = "tools" | "result" | "code" | "console" | "header";
+export type CodeExecutionViewMode = "tools" | "result" | "code" | "console";
 
 interface ResolveCodeExecutionViewModeOptions {
   isComplete: boolean;
   hasToolCalls: boolean;
-  noToolCallsDefaultView: Extract<CodeExecutionViewMode, "result" | "header">;
+  noToolCallsDefaultView: Extract<CodeExecutionViewMode, "result" | "code">;
 }
 
 /**

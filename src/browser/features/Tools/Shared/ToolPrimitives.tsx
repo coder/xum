@@ -12,6 +12,7 @@ import {
   BookOpen,
   Braces,
   Brain,
+  ChevronRight,
   CircleCheck,
   Cpu,
   Database,
@@ -56,17 +57,37 @@ interface ToolContainerProps extends React.HTMLAttributes<HTMLDivElement> {
   expanded: boolean;
 }
 
-export const ToolContainer: React.FC<ToolContainerProps> = ({ expanded, className, ...props }) => (
+/**
+ * Tool rows share the prose column's 4px gutter, so a row's chevron sits on the same left edge
+ * as the text around it. Padding is constant: opening a row must not move its header.
+ */
+export const ToolContainer: React.FC<ToolContainerProps> = ({
+  expanded: _expanded,
+  className,
+  ...props
+}) => (
   <div
     className={cn(
-      "my-2 rounded font-mono text-[11px] transition-all duration-200",
+      "my-2 rounded px-1 py-1 font-monospace text-[11px]",
       "[container-type:inline-size]",
-      expanded ? "py-2 px-3" : "py-1 px-3",
       className
     )}
     {...props}
   />
 );
+
+/**
+ * The rail that children of an opened row hang from (members of a summary row, calls made by a
+ * script). It sits under the centre of the parent's 12px chevron: 4px gutter + 6px.
+ */
+export const TOOL_RAIL_CLASS = "ml-[9px] border-l border-foreground/15 pl-[10px]";
+
+/**
+ * Type for a one-line stand-in for folded work (a summary row, a reasoning row): the prose font,
+ * one step below prose. Transcript text then has three sizes only: 14px prose, 12px folded
+ * work, 11px mono tool rows.
+ */
+export const FOLDED_ROW_TEXT_CLASS = "font-primary text-[12px] leading-[18px]";
 
 export const ToolChrome: React.FC<React.HTMLAttributes<HTMLDivElement>> = ({
   className,
@@ -87,19 +108,25 @@ export const ToolHeader: React.FC<React.HTMLAttributes<HTMLDivElement>> = ({
   />
 );
 
-interface ExpandIconProps extends React.HTMLAttributes<HTMLSpanElement> {
+interface ExpandIconProps extends Omit<React.HTMLAttributes<HTMLSpanElement>, "children"> {
   expanded: boolean;
 }
 
+/**
+ * The one disclosure mark for transcript rows: a leading chevron that turns down when open.
+ * An SVG, not a text glyph, so it does not change shape (or become an emoji) with the font.
+ */
 export const ExpandIcon: React.FC<ExpandIconProps> = ({ expanded, className, ...props }) => (
   <span
-    className={cn(
-      "inline-block transition-transform duration-200 text-[10px]",
-      expanded ? "rotate-90" : "rotate-0",
-      className
-    )}
+    data-expand-icon=""
+    className={cn("text-muted inline-flex shrink-0 items-center justify-center", className)}
     {...props}
-  />
+  >
+    <ChevronRight
+      aria-hidden="true"
+      className={cn("size-3 transition-transform duration-200", expanded && "rotate-90")}
+    />
+  </span>
 );
 
 export const ToolName: React.FC<React.HTMLAttributes<HTMLSpanElement>> = ({
@@ -114,7 +141,8 @@ interface StatusIndicatorProps extends React.HTMLAttributes<HTMLSpanElement> {
 const getStatusColor = (status: string) => {
   switch (status) {
     case "executing":
-      return "text-pending";
+      // Running is shown by the dots, not by colour: colour is kept for outcomes.
+      return "text-muted";
     case "completed":
       return "text-success-text";
     case "failed":
@@ -138,7 +166,10 @@ export const StatusIndicator: React.FC<StatusIndicatorProps> = ({
 }) => (
   <span
     className={cn(
-      "text-[10px] ml-auto opacity-80 whitespace-nowrap shrink-0",
+      "text-[11px] whitespace-nowrap shrink-0",
+      // An outcome sits at the row's right edge; the running dots stay next to the label they
+      // describe instead of drifting across the row.
+      status !== "executing" && "ml-auto",
       "[&_.status-text]:inline [@container(max-width:350px)]:[&_.status-text]:hidden",
       getStatusColor(status),
       className
@@ -351,26 +382,6 @@ export const ErrorBox: React.FC<ErrorBoxProps> = ({ className, ...props }) => (
     )}
     {...props}
   />
-);
-
-/**
- * Badge for displaying exit codes or process status
- */
-interface ExitCodeBadgeProps {
-  exitCode: number;
-  className?: string;
-}
-
-export const ExitCodeBadge: React.FC<ExitCodeBadgeProps> = ({ exitCode, className }) => (
-  <span
-    className={cn(
-      "inline-block shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
-      exitCode === 0 ? "bg-success text-on-success" : "bg-danger text-on-danger",
-      className
-    )}
-  >
-    {exitCode}
-  </span>
 );
 
 /**

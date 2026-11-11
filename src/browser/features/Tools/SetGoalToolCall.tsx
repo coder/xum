@@ -60,7 +60,7 @@ export const SetGoalToolCall: React.FC<SetGoalToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="set_goal" />
         <span className="text-secondary font-medium whitespace-nowrap">Set goal</span>
         {goal && <GoalStatusBadge status={goal.status} />}

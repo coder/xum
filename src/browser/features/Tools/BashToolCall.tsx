@@ -1,5 +1,5 @@
 import React, { useLayoutEffect, useRef, useState } from "react";
-import { FileText, Info, Layers } from "lucide-react";
+import { FileText, Info, Layers, X } from "lucide-react";
 import type { BashToolArgs, BashToolResult } from "@/common/types/tools";
 import { BASH_DEFAULT_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 import {
@@ -13,7 +13,6 @@ import {
   DetailContent,
   ToolIcon,
   ErrorBox,
-  ExitCodeBadge,
 } from "./Shared/ToolPrimitives";
 import {
   useToolExpansion,
@@ -190,7 +189,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="bash" />
         {bashCollapsedSummary.kind === "intent-command" ? (
           <span className="flex min-w-0 flex-1 flex-col leading-tight">
@@ -272,14 +271,19 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             {!result && <ElapsedTimeDisplay startedAt={startedAt} isActive={isPending} />}
           </span>
         )}
-        {/* A zero exit is the expected outcome; only a non-zero code earns a badge. Kernel-mode
-            nested reloads reconstruct partial results without exitCode, so check the type. */}
-        {!isBackground && typeof result?.exitCode === "number" && result.exitCode !== 0 && (
-          <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />
-        )}
         <SandboxDenialBadge summary={sandboxDenialSummary} />
         <StatusIndicator status={effectiveStatus}>
-          {getStatusDisplay(effectiveStatus)}
+          {/* A failed command says why once, in the status slot: "exit 1" replaces the generic
+              "failed" and the separate exit-code pill. A zero exit shows nothing at all.
+              Kernel-mode nested reloads can lack exitCode, so check the type. */}
+          {effectiveStatus === "failed" && typeof result?.exitCode === "number" ? (
+            <>
+              <X aria-hidden="true" className="mr-1 inline-block h-3 w-3 align-[-2px]" />
+              <span className="status-text">exit {result.exitCode}</span>
+            </>
+          ) : (
+            getStatusDisplay(effectiveStatus)
+          )}
         </StatusIndicator>
         {/* Show "Background" button when bash is executing and can be sent to background.
             Use invisible when executing but not yet confirmed as foreground to avoid layout flash. */}
@@ -295,7 +299,8 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
                 }}
                 disabled={!canSendToBackground}
                 className={cn(
-                  "ml-2 flex cursor-pointer items-center gap-1 rounded p-1 text-[10px] font-medium transition-colors",
+                  // The running dots sit by the command, so this action takes the right edge.
+                  "ml-auto flex cursor-pointer items-center gap-1 rounded p-1 text-[10px] font-medium transition-colors",
                   "bg-[var(--color-pending)]/20 text-[var(--color-pending)]",
                   "hover:bg-[var(--color-pending)]/30",
                   "disabled:pointer-events-none disabled:invisible"

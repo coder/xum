@@ -447,7 +447,7 @@ export const WorkspaceLifecycleToolCall: React.FC<WorkspaceLifecycleToolCallProp
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="task_workspace_lifecycle" />
         {/* Verb truncates as a last resort so the header never overflows; the count is
             hidden on narrow containers (the badge already conveys it there), mirroring how

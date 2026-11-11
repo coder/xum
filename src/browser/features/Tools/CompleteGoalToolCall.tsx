@@ -132,7 +132,7 @@ export const CompleteGoalToolCall: React.FC<CompleteGoalToolCallProps> = ({
       className={succeeded ? "border-success/40 bg-success/5 @container border-l-2" : "@container"}
     >
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <Tooltip>
           <TooltipTrigger asChild>
             <span className={iconClassName}>

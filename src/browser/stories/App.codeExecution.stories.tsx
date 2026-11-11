@@ -97,7 +97,7 @@ export const NestedTools: AppStory = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     const toggle = await canvas.findByRole("button", { name: "Message to Reviewer" });
-    const frame = canvas.getByRole("group", { name: "Code Execution" });
+    const frame = canvas.getByRole("group", { name: "Script" });
     const header = frame.firstElementChild!;
     const tools = within(frame).getByTestId("nested-tool-calls");
     await expect(tools.children).toHaveLength(3);
@@ -138,7 +138,7 @@ export const NestedToolsPhone: AppStory = {
   parameters: { pixel: PIXEL_DISABLED },
   play: async (context) => {
     await NestedTools.play?.(context);
-    const frame = within(context.canvasElement).getByRole("group", { name: "Code Execution" });
+    const frame = within(context.canvasElement).getByRole("group", { name: "Script" });
     await expect(frame.getBoundingClientRect().width).toBeLessThan(390);
   },
 };
@@ -211,9 +211,9 @@ function setupSequenceStory() {
 }
 
 /**
- * A settled run of code executions folds into one summary row (normal density); expanding it
- * shows each execution as a one-line header over its calls, and a long run shows only its
- * latest calls until asked for the rest.
+ * A settled run of scripts folds into one summary row (normal density). Opening it shows each
+ * script as one line; opening a script shows its calls, and a long script shows only its latest
+ * calls until asked for the rest.
  */
 export const ConsecutiveRuns: AppStory = {
   render: () => <AppWithMocks setup={setupSequenceStory} />,
@@ -223,17 +223,21 @@ export const ConsecutiveRuns: AppStory = {
     const canvas = within(canvasElement);
     const bundle = await canvas.findByRole("button", { name: /Ran 3 scripts/ });
     await expect(bundle).toHaveAttribute("aria-expanded", "false");
-    await expect(canvas.queryAllByRole("group", { name: "Code Execution" })).toHaveLength(0);
+    await expect(canvas.queryAllByRole("group", { name: "Script" })).toHaveLength(0);
 
     await userEvent.click(bundle);
-    const runs = await canvas.findAllByRole("group", { name: "Code Execution" });
+    const runs = await canvas.findAllByRole("group", { name: "Script" });
     await expect(runs).toHaveLength(3);
 
-    // A run without nested calls stays a single header line that previews its first statement.
-    await expect(within(runs[1]).queryByTestId("nested-tool-calls")).toBeNull();
+    // One level per click: opening the summary shows three one-line scripts, not their calls.
+    for (const run of runs) {
+      await expect(within(run).queryByTestId("nested-tool-calls")).toBeNull();
+    }
+    // A script that made no calls previews its first statement in the header.
     await expect(runs[1]).toHaveTextContent("const counts = new Map();");
 
     const longRun = within(runs[2]);
+    await userEvent.click(longRun.getByText("Script"));
     await expect(longRun.getByTestId("nested-tool-calls").children).toHaveLength(4);
     await userEvent.click(longRun.getByRole("button", { name: "Show 3 earlier calls" }));
     await expect(longRun.getByTestId("nested-tool-calls").children).toHaveLength(7);
@@ -251,7 +255,7 @@ export const ConsecutiveRunsPhone: AppStory = {
   play: async (context) => {
     await ConsecutiveRuns.play?.(context);
     for (const run of within(context.canvasElement).getAllByRole("group", {
-      name: "Code Execution",
+      name: "Script",
     })) {
       await expect(run.scrollWidth).toBeLessThanOrEqual(run.clientWidth);
     }

@@ -129,7 +129,7 @@ describe("NestedToolRenderer", () => {
     expect(queryByText(/—/)).toBeNull();
   });
 
-  test("collapsed bash rows show an exit-code badge only for a non-zero exit", () => {
+  test("collapsed bash rows name the exit code only when it is non-zero", () => {
     const renderBash = (exitCode: number) =>
       render(
         <Providers>
@@ -148,7 +148,7 @@ describe("NestedToolRenderer", () => {
     success.unmount();
 
     const failure = renderBash(2);
-    expect(failure.getByText("2")).toBeDefined();
+    expect(failure.getByText("exit 2")).toBeDefined();
   });
 
   test("passes workspace identity to nested workflow components", async () => {

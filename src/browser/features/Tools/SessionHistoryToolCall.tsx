@@ -517,7 +517,7 @@ const RawToggle: React.FC<{ args: SessionHistoryToolArgs; result: unknown }> = (
         onClick={() => setOpen((value) => !value)}
         className="text-muted hover:text-foreground flex cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-[10px]"
       >
-        <ExpandIcon expanded={open}>▶</ExpandIcon>
+        <ExpandIcon expanded={open} />
         raw input / output
       </button>
       {open && (
@@ -640,7 +640,7 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded} className={wideCount ? "flex-wrap" : undefined}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="session_history" />
         <span className="text-secondary shrink-0 font-medium whitespace-nowrap">
           {ACTION_VERBS[args.action]}

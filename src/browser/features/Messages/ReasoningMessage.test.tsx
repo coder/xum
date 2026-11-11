@@ -139,10 +139,9 @@ describe("ReasoningMessage", () => {
     });
     const view = render(<ReasoningMessage message={streamingMessage} />);
 
-    // The accessible activity label omits its own dots while the separate
-    // collapsed-content marker supplies the one visible ellipsis.
-    expect(view.container.querySelector(".shimmer-text-base")?.textContent).toBe("Thinking");
-    expect(view.getByTestId("reasoning-ellipsis").textContent).toBe("...");
+    // The activity label carries the one ellipsis; there is no second truncation marker.
+    expect(view.container.querySelector(".shimmer-text-base")?.textContent).toBe("Thinking…");
+    expect(view.queryByTestId("reasoning-ellipsis")).toBeNull();
     expect(view.container.querySelector(".shimmer-text-sweep")?.getAttribute("aria-hidden")).toBe(
       "true"
     );

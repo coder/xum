@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { WorkBundleMessage } from "@/browser/features/Messages/WorkBundleMessage";
 import { OperationalBundleMessage } from "@/browser/features/Messages/OperationalBundleMessage";
+import { TOOL_RAIL_CLASS } from "@/browser/features/Tools/Shared/ToolPrimitives";
 import {
   computeOperationalBundleInfos,
   computeWorkBundleInfos,
@@ -278,11 +279,13 @@ export function TranscriptBundleRows(props: {
         {renderMessageAfterOperationalBundle &&
           renderMessageAtIndex(msg, index, {
             key: `${workspaceId}:${msg.id}:message`,
-            // Open bundle members hang off a thin rail under the summary line, like the calls
-            // under a code execution header.
-            className: operationalBundle
-              ? "ml-[5px] border-l border-foreground/15 pl-2"
-              : undefined,
+            // Open bundle members hang off the shared rail under the summary line's chevron,
+            // like the calls under a script header.
+            // `flow-root` keeps each row's 8px margins inside its rail segment, so the rail is
+            // one unbroken line. Neighbouring segments' negative margins collapse to one, so
+            // `-my-3` overlaps them by 12px: the 4px left between rows is the gap the calls
+            // under a script have, giving every opened list the same pitch.
+            className: operationalBundle ? `${TOOL_RAIL_CLASS} flow-root -my-3` : undefined,
           })}
       </React.Fragment>
     );

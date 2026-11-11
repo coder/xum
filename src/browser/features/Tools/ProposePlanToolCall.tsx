@@ -1043,7 +1043,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     <>
       <ToolContainer expanded={expanded}>
         <ToolHeader onClick={toggleExpanded}>
-          <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+          <ExpandIcon expanded={expanded} />
           <ToolName>propose_plan</ToolName>
           <StatusIndicator status={status}>{statusDisplay}</StatusIndicator>
         </ToolHeader>

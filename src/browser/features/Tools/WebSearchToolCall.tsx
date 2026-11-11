@@ -72,13 +72,13 @@ export const WebSearchToolCall: React.FC<WebSearchToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="web_search" />
         <div className="text-text flex max-w-96 min-w-0 items-center gap-1.5">
-          <span className="font-monospace truncate">{query ?? "searching..."}</span>
+          <span className="font-monospace truncate">{query ?? "Searching…"}</span>
         </div>
         {result !== undefined && resultCount > 0 && (
-          <span className="text-secondary ml-2 text-[10px] whitespace-nowrap">
+          <span className="text-muted whitespace-nowrap">
             {resultCount} result{resultCount !== 1 ? "s" : ""}
           </span>
         )}

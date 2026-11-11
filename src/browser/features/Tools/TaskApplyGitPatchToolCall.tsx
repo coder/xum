@@ -371,7 +371,7 @@ export const TaskApplyGitPatchToolCall: React.FC<TaskApplyGitPatchToolCallProps>
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="task_apply_git_patch" />
         <ToolName>Apply patch</ToolName>
         <span className="text-muted ml-1 max-w-40 truncate text-[10px]">{taskId}</span>

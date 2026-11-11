@@ -58,13 +58,15 @@ export const TodoWriteWithLongTodos: Story = {
     const canvas = within(canvasElement);
 
     if (!canvas.queryByText(/Create British-themed layout \(HTML\)/)) {
-      await waitFor(() => {
-        if (canvas.getAllByText("▶").length === 0) {
+      const expandIcon = await waitFor(() => {
+        const icon = canvasElement.querySelector("[data-expand-icon]");
+        if (!icon) {
           throw new Error("Tool expand icon not found");
         }
+        return icon;
       });
 
-      await userEvent.click(canvas.getAllByText("▶")[0]);
+      await userEvent.click(expandIcon);
     }
 
     const firstTodo = await canvas.findByText(/Create British-themed layout \(HTML\)/);

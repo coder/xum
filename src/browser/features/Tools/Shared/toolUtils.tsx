@@ -100,9 +100,11 @@ export function useAutoCollapsingToolExpansion(
 export function getStatusDisplay(status: ToolStatus): React.ReactNode {
   switch (status) {
     case "executing":
+      // Dots only: the motion already says "running", and the word repeated it.
       return (
         <>
-          <LoadingDots /> <span className="status-text">executing</span>
+          <LoadingDots aria-hidden="true" />
+          <span className="status-text sr-only">executing</span>
         </>
       );
     case "completed":

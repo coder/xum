@@ -534,8 +534,8 @@ describe("task_await poll grouping", () => {
     expect(infos[0]).toMatchObject({
       defaultExpanded: true,
       summary: {
-        title: "Task wait needs attention",
-        activeTitle: "Task wait needs attention",
+        title: "Task wait failed",
+        activeTitle: "Task wait failed",
         details: "2 checks",
         tone: "danger",
       },
@@ -559,7 +559,7 @@ describe("task_await poll grouping", () => {
 
     expect(infos[0]).toMatchObject({
       defaultExpanded: true,
-      summary: { title: "Task wait needs attention", tone: "danger" },
+      summary: { title: "Task wait failed", tone: "danger" },
     });
   });
 
@@ -857,7 +857,7 @@ describe("operational bundle coalescing", () => {
         { message: partialRead, originalIndex: 4 },
       ],
       summary: {
-        title: "Searched 1 query, ran 1 command, read 3 files",
+        title: "Ran 1 search and 1 command, read 3 files",
         details: "2 failed",
       },
     });
@@ -927,7 +927,7 @@ describe("operational bundle coalescing", () => {
     );
     expect(failed[0]).toMatchObject({
       defaultExpanded: true,
-      summary: { title: "Task wait needs attention", tone: "danger" },
+      summary: { title: "Task wait failed", tone: "danger" },
     });
   });
 
@@ -980,13 +980,13 @@ describe("operational bundle summary", () => {
       tool({ id: "read-2", toolName: "file_read" }),
       tool({ id: "search-1", toolName: "web_search", result: [{ title: "one" }] }),
     ]);
-    expect(explored.title).toBe("Explored 2 files, 1 query");
+    expect(explored.title).toBe("Explored 2 files, 1 search");
 
     const searches = summarizeOperationalBundle([
       tool({ id: "search-2", toolName: "web_search", result: [{ title: "two" }] }),
       tool({ id: "search-3", toolName: "web_search", result: [{ title: "three" }] }),
     ]);
-    expect(searches.title).toBe("Searched 2 queries");
+    expect(searches.title).toBe("Ran 2 searches");
   });
 
   test("reads as a thought when the bundle only reasoned", () => {
@@ -1004,7 +1004,7 @@ describe("operational bundle summary", () => {
       tool({ id: "search-1", toolName: "web_search", result: [{ title: "one" }] }),
     ]);
 
-    expect(summary.title).toBe("Searched 2 queries");
+    expect(summary.title).toBe("Ran 2 searches");
   });
 
   test("all-miss completed search bundle says it found nothing", () => {
@@ -1017,7 +1017,7 @@ describe("operational bundle summary", () => {
         result: { type: "json", value: { sources: [] } },
       }),
     ]);
-    expect(allMiss.title).toBe("Searched 2 queries, no results");
+    expect(allMiss.title).toBe("Ran 2 searches, no results");
   });
 
   test("failed searches report the failure, not missing results", () => {
@@ -1029,7 +1029,7 @@ describe("operational bundle summary", () => {
         result: { error: "provider unavailable" },
       }),
     ]);
-    expect(failedSearch.title).toBe("Searched 1 query");
+    expect(failedSearch.title).toBe("Ran 1 search");
     expect(failedSearch.details).toBe("1 failed");
   });
 });

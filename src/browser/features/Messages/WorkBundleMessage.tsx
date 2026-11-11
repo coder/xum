@@ -54,9 +54,7 @@ export function WorkBundleMessage(props: WorkBundleMessageProps): React.ReactEle
       onClick={props.onToggle}
     >
       <span className="counter-nums min-w-0 truncate">{label}</span>
-      <ExpandIcon expanded={props.expanded} className="text-muted shrink-0">
-        ▶
-      </ExpandIcon>
+      <ExpandIcon expanded={props.expanded} className="text-muted shrink-0" />
     </button>
   );
 }

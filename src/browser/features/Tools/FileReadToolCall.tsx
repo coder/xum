@@ -1,5 +1,4 @@
 import React from "react";
-import { FileIcon } from "@/browser/components/FileIcon/FileIcon";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
 import type { FileReadToolArgs, FileReadToolResult } from "@/common/types/tools";
 import {
@@ -78,20 +77,14 @@ export const FileReadToolCall: React.FC<FileReadToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="file_read" />
         <div className="text-text flex max-w-96 min-w-0 items-center gap-1.5">
-          <FileIcon filePath={filePath} className="text-[15px] leading-none" />
+          {/* The collapsed row is the path and nothing else: the tool icon already says "read",
+              and how much was read is detail (see the expanded block). */}
           <span className="font-monospace truncate">{filePath}</span>
           <OpenAsArtifactButton workspaceId={workspaceId} path={filePath} relativeTo="tool-cwd" />
         </div>
-        {result && result.success && parsedContent && (
-          <span className="text-secondary ml-2 text-[10px] whitespace-nowrap">
-            <span className="hidden @sm:inline">read </span>
-            {formatBytes(parsedContent.actualBytes)}
-            <span className="hidden @lg:inline"> of {formatBytes(result.file_size)}</span>
-          </span>
-        )}
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
       </ToolHeader>
 
@@ -113,6 +106,16 @@ export const FileReadToolCall: React.FC<FileReadToolCallProps> = ({
                 <div className="flex gap-1.5">
                   <span className="text-secondary font-medium">Limit:</span>
                   <span className="text-text font-monospace break-all">{args.limit} lines</span>
+                </div>
+              )}
+              {/* History replays can carry results without a numeric file_size. */}
+              {result?.success && parsedContent && (
+                <div className="flex gap-1.5">
+                  <span className="text-secondary font-medium">Read:</span>
+                  <span className="text-text font-monospace">
+                    {formatBytes(parsedContent.actualBytes)}
+                    {Number.isFinite(result.file_size) && ` of ${formatBytes(result.file_size)}`}
+                  </span>
                 </div>
               )}
             </div>

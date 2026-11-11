@@ -70,7 +70,8 @@ type OperationalBundleCategory =
   | "shell"
   | "skill"
   | "task"
-  | "tool";
+  | "tool"
+  | "wait";
 
 const FILE_READ_TOOL_NAMES = new Set<string>(["file_read"]);
 
@@ -83,7 +84,7 @@ const FILE_EDIT_TOOL_NAMES = new Set<string>([
 ]);
 
 /**
- * Summary-row copy, phrased like Claude Code / Codex / Cursor ("Explored 3 files, 2 queries",
+ * Summary-row copy, phrased like Claude Code / Codex / Cursor ("Explored 3 files, 2 searches",
  * "Ran 2 commands, read 1 file") rather than tallying "operations". `explores` marks read-only
  * lookups: a run made only of those reads as "Explored ...".
  */
@@ -92,7 +93,7 @@ const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
   { verb: string; noun: string; nounPlural: string; explores: boolean }
 > = {
   read: { verb: "Read", noun: "file", nounPlural: "files", explores: true },
-  search: { verb: "Searched", noun: "query", nounPlural: "queries", explores: true },
+  search: { verb: "Ran", noun: "search", nounPlural: "searches", explores: true },
   fetch: { verb: "Fetched", noun: "page", nounPlural: "pages", explores: true },
   skill: { verb: "Read", noun: "skill", nounPlural: "skills", explores: true },
   edit: { verb: "Edited", noun: "file", nounPlural: "files", explores: false },
@@ -100,6 +101,8 @@ const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
   code: { verb: "Ran", noun: "script", nounPlural: "scripts", explores: false },
   question: { verb: "Asked", noun: "question", nounPlural: "questions", explores: false },
   task: { verb: "Ran", noun: "agent task", nounPlural: "agent tasks", explores: false },
+  // A task_await inside a mixed run, worded like the all-wait row ("Checked task status 2 times").
+  wait: { verb: "Checked task status", noun: "time", nounPlural: "times", explores: false },
   tool: { verb: "Used", noun: "tool", nounPlural: "tools", explores: false },
 };
 
@@ -310,6 +313,11 @@ const ROUTINE_TOOL_NAMES = new Set<string>([
   "web_fetch",
   "web_search",
 ]);
+
+/** Whether a call to this tool is routine enough to fold out of sight (see ROUTINE_TOOL_NAMES). */
+export function isRoutineToolName(toolName: string): boolean {
+  return ROUTINE_TOOL_NAMES.has(toolName);
+}
 
 /** Fewest routine tool calls that fold into a summary row; one call is already one row. */
 const MIN_ROUTINE_RUN_TOOLS = 2;
@@ -654,8 +662,8 @@ export function summarizeOperationalBundle(
       messages.some(hasTaskAwaitCallInterruption) || messages.some(hasTaskAwaitResultInterruption);
     if (hasFailure || hasInterruption) {
       return {
-        title: hasFailure ? "Task wait needs attention" : "Task wait interrupted",
-        activeTitle: hasFailure ? "Task wait needs attention" : "Task wait interrupted",
+        title: hasFailure ? "Task wait failed" : "Task wait interrupted",
+        activeTitle: hasFailure ? "Task wait failed" : "Task wait interrupted",
         details: pollCount === 1 ? "" : `${pollCount} checks`,
         tone: hasFailure ? "danger" : "interrupted",
       };
@@ -792,7 +800,7 @@ function isActiveOperationalMessage(message: OperationalBundleMemberMessage): bo
 }
 
 /**
- * One sentence for the whole run, in order of first appearance: "Explored 3 files, 2 queries" when
+ * One sentence for the whole run, in order of first appearance: "Explored 3 files, 2 searches" when
  * every call was a read-only lookup of more than one kind, else verb clauses ("Ran 2 commands, read 1 file"). Reasoning
  * rows are folded in silently; a reasoning-only bundle reads "Thought".
  */
@@ -871,8 +879,11 @@ function getOperationalBundleCategory(
   if (message.toolName === "ask_user_question") {
     return "question";
   }
-  if (message.toolName === "task" || message.toolName === "task_await") {
+  if (message.toolName === "task") {
     return "task";
+  }
+  if (message.toolName === "task_await") {
+    return "wait";
   }
   if (message.toolName === "code_execution") {
     return "code";

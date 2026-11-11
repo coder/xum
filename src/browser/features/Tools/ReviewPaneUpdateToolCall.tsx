@@ -55,7 +55,7 @@ export const ReviewPaneUpdateToolCall: React.FC<ReviewPaneUpdateToolCallProps> =
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="review_pane_update" />
         <span className="text-muted-foreground flex min-w-0 flex-1 items-center gap-1 italic">
           <span className="truncate">{summary}</span>
