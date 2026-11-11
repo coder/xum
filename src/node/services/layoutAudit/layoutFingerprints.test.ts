@@ -142,6 +142,21 @@ describe("startLayoutAudit", () => {
     expect(memoryOf(dir, "filler0.html")).toEqual({});
   });
 
+  test("reading a path's memory does not save it from eviction, committing it again does", () => {
+    const dir = freshDir();
+    const commitAs = (relPath: string) => finish(startLayoutAudit(dir, relPath), remember(relPath));
+    for (let index = 0; index < LAYOUT_MEMORY_MAX_PATHS; index++) commitAs(`p${index}.html`);
+    // A read of the oldest path leaves it the oldest: the next commit evicts it.
+    expect(memoryOf(dir, "p0.html")).toEqual(remember("p0.html"));
+    commitAs("first-newcomer.html");
+    expect(memoryOf(dir, "p0.html")).toEqual({});
+    // A commit of the now oldest path makes it the newest: the next commit evicts the one after.
+    commitAs("p1.html");
+    commitAs("second-newcomer.html");
+    expect(memoryOf(dir, "p1.html")).toEqual(remember("p1.html"));
+    expect(memoryOf(dir, "p2.html")).toEqual({});
+  });
+
   test("an audit that remembers nothing does not move its path in the recency order", () => {
     const dir = freshDir();
     for (let index = 0; index < LAYOUT_MEMORY_MAX_PATHS; index++) {

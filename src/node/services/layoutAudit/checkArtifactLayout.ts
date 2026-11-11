@@ -88,6 +88,10 @@ async function auditOutcomes(
     pageScript: LAYOUT_AUDIT_PAGE_SCRIPT,
     deadlineMs,
     abortSignal: input.abortSignal,
+    // The page runs under the same macOS agent sandbox as the agent's bash, which does not open
+    // Xum's session folders: read access to the artifacts folder (the page and the files it loads
+    // by relative path), nothing more. A runtime location is not on this machine.
+    sandboxReadPaths: input.location.kind === "host" ? [input.location.dir] : undefined,
   });
 }
 
