@@ -1212,7 +1212,7 @@ describe("runMemoryHarvest", () => {
     // carries the note and the truncated flag, as a cut part with kept text does. As above, the note
     // counts the characters past the cap.
     describe("a part that the cut at a JWT leaves empty", () => {
-      const blob = `eyJ${"Q".repeat(TEXT_PART_LIMIT + 600)}`; // made up, no dot: not a match
+      const blob = `eyJ${"Q".repeat(TEXT_PART_LIMIT + 597)}`; // made up, no dot: not a match
       const rowsOf = (message: MuxMessage) =>
         buildHarvestChunks([message]).flatMap(
           (chunk) =>
@@ -1223,15 +1223,20 @@ describe("runMemoryHarvest", () => {
             }>
         );
 
-      it("keeps its note when it is the message's only part", () => {
-        const rows = rowsOf(createMuxMessage("t1", "user", blob, { historySequence: 0 }));
+      // One character past the cap is the least cut there is.
+      it.each([1, 600])(
+        "keeps its note when it is the message's only part, %d characters past the cap",
+        (pastCap) => {
+          const part = blob.slice(0, TEXT_PART_LIMIT + pastCap);
+          const rows = rowsOf(createMuxMessage("t1", "user", part, { historySequence: 0 }));
 
-        expect(rows).toHaveLength(1);
-        expect(rows[0]).toMatchObject({
-          text: `[truncated ${blob.length - TEXT_PART_LIMIT} more chars for memory harvest]`,
-          truncated: true,
-        });
-      });
+          expect(rows).toHaveLength(1);
+          expect(rows[0]).toMatchObject({
+            text: `[truncated ${pastCap} more chars for memory harvest]`,
+            truncated: true,
+          });
+        }
+      );
 
       it("keeps its place among the message's parts after a prose part", () => {
         const message = createMuxMessage("t1", "user", "see the attached state blob", {
