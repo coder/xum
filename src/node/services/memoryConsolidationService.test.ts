@@ -5531,7 +5531,16 @@ describe("MemoryConsolidationService", () => {
      * next step hangs until its stream is aborted. Aborting `timeout` stands in for the run timeout
      * firing; the hanging step aborts it itself once the edit has landed.
      */
-    function hangingModel(timeout: AbortController, editFirst: boolean): MockLanguageModelV3 {
+    /**
+     * `beforeHang` runs before the call that hangs: a test that expects a run timeout throws from
+     * it when the run took none, so the run fails at once instead of hanging until the test's own
+     * timeout.
+     */
+    function hangingModel(
+      timeout: AbortController,
+      editFirst: boolean,
+      beforeHang?: () => void
+    ): MockLanguageModelV3 {
       let calls = 0;
       const usage = {
         inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
@@ -5556,6 +5565,7 @@ describe("MemoryConsolidationService", () => {
             ];
             return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
           }
+          beforeHang?.();
           return new Promise((_resolve, reject) => {
             options.abortSignal?.addEventListener("abort", () =>
               reject(new Error("stalled provider call aborted"))
@@ -5737,10 +5747,17 @@ describe("MemoryConsolidationService", () => {
 
     it("fails a run its timeout cut before any edit, and saves no record", async () => {
       const timeout = new AbortController();
-      using fixture = await createFixture({ modelFactory: () => hangingModel(timeout, false) });
+      const timeouts: number[] = [];
+      using fixture = await createFixture({
+        modelFactory: () =>
+          // No saved value: the constant. Checked before the model hangs, since without a
+          // timeout nothing would end the hung stream.
+          hangingModel(timeout, false, () =>
+            expect(timeouts).toContain(MEMORY_CONSOLIDATION_TIMEOUT_MS)
+          ),
+      });
       // Other preferences, but no memory group: the run still gets the default timeout.
       await fixture.config.updateUserPreferences([{ appearance: { vimEnabled: true } }]);
-      const timeouts: number[] = [];
       const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
         timeouts.push(ms);
         return timeout.signal;
