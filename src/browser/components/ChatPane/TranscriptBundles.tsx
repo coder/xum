@@ -10,7 +10,7 @@ import {
 import type { TranscriptDensity } from "@/common/constants/storage";
 import type { DisplayedMessage } from "@/common/types/message";
 
-// Work bundles (hyper density) and operational bundles (e.g. collapsed task_await polls),
+// Work bundles (hyper density) and operational bundles (runs of routine tool calls),
 // shared by the desktop ChatPane and the VS Code webview (#4979) so both collapse the same rows.
 
 function findTailProposePlanToolId(messages: readonly DisplayedMessage[]): string | null {
@@ -83,7 +83,9 @@ export function useTranscriptBundles(params: {
     () =>
       computeOperationalBundleInfos(messages, {
         isTurnActive,
-        taskAwaitPollsOnly: transcriptDensity !== "hyper",
+        // Normal density folds runs of routine tool calls (reads, searches, shell, code runs,
+        // task polls) into one summary row; hyper bundles every operational run.
+        scope: transcriptDensity === "hyper" ? "all" : "routine",
       }),
     [isTurnActive, messages, transcriptDensity]
   );

@@ -234,13 +234,23 @@ describe("Send dispatch modes (mock AI router)", () => {
       // The mock turn holds its tool calls until now, so the follow-up was queued mid-step.
       app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
 
-      await app.chat.expectTranscriptContains("parallel-step-a.txt");
-      await app.chat.expectTranscriptContains("parallel-step-b.txt");
       await app.chat.expectTranscriptContains(
         "Finished both sibling tool calls before continuing."
       );
       await app.chat.expectTranscriptContains(`Mock response: ${queuedText}`);
       await app.chat.expectStreamComplete();
+
+      // Normal density folds the two settled reads into one summary row; open it to see both.
+      const readsSummary = await waitFor(() => {
+        const button = Array.from(app.view.container.querySelectorAll("button")).find((element) =>
+          element.textContent?.includes("2 reads")
+        );
+        if (!button) throw new Error("Expected the two reads to fold into one summary row");
+        return button;
+      });
+      fireEvent.click(readsSummary);
+      await app.chat.expectTranscriptContains("parallel-step-a.txt");
+      await app.chat.expectTranscriptContains("parallel-step-b.txt");
     } finally {
       await app.dispose();
     }

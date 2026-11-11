@@ -49,10 +49,18 @@ export interface WorkBundleInfo {
 
 interface ComputeBundleInfosOptions {
   isTurnActive: boolean;
-  taskAwaitPollsOnly?: boolean;
+  /**
+   * "all" (hyper density): every run of reasoning and tool rows becomes a bundle.
+   * "routine" (normal density): only runs of two or more routine tool calls (reads, searches,
+   * shell commands, code execution, task polls) collapse into one summary row, the way Claude
+   * Code, Codex and Cursor fold exploration into "Explored · 3 reads" lines. Rows the user must
+   * see (edits, questions, plans, todos, attachments) stay standalone.
+   */
+  scope?: "all" | "routine";
 }
 
 type OperationalBundleCategory =
+  | "code"
   | "edit"
   | "fetch"
   | "question"
@@ -105,6 +113,11 @@ const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
     singletonTitle: "Asked 1 question",
     detailLabel: "question",
     detailLabelPlural: "questions",
+  },
+  code: {
+    singletonTitle: "Ran code",
+    detailLabel: "code run",
+    detailLabelPlural: "code runs",
   },
   task: {
     singletonTitle: "Ran 1 agent task",
@@ -240,34 +253,32 @@ export function computeOperationalBundleInfos(
   messages: DisplayedMessage[],
   options: ComputeBundleInfosOptions
 ): Array<OperationalBundleInfo | undefined> {
+  if (options.scope === "routine") {
+    return computeRoutineRunBundleInfos(messages, options);
+  }
+
   const infos = new Array<OperationalBundleInfo | undefined>(messages.length);
-  const taskAwaitPollsOnly = options.taskAwaitPollsOnly === true;
   let index = 0;
 
   while (index < messages.length) {
     const leadingReasoningStart = index;
     const leadingReasoningEntries: OperationalBundleEntry[] = [];
-    if (!taskAwaitPollsOnly) {
-      while (true) {
-        const message = messages[index];
-        if (message?.type !== "reasoning") break;
-        leadingReasoningEntries.push({ message, originalIndex: index });
-        index += 1;
-      }
+    while (true) {
+      const message = messages[index];
+      if (message?.type !== "reasoning") break;
+      leadingReasoningEntries.push({ message, originalIndex: index });
+      index += 1;
+    }
 
-      if (leadingReasoningEntries.length > 0 && messages[index]?.type === "assistant") {
-        index += 1;
-      } else if (leadingReasoningEntries.length > 0) {
-        leadingReasoningEntries.length = 0;
-        index = leadingReasoningStart;
-      }
+    if (leadingReasoningEntries.length > 0 && messages[index]?.type === "assistant") {
+      index += 1;
+    } else if (leadingReasoningEntries.length > 0) {
+      leadingReasoningEntries.length = 0;
+      index = leadingReasoningStart;
     }
 
     const firstMessage = messages[index];
-    if (
-      !isOperationalBundleMemberMessage(firstMessage) ||
-      (taskAwaitPollsOnly && !isTaskAwaitMessage(firstMessage))
-    ) {
+    if (!isOperationalBundleMemberMessage(firstMessage)) {
       index += 1;
       continue;
     }
@@ -276,46 +287,169 @@ export function computeOperationalBundleInfos(
     const entries: OperationalBundleEntry[] = [...leadingReasoningEntries];
     while (index < messages.length) {
       const candidate = messages[index];
-      if (
-        !isOperationalBundleMemberMessage(candidate) ||
-        (taskAwaitPollsOnly && !isTaskAwaitMessage(candidate))
-      ) {
+      if (!isOperationalBundleMemberMessage(candidate)) {
         break;
       }
       entries.push({ message: candidate, originalIndex: index });
       index += 1;
     }
 
-    if (taskAwaitPollsOnly && entries.length < 2) {
-      continue;
-    }
-
     const frozenEntries = Object.freeze(entries);
     const messagesInBundle = frozenEntries.map((entry) => entry.message);
     const allTaskAwaits = messagesInBundle.every(isTaskAwaitMessage);
-    const state = frozenEntries.some((entry) => isActiveOperationalMessage(entry.message))
-      ? "active"
-      : "settled";
+    const state = getBundleState(frozenEntries);
     const needsAttention = hasTaskAwaitTerminalIssue(messagesInBundle);
-    const info: OperationalBundleInfo = {
-      key: `${taskAwaitPollsOnly ? "task-await-polls" : "bundle"}:${entries[0].message.id}`,
+    assignBundleInfo(infos, {
+      key: `bundle:${entries[0].message.id}`,
       position: "head",
       headIndex,
       entries: frozenEntries,
       summary: summarizeOperationalBundle(messagesInBundle),
       state,
       defaultExpanded: needsAttention || (state === "active" && !allTaskAwaits),
-    };
-
-    for (const entry of frozenEntries) {
-      infos[entry.originalIndex] = {
-        ...info,
-        position: entry.originalIndex === headIndex ? "head" : "member",
-      };
-    }
+    });
   }
 
   return infos;
+}
+
+/**
+ * Tools whose collapsed card carries no information the user must act on or review, so a run of
+ * them can fold into one summary row. Deliberately an allowlist: an unknown or new tool keeps its
+ * own card until someone decides it is routine.
+ */
+const ROUTINE_TOOL_NAMES = new Set<string>([
+  "agent_skill_list",
+  "agent_skill_read",
+  "agent_skill_read_file",
+  "bash",
+  "bash_background_list",
+  "bash_output",
+  "code_execution",
+  "file_read",
+  "get_goal",
+  "models_list",
+  "review_pane_get",
+  "server:GOOGLE_SEARCH_WEB",
+  "session_history",
+  "task_await",
+  "tool_catalog_search",
+  "tool_search",
+  "web_fetch",
+  "web_search",
+]);
+
+/** Fewest routine tool calls that fold into a summary row; one call is already one row. */
+const MIN_ROUTINE_RUN_TOOLS = 2;
+
+function isRoutineToolMessage(
+  message: DisplayedMessage | undefined
+): message is DisplayedMessage & { type: "tool" } {
+  if (message?.type !== "tool" || !ROUTINE_TOOL_NAMES.has(message.toolName)) {
+    return false;
+  }
+  if (message.toolName !== "code_execution") {
+    return true;
+  }
+  // A code execution is only as routine as what it ran: one that edited a file or asked a
+  // question keeps its card visible. Attachments (screenshots, files) ride on its result.
+  const nestedCalls = Array.isArray(message.nestedCalls) ? message.nestedCalls : [];
+  if (nestedCalls.some((call) => !ROUTINE_TOOL_NAMES.has(call.toolName))) {
+    return false;
+  }
+  const result = unwrapJsonResult(message.result);
+  return !(
+    isPlainObject(result) &&
+    Array.isArray(result.attachments) &&
+    result.attachments.length > 0
+  );
+}
+
+function computeRoutineRunBundleInfos(
+  messages: DisplayedMessage[],
+  options: ComputeBundleInfosOptions
+): Array<OperationalBundleInfo | undefined> {
+  const infos = new Array<OperationalBundleInfo | undefined>(messages.length);
+  let index = 0;
+
+  while (index < messages.length) {
+    if (!isRoutineToolMessage(messages[index])) {
+      index += 1;
+      continue;
+    }
+
+    // Reasoning between routine calls stays inside the run (it is part of the same exploration),
+    // but reasoning after the last call is left out so the thought that leads into the next
+    // visible row (an answer, an edit) stays next to it.
+    const headIndex = index;
+    let lastToolIndex = index;
+    let toolCount = 0;
+    for (let cursor = index; cursor < messages.length; cursor++) {
+      const candidate = messages[cursor];
+      if (isRoutineToolMessage(candidate)) {
+        lastToolIndex = cursor;
+        toolCount += 1;
+        continue;
+      }
+      if (candidate.type === "reasoning" && isOperationalBundleMemberMessage(candidate)) {
+        continue;
+      }
+      break;
+    }
+    index = lastToolIndex + 1;
+
+    if (toolCount < MIN_ROUTINE_RUN_TOOLS) {
+      continue;
+    }
+
+    const entries: OperationalBundleEntry[] = [];
+    for (let entryIndex = headIndex; entryIndex <= lastToolIndex; entryIndex++) {
+      const message = messages[entryIndex];
+      if (isOperationalBundleMemberMessage(message)) {
+        entries.push({ message, originalIndex: entryIndex });
+      }
+    }
+
+    const frozenEntries = Object.freeze(entries);
+    const messagesInBundle = frozenEntries.map((entry) => entry.message);
+    const allTaskAwaits = messagesInBundle.every(isTaskAwaitMessage);
+    // The run the agent is still working in stays open so progress is visible, and it folds once
+    // the agent moves on (writes text, makes an edit) or the turn ends. Keying this on the tail
+    // rather than on per-row status keeps the run from collapsing and reopening between calls.
+    const isLiveTail =
+      options.isTurnActive &&
+      messages.slice(lastToolIndex + 1).every((message) => message.type === "reasoning");
+    assignBundleInfo(infos, {
+      key: `routine:${entries[0].message.id}`,
+      position: "head",
+      headIndex,
+      entries: frozenEntries,
+      summary: summarizeOperationalBundle(messagesInBundle),
+      state: getBundleState(frozenEntries),
+      defaultExpanded:
+        hasTaskAwaitTerminalIssue(messagesInBundle) || (isLiveTail && !allTaskAwaits),
+    });
+  }
+
+  return infos;
+}
+
+function getBundleState(
+  entries: readonly OperationalBundleEntry[]
+): OperationalBundleInfo["state"] {
+  return entries.some((entry) => isActiveOperationalMessage(entry.message)) ? "active" : "settled";
+}
+
+function assignBundleInfo(
+  infos: Array<OperationalBundleInfo | undefined>,
+  info: OperationalBundleInfo
+): void {
+  for (const entry of info.entries) {
+    infos[entry.originalIndex] = {
+      ...info,
+      position: entry.originalIndex === info.headIndex ? "head" : "member",
+    };
+  }
 }
 
 interface WorkBundleSpan {
@@ -700,13 +834,19 @@ function formatDetails(messages: OperationalBundleMemberMessage[]): string {
     counts.set(category, (counts.get(category) ?? 0) + 1);
   }
 
-  return Array.from(counts.entries())
-    .map(([category, count]) => {
-      const copy = OPERATIONAL_BUNDLE_CATEGORY_COPY[category];
-      const label = count === 1 ? copy.detailLabel : copy.detailLabelPlural;
-      return `${count.toLocaleString()} ${label}`;
-    })
-    .join(" · ");
+  const parts = Array.from(counts.entries()).map(([category, count]) => {
+    const copy = OPERATIONAL_BUNDLE_CATEGORY_COPY[category];
+    const label = count === 1 ? copy.detailLabel : copy.detailLabelPlural;
+    return `${count.toLocaleString()} ${label}`;
+  });
+  // A collapsed bundle hides each card's status, so surface failures in the summary itself.
+  const failedCount = messages.filter(
+    (message) => message.type === "tool" && message.status === "failed"
+  ).length;
+  if (failedCount > 0) {
+    parts.push(`${failedCount.toLocaleString()} failed`);
+  }
+  return parts.join(" · ");
 }
 
 function getOperationalBundleCategory(
@@ -741,6 +881,9 @@ function getOperationalBundleCategory(
   }
   if (message.toolName === "task" || message.toolName === "task_await") {
     return "task";
+  }
+  if (message.toolName === "code_execution") {
+    return "code";
   }
 
   return "tool";

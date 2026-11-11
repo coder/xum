@@ -10,6 +10,7 @@ import {
   ArrowDownUp,
   Bell,
   BookOpen,
+  Braces,
   Brain,
   CircleCheck,
   Cpu,
@@ -247,6 +248,8 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   bash_output: Wrench,
   bash_background_terminate: Square,
   bash_background_list: List,
+  // Braces read as "a block of code"; the card is a header row over the calls it made.
+  code_execution: Braces,
   workflow_run: Sparkles,
   workflow_resume: RotateCcw,
   agent_report: FileText,

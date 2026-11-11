@@ -8,9 +8,9 @@ import {
   summarizeOperationalBundle,
 } from "./transcriptRenderProjection";
 
-// ChatPane groups only task_await polls outside hyper density.
+// ChatPane groups only routine tool runs (task_await polls included) outside hyper density.
 function computeTaskAwaitPollGroupInfos(messages: DisplayedMessage[]) {
-  return computeOperationalBundleInfos(messages, { isTurnActive: false, taskAwaitPollsOnly: true });
+  return computeOperationalBundleInfos(messages, { isTurnActive: false, scope: "routine" });
 }
 
 let nextToolId = 0;
@@ -606,6 +606,114 @@ describe("task_await poll grouping", () => {
   });
 });
 
+describe("routine tool runs (normal density)", () => {
+  function routine(messages: DisplayedMessage[], isTurnActive = false) {
+    return computeOperationalBundleInfos(messages, { isTurnActive, scope: "routine" });
+  }
+
+  test("folds routine calls with interleaved reasoning but leaves trailing reasoning out", () => {
+    const read = tool({ id: "read-a", toolName: "file_read" });
+    const between = reasoning({ id: "think-between" });
+    const shell = tool({ id: "bash-a", toolName: "bash" });
+    const trailing = reasoning({ id: "think-trailing" });
+    const answer = assistant("answer-a");
+
+    const infos = routine([read, between, shell, trailing, answer]);
+
+    expect(infos[0]).toMatchObject({
+      key: "routine:read-a",
+      position: "head",
+      defaultExpanded: false,
+      summary: { details: "1 read · 1 reasoning step · 1 shell command" },
+    });
+    expect(infos[1]).toMatchObject({ key: "routine:read-a", position: "member" });
+    expect(infos[2]).toMatchObject({ key: "routine:read-a", position: "member" });
+    expect(infos[3]).toBeUndefined();
+    expect(infos[4]).toBeUndefined();
+  });
+
+  test("keeps a lone routine call and rows the user must review as standalone cards", () => {
+    const lone = routine([tool({ toolName: "file_read" }), assistant("after-lone")]);
+    expect(lone[0]).toBeUndefined();
+
+    const read = tool({ id: "read-b", toolName: "file_read" });
+    const edit = tool({ id: "edit-b", toolName: "file_edit_replace_string" });
+    const shellA = tool({ id: "bash-b1", toolName: "bash" });
+    const shellB = tool({ id: "bash-b2", toolName: "bash" });
+    const question = tool({ id: "ask-b", toolName: "ask_user_question" });
+
+    const infos = routine([read, edit, shellA, shellB, question]);
+
+    // The edit splits the run: the read alone is not worth a summary row.
+    expect(infos[0]).toBeUndefined();
+    expect(infos[1]).toBeUndefined();
+    expect(infos[2]).toMatchObject({ key: "routine:bash-b1", position: "head" });
+    expect(infos[3]).toMatchObject({ key: "routine:bash-b1", position: "member" });
+    expect(infos[4]).toBeUndefined();
+  });
+
+  test("treats code execution as routine only when everything it ran was routine", () => {
+    const readOnlyRun = tool({
+      id: "code-read",
+      toolName: "code_execution",
+      nestedCalls: [
+        { toolCallId: "n1", toolName: "file_read", input: {}, state: "output-available" },
+      ],
+    });
+    const plainRun = tool({ id: "code-plain", toolName: "code_execution" });
+    const editingRun = tool({
+      id: "code-edit",
+      toolName: "code_execution",
+      nestedCalls: [
+        {
+          toolCallId: "n2",
+          toolName: "file_edit_insert",
+          input: {},
+          state: "output-available",
+        },
+      ],
+    });
+    const attachingRun = tool({
+      id: "code-attach",
+      toolName: "code_execution",
+      result: {
+        success: true,
+        attachments: [{ type: "media", data: "x", mediaType: "image/png" }],
+      },
+    });
+
+    const infos = routine([readOnlyRun, plainRun, editingRun, attachingRun, plainRun]);
+
+    expect(infos[0]).toMatchObject({
+      key: "routine:code-read",
+      summary: { title: "Ran 2 operations", details: "2 code runs" },
+    });
+    expect(infos[1]).toMatchObject({ position: "member" });
+    expect(infos[2]).toBeUndefined();
+    expect(infos[3]).toBeUndefined();
+    expect(infos[4]).toBeUndefined();
+  });
+
+  test("keeps the live run open until the agent moves on or the turn ends", () => {
+    const first = tool({ id: "read-live-1", toolName: "file_read" });
+    const second = tool({ id: "read-live-2", toolName: "file_read" });
+    const thinking = reasoning({ id: "think-live", isStreaming: true });
+
+    // Settled calls followed only by fresh reasoning: still the run the agent is working in.
+    expect(routine([first, second, thinking], true)[0]).toMatchObject({
+      state: "settled",
+      defaultExpanded: true,
+    });
+    // Text after the run means the agent moved on, so the run folds even mid-turn.
+    expect(routine([first, second, assistant("moved-on")], true)[0]).toMatchObject({
+      defaultExpanded: false,
+    });
+    expect(routine([first, second, thinking], false)[0]).toMatchObject({
+      defaultExpanded: false,
+    });
+  });
+});
+
 describe("operational bundle coalescing", () => {
   test("groups consecutive reasoning and tool calls without mutating messages", () => {
     const first = reasoning({ id: "think-1" });
@@ -750,7 +858,7 @@ describe("operational bundle coalescing", () => {
       ],
       summary: {
         title: "Ran 5 operations",
-        details: "1 search · 1 shell command · 3 reads",
+        details: "1 search · 1 shell command · 3 reads · 2 failed",
       },
     });
     expect(infos[1]).toMatchObject({ key: "bundle:search-1", position: "member" });

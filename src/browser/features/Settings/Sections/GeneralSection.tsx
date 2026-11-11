@@ -861,8 +861,8 @@ export function GeneralSection() {
             <div className="flex-1">
               <div className="text-foreground text-sm">Transcript density</div>
               <div className="text-muted text-xs">
-                Control how much detail the transcript shows. Hyper collapses completed work into
-                expandable summaries.
+                Control how much detail the transcript shows. Normal folds runs of routine tool
+                calls into expandable summaries; Hyper also collapses completed work.
               </div>
             </div>
             <Select

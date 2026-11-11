@@ -7,7 +7,7 @@ import {
   AlertTriangleIcon,
   CirclePauseIcon,
 } from "lucide-react";
-import { DetailContent } from "./Shared/ToolPrimitives";
+import { DetailContent, ToolIcon } from "./Shared/ToolPrimitives";
 import { type ToolStatus } from "./Shared/toolUtils";
 import { HighlightedCode } from "./Shared/HighlightedCode";
 import { ConsoleOutputDisplay } from "./Shared/ConsoleOutput";
@@ -15,7 +15,12 @@ import { NestedToolsContainer } from "./Shared/NestedToolsContainer";
 import type { CodeExecutionResult, NestedToolCall } from "./Shared/codeExecutionTypes";
 import { cn } from "@/common/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
-import { resolveCodeExecutionViewMode, type CodeExecutionViewMode } from "./codeExecutionViewMode";
+import {
+  getCodePreviewLine,
+  getHiddenNestedCallCount,
+  resolveCodeExecutionViewMode,
+  type CodeExecutionViewMode,
+} from "./codeExecutionViewMode";
 import { ToolResultImages, sanitizeImageData } from "./Shared/ToolResultImages";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
@@ -51,6 +56,8 @@ const ViewToggle: React.FC<ViewToggleProps> = ({
       <button
         type="button"
         onClick={onClick}
+        aria-label={tooltip}
+        aria-pressed={active}
         className={cn(
           "flex h-5 w-5 items-center justify-center rounded-full p-0.5 transition-colors",
           active && "bg-foreground/10",
@@ -67,6 +74,12 @@ const ViewToggle: React.FC<ViewToggleProps> = ({
   </Tooltip>
 );
 
+/**
+ * Code execution renders like the other tool rows (Claude Code / Codex / Cursor style): one header
+ * line, with the calls it made listed under a thin rail instead of inside a dashed frame.
+ * Consecutive executions then stack as an even list rather than a column of boxes, and the code,
+ * console and return value stay one click away in the header.
+ */
 export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   args,
   result,
@@ -82,10 +95,12 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   const isComplete = status === "completed" || status === "failed";
 
   const [viewMode, setViewMode] = useState<CodeExecutionViewMode>("tools");
+  const [showAllCalls, setShowAllCalls] = useState(false);
 
-  // Determine the appropriate default view for no-tool-calls case
+  // With no nested calls, a successful run collapses to its header line (the code preview says
+  // what it ran); a failed one opens on its error so the failure is not hidden.
   const hasFailed = isComplete && result && !result.success;
-  const noToolCallsDefaultView = hasFailed ? "result" : "code";
+  const noToolCallsDefaultView = hasFailed ? "result" : "header";
 
   const effectiveViewMode = resolveCodeExecutionViewMode(viewMode, {
     isComplete,
@@ -96,7 +111,7 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   const toggleView = (mode: CodeExecutionViewMode) => {
     // When toggling off, return to tools if available, otherwise the no-tool-calls default.
     // Resolve the current mode first so a completed execution with no nested tools doesn't
-    // render an empty fieldset for one commit before an effect switches tabs.
+    // render an empty body for one commit before an effect switches tabs.
     const defaultView = hasToolCalls || !isComplete ? "tools" : noToolCallsDefaultView;
     setViewMode((prev) =>
       resolveCodeExecutionViewMode(prev, { isComplete, hasToolCalls, noToolCallsDefaultView }) ===
@@ -137,6 +152,13 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
         ? { filename: media.filename }
         : {}),
     }));
+  const hasAttachments =
+    attachmentsResult !== null || downloadOnlyMedia.length > 0 || displayAttachments.length > 0;
+
+  // Long runs show only their latest calls by default; earlier ones are one click away.
+  const hiddenCallCount = getHiddenNestedCallCount(toolCalls.length, showAllCalls);
+  const visibleCalls = hiddenCallCount > 0 ? toolCalls.slice(hiddenCallCount) : toolCalls;
+  const canCollapseCalls = getHiddenNestedCallCount(toolCalls.length, false) > 0;
 
   // Determine result icon and variant
   const isInterrupted = status === "interrupted";
@@ -151,12 +173,33 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
           ? "success"
           : "error";
 
+  const showsBody =
+    (effectiveViewMode === "tools" && hasToolCalls) ||
+    effectiveViewMode === "code" ||
+    effectiveViewMode === "console" ||
+    effectiveViewMode === "result" ||
+    hasAttachments;
+  const codePreview = hasToolCalls ? "" : getCodePreviewLine(args.code);
+
   return (
-    <fieldset className="border-foreground/20 mt-3 flex flex-col gap-1.5 rounded-lg border border-dashed px-3 pt-1 pb-2">
-      {/* Legend with title and view toggles */}
-      <legend className="flex items-center gap-1.5 px-1.5">
-        <span className="text-foreground text-xs font-medium">Code Execution</span>
-        <div className="flex items-center">
+    <div
+      role="group"
+      aria-label="Code Execution"
+      className="[container-type:inline-size] my-2 font-mono text-[11px]"
+    >
+      <div className="text-secondary flex min-w-0 items-center gap-2 px-3 py-1">
+        <ToolIcon toolName="code_execution" />
+        <span className="text-foreground shrink-0 font-medium">Code execution</span>
+        {hasToolCalls ? (
+          <span className="text-muted shrink-0 whitespace-nowrap">
+            {toolCalls.length.toLocaleString()} {toolCalls.length === 1 ? "call" : "calls"}
+          </span>
+        ) : (
+          codePreview && (
+            <span className="text-muted font-monospace min-w-0 truncate">{codePreview}</span>
+          )
+        )}
+        <div className="ml-auto flex shrink-0 items-center">
           <div className="mr-0.5">
             <ViewToggle
               active={effectiveViewMode === "result"}
@@ -192,75 +235,95 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
             <TerminalIcon className="h-3.5 w-3.5" />
           </ViewToggle>
         </div>
-      </legend>
+      </div>
 
-      {/* Content based on view mode */}
-      {effectiveViewMode === "tools" && hasToolCalls && (
-        <NestedToolsContainer
-          calls={toolCalls}
-          parentInterrupted={isInterrupted}
-          workspaceId={workspaceId}
-          toolCallTimestamp={toolCallTimestamp}
-        />
-      )}
+      {/* The rail sits under the header icon so the body reads as the header's children. */}
+      {showsBody && (
+        <div className="border-foreground/15 ml-[17px] flex min-w-0 flex-col gap-1.5 border-l py-0.5 pl-2">
+          {effectiveViewMode === "tools" && hasToolCalls && (
+            <>
+              {canCollapseCalls && (
+                <button
+                  type="button"
+                  className="text-muted hover:text-foreground self-start px-3 text-left transition-colors"
+                  aria-expanded={showAllCalls}
+                  onClick={() => setShowAllCalls((prev) => !prev)}
+                >
+                  {showAllCalls
+                    ? "Show fewer calls"
+                    : `Show ${hiddenCallCount.toLocaleString()} earlier ${
+                        hiddenCallCount === 1 ? "call" : "calls"
+                      }`}
+                </button>
+              )}
+              <NestedToolsContainer
+                calls={visibleCalls}
+                parentInterrupted={isInterrupted}
+                workspaceId={workspaceId}
+                toolCallTimestamp={toolCallTimestamp}
+              />
+            </>
+          )}
 
-      {effectiveViewMode === "code" && (
-        <div className="border-foreground/10 bg-code-bg rounded border p-2">
-          <HighlightedCode language="javascript" code={args.code.trim()} />
-        </div>
-      )}
+          {effectiveViewMode === "code" && (
+            <div className="border-foreground/10 bg-code-bg rounded border p-2">
+              <HighlightedCode language="javascript" code={args.code.trim()} />
+            </div>
+          )}
 
-      {effectiveViewMode === "console" && (
-        <div className="border-foreground/10 bg-code-bg rounded border p-2">
-          {consoleOutput.length > 0 ? (
-            <ConsoleOutputDisplay output={consoleOutput} />
-          ) : (
-            <span className="text-muted text-xs italic">No console output</span>
+          {effectiveViewMode === "console" && (
+            <div className="border-foreground/10 bg-code-bg rounded border p-2">
+              {consoleOutput.length > 0 ? (
+                <ConsoleOutputDisplay output={consoleOutput} />
+              ) : (
+                <span className="text-muted text-xs italic">No console output</span>
+              )}
+            </div>
+          )}
+
+          {effectiveViewMode === "result" &&
+            (isComplete && result ? (
+              result.success ? (
+                formattedResult ? (
+                  <DetailContent className="p-2">{formattedResult}</DetailContent>
+                ) : (
+                  <div className="text-muted text-xs italic">(no return value)</div>
+                )
+              ) : (
+                <DetailContent className="border border-red-500/30 bg-red-500/10 p-2 text-red-400">
+                  {result.error}
+                </DetailContent>
+              )
+            ) : isInterrupted ? (
+              <div className="text-xs text-yellow-400 italic">Execution interrupted</div>
+            ) : isBackgrounded ? (
+              <div className="text-muted text-xs italic">Execution backgrounded</div>
+            ) : (
+              <div className="text-muted text-xs italic">Execution in progress...</div>
+            ))}
+
+          {/* Attachments carried out of nested tool results (attach_file): the
+          nested result only holds a stub, so previews render from the carrier. */}
+          {attachmentsResult && <ToolResultImages result={attachmentsResult} />}
+          {downloadOnlyMedia.length > 0 && (
+            <div className="space-y-2">
+              {downloadOnlyMedia.map((media, index) => (
+                <MediaAttachmentDownloadCard
+                  key={`${media.filename ?? media.mediaType}-${index}`}
+                  media={media}
+                />
+              ))}
+            </div>
+          )}
+          {displayAttachments.length > 0 && (
+            <div className="space-y-2">
+              {displayAttachments.map((file, index) => (
+                <DisplayOnlyFile key={`${file.filename ?? file.mediaType}-${index}`} file={file} />
+              ))}
+            </div>
           )}
         </div>
       )}
-
-      {effectiveViewMode === "result" &&
-        (isComplete && result ? (
-          result.success ? (
-            formattedResult ? (
-              <DetailContent className="p-2">{formattedResult}</DetailContent>
-            ) : (
-              <div className="text-muted text-xs italic">(no return value)</div>
-            )
-          ) : (
-            <DetailContent className="border border-red-500/30 bg-red-500/10 p-2 text-red-400">
-              {result.error}
-            </DetailContent>
-          )
-        ) : isInterrupted ? (
-          <div className="text-xs text-yellow-400 italic">Execution interrupted</div>
-        ) : isBackgrounded ? (
-          <div className="text-muted text-xs italic">Execution backgrounded</div>
-        ) : (
-          <div className="text-muted text-xs italic">Execution in progress...</div>
-        ))}
-
-      {/* Attachments carried out of nested tool results (attach_file): the
-          nested result only holds a stub, so previews render from the carrier. */}
-      {attachmentsResult && <ToolResultImages result={attachmentsResult} />}
-      {downloadOnlyMedia.length > 0 && (
-        <div className="space-y-2">
-          {downloadOnlyMedia.map((media, index) => (
-            <MediaAttachmentDownloadCard
-              key={`${media.filename ?? media.mediaType}-${index}`}
-              media={media}
-            />
-          ))}
-        </div>
-      )}
-      {displayAttachments.length > 0 && (
-        <div className="space-y-2">
-          {displayAttachments.map((file, index) => (
-            <DisplayOnlyFile key={`${file.filename ?? file.mediaType}-${index}`} file={file} />
-          ))}
-        </div>
-      )}
-    </fieldset>
+    </div>
   );
 };
