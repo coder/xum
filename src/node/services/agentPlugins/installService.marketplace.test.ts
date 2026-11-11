@@ -18,7 +18,7 @@ import type {
 import { Config } from "@/node/config";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { discoverAgentPluginAt } from "./discovery";
-import { AgentPluginInstallService } from "./installService";
+import { AgentPluginInstallService, realEntryFolder } from "./installService";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   using proc = execFileAsync("git", [`-C`, cwd, ...args]);
@@ -757,6 +757,7 @@ describe("AgentPluginInstallService marketplaces", () => {
           { name: "linked", source: "linked" },
           { name: "through", source: "through/inner" },
           { name: "past-file", source: "afile/x" },
+          { name: "too-long", source: "x".repeat(300) },
         ],
       }),
       afile: "not a folder\n",
@@ -769,7 +770,7 @@ describe("AgentPluginInstallService marketplaces", () => {
       "clauded/skills/b/SKILL.md": skillMd("b"),
       "deep/inner/.cursor-plugin/plugin.json": JSON.stringify({ name: "through" }),
     });
-    // The preview refuses a symlinked folder even when it holds a manifest (extractSubpath),
+    // The preview refuses a symlinked folder even when it holds a manifest (narrowToSubpath),
     // and a folder reached through a symlinked parent.
     await fsPromises.symlink("rooted", path.join(marketDir, "linked"));
     await fsPromises.symlink("deep", path.join(marketDir, "through"));
@@ -801,12 +802,68 @@ describe("AgentPluginInstallService marketplaces", () => {
         false,
         "Xum cannot install the entry's folder 'afile/x': it runs through a file",
       ],
+      // The error code, never the error's own text, which names the staging path.
+      [
+        "too-long",
+        false,
+        `Xum cannot install the entry's folder '${"x".repeat(300)}': Xum cannot read it (ENAMETOOLONG)`,
+      ],
     ]);
     // The listing offers what the preview installs, and refuses what it refuses.
     expect((await previewCursorEntry("rooted")).method).toEqual({ kind: "agent-plugin" });
     expect((await previewCursorEntry("clauded")).method).toEqual({ kind: "claude-plugin" });
     await expect(previewCursorEntry("linked")).rejects.toThrow("is a symbolic link");
     await expect(previewCursorEntry("through")).rejects.toThrow("is a symbolic link");
+    // One listing and four previews: over 20 s when several test files run at once.
+  }, 60_000);
+
+  test("an entry folder behind a link is refused without following the link", async () => {
+    // Following a link to a folder thousands of levels deep stalled the list: only lstat may
+    // touch a path that runs through one.
+    const staged = path.join(tmpRoot, "staged");
+    await fsPromises.mkdir(path.join(staged, "deep", "inner"), { recursive: true });
+    await fsPromises.symlink("deep", path.join(staged, "linked"));
+    await fsPromises.writeFile(path.join(staged, "afile"), "not a folder\n");
+    const realpath = spyOn(fsPromises, "realpath");
+    try {
+      expect(await realEntryFolder(staged, "linked/inner")).toEqual({
+        why: "it is a symbolic link or runs through one",
+      });
+      expect(await realEntryFolder(staged, "linked")).toEqual({
+        why: "it is a symbolic link or runs through one",
+      });
+      expect(await realEntryFolder(staged, "afile/x")).toEqual({ why: "it runs through a file" });
+      expect(await realEntryFolder(staged, "afile")).toEqual({ why: "it is a file" });
+      expect(await realEntryFolder(staged, "gone")).toEqual({ why: "it does not exist" });
+      expect(realpath).not.toHaveBeenCalled();
+      expect("entryDir" in (await realEntryFolder(staged, "deep/inner"))).toBe(true);
+    } finally {
+      realpath.mockRestore();
+    }
+  });
+
+  test("a Xum root behind a symbolic link does not make every entry folder look like a link", async () => {
+    // A linked home such as Fedora Silverblue's /home -> /var/home: the staging folder's path runs
+    // through a link, but the entry folders inside the clone do not.
+    await writeCursorMarketplace();
+    const realRoot = path.join(tmpRoot, "real-xum");
+    await fsPromises.mkdir(realRoot);
+    const linkedRoot = path.join(tmpRoot, "linked-xum");
+    await fsPromises.symlink(realRoot, linkedRoot);
+    const linkedService = new AgentPluginInstallService(new Config(linkedRoot), {});
+    const listed = await linkedService.previewSource({ input: marketDir });
+    if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+    expect(
+      listed.marketplace.entries.map((entry) => [
+        entry.name,
+        entry.builds.map((build) => build.installable),
+      ])
+    ).toEqual([
+      ["pstack", [true, true]],
+      ["kit", [true]],
+      ["bare", [false]],
+      ["attio", [true]],
+    ]);
   }, 20_000);
 
   // Four staging runs (preview, install, update review, update): 14 s at load 30 on a shared
