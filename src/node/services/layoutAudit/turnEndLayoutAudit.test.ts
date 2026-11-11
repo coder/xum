@@ -12,11 +12,16 @@ import * as artifactsOperations from "@/node/services/artifactsOperations";
 import { recordArtifactPublish } from "@/node/services/artifactRecordStore";
 import * as checkArtifactLayoutModule from "./checkArtifactLayout";
 import { installFakeAgentBrowser } from "./fakeAgentBrowser.testHarness";
-import { layoutAuditLastStartedAtMs, startLayoutAudit } from "./layoutFingerprints";
+import {
+  isLayoutAuditDue,
+  layoutAuditLastStartedAtMs,
+  markLayoutAuditDue,
+  startLayoutAudit,
+} from "./layoutFingerprints";
 import {
   TURN_END_AUDIT_MAX_PAGES,
   hasNewLayoutIssueAtTurnEnd,
-  pagesChangedSinceAudit,
+  pagesDueForAudit,
   workspaceHasNewLayoutIssueAtTurnEnd,
   type TurnEndArtifactListing,
   type TurnEndLayoutAuditDeps,
@@ -59,19 +64,22 @@ const listingOf = (
 
 const never = () => undefined;
 
-describe("pagesChangedSinceAudit", () => {
+/** The pages the modified-time rule alone picks: no earlier turn end left one due. */
+const changedPages = (
+  listing: TurnEndArtifactListing,
+  streamStartedAtMs: number,
+  lastAuditStartedAtMs: (relPath: string) => number | undefined
+) => pagesDueForAudit(listing, streamStartedAtMs, lastAuditStartedAtMs, () => false);
+
+describe("pagesDueForAudit", () => {
   test("a published HTML page modified in this stream, with no audit of its own, is audited", () => {
-    const pages = pagesChangedSinceAudit(
-      listingOf([page("a.html", STREAM_START + 1)]),
-      STREAM_START,
-      never
-    );
+    const pages = changedPages(listingOf([page("a.html", STREAM_START + 1)]), STREAM_START, never);
     expect(pages).toEqual(["a.html"]);
   });
 
   test("a page that did not change in this stream is not audited, so a restart audits nothing old", () => {
     expect(
-      pagesChangedSinceAudit(listingOf([page("a.html", STREAM_START - 1)]), STREAM_START, never)
+      changedPages(listingOf([page("a.html", STREAM_START - 1)]), STREAM_START, never)
     ).toEqual([]);
   });
 
@@ -80,9 +88,7 @@ describe("pagesChangedSinceAudit", () => {
       page("scratch.html", STREAM_START + 1),
       page("notes.md", STREAM_START + 1, "markdown"),
     ];
-    expect(pagesChangedSinceAudit(listingOf(entries, ["notes.md"]), STREAM_START, never)).toEqual(
-      []
-    );
+    expect(changedPages(listingOf(entries, ["notes.md"]), STREAM_START, never)).toEqual([]);
   });
 
   test("a page whose last audit ran after its last write is not audited again", () => {
@@ -91,34 +97,50 @@ describe("pagesChangedSinceAudit", () => {
       page("a.html", STREAM_START + 99),
       page("b.html", STREAM_START + 99),
     ]);
-    expect(pagesChangedSinceAudit(listing, STREAM_START, (p) => audited.get(p))).toEqual([
-      "b.html",
-    ]);
+    expect(changedPages(listing, STREAM_START, (p) => audited.get(p))).toEqual(["b.html"]);
   });
 
   test("a write at the very start of the last audit still counts as a change", () => {
     const listing = listingOf([page("a.html", STREAM_START + 100)]);
-    expect(pagesChangedSinceAudit(listing, STREAM_START, () => STREAM_START + 100)).toEqual([
-      "a.html",
-    ]);
+    expect(changedPages(listing, STREAM_START, () => STREAM_START + 100)).toEqual(["a.html"]);
   });
 
   test("the last audit replaces the stream start as the bar, even when it is older than the stream", () => {
     const listing = listingOf([page("a.html", STREAM_START - 50)]);
-    expect(pagesChangedSinceAudit(listing, STREAM_START, () => STREAM_START - 100)).toEqual([
-      "a.html",
-    ]);
-    expect(pagesChangedSinceAudit(listing, STREAM_START, () => STREAM_START - 10)).toEqual([]);
+    expect(changedPages(listing, STREAM_START, () => STREAM_START - 100)).toEqual(["a.html"]);
+    expect(changedPages(listing, STREAM_START, () => STREAM_START - 10)).toEqual([]);
   });
 
-  test("at most three pages are audited, the newest first", () => {
-    const entries = [1, 2, 3, 4, 5].map((n) => page(`p${n}.html`, STREAM_START + n));
-    expect(TURN_END_AUDIT_MAX_PAGES).toBe(3);
-    expect(pagesChangedSinceAudit(listingOf(entries), STREAM_START, never)).toEqual([
-      "p5.html",
+  test("the pages come newest first", () => {
+    const entries = [2, 4, 1, 3].map((n) => page(`p${n}.html`, STREAM_START + n));
+    expect(changedPages(listingOf(entries), STREAM_START, never)).toEqual([
       "p4.html",
       "p3.html",
+      "p2.html",
+      "p1.html",
     ]);
+  });
+
+  test("a page an earlier turn end left due is picked again, although it did not change in this stream", () => {
+    // After a restart the page has no audit time, so the bar is the start of the ending stream,
+    // which has moved past the write: only the due mark keeps the page.
+    const listing = listingOf([
+      page("a.html", STREAM_START - 900),
+      page("b.html", STREAM_START - 900),
+    ]);
+    expect(pagesDueForAudit(listing, STREAM_START, never, (p) => p === "a.html")).toEqual([
+      "a.html",
+    ]);
+  });
+
+  test("a due mark does not pick a file that is not a published HTML page", () => {
+    const entries = [
+      page("scratch.html", STREAM_START + 1),
+      page("notes.md", STREAM_START + 1, "markdown"),
+    ];
+    expect(
+      pagesDueForAudit(listingOf(entries, ["notes.md"]), STREAM_START, never, () => true)
+    ).toEqual([]);
   });
 });
 
@@ -132,6 +154,8 @@ describe("hasNewLayoutIssueAtTurnEnd", () => {
       abortSignal: controller.signal,
       list: () => Promise.resolve(changed),
       lastAuditStartedAtMs: never,
+      isDue: () => false,
+      markDue: () => undefined,
       audit: () => Promise.resolve(report()),
       ...overrides,
     };
@@ -206,13 +230,16 @@ describe("hasNewLayoutIssueAtTurnEnd", () => {
     expect([found, audits]).toEqual([false, 0]);
   });
 
-  test("the pages of one turn end are audited at the same time, three at most", async () => {
+  test("the pages of one turn end are audited at the same time, three at most, and every picked page is left due", async () => {
     const started: string[] = [];
+    const due: string[] = [];
     const release = Promise.withResolvers<void>();
+    expect(TURN_END_AUDIT_MAX_PAGES).toBe(3);
     const run = hasNewLayoutIssueAtTurnEnd(
       deps({
         list: () =>
           Promise.resolve(listingOf([1, 2, 3, 4].map((n) => page(`p${n}.html`, STREAM_START + n)))),
+        markDue: (relPath) => due.push(relPath),
         audit: async (relPath) => {
           started.push(relPath);
           await release.promise;
@@ -224,6 +251,9 @@ describe("hasNewLayoutIssueAtTurnEnd", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(started).toEqual(["p4.html", "p3.html", "p2.html"]);
+    // The page past the cap is due as well: a later turn end audits it, changed or not. So is a
+    // page whose audit a Stop ends: the marks are set before the first audit starts.
+    expect(due).toEqual(["p4.html", "p3.html", "p2.html", "p1.html"]);
     release.resolve();
     expect(await run).toBe(true);
   });
@@ -378,6 +408,15 @@ describe("workspaceHasNewLayoutIssueAtTurnEnd", () => {
     expect(audits).toEqual([]);
   });
 
+  test("a page whose issue the agent was not shown is audited at the next turn end too, although it did not change in that stream", async () => {
+    // The mocked audit settles nothing, like a turn-end audit that found a new issue. The page
+    // has no audit time of its own (as after a restart), so only its due mark keeps it.
+    await publishedPage("report.html");
+    expect(await run()).toBe(true);
+    expect(await run({ streamStartedAtMs: Date.now() + 60_000 })).toBe(true);
+    expect(audits).toHaveLength(2);
+  });
+
   test("a side chat is not audited", async () => {
     await publishedPage("report.html");
     metadata = { ...metadata, sideChatParentWorkspaceId: "ws-main" };
@@ -459,12 +498,15 @@ describe("a turn-end audit through the real layout audit", () => {
     } as const;
     let modifiedMs = Date.now();
     let turnEndAudits = 0;
-    const atTurnEnd = () =>
+    // Each turn end belongs to a later stream, as in a real chat.
+    const atTurnEnd = (streamStartedAtMs = Date.now()) =>
       hasNewLayoutIssueAtTurnEnd({
-        streamStartedAtMs: modifiedMs - 1,
+        streamStartedAtMs,
         abortSignal: new AbortController().signal,
         list: () => Promise.resolve(listingOf([page("chart.html", modifiedMs)])),
         lastAuditStartedAtMs: (relPath) => layoutAuditLastStartedAtMs(input.sessionDir, relPath),
+        isDue: (relPath) => isLayoutAuditDue(input.sessionDir, relPath),
+        markDue: (relPath) => markLayoutAuditDue(input.sessionDir, relPath),
         audit: (relPath, abortSignal) => {
           turnEndAudits += 1;
           return checkArtifactLayoutModule.checkArtifactLayout({
@@ -476,9 +518,10 @@ describe("a turn-end audit through the real layout audit", () => {
         },
       });
 
-    expect(await atTurnEnd()).toBe(true);
+    // The page has no audit of its own yet (as after a restart) and changed in this stream.
+    expect(await atTurnEnd(modifiedMs - 1)).toBe(true);
     // New input or a Stop can win over the continuation, so the agent may not have been told:
-    // the unchanged page is audited, and found, again.
+    // the unchanged page is audited, and found, again, in a stream that started after the write.
     expect(await atTurnEnd()).toBe(true);
     // The agent has been shown nothing: the publish lists the issue as new, and commits it.
     expect(
@@ -489,7 +532,8 @@ describe("a turn-end audit through the real layout audit", () => {
     expect(turnEndAudits).toBe(2);
     // The page changes and keeps the issue the publish listed: audited, with nothing new to say.
     modifiedMs = Date.now();
-    expect(await atTurnEnd()).toBe(false);
+    expect(await atTurnEnd(modifiedMs - 1)).toBe(false);
     expect(turnEndAudits).toBe(3);
+    expect(isLayoutAuditDue(input.sessionDir, "chart.html")).toBe(false);
   }, 300_000);
 });

@@ -42,8 +42,30 @@ const remembered = new LRUCache<string, FingerprintSnapshot>({ max: LAYOUT_MEMOR
 // as "never audited": the next turn-end audit repeats one check at worst (the safe direction).
 const lastAuditStartedAt = new LRUCache<string, number>({ max: LAYOUT_MEMORY_MAX_PATHS });
 
+// The paths a turn end picked for an audit that no audit has settled since. The modified-time
+// rule alone loses such a page when it has no start time above: the bar is then the start of
+// the ending stream, which moves on with every turn. Bounded like the memory above. An evicted
+// path is only picked again when it changes (no extra audit).
+const dueForAudit = new LRUCache<string, true>({ max: LAYOUT_MEMORY_MAX_PATHS });
+
 function pathKey(sessionDir: string, relPath: string): string {
   return JSON.stringify([sessionDir, relPath]);
+}
+
+/** An audit that started at `startedAtMs` settled the path: the latest start wins. */
+function settlePath(key: string, startedAtMs: number): void {
+  lastAuditStartedAt.set(key, Math.max(startedAtMs, lastAuditStartedAt.peek(key) ?? 0));
+  dueForAudit.delete(key);
+}
+
+/** Keeps the path picked for the turn-end audit until an audit settles it. */
+export function markLayoutAuditDue(sessionDir: string, relPath: string): void {
+  dueForAudit.set(pathKey(sessionDir, relPath), true);
+}
+
+/** Whether a turn end picked the path and no audit has settled it since, in this process. */
+export function isLayoutAuditDue(sessionDir: string, relPath: string): boolean {
+  return dueForAudit.has(pathKey(sessionDir, relPath));
 }
 
 /**
@@ -86,10 +108,11 @@ export interface LayoutAuditTurn {
    * this path. An audit that loses that check still gets its own report back. The audit ends
    * whether or not `build` throws. Call it exactly once.
    *
-   * The audit also settles the page, and records its start time for the path (the latest start
-   * wins: a slow early audit never moves it back), whether or not it remembers anything. It does
-   * not when `staysDue` says so for its report, or when `build` throws: the page is then audited
-   * again at the next turn end, changed or not.
+   * The audit also settles the page: it records its start time for the path (the latest start
+   * wins: a slow early audit never moves it back) and clears the path's due mark, whether or
+   * not it remembers anything. It does not when `staysDue` says so for its report, or when
+   * `build` throws: a page that a turn end picked is then audited again at the next turn end,
+   * changed or not.
    */
   finish<T>(
     build: (previous: FingerprintSnapshot) => { report: T; next: FingerprintSnapshot },
@@ -127,9 +150,7 @@ export function startLayoutAudit(
         settled = staysDue?.(report) !== true;
         return report;
       } finally {
-        if (settled) {
-          lastAuditStartedAt.set(key, Math.max(startedAtMs, lastAuditStartedAt.peek(key) ?? 0));
-        }
+        if (settled) settlePath(key, startedAtMs);
         path.inFlight -= 1;
         if (path.inFlight === 0) auditsByPath.delete(key);
       }

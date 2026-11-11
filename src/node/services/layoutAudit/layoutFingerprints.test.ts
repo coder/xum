@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   LAYOUT_MEMORY_MAX_PATHS,
+  isLayoutAuditDue,
   layoutAuditLastStartedAtMs,
   layoutAuditPathsInFlight,
   layoutFingerprint,
+  markLayoutAuditDue,
   startLayoutAudit,
   type FingerprintSnapshot,
   type LayoutAuditTurn,
@@ -213,6 +215,20 @@ describe("layoutAuditLastStartedAtMs", () => {
     expect(layoutAuditLastStartedAtMs(dir, `p${LAYOUT_MEMORY_MAX_PATHS}.html`)).toBe(
       100 + LAYOUT_MEMORY_MAX_PATHS
     );
+  });
+});
+
+describe("the due mark of a path a turn end picked", () => {
+  test("stays until an audit settles the path, and is kept by one that leaves it due", () => {
+    const dir = freshDir();
+    expect(isLayoutAuditDue(dir, "a.html")).toBe(false);
+    markLayoutAuditDue(dir, "a.html");
+    finish(startLayoutAudit(dir, "a.html"), {}, false, true);
+    expect(isLayoutAuditDue(dir, "a.html")).toBe(true);
+    expect(isLayoutAuditDue(dir, "b.html")).toBe(false);
+    expect(isLayoutAuditDue(freshDir(), "a.html")).toBe(false);
+    finish(startLayoutAudit(dir, "a.html"), {}, false);
+    expect(isLayoutAuditDue(dir, "a.html")).toBe(false);
   });
 });
 

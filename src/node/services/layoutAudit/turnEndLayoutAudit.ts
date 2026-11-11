@@ -10,7 +10,11 @@ import {
   resolveArtifactsLocation,
 } from "@/node/services/artifactsOperations";
 import { checkArtifactLayout } from "@/node/services/layoutAudit/checkArtifactLayout";
-import { layoutAuditLastStartedAtMs } from "@/node/services/layoutAudit/layoutFingerprints";
+import {
+  isLayoutAuditDue,
+  layoutAuditLastStartedAtMs,
+  markLayoutAuditDue,
+} from "@/node/services/layoutAudit/layoutFingerprints";
 import { hasNewLayoutIssue } from "@/node/services/layoutAudit/layoutReport";
 import type { LayoutAuditReport } from "@/common/types/artifactLayoutAudit";
 import { log } from "@/node/services/log";
@@ -25,7 +29,7 @@ import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/work
  * AIService turns a yes into one constant continuation prompt (LAYOUT_TURN_END_NUDGE).
  */
 
-/** At most this many changed pages are audited at one turn end, newest first. */
+/** At most this many pages are audited at one turn end, newest first. The rest stay due. */
 export const TURN_END_AUDIT_MAX_PAGES = 3;
 
 /** What the audit reads of a workspace's artifacts: the tab's listing, not the files. */
@@ -36,18 +40,24 @@ export interface TurnEndArtifactListing {
 }
 
 /**
- * The pages to audit: published, shown as HTML, and changed since their last audit, newest
- * first. "Changed" is one rule: modified at or after the start of the last audit that settled
- * the page, else (after a restart, or before any audit) at or after the start of the ending
- * stream. So a restart audits nothing old, and a publish-time audit is not repeated: it started
- * after the write it covers. A turn-end audit that found a new issue does not settle the page
- * (checkArtifactLayout): new input or a Stop can win over the continuation that tells the agent,
- * so the page is audited at each turn end until a publish has shown the issue.
+ * The pages that are due for an audit, newest first: published, shown as HTML, and either
+ * changed since their last audit or picked by an earlier turn end and not settled since.
+ * "Changed" is one rule: modified at or after the start of the last audit that settled the
+ * page, else (after a restart, or before any audit) at or after the start of the ending stream.
+ * So a restart audits nothing old, and a publish-time audit is not repeated: it started after
+ * the write it covers.
+ *
+ * A picked page stays due until an audit settles it (LayoutAuditTurn.finish). A turn-end audit
+ * that found a new issue does not: new input or a Stop can win over the continuation that tells
+ * the agent, so the page is audited at each turn end until a publish has shown the issue. The
+ * same holds for a page whose audit a Stop ended, and for the pages past the cap of one turn
+ * end.
  */
-export function pagesChangedSinceAudit(
+export function pagesDueForAudit(
   listing: TurnEndArtifactListing,
   streamStartedAtMs: number,
-  lastAuditStartedAtMs: (relPath: string) => number | undefined
+  lastAuditStartedAtMs: (relPath: string) => number | undefined,
+  isDue: (relPath: string) => boolean
 ): string[] {
   const published = new Set(listing.publishedPaths);
   return listing.entries
@@ -55,10 +65,10 @@ export function pagesChangedSinceAudit(
       (entry) =>
         entry.kind === "html" &&
         published.has(entry.path) &&
-        entry.modifiedMs >= (lastAuditStartedAtMs(entry.path) ?? streamStartedAtMs)
+        (isDue(entry.path) ||
+          entry.modifiedMs >= (lastAuditStartedAtMs(entry.path) ?? streamStartedAtMs))
     )
     .sort((a, b) => b.modifiedMs - a.modifiedMs)
-    .slice(0, TURN_END_AUDIT_MAX_PAGES)
     .map((entry) => entry.path);
 }
 
@@ -69,6 +79,10 @@ export interface TurnEndLayoutAuditDeps {
   abortSignal: AbortSignal;
   list: () => Promise<TurnEndArtifactListing>;
   lastAuditStartedAtMs: (relPath: string) => number | undefined;
+  /** Whether an earlier turn end picked the page and no audit has settled it since. */
+  isDue: (relPath: string) => boolean;
+  /** Keeps the page picked until an audit settles it. */
+  markDue: (relPath: string) => void;
   /** Audits one page and leaves the fix-loop memory as it was. */
   audit: (relPath: string, abortSignal: AbortSignal) => Promise<LayoutAuditReport | undefined>;
 }
@@ -82,11 +96,15 @@ export async function hasNewLayoutIssueAtTurnEnd(deps: TurnEndLayoutAuditDeps): 
   let pages: string[];
   try {
     if (deps.abortSignal.aborted) return false;
-    pages = pagesChangedSinceAudit(
+    const due = pagesDueForAudit(
       await deps.list(),
       deps.streamStartedAtMs,
-      deps.lastAuditStartedAtMs
+      deps.lastAuditStartedAtMs,
+      deps.isDue
     );
+    // Before any audit runs: a Stop, a failure and the cap must not lose a picked page.
+    due.forEach(deps.markDue);
+    pages = due.slice(0, TURN_END_AUDIT_MAX_PAGES);
   } catch (error) {
     log.debug("turn-end layout audit could not list the artifacts", { error });
     return false;
@@ -150,6 +168,8 @@ export async function workspaceHasNewLayoutIssueAtTurnEnd(
       };
     },
     lastAuditStartedAtMs: (relPath) => layoutAuditLastStartedAtMs(sessionDir, relPath),
+    isDue: (relPath) => isLayoutAuditDue(sessionDir, relPath),
+    markDue: (relPath) => markLayoutAuditDue(sessionDir, relPath),
     audit: (relPath, signal) =>
       checkArtifactLayout({
         kind: "html",
