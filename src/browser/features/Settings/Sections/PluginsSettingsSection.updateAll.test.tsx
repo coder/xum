@@ -44,13 +44,10 @@ const capabilityChanging = (name: string) => review(name, [{ summary: `adds skil
 
 interface Fixture {
   names: string[];
-  /** Plugins with an update waiting; the rest are up to date. */
   pending: Record<string, AgentPluginUpdateReview>;
-  /** Plugins whose update the backend rejects. */
   failing?: Record<string, string>;
 }
 
-/** A backend where a plugin leaves `pending` once its update applies. */
 function createApi(fixture: Fixture) {
   const pending = new Map(Object.entries(fixture.pending));
   const api = createMockORPCClient({ agentPlugins: { items: fixture.names.map(row) } });
@@ -121,14 +118,12 @@ test("one click applies the neutral updates, opens the capability-changing revie
   expect(updates.map((update) => update.name)).toEqual(["alpha", "delta"]);
   expect(previews).not.toContain("gamma");
 
-  // The user still confirms the capability change: only then does beta update, with its consent.
   fireEvent.click(openReviews(view)[0]);
   await waitFor(() =>
     expect(updates.map((update) => update.name)).toEqual(["alpha", "delta", "beta"])
   );
   expect(updates[2].consent).toMatchObject({ fromSha: "a".repeat(40), toSha: "b".repeat(40) });
   await waitFor(() => expect(openReviews(view)).toHaveLength(0));
-  // Nothing is pending any more, so the button is gone.
   await waitFor(() => expect(buttonNamed(view, /Update all/) === undefined).toBe(true));
 });
 
@@ -181,7 +176,6 @@ test("a failed update does not stop the others and the status names it", async (
   await waitFor(() => expect(status()).toContain("beta"));
   expect(updates.map((update) => update.name)).toEqual(["alpha", "beta", "gamma"]);
   expect(status()).toContain("swap failed");
-  // The two that applied are no longer pending: only the failed one still counts.
   await waitFor(() => expect(buttonNamed(view, /Update all/)?.textContent).toContain("1"));
 });
 

@@ -27,7 +27,6 @@ const neutral = (name: string): AgentPluginUpdateReview => ({ ...review(name), c
 type Preview = Awaited<ReturnType<APIClient["agentPlugins"]["previewUpdate"]>>;
 type Update = Awaited<ReturnType<APIClient["agentPlugins"]["update"]>>;
 
-/** An API whose previews and updates follow the per-plugin tables (an absent name fails). */
 function apiWith(
   previews: Record<string, Preview | Error>,
   updates: Record<string, Update | Error> = {}
@@ -68,7 +67,6 @@ describe("updateAllPlugins", () => {
     expect(result.updated).toEqual(["a", "d"]);
     expect(result.reviews).toEqual([review("b")]);
     expect(result.failures).toEqual([]);
-    // The backend refuses a capability-changing update without consent: it is never attempted.
     expect(update.mock.calls.map(([input]) => input.name)).toEqual(["a", "d"]);
     expect(update.mock.calls.every(([input]) => !("consent" in input))).toBe(true);
   });

@@ -12,12 +12,10 @@ import { getErrorMessage } from "@/common/utils/errors";
  * Each pending update is previewed first. The backend refuses an update that changes a plugin's
  * capability surface unless the user confirmed the reviewed SHAs (installService.update), so a
  * capability-changing update is never applied here: it comes back as a review for the user to
- * confirm one at a time. The batch is not atomic: every plugin is previewed, applied or failed
- * on its own, and a failure never stops the rest.
+ * confirm one at a time.
  */
 export interface UpdateAllResult {
   updated: string[];
-  /** Capability-changing updates, each waiting for the user's own confirmation. */
   reviews: AgentPluginUpdateReview[];
   failures: Array<{ name: string; error: string }>;
   /** Moved tags are not bulk-applied: tags should be immutable, so each needs a per-plugin review. */
@@ -48,10 +46,7 @@ const namesWithStatus = (
   status: AgentPluginUpdateCheck["status"]
 ): string[] => checks.filter((check) => check.status === status).map((check) => check.name);
 
-/**
- * Applies every "update-available" check in order, one plugin at a time (the installer mutates
- * one registry). `onProgress` names the plugin about to be previewed.
- */
+/** One plugin at a time: the installer mutates one registry. */
 export async function updateAllPlugins(
   api: APIClient,
   checks: readonly AgentPluginUpdateCheck[],
@@ -105,11 +100,9 @@ function summaryParts(result: UpdateAllResult): string[] {
   return parts;
 }
 
-/** A failure, a moved tag or an unreachable remote must never read as a clean success. */
 const isUnexpected = (result: UpdateAllResult): boolean =>
   result.failures.length > 0 || result.checkFailures.length > 0 || result.tagMoved.length > 0;
 
-/** The status the section shows and the palette toasts. */
 export function summarizeUpdateAll(result: UpdateAllResult): UpdateAllSummary {
   const parts = summaryParts(result);
   if (parts.length === 0) return { tone: "success", message: "All plugins are up to date." };

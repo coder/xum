@@ -1883,7 +1883,6 @@ export const PluginsSettingsSection: React.FC = () => {
   /** Pending update whose capability changes await the user's confirmation. */
   const updateReviews = useUpdateReviewQueue(
     initialIntent?.type === "review-updates" ? initialIntent.reviews : [],
-    // Lazy: `updateAll` is declared below.
     () => updateAll.dismissStatus()
   );
   const updateReview = updateReviews.open;
@@ -2033,7 +2032,6 @@ export const PluginsSettingsSection: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribe on API reconnect only; the listener reads the latest handlers via closure per subscription
   }, [api]);
 
-  /** Both update paths start here: any open review would confirm against a tree the update moves. */
   const startUpdate = () => {
     setError(null);
     updateReviews.clear();

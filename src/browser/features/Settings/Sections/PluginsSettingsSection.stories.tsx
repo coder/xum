@@ -843,7 +843,6 @@ const UPDATE_ALL_OPTIONS: MockORPCClientOptions = {
   },
 };
 
-/** The header holds Update all next to Check for updates and Add plugin. */
 async function findUpdateAllHeader(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
   const updateAll = await canvas.findByRole("button", { name: "Update all (2)" });
@@ -853,9 +852,8 @@ async function findUpdateAllHeader(canvasElement: HTMLElement) {
 }
 
 /**
- * Two managed plugins have an update waiting: one Update all button, with their count. Out of
- * Pixel snapshots (snapshot budget): InstalledWithUpdateStates and InstalledPhoneViewport already
- * snapshot the header with the button, so the plays check the layout here.
+ * Out of Pixel snapshots (snapshot budget): InstalledWithUpdateStates and InstalledPhoneViewport
+ * already snapshot the header with the button, so the plays check the layout here.
  */
 export const UpdateAllPending: Story = {
   parameters: { pixel: PIXEL_DISABLED },
@@ -866,17 +864,12 @@ export const UpdateAllPending: Story = {
   ),
   play: async ({ canvasElement }) => {
     const { updateAll, check, add } = await findUpdateAllHeader(canvasElement);
-    // Desktop width fits the three header buttons on one row.
     if (new Set([updateAll, check, add].map((b) => b.getBoundingClientRect().top)).size !== 1) {
       throw new Error("Header buttons do not share one row at desktop width");
     }
   },
 };
 
-/**
- * Update all at phone width: the header buttons wrap onto further rows instead of overflowing the
- * right edge or clipping a button (AGENTS.md Storybook responsive rule).
- */
 export const UpdateAllPendingPhoneViewport: Story = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
@@ -929,10 +922,6 @@ const UPDATE_ALL_REVIEWS = [
   },
 ];
 
-/**
- * Update all found two capability-changing updates: the first review is open and the second waits.
- * Cancelling or confirming the first opens the second.
- */
 export const UpdateAllReviewQueue: Story = {
   // Out of Pixel snapshots (snapshot budget): the review panel is snapshotted by UpdateRequiresReview.
   parameters: { pixel: PIXEL_DISABLED },

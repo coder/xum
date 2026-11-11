@@ -653,9 +653,8 @@ async function signOutPluginServersFromPalette(api: BuildSourcesParams["api"]): 
 }
 
 /**
- * "Update All Plugins": the same bulk update as Settings → Plugins ("Update all"), through the
- * shared helper. A capability-changing update is not applied here: its review opens in the
- * section, where the user confirms it.
+ * A capability-changing update is not applied here: its review opens in the section, where the
+ * user confirms it.
  */
 async function updateAllPluginsFromPalette(
   api: BuildSourcesParams["api"],
@@ -674,8 +673,6 @@ async function updateAllPluginsFromPalette(
   // section only the latest intent is kept for the next mount.
   publishPluginsSectionIntent({ type: "refresh" });
   if (result.updated.length > 0) {
-    // Mounted composers cache contributed slash-command/skill descriptors; an update can change
-    // them without a remount.
     publishAgentPluginsMutated();
   }
   const summary = summarizeUpdateAll(result);

@@ -425,7 +425,6 @@ describe("plugin update commands", () => {
     data: { name, fromSha: sha("a"), toSha: sha("b"), changes, warnings: [] },
   });
 
-  /** An API whose plugins have the given previews; update records the names it is asked for. */
   const pluginApi = (
     checks: Array<ReturnType<typeof check>>,
     previews: Record<string, ReturnType<typeof preview>>

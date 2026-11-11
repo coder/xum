@@ -12,7 +12,6 @@ import { summarizeUpdateAll, updateAllPlugins, type UpdateAllSummary } from "./u
 
 type Reviews = readonly AgentPluginUpdateReview[];
 
-/** The update review the section shows, and the ones waiting behind it (Update all can find several). */
 interface ReviewQueue {
   open: AgentPluginUpdateReview | null;
   queued: Reviews;
@@ -23,17 +22,12 @@ const queueOf = (reviews: Reviews): ReviewQueue => ({
   queued: reviews.slice(1),
 });
 
-/**
- * `onSettled` runs when the open review is dropped: confirmed, cancelled or cleared. The Update all
- * status then no longer describes what is left, so the caller dismisses it.
- */
+/** Once a review settles, the Update all status no longer describes what is left. */
 export function useUpdateReviewQueue(initial: Reviews, onSettled: () => void) {
   const [queue, setQueue] = useState(() => queueOf(initial));
   return {
     open: queue.open,
-    /** Replaces the open review and everything queued behind it. */
     show: (reviews: Reviews) => setQueue(queueOf(reviews)),
-    /** The open review was confirmed or cancelled: the next queued one opens. */
     next: () => {
       onSettled();
       setQueue((current) => queueOf(current.queued));
@@ -47,12 +41,10 @@ export function useUpdateReviewQueue(initial: Reviews, onSettled: () => void) {
 
 interface UpdateAllDeps {
   api: APIClient | null;
-  /** Name of the plugin with an action in flight; Update all holds it for the whole run. */
   busyPlugin: string | null;
   setBusyPlugin: (name: string | null) => void;
   items: readonly AgentPluginListItem[] | null;
   updateChecks: ReadonlyMap<string, AgentPluginUpdateCheck>;
-  /** Called before a run: an open review would confirm against a tree this run moves. */
   onStart: () => void;
   onReviews: (reviews: Reviews) => void;
   refresh: () => Promise<void>;
@@ -78,8 +70,6 @@ export function useUpdateAll(deps: UpdateAllDeps) {
       // The progress callback keeps `busyPlugin` set, which disables every per-card action.
       const result = await updateAllPlugins(deps.api, checks, deps.setBusyPlugin);
       if (result.updated.length > 0) {
-        // Mounted composers cache contributed slash-command/skill descriptors; an update can
-        // change them without a remount.
         publishAgentPluginsMutated();
       }
       deps.onReviews(result.reviews);
@@ -94,7 +84,6 @@ export function useUpdateAll(deps: UpdateAllDeps) {
   return { count, running, status, run, dismissStatus: () => setStatus(null) };
 }
 
-/** Shown only while a managed plugin has an update waiting. */
 export const UpdateAllButton: React.FC<{
   count: number;
   running: boolean;
@@ -114,7 +103,6 @@ export const UpdateAllButton: React.FC<{
   );
 };
 
-/** What the last Update all did, including what it left for the user. */
 export const UpdateAllStatus: React.FC<{ status: UpdateAllSummary | null }> = (props) => {
   if (props.status === null) return null;
   if (props.status.tone === "success") {
