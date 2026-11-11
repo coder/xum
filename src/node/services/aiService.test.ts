@@ -54,7 +54,6 @@ import { WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE } from "@/common/utils/workflow
 import type { InstructionSources } from "@/common/types/instructions";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import type { CompletedMessagePart } from "@/common/types/stream";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type {
   ErrorEvent,
@@ -891,16 +890,6 @@ describe("AIService status page turn-end nudge", () => {
 describe("AIService layout turn-end nudge", () => {
   afterEach(() => mock.restore());
 
-  const toolCall = (output: unknown): CompletedMessagePart => ({
-    type: "dynamic-tool",
-    toolCallId: "call-1",
-    toolName: "bash",
-    input: {},
-    state: "output-available",
-    output,
-  });
-  const succeeded = [toolCall({ success: true })];
-
   async function setup(artifactsOn = true) {
     const testHistory = await createTestHistoryService();
     const projectPath = path.join(testHistory.tempDir, "project");
@@ -924,11 +913,8 @@ describe("AIService layout turn-end nudge", () => {
       experimentsService,
     });
     const audit = spyOn(turnEndLayoutAudit, "workspaceHasNewLayoutIssueAtTurnEnd");
-    const nudge = (
-      parts: readonly CompletedMessagePart[],
-      streamStartedAtMs: number | undefined,
-      abortSignal = new AbortController().signal
-    ) => harness.service.layoutTurnEndNudge(workspaceId, { parts, streamStartedAtMs, abortSignal });
+    const nudge = (abortSignal = new AbortController().signal) =>
+      harness.service.layoutTurnEndNudge(workspaceId, { abortSignal });
     return { testHistory, projectPath, workspaceId, audit, nudge, config: harness.config };
   }
 
@@ -938,12 +924,11 @@ describe("AIService layout turn-end nudge", () => {
       audit.mockResolvedValue(true);
       const stop = new AbortController();
 
-      expect(await nudge(succeeded, 1_234, stop.signal)).toBe(LAYOUT_TURN_END_NUDGE);
+      expect(await nudge(stop.signal)).toBe(LAYOUT_TURN_END_NUDGE);
       expect(audit).toHaveBeenCalledTimes(1);
       const call = audit.mock.calls[0]?.[0];
       expect(call).toMatchObject({
         workspaceId,
-        streamStartedAtMs: 1_234,
         metadata: { id: workspaceId, projectPath, namedWorkspacePath: projectPath },
         // The agent's cwd, where a publish runs its audit too.
         cwd: projectPath,
@@ -959,25 +944,19 @@ describe("AIService layout turn-end nudge", () => {
     const { testHistory, audit, nudge } = await setup();
     try {
       audit.mockResolvedValueOnce(false);
-      expect(await nudge(succeeded, 1_000)).toBeNull();
+      expect(await nudge()).toBeNull();
       audit.mockRejectedValueOnce(new Error("runtime unreachable"));
-      expect(await nudge(succeeded, 1_000)).toBeNull();
+      expect(await nudge()).toBeNull();
     } finally {
       await testHistory.cleanup();
     }
   });
 
-  it.each([
-    { name: "the experiment is off", artifactsOn: false, parts: succeeded },
-    { name: "the turn made no tool call", parts: [] },
-    { name: "every tool call failed", parts: [toolCall({ success: false, error: "no" })] },
-    { name: "the stream's start is unknown", parts: succeeded, streamStart: undefined },
-  ])("does not audit when $name", async (row) => {
-    const { testHistory, audit, nudge } = await setup(row.artifactsOn ?? true);
+  it("does not audit when the experiment is off", async () => {
+    const { testHistory, audit, nudge } = await setup(false);
     try {
       audit.mockResolvedValue(true);
-      const start = "streamStart" in row ? row.streamStart : 1_000;
-      expect(await nudge(row.parts, start)).toBeNull();
+      expect(await nudge()).toBeNull();
       expect(audit).not.toHaveBeenCalled();
     } finally {
       await testHistory.cleanup();
@@ -995,8 +974,6 @@ describe("AIService layout turn-end nudge", () => {
       });
       expect(
         await harness.service.layoutTurnEndNudge("unknown-workspace", {
-          parts: succeeded,
-          streamStartedAtMs: 1_000,
           abortSignal: new AbortController().signal,
         })
       ).toBeNull();

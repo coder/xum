@@ -39,35 +39,12 @@ const remembered = new LRUCache<string, FingerprintSnapshot>({ max: LAYOUT_MEMOR
 // Per path, the start time (host clock, ms) of the latest audit that settled the page (see
 // LayoutAuditTurn.finish). The turn-end audit compares a page's modified time with it, so a page
 // is not audited twice for the same change. Bounded like the memory above. An evicted path reads
-// as "never audited": its bar is then the start of the stream that ends, as after a restart. So
-// an edit the page got in an earlier turn whose end ran no audit is not checked until the page
-// changes again, unless the page is still marked due (below).
+// as "never audited": its bar is then the time of its latest publish (pagesDueForAudit), as
+// after a restart.
 const lastAuditStartedAt = new LRUCache<string, number>({ max: LAYOUT_MEMORY_MAX_PATHS });
-
-// The paths a turn end picked for an audit that no audit has settled since. The modified-time
-// rule alone loses such a page when it has no start time above: the bar is then the start of
-// the ending stream, which moves on with every turn. Bounded like the memory above. An evicted
-// path is only picked again when it changes (no extra audit).
-const dueForAudit = new LRUCache<string, true>({ max: LAYOUT_MEMORY_MAX_PATHS });
 
 function pathKey(sessionDir: string, relPath: string): string {
   return JSON.stringify([sessionDir, relPath]);
-}
-
-/** An audit that started at `startedAtMs` settled the path: the latest start wins. */
-function settlePath(key: string, startedAtMs: number): void {
-  lastAuditStartedAt.set(key, Math.max(startedAtMs, lastAuditStartedAt.peek(key) ?? 0));
-  dueForAudit.delete(key);
-}
-
-/** Keeps the path picked for the turn-end audit until an audit settles it. */
-export function markLayoutAuditDue(sessionDir: string, relPath: string): void {
-  dueForAudit.set(pathKey(sessionDir, relPath), true);
-}
-
-/** Whether a turn end picked the path and no audit has settled it since, in this process. */
-export function isLayoutAuditDue(sessionDir: string, relPath: string): boolean {
-  return dueForAudit.has(pathKey(sessionDir, relPath));
 }
 
 /**
@@ -111,10 +88,9 @@ export interface LayoutAuditTurn {
    * whether or not `build` throws. Call it exactly once.
    *
    * The audit also settles the page: it records its start time for the path (the latest start
-   * wins: a slow early audit never moves it back) and clears the path's due mark, whether or
-   * not it remembers anything. It does not when `staysDue` says so for its report, or when
-   * `build` throws: a page that a turn end picked is then audited again at the next turn end,
-   * changed or not.
+   * wins: a slow early audit never moves it back), whether or not it remembers anything. It
+   * does not when `staysDue` says so for its report, or when `build` throws: the bar of the
+   * page stays where it was, so the next turn end audits it again, changed or not.
    */
   finish<T>(
     build: (previous: FingerprintSnapshot) => { report: T; next: FingerprintSnapshot },
@@ -152,7 +128,9 @@ export function startLayoutAudit(
         settled = staysDue?.(report) !== true;
         return report;
       } finally {
-        if (settled) settlePath(key, startedAtMs);
+        if (settled) {
+          lastAuditStartedAt.set(key, Math.max(startedAtMs, lastAuditStartedAt.peek(key) ?? 0));
+        }
         path.inFlight -= 1;
         if (path.inFlight === 0) auditsByPath.delete(key);
       }

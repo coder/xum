@@ -744,11 +744,6 @@ interface StopContinuationProvenance {
   admissionStopEpoch: number;
   /** A message the user sent started the turn (see AgentSession.turnStartedByUserMessage). */
   startedByUserMessage: boolean;
-  /**
-   * When the ended stream started (host clock, ms). Read here because the active stream state is
-   * reset before the hooks run.
-   */
-  streamStartedAtMs: number | undefined;
 }
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
@@ -1102,12 +1097,10 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     workspaceId: string,
     input: { messageId: string; parts: readonly CompletedMessagePart[] }
   ): Promise<string | null>;
-  /** The layout nudge for HTML artifacts the turn changed, or null. Absent: never. */
+  /** The layout nudge for HTML artifacts that are due for an audit, or null. Absent: never. */
   layoutTurnEndNudge?(
     workspaceId: string,
     input: {
-      parts: readonly CompletedMessagePart[];
-      streamStartedAtMs: number | undefined;
       /** A user Stop (or a shutdown) ends the audit: no nudge is returned. */
       abortSignal: AbortSignal;
     }
@@ -11012,7 +11005,7 @@ export class AgentSession {
       parts: payload.parts,
     });
     if (statusPageNudge != null) nudges.push(statusPageNudge);
-    const layoutNudge = await this.readLayoutNudge(payload, provenance, abortSignal);
+    const layoutNudge = await this.readLayoutNudge(provenance, abortSignal);
     if (layoutNudge != null) nudges.push(layoutNudge);
     return nudges;
   }
@@ -11024,18 +11017,11 @@ export class AgentSession {
    * (runTurnStopHooks).
    */
   private async readLayoutNudge(
-    payload: StreamEndEvent,
     provenance: StopContinuationProvenance,
     abortSignal: AbortSignal
   ): Promise<string | null> {
     if (provenance.externallyOwnedTurn) return null;
-    return (
-      (await this.aiService.layoutTurnEndNudge?.(this.workspaceId, {
-        parts: payload.parts,
-        streamStartedAtMs: provenance.streamStartedAtMs,
-        abortSignal,
-      })) ?? null
-    );
+    return (await this.aiService.layoutTurnEndNudge?.(this.workspaceId, { abortSignal })) ?? null;
   }
 
   /** Records whether the sent message whose stream starts now began a user turn. */
@@ -11073,7 +11059,6 @@ export class AgentSession {
       externallyOwnedTurn: this.isExternallyOwnedTurn(payload, context.options),
       admissionStopEpoch: context.admissionStopEpoch ?? this.getStopEpoch(),
       startedByUserMessage: this.turnStartedByUserMessage,
-      streamStartedAtMs: this.activeStreamStartedAtMs,
     };
   }
 

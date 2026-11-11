@@ -3,18 +3,17 @@ import type { ArtifactEntry } from "@/common/orpc/schemas/artifacts";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { Config } from "@/node/config";
-import { listArtifactRecords, withPublishedKinds } from "@/node/services/artifactRecordStore";
 import {
-  getWorkspaceArtifactCapabilities,
+  listArtifactRecords,
+  withPublishedKinds,
+  type ArtifactRecord,
+} from "@/node/services/artifactRecordStore";
+import {
   listArtifactsAtLocation,
   resolveArtifactsLocation,
 } from "@/node/services/artifactsOperations";
 import { checkArtifactLayout } from "@/node/services/layoutAudit/checkArtifactLayout";
-import {
-  isLayoutAuditDue,
-  layoutAuditLastStartedAtMs,
-  markLayoutAuditDue,
-} from "@/node/services/layoutAudit/layoutFingerprints";
+import { layoutAuditLastStartedAtMs } from "@/node/services/layoutAudit/layoutFingerprints";
 import { hasNewLayoutIssue } from "@/node/services/layoutAudit/layoutReport";
 import type { LayoutAuditReport } from "@/common/types/artifactLayoutAudit";
 import { log } from "@/node/services/log";
@@ -35,60 +34,55 @@ export const TURN_END_AUDIT_MAX_PAGES = 3;
 /** What the audit reads of a workspace's artifacts: the tab's listing, not the files. */
 export interface TurnEndArtifactListing {
   entries: ReadonlyArray<Pick<ArtifactEntry, "path" | "kind" | "modifiedMs">>;
-  /** Paths that have a publish record. */
-  publishedPaths: readonly string[];
+  /** The publish records: a page is published when it has one. */
+  published: ReadonlyArray<Pick<ArtifactRecord, "path" | "publishedAtMs">>;
 }
 
 /**
- * The pages that are due for an audit, newest first: published, shown as HTML, and either
- * changed since their last audit or picked by an earlier turn end and not settled since.
- * "Changed" is one rule: modified at or after the start of the last audit that settled the
- * page, else (after a restart, or before any audit) at or after the start of the ending stream.
- * So a restart audits nothing old, and a publish-time audit is not repeated: it started after
- * the write it covers.
+ * The pages that are due for an audit, newest first: published, shown as HTML, and modified at
+ * or after their bar. The bar is the start of the last audit that settled the page in this
+ * process, else the time of its latest publish (each publish rewrites the record). A publish
+ * audits the page after it writes the record, so a publish-time audit is not repeated, and an
+ * edit made before the latest publish is the publish's to check.
  *
- * A picked page stays due until an audit settles it (LayoutAuditTurn.finish). A turn-end audit
- * that found a new issue does not: new input or a Stop can win over the continuation that tells
- * the agent, so the page is audited at each turn end until a publish has shown the issue. The
- * same holds for a page whose audit a Stop ended, and for the pages past the cap of one turn
- * end.
+ * Due is derived, never marked: a page whose audit did not settle it keeps its bar, so the rule
+ * alone keeps it due at later turn ends, after a restart and after an eviction from the start
+ * times. That covers a page past the cap of one turn end, one that a Stop or a failure ended the
+ * audit of, and one whose turn-end audit found a new issue: new input or a Stop can win over
+ * the continuation that tells the agent, so the page is audited at each turn end until a
+ * publish has shown the issue.
  */
 export function pagesDueForAudit(
   listing: TurnEndArtifactListing,
-  streamStartedAtMs: number,
-  lastAuditStartedAtMs: (relPath: string) => number | undefined,
-  isDue: (relPath: string) => boolean
+  lastAuditStartedAtMs: (relPath: string) => number | undefined
 ): string[] {
-  const published = new Set(listing.publishedPaths);
+  const publishedAtMs = new Map(
+    listing.published.map((record) => [record.path, record.publishedAtMs])
+  );
   return listing.entries
-    .filter(
-      (entry) =>
+    .filter((entry) => {
+      const publishedAt = publishedAtMs.get(entry.path);
+      return (
         entry.kind === "html" &&
-        published.has(entry.path) &&
-        (isDue(entry.path) ||
-          entry.modifiedMs >= (lastAuditStartedAtMs(entry.path) ?? streamStartedAtMs))
-    )
+        publishedAt != null &&
+        entry.modifiedMs >= (lastAuditStartedAtMs(entry.path) ?? publishedAt)
+      );
+    })
     .sort((a, b) => b.modifiedMs - a.modifiedMs)
     .map((entry) => entry.path);
 }
 
 export interface TurnEndLayoutAuditDeps {
-  /** When the ending stream started (host clock, ms). */
-  streamStartedAtMs: number;
   /** A user Stop, or a shutdown: ends the audit, and then nothing is reported. */
   abortSignal: AbortSignal;
   list: () => Promise<TurnEndArtifactListing>;
   lastAuditStartedAtMs: (relPath: string) => number | undefined;
-  /** Whether an earlier turn end picked the page and no audit has settled it since. */
-  isDue: (relPath: string) => boolean;
-  /** Keeps the page picked until an audit settles it. */
-  markDue: (relPath: string) => void;
   /** Audits one page and leaves the fix-loop memory as it was. */
   audit: (relPath: string, abortSignal: AbortSignal) => Promise<LayoutAuditReport | undefined>;
 }
 
 /**
- * Whether at least one changed page has a new layout issue. The pages run at the same time, each
+ * Whether at least one due page has a new layout issue. The pages run at the same time, each
  * with the audit's own budget. Whatever fails (the listing, an audit) counts as no finding: the
  * turn has already ended, and "not checked" is never a reason to wake the agent.
  */
@@ -96,15 +90,10 @@ export async function hasNewLayoutIssueAtTurnEnd(deps: TurnEndLayoutAuditDeps): 
   let pages: string[];
   try {
     if (deps.abortSignal.aborted) return false;
-    const due = pagesDueForAudit(
-      await deps.list(),
-      deps.streamStartedAtMs,
-      deps.lastAuditStartedAtMs,
-      deps.isDue
+    pages = pagesDueForAudit(await deps.list(), deps.lastAuditStartedAtMs).slice(
+      0,
+      TURN_END_AUDIT_MAX_PAGES
     );
-    // Before any audit runs: a Stop, a failure and the cap must not lose a picked page.
-    due.forEach(deps.markDue);
-    pages = due.slice(0, TURN_END_AUDIT_MAX_PAGES);
   } catch (error) {
     log.debug("turn-end layout audit could not list the artifacts", { error });
     return false;
@@ -128,16 +117,15 @@ export interface WorkspaceTurnEndLayoutAudit {
   /** The agent's bash runtime and cwd, where a publish audits the page too. */
   runtime: Runtime;
   cwd: string;
-  streamStartedAtMs: number;
   abortSignal: AbortSignal;
 }
 
 /**
  * hasNewLayoutIssueAtTurnEnd for a real workspace. It looks nothing up, lists nothing and audits
- * nothing in a side chat, when the workspace has published nothing (most turn ends: no location lookup, which
- * can be an exec on a remote runtime, and no probe), when it has no artifacts location, or when
- * the probe the tab uses says agent-browser is missing (a probe that could not answer does not
- * stop the audit: it reports "not checked").
+ * nothing in a side chat, when the workspace has published nothing (most turn ends: no location
+ * lookup, which can be an exec on a remote runtime), or when it has no artifacts location. A
+ * workspace without agent-browser is not skipped here: the audit itself reports "not checked"
+ * within a fraction of a second, and that settles the page.
  */
 export async function workspaceHasNewLayoutIssueAtTurnEnd(
   input: WorkspaceTurnEndLayoutAudit
@@ -153,23 +141,20 @@ export async function workspaceHasNewLayoutIssueAtTurnEnd(
     abortSignal,
   });
   if (location.kind === "unavailable") return false;
-  const projects = input.config.loadConfigOrDefault().projects;
-  const capabilities = await getWorkspaceArtifactCapabilities(workspaceId, metadata, projects);
-  if (capabilities.agentBrowserAvailable === false) return false;
-  const trusted = isWorkspaceTrustedForSharedExecution(metadata, projects);
+  const trusted = isWorkspaceTrustedForSharedExecution(
+    metadata,
+    input.config.loadConfigOrDefault().projects
+  );
   return hasNewLayoutIssueAtTurnEnd({
-    streamStartedAtMs: input.streamStartedAtMs,
     abortSignal,
     list: async () => {
       const listing = await listArtifactsAtLocation(location, abortSignal);
       return {
         entries: withPublishedKinds(listing.entries, records),
-        publishedPaths: records.map((record) => record.path),
+        published: records,
       };
     },
     lastAuditStartedAtMs: (relPath) => layoutAuditLastStartedAtMs(sessionDir, relPath),
-    isDue: (relPath) => isLayoutAuditDue(sessionDir, relPath),
-    markDue: (relPath) => markLayoutAuditDue(sessionDir, relPath),
     audit: (relPath, signal) =>
       checkArtifactLayout({
         kind: "html",

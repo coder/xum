@@ -105,7 +105,7 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import type { CompletedMessagePart } from "@/common/types/stream";
-import { madeSuccessfulToolCall, needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
+import { needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
 import {
   workspaceHasNewLayoutIssueAtTurnEnd,
   type WorkspaceTurnEndLayoutAudit,
@@ -658,26 +658,16 @@ export class AIService extends EventEmitter {
 
   /**
    * The turn-end layout nudge (see turnEndLayoutAudit.ts), or null: audits the published HTML
-   * artifacts that changed since their last audit, and asks for the nudge only when one has an
-   * issue no publish result has listed. A turn that made no successful tool call changed nothing,
-   * and `streamStartedAtMs` (absent when the ended stream's start is unknown) is the change bar
-   * for pages with no audit of their own. Fail-soft: a turn that ended must still end.
+   * artifacts that are due, and asks for the nudge only when one has an issue no publish result
+   * has listed. A turn that changed nothing finds no page due, so nothing is audited (the
+   * turn's own tool calls are not read: a compaction can end the stream that held them).
+   * Fail-soft: a turn that ended must still end.
    */
   async layoutTurnEndNudge(
     workspaceId: string,
-    input: {
-      parts: readonly CompletedMessagePart[];
-      streamStartedAtMs: number | undefined;
-      abortSignal: AbortSignal;
-    }
+    input: { abortSignal: AbortSignal }
   ): Promise<string | null> {
-    if (
-      input.streamStartedAtMs == null ||
-      !this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) ||
-      !madeSuccessfulToolCall(input.parts)
-    ) {
-      return null;
-    }
+    if (!this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) return null;
     try {
       const target = await this.layoutAuditTarget(workspaceId);
       if (target == null) return null;
@@ -685,7 +675,6 @@ export class AIService extends EventEmitter {
         workspaceId,
         config: this.config,
         ...target,
-        streamStartedAtMs: input.streamStartedAtMs,
         abortSignal: input.abortSignal,
       });
       return found ? LAYOUT_TURN_END_NUDGE : null;

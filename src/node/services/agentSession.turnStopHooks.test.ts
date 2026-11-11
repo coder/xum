@@ -1555,33 +1555,6 @@ describe("layout turn-end nudge", () => {
     expect(calls).toHaveLength(1);
   });
 
-  test("the audit gets the turn's parts and the time the ended stream started", async () => {
-    const calls: LayoutCall[] = [];
-    const before = Date.now();
-    let streaming = 0;
-    const parts: CompletedMessagePart[] = [{ type: "text", text: "edited the page" }];
-    const { h } = await setup({
-      layoutNudge: findsIssue(calls),
-      parts: () => parts,
-      whileStreaming: (turn) => {
-        // The first stream takes a while, so its start and its end are different times: a page
-        // the turn wrote in between counts as changed only against the start. The nudged turn
-        // streams too, and must not move the mark.
-        if (turn !== 1) return;
-        streaming = Date.now();
-        Bun.sleepSync(25);
-      },
-    });
-
-    await h.session.sendMessage("fix the bug", options);
-    await settle(h);
-
-    // The stream's state is reset before the hooks run: the start time must be read ahead.
-    expect(calls[0]?.parts).toEqual(parts);
-    expect(calls[0]?.streamStartedAtMs).toBeGreaterThanOrEqual(before);
-    expect(calls[0]?.streamStartedAtMs).toBeLessThanOrEqual(streaming);
-  });
-
   test("a turn the audit finds nothing in is not nudged", async () => {
     const { h, streams } = await setup({ layoutNudge: () => Promise.resolve(null) });
 

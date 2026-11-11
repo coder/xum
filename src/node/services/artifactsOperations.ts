@@ -14,7 +14,6 @@ import type {
   ArtifactEntry,
   ArtifactListing,
 } from "@/common/orpc/schemas/artifacts";
-import type { ProjectsConfig } from "@/common/types/project";
 import type { ArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -335,30 +334,17 @@ export async function getArtifactsCapabilities(
   assertArtifactsEnabled(context);
   const metadata = await context.workspaceService.getInfo(input.workspaceId);
   if (!metadata) return { agentBrowserAvailable: null };
-  return getWorkspaceArtifactCapabilities(
-    input.workspaceId,
-    metadata,
-    context.config.loadConfigOrDefault().projects
-  );
-}
-
-/**
- * The capability probe of a workspace whose metadata the caller has. The tab and the turn-end
- * layout audit both call it, so they share one cache entry and one answer.
- */
-export function getWorkspaceArtifactCapabilities(
-  workspaceId: string,
-  metadata: FrontendWorkspaceMetadata,
-  projects: ProjectsConfig["projects"]
-): Promise<ArtifactCapabilities> {
   return getArtifactCapabilities({
-    workspaceId,
+    workspaceId: input.workspaceId,
     // A recreated workspace on another runtime must not reuse the old answer.
     runtimeKey: JSON.stringify(metadata.runtimeConfig ?? null),
     createRuntime: () => createRuntimeForWorkspace(metadata),
     // Probe where and how the agent's bash tool runs, tool_env included.
     resolveCwd: (runtime) => resolveWorkspaceExecutionPath(metadata, runtime),
-    trusted: isWorkspaceTrustedForSharedExecution(metadata, projects),
+    trusted: isWorkspaceTrustedForSharedExecution(
+      metadata,
+      context.config.loadConfigOrDefault().projects
+    ),
   });
 }
 
