@@ -46,33 +46,23 @@ function followPositions(positions: number[], edits: Edit[]): number[] {
   return followed;
 }
 
-/**
- * `text.replace(pattern, ...)` for a global pattern, and what each match became. `marked` holds the
- * position in the new text of the last character of each replacement whose match `marks` accepts (none
- * when it is omitted).
- */
+/** `text.replace(pattern, ...)` for a global pattern, and what each match became. */
 function replaceMatches(
   text: string,
   pattern: RegExp,
-  replacer: (match: RegExpExecArray) => string,
-  marks?: (match: RegExpExecArray) => boolean
-): { text: string; edits: Edit[]; marked: number[] } {
+  replacer: (match: RegExpExecArray) => string
+): { text: string; edits: Edit[] } {
   const parts: string[] = [];
   const edits: Edit[] = [];
-  const marked: number[] = [];
   let from = 0;
-  let shift = 0;
   for (const match of text.matchAll(pattern)) {
-    const at = match.index;
     const replacement = replacer(match);
-    parts.push(text.slice(from, at), replacement);
-    edits.push({ at, removed: match[0].length, added: replacement.length });
-    if (marks?.(match)) marked.push(at + shift + replacement.length - 1);
-    shift += replacement.length - match[0].length;
-    from = at + match[0].length;
+    parts.push(text.slice(from, match.index), replacement);
+    edits.push({ at: match.index, removed: match[0].length, added: replacement.length });
+    from = match.index + match[0].length;
   }
   parts.push(text.slice(from));
-  return { text: parts.join(""), edits, marked };
+  return { text: parts.join(""), edits };
 }
 
 /**
@@ -82,6 +72,7 @@ function replaceMatches(
  * text, since the text can hold a credential.
  */
 function removeAt(text: string, positions: number[]): string {
+  if (positions.length === 0) return text;
   const parts: string[] = [];
   let from = 0;
   for (const position of positions) {
@@ -555,7 +546,7 @@ function advanceHint(text: string, at: number, state: HintState): number {
 function redactCookieHeaders(
   text: string,
   onRemoved: (removed: string) => void,
-  onEdit: (edit: Edit) => void
+  onEdit?: (edit: Edit) => void
 ): string {
   const state: HintState = {
     frame: null,
@@ -583,7 +574,7 @@ function redactCookieHeaders(
     const removed = text.slice(value.start, end);
     if (removed !== "" && removed !== REDACTED) {
       parts.push(text.slice(copied, value.start), REDACTED);
-      onEdit({ at: value.start, removed: end - value.start, added: REDACTED.length });
+      onEdit?.({ at: value.start, removed: end - value.start, added: REDACTED.length });
       copied = end;
       state.redactedEnd = end;
       onRemoved(removed);
@@ -632,31 +623,45 @@ function runRedactionPasses(
       return `${kept}${REDACTED}`;
     }
   );
+  // The edits of each pass are logged only once a `]` is tracked: a text without one costs what it
+  // cost before.
   let artifacts: number[] = [];
+  let edits: Edit[] | null = null;
+  let added: number[] | null = null;
+  let shift = 0;
+  const replaceStandalone = (match: string, offset: number, whole: string): string => {
+    fromRegex(match);
+    if (MARKER_HEAD.test(match) && whole.charAt(offset + match.length) === "]") {
+      (added ??= []).push(offset + shift + REDACTED.length - 1);
+    }
+    edits?.push({ at: offset, removed: match.length, added: REDACTED.length });
+    shift += REDACTED.length - match.length;
+    return REDACTED;
+  };
   for (const pattern of STANDALONE_SECRET_PATTERNS) {
-    const replaced = replaceMatches(
-      redacted,
-      pattern,
-      (match) => {
-        fromRegex(match[0]);
-        return REDACTED;
-      },
-      (match) =>
-        MARKER_HEAD.test(match[0]) && match.input.charAt(match.index + match[0].length) === "]"
-    );
-    redacted = replaced.text;
-    // Only the signed-URL pattern marks, and no pattern before it did, so the two lists are never both
-    // in play and the result stays ascending. `removeAt` asserts it.
-    artifacts = [...followPositions(artifacts, replaced.edits), ...replaced.marked];
+    edits = artifacts.length > 0 ? [] : null;
+    added = null;
+    shift = 0;
+    redacted = redacted.replace(pattern, replaceStandalone);
+    if (edits !== null) artifacts = followPositions(artifacts, edits);
+    // Only the signed-URL pattern adds, and no pattern before it tracked anything, so the two lists
+    // are never both in play and the result stays ascending. `removeAt` asserts it.
+    if (added !== null) artifacts = [...artifacts, ...added];
   }
-  const keyValue = replaceMatches(redacted, SECRET_KEY_VALUE_PATTERN, (match) => {
-    const prefix = match[1];
-    fromRegex(match[0].slice(prefix.length));
+  const replaceKeyValue = (match: string, prefix: string): string => {
+    fromRegex(match.slice(prefix.length));
     return `${prefix}${REDACTED}`;
-  });
-  redacted = keyValue.text;
-  // A key's prefix holds no marker, so the whole match counts as the span that was replaced.
-  artifacts = followPositions(artifacts, keyValue.edits);
+  };
+  if (artifacts.length === 0) {
+    redacted = redacted.replace(SECRET_KEY_VALUE_PATTERN, replaceKeyValue);
+  } else {
+    const keyValue = replaceMatches(redacted, SECRET_KEY_VALUE_PATTERN, (match) =>
+      replaceKeyValue(match[0], match[1])
+    );
+    redacted = keyValue.text;
+    // A key's prefix holds no marker, so the whole match counts as the span that was replaced.
+    artifacts = followPositions(artifacts, keyValue.edits);
+  }
   // Last, on what the passes above left: the reader only replaces spans of their output with the
   // marker, so it never brings back a character they took out. It adds the rest of a value that
   // the regex ended early (at a quote, a `]` or a marker inside it), and never redacts less.
@@ -664,7 +669,7 @@ function runRedactionPasses(
   redacted = redactCookieHeaders(
     redacted,
     (removed) => onRemoved(removed, "reader"),
-    (edit) => readerEdits.push(edit)
+    artifacts.length > 0 ? (edit) => readerEdits.push(edit) : undefined
   );
   return { text: redacted, artifacts: followPositions(artifacts, readerEdits) };
 }
