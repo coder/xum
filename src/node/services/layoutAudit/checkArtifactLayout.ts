@@ -1,6 +1,7 @@
 import * as path from "path";
 import { pathToFileURL } from "url";
 import { LAYOUT_AUDIT_BUDGET_MS } from "@/common/constants/artifactLayoutAudit";
+import { getArtifactKind } from "@/common/utils/artifactKind";
 import type { LayoutAuditReport } from "@/common/types/artifactLayoutAudit";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { AvailableArtifactsLocation } from "@/node/services/artifactsOperations";
@@ -126,10 +127,20 @@ async function outcomesOrFailed(input: ArtifactLayoutInput): Promise<ViewportOut
  * audit that starts finishes exactly once, whatever happened to its work: the ordering state of
  * its path lives until then.
  */
+/**
+ * Whether a publish of `relPath` as `kind` is audited: shown as HTML, and named so that the
+ * browser parses it as HTML. The browser opens the file by its `file://` URL and picks the
+ * document type from the name, so a `page.txt` published as html would load as plain text and
+ * could read clean. Such a file is not audited (no `layout`), like any other kind.
+ */
+export function isAuditableHtml(kind: string, relPath: string): boolean {
+  return kind === "html" && getArtifactKind(relPath) === "html";
+}
+
 export async function checkArtifactLayout(
   input: ArtifactLayoutInput
 ): Promise<LayoutAuditReport | undefined> {
-  if (input.kind !== "html") return undefined;
+  if (!isAuditableHtml(input.kind, input.relPath)) return undefined;
   const turn = startLayoutAudit(input.sessionDir, input.relPath);
   const outcomes = await outcomesOrFailed(input);
   try {
