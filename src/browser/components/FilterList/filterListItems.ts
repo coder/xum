@@ -41,3 +41,20 @@ export function stepFilterListIndex(current: number, delta: 1 | -1, count: numbe
   if (current < 0) return delta === 1 ? 0 : count - 1;
   return (current + delta + count) % count;
 }
+
+/**
+ * The rows to render: at most `max`, always including the selected item when it matches. A long
+ * list would otherwise cut the selection off, and the first row would then look like (and act as)
+ * the current choice.
+ */
+export function windowFilterListItems<T extends FilterListItem>(
+  matches: readonly T[],
+  selected: string | null,
+  max: number
+): T[] {
+  const rows = matches.slice(0, max);
+  const selectedItem = matches.find((item) => item.value === selected);
+  if (selectedItem === undefined || rows.includes(selectedItem)) return rows;
+  // Lead with the selection so it is the active row; the last windowed row makes room for it.
+  return [selectedItem, ...rows.slice(0, Math.max(0, max - 1))];
+}

@@ -6,6 +6,7 @@ import {
   filterListItems,
   splitFilterMatch,
   stepFilterListIndex,
+  windowFilterListItems,
   type FilterListItem,
 } from "./filterListItems";
 
@@ -44,7 +45,7 @@ export function FilterList(props: {
   const [activeValue, setActiveValue] = useState<string | null>(null);
 
   const matches = filterListItems(props.items, query);
-  const rows = matches.slice(0, MAX_RENDERED_ROWS);
+  const rows = windowFilterListItems(matches, props.selected, MAX_RENDERED_ROWS);
   const explicitIndex = rows.findIndex((item) => item.value === activeValue);
   const selectedIndex = rows.findIndex((item) => item.value === props.selected);
   // Without an explicit move the selected row is active, else the first match.
@@ -123,6 +124,9 @@ export function FilterList(props: {
               // Focus stays in the input; the rows are pointer targets.
               tabIndex={-1}
               disabled={props.disabled}
+              // A click must not take focus from the input, or typing and the arrows would stop
+              // filtering and moving while the list stays open (the branch picker does).
+              onMouseDown={(event) => event.preventDefault()}
               onClick={() => props.onSelect(item.value)}
               onMouseMove={() => {
                 if (activeValue !== item.value) setActiveValue(item.value);

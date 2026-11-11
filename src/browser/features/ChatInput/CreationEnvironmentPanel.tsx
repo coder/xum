@@ -1,12 +1,5 @@
 import { useId, useRef, useState, type ReactNode } from "react";
-import {
-  AlertTriangle,
-  Check,
-  ChevronDown,
-  GitBranch,
-  ShieldAlert,
-  ShieldCheck,
-} from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, GitBranch } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { FilterList } from "@/browser/components/FilterList/FilterList";
@@ -55,8 +48,6 @@ interface CreationEnvironmentPanelProps {
   workspaceFields: ReactNode;
   branch: EnvironmentBranchPicker | null;
   fieldError: RuntimeFieldError | null;
-  /** Trust of the SSH+None directory, or null when it does not apply. */
-  directoryTrusted: boolean | null;
 }
 
 const COLUMN_SELECTOR = "[data-environment-column]";
@@ -139,7 +130,12 @@ function OptionColumn<T extends string>(props: {
                 // aria-disabled as well: assistive tech and tests read it on a native-disabled row.
                 aria-disabled={rowDisabled}
                 disabled={rowDisabled}
-                onClick={() => props.onChange(option.value)}
+                // Re-picking the selected row is a no-op, as with the select this replaced: the
+                // pick rebuilds the runtime and would drop what the row's fields hold (for
+                // example Docker's credential sharing).
+                onClick={() => {
+                  if (!checked) props.onChange(option.value);
+                }}
                 className={cn(
                   "focus-visible:ring-accent flex w-full items-start gap-2.5 rounded-sm px-2 py-1.5 text-left outline-none focus-visible:ring-1",
                   checked ? "bg-hover" : "hover:bg-hover/60",
@@ -267,11 +263,9 @@ function ChipSummary(props: {
   summary: EnvironmentSummary;
   projectUi: IsolationOptionUi | undefined;
   workspaceUi: IsolationOptionUi | undefined;
-  directoryTrusted: boolean | null;
 }) {
   const { summary, projectUi } = props;
   const ProjectIcon = projectUi?.Icon;
-  const TrustIcon = props.directoryTrusted === true ? ShieldCheck : ShieldAlert;
   return (
     <>
       <span className="sr-only">Environment:</span>
@@ -302,16 +296,6 @@ function ChipSummary(props: {
       >
         {summary.isolation}
       </span>
-      {props.directoryTrusted !== null && (
-        <TrustIcon
-          role="img"
-          aria-label={props.directoryTrusted ? "Trusted directory" : "Untrusted directory"}
-          className={cn(
-            "size-3.5 shrink-0",
-            props.directoryTrusted ? "text-success-text" : "text-warning-text"
-          )}
-        />
-      )}
       <ChipBranch branch={summary.branch} />
       <ChevronDown aria-hidden className="text-muted size-3.5 shrink-0" />
     </>
@@ -389,7 +373,6 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
                     (option) => option.value === props.isolation.workspace
                   )?.ui
                 }
-                directoryTrusted={props.directoryTrusted}
               />
             </button>
           </PopoverTrigger>

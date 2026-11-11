@@ -75,7 +75,9 @@ function ProjectSwitcher(props: {
 }) {
   const [open, setOpen] = useState(false);
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    // A lock that lands while the list is open (a send, a file read, a recording) closes it: the
+    // open rows would otherwise still switch projects under the draft the lock protects.
+    <Popover open={open && !props.disabled} onOpenChange={setOpen}>
       <Tooltip>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
@@ -94,7 +96,12 @@ function ProjectSwitcher(props: {
         </TooltipTrigger>
         <TooltipContent align="start">{props.tooltip}</TooltipContent>
       </Tooltip>
-      <PopoverContent align="start" className="w-[min(22rem,calc(100vw-1rem))] p-0">
+      {/* Fits the space Radix has on the side it opens: on a short phone (keyboard up) the list
+          opens above the heading and must end below the top safe-area band, not under it. */}
+      <PopoverContent
+        align="start"
+        className="flex max-h-(--radix-popover-content-available-height) w-[min(22rem,calc(100vw-1rem))] flex-col p-0"
+      >
         <FilterList
           items={props.items}
           selected={props.selected}
@@ -106,6 +113,7 @@ function ProjectSwitcher(props: {
           label="Select project"
           placeholder="Find a project…"
           noun="projects"
+          disabled={props.disabled}
           listClassName="max-h-72"
         />
       </PopoverContent>

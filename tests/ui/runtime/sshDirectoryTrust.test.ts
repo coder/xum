@@ -10,7 +10,12 @@ import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, openProjectCreationView, selectCreationIsolation } from "../helpers";
+import {
+  cleanupView,
+  openCreationEnvironment,
+  openProjectCreationView,
+  selectCreationIsolation,
+} from "../helpers";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { expandProjects } from "@/browser/stories/helpers/uiState";
 import type { ProjectConfig } from "@/common/types/project";
@@ -20,8 +25,8 @@ const describeIntegration = shouldRunIntegrationTests() ? describe : describe.sk
 type AppView = ReturnType<typeof renderApp>;
 
 /**
- * The trust row and the host and directory inputs are in the environment panel, which is portaled
- * to document.body; "Set as default" stays on the page. Both are under the document body.
+ * The host and directory inputs are in the environment panel, which is portaled to document.body;
+ * the trust row and "Set as default" stay on the page. Both are under the document body.
  */
 const page = (): HTMLElement => document.body;
 
@@ -83,13 +88,18 @@ describeIntegration("SSH+None directory trust (UI)", () => {
       const view = renderApp({ apiClient: client });
 
       try {
-        const { user, dirInput } = await openSshNoneForm(view, projectPath, dir);
+        const { user } = await openSshNoneForm(view, projectPath, dir);
         await user.click(await findButtonEventually(page(), "Trust directory"));
 
         await findButtonEventually(page(), "Untrust");
         expect(page().textContent).toContain("Trusted directory");
-        // The host-resolved path replaces ~ in the field, matching the stored trust entry.
-        expect(dirInput.value).toBe(dir.replace(/^~/, "/home/mock"));
+        // The host-resolved path replaces ~ in the field, matching the stored trust entry. The
+        // trust row is on the page, so clicking it closed the panel that holds the field.
+        await openCreationEnvironment(view.container);
+        const dirInput = page().querySelector<HTMLInputElement>(
+          'input[aria-label="Project directory on host"]'
+        );
+        expect(dirInput?.value).toBe(dir.replace(/^~/, "/home/mock"));
       } finally {
         await cleanupView(view, cleanupDom);
       }

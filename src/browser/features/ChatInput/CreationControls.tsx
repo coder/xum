@@ -34,7 +34,6 @@ import {
 import { CreationProjectSelect } from "./CreationProjectSelect";
 import { SetDefaultIsolationButton } from "./SetDefaultIsolationButton";
 import { SshDirectoryTrustNotice } from "./SshDirectoryTrustNotice";
-import { resolveSshDirectoryTrustNotice } from "./sshDirectoryTrustState";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { cn } from "@/common/lib/utils";
@@ -463,7 +462,7 @@ function SshHostInput(props: {
 
 /**
  * What the selected "Run on" option asks for, shown under its row in the environment panel: the
- * SSH host (and, without isolation, the directory and its trust), or the Coder workspace form.
+ * SSH host (and, without isolation, the directory), or the Coder workspace form.
  * These used to trail the sentence of selects; under the row they belong to, it is clear which
  * choice asks for them.
  */
@@ -476,8 +475,6 @@ function ProjectIsolationFields(props: {
   coderDeploymentUrl: string | undefined;
   disabled: boolean;
   runtimeFieldError: RuntimeFieldError | null;
-  projectPath: string;
-  userProjects: Map<string, ProjectConfig>;
   onSelectedRuntimeChange: (runtime: ParsedRuntime) => void;
 }) {
   const { coderProps, onSelectedRuntimeChange } = props;
@@ -499,13 +496,6 @@ function ProjectIsolationFields(props: {
           onSelectedRuntimeChange={onSelectedRuntimeChange}
         />
       )}
-      <SshNoneDirectoryTrust
-        runtime={props.sshNoneRuntime}
-        projectPath={props.projectPath}
-        userProjects={props.userProjects}
-        disabled={props.disabled}
-        onSelectedRuntimeChange={onSelectedRuntimeChange}
-      />
       {props.isCoderSelected && coderProps && (
         <div className="flex flex-col gap-1.5" data-testid="coder-controls">
           {/* Coder runtime needs availability status without the SSH-only toggle. */}
@@ -853,16 +843,6 @@ function CreationControlsContent(props: CreationControlsProps) {
     isNonGitRepo,
     fieldError,
   };
-  // The chip shows the SSH+None directory's trust, since the trust row itself is in the panel.
-  const directoryTrust = sshNoneRuntime
-    ? resolveSshDirectoryTrustNotice({
-        projectPath: props.projectPath,
-        userProjects: props.userProjects,
-        host: sshNoneRuntime.host,
-        projectDir: sshNoneRuntime.projectDir ?? "",
-      })
-    : null;
-
   const selectIsolation = (choice: IsolationChoice) => {
     const runtime = runtimeForIsolationChoice(choice, {
       runtimeChoiceContext,
@@ -1006,61 +986,71 @@ function CreationControlsContent(props: CreationControlsProps) {
       </div>
 
       <div
-        className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-2"
+        className="flex min-w-0 flex-col gap-1.5"
         data-component="RuntimeTypeGroup"
         // Tests and stories wait on this the way a user waits for the branch to appear.
         data-branch-load={props.branchLoad}
       >
-        <CreationEnvironmentPanel
-          summary={summarizeEnvironment(environmentInput)}
-          description={describeEnvironment(environmentInput)}
-          disabled={props.disabled}
-          isolation={currentIsolation}
-          projectOptions={projectIsolationOptions}
-          workspaceOptions={workspaceIsolationOptions}
-          onSelectIsolation={selectIsolation}
-          projectFields={
-            currentIsolation.project === "local" ? null : (
-              <ProjectIsolationFields
-                selectedRuntime={selectedRuntime}
-                sshNoneRuntime={sshNoneRuntime}
-                isCoderSelected={isCoderSelected}
-                coderProps={props.coderProps}
-                coderUsername={coderUsername}
-                coderDeploymentUrl={coderDeploymentUrl}
-                disabled={props.disabled}
-                runtimeFieldError={fieldError}
-                projectPath={props.projectPath}
-                userProjects={props.userProjects}
-                onSelectedRuntimeChange={onSelectedRuntimeChange}
-              />
-            )
-          }
-          workspaceFields={workspaceIsolationFields({
-            selectedRuntime,
-            devcontainerSelection,
-            disabled: props.disabled,
-            runtimeFieldError: fieldError,
-            onSelectedRuntimeChange,
-          })}
-          branch={
-            environmentUsesBaseBranch(environmentInput)
-              ? {
-                  load: props.branchLoad,
-                  options: branchOptions,
-                  selected: props.trunkBranch,
-                  onSelect: props.onTrunkBranchChange,
-                }
-              : null
-          }
-          fieldError={fieldError}
-          directoryTrusted={directoryTrust?.trusted ?? null}
-        />
-        <SetDefaultIsolationButton
+        <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-2">
+          <CreationEnvironmentPanel
+            summary={summarizeEnvironment(environmentInput)}
+            description={describeEnvironment(environmentInput)}
+            disabled={props.disabled}
+            isolation={currentIsolation}
+            projectOptions={projectIsolationOptions}
+            workspaceOptions={workspaceIsolationOptions}
+            onSelectIsolation={selectIsolation}
+            projectFields={
+              currentIsolation.project === "local" ? null : (
+                <ProjectIsolationFields
+                  selectedRuntime={selectedRuntime}
+                  sshNoneRuntime={sshNoneRuntime}
+                  isCoderSelected={isCoderSelected}
+                  coderProps={props.coderProps}
+                  coderUsername={coderUsername}
+                  coderDeploymentUrl={coderDeploymentUrl}
+                  disabled={props.disabled}
+                  runtimeFieldError={fieldError}
+                  onSelectedRuntimeChange={onSelectedRuntimeChange}
+                />
+              )
+            }
+            workspaceFields={workspaceIsolationFields({
+              selectedRuntime,
+              devcontainerSelection,
+              disabled: props.disabled,
+              runtimeFieldError: fieldError,
+              onSelectedRuntimeChange,
+            })}
+            branch={
+              environmentUsesBaseBranch(environmentInput)
+                ? {
+                    load: props.branchLoad,
+                    options: branchOptions,
+                    selected: props.trunkBranch,
+                    onSelect: props.onTrunkBranchChange,
+                  }
+                : null
+            }
+            fieldError={fieldError}
+          />
+          <SetDefaultIsolationButton
+            projectPath={props.projectPath}
+            isolation={currentIsolation}
+            disabled={props.disabled}
+            rememberShownFields={() => onSelectedRuntimeChange(selectedRuntime)}
+          />
+        </div>
+
+        {/* The directory's trust stays on the page, under the chip, not inside the panel: its
+            pending and error state must survive the panel closing, and the trust state stands
+            out on its own row. */}
+        <SshNoneDirectoryTrust
+          runtime={sshNoneRuntime}
           projectPath={props.projectPath}
-          isolation={currentIsolation}
+          userProjects={props.userProjects}
           disabled={props.disabled}
-          rememberShownFields={() => onSelectedRuntimeChange(selectedRuntime)}
+          onSelectedRuntimeChange={onSelectedRuntimeChange}
         />
       </div>
     </div>

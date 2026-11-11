@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { filterListItems, splitFilterMatch, stepFilterListIndex } from "./filterListItems";
+import {
+  filterListItems,
+  splitFilterMatch,
+  stepFilterListIndex,
+  windowFilterListItems,
+} from "./filterListItems";
 
 const items = [
   { value: "a", label: "coder", detail: "/src/coder" },
@@ -47,5 +52,30 @@ describe("stepFilterListIndex", () => {
 
   test("has no active row in an empty list", () => {
     expect(stepFilterListIndex(0, 1, 0)).toBe(-1);
+  });
+});
+
+describe("windowFilterListItems", () => {
+  const many = Array.from({ length: 5 }, (_, index) => ({
+    value: `b${index}`,
+    label: `b${index}`,
+  }));
+
+  test("keeps the selected item when it falls outside the window", () => {
+    const rows = windowFilterListItems(many, "b4", 3);
+    expect(rows.map((item) => item.value)).toEqual(["b4", "b0", "b1"]);
+  });
+
+  test("leaves the order alone when the selection is already in the window or absent", () => {
+    expect(windowFilterListItems(many, "b1", 3).map((item) => item.value)).toEqual([
+      "b0",
+      "b1",
+      "b2",
+    ]);
+    expect(windowFilterListItems(many, "missing", 3).map((item) => item.value)).toEqual([
+      "b0",
+      "b1",
+      "b2",
+    ]);
   });
 });
