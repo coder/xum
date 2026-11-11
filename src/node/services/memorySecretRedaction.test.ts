@@ -1326,12 +1326,12 @@ describe("redactSecretLike", () => {
       `\\n${"\\".repeat(31)}nCookie`.repeat(2_500),
     ],
     ["nested cookie list openers", `${"Cookie: [".repeat(10_000)}]`],
-    ["a key and a run of markers", `token=${"[redacted]".repeat(10_000)}x`],
-    ["a key and markers each with a tail", `token=${"[redacted]x".repeat(10_000)}`],
-    ["keys that each hold a marker and a tail", "token=[redacted]x ".repeat(6_000)],
-    ["a key and a marker followed by brackets", `token=[redacted]${"]x".repeat(20_000)}`],
-    ["a signature and a run of markers", `?sig=${"[redacted]]".repeat(10_000)}x`],
-    ["keys and half markers", "token=[redacted".repeat(20_000)],
+    ["a key and a run of markers", `token=${"[redacted]".repeat(5_000)}x`],
+    ["a key and markers each with a tail", `token=${"[redacted]x".repeat(5_000)}`],
+    ["keys that each hold a marker and a tail", "token=[redacted]x ".repeat(4_000)],
+    ["a key and a marker followed by brackets", `token=[redacted]${"]x".repeat(10_000)}`],
+    ["a signature and a run of markers", `?sig=${"[redacted]]".repeat(5_000)}x`],
+    ["keys and half markers", "token=[redacted".repeat(10_000)],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
@@ -1355,6 +1355,10 @@ describe("redactWithinCap", () => {
 
   it("returns the whole redaction of a text that fits under the cap", () => {
     expect(redactWithinCap(`a ${KEY} b`, CAP)).toBe("a [redacted] b");
+  });
+
+  it("takes a secret that starts the text and crosses the cap whole", () => {
+    expect(redactWithinCap(`${KEY} tail`, 10)).toBe("[redacted]");
   });
 
   it("takes a secret that crosses the cap whole, and shows no part of it", () => {

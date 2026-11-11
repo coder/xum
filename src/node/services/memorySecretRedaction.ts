@@ -683,6 +683,8 @@ export function addsSecretLike(previous: string, updated: string): boolean {
  */
 export function redactWithinCap(text: string, cap: number): string {
   const whole = redactSecretLike(text);
+  // mutation-equivalent: at a length of exactly `cap` the head is the whole text, so either branch
+  // returns the same text; this one skips the second redaction
   if (text.length <= cap) return whole;
   const head = redactSecretLike(text.slice(0, cap));
   let same = 0;
