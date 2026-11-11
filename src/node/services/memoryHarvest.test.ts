@@ -1132,6 +1132,23 @@ describe("runMemoryHarvest", () => {
       expect(rows.map((row) => row.text).join("")).not.toContain(githubToken);
     });
 
+    // Redaction can lengthen a part (a one-character value becomes a marker), so a part that fits its
+    // cap in its own characters can be cut at the cap in what is shown. The note says so, in the
+    // characters that were cut from what is shown: no character of the part lies past its cap.
+    it("reports a cut for a part that redaction lengthened past its cap", () => {
+      using fixture = createFixture();
+      const text = "password=a ".repeat(Math.floor(TEXT_PART_LIMIT / 11));
+      expect(text.length).toBeLessThanOrEqual(TEXT_PART_LIMIT);
+      fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
+
+      const rows = buildHarvestChunks(fixture.messages).flatMap(
+        (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
+      );
+
+      const note = rows.at(-1)?.text.match(/\[truncated (\d+) more chars for memory harvest\]$/);
+      expect(Number(note?.[1])).toBeGreaterThan(0);
+    });
+
     // The scan window is the cap and a lookahead past it. Its end can cut a key, and what is left is
     // too short to match, so it shows as it is. Redaction shortens the text (a long value becomes one
     // marker), so a cut of the redacted window at the cap reached that end.
