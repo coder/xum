@@ -23,10 +23,7 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { Loader2, Wand2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
-import {
-  CreationEnvironmentPanel,
-  type IsolationSelectOption,
-} from "./CreationEnvironmentPanel";
+import { CreationEnvironmentPanel, type IsolationSelectOption } from "./CreationEnvironmentPanel";
 import {
   describeEnvironment,
   environmentUsesBaseBranch,
