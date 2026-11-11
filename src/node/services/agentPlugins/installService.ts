@@ -1436,8 +1436,8 @@ async function subpathNotAFolderReason(
 
 /**
  * The real folder at `subpath`, or why the preview would not stage it: missing, a file, a path
- * through a file or a symbolic link (subpathNotAFolderReason), or escaping the repository. Exported
- * for its test.
+ * through a file or a symbolic link (subpathNotAFolderReason), escaping the repository, or a name
+ * that matches the folder only by ignoring letter case. Exported for its test.
  */
 export async function realEntryFolder(
   stagedDir: string,
@@ -1445,14 +1445,22 @@ export async function realEntryFolder(
 ): Promise<{ entryDir: string } | { why: string }> {
   const notAFolder = await subpathNotAFolderReason(stagedDir, subpath);
   if (notAFolder !== undefined) return { why: notAFolder };
+  let entryDir: string;
   try {
     // No link is left on the path, so this realpath stays shallow.
-    return {
-      entryDir: await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? "")),
-    };
+    entryDir = await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? ""));
   } catch (error) {
     return { why: folderErrorReason(error) };
   }
+  // With no link on the path, the realpath differs from the declared path only where a drive
+  // that ignores letter case (macOS, Windows) matched another case. The preview matches git's
+  // exact names (narrowToSubpath), so the list refuses it too. NFC on both sides: macOS may
+  // return a name in another Unicode form, which is the same name.
+  const declared = path.join(await fsPromises.realpath(stagedDir), subpath ?? "");
+  if (entryDir.normalize("NFC") !== declared.normalize("NFC")) {
+    return { why: "its letter case differs from the folder in the repository" };
+  }
+  return { entryDir };
 }
 
 /**
