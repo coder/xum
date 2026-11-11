@@ -147,6 +147,20 @@ describe("artifact tool", () => {
   });
 
   describe("layout audit", () => {
+    // The tool passes no budget, so the audit uses its production 15 s. Three fake widths took
+    // longer than that on a host at load 40: these tests get a budget no host load exhausts, and
+    // the hang test sets a short one. Captured before spyOn, which replaces the export.
+    const audit = checkArtifactLayoutModule.checkArtifactLayout;
+    let budgetMs = 60_000;
+    let auditSpy: ReturnType<typeof spyOn<typeof checkArtifactLayoutModule, "checkArtifactLayout">>;
+    beforeEach(() => {
+      budgetMs = 60_000;
+      auditSpy = spyOn(checkArtifactLayoutModule, "checkArtifactLayout").mockImplementation(
+        (input) => audit({ ...input, budgetMs })
+      );
+    });
+    afterEach(() => auditSpy.mockRestore());
+
     const publish = (file: string, html = "<p>hello</p>") =>
       fs.writeFile(path.join(scratchDir, "artifacts", file), html).then(() => run({ path: file }));
 
@@ -207,19 +221,11 @@ describe("artifact tool", () => {
 
     test("a hang gives up within the test budget: not checked, publish succeeds", async () => {
       await withFake({ eval: { 390: { kind: "hang" } } });
-      // Captured before spyOn: spyOn replaces the export before its argument is evaluated.
-      const audit = checkArtifactLayoutModule.checkArtifactLayout;
-      const spy = spyOn(checkArtifactLayoutModule, "checkArtifactLayout").mockImplementation(
-        (input) => audit({ ...input, budgetMs: 6_000 })
-      );
-      try {
-        const result = await publish("page.html");
-        expect(result).toMatchObject({ success: true, layout: { checked: false } });
-        expect(notCheckedOf(result)).toContainEqual({ viewport: 390, reason: "timeout" });
-        expect(spy).toHaveBeenCalledTimes(1);
-      } finally {
-        spy.mockRestore();
-      }
+      budgetMs = 6_000;
+      const result = await publish("page.html");
+      expect(result).toMatchObject({ success: true, layout: { checked: false } });
+      expect(notCheckedOf(result)).toContainEqual({ viewport: 390, reason: "timeout" });
+      expect(auditSpy).toHaveBeenCalledTimes(1);
     });
 
     test("a crashed audit script is not checked and the publish succeeds", async () => {

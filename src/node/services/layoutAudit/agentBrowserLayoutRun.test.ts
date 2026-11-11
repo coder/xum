@@ -353,7 +353,11 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   });
 
   test("a hang keeps the earlier widths, times the rest out and still closes", async () => {
-    const { outcomes, fake } = await run({ eval: { 1440: { kind: "hang" } } }, { budgetMs: 6_000 });
+    // 390 must finish inside the budget: 6 s was too short on a host at load 40.
+    const { outcomes, fake } = await run(
+      { eval: { 1440: { kind: "hang" } } },
+      { budgetMs: 15_000 }
+    );
     expect(summary(outcomes)).toEqual([
       "390 complete",
       "1440 failed timeout",
