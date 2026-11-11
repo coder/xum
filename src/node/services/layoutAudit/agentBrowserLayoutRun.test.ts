@@ -68,7 +68,9 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       toolEnvPath: await getToolEnvPath(runtime, projectDir),
       fileUrl: overrides.fileUrl ?? FILE_URL,
       pageScript: overrides.pageScript ?? PAGE_SCRIPT,
-      deadlineMs: Date.now() + (overrides.budgetMs ?? 20_000),
+      // A clean run ends long before this. A loaded host (load 25 and more) once spent 20 s on
+      // the ten fake calls of one run and timed 768 out; only the hang tests set a short budget.
+      deadlineMs: Date.now() + (overrides.budgetMs ?? 60_000),
       abortSignal: overrides.abortSignal,
     });
     return { outcomes, fake };
