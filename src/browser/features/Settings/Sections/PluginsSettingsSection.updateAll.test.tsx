@@ -22,12 +22,22 @@ afterEach(() => {
   cleanupDom?.();
 });
 
-const row = (name: string): AgentPluginListItem => ({
+const OLD_SHA = "a".repeat(40);
+/** The commit the list reports after an update; no review text carries it. */
+const UPDATED_SHA = "c".repeat(40);
+
+const row = (name: string, lockedSha: string): AgentPluginListItem => ({
   name,
   managed: true,
   present: true,
   location: `~/.mux/plugins/${name}`,
-  lockedSha: "a".repeat(40),
+  source: {
+    type: "git",
+    url: `https://example.invalid/${name}.git`,
+    ref: "main",
+    refType: "branch",
+  },
+  lockedSha,
   skillCount: 1,
   mcpServerCount: 0,
 });
@@ -50,7 +60,13 @@ interface Fixture {
 
 function createApi(fixture: Fixture) {
   const pending = new Map(Object.entries(fixture.pending));
-  const api = createMockORPCClient({ agentPlugins: { items: fixture.names.map(row) } });
+  const api = createMockORPCClient({ agentPlugins: { items: [] } });
+  const locked = new Map(fixture.names.map((name) => [name, OLD_SHA]));
+  api.agentPlugins.listForSettings = (() =>
+    Promise.resolve({
+      list: { success: true, data: fixture.names.map((name) => row(name, locked.get(name)!)) },
+      pendingSignOuts: { kind: "none" },
+    })) as typeof api.agentPlugins.listForSettings;
   const updates: Array<{ name: string; consent: unknown }> = [];
   const previews: string[] = [];
   const checks = (): AgentPluginUpdateCheck[] =>
@@ -94,6 +110,7 @@ function createApi(fixture: Fixture) {
     const failure = fixture.failing?.[input.name];
     if (failure !== undefined) return Promise.resolve({ success: false, error: failure });
     pending.delete(input.name);
+    locked.set(input.name, UPDATED_SHA);
     return Promise.resolve({ success: true });
   }) as unknown as typeof api.agentPlugins.update;
   return { api, updates, previews, holdChecks };
@@ -196,6 +213,10 @@ test("reviews and the status appear only once the run has refreshed, with their 
   const hold = holdChecks();
   fireEvent.click(button);
   await hold.entered;
+  // The refreshed list has rendered (alpha shows its new commit), and the check is still held.
+  await waitFor(() =>
+    expect((view.container.textContent ?? "").includes(UPDATED_SHA.slice(0, 12))).toBe(true)
+  );
   expect(openReviews(view)).toHaveLength(0);
   expect(status() === null).toBe(true);
 
@@ -220,6 +241,8 @@ test("the next queued review opens only after the confirmed update has settled",
   const hold = holdChecks();
   fireEvent.click(openReviews(view)[0]);
   await hold.entered;
+  // The refreshed list has rendered (beta shows its new commit), and the check is still held.
+  await waitFor(() => expect(shows(UPDATED_SHA.slice(0, 12))).toBe(true));
   expect(updates.map((update) => update.name)).toEqual(["beta"]);
   expect(shows("adds skill 'epsilon'")).toBe(false);
 
