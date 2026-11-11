@@ -74,6 +74,13 @@ export const MAX_CLAUDE_MARKETPLACE_BYTES = 8 * 1024 * 1024;
  * list has at most as many times this many rows as there are marketplace files.
  */
 export const MAX_CLAUDE_MARKETPLACE_ENTRIES = 500;
+/**
+ * Folders per marketplace path (an entry's source or path, and metadata.pluginRoot). Real catalogs
+ * use one to four. Resolving a path costs time that grows with the square of its depth (glibc
+ * realpath), and a listing checks up to 1,500 entry folders, so a hostile catalog of very deep
+ * paths stalled the list for over a minute. The list and the preview both read paths here.
+ */
+export const MAX_MARKETPLACE_PATH_FOLDERS = 32;
 
 export type MarketplaceSourceKind = AgentPluginMarketplaceBuild["sourceKind"];
 
@@ -137,6 +144,12 @@ export function marketplaceRelativePath(raw: string): string {
   const segments = trimmed.split("/").filter((segment) => segment !== "" && segment !== ".");
   if (segments.includes("..")) {
     throw new Error(`'${raw}' contains '..'. A marketplace path must stay inside the repository.`);
+  }
+  if (segments.length > MAX_MARKETPLACE_PATH_FOLDERS) {
+    // Not the path itself: it can be thousands of characters long.
+    throw new Error(
+      `The path is ${segments.length} folders deep. A marketplace path can be at most ${MAX_MARKETPLACE_PATH_FOLDERS} folders deep.`
+    );
   }
   // The same checks as a typed subpath: no .git, globs or control characters.
   return segments.length === 0 ? "" : normalizeAgentPluginSubpath(segments.join("/"));

@@ -119,6 +119,7 @@ import {
   MARKETPLACE_FILE_RULES,
   MARKETPLACE_RELATIVE_PATHS,
   MAX_CLAUDE_MARKETPLACE_BYTES,
+  MAX_MARKETPLACE_PATH_FOLDERS,
   findMarketplaceEntry,
   marketplaceEntryRefOf,
   marketplaceListing,
@@ -1390,29 +1391,68 @@ function resolvePreviewRef(
 }
 
 /**
- * The real folder at `subpath`, or why the preview would not stage it (extractSubpath): missing,
- * escaping the repository, a file, or a path through a symbolic link. A constant number of calls
- * per build: a marketplace lists up to 1,500 builds, and a per-segment walk of deep paths that
- * all name one folder made a hostile listing take over a minute. The realpath already resolved
- * every segment, so a link anywhere on the path shows as a realpath that differs from the path.
+ * Why an entry folder cannot be read. A filesystem error's own message names the staging path,
+ * which the list must not show: name the error code instead.
  */
-async function realEntryFolder(
+function folderErrorReason(error: unknown): string {
+  if (hasErrorCode(error, "ENOENT")) return "it does not exist";
+  if (hasErrorCode(error, "ENOTDIR")) return "it runs through a file";
+  const code = error != null && typeof error === "object" && "code" in error ? error.code : null;
+  return typeof code === "string" ? `Xum cannot read it (${code})` : getErrorMessage(error);
+}
+
+/**
+ * Why `subpath` is not a path of real folders, checked segment by segment as the preview checks
+ * it (narrowToSubpath, then extractSubpath), with lstat: a link is refused without being
+ * followed. Resolving a link costs time that grows with the square of its target's depth, so a
+ * link to a folder thousands of levels deep stalled a listing of 1,500 builds. A marketplace path
+ * has at most MAX_MARKETPLACE_PATH_FOLDERS folders, plus as many for metadata.pluginRoot.
+ */
+async function subpathNotAFolderReason(
+  stagedDir: string,
+  subpath: string | undefined
+): Promise<string | undefined> {
+  const segments = subpath === undefined ? [] : subpath.split("/");
+  assert(
+    segments.length <= 2 * MAX_MARKETPLACE_PATH_FOLDERS,
+    "subpathNotAFolderReason: marketplaceRelativePath caps every part of an entry path"
+  );
+  let folder = stagedDir;
+  for (const [index, segment] of segments.entries()) {
+    folder = path.join(folder, segment);
+    let stat: Awaited<ReturnType<typeof fsPromises.lstat>>;
+    try {
+      stat = await fsPromises.lstat(folder);
+    } catch (error) {
+      return folderErrorReason(error);
+    }
+    if (stat.isSymbolicLink()) return "it is a symbolic link or runs through one";
+    if (!stat.isDirectory()) {
+      return index === segments.length - 1 ? "it is a file" : "it runs through a file";
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The real folder at `subpath`, or why the preview would not stage it: missing, a file, a path
+ * through a file or a symbolic link (subpathNotAFolderReason), or escaping the repository. Exported
+ * for its test.
+ */
+export async function realEntryFolder(
   stagedDir: string,
   subpath: string | undefined
 ): Promise<{ entryDir: string } | { why: string }> {
-  let entryDir: string;
+  const notAFolder = await subpathNotAFolderReason(stagedDir, subpath);
+  if (notAFolder !== undefined) return { why: notAFolder };
   try {
-    entryDir = await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? ""));
+    // No link is left on the path, so this realpath stays shallow.
+    return {
+      entryDir: await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? "")),
+    };
   } catch (error) {
-    // ENOTDIR's own message names the staging path: say what the preview says instead.
-    if (hasErrorCode(error, "ENOTDIR")) return { why: "it runs through a file" };
-    return { why: hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error) };
+    return { why: folderErrorReason(error) };
   }
-  if (entryDir !== path.join(await fsPromises.realpath(stagedDir), subpath ?? "")) {
-    return { why: "it is a symbolic link or runs through one" };
-  }
-  if (!(await fsPromises.lstat(entryDir)).isDirectory()) return { why: "it is a file" };
-  return { entryDir };
 }
 
 /**
