@@ -285,7 +285,9 @@ function ChipSummary(props: {
           data-component="ProjectIsolationSummary"
           className="text-foreground flex min-w-0 items-center gap-1.5"
         >
-          {ProjectIcon && <ProjectIcon size={12} className={cn("shrink-0", projectUi.iconClass)} />}
+          {ProjectIcon && (
+            <ProjectIcon size={12} className={cn("shrink-0", projectUi?.iconClass)} />
+          )}
           <span className="min-w-0 truncate">{summary.where}</span>
         </span>
       )}

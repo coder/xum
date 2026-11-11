@@ -64,7 +64,7 @@ export function FilterList(props: {
       stopKeyboardPropagation(event);
       setActiveValue(rows[next].value);
       // The row is already mounted, so it can scroll into view from the handler.
-      document.getElementById(optionId(next))?.scrollIntoView?.({ block: "nearest" });
+      document.getElementById(optionId(next))?.scrollIntoView({ block: "nearest" });
       return;
     }
     if (event.key === "Enter" && rows[activeIndex]) {
