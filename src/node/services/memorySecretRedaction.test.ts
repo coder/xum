@@ -1286,6 +1286,14 @@ describe("redactWithinCap", () => {
       expect(redactWithinCap(windowOf(text), CAP)).toBe(text.slice(0, CAP));
     });
 
+    // A run with two dots is one the JWT pattern would take, if its parts were long enough. When it
+    // does not take it, a run that goes on past the window does not become a JWT either.
+    it("keeps a run with two dots that ends the window and that the JWT pattern leaves alone", () => {
+      const text = `${before}eyJab.cd.${"e".repeat(1_200)}`;
+
+      expect(redactWithinCap(windowOf(text), CAP)).toBe(text.slice(0, CAP));
+    });
+
     it("leaves the output as it is for a JWT-like run that starts past the cap", () => {
       const text = `${"z".repeat(CAP + 5)} ${jwt(HEADER, `eyJ${"W".repeat(1_200)}`)}`;
 
@@ -1304,11 +1312,14 @@ describe("redactWithinCap", () => {
   });
 
   // A run of JWT starts that never reaches the window's end: the search tries only a start that no
-  // JWT character comes before, so it reads the run once. Tried at every start it is quadratic:
-  // about 5 seconds at this size, against well under 100 ms. The budget is generous because a
-  // loaded test host slows every row.
-  it("cuts a window of JWT starts that miss its end in linear time", () => {
-    const text = `${"eyJ".repeat(30_000)} `;
+  // JWT character comes before, so it reads the run once. Tried at every start (no anchor, or a
+  // `\b` anchor, which a dash before each start passes) it is quadratic: several seconds at these
+  // sizes, against well under 100 ms. The budget is generous because a loaded test host slows
+  // every row.
+  it.each([
+    ["JWT starts", `${"eyJ".repeat(30_000)} `],
+    ["JWT starts with a dash after each", `${"eyJ-".repeat(32_000)} `],
+  ])("cuts a window of %s that miss its end in linear time", (_label, text) => {
     redactWithinCap("warm up eyJabc.def", 10); // keep a cold regex compile out of the timing
     const started = performance.now();
     redactWithinCap(text, text.length - REDACTION_LOOKAHEAD_CHARS);
