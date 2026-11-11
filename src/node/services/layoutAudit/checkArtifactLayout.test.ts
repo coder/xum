@@ -102,6 +102,15 @@ describe("checkArtifactLayout", () => {
     expect(await fake.calls()).toEqual([]);
   });
 
+  test("an html publish of a file the browser would not parse as html is not audited", async () => {
+    // Opened by its file:// URL, `page.txt` loads as plain text: a check of it could read clean.
+    const fake = await install();
+    expect(await check({ relPath: "page.txt" })).toBeUndefined();
+    expect(await check({ relPath: "notes.md" })).toBeUndefined();
+    expect(await fake.calls()).toEqual([]);
+    expect(await check({ relPath: "page.htm" })).toMatchObject({ checked: true });
+  });
+
   test("a clean page is checked at all three widths", async () => {
     const fake = await install();
     expect(await check()).toEqual({

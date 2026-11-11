@@ -528,7 +528,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
           () => false
         )
       ).toBe(false);
-      // Far below the fake's 60 s hang and the run's 20 s budget.
+      // Far below the fake's 60 s hang and the run's 60 s default budget.
       expect(Date.now() - started).toBeLessThan(15_000);
     }
   );
