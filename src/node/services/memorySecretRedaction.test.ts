@@ -1410,6 +1410,16 @@ describe("addsSecretLike", () => {
     expect(addsSecretLike("key sk-ABCDEFGHIJKLMNO\n", "key sk-PQRSTUVWXYZABCD\n")).toBe(true);
   });
 
+  // A text that holds a tracked `]` reads its key/value pairs through another path: the guard must
+  // still tell one value from another there.
+  it("flags a key's value swapped for another beside a signed URL", () => {
+    const signed = "&sig=sk-ABCDEFGHIJKLMNOP";
+    expect(addsSecretLike(`password=hunter2 ${signed}`, `password=hunter3 ${signed}`)).toBe(true);
+    expect(addsSecretLike(`password=hunter2 ${signed}`, `password=hunter2 ${signed}\n`)).toBe(
+      false
+    );
+  });
+
   it("flags a second copy of a credential the file held once", () => {
     expect(addsSecretLike(`${KEY}\n`, `${KEY}\n${KEY}\n`)).toBe(true);
   });

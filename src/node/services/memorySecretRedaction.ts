@@ -628,6 +628,7 @@ function runRedactionPasses(
   let artifacts: number[] = [];
   let edits: Edit[] | null = null;
   let added: number[] | null = null;
+  // mutation-equivalent: every pattern starts its own count at 0 below
   let shift = 0;
   const replaceStandalone = (match: string, offset: number, whole: string): string => {
     fromRegex(match);
@@ -639,7 +640,7 @@ function runRedactionPasses(
     return REDACTED;
   };
   for (const pattern of STANDALONE_SECRET_PATTERNS) {
-    edits = artifacts.length > 0 ? [] : null;
+    edits = artifacts.length === 0 ? null : [];
     added = null;
     shift = 0;
     redacted = redacted.replace(pattern, replaceStandalone);
@@ -669,7 +670,7 @@ function runRedactionPasses(
   redacted = redactCookieHeaders(
     redacted,
     (removed) => onRemoved(removed, "reader"),
-    artifacts.length > 0 ? (edit) => readerEdits.push(edit) : undefined
+    artifacts.length === 0 ? undefined : (edit) => readerEdits.push(edit)
   );
   return { text: redacted, artifacts: followPositions(artifacts, readerEdits) };
 }
