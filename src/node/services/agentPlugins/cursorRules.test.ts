@@ -196,6 +196,23 @@ describe("Cursor rule conversion", () => {
         `B${GLOBS_PREFIX}${"g".repeat(SKILL_DESCRIPTION_CAP - GLOBS_PREFIX.length - 1)}`
       );
     });
+
+    test("cuts a glob before it trims it, so leading spaces cannot pull half a pair inside the cap", () => {
+      // Cut first: the 40 spaces put the first half of the pair at the 1024th unit, and trimming
+      // before the cut (or after a plain slice) would move that half inside the cap for good.
+      const glob = `${" ".repeat(40)}${"g".repeat(983)}\u{1F600}tail`;
+      const { frontmatter } = ruleSkill("spaced-glob", `---\nglobs: ["${glob}"]\n---\nBody\n`);
+      expect(frontmatter.description).toBe(`Body${GLOBS_PREFIX}${"g".repeat(983)}`);
+    });
+
+    test("adds no glob once the globs part is at the cap, and does not rewrite text that fits", () => {
+      // The author's own escape leaves half a pair at the 1024th unit: only text over the cap is cut.
+      const first = `${"g".repeat(SKILL_DESCRIPTION_CAP - GLOBS_PREFIX.length - 1)}\\uD83D`;
+      const { frontmatter } = ruleSkill("full-globs", `---\nglobs: ["${first}", "x"]\n---\nBody\n`);
+      expect(frontmatter.description).toBe(
+        `${GLOBS_PREFIX}${"g".repeat(SKILL_DESCRIPTION_CAP - GLOBS_PREFIX.length - 1)}\uD83D`
+      );
+    });
   });
 
   test("cuts a long first body line to the skill description cap", () => {

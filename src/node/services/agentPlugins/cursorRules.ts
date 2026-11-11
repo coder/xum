@@ -44,10 +44,13 @@ function parseRuleFrontmatter(yaml: string): Record<string, unknown> | undefined
 
 function ruleGlobs(value: unknown): string[] {
   const entries = Array.isArray(value) ? value : [value];
-  return entries
-    .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => entry.slice(0, MAX_SKILL_DESCRIPTION_LENGTH).trim())
-    .filter((entry) => entry.length > 0);
+  return (
+    entries
+      .filter((entry): entry is string => typeof entry === "string")
+      // Cut before trimming, so memory stays bounded when YAML aliases repeat a long glob.
+      .map((entry) => cutToCap(entry, MAX_SKILL_DESCRIPTION_LENGTH).trim())
+      .filter((entry) => entry.length > 0)
+  );
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -75,7 +78,6 @@ function globsSuffix(globs: readonly string[]): string {
   if (globs.length === 0) return "";
   let suffix = "\n\nApplies to files matching: ";
   for (const [index, glob] of globs.entries()) {
-    // mutation-equivalent: at exactly the cap, another glob only adds text that the final cut removes
     if (suffix.length >= MAX_SKILL_DESCRIPTION_LENGTH) break;
     suffix += `${index > 0 ? ", " : ""}${glob}`;
   }
