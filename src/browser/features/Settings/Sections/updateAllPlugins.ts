@@ -113,3 +113,16 @@ export function summarizeUpdateAll(
   if (parts.length === 0) return { tone: "success", message: "All plugins are up to date." };
   return { tone: isUnexpected(result) ? "error" : "success", message: parts.join(". ") };
 }
+
+/**
+ * The summary of a run once only the `waiting` reviews still need the user. Reviews are matched
+ * by identity, so a review that settled never returns when a later run queues the same plugin.
+ * `null` when nothing is left to say.
+ */
+export function summarizeRemaining(
+  result: UpdateAllResult,
+  waiting: readonly AgentPluginUpdateReview[]
+): UpdateAllSummary | null {
+  const remaining = { ...result, reviews: result.reviews.filter((r) => waiting.includes(r)) };
+  return summaryParts(remaining, false).length === 0 ? null : summarizeUpdateAll(remaining);
+}

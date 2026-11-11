@@ -1882,8 +1882,7 @@ export const PluginsSettingsSection: React.FC = () => {
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
   /** Pending update whose capability changes await the user's confirmation. */
   const updateReviews = useUpdateReviewQueue(
-    initialIntent?.type === "review-updates" ? initialIntent.reviews : [],
-    () => updateAll.dismissStatus()
+    initialIntent?.type === "review-updates" ? initialIntent.reviews : []
   );
   const updateReview = updateReviews.open;
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
@@ -2035,6 +2034,7 @@ export const PluginsSettingsSection: React.FC = () => {
   const startUpdate = () => {
     setError(null);
     updateReviews.clear();
+    updateAll.dismissStatus();
     // The update moves lockedSha, so an open component review would confirm against a stale tree.
     componentReview.close();
   };
@@ -2045,6 +2045,7 @@ export const PluginsSettingsSection: React.FC = () => {
     setBusyPlugin,
     items,
     updateChecks,
+    waitingReviews: updateReviews.waiting,
     onStart: startUpdate,
     onReviews: updateReviews.show,
     refresh,
@@ -2133,6 +2134,7 @@ export const PluginsSettingsSection: React.FC = () => {
         publishAgentPluginsMutated();
         setUninstallTarget(null);
         await refresh();
+        updateReviews.drop(name);
       } else {
         // Keep the confirmation open and surface the error after the list
         // refresh (whose success path clears error state).
