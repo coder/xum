@@ -947,13 +947,13 @@ export const UpdateAllReviewQueue: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByText(/adds skill 'grill-harder'/);
-    expect(canvas.queryByText(/adds MCP server 'pager'/)).toBeNull();
-    expect(canvas.getAllByRole("button", { name: /Apply update/ })).toHaveLength(1);
+    await expect(canvas.queryByText(/adds MCP server 'pager'/)).toBeNull();
+    await expect(canvas.getAllByRole("button", { name: /Apply update/ })).toHaveLength(1);
 
     await userEvent.click(canvas.getByRole("button", { name: "Cancel" }));
     await canvas.findByText(/adds MCP server 'pager'/);
-    expect(canvas.queryByText(/adds skill 'grill-harder'/)).toBeNull();
-    expect(canvas.getAllByRole("button", { name: /Apply update/ })).toHaveLength(1);
+    await expect(canvas.queryByText(/adds skill 'grill-harder'/)).toBeNull();
+    await expect(canvas.getAllByRole("button", { name: /Apply update/ })).toHaveLength(1);
   },
 };
 

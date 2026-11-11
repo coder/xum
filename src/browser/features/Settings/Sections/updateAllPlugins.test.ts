@@ -207,6 +207,6 @@ describe("summarizeUpdateAll", () => {
     const summary = summarizeUpdateAll({ ...empty, ...patch });
 
     expect(summary.tone).toBe("error");
-    expect(summary.message).toContain(Object.values(patch)[0]![0]!);
+    expect(summary.message).toContain(Object.values(patch)[0][0]);
   });
 });

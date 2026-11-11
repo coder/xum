@@ -122,11 +122,11 @@ test("one click applies the neutral updates, opens the capability-changing revie
   expect(previews).not.toContain("gamma");
 
   // The user still confirms the capability change: only then does beta update, with its consent.
-  fireEvent.click(openReviews(view)[0]!);
+  fireEvent.click(openReviews(view)[0]);
   await waitFor(() =>
     expect(updates.map((update) => update.name)).toEqual(["alpha", "delta", "beta"])
   );
-  expect(updates[2]!.consent).toMatchObject({ fromSha: "a".repeat(40), toSha: "b".repeat(40) });
+  expect(updates[2].consent).toMatchObject({ fromSha: "a".repeat(40), toSha: "b".repeat(40) });
   await waitFor(() => expect(openReviews(view)).toHaveLength(0));
   // Nothing is pending any more, so the button is gone.
   await waitFor(() => expect(buttonNamed(view, /Update all/) === undefined).toBe(true));
@@ -146,7 +146,7 @@ test("capability-changing reviews open one after another, and cancelling one ope
   fireEvent.click(buttonNamed(view, "Cancel")!);
   await waitFor(() => expect(openReviews(view)).toHaveLength(1));
 
-  fireEvent.click(openReviews(view)[0]!);
+  fireEvent.click(openReviews(view)[0]);
   await waitFor(() => expect(updates.map((update) => update.name)).toEqual(["epsilon"]));
   await waitFor(() => expect(openReviews(view)).toHaveLength(0));
 });
@@ -231,6 +231,6 @@ test("reviews a palette Update All found open in the section the same way", asyn
   await waitFor(() => expect(openReviews(view)).toHaveLength(1));
   fireEvent.click(buttonNamed(view, "Cancel")!);
   await waitFor(() => expect(openReviews(view)).toHaveLength(1));
-  fireEvent.click(openReviews(view)[0]!);
+  fireEvent.click(openReviews(view)[0]);
   await waitFor(() => expect(updates.map((update) => update.name)).toEqual(["epsilon"]));
 });
