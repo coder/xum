@@ -1924,6 +1924,24 @@ describe("redactSecretLike", () => {
         `eyJSEKRITheader.eyJSEKRITpayload-${KEY}-hooks.slack.com/services/SEKRITtoken1`,
         "[redacted][redacted]",
       ],
+      // The cookie reader runs last, on what the other passes left, and hides the rest of a header's
+      // value: it takes characters of a run that the other passes left.
+      [
+        "in a cookie header that the reader finishes",
+        `Cookie: "x"; sid=${RUN}`,
+        "Cookie: [redacted]",
+      ],
+      [
+        "in a JSON cookie header that the reader finishes",
+        `"cookie": "x\\"y; ${RUN}"`,
+        '"cookie": [redacted]',
+      ],
+      // A signed URL's extra `]` comes after the run's characters here, and both lists are in play.
+      [
+        "before a marker that a signed URL reads",
+        `${RUN} then ?sig=[redacted]`,
+        "[redacted] then ?sig=[redacted]",
+      ],
       // A key right in front of the header hides the header from a JWT pattern that reads the text
       // before the key pass, and the passes still hide it as they did.
       [
@@ -1950,6 +1968,11 @@ describe("redactSecretLike", () => {
       ["a key in the fourth part", `${FAKE.jwt}.x-${FAKE.aws}`, "[redacted].x-[redacted]"],
     ])("reads %s as before", (_label, text, expected) => {
       expect(redactSecretLike(text)).toBe(expected);
+    });
+
+    it("counts a run that holds no key as no run of its own", () => {
+      // The JWT pattern takes the run in both texts: a regex value that the cookie pass held excuses it.
+      expect(addsSecretLike(`Cookie: ${FAKE.jwt}`, FAKE.jwt)).toBe(false);
     });
 
     it("lets the guards see the run as one credential", () => {

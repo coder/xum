@@ -79,6 +79,14 @@ function replaceMatches(
 // What a character of a JWT-like run is: a run is these characters and the dots between its parts.
 const RUN_CHAR = /[A-Za-z0-9_.-]/;
 
+/** True when `text` holds at `position` what the position was tracked for. */
+function holdsTracked(text: string, position: number, artifact: boolean): boolean {
+  // mutation-equivalent: an invariant check that no valid position can fail
+  if (artifact) return text.charAt(position) === "]" && text.charAt(position + 1) === "]";
+  // mutation-equivalent: the same check for a character of a run
+  return RUN_CHAR.test(text.charAt(position));
+}
+
 /**
  * `text` without the character at each position of `artifacts` and of `runChars`. Both lists are
  * ascending. The assertion on `artifacts` guarantees one thing: every position holds a `]` with a
@@ -101,10 +109,7 @@ function removeAt(text: string, artifacts: number[], runChars: number[] = []): s
     const position = artifact ? artifacts[a++] : runChars[r++];
     assert(
       // mutation-equivalent: an invariant check that no valid position can fail
-      position >= from &&
-        (artifact
-          ? text.charAt(position) === "]" && text.charAt(position + 1) === "]"
-          : RUN_CHAR.test(text.charAt(position))),
+      position >= from && holdsTracked(text, position, artifact),
       "a tracked position is not one that it was tracked for"
     );
     if (position > from) parts.push(text.slice(from, position));
