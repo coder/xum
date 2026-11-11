@@ -2601,7 +2601,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "Required fields:",
       "",
       "- `name`: must match the directory name (see [Display names](#display-names))",
-      "- `description`: short summary shown in Xum’s skills index. Xum cuts a `description` or `when_to_use` longer than 1,024 characters to that length when it loads a skill from a project, global or plugin root, so the skill still loads. `agent_skill_write` refuses to save one.",
+      "- `description`: short summary shown in Xum’s skills index. Xum cuts a `description`, `when_to_use` or `when-to-use` that is longer than 1,024 characters to at most 1,024 characters when it loads a skill from a project, global or plugin root, so the skill still loads. `agent_skill_write` refuses to save one that is longer.",
       "",
       "Optional fields:",
       "",
