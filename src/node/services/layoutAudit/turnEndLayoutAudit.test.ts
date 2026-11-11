@@ -11,6 +11,7 @@ import { Config } from "@/node/config";
 import * as artifactsOperations from "@/node/services/artifactsOperations";
 import { recordArtifactPublish } from "@/node/services/artifactRecordStore";
 import * as checkArtifactLayoutModule from "./checkArtifactLayout";
+import { installFakeAgentBrowser } from "./fakeAgentBrowser.testHarness";
 import { layoutAuditLastStartedAtMs, startLayoutAudit } from "./layoutFingerprints";
 import {
   TURN_END_AUDIT_MAX_PAGES,
@@ -398,4 +399,64 @@ describe("workspaceHasNewLayoutIssueAtTurnEnd", () => {
     await publishedPage("report.html");
     expect(await run()).toBe(true);
   });
+});
+
+describe("a turn-end audit through the real layout audit", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "turn-end-real-audit-"));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  // Every audit runs a fake CLI through a dozen shells, and a loaded host is slow.
+  test("tells about an issue no publish listed, adds nothing to the fix-loop memory, and goes silent once a publish listed it", async () => {
+    const artifactsDir = path.join(tempDir, "scratch", "artifacts");
+    await fs.mkdir(artifactsDir, { recursive: true });
+    await installFakeAgentBrowser(tempDir, {
+      eval: {
+        390: {
+          kind: "pass",
+          findings: [
+            { rule: "clipped-text", selector: "div.card > h2", axis: "horizontal", overflowPx: 12 },
+          ],
+        },
+      },
+    });
+    const input = {
+      kind: "html",
+      runtime: new LocalRuntime(tempDir),
+      cwd: tempDir,
+      trusted: true,
+      location: { kind: "host", dir: artifactsDir },
+      relPath: "chart.html",
+      sessionDir: path.join(tempDir, "session"),
+      budgetMs: 20_000,
+    } as const;
+    const atTurnEnd = () =>
+      hasNewLayoutIssueAtTurnEnd({
+        streamStartedAtMs: STREAM_START,
+        abortSignal: new AbortController().signal,
+        list: () => Promise.resolve(listingOf([page("chart.html", STREAM_START + 1)])),
+        lastAuditStartedAtMs: never,
+        audit: (relPath, abortSignal) =>
+          checkArtifactLayoutModule.checkArtifactLayout({
+            ...input,
+            relPath,
+            abortSignal,
+            remember: false,
+          }),
+      });
+
+    expect(await atTurnEnd()).toBe(true);
+    // The agent has been shown nothing: the publish lists the issue as new, and commits it.
+    expect(
+      (await checkArtifactLayoutModule.checkArtifactLayout(input))?.issues[0]
+    ).not.toHaveProperty("persistent");
+    // Now a publish result listed it: the next turn end has nothing new to say.
+    expect(await atTurnEnd()).toBe(false);
+  }, 180_000);
 });

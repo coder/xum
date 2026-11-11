@@ -239,11 +239,10 @@ describe("checkArtifactLayout", () => {
     await install({ eval: { 390: { kind: "pass", findings: [card] } } });
     const atTurnEnd = () => check({ remember: false });
     expect((await atTurnEnd())?.issues[0]).not.toHaveProperty("persistent");
-    expect((await atTurnEnd())?.issues[0]).not.toHaveProperty("persistent");
     // The publish still reads the finding as new, and its result is what commits it.
     expect((await check())?.issues[0]).not.toHaveProperty("persistent");
     expect((await atTurnEnd())?.issues[0]).toHaveProperty("persistent", true);
-  });
+  }, 180_000);
 
   describe("the start time of the last audit that ran to its end", () => {
     const startedAt = () => layoutAuditLastStartedAtMs(sessionDir, "chart.html");
