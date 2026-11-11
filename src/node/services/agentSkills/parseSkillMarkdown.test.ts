@@ -342,3 +342,67 @@ describe("parseSkillMarkdown allowDisplayName", () => {
     expect(() => parse(name, "poteto-mode", true)).toThrow(AgentSkillParseError);
   });
 });
+
+describe("parseSkillMarkdown over-long description and when-to-use text", () => {
+  const CAP = 1024;
+  const TEXT_KEYS = ["description", "when_to_use", "when-to-use"] as const;
+  // Letters that change along the text, so a cut that is not a prefix would show.
+  const textOf = (length: number) =>
+    Array.from({ length }, (_, index) => String.fromCharCode(97 + (index % 26))).join("");
+
+  const parse = (key: (typeof TEXT_KEYS)[number], text: string, allowDisplayName?: boolean) => {
+    const description = key === "description" ? text : "Router skill";
+    const extra = key === "description" ? "" : `${key}: ${text}\n`;
+    const content = `---\nname: demo\ndescription: ${description}\n${extra}---\nBody\n`;
+    return parseSkillMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+      directoryName: SkillNameSchema.parse("demo"),
+      allowDisplayName,
+    });
+  };
+
+  test.each([...TEXT_KEYS])(
+    "a discovered skill's %s over the cap is cut to a prefix of it",
+    (key) => {
+      const text = textOf(1069);
+      const cut = parse(key, text, true).frontmatter[key];
+      expect(cut).toHaveLength(CAP);
+      expect(text.startsWith(cut ?? "")).toBe(true);
+    }
+  );
+
+  test.each([...TEXT_KEYS])("strict callers still reject a %s over the cap", (key) => {
+    expect(() => parse(key, textOf(CAP + 1))).toThrow(AgentSkillParseError);
+    expect(() => parse(key, textOf(CAP + 1))).toThrow(key);
+  });
+
+  test.each([...TEXT_KEYS])(
+    "%s at exactly the cap is unchanged with or without the option",
+    (key) => {
+      const text = textOf(CAP);
+      expect(parse(key, text, true).frontmatter[key]).toBe(text);
+      expect(parse(key, text).frontmatter[key]).toBe(text);
+    }
+  );
+
+  test("a discovered skill's description that is not text still fails the schema", () => {
+    const content = "---\nname: demo\ndescription: 42\n---\nBody\n";
+    expect(() =>
+      parseSkillMarkdown({
+        content,
+        byteSize: Buffer.byteLength(content, "utf-8"),
+        directoryName: SkillNameSchema.parse("demo"),
+        allowDisplayName: true,
+      })
+    ).toThrow(AgentSkillParseError);
+  });
+
+  test("a cut never leaves half of a surrogate pair", () => {
+    const text = `${textOf(CAP - 1)}\u{1F600}${textOf(50)}`;
+    const cut = parse("description", text, true).frontmatter.description;
+    expect(cut.length).toBeLessThanOrEqual(CAP);
+    expect(/[\uD800-\uDFFF]/.test(cut)).toBe(false);
+    expect(text.startsWith(cut)).toBe(true);
+  });
+});
