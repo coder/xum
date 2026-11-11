@@ -210,6 +210,25 @@ describe("clipped-text", () => {
           audit(contents.replace('data-css="display: contents"', `data-css="${css}"`))
         ).toEqual([finding("clipped-text", "span#s", "horizontal", 340)]);
       }
+      // A collapsed holder does not paint either, whatever else it sets.
+      for (const css of [
+        "visibility: collapse",
+        "display: contents; opacity: 0; visibility: collapse",
+      ]) {
+        expect(audit(html.replace('data-css="visibility: hidden"', `data-css="${css}"`))).toEqual(
+          []
+        );
+      }
+      // A wrapper without a box ignores its own opacity: the text it holds paints, and is cut.
+      const contentsWrapped = html
+        .replace(
+          '<span id="hidden" data-box="0 0 400 20" data-css="visibility: hidden"',
+          '<span id="wrap" data-box="0 0 0 0" data-css="display: contents; opacity: 0"><span id="hidden" data-box="0 0 400 20"'
+        )
+        .replace("A long line nobody sees</span>", "A long line nobody sees</span></span>");
+      expect(audit(contentsWrapped)).toEqual([
+        finding("clipped-text", "span#s", "horizontal", 340),
+      ]);
       // Text under a transparent or content-visibility hidden wrapper does not paint.
       for (const css of ["opacity: 0", "content-visibility: hidden"]) {
         const wrapped = html
