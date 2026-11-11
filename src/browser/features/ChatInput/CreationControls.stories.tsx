@@ -236,6 +236,9 @@ export const CoderNotAvailable: Story = {
 
 /** Coder option remains visible but disabled when CLI version is outdated. */
 export const CoderOutdated: Story = {
+  // Closed, the chip looks the same as CoderAvailable's; the play checks the disabled row. This
+  // keeps the Pixel snapshot budget level now that EnvironmentPanelOpen snapshots the open panel.
+  parameters: { pixel: PIXEL_DISABLED },
   args: {
     coderInfo: mockCoderInfoOutdated,
   },
