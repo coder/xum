@@ -109,6 +109,9 @@ const NAME_SUFFIX_MAX = 48;
 const GAP_MAX = 48;
 
 const SIGNED_URL_PARAM = "(?:sig|signature|x-amz-signature|x-goog-signature)";
+// Where a signed URL's value starts, and the characters that end it.
+const SIGNED_URL_VALUE_START = String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)`;
+const SIGNED_URL_VALUE_END = String.raw`\s"'\\<>&#,;)\]}`;
 
 // Credential shapes that are secret on their own, wherever they appear.
 const STANDALONE_SECRET_PATTERNS: RegExp[] = [
@@ -127,7 +130,7 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // Google `X-Goog-Signature`. Only the value goes, and only in query position (after `?` or `&`,
   // `&amp;` too, as in XML listings). `signature` stays out of SECRET_NAME: the memory-write guard
   // reuses it, and prose such as `signature: foo(a, b)` must stay writable.
-  new RegExp(String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)[^\s"'\\<>&#,;)\]}]+`, "gi"),
+  new RegExp(String.raw`${SIGNED_URL_VALUE_START}[^${SIGNED_URL_VALUE_END}]+`, "gi"),
   // Anchored to the start of a character run: `\b` also matches after `-`, so `eyJ-eyJ-eyJ-...`
   // would start a scan to the end of the run at every `eyJ`.
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
@@ -162,9 +165,12 @@ const ESCAPED_QUOTED_VALUE = String.raw`(?<run>\\{1,${ESCAPE_RUN_MAX}})(?<quote>
 // The value is a quoted run (to its closing quote, or to the end of an unterminated one) or one
 // unquoted word, optionally behind an auth scheme.
 // Already-redacted values are skipped so the passes compose, and so are comparisons (`token === x`).
+// Where a key pair's value starts, and the characters that end an unquoted one.
+const KEY_VALUE_PREFIX = String.raw`${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}}`;
+const UNQUOTED_VALUE_END = String.raw`\s"'\\,;&}\])`;
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
-  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
-    String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
+  `(${KEY_VALUE_PREFIX})` +
+    String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^${UNQUOTED_VALUE_END}]+)`,
   "gi"
 );
 
@@ -697,27 +703,139 @@ export function redactSecretLike(text: string): string {
   return removeAt(redacted, artifacts);
 }
 
+// A value can go on after a marker. A pass that redacts part of a value leaves the marker inside it
+// (`sig=abc.<key>.xyz` is `sig=[redacted].xyz` once the passes ran: the signed-URL value stops at the
+// marker's `]`), and a value that a model writes beside a marker starts with it
+// (`password=[redacted]SEKRIT`). The key pattern skips a value that starts with the marker, and the
+// value patterns end a value at the marker's `]`, so what goes on stays readable and the write
+// guards accepted it. The guards read these tails in the
+// output of the passes. They do not change that output: a pass that rewrote it after the others
+// could make a text that main redacts stably unstable, and the readers' text is as main writes it.
+//
+// A tail starts at a marker (in any case) right after a value start of the key pattern or of the
+// signed-URL pattern (the same bounded prefix, read by the same patterns without the marker). It goes
+// on through more markers, and through a `]` when no end of a value follows it, and stops at the
+// first character that ends the value, or at the end of the text. It counts only when a letter or a
+// digit of any script (`\p{L}`, `\p{N}`) stands outside its markers: what a note that quotes a
+// marker puts behind it is punctuation (`` `API_KEY=[redacted]` ``, `password=[redacted].`,
+// `password=[redacted]。`), and that stays as it is.
+// The loop reads one character at a time: the start is found by a regex without the `u` flag, and a
+// regex of the `u` flag over a long tail fails silently in Bun.
+const MARKER_ANYWHERE = /\[redacted\]/i;
+const MARKER_AT = /\[redacted\]/iy;
+const KEY_TAIL_START = new RegExp(`(?:${KEY_VALUE_PREFIX})\\[redacted\\]`, "gi");
+const SIGNED_URL_TAIL_START = new RegExp(`${SIGNED_URL_VALUE_START}\\[redacted\\]`, "gi");
+const TAIL_STARTS: ReadonlyArray<readonly [RegExp, RegExp]> = [
+  [KEY_TAIL_START, new RegExp(`[${UNQUOTED_VALUE_END}]`)],
+  [SIGNED_URL_TAIL_START, new RegExp(`[${SIGNED_URL_VALUE_END}]`)],
+];
+const LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+
+/** The character at `i`: a surrogate pair is one character. */
+function characterAt(text: string, i: number): string {
+  const unit = text.charCodeAt(i);
+  const next = text.charCodeAt(i + 1);
+  // mutation-equivalent: the high surrogate 0xdbff starts only private-use code points, which are
+  // no letter or digit, so reading one as two lone surrogates counts the same
+  const paired = unit >= 0xd800 && unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff;
+  return paired ? text.slice(i, i + 2) : text[i];
+}
+
+/** A letter or a digit of any script. The ASCII ones are decided without the regex. */
+function isLetterOrDigit(char: string): boolean {
+  // mutation-equivalent: the regex decides an ASCII character as the check below does, so reading
+  // another unit only skips the shortcut
+  const code = char.charCodeAt(0);
+  // mutation-equivalent: U+0080 is no letter or digit, so the shortcut and the regex agree on it
+  if (code < 0x80) return (code >= 48 && code <= 57) || ((code | 32) >= 97 && (code | 32) <= 122);
+  return LETTER_OR_DIGIT.test(char);
+}
+
+/** True when `char`, at `i` in `text`, ends a value: an end character, or a `]` that no value character follows. */
+function endsValue(text: string, i: number, char: string, valueEnd: RegExp): boolean {
+  if (char !== "]") return valueEnd.test(char);
+  const next = text[i + 1];
+  return next === undefined || valueEnd.test(next);
+}
+
+/** Where the tail that starts at `from` ends, and whether a letter or a digit stands in it. */
+function scanTail(text: string, from: number, valueEnd: RegExp): { end: number; counts: boolean } {
+  let i = from;
+  let counts = false;
+  while (i < text.length) {
+    if (text.charCodeAt(i) === 0x5b) {
+      MARKER_AT.lastIndex = i;
+      if (MARKER_AT.test(text)) {
+        i += REDACTED.length;
+        continue;
+      }
+    }
+    const char = characterAt(text, i);
+    if (endsValue(text, i, char, valueEnd)) break;
+    counts ||= isLetterOrDigit(char);
+    i += char.length;
+  }
+  return { end: i, counts };
+}
+
+/** The tails in `redacted` (the output of the passes), each as the text it holds. */
+function markerTails(redacted: string): string[] {
+  const tails: string[] = [];
+  if (!MARKER_ANYWHERE.test(redacted)) return tails;
+  for (const [start, valueEnd] of TAIL_STARTS) {
+    start.lastIndex = 0;
+    for (let match = start.exec(redacted); match !== null; match = start.exec(redacted)) {
+      const from = match.index + match[0].length;
+      const tail = scanTail(redacted, from, valueEnd);
+      if (tail.counts) tails.push(redacted.slice(from, tail.end));
+      start.lastIndex = tail.end;
+    }
+  }
+  return tails;
+}
+
+/** True when `now` holds a tail that `held` does not, counting repeats. */
+function holdsNewTail(held: string[], now: string[]): boolean {
+  const left = new Map<string, number>();
+  // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
+  for (const tail of held) left.set(tail, (left.get(tail) ?? 0) + 1);
+  for (const tail of now) {
+    // mutation-equivalent: a count of 0 and a missing one both read as 0
+    const count = left.get(tail) ?? 0;
+    if (count === 0) return true;
+    left.set(tail, count - 1);
+  }
+  return false;
+}
+
 /**
  * True when `updated` holds a credential shape `previous` did not: the values redaction takes out
  * of `updated` are not all among (as a multiset) those it takes out of `previous`. Comparing values,
  * not a count, refuses an edit that drops one credential and assembles another. The accepted cost:
  * an edit inside a matched span (rewording the rest of a quoted value beside `password:`, trimming a
  * key) makes a new value and is refused too, though it adds no secret.
+ * It is also true when the output of the passes for `updated` holds a tail behind a marker (see
+ * `markerTails`) that the output for `previous` does not hold, counting repeats.
  */
 export function addsSecretLike(previous: string, updated: string): boolean {
   const held: Record<RemovalSource, Map<string, number>> = { regex: new Map(), reader: new Map() };
-  runRedactionPasses(previous, (removed, source) => {
+  const previousPasses = runRedactionPasses(previous, (removed, source) => {
     // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
     held[source].set(removed, (held[source].get(removed) ?? 0) + 1);
   });
   let added = false;
-  runRedactionPasses(updated, (removed, source) => {
+  const updatedPasses = runRedactionPasses(updated, (removed, source) => {
     // mutation-equivalent: a count of 0 and a missing one both read as 0
     const left = held[source].get(removed) ?? 0;
     if (left === 0) added = true;
     else held[source].set(removed, left - 1);
   });
-  return added;
+  if (added) return true;
+  const tails = markerTails(removeAt(updatedPasses.text, updatedPasses.artifacts));
+  // mutation-equivalent: with no tail in `updated`, holdsNewTail is false whatever `previous` holds,
+  // so the check only skips reading the tails of `previous`
+  if (tails.length === 0) return false;
+  return holdsNewTail(markerTails(removeAt(previousPasses.text, previousPasses.artifacts)), tails);
 }
 
 /**
@@ -744,7 +862,12 @@ export function redactWithinCap(text: string, cap: number): string {
   return whole.slice(0, whole.startsWith(REDACTED, same) ? same + REDACTED.length : same);
 }
 
-/** True when `text` holds a credential shape: redacting it would change it. */
+/**
+ * True when `text` holds a credential shape: redacting it would change it, or its output holds a
+ * tail behind a marker (see `markerTails`).
+ */
 export function containsSecretLike(text: string): boolean {
-  return runRedactionPasses(text, () => undefined).text !== text;
+  const { text: passed } = runRedactionPasses(text, () => undefined);
+  // A text that the passes leave as it is has no added `]` to take out, so it is its own output.
+  return passed !== text || markerTails(text).length > 0;
 }
