@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import {
   addsSecretLike,
   containsSecretLike,
+  REDACTION_LOOKAHEAD_CHARS,
   redactSecretLike,
   redactWithinCap,
 } from "./memorySecretRedaction";
@@ -1218,6 +1219,82 @@ describe("redactWithinCap", () => {
   it("keeps a pair whose value goes past the cap redacted whole", () => {
     const text = `password=${"z".repeat(600)}`;
     expect(redactWithinCap(text, CAP)).toBe("password=[redacted]");
+  });
+
+  // The JWT pattern needs both dots. A JWT whose first parts run past the window is not matched, and
+  // what lies inside the cap would stay readable. Made-up parts: `Q` is the header, `W` the payload.
+  describe("a JWT that the window ends inside", () => {
+    const HEADER = `eyJ${"Q".repeat(40)}`;
+    const jwt = (header: string, payload: string): string =>
+      `${header}.${payload}.${"X".repeat(86)}`;
+    const windowOf = (text: string): string => text.slice(0, CAP + REDACTION_LOOKAHEAD_CHARS);
+    const before = `${"z".repeat(CAP - 20)} `;
+
+    it.each([
+      ["a payload that runs past it", "eyJ" + "W".repeat(1_200), HEADER, " "],
+      ["a payload with no claim marker", "W".repeat(1_200), HEADER, " "],
+      [
+        "a header that runs past it, with no dot read yet",
+        "eyJ" + "W".repeat(40),
+        "eyJ" + "Q".repeat(1_200),
+        " ",
+      ],
+      ["a header glued behind a dot", "eyJ" + "W".repeat(1_200), HEADER, "."],
+    ])("stops at the start of %s", (_label, payload, header, glue) => {
+      const text = `${before.trimEnd()}${glue}${jwt(header, payload)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP)).toBe(`${before.trimEnd()}${glue}`);
+    });
+
+    it("takes a JWT whose signature runs past the window whole, as a marker", () => {
+      const text = `${before}${HEADER}.eyJ${"W".repeat(100)}.${"X".repeat(1_200)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP)).toBe(`${before}[redacted]`);
+    });
+
+    it("takes a JWT that fits the window whole, and keeps what follows it up to the cap", () => {
+      const text = `${before}${jwt(HEADER, `eyJ${"W".repeat(100)}`)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP)).toBe(`${before}[redacted]`);
+    });
+
+    // Only a run that touches the window's end can be a JWT that goes on: a short one in the middle
+    // of the text is a JWT-like word that the pattern leaves alone.
+    it("keeps a JWT-like run that ends before the end of the window", () => {
+      const text = `see eyJabc.def in ${"z".repeat(CAP + 600)}`;
+
+      expect(redactWithinCap(windowOf(text), CAP)).toBe(text.slice(0, CAP));
+    });
+
+    it("leaves the output as it is for a JWT-like run that starts past the cap", () => {
+      const text = `${"z".repeat(CAP + 5)} ${jwt(HEADER, `eyJ${"W".repeat(1_200)}`)}`;
+
+      expect(redactWithinCap(windowOf(text), CAP)).toBe("z".repeat(CAP));
+    });
+
+    // Every prefix of a JWT that is longer than the cap shows nothing of it: it is a marker once the
+    // second part has its 8 characters and a second dot, and cut before it until then.
+    it("shows nothing of any prefix of a JWT", () => {
+      const whole = jwt(`eyJ${"Q".repeat(10)}`, `eyJ${"W".repeat(20)}`);
+      for (let length = 6; length <= whole.length; length++) {
+        const shown = redactWithinCap(whole.slice(0, length), 5);
+        expect([length, shown === "" || shown === "[redacted]"]).toEqual([length, true]);
+      }
+    });
+  });
+
+  // The cut reads the redacted window once more. Its cost must not grow faster than the window: a
+  // quadratic scan of these shapes takes seconds at this size.
+  it.each([
+    ["dots between JWT starts", "eyJ.".repeat(7_500)],
+    ["JWT starts with a dot after each", "eyJabc.".repeat(4_300)],
+    ["one long header and one long payload", `eyJ${"a".repeat(15_000)}.${"b".repeat(15_000)} x`],
+    ["many long parts", `eyJ${"a".repeat(1_000)}.`.repeat(30)],
+  ])("cuts the window of %s in linear time", (_label, text) => {
+    redactWithinCap("warm up eyJabc.def", 10); // keep a cold regex compile out of the timing
+    const started = performance.now();
+    redactWithinCap(text, 29_000);
+    expect(performance.now() - started).toBeLessThan(100);
   });
 });
 

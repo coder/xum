@@ -1170,6 +1170,26 @@ describe("runMemoryHarvest", () => {
         expect(shown).toStartWith(redactSecretLike(text.slice(0, TEXT_PART_LIMIT)));
       });
     });
+
+    // The JWT pattern needs both dots, so a JWT whose first parts run past the window is not matched.
+    // What lies inside the cap is cut off at the JWT's start.
+    it("shows no part of a JWT that the window ends inside", () => {
+      using fixture = createFixture();
+      const jwt = `eyJ${"Q".repeat(40)}.eyJ${"W".repeat(1_200)}.${"X".repeat(86)}`; // made up
+      const text = `${"z".repeat(TEXT_PART_LIMIT - 100)} ${jwt} tail`;
+      fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
+
+      const rows = buildHarvestChunks(fixture.messages).flatMap(
+        (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
+      );
+      const shown = rows.map((row) => row.text).join("");
+
+      expect(shown).not.toMatch(/eyJ|QQQQ|WWWW/);
+      // The text stops at the JWT's start, and the note counts every character past the cap.
+      expect(shown).toBe(
+        `${"z".repeat(TEXT_PART_LIMIT - 100)} \n[truncated ${text.length - TEXT_PART_LIMIT} more chars for memory harvest]`
+      );
+    });
   });
 
   // A data URL in a message the user typed or the model wrote is attachment bytes like one in a

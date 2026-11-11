@@ -581,6 +581,12 @@ export function addsSecretLike(previous: string, updated: string): boolean {
   return added;
 }
 
+// What a window that stops inside a JWT ends with: a run that starts like a JWT and has not read its
+// second dot. The JWT pattern (in STANDALONE_SECRET_PATTERNS) needs both dots, so such a run is not
+// matched and stays readable. The character class and the anchor to the start of a run are the JWT
+// pattern's own.
+const OPEN_JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*)?$/;
+
 /**
  * `text` redacted, and cut at its first `cap` characters, with the rest of `text` as a lookahead: a
  * secret that starts inside the cap is matched whole, and no output from past the cap is shown.
@@ -590,12 +596,25 @@ export function addsSecretLike(previous: string, updated: string): boolean {
  * leaves the start of a secret that crosses the cap. Where the redacted whole differs from that,
  * the whole has taken the secret, and its marker stands in for the start. Redaction can also
  * lengthen text (a one-character value becomes a marker), so the result can be longer than `cap`.
+ *
+ * A secret that goes on past the lookahead cannot be matched whole, and its start inside the cap
+ * would stay readable. The JWT is the only pattern that needs more than a minimum of its own
+ * before it takes the rest of the window, so the output stops where a run that could be the start
+ * of a JWT begins (`OPEN_JWT`). A pattern that is added with that need must be cut here too.
  */
 export function redactWithinCap(text: string, cap: number): string {
   const whole = redactSecretLike(text);
   // mutation-equivalent: at a length of exactly `cap` the head is the whole text, so either branch
   // returns the same text; this one skips the second redaction
   if (text.length <= cap) return whole;
+  const shown = prefixWithinCap(text, cap, whole);
+  // What is shown is a prefix of `whole`, so an index in `whole` is an index in it.
+  const open = whole.search(OPEN_JWT);
+  return open < 0 ? shown : shown.slice(0, open);
+}
+
+/** The prefix of `whole` (the redacted `text`) that comes from the first `cap` characters of `text`. */
+function prefixWithinCap(text: string, cap: number, whole: string): string {
   const head = redactSecretLike(text.slice(0, cap));
   let same = 0;
   // mutation-equivalent: past the end of both texts `undefined === undefined` takes one more step,

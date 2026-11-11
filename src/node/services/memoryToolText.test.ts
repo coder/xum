@@ -201,6 +201,21 @@ describe("renderToolValue", () => {
     });
   });
 
+  // The JWT pattern needs both dots, so a JWT whose first parts run past the window is not matched.
+  // What lies inside the cap is cut off at the JWT's start.
+  describe("a JWT that the window ends inside", () => {
+    const jwt = `eyJ${"Q".repeat(40)}.eyJ${"W".repeat(1_200)}.${"X".repeat(86)}`; // made up
+
+    it.each([2_000, 128_000])("shows no part of it, at a cap of %d", (cap) => {
+      const text = `${"z".repeat(cap - 100)} ${jwt} tail`;
+
+      const rendered = renderToolValue(text, cap);
+
+      expect(rendered).not.toMatch(/eyJ|QQQQ|WWWW/);
+      expect(rendered).toStartWith(`${"z".repeat(cap - 100)}  [truncated `);
+    });
+  });
+
   it("says how much was cut when the whole value fit, and at least how much when it did not", () => {
     expect(renderToolValue("x".repeat(2_100), 2_000)).toBe(
       `${"x".repeat(2_000)} [truncated 100 more chars for memory harvest]`
