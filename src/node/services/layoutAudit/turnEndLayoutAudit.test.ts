@@ -156,12 +156,24 @@ describe("hasNewLayoutIssueAtTurnEnd", () => {
   test.each([
     { name: "a clean page", audited: report() },
     { name: "an issue the agent was already shown", audited: report([issue(true)]) },
-    { name: "a page with a width that was not checked", audited: notChecked([issue()]) },
+    { name: "a page with a width that was not checked", audited: notChecked([]) },
+    {
+      name: "a page with a width that was not checked and an issue the agent was shown",
+      audited: notChecked([issue(true)]),
+    },
     { name: "a page with nothing to report", audited: undefined },
   ])("$name is not a finding", async ({ audited }) => {
     expect(await hasNewLayoutIssueAtTurnEnd(deps({ audit: () => Promise.resolve(audited) }))).toBe(
       false
     );
+  });
+
+  test("a new issue at a width that completed is a finding, even when another width was not checked", async () => {
+    expect(
+      await hasNewLayoutIssueAtTurnEnd(
+        deps({ audit: () => Promise.resolve(notChecked([issue()])) })
+      )
+    ).toBe(true);
   });
 
   test("one page with a new issue is enough, next to a clean page and a shown one", async () => {
@@ -366,6 +378,14 @@ describe("workspaceHasNewLayoutIssueAtTurnEnd", () => {
     expect(audits).toEqual([]);
   });
 
+  test("a side chat is not audited", async () => {
+    await publishedPage("report.html");
+    metadata = { ...metadata, sideChatParentWorkspaceId: "ws-main" };
+    expect(await run()).toBe(false);
+    expect(probe).not.toHaveBeenCalled();
+    expect(audits).toEqual([]);
+  });
+
   test("lists and audits nothing when the Artifacts location is unavailable", async () => {
     spyOn(artifactsOperations, "resolveArtifactsLocation").mockResolvedValue({
       kind: "unavailable",
@@ -414,7 +434,7 @@ describe("a turn-end audit through the real layout audit", () => {
   });
 
   // Every audit runs a fake CLI through a dozen shells, and a loaded host is slow.
-  test("tells about an issue no publish listed, adds nothing to the fix-loop memory, and goes silent once a publish listed it", async () => {
+  test("tells about an issue no publish listed at every turn end, adds nothing to the fix-loop memory, and goes silent once a publish listed it", async () => {
     const artifactsDir = path.join(tempDir, "scratch", "artifacts");
     await fs.mkdir(artifactsDir, { recursive: true });
     await installFakeAgentBrowser(tempDir, {
@@ -437,27 +457,39 @@ describe("a turn-end audit through the real layout audit", () => {
       sessionDir: path.join(tempDir, "session"),
       budgetMs: 20_000,
     } as const;
+    let modifiedMs = Date.now();
+    let turnEndAudits = 0;
     const atTurnEnd = () =>
       hasNewLayoutIssueAtTurnEnd({
-        streamStartedAtMs: STREAM_START,
+        streamStartedAtMs: modifiedMs - 1,
         abortSignal: new AbortController().signal,
-        list: () => Promise.resolve(listingOf([page("chart.html", STREAM_START + 1)])),
-        lastAuditStartedAtMs: never,
-        audit: (relPath, abortSignal) =>
-          checkArtifactLayoutModule.checkArtifactLayout({
+        list: () => Promise.resolve(listingOf([page("chart.html", modifiedMs)])),
+        lastAuditStartedAtMs: (relPath) => layoutAuditLastStartedAtMs(input.sessionDir, relPath),
+        audit: (relPath, abortSignal) => {
+          turnEndAudits += 1;
+          return checkArtifactLayoutModule.checkArtifactLayout({
             ...input,
             relPath,
             abortSignal,
             remember: false,
-          }),
+          });
+        },
       });
 
+    expect(await atTurnEnd()).toBe(true);
+    // New input or a Stop can win over the continuation, so the agent may not have been told:
+    // the unchanged page is audited, and found, again.
     expect(await atTurnEnd()).toBe(true);
     // The agent has been shown nothing: the publish lists the issue as new, and commits it.
     expect(
       (await checkArtifactLayoutModule.checkArtifactLayout(input))?.issues[0]
     ).not.toHaveProperty("persistent");
-    // Now a publish result listed it: the next turn end has nothing new to say.
+    // A publish audited the page after its last write: the next turn end does not audit it.
     expect(await atTurnEnd()).toBe(false);
-  }, 180_000);
+    expect(turnEndAudits).toBe(2);
+    // The page changes and keeps the issue the publish listed: audited, with nothing new to say.
+    modifiedMs = Date.now();
+    expect(await atTurnEnd()).toBe(false);
+    expect(turnEndAudits).toBe(3);
+  }, 300_000);
 });

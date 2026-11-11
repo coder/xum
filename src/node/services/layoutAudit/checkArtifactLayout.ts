@@ -8,7 +8,7 @@ import { getToolEnvPath } from "@/node/services/hooks";
 import { runLayoutPasses } from "@/node/services/layoutAudit/agentBrowserLayoutRun";
 import { LAYOUT_AUDIT_PAGE_SCRIPT } from "@/node/services/layoutAudit/layoutAuditPageScript.generated";
 import { startLayoutAudit } from "@/node/services/layoutAudit/layoutFingerprints";
-import { buildLayoutReport } from "@/node/services/layoutAudit/layoutReport";
+import { buildLayoutReport, hasNewLayoutIssue } from "@/node/services/layoutAudit/layoutReport";
 import { failedOutcomes, type ViewportOutcome } from "@/node/services/layoutAudit/viewportOutcome";
 import { log } from "@/node/services/log";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -134,12 +134,15 @@ export async function checkArtifactLayout(
     // check in which no width completed: it learned nothing, and committing it would still
     // push another path out of the bounded memory.
     const cancelled = input.abortSignal?.aborted === true;
+    const shown = input.remember !== false;
     return turn.finish(
       (previous) => buildLayoutReport(outcomes, previous),
-      input.remember !== false &&
-        !cancelled &&
-        outcomes.some((outcome) => outcome.status === "complete"),
-      cancelled
+      shown && !cancelled && outcomes.some((outcome) => outcome.status === "complete"),
+      // The page stays due for the turn-end audit when this audit was cancelled (it never
+      // looked at the page the way a finished one does), and when it found an issue that it
+      // does not show the agent: the continuation that tells the agent can lose to newer input
+      // or a Stop, and then only a later turn end can tell it.
+      (report) => cancelled || (!shown && hasNewLayoutIssue(report))
     );
   } catch (error) {
     log.debug("layout audit report failed", { error });

@@ -31,14 +31,19 @@ describe("layoutFingerprint", () => {
 /**
  * Ends an audit with `next` as its memory and returns what it read as `previous`. `remember`
  * false is an audit that leaves no memory behind (nothing completed, or a turn-end audit), and
- * `cancelled` one that never ran to its end.
+ * `staysDue` one that does not settle the page (cancelled, or an issue the agent was not shown).
  */
 const finish = (
   turn: LayoutAuditTurn,
   next: FingerprintSnapshot = {},
   remember = true,
-  cancelled = false
-) => turn.finish((previous) => ({ report: previous, next }), remember, cancelled);
+  staysDue = false
+) =>
+  turn.finish(
+    (previous) => ({ report: previous, next }),
+    remember,
+    () => staysDue
+  );
 
 /** The memory of a path, read by an audit that leaves nothing behind. */
 const memoryOf = (dir: string, relPath: string) =>
@@ -166,7 +171,7 @@ describe("layoutAuditLastStartedAtMs", () => {
     expect(layoutAuditLastStartedAtMs(dir, "a.html")).toBeUndefined();
   });
 
-  test("is the start of an audit that ran to its end, whether or not it remembered anything", () => {
+  test("is the start of an audit that settled the page, whether or not it remembered anything", () => {
     const dir = freshDir();
     finish(startLayoutAudit(dir, "kept.html", 100), remember("one"));
     finish(startLayoutAudit(dir, "dropped.html", 200), remember("two"), false);
@@ -174,7 +179,7 @@ describe("layoutAuditLastStartedAtMs", () => {
     expect(layoutAuditLastStartedAtMs(dir, "dropped.html")).toBe(200);
   });
 
-  test("a cancelled audit records nothing and leaves an earlier start as it was", () => {
+  test("an audit that leaves the page due records nothing and leaves an earlier start as it was", () => {
     const dir = freshDir();
     finish(startLayoutAudit(dir, "a.html", 100), {}, true, true);
     expect(layoutAuditLastStartedAtMs(dir, "a.html")).toBeUndefined();
@@ -234,10 +239,12 @@ describe("the audits of a path in flight", () => {
     throw new Error("build failed");
   };
 
-  test("a build that throws still ends the audit", () => {
+  test("a build that throws still ends the audit, and leaves the page due", () => {
     const base = layoutAuditPathsInFlight();
-    const turn = startLayoutAudit(freshDir(), "a.html");
+    const dir = freshDir();
+    const turn = startLayoutAudit(dir, "a.html", 100);
     expect(() => turn.finish(throwingBuild, true)).toThrow("build failed");
     expect(layoutAuditPathsInFlight()).toBe(base);
+    expect(layoutAuditLastStartedAtMs(dir, "a.html")).toBeUndefined();
   });
 });

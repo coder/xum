@@ -93,8 +93,8 @@ You ended your turn without a status update, and the status page the user sees i
 const STATUS_PAGE_TURN_END_NUDGES = [STATUS_PAGE_TURN_END_NUDGE, STATUS_PAGE_AGENT_TURN_END_NUDGE];
 
 /**
- * The turn-end layout nudge. Xum audits every published HTML artifact that changed during the
- * turn once the turn ends (layoutAudit/turnEndLayoutAudit.ts), and sends this prompt as a
+ * The turn-end layout nudge. Once a turn ends, Xum audits every published HTML artifact that
+ * changed since its last audit (layoutAudit/turnEndLayoutAudit.ts), and sends this prompt as a
  * turn.stop continuation, at most once per user turn, only when a page has an issue that no
  * publish result has listed yet. Constant, like the other nudges: the issue text comes from the
  * page, so no path, selector or count of it may come back as a user row. A publish result
@@ -102,7 +102,7 @@ const STATUS_PAGE_TURN_END_NUDGES = [STATUS_PAGE_TURN_END_NUDGE, STATUS_PAGE_AGE
  * for them.
  */
 export const LAYOUT_TURN_END_NUDGE = `<notification>
-You ended your turn, but Xum checked the layout of an HTML artifact you changed this turn and found an issue that no publish result has shown you. Publish each HTML artifact you changed this turn again with the artifact tool: its result lists the layout issues. Fix the ones that matter and publish again to confirm. Do not redo work you already did.
+You ended your turn, but Xum checked the layout of a published HTML artifact that changed since you last published it and found an issue that no publish result has shown you. Publish each HTML artifact that changed since you last published it again with the artifact tool: its result lists the layout issues. Fix the ones that matter and publish again to confirm. Do not redo work you already did.
 </notification>`;
 
 /** Joins Xum's turn-end nudges (TODO, status page, then layout) into one continuation. */

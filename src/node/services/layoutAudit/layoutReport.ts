@@ -168,3 +168,12 @@ export function buildLayoutReport(
     next: nextSnapshot(complete, listed, previous),
   };
 }
+
+/**
+ * Whether the report lists an issue that no publish result has listed before. New issues are
+ * listed first, so a report with any new issue lists one. A width that was not checked does not
+ * change the answer: the issues of the widths that completed are evidence either way.
+ */
+export function hasNewLayoutIssue(report: LayoutAuditReport): boolean {
+  return report.issues.some((issue) => issue.persistent !== true);
+}

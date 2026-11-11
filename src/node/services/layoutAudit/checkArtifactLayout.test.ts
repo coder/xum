@@ -267,6 +267,20 @@ describe("checkArtifactLayout", () => {
       await check({ abortSignal: AbortSignal.abort() });
       expect(startedAt()).toBeUndefined();
     });
+
+    test("is not set by a check that found an issue it does not show, until a publish shows it", async () => {
+      // The continuation that tells the agent can lose to newer input or a Stop: the page must
+      // stay due for the next turn end, changed or not.
+      await install({ eval: { 390: { kind: "pass", findings: [card] } } });
+      await check({ remember: false });
+      expect(startedAt()).toBeUndefined();
+      await check();
+      const shownAt = startedAt();
+      expect(shownAt).toBeDefined();
+      // The agent was shown the issue: a turn-end audit that finds only that one settles the page.
+      await check({ remember: false });
+      expect(startedAt()).toBeGreaterThan(shownAt ?? Infinity);
+    }, 180_000);
   });
 
   test("overlapping publishes of one path run at once, and the one that started first does not overwrite the newer memory", async () => {

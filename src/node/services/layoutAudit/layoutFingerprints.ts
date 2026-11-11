@@ -36,10 +36,10 @@ export const LAYOUT_MEMORY_MAX_PATHS = 64;
 // remembered (`peek`) leaves the order alone.
 const remembered = new LRUCache<string, FingerprintSnapshot>({ max: LAYOUT_MEMORY_MAX_PATHS });
 
-// Per path, the start time (host clock, ms) of the latest audit that ran to its end, whatever it
-// found. The turn-end audit compares a page's modified time with it, so a page is never audited
-// twice for the same change. Bounded like the memory above. An evicted path reads as "never
-// audited": the next turn-end audit repeats one check at worst (the safe direction).
+// Per path, the start time (host clock, ms) of the latest audit that settled the page (see
+// LayoutAuditTurn.finish). The turn-end audit compares a page's modified time with it, so a page
+// is not audited twice for the same change. Bounded like the memory above. An evicted path reads
+// as "never audited": the next turn-end audit repeats one check at worst (the safe direction).
 const lastAuditStartedAt = new LRUCache<string, number>({ max: LAYOUT_MEMORY_MAX_PATHS });
 
 function pathKey(sessionDir: string, relPath: string): string {
@@ -47,8 +47,8 @@ function pathKey(sessionDir: string, relPath: string): string {
 }
 
 /**
- * When the latest audit of the path that ran to its end started, in this process; undefined
- * when it has none (never audited, evicted, or the backend restarted).
+ * When the latest audit that settled the path started, in this process; undefined when it has
+ * none (never audited, still due, evicted, or the backend restarted).
  */
 export function layoutAuditLastStartedAtMs(
   sessionDir: string,
@@ -86,14 +86,15 @@ export interface LayoutAuditTurn {
    * this path. An audit that loses that check still gets its own report back. The audit ends
    * whether or not `build` throws. Call it exactly once.
    *
-   * An audit that ran to its end also records its start time for the path (the latest start
-   * wins: a slow early audit never moves it back), whether or not it remembers anything. A
-   * `cancelled` audit records nothing: it never looked at the page the way a finished one did.
+   * The audit also settles the page, and records its start time for the path (the latest start
+   * wins: a slow early audit never moves it back), whether or not it remembers anything. It does
+   * not when `staysDue` says so for its report, or when `build` throws: the page is then audited
+   * again at the next turn end, changed or not.
    */
   finish<T>(
     build: (previous: FingerprintSnapshot) => { report: T; next: FingerprintSnapshot },
     remember: boolean,
-    cancelled?: boolean
+    staysDue?: (report: T) => boolean
   ): T;
 }
 
@@ -115,16 +116,18 @@ export function startLayoutAudit(
   auditsStarted += 1;
   const startedAs = auditsStarted;
   return {
-    finish: (build, remember, cancelled = false) => {
+    finish: (build, remember, staysDue) => {
+      let settled = false;
       try {
         const { report, next } = build(remembered.peek(key) ?? {});
         if (remember && startedAs > path.committedStart) {
           path.committedStart = startedAs;
           remembered.set(key, next);
         }
+        settled = staysDue?.(report) !== true;
         return report;
       } finally {
-        if (!cancelled) {
+        if (settled) {
           lastAuditStartedAt.set(key, Math.max(startedAtMs, lastAuditStartedAt.peek(key) ?? 0));
         }
         path.inFlight -= 1;
