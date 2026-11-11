@@ -11,8 +11,85 @@
  * leave the tail of a long credential readable.
  */
 
+import assert from "@/common/utils/assert";
+
 /** What a redacted value becomes. */
 export const REDACTED = "[redacted]";
+
+/** The marker without its closing bracket: what a value pattern that stops before `]` reads of it. */
+const MARKER_HEAD = /^\[redacted$/i;
+
+/** What a pass did to the text it read: `removed` characters at `at` became `added` ones. */
+interface Edit {
+  at: number;
+  removed: number;
+  added: number;
+}
+
+/**
+ * Where positions of the text before a pass are in the text after it. Both lists are ascending. A
+ * position that an edit replaced is gone.
+ */
+function followPositions(positions: number[], edits: Edit[]): number[] {
+  const followed: number[] = [];
+  let shift = 0;
+  let next = 0;
+  for (const position of positions) {
+    while (next < edits.length && edits[next].at + edits[next].removed <= position) {
+      shift += edits[next].added - edits[next].removed;
+      next++;
+    }
+    // mutation-equivalent: no edit starts at a tracked `]`, a marker's head comes before it
+    if (next < edits.length && edits[next].at <= position) continue;
+    followed.push(position + shift);
+  }
+  return followed;
+}
+
+/** `text.replace(pattern, ...)` for a global pattern, and what each match became. */
+function replaceMatches(
+  text: string,
+  pattern: RegExp,
+  replacer: (match: RegExpExecArray) => string
+): { text: string; edits: Edit[] } {
+  const parts: string[] = [];
+  const edits: Edit[] = [];
+  let from = 0;
+  for (const match of text.matchAll(pattern)) {
+    const replacement = replacer(match);
+    parts.push(text.slice(from, match.index), replacement);
+    edits.push({ at: match.index, removed: match[0].length, added: replacement.length });
+    from = match.index + match[0].length;
+  }
+  parts.push(text.slice(from));
+  return { text: parts.join(""), edits };
+}
+
+/**
+ * `text` without the character at each position. The assertion guarantees one thing: every position
+ * holds a `]` with a `]` behind it, so a deletion never takes a lone `]` out of a text and a marker
+ * keeps its closing bracket. It does not prove that a position is one the signed-URL pattern added:
+ * a position that a pass moved without reporting it (see `followPositions`) is caught only when it no
+ * longer lands on a `]` that a `]` follows. Where it lands on another such pair, that `]` is deleted
+ * silently. The tests that pin what each pass reports are the guard against that. The message names
+ * no text, since the text can hold a credential.
+ */
+function removeAt(text: string, positions: number[]): string {
+  if (positions.length === 0) return text;
+  const parts: string[] = [];
+  let from = 0;
+  for (const position of positions) {
+    assert(
+      // mutation-equivalent: an invariant check that no valid position can fail
+      position >= from && text.charAt(position) === "]" && text.charAt(position + 1) === "]",
+      "a tracked position is not a `]` that a `]` follows"
+    );
+    parts.push(text.slice(from, position));
+    from = position + 1;
+  }
+  parts.push(text.slice(from));
+  return parts.join("");
+}
 
 /**
  * Callers cut text at a cap. They scan this much past it, so a secret that starts inside the kept
@@ -476,7 +553,11 @@ function advanceHint(text: string, at: number, state: HintState): number {
   return at + 1;
 }
 
-function redactCookieHeaders(text: string, onRemoved: (removed: string) => void): string {
+function redactCookieHeaders(
+  text: string,
+  onRemoved: (removed: string) => void,
+  onEdit?: (edit: Edit) => void
+): string {
   const state: HintState = {
     frame: null,
     // mutation-equivalent: with no frame yet, markers count for nothing
@@ -503,6 +584,7 @@ function redactCookieHeaders(text: string, onRemoved: (removed: string) => void)
     const removed = text.slice(value.start, end);
     if (removed !== "" && removed !== REDACTED) {
       parts.push(text.slice(copied, value.start), REDACTED);
+      onEdit?.({ at: value.start, removed: end - value.start, added: REDACTED.length });
       copied = end;
       state.redactedEnd = end;
       onRemoved(removed);
@@ -524,17 +606,62 @@ function redactCookieHeaders(text: string, onRemoved: (removed: string) => void)
 type RemovalSource = "regex" | "reader";
 
 /**
+ * The standalone patterns, in order, and where each `]` that the signed-URL pattern added ended up in
+ * the result. The edits of a pass are logged only once a `]` is tracked: a text without one costs
+ * what it cost before.
+ */
+function redactStandalone(
+  text: string,
+  fromRegex: (removed: string) => void
+): { text: string; artifacts: number[] } {
+  let redacted = text;
+  let artifacts: number[] = [];
+  let edits: Edit[] | null = null;
+  let added: number[] | null = null;
+  // mutation-equivalent: every pattern starts its own count at 0 below
+  let shift = 0;
+  const replaceStandalone = (match: string, offset: number, whole: string): string => {
+    fromRegex(match);
+    if (MARKER_HEAD.test(match) && whole.charAt(offset + match.length) === "]") {
+      (added ??= []).push(offset + shift + REDACTED.length - 1);
+    }
+    edits?.push({ at: offset, removed: match.length, added: REDACTED.length });
+    shift += REDACTED.length - match.length;
+    return REDACTED;
+  };
+  for (const pattern of STANDALONE_SECRET_PATTERNS) {
+    edits = artifacts.length === 0 ? null : [];
+    added = null;
+    shift = 0;
+    redacted = redacted.replace(pattern, replaceStandalone);
+    if (edits !== null) artifacts = followPositions(artifacts, edits);
+    // Only the signed-URL pattern adds, and no pattern before it tracked anything, so the two lists
+    // are never both in play and the result stays ascending. `removeAt` asserts it.
+    if (added !== null) artifacts = [...artifacts, ...added];
+  }
+  return { text: redacted, artifacts };
+}
+
+/**
  * The redaction passes, in order, each on the previous pass's output. `onRemoved` hears what each
  * replacement took out, so a caller can tell credentials apart instead of only counting them.
+ *
+ * The signed-URL pattern's value stops before `]`, so on a marker that is already in the text it
+ * matches `[redacted` and writes `[redacted]` in front of the `]` that was there: `[redacted]]`, one
+ * more `]` on every pass. The passes keep doing that, because the write guard compares what they take
+ * out and the later passes read what they leave. `artifacts` lists where each `]` that such a match
+ * added ended up in the returned text, so `redactSecretLike` can take it out and the `]` stops
+ * growing. Each pass after the signed-URL pattern must report its edits to `followPositions`. Other
+ * second-pass changes (a key next to a marker) stay as they are on main.
  */
 function runRedactionPasses(
   text: string,
   onRemoved: (removed: string, source: RemovalSource) => void
-): string {
+): { text: string; artifacts: number[] } {
   const fromRegex = (removed: string): void => onRemoved(removed, "regex");
   // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
   // would end the value there and leave its tail readable.
-  let redacted = text.replace(
+  const afterCookies = text.replace(
     COOKIE_HEADER_PATTERN,
     (match: string, prefix: string, opener: string | undefined) => {
       // mutation-equivalent: `opener` is undefined or a string, and "" or undefined both add nothing
@@ -543,32 +670,45 @@ function runRedactionPasses(
       return `${kept}${REDACTED}`;
     }
   );
-  for (const pattern of STANDALONE_SECRET_PATTERNS) {
-    redacted = redacted.replace(pattern, (match: string) => {
-      fromRegex(match);
-      return REDACTED;
-    });
-  }
-  redacted = redacted.replace(SECRET_KEY_VALUE_PATTERN, (match: string, prefix: string) => {
+  let { text: redacted, artifacts } = redactStandalone(afterCookies, fromRegex);
+  const replaceKeyValue = (match: string, prefix: string): string => {
     fromRegex(match.slice(prefix.length));
     return `${prefix}${REDACTED}`;
-  });
+  };
+  if (artifacts.length === 0) {
+    redacted = redacted.replace(SECRET_KEY_VALUE_PATTERN, replaceKeyValue);
+  } else {
+    const keyValue = replaceMatches(redacted, SECRET_KEY_VALUE_PATTERN, (match) =>
+      replaceKeyValue(match[0], match[1])
+    );
+    redacted = keyValue.text;
+    // A key's prefix holds no marker, so the whole match counts as the span that was replaced.
+    artifacts = followPositions(artifacts, keyValue.edits);
+  }
   // Last, on what the passes above left: the reader only replaces spans of their output with the
   // marker, so it never brings back a character they took out. It adds the rest of a value that
   // the regex ended early (at a quote, a `]` or a marker inside it), and never redacts less.
-  return redactCookieHeaders(redacted, (removed) => onRemoved(removed, "reader"));
+  const readerEdits: Edit[] = [];
+  redacted = redactCookieHeaders(
+    redacted,
+    (removed) => onRemoved(removed, "reader"),
+    artifacts.length === 0 ? undefined : (edit) => readerEdits.push(edit)
+  );
+  return { text: redacted, artifacts: followPositions(artifacts, readerEdits) };
 }
 
 /** Replaces common credential shapes with `[redacted]`. */
 export function redactSecretLike(text: string): string {
-  return runRedactionPasses(text, () => undefined);
+  const { text: redacted, artifacts } = runRedactionPasses(text, () => undefined);
+  return removeAt(redacted, artifacts);
 }
 
 // A value can go on after a marker. A pass that redacts part of a value leaves the marker inside it
-// (`sig=abc.<key>.xyz` is `sig=abc.[redacted]].xyz` once the key pattern ran), and a value that a
-// model writes beside a marker starts with it (`password=[redacted]SEKRIT`). The key pattern skips a
-// value that starts with the marker, and the value patterns end a value at the marker's `]`, so what
-// goes on stays readable and the write guards accepted it. The guards read these tails in the
+// (`sig=abc.<key>.xyz` is `sig=[redacted].xyz` once the passes ran: the signed-URL value stops at the
+// marker's `]`), and a value that a model writes beside a marker starts with it
+// (`password=[redacted]SEKRIT`). The key pattern skips a value that starts with the marker, and the
+// value patterns end a value at the marker's `]`, so what goes on stays readable and the write
+// guards accepted it. The guards read these tails in the
 // output of the passes. They do not change that output: a pass that rewrote it after the others
 // could make a text that main redacts stably unstable, and the readers' text is as main writes it.
 //
@@ -678,22 +818,25 @@ function holdsNewTail(held: string[], now: string[]): boolean {
  */
 export function addsSecretLike(previous: string, updated: string): boolean {
   const held: Record<RemovalSource, Map<string, number>> = { regex: new Map(), reader: new Map() };
-  const previousRedacted = runRedactionPasses(previous, (removed, source) => {
+  const previousPasses = runRedactionPasses(previous, (removed, source) => {
     // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
     held[source].set(removed, (held[source].get(removed) ?? 0) + 1);
   });
   let added = false;
-  const updatedRedacted = runRedactionPasses(updated, (removed, source) => {
+  const updatedPasses = runRedactionPasses(updated, (removed, source) => {
     // mutation-equivalent: a count of 0 and a missing one both read as 0
     const left = held[source].get(removed) ?? 0;
     if (left === 0) added = true;
     else held[source].set(removed, left - 1);
   });
   if (added) return true;
-  const tails = markerTails(updatedRedacted);
+  const tails = markerTails(removeAt(updatedPasses.text, updatedPasses.artifacts));
   // mutation-equivalent: with no tail in `updated`, holdsNewTail is false whatever `previous` holds,
   // so the check only skips reading the tails of `previous`
-  return tails.length > 0 && holdsNewTail(markerTails(previousRedacted), tails);
+  return (
+    tails.length > 0 &&
+    holdsNewTail(markerTails(removeAt(previousPasses.text, previousPasses.artifacts)), tails)
+  );
 }
 
 /**
@@ -725,6 +868,7 @@ export function redactWithinCap(text: string, cap: number): string {
  * tail behind a marker (see `markerTails`).
  */
 export function containsSecretLike(text: string): boolean {
-  const redacted = redactSecretLike(text);
-  return redacted !== text || markerTails(redacted).length > 0;
+  const { text: passed } = runRedactionPasses(text, () => undefined);
+  // A text that the passes leave as it is has no added `]` to take out, so it is its own output.
+  return passed !== text || markerTails(text).length > 0;
 }

@@ -1046,6 +1046,197 @@ describe("redactSecretLike", () => {
     ).toBe("https://h.example.com/p?sv=1&sig=[redacted]&sp=r#frag (see ?signature=[redacted])");
   });
 
+  // The harvest renderer and the guard run redaction over text that may hold the marker already. The
+  // value pattern stops before `]`: on the marker an earlier pass wrote, it read `[redacted` and wrote
+  // `[redacted]]`, one more `]` on every pass. The output no longer grows that `]`, and every shape
+  // below is stable on a second pass. Such a match is still reported to the write guard, as on main,
+  // so the guard refuses all of these: what stays readable behind the marker (`SEKRIT`) is a credential
+  // the redaction did not reach. Other second-pass changes (a key next to a marker) are main's.
+  it.each([
+    // Every value goes once, and the output is stable.
+    ["a request line", "GET /x?a=1&sig=SEKRIT2 HTTP/1.1", "GET /x?a=1&sig=[redacted] HTTP/1.1"],
+    [
+      "a JSON string",
+      '{"u": "https://h/p?X-Amz-Signature=SEKRIT4"}',
+      '{"u": "https://h/p?X-Amz-Signature=[redacted]"}',
+    ],
+    ["a bare parameter", "?sig=SEKRIT", "?sig=[redacted]"],
+    ["an XML-escaped ampersand", "?a=1&amp;signature=SEKRIT", "?a=1&amp;signature=[redacted]"],
+    ["a Google signature", "?X-Goog-Signature=SEKRIT", "?X-Goog-Signature=[redacted]"],
+    ["a value that an earlier pass redacted", "?sig=sk-ABCDEFGHIJKLMNOP", "?sig=[redacted]"],
+    ["a signature in square brackets", "[https://h/p?sig=SEKRIT]", "[https://h/p?sig=[redacted]]"],
+    [
+      "a signature in parentheses",
+      "(see https://h/p?sig=SEKRIT)",
+      "(see https://h/p?sig=[redacted])",
+    ],
+    // The marker is the head of the value: the passes read it as on main, and the output does not
+    // take the `]` that main wrote after it.
+    ["a value that is the marker already", "?sig=[redacted]", "?sig=[redacted]"],
+    ["a marker and a bracket", "?sig=[redacted]]", "?sig=[redacted]]"],
+    ["a value behind the marker", "?sig=[redacted]SEKRIT", "?sig=[redacted]SEKRIT"],
+    ["a value behind an upper-case marker", "?sig=[REDACTED]x", "?sig=[redacted]x"],
+    [
+      "a semicolon and a value behind the marker",
+      "https://x/?sig=[redacted];SEKRIT",
+      "https://x/?sig=[redacted];SEKRIT",
+    ],
+    [
+      "a PHP-escaped slash behind the head of a value",
+      String.raw`https:\/\/h\/p?signature=k\/SEKRITREST`,
+      String.raw`https:\/\/h\/p?signature=[redacted]\/SEKRITREST`,
+    ],
+    [
+      "an HTML entity behind the head of a value",
+      "https://h/p?sig=k&#43;SEKRITREST",
+      "https://h/p?sig=[redacted]&#43;SEKRITREST",
+    ],
+    [
+      "a key's marker with a tail, as the harvest renderer shows it",
+      "https://acct.blob.core.windows.net/c/b?sv=1&sig=sk-ABCDEFGHIJKL%2BSEKRITTAIL%3D",
+      "https://acct.blob.core.windows.net/c/b?sv=1&sig=[redacted]%2BSEKRITTAIL%3D",
+    ],
+  ])(
+    "redacts a signed URL's signature once, and the guard refuses it: %s",
+    (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+      expect(redacted).toBe(expected);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+      // The text as given, and as the harvest renderer shows it back to a model that writes it down.
+      for (const written of [text, redacted]) {
+        expect(containsSecretLike(written)).toBe(true);
+        expect(addsSecretLike("", written)).toBe(true);
+      }
+    }
+  );
+
+  // The collapse follows the `]` that main's passes add through the passes after the signed-URL
+  // pattern, and takes out only that one: a `]` the text had after a marker stays.
+  it("leaves a `]` after a marker that no signed-URL match wrote", () => {
+    const text = "user text [[redacted]] and [redacted]] keep";
+    expect(redactSecretLike(text)).toBe(text);
+    expect(redactSecretLike("x ?sig=[redacted]] y [redacted]]")).toBe(
+      "x ?sig=[redacted]] y [redacted]]"
+    );
+  });
+
+  // A header that only the cookie reader detects reads on past a `]`, so the reader still sees the
+  // extra `]` that the signed-URL pattern wrote, as on main: the redaction hides `SEKRIT` too, and
+  // the guard judges an edit of the tail as main's does.
+  it.each([
+    String.raw`a\tcookie": [?sig=sk-ABCDEFGHIJKLMNOP x], SEKRIT`,
+    String.raw`a\tcookie": [?sig=[redacted] x], SEKRIT`,
+  ])("hides a tail that the reader reads on past a marker: %s", (text) => {
+    const redacted = redactSecretLike(text);
+    expect(redacted).not.toContain("SEKRIT");
+    expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
+  it.each([
+    ['password="?sig=[redacted]"\n?sig=SEKRIT', 'password="?sig=SEKRIT"'],
+    [
+      String.raw`a\tcookie": [?sig=[redacted] x], AAA`,
+      String.raw`a\tcookie": [?sig=[redacted] x], SEKRIT`,
+    ],
+  ])("judges an edit as main's guard does: %j then %j", (previous, updated) => {
+    expect(addsSecretLike(previous, updated)).toBe(true);
+  });
+
+  // The `]` that a signed-URL match adds is followed through every pass after it. Each shape puts the
+  // edit of another pass in front of it, behind it, or right up to it. A position that a pass moved
+  // without reporting it deletes some other character, which these exact outputs show. `removeAt`
+  // asserts only when that character is no `]` with a `]` behind it. The last shape ends in `]]`,
+  // so a stale position that lands there is deleted without an assertion: only the output tells.
+  it.each([
+    [
+      "a key's value in front",
+      "password=hunter2 &sig=sk-ABCDEFGHIJKLMNOP",
+      "password=[redacted] &sig=[redacted]",
+    ],
+    [
+      "a key's value behind",
+      "?sig=sk-ABCDEFGHIJKLMNOP password=hunter2",
+      "?sig=[redacted] password=[redacted]",
+    ],
+    ["a key's value that ends at it", "password=?sig=sk-ABCDEFGHIJKLMNOP", "password=[redacted]]"],
+    [
+      "a key's value that takes the first of two",
+      "token=?sig=sk-ABCDEFGHIJKLMNOP ?sig=sk-QRSTUVWXYZABCDEF",
+      "token=[redacted]] ?sig=[redacted]",
+    ],
+    [
+      "a JWT in front",
+      "eyJhbGciOiJI.eyJzdWIiOiIx.c2lnbmF0 &sig=sk-ABCDEFGHIJKLMNOP",
+      "[redacted] &sig=[redacted]",
+    ],
+    [
+      "a signature in front, from the same pattern",
+      "?sig=abcdefg &sig=sk-ABCDEFGHIJKLMNOP",
+      "?sig=[redacted] &sig=[redacted]",
+    ],
+    [
+      "a signature behind, from the same pattern",
+      "?sig=sk-ABCDEFGHIJKLMNOP &sig=abcdefg",
+      "?sig=[redacted] &sig=[redacted]",
+    ],
+    [
+      "two markers",
+      "?sig=sk-ABCDEFGHIJKLMNOP ?sig=sk-QRSTUVWXYZABCDEF",
+      "?sig=[redacted] ?sig=[redacted]",
+    ],
+    [
+      "a header in front that only the reader reads",
+      String.raw`a\tCookie: v1` + "\n?sig=sk-ABCDEFGHIJKLMNOP",
+      String.raw`a\tCookie: [redacted]` + "\n?sig=[redacted]",
+    ],
+    [
+      "a header behind that only the reader reads",
+      "?sig=sk-ABCDEFGHIJKLMNOP\n" + String.raw`a\tCookie: v1`,
+      "?sig=[redacted]\n" + String.raw`a\tCookie: [redacted]`,
+    ],
+    [
+      "a reader's header in front, and a `]]` at the end of the text",
+      String.raw`a\tCookie: XXXXXXXXXXXXX` + "\n?sig=[redacted]x]]",
+      String.raw`a\tCookie: [redacted]` + "\n?sig=[redacted]x]]",
+    ],
+    // The reader's edit is the value without the blanks it leaves: `removed` ends where the value is
+    // cut, and `at` is where it starts. A bound that is off by one moves or loses the tracked `]`.
+    [
+      "a reader value that ends in blanks",
+      String.raw`a\tCookie: v1 ` + "\n?sig=[redacted]",
+      String.raw`a\tCookie: [redacted] ` + "\n?sig=[redacted]",
+    ],
+    [
+      "a reader list that ends at it",
+      String.raw`a\tcookie": [token=?sig=[redacted]`,
+      String.raw`a\tcookie": [redacted]]`,
+    ],
+  ])("follows the added bracket past another pass: %s", (_label, text, expected) => {
+    const redacted = redactSecretLike(text);
+    expect(redacted).toBe(expected);
+    expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
+  // Only the marker's own head is read back as the marker. A value that merely starts or ends like it
+  // is a value: its `]` stays as on main, and no tracked bracket is taken out.
+  it.each([
+    ["a value that goes on after the head", "?sig=[redactedX]", "?sig=[redacted]]"],
+    ["a value that has the head at its end", "?sig=abc[redacted]", "?sig=[redacted]]"],
+    ["a value that has the head in the middle", "?sig=abc[redactedX]", "?sig=[redacted]]"],
+  ])(
+    "leaves the bracket of a value that is not the marker's head: %s",
+    (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
+      expect(redactSecretLike(expected)).toBe(expected);
+    }
+  );
+
+  // A half marker is not the marker: a value that merely starts like it is still a value.
+  it("redacts a signature value that starts like the marker but is not it", () => {
+    expect(redactSecretLike("?sig=[redacted")).toBe("?sig=[redacted]");
+    expect(redactSecretLike("?sig=[redactedSEKRIT")).toBe("?sig=[redacted]");
+  });
+
   // `signature` is not a secret name: the memory-write guard reuses this detector, and a note
   // about a function signature or a signed commit must stay writable.
   it("leaves a signature or sig that is not a URL query parameter readable", () => {
@@ -1158,7 +1349,7 @@ describe("redactSecretLike", () => {
       [
         "a signature that starts with the marker",
         "?sig=[redacted]SEKRIT&x=1",
-        "?sig=[redacted]]SEKRIT&x=1",
+        "?sig=[redacted]SEKRIT&x=1",
       ],
       [
         "a signature after an XML-escaped ampersand",
@@ -1184,12 +1375,12 @@ describe("redactSecretLike", () => {
       [
         "a signature that ends at an angle bracket and a hash",
         "<https://h/p?sig=[redacted]SEKRIT><a>#frag",
-        "<https://h/p?sig=[redacted]]SEKRIT><a>#frag",
+        "<https://h/p?sig=[redacted]SEKRIT><a>#frag",
       ],
       [
         "a signature that ends at a hash",
         "?sig=[redacted]SEKRIT#frag",
-        "?sig=[redacted]]SEKRIT#frag",
+        "?sig=[redacted]SEKRIT#frag",
       ],
       // A URL whose user holds a marker and a tail: the userinfo pattern takes none of it (it bounds
       // its user at 64 characters), and the tail is the guards' to read.
@@ -1345,8 +1536,8 @@ describe("redactSecretLike", () => {
       expect(addsSecretLike(updated, updated)).toBe(false);
     });
 
-    // A signature that holds a marker is rewritten by main's pass (`[redacted]]`), so only an edit
-    // shows what the guards read: punctuation behind it is no tail.
+    // The passes write `[redacted]]` for a signature that holds a marker, and redactSecretLike takes the
+    // extra `]` out again. The guards read the text without it: punctuation behind it is no tail.
     it("accepts an edit that puts punctuation behind a signature's marker", () => {
       expect(addsSecretLike("?sig=[redacted]&x=1", "?sig=[redacted]。&x=1")).toBe(false);
       expect(addsSecretLike("?sig=[redacted]&x=1", "?sig=[redacted]...&x=1")).toBe(false);
@@ -1528,6 +1719,14 @@ describe("containsSecretLike", () => {
     expect(containsSecretLike("The token budget resets each turn; max_tokens: 4096.")).toBe(false);
     expect(containsSecretLike("Auth uses a password manager and a bearer scheme.")).toBe(false);
   });
+
+  // The passes still write `[redacted]]` after the head of a marker, and only the output drops that
+  // `]`, so the verdict is main's. A marker that the cookie rule puts back stays unflagged.
+  it("flags a marker that the signed-URL pattern reads", () => {
+    expect(containsSecretLike("?sig=[redacted]")).toBe(true);
+    expect(containsSecretLike("?sig=[redacted]]")).toBe(true);
+    expect(containsSecretLike("Cookie: [redacted]")).toBe(false);
+  });
 });
 
 describe("addsSecretLike", () => {
@@ -1609,6 +1808,20 @@ describe("addsSecretLike", () => {
 
   it("flags an edit that swaps one credential for another, which keeps their count", () => {
     expect(addsSecretLike(`password: old-secret\nsk-\nABCDEFGHIJKLMNO\n`, `${KEY}\n`)).toBe(true);
+  });
+
+  it("flags a credential swapped for another of the same shape", () => {
+    expect(addsSecretLike("key sk-ABCDEFGHIJKLMNO\n", "key sk-PQRSTUVWXYZABCD\n")).toBe(true);
+  });
+
+  // A text that holds a tracked `]` reads its key/value pairs through another path: the guard must
+  // still tell one value from another there.
+  it("flags a key's value swapped for another beside a signed URL", () => {
+    const signed = "&sig=sk-ABCDEFGHIJKLMNOP";
+    expect(addsSecretLike(`password=hunter2 ${signed}`, `password=hunter3 ${signed}`)).toBe(true);
+    expect(addsSecretLike(`password=hunter2 ${signed}`, `password=hunter2 ${signed}\n`)).toBe(
+      false
+    );
   });
 
   it("flags a second copy of a credential the file held once", () => {

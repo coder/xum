@@ -301,12 +301,16 @@ describe("AgentPluginInstallService marketplaces", () => {
     );
   });
 
-  test("a relative entry whose folder is missing is listed as not installable", async () => {
+  test("a relative entry whose folder is missing is listed as not installable, with or without skills", async () => {
     await writeFiles(marketDir, {
       ".claude-plugin/marketplace.json": marketplace([
         DOCS,
         { name: "gone", source: "./plugins/gone", skills: ["./skills/x"] },
+        // No skills list, so no skill count: the folder check still runs.
+        { name: "gone-bare", source: "./plugins/gone-bare" },
+        { name: "a-file", source: "./notes.txt" },
       ]),
+      "notes.txt": "not a folder\n",
     });
     await commit(marketDir, "an entry without its folder");
     const listed = await service.previewSource({ input: marketDir });
@@ -316,6 +320,12 @@ describe("AgentPluginInstallService marketplaces", () => {
     ).toEqual([
       ["docs", true, undefined],
       ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
+      [
+        "gone-bare",
+        false,
+        "Xum cannot install the entry's folder 'plugins/gone-bare': it does not exist",
+      ],
+      ["a-file", false, "Xum cannot install the entry's folder 'notes.txt': it is a file"],
     ]);
   });
 
@@ -632,7 +642,8 @@ describe("AgentPluginInstallService marketplaces", () => {
         ],
       ],
       ["kit", undefined, [["cursor", "kit", true]]],
-      ["bare", undefined, [["cursor", "bare", true]]],
+      // Its folder has no manifest, and a Cursor entry is never one: the preview would refuse it.
+      ["bare", undefined, [["cursor", "bare", false]]],
       ["attio", undefined, [["cursor", "third_party/attio", true]]],
     ]);
   });
@@ -734,6 +745,72 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect((await service.list()).map((item) => item.name)).toEqual([]);
   }, 20_000);
 
+  test("a Cursor entry lists as installable with any manifest its preview reads; a missing folder, a file or a symlink does not", async () => {
+    await writeFiles(marketDir, {
+      ".cursor-plugin/marketplace.json": JSON.stringify({
+        name: "cursor-market",
+        plugins: [
+          { name: "rooted", source: "rooted" },
+          { name: "clauded", source: "clauded" },
+          { name: "gone", source: "plugins/gone" },
+          { name: "afile", source: "afile" },
+          { name: "linked", source: "linked" },
+          { name: "through", source: "through/inner" },
+          { name: "past-file", source: "afile/x" },
+        ],
+      }),
+      afile: "not a folder\n",
+      "rooted/plugin.json": JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "rooted",
+      }),
+      "rooted/skills/a/SKILL.md": skillMd("a"),
+      "clauded/.claude-plugin/plugin.json": JSON.stringify({ name: "clauded" }),
+      "clauded/skills/b/SKILL.md": skillMd("b"),
+      "deep/inner/.cursor-plugin/plugin.json": JSON.stringify({ name: "through" }),
+    });
+    // The preview refuses a symlinked folder even when it holds a manifest (extractSubpath),
+    // and a folder reached through a symlinked parent.
+    await fsPromises.symlink("rooted", path.join(marketDir, "linked"));
+    await fsPromises.symlink("deep", path.join(marketDir, "through"));
+    await commit(marketDir, "Cursor entries with a root manifest, a Claude manifest and no folder");
+    const listing = await listMarketplace();
+    expect(
+      listing.entries.flatMap((entry) =>
+        entry.builds
+          .filter((build) => build.file === "cursor")
+          .map((build) => [entry.name, build.installable, build.reason])
+      )
+    ).toEqual([
+      ["rooted", true, undefined],
+      ["clauded", true, undefined],
+      ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
+      ["afile", false, "Xum cannot install the entry's folder 'afile': it is a file"],
+      [
+        "linked",
+        false,
+        "Xum cannot install the entry's folder 'linked': it is a symbolic link or runs through one",
+      ],
+      [
+        "through",
+        false,
+        "Xum cannot install the entry's folder 'through/inner': it is a symbolic link or runs through one",
+      ],
+      [
+        "past-file",
+        false,
+        "Xum cannot install the entry's folder 'afile/x': it runs through a file",
+      ],
+    ]);
+    // The listing offers what the preview installs, and refuses what it refuses.
+    expect((await previewCursorEntry("rooted")).method).toEqual({ kind: "agent-plugin" });
+    expect((await previewCursorEntry("clauded")).method).toEqual({ kind: "claude-plugin" });
+    await expect(previewCursorEntry("linked")).rejects.toThrow("is a symbolic link");
+    await expect(previewCursorEntry("through")).rejects.toThrow("is a symbolic link");
+  }, 20_000);
+
+  // Four staging runs (preview, install, update review, update): 14 s at load 30 on a shared
+  // host, and over 20 s when four test files run at once.
   test("an installed Cursor entry lists its not-applied parts and updates by its folder", async () => {
     await writeCursorMarketplace();
     const variables: AgentPluginNotApplied = {
@@ -757,7 +834,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(await installedSkills("kit")).toEqual(["format", "lint"]);
     const updated = (await service.list()).find((item) => item.name === "kit");
     expect([updated?.lockedSha, updated?.source?.subpath]).toEqual([head, "kit"]);
-  }, 20_000);
+  }, 60_000);
 
   test("not-applied names show invisible characters as marks", async () => {
     await writeCursorMarketplace();
@@ -1051,10 +1128,13 @@ describe("AgentPluginInstallService marketplaces", () => {
     const rows = singleBuildRows(listing);
     expect(rows.map((row) => [row.name, row.installable])).toEqual([
       ["held", false],
-      ["bare", true],
+      ["bare", false],
     ]);
     expect(rows[0].reason).toContain("NOT_AVAILABLE");
-    expect(rows[1].reason).toBeUndefined();
+    // The listing refuses what the preview refuses below, with the folder named.
+    expect(rows[1].reason).toBe(
+      "The entry's folder 'plugins/bare' has no plugin manifest, so Xum cannot install it."
+    );
     await expect(previewAgentsEntry("held")).rejects.toThrow("NOT_AVAILABLE");
     await expect(previewAgentsEntry("bare")).rejects.toThrow(
       "The Agent Plugins marketplace entry 'bare' has no plugin manifest in its folder. Xum does not install it."
