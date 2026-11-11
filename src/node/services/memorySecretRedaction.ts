@@ -39,52 +39,75 @@ function followPositions(positions: number[], edits: Edit[]): number[] {
       shift += edits[next].added - edits[next].removed;
       next++;
     }
-    // mutation-equivalent: no edit starts at a tracked `]`, a marker's head comes before it
     if (next < edits.length && edits[next].at <= position) continue;
     followed.push(position + shift);
   }
   return followed;
 }
 
-/** `text.replace(pattern, ...)` for a global pattern, and what each match became. */
+/**
+ * `text.replace(pattern, ...)` for a global pattern, and what each match became. `edits` count the
+ * whole match as replaced. `replaced` count only what the replacement changed, when it keeps the
+ * first `kept(match)` characters of the match as they were.
+ */
 function replaceMatches(
   text: string,
   pattern: RegExp,
-  replacer: (match: RegExpExecArray) => string
-): { text: string; edits: Edit[] } {
+  replacer: (match: RegExpExecArray) => string,
+  kept: (match: RegExpExecArray) => number = () => 0
+): { text: string; edits: Edit[]; replaced: Edit[] } {
   const parts: string[] = [];
   const edits: Edit[] = [];
+  const replaced: Edit[] = [];
   let from = 0;
   for (const match of text.matchAll(pattern)) {
     const replacement = replacer(match);
+    const keep = kept(match);
     parts.push(text.slice(from, match.index), replacement);
     edits.push({ at: match.index, removed: match[0].length, added: replacement.length });
+    replaced.push({
+      at: match.index + keep,
+      removed: match[0].length - keep,
+      added: replacement.length - keep,
+    });
     from = match.index + match[0].length;
   }
   parts.push(text.slice(from));
-  return { text: parts.join(""), edits };
+  return { text: parts.join(""), edits, replaced };
 }
 
+// What a character of a JWT-like run is: a run is these characters and the dots between its parts.
+const RUN_CHAR = /[A-Za-z0-9_.-]/;
+
 /**
- * `text` without the character at each position. The assertion guarantees one thing: every position
- * holds a `]` with a `]` behind it, so a deletion never takes a lone `]` out of a text and a marker
- * keeps its closing bracket. It does not prove that a position is one the signed-URL pattern added:
- * a position that a pass moved without reporting it (see `followPositions`) is caught only when it no
- * longer lands on a `]` that a `]` follows. Where it lands on another such pair, that `]` is deleted
- * silently. The tests that pin what each pass reports are the guard against that. The message names
- * no text, since the text can hold a credential.
+ * `text` without the character at each position of `artifacts` and of `runChars`. Both lists are
+ * ascending. The assertion on `artifacts` guarantees one thing: every position holds a `]` with a
+ * `]` behind it, so a deletion never takes a lone `]` out of a text and a marker keeps its closing
+ * bracket. It does not prove that a position is one the signed-URL pattern added: a position that
+ * a pass moved without reporting it (see `followPositions`) is caught only when it no longer lands
+ * on a `]` that a `]` follows. Where it lands on another such pair, that `]` is deleted silently.
+ * The same holds for `runChars`, which must land on a character of a run. The tests that pin what
+ * each pass reports are the guard against that. The message names no text, since the text can hold
+ * a credential.
  */
-function removeAt(text: string, positions: number[]): string {
-  if (positions.length === 0) return text;
+function removeAt(text: string, artifacts: number[], runChars: number[] = []): string {
+  if (artifacts.length === 0 && runChars.length === 0) return text;
   const parts: string[] = [];
   let from = 0;
-  for (const position of positions) {
+  let a = 0;
+  let r = 0;
+  while (a < artifacts.length || r < runChars.length) {
+    const artifact = r === runChars.length || (a < artifacts.length && artifacts[a] < runChars[r]);
+    const position = artifact ? artifacts[a++] : runChars[r++];
     assert(
       // mutation-equivalent: an invariant check that no valid position can fail
-      position >= from && text.charAt(position) === "]" && text.charAt(position + 1) === "]",
-      "a tracked position is not a `]` that a `]` follows"
+      position >= from &&
+        (artifact
+          ? text.charAt(position) === "]" && text.charAt(position + 1) === "]"
+          : RUN_CHAR.test(text.charAt(position))),
+      "a tracked position is not one that it was tracked for"
     );
-    parts.push(text.slice(from, position));
+    if (position > from) parts.push(text.slice(from, position));
     from = position + 1;
   }
   parts.push(text.slice(from));
@@ -113,13 +136,21 @@ const SIGNED_URL_PARAM = "(?:sig|signature|x-amz-signature|x-goog-signature)";
 const SIGNED_URL_VALUE_START = String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)`;
 const SIGNED_URL_VALUE_END = String.raw`\s"'\\<>&#,;)\]}`;
 
+// Provider key prefixes: OpenAI/Anthropic, GitHub, Slack, AWS, Stripe, GitLab, Google, npm. Every
+// shape is made of `[A-Za-z0-9_-]` only, so a match lies inside one run of those characters.
+const PROVIDER_KEY_PATTERN =
+  /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[abprs]-[A-Za-z0-9-]{8,}|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|glpat-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{30,})/g;
+
+// Anchored to the start of a character run: `\b` also matches after `-`, so `eyJ-eyJ-eyJ-...`
+// would start a scan to the end of the run at every `eyJ`.
+const JWT_PATTERN = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
+
 // Credential shapes that are secret on their own, wherever they appear.
 const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // An unterminated block (a tool that cut its own output) redacts through to the end of the text.
   // A PGP armor header ends `PRIVATE KEY BLOCK-----`.
   /-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----|$)/g,
-  // Provider key prefixes: OpenAI/Anthropic, GitHub, Slack, AWS, Stripe, GitLab, Google, npm.
-  /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[abprs]-[A-Za-z0-9-]{8,}|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|glpat-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{30,})/g,
+  PROVIDER_KEY_PATTERN,
   // A Slack incoming-webhook URL is a bearer secret in its path.
   /\bhooks\.slack\.com\/services\/[A-Za-z0-9/_-]{8,}/g,
   // `scheme://user:password@host`: only the userinfo goes, so the host stays readable. The user
@@ -131,9 +162,7 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // `&amp;` too, as in XML listings). `signature` stays out of SECRET_NAME: the memory-write guard
   // reuses it, and prose such as `signature: foo(a, b)` must stay writable.
   new RegExp(String.raw`${SIGNED_URL_VALUE_START}[^${SIGNED_URL_VALUE_END}]+`, "gi"),
-  // Anchored to the start of a character run: `\b` also matches after `-`, so `eyJ-eyJ-eyJ-...`
-  // would start a scan to the end of the run at every `eyJ`.
-  /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
+  JWT_PATTERN,
 ];
 
 // A quoted value reads through backslash escapes, so an escaped quote inside the string does not
@@ -599,23 +628,50 @@ function redactCookieHeaders(
 }
 
 /**
- * Which passes took a value out: main's regex passes, or the reader that runs on their output. The
- * write guard compares each apart, so its verdict on the regex passes' values is main's own: a
- * value the reader takes out of the previous text never excuses one the regex takes out of the new.
+ * Which passes took a value out: main's regex passes, the reader that runs on their output, or the
+ * read of the JWT-like runs that hold a provider key (see `keyHoldingRunChars`). The write guard
+ * compares each apart, so its verdict on the regex passes' values is main's own: a value the reader
+ * takes out of the previous text never excuses one the regex takes out of the new. A run is one
+ * more value, so the guard refuses at least what main's refused.
  */
-type RemovalSource = "regex" | "reader";
+type RemovalSource = "regex" | "reader" | "run";
 
 /**
- * The standalone patterns, in order, and where each `]` that the signed-URL pattern added ended up in
- * the result. The edits of a pass are logged only once a `]` is tracked: a text without one costs
- * what it cost before.
+ * The positions of the characters of each JWT-like run in `text` that holds a provider key, and the
+ * runs reported to `onRun`. The key pass replaces such a key alone, and its marker has no dots, so
+ * the JWT pattern can no longer match what is left of the run: its other parts stay readable. The
+ * passes run on the text as they would without this read. What of these characters is left once
+ * they ran is taken out of the result (see `removeAt`), so no character of a run that holds a key
+ * stays that a pass on main took out. Every provider shape is made of `[A-Za-z0-9_-]` only, so a
+ * key lies inside one part of a run. Linear: one scan for the runs, and each key is searched for
+ * inside its own run.
+ */
+function keyHoldingRunChars(text: string, onRun: (run: string) => void): number[] {
+  const chars: number[] = [];
+  // mutation-equivalent: a text without `eyJ` has no run, so the check only skips the scan
+  if (!text.includes("eyJ")) return chars;
+  for (const match of text.matchAll(JWT_PATTERN)) {
+    if (match[0].search(PROVIDER_KEY_PATTERN) === -1) continue;
+    onRun(match[0]);
+    for (let at = match.index; at < match.index + match[0].length; at++) chars.push(at);
+  }
+  return chars;
+}
+
+/**
+ * The standalone patterns, in order, where each `]` that the signed-URL pattern added ended up in
+ * the result, and where the characters of the runs that hold a key did (read just before the key
+ * pattern, on the text that the earlier patterns left). The edits of a pass are logged only once
+ * something is tracked: a text without a `]` and without a run costs what it cost before.
  */
 function redactStandalone(
   text: string,
-  fromRegex: (removed: string) => void
-): { text: string; artifacts: number[] } {
+  fromRegex: (removed: string) => void,
+  fromRun: (removed: string) => void
+): { text: string; artifacts: number[]; runChars: number[] } {
   let redacted = text;
   let artifacts: number[] = [];
+  let runChars: number[] = [];
   let edits: Edit[] | null = null;
   let added: number[] | null = null;
   // mutation-equivalent: every pattern starts its own count at 0 below
@@ -630,16 +686,20 @@ function redactStandalone(
     return REDACTED;
   };
   for (const pattern of STANDALONE_SECRET_PATTERNS) {
-    edits = artifacts.length === 0 ? null : [];
+    if (pattern === PROVIDER_KEY_PATTERN) runChars = keyHoldingRunChars(redacted, fromRun);
+    edits = artifacts.length + runChars.length === 0 ? null : [];
     added = null;
     shift = 0;
     redacted = redacted.replace(pattern, replaceStandalone);
-    if (edits !== null) artifacts = followPositions(artifacts, edits);
-    // Only the signed-URL pattern adds, and no pattern before it tracked anything, so the two lists
-    // are never both in play and the result stays ascending. `removeAt` asserts it.
+    if (edits !== null) {
+      artifacts = followPositions(artifacts, edits);
+      runChars = followPositions(runChars, edits);
+    }
+    // Only the signed-URL pattern adds, and no pattern before it tracked an artifact, so the two
+    // lists are never both in play and the result stays ascending. `removeAt` asserts it.
     if (added !== null) artifacts = [...artifacts, ...added];
   }
-  return { text: redacted, artifacts };
+  return { text: redacted, artifacts, runChars };
 }
 
 /**
@@ -657,7 +717,7 @@ function redactStandalone(
 function runRedactionPasses(
   text: string,
   onRemoved: (removed: string, source: RemovalSource) => void
-): { text: string; artifacts: number[] } {
+): { text: string; artifacts: number[]; runChars: number[] } {
   const fromRegex = (removed: string): void => onRemoved(removed, "regex");
   // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
   // would end the value there and leave its tail readable.
@@ -670,20 +730,29 @@ function runRedactionPasses(
       return `${kept}${REDACTED}`;
     }
   );
-  let { text: redacted, artifacts } = redactStandalone(afterCookies, fromRegex);
+  let {
+    text: redacted,
+    artifacts,
+    runChars,
+  } = redactStandalone(afterCookies, fromRegex, (run) => onRemoved(run, "run"));
   const replaceKeyValue = (match: string, prefix: string): string => {
     fromRegex(match.slice(prefix.length));
     return `${prefix}${REDACTED}`;
   };
-  if (artifacts.length === 0) {
+  if (artifacts.length + runChars.length === 0) {
     redacted = redacted.replace(SECRET_KEY_VALUE_PATTERN, replaceKeyValue);
   } else {
-    const keyValue = replaceMatches(redacted, SECRET_KEY_VALUE_PATTERN, (match) =>
-      replaceKeyValue(match[0], match[1])
+    const keyValue = replaceMatches(
+      redacted,
+      SECRET_KEY_VALUE_PATTERN,
+      (match) => replaceKeyValue(match[0], match[1]),
+      (match) => match[1].length
     );
     redacted = keyValue.text;
     // A key's prefix holds no marker, so the whole match counts as the span that was replaced.
     artifacts = followPositions(artifacts, keyValue.edits);
+    // The prefix stays readable, so a character of a run in it is still there.
+    runChars = followPositions(runChars, keyValue.replaced);
   }
   // Last, on what the passes above left: the reader only replaces spans of their output with the
   // marker, so it never brings back a character they took out. It adds the rest of a value that
@@ -692,15 +761,19 @@ function runRedactionPasses(
   redacted = redactCookieHeaders(
     redacted,
     (removed) => onRemoved(removed, "reader"),
-    artifacts.length === 0 ? undefined : (edit) => readerEdits.push(edit)
+    artifacts.length + runChars.length === 0 ? undefined : (edit) => readerEdits.push(edit)
   );
-  return { text: redacted, artifacts: followPositions(artifacts, readerEdits) };
+  return {
+    text: redacted,
+    artifacts: followPositions(artifacts, readerEdits),
+    runChars: followPositions(runChars, readerEdits),
+  };
 }
 
 /** Replaces common credential shapes with `[redacted]`. */
 export function redactSecretLike(text: string): string {
-  const { text: redacted, artifacts } = runRedactionPasses(text, () => undefined);
-  return removeAt(redacted, artifacts);
+  const { text: redacted, artifacts, runChars } = runRedactionPasses(text, () => undefined);
+  return removeAt(redacted, artifacts, runChars);
 }
 
 // A value can go on after a marker. A pass that redacts part of a value leaves the marker inside it
@@ -818,7 +891,11 @@ function holdsNewTail(held: string[], now: string[]): boolean {
  * `markerTails`) that the output for `previous` does not hold, counting repeats.
  */
 export function addsSecretLike(previous: string, updated: string): boolean {
-  const held: Record<RemovalSource, Map<string, number>> = { regex: new Map(), reader: new Map() };
+  const held: Record<RemovalSource, Map<string, number>> = {
+    regex: new Map(),
+    reader: new Map(),
+    run: new Map(),
+  };
   const previousPasses = runRedactionPasses(previous, (removed, source) => {
     // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
     held[source].set(removed, (held[source].get(removed) ?? 0) + 1);

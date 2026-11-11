@@ -1817,7 +1817,9 @@ describe("redactSecretLike", () => {
 
   // A JWT-like run that holds a provider key. The key pass used to replace the key alone, and its
   // marker has no dots, so the JWT pattern no longer matched the run: the rest of it, the signature
-  // too, stayed readable. The `SEKRIT` words stand for the run's own characters: none may show.
+  // too, stayed readable. The passes still run on the text as they ran before, and the result is
+  // what they leave without the characters of the run that they leave: it hides what they hide, and
+  // every part of the run. The `SEKRIT` words stand for the run's own characters: none may show.
   describe("a JWT-like run that holds a provider key", () => {
     const KEYS = [
       ["an OpenAI-style key", FAKE.openai],
@@ -1842,20 +1844,37 @@ describe("redactSecretLike", () => {
         ["the start of its payload", `eyJSEKRITheader.${key}-SEKRITpayloadtail.SEKRITsig`],
         ["the start of its signature", `eyJSEKRITheader.eyJSEKRITpayload.${key}-SEKRITsigtail`],
       ] as const;
-    const RUN = runWith(FAKE.aws)[0][1];
+    const KEY = FAKE.aws;
+    const RUN = runWith(KEY)[0][1];
 
+    // A run in the signature leaves a marker for the key and one for the JWT pattern's match of the
+    // rest: the passes do not merge markers, and this rule takes characters out only.
     it.each(
       KEYS.flatMap(([label, key]) => runWith(key).map(([where, run]) => [label, where, run]))
-    )("redacts the whole run that holds %s in %s", (_label, _where, run) => {
+    )("hides every part of a run that holds %s in %s", (_label, _where, run) => {
       const redacted = redactSecretLike(`see ${run} then`);
-      expect(redacted).toBe("see [redacted] then");
+      expect(redacted).toMatch(/^see (?:\[redacted\])+ then$/);
       expect(redactSecretLike(redacted)).toBe(redacted);
     });
 
-    // Each context is read by a pass of its own, and each used to leave part of the run behind.
+    // The passes that read the text around a run still read it as they did: what they hide stays
+    // hidden, and what they leave of the run goes. Each case used to leave a part of the run, or
+    // (when a pass could not read it any more) text that a pass hides without the rule.
     it.each([
-      ["after a bearer scheme", `t Bearer ${RUN} done`, "t Bearer [redacted] done"],
-      ["as an assignment's value", `token=${RUN} x`, "token=[redacted] x"],
+      ["after a bearer scheme", `t Bearer ${RUN} done`, "t [redacted][redacted] done"],
+      [
+        "after a bearer scheme, with a fourth part",
+        `t Bearer ${RUN}.SEKRITtail done`,
+        "t [redacted][redacted][redacted] done",
+      ],
+      [
+        "in an authorization header",
+        `Authorization: Bearer ${RUN}`,
+        "Authorization: [redacted][redacted]",
+      ],
+      // The pair's value stops at the key's marker, so the passes write a second `]` here, as they do
+      // for a key that no run holds.
+      ["as an assignment's value", `token=${RUN} x`, "token=[redacted]] x"],
       [
         "as a query value",
         `https://h.example.com/p?next=${RUN}&x=1`,
@@ -1864,7 +1883,12 @@ describe("redactSecretLike", () => {
       [
         "as a signed URL's signature",
         `https://h.example.com/p?sig=${RUN}&x=1`,
-        "https://h.example.com/p?sig=[redacted]&x=1",
+        "https://h.example.com/p?sig=[redacted]]&x=1",
+      ],
+      [
+        "as a signed URL's signature, with a fourth part",
+        `https://h.example.com/p?sig=${RUN}.SEKRITtail&x=1`,
+        "https://h.example.com/p?sig=[redacted]][redacted]&x=1",
       ],
       ["behind a dot", `foo.${RUN} end`, "foo.[redacted] end"],
       ["twice on a line", `${RUN} ${RUN}`, "[redacted] [redacted]"],
@@ -1876,13 +1900,44 @@ describe("redactSecretLike", () => {
         `${RUN}-----BEGIN PRIVATE KEY-----\nMIIEFAKE\n-----END PRIVATE KEY-----`,
         "[redacted][redacted]",
       ],
-    ])("redacts the whole run %s", (_label, text, expected) => {
+      [
+        "glued behind a PEM block, where the JWT pattern then starts",
+        `-----BEGIN PRIVATE KEY-----\nMIIEFAKE\n-----END PRIVATE KEY-----${RUN}`,
+        "[redacted][redacted]",
+      ],
+      // The key pair's pattern keeps its name, and the run's signature is a name here: the name stays
+      // readable in the passes' result and so in this one, and the value is hidden as it always was.
+      [
+        "whose signature is the name of a key pair",
+        `eyJSEKRITheader.eyJSEKRITpayload-${KEY}.token:SEKRITvalue`,
+        "[redacted]:[redacted]",
+      ],
+      // The Slack pattern starts at the word `hooks`, which a run can end in. It runs after the key
+      // pass, so it hides the webhook's path as it does without the run, and this rule hides the run.
+      [
+        "that ends in a Slack webhook's host",
+        `eyJSEKRITheader-${KEY}.eyJSEKRITpayload.hooks.slack.com/services/T00000000/B00000000/SEKRITtoken`,
+        "[redacted][redacted]",
+      ],
+      [
+        "that ends in the word before a Slack webhook's host",
+        `eyJSEKRITheader.eyJSEKRITpayload-${KEY}-hooks.slack.com/services/SEKRITtoken1`,
+        "[redacted][redacted]",
+      ],
+      // A key right in front of the header hides the header from a JWT pattern that reads the text
+      // before the key pass, and the passes still hide it as they did.
+      [
+        "behind a key that touches its header",
+        `${KEY}eyJSEKRITone.eyJSEKRITtwo.${KEY}.`,
+        "[redacted][redacted][redacted]",
+      ],
+    ])("hides every part of a run %s", (_label, text, expected) => {
+      expect(text).toContain("SEKRIT");
       expect(redactSecretLike(text)).toBe(expected);
       expect(redactSecretLike(expected)).toBe(expected);
     });
 
-    // The key pass still takes a key that no run holds, and the JWT pattern a run that holds none:
-    // a run without a key is read by the `Bearer` and `key=` passes as before.
+    // A run that holds no key, and a key that no run holds, read exactly as before.
     it.each([
       ["a bare key", `key ${FAKE.aws} end`, "key [redacted] end"],
       ["a run without a key", `t ${FAKE.jwt} done`, "t [redacted] done"],
@@ -1892,7 +1947,7 @@ describe("redactSecretLike", () => {
         `Authorization: Bearer ${FAKE.jwt}`,
         "Authorization: [redacted]",
       ],
-      ["a key in the fourth segment", `${FAKE.jwt}.x-${FAKE.aws}`, "[redacted].x-[redacted]"],
+      ["a key in the fourth part", `${FAKE.jwt}.x-${FAKE.aws}`, "[redacted].x-[redacted]"],
     ])("reads %s as before", (_label, text, expected) => {
       expect(redactSecretLike(text)).toBe(expected);
     });
@@ -1906,8 +1961,8 @@ describe("redactSecretLike", () => {
       expect(addsSecretLike(RUN, other)).toBe(true);
     });
 
-    // The guard reads the later passes on the text as main did, so it refuses at least what main's
-    // refused: a context in front of a run that the previous text held makes a new value there.
+    // The guard reads the passes on the text as before, so it refuses at least what main's refused:
+    // a context in front of a run that the previous text held makes a new value there.
     it.each([
       ["a bearer scheme", `Bearer ${RUN}`],
       ["an assignment", `token=${RUN}`],
@@ -1923,9 +1978,8 @@ describe("redactSecretLike", () => {
     // A run is one more value, apart from the regex passes' values: a cookie value that was the same
     // text excuses nothing, and the key inside the run is held by the file either way.
     it("keeps a run apart from a regex value of the same text", () => {
-      const key = FAKE.aws;
-      expect(addsSecretLike(`Cookie: ${RUN}\n${key}`, RUN)).toBe(true);
-      expect(addsSecretLike(`Cookie: ${RUN}\n${key}`, `Cookie: ${RUN}\n${key}`)).toBe(false);
+      expect(addsSecretLike(`Cookie: ${RUN}\n${KEY}`, RUN)).toBe(true);
+      expect(addsSecretLike(`Cookie: ${RUN}\n${KEY}`, `Cookie: ${RUN}\n${KEY}`)).toBe(false);
     });
   });
 
