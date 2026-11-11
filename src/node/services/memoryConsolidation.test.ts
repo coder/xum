@@ -906,6 +906,30 @@ describe("consolidation memory tool rails", () => {
       expect(JSON.stringify(fixture.journal)).not.toContain(githubToken);
     });
 
+    it("journals a dry run's rows of a credential-named file without the credential", async () => {
+      // A redacting dry run (the debug CLI's --dry-run) stages a delete of such a file, or refuses
+      // one whose file is missing with a note that quotes the path: both rows are persisted like
+      // a real run's, so they must not keep the name either.
+      using fixture = await createFixture({ dryRun: true, guard: { rejectSecretLike: true } });
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, `${githubToken}.md`), "a\n");
+
+      const staged = await execute(fixture.tool, {
+        command: "delete",
+        path: `/memories/global/${githubToken}.md`,
+      });
+      const missing = await execute(fixture.tool, {
+        command: "delete",
+        path: `/memories/global/gone-${githubToken}.md`,
+      });
+
+      expect(staged.success).toBe(true);
+      expect(missing.success).toBe(false);
+      expect(fixture.journal.map((op) => op.note === "dry-run")).toEqual([true, false]);
+      expect(fixture.journal[1]?.note).toBeDefined();
+      expect(JSON.stringify(fixture.journal)).not.toContain(githubToken);
+    });
+
     it("rejects a credential that has no keyword beside it", async () => {
       // A check on the words `token`, `secret` and `password` lets these shapes through: the
       // guard has to read the credential shapes themselves.
