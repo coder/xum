@@ -6753,6 +6753,21 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("staged trees reject a relative symlink that escapes to a file outside the plugins directory", async () => {
+    // The relative-escape refusal must stand on its own: this link resolves,
+    // lands outside both the staged root and the managed plugins directory,
+    // so no other refusal in stagedLinkProblem catches it. Enough ".." reach
+    // the filesystem root from any staging depth (".." at "/" stays at "/").
+    const outsideFile = path.join(await fsPromises.realpath(remoteDir), "outside.js");
+    await fsPromises.writeFile(outsideFile, "// outside the plugin\n");
+    const target = "../".repeat(64) + path.relative(path.parse(outsideFile).root, outsideFile);
+    await fsPromises.symlink(target, path.join(remoteDir, "hooks.js"));
+    await commitAll(remoteDir, "relative hook link that leaves every managed folder");
+    await expect(service.preview({ input: remoteDir })).rejects.toThrow(
+      /relative symbolic link that escapes the plugin folder/
+    );
+  });
+
   test("staged trees reject absolute symlinks into the managed plugins directory", async () => {
     // The update-time consent bypass: v1 ships a benign payload.js; v2 adds
     // hooks.js as an ABSOLUTE link to the plugin's own final install path.
