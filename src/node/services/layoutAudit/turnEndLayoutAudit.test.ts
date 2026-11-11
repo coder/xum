@@ -99,6 +99,14 @@ describe("pagesDueForAudit", () => {
     expect(pagesDueForAudit(listingOf(entries, ["notes.md"]), never)).toEqual([]);
   });
 
+  test("a file published as html that the browser would not parse as html is not due", () => {
+    // The publish check does not audit it, so it never settles: it must not take a slot.
+    expect(pagesDueForAudit(listingOf([page("page.txt", PUBLISHED_AT + 1)]), never)).toEqual([]);
+    expect(pagesDueForAudit(listingOf([page("page.htm", PUBLISHED_AT + 1)]), never)).toEqual([
+      "page.htm",
+    ]);
+  });
+
   test("an audit time does not make an unpublished page due", () => {
     const listing = listingOf([page("scratch.html", PUBLISHED_AT + 1)], []);
     expect(pagesDueForAudit(listing, () => PUBLISHED_AT)).toEqual([]);

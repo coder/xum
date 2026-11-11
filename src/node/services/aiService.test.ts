@@ -1071,6 +1071,23 @@ describe("AIService layout turn-end nudge", () => {
     }
   });
 
+  it("does not audit after a PTC turn whose request lost code_execution", async () => {
+    const { testHistory, audit, nudge, startTurn, workspaceId } = await setup(true, true);
+    const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
+      if (ctx.workspaceId !== workspaceId) return;
+      const { code_execution: _dropped, ...rest } = ctx.tools;
+      ctx.tools = rest;
+    });
+    try {
+      audit.mockResolvedValue(true);
+      expect(await nudge(undefined, await startTurn())).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+    } finally {
+      removeHook();
+      await testHistory.cleanup();
+    }
+  });
+
   it("does not audit for a message that is not the workspace's latest prepared turn", async () => {
     const { testHistory, audit, nudge } = await setup();
     try {

@@ -12,7 +12,10 @@ import {
   listArtifactsAtLocation,
   resolveArtifactsLocation,
 } from "@/node/services/artifactsOperations";
-import { checkArtifactLayout } from "@/node/services/layoutAudit/checkArtifactLayout";
+import {
+  checkArtifactLayout,
+  isAuditableHtml,
+} from "@/node/services/layoutAudit/checkArtifactLayout";
 import { layoutAuditLastStartedAtMs } from "@/node/services/layoutAudit/layoutFingerprints";
 import { hasNewLayoutIssue } from "@/node/services/layoutAudit/layoutReport";
 import type { LayoutAuditReport } from "@/common/types/artifactLayoutAudit";
@@ -75,7 +78,9 @@ export function pagesDueForAudit(
     .filter((entry) => {
       const publishedAt = publishedAtMs.get(entry.path);
       return (
-        entry.kind === "html" &&
+        // The publish check's own rule: a page it would not audit never settles, so it must
+        // not take one of the turn end's slots.
+        isAuditableHtml(entry.kind, entry.path) &&
         publishedAt != null &&
         isModifiedSince(entry.modifiedMs, lastAuditStartedAtMs(entry.path) ?? publishedAt)
       );
