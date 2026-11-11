@@ -2281,6 +2281,25 @@ describe("redactWithinCap", () => {
       expect(redactWithinCap(text, CAP, { cut: true })).toBe(`${"x".repeat(80)} `);
     });
 
+    // A JWT header is `eyJ` in lower case. A run that starts with another case is no JWT's start, so a
+    // window that ends in one is not cut.
+    it.each(["EYJ", "eYj", "Eyj"])(
+      "keeps a run that starts with `%s` and ends the window",
+      (start) => {
+        const text = `${"x".repeat(80)} ${start}${"A".repeat(30)}`;
+
+        expect(redactWithinCap(text, CAP, { cut: true })).toBe(text.slice(0, CAP));
+      }
+    );
+
+    // Only a run that touches the end of the window can go on past it. A run that ends a line is
+    // followed by more text inside the window, so it is no start of a longer JWT.
+    it("keeps a JWT-like run that ends a line but not the window", () => {
+      const text = `${"x".repeat(40)} eyJ${"A".repeat(30)}\n${"z".repeat(CAP + 50)}`;
+
+      expect(redactWithinCap(text, CAP, { cut: true })).toBe(text.slice(0, CAP));
+    });
+
     it("leaves the output as it is for a JWT-like run that starts past the cap", () => {
       const text = `${"z".repeat(CAP + 5)} ${jwt(HEADER, `eyJ${"W".repeat(1_200)}`)}`;
 
