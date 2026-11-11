@@ -177,6 +177,17 @@ function shouldSkipOversizedCandidate(byteSize: number): boolean {
   return byteSize > MAX_FILE_SIZE;
 }
 
+/**
+ * The one parse of a catalog SKILL.md. The fetch decides which file is the requested skill and the
+ * read returns it, so they must accept the same files. A catalog skill is a discovered skill:
+ * Claude Code and Codex load one whose description is over 1024 characters, so
+ * `allowDisplayName` cuts it as discovery does. There is no `directoryName`, so the name stays
+ * strict: a catalog directory can differ from the frontmatter name.
+ */
+export function parseCatalogSkill(content: string, byteSize: number) {
+  return parseSkillMarkdown({ content, byteSize, allowDisplayName: true });
+}
+
 async function evaluateCatalogCandidate(
   candidate: CatalogSkillCandidate,
   skillId: string,
@@ -189,10 +200,7 @@ async function evaluateCatalogCandidate(
 
   const content = await nodeHostFiles.promises.readFile(candidate.resolvedPath, "utf-8");
   try {
-    const parsed = parseSkillMarkdown({
-      content,
-      byteSize: candidate.byteSize,
-    });
+    const parsed = parseCatalogSkill(content, candidate.byteSize);
     if (parsed.frontmatter.name !== skillId) {
       return null;
     }
