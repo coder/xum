@@ -18,7 +18,7 @@ import type {
 import { Config } from "@/node/config";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { discoverAgentPluginAt } from "./discovery";
-import { AgentPluginInstallService } from "./installService";
+import { AgentPluginInstallService, realEntryFolder } from "./installService";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   using proc = execFileAsync("git", [`-C`, cwd, ...args]);
@@ -816,6 +816,31 @@ describe("AgentPluginInstallService marketplaces", () => {
     await expect(previewCursorEntry("through")).rejects.toThrow("is a symbolic link");
     // One listing and four previews: over 20 s when several test files run at once.
   }, 60_000);
+
+  test("an entry folder behind a link is refused without following the link", async () => {
+    // Following a link to a folder thousands of levels deep stalled the list: only lstat may
+    // touch a path that runs through one.
+    const staged = path.join(tmpRoot, "staged");
+    await fsPromises.mkdir(path.join(staged, "deep", "inner"), { recursive: true });
+    await fsPromises.symlink("deep", path.join(staged, "linked"));
+    await fsPromises.writeFile(path.join(staged, "afile"), "not a folder\n");
+    const realpath = spyOn(fsPromises, "realpath");
+    try {
+      expect(await realEntryFolder(staged, "linked/inner")).toEqual({
+        why: "it is a symbolic link or runs through one",
+      });
+      expect(await realEntryFolder(staged, "linked")).toEqual({
+        why: "it is a symbolic link or runs through one",
+      });
+      expect(await realEntryFolder(staged, "afile/x")).toEqual({ why: "it runs through a file" });
+      expect(await realEntryFolder(staged, "afile")).toEqual({ why: "it is a file" });
+      expect(await realEntryFolder(staged, "gone")).toEqual({ why: "it does not exist" });
+      expect(realpath).not.toHaveBeenCalled();
+      expect("entryDir" in (await realEntryFolder(staged, "deep/inner"))).toBe(true);
+    } finally {
+      realpath.mockRestore();
+    }
+  });
 
   test("a Xum root behind a symbolic link does not make every entry folder look like a link", async () => {
     // A linked home such as Fedora Silverblue's /home -> /var/home: the staging folder's path runs
