@@ -199,6 +199,11 @@ export interface LayoutRunInput {
   /** Absolute time by which the run and the close must both be over. */
   deadlineMs: number;
   abortSignal?: AbortSignal;
+  /**
+   * Folders the run reads besides cwd: where the macOS agent sandbox applies (local runtimes, when
+   * the user turned it on), the browser could not open the artifact without them.
+   */
+  sandboxReadPaths?: string[];
 }
 
 interface RunRecord {
@@ -303,6 +308,7 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
     },
     stdin: input.pageScript,
     stdinMayGoUnread: true,
+    sandboxReadPaths: input.sandboxReadPaths,
     timeout: (remainingMs - closeMs) / 1000,
     abortSignal: input.abortSignal,
     maxOutputBytes: MAX_RUN_OUTPUT_BYTES,

@@ -7,6 +7,10 @@ import type { LayoutAuditNotCheckedReason } from "@/common/constants/artifactLay
 import type { LayoutAuditPageFinding, LayoutAuditReport } from "@/common/types/artifactLayoutAudit";
 import type { ExecStream } from "@/node/runtime/Runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import {
+  agentSandboxPolicyAllows,
+  buildAgentSandboxPolicy,
+} from "@/node/runtime/sandbox/agentSandboxTargets";
 import type { AvailableArtifactsLocation } from "@/node/services/artifactsOperations";
 import { waitForCondition } from "@/node/services/testDispatchHelpers";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
@@ -110,6 +114,34 @@ describe("checkArtifactLayout", () => {
     expect(await fake.openedUrls()).toEqual(
       thrice(pathToFileURL(path.join(artifactsDir, "chart.html")).href)
     );
+  });
+
+  test("the macOS agent sandbox lets the browser read the artifacts folder and nothing else of the session", async () => {
+    await install();
+    // Where the folders really are: under Xum's home, which the sandbox does not open by itself.
+    // The paths need not exist: the policy is a pure function of them.
+    const session = path.join(os.homedir(), ".xum", "sessions", "layout-sandbox-test");
+    const artifacts = path.join(session, "scratch", "artifacts");
+    const exec = spyOn(runtime, "exec");
+    await check({ location: { kind: "host", dir: artifacts } });
+    // The run reads the page. The close and the folder removal read nothing.
+    const readPaths = exec.mock.calls.map(([, options]) => options.sandboxReadPaths);
+    expect(readPaths.slice(1).every((paths) => paths === undefined)).toBe(true);
+    const policy = buildAgentSandboxPolicy(
+      {
+        enabled: true,
+        network: "loopback",
+        allowedHosts: [],
+        extraReadPaths: [],
+        extraWritePaths: [],
+      },
+      { cwd: tempDir, readPaths: readPaths[0], pathEnv: "/usr/bin" }
+    );
+    expect(agentSandboxPolicyAllows(policy, path.join(artifacts, "chart.html"), "read")).toBe(true);
+    expect(agentSandboxPolicyAllows(policy, path.join(artifacts, "chart.html"), "write")).toBe(
+      false
+    );
+    expect(agentSandboxPolicyAllows(policy, path.join(session, "chat.jsonl"), "read")).toBe(false);
   });
 
   test("lists what the page reports and marks it persistent on the next publish", async () => {
