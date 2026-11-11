@@ -104,6 +104,11 @@ function summaryParts(result: UpdateAllResult, pointToSettings: boolean): string
 const isUnexpected = (result: UpdateAllResult): boolean =>
   result.failures.length > 0 || result.checkFailures.length > 0 || result.tagMoved.length > 0;
 
+const NOTHING_TO_UPDATE: UpdateAllSummary = {
+  tone: "success",
+  message: "All plugins are up to date.",
+};
+
 function summarize(result: UpdateAllResult, pointToSettings: boolean): UpdateAllSummary | null {
   const parts = summaryParts(result, pointToSettings);
   if (parts.length === 0) return null;
@@ -115,8 +120,8 @@ export function summarizeUpdateAll(
   result: UpdateAllResult,
   pointToSettings = false
 ): UpdateAllSummary {
-  const summary = summarize(result, pointToSettings);
-  return summary === null ? { tone: "success", message: "All plugins are up to date." } : summary;
+  // mutation-equivalent: a summary is an object or null, so ?? and || agree
+  return summarize(result, pointToSettings) ?? NOTHING_TO_UPDATE;
 }
 
 /**
