@@ -1207,7 +1207,7 @@ describe("redactSecretLike", () => {
 
     // The userinfo pattern bounds its user at 64 characters. The tail pass shortens the value in
     // front of the user's `:`, so a URL that was too long to match before it matches after it, and
-    // a second pass would take the password: the passes run again on a text that a tail cut.
+    // a second pass would take the password: the userinfo pattern reads a text that a tail cut once more.
     describe("a URL whose user the tail pass shortens into the userinfo bound", () => {
       const long = `see https://token=[redacted]${"x".repeat(48)},:pw@db.example/x`;
       const short = "see https://token=[redacted],:pw@db.example/x";
@@ -1219,8 +1219,16 @@ describe("redactSecretLike", () => {
         expect(addsSecretLike("", redacted)).toBe(false);
       });
 
+      // The userinfo pattern reads only a text that a tail cut. A URL with a credential behind a
+      // scheme is unstable on main (#8121: a second pass takes the user too), and stays as it is.
+      it("leaves a URL that no tail cut as main redacts it", () => {
+        expect(redactSecretLike("https://user:Bearer SEKRIT66666666@h")).toBe(
+          "https://user:[redacted]@h"
+        );
+      });
+
       // Main takes the password out of the short form and not out of the long one, so the edit adds
-      // a credential. The second round's value of the long form must not excuse it.
+      // a credential. The value that the long form's cut text gives (`cut`) must not excuse it.
       it("refuses the short form as an edit of the long one, as main does", () => {
         expect(addsSecretLike(long, short)).toBe(true);
         expect(addsSecretLike(long, long)).toBe(false);

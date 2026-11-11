@@ -35,6 +35,11 @@ const SIGNED_URL_PARAM = "(?:sig|signature|x-amz-signature|x-goog-signature)";
 const SIGNED_URL_VALUE_START = String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)`;
 const SIGNED_URL_VALUE_END = String.raw`\s"'\\<>&#,;)\]}`;
 
+// `scheme://user:password@host`: only the userinfo goes, so the host stays readable. The user may be
+// empty (`redis://:password@host`). Its user and password take any character but the delimiters, so
+// they read across a marker and the text behind it, up to their bounds.
+const USERINFO_PATTERN = /(?<=:\/\/)[^\s:/@]{0,64}:[^\s/@]{1,256}(?=@)/g;
+
 // Credential shapes that are secret on their own, wherever they appear.
 const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // An unterminated block (a tool that cut its own output) redacts through to the end of the text.
@@ -44,9 +49,7 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[abprs]-[A-Za-z0-9-]{8,}|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|glpat-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{30,})/g,
   // A Slack incoming-webhook URL is a bearer secret in its path.
   /\bhooks\.slack\.com\/services\/[A-Za-z0-9/_-]{8,}/g,
-  // `scheme://user:password@host`: only the userinfo goes, so the host stays readable. The user
-  // may be empty (`redis://:password@host`).
-  /(?<=:\/\/)[^\s:/@]{0,64}:[^\s/@]{1,256}(?=@)/g,
+  USERINFO_PATTERN,
   new RegExp(String.raw`\bBearer\s{1,${GAP_MAX}}[A-Za-z0-9._~+/=-]{8,}`, "gi"),
   // A signed URL's signature is the credential: Azure SAS `sig`, `signature`, AWS `X-Amz-Signature`,
   // Google `X-Goog-Signature`. Only the value goes, and only in query position (after `?` or `&`,
@@ -573,12 +576,12 @@ function redactMarkerTails(text: string, onRemoved: (removed: string) => void): 
 
 /**
  * Which passes took a value out: main's regex passes, the reader that runs on their output, the
- * marker tails after that, or any of them in a later round (`again`, see `runRedactionPasses`). The
- * write guard compares each apart, so its verdict on the regex passes' values is main's own: a value
- * that the reader, a tail or a later round takes out of the previous text never excuses one the
- * regex takes out of the new.
+ * marker tails after that, or the userinfo pattern on a text that a tail cut (`cut`). The write
+ * guard compares each apart, so its verdict on the regex passes' values is main's own: a value that
+ * the reader, a tail or the cut text takes out of the previous text never excuses one the regex
+ * takes out of the new.
  */
-type RemovalSource = "regex" | "reader" | "tail" | "again";
+type RemovalSource = "regex" | "reader" | "tail" | "cut";
 
 /** The regex passes and the reader, in order, each on the previous pass's output. */
 function runPassesOnce(
@@ -613,44 +616,26 @@ function runPassesOnce(
   return redactCookieHeaders(redacted, (removed) => onRemoved(removed, "reader"));
 }
 
-// A tail pass that shortens the text changes what the earlier passes read: the userinfo pattern
-// bounds its user and password, so a URL that was too long to match before the cut matches after it.
-// The passes run again on the shortened text, so one call leaves a text that a second call does not
-// change. A text can set off a chain of such cuts, so the rounds are bounded.
-const MAX_REDACTION_ROUNDS = 3;
-
-const ANY_MARKER = new RegExp(MARKER_SOURCE, "gi");
-
-/** How much of `text` a reader sees: its characters outside the markers. */
-function shownLength(text: string): number {
-  return text.replace(ANY_MARKER, "").length;
-}
-
 /**
- * The redaction passes, in order, each on the previous pass's output, and again on a text that the
- * tail pass cut. `onRemoved` hears what each replacement took out, so a caller can tell credentials
- * apart instead of only counting them.
- *
- * A later round counts only when it hides more of the text. Run on a marker alone, the signed-URL
- * pattern writes one more `]` (main's own doubled bracket): a round that did nothing else would put
- * that bracket into a text that was done. What a later round takes out is reported as `again`, so
- * a value that it finds never excuses one that the first round finds in the new text.
+ * The redaction passes, in order, each on the previous pass's output. `onRemoved` hears what each
+ * replacement took out, so a caller can tell credentials apart instead of only counting them.
  */
 function runRedactionPasses(
   text: string,
   onRemoved: (removed: string, source: RemovalSource) => void
 ): string {
-  let current = text;
-  for (let round = 0; round < MAX_REDACTION_ROUNDS; round++) {
-    const removals: Array<[string, RemovalSource]> = [];
-    const redacted = runPassesOnce(current, (removed, source) => removals.push([removed, source]));
-    const tailed = redactMarkerTails(redacted, (removed) => removals.push([removed, "tail"]));
-    if (round > 0 && shownLength(tailed) >= shownLength(current)) return current;
-    for (const [removed, source] of removals) onRemoved(removed, round === 0 ? source : "again");
-    if (tailed === redacted) return tailed;
-    current = tailed;
-  }
-  return current;
+  const redacted = runPassesOnce(text, onRemoved);
+  const tailed = redactMarkerTails(redacted, (removed) => onRemoved(removed, "tail"));
+  if (tailed === redacted) return tailed;
+  // The tail pass shortened the text, and the userinfo pattern bounds its user and its password: a
+  // URL that was too long to match before the cut matches after it, and a second call would take the
+  // password. It reads the cut text once more, so one call leaves a text that a second does not
+  // change. No other pattern reads across the text that a tail cut (a key's prefix and a signed-URL
+  // value stop at the marker), and the value it takes out is reported apart.
+  return tailed.replace(USERINFO_PATTERN, (match: string) => {
+    onRemoved(match, "cut");
+    return REDACTED;
+  });
 }
 
 /** Replaces common credential shapes with `[redacted]`. */
@@ -670,7 +655,7 @@ export function addsSecretLike(previous: string, updated: string): boolean {
     regex: new Map(),
     reader: new Map(),
     tail: new Map(),
-    again: new Map(),
+    cut: new Map(),
   };
   runRedactionPasses(previous, (removed, source) => {
     // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
