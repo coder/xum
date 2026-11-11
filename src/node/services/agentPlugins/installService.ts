@@ -1478,6 +1478,34 @@ function subpathNotAFolder(
   );
 }
 
+/**
+ * Why a symbolic link of a staged tree must not be installed (assertStagedTreeWithinQuota): it
+ * does not resolve, a relative one leaves the staged root, or an absolute one reaches into the
+ * managed plugins directory. A link that resolves inside the staged root keeps its meaning.
+ */
+async function stagedLinkProblem(
+  entryPath: string,
+  relative: string,
+  rootReal: string,
+  withinContainer: (candidate: string) => boolean
+): Promise<string | undefined> {
+  const resolvedTarget = await fsPromises.realpath(entryPath).catch(() => undefined);
+  if (resolvedTarget === undefined) {
+    return `The repository ships a symbolic link that does not resolve (${relative}). Its target could appear at the install location AFTER the consent preview validated the tree, so unresolvable links are rejected.`;
+  }
+  if (resolvedTarget === rootReal || resolvedTarget.startsWith(rootReal + path.sep)) {
+    return undefined;
+  }
+  const rawTarget = await fsPromises.readlink(entryPath);
+  if (!path.isAbsolute(rawTarget)) {
+    return `The repository ships a relative symbolic link that escapes the plugin folder (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`;
+  }
+  if (withinContainer(path.resolve(rawTarget)) || withinContainer(resolvedTarget)) {
+    return `The repository ships an absolute symbolic link into the managed plugins directory (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`;
+  }
+  return undefined;
+}
+
 /** Max simultaneous `git ls-remote` processes during an update check. */
 const UPDATE_CHECK_CONCURRENCY = 4;
 
@@ -2748,30 +2776,13 @@ export class AgentPluginInstallService {
         (container) => candidate === container || candidate.startsWith(container + path.sep)
       );
     for (const entryPath of links) {
-      const relative = path.relative(dir, entryPath);
-      const resolvedTarget = await fsPromises.realpath(entryPath).catch(() => undefined);
-      if (resolvedTarget === undefined) {
-        throw new Error(
-          `The repository ships a symbolic link that does not resolve (${relative}). Its target could appear at the install location AFTER the consent preview validated the tree, so unresolvable links are rejected.`
-        );
-      }
-      const rawTarget = await fsPromises.readlink(entryPath);
-      const withinStagedRoot =
-        resolvedTarget === rootReal || resolvedTarget.startsWith(rootReal + path.sep);
-      if (!path.isAbsolute(rawTarget) && !withinStagedRoot) {
-        throw new Error(
-          `The repository ships a relative symbolic link that escapes the plugin folder (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
-        );
-      }
-      if (
-        path.isAbsolute(rawTarget) &&
-        !withinStagedRoot &&
-        (withinContainer(path.resolve(rawTarget)) || withinContainer(resolvedTarget))
-      ) {
-        throw new Error(
-          `The repository ships an absolute symbolic link into the managed plugins directory (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
-        );
-      }
+      const problem = await stagedLinkProblem(
+        entryPath,
+        path.relative(dir, entryPath),
+        rootReal,
+        withinContainer
+      );
+      if (problem !== undefined) throw new Error(problem);
     }
   }
 
