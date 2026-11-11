@@ -75,6 +75,7 @@ function globsSuffix(globs: readonly string[]): string {
   if (globs.length === 0) return "";
   let suffix = "\n\nApplies to files matching: ";
   for (const [index, glob] of globs.entries()) {
+    // mutation-equivalent: at exactly the cap, another glob only adds text that the final cut removes
     if (suffix.length >= MAX_SKILL_DESCRIPTION_LENGTH) break;
     suffix += `${index > 0 ? ", " : ""}${glob}`;
   }
