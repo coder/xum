@@ -797,6 +797,7 @@ function markerTails(redacted: string): string[] {
 /** True when `now` holds a tail that `held` does not, counting repeats. */
 function holdsNewTail(held: string[], now: string[]): boolean {
   const left = new Map<string, number>();
+  // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
   for (const tail of held) left.set(tail, (left.get(tail) ?? 0) + 1);
   for (const tail of now) {
     // mutation-equivalent: a count of 0 and a missing one both read as 0
@@ -833,10 +834,8 @@ export function addsSecretLike(previous: string, updated: string): boolean {
   const tails = markerTails(removeAt(updatedPasses.text, updatedPasses.artifacts));
   // mutation-equivalent: with no tail in `updated`, holdsNewTail is false whatever `previous` holds,
   // so the check only skips reading the tails of `previous`
-  return (
-    tails.length > 0 &&
-    holdsNewTail(markerTails(removeAt(previousPasses.text, previousPasses.artifacts)), tails)
-  );
+  if (tails.length === 0) return false;
+  return holdsNewTail(markerTails(removeAt(previousPasses.text, previousPasses.artifacts)), tails);
 }
 
 /**
