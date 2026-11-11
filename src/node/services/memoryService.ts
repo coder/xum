@@ -33,6 +33,7 @@ import {
   MEMORY_MAX_FILES_PER_SCOPE,
   MEMORY_SCOPES,
   SHARED_MEMORY_SCOPES,
+  MEMORY_STR_REPLACE_ERROR_MAX_LINES,
   MEMORY_VIEW_MAX_DEPTH,
   MEMORY_VIRTUAL_ROOT,
   type MemoryScope,
@@ -3876,7 +3877,7 @@ export function computeStrReplaceUpdate(
   if (occurrences > 1) {
     const lines = lineNumbersOf(content, offsets);
     throw new MemoryCommandError(
-      `No replacement was performed: old_str matches ${occurrences} locations (lines ${lines.join(", ")}) in ${virtualPath}. Provide a longer, unique old_str.`
+      `No replacement was performed: old_str matches ${occurrences} locations (lines ${describeMatchingLines(lines)}) in ${virtualPath}. Provide a longer, unique old_str.`
     );
   }
   // A replacer function, not the string: `replace` would read `$&`, `$'`, `` $` `` and `$$` in
@@ -4037,6 +4038,19 @@ function borderTable(needle: string): Int32Array {
     borders[i] = length;
   }
   return borders;
+}
+
+/**
+ * The line list of the ambiguity error: every matching line while there are at most
+ * MEMORY_STR_REPLACE_ERROR_MAX_LINES of them, so the text stays as it was for those inputs, and
+ * otherwise the first ones and how many more matching lines there are. The cap counts lines, not
+ * matches: the list is the part that grows, and many matches on a few lines still name them all.
+ */
+// dry-duplicate-ok: error text for the model that tests pin, unlike the About dialog's UI copy
+function describeMatchingLines(lines: readonly number[]): string {
+  const listed = lines.slice(0, MEMORY_STR_REPLACE_ERROR_MAX_LINES).join(", ");
+  const unlisted = lines.length - MEMORY_STR_REPLACE_ERROR_MAX_LINES;
+  return unlisted > 0 ? `${listed}, and ${unlisted} more` : listed;
 }
 
 /**

@@ -72,6 +72,15 @@ export const MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES = 4 * 1024;
 export const MEMORY_VIEW_MAX_DEPTH = 2;
 
 /**
+ * Most line numbers that a refused `str_replace` names ("old_str matches N locations (lines ...)"),
+ * so the error stays a few hundred bytes however many lines match: 100 KiB of newlines gave an
+ * error of about 708 KB that went back to the model. 20 numbers of up to 6 digits take under 160
+ * bytes, and a model that sees 20 matching lines already knows old_str is far too short and needs
+ * more of its surrounding text.
+ */
+export const MEMORY_STR_REPLACE_ERROR_MAX_LINES = 20;
+
+/**
  * Memory consolidation ("dream" agent, issue #3534): maximum mutating memory
  * commands per consolidation run. Reads are unlimited; the budget bounds churn
  * from a misbehaving model.
@@ -123,12 +132,13 @@ export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
  */
 export const MEMORY_CONSOLIDATION_PATH_MAX_CHARS = 512;
 /**
- * Longest note (characters) a journal row stores. A failed command's error can be long: a
- * str_replace whose old_str matches many lines of a large file lists every line number, and an
- * organizer run can journal up to MEMORY_DREAM_EDIT_LIMIT_MAX failed edits. A refusal note
- * quotes at most one path of MEMORY_CONSOLIDATION_PATH_MAX_CHARS, but a guarded run's redaction
- * can lengthen it past this cap (a path of `token=a&` segments), so every note over it is cut,
- * with a marker. The tool still returns the whole error to the model.
+ * Longest note (characters) a journal row stores. A failed command's error is not bounded by
+ * the journal: it quotes model-chosen text, and an organizer run can journal up to
+ * MEMORY_DREAM_EDIT_LIMIT_MAX failed edits. A str_replace error names at most
+ * MEMORY_STR_REPLACE_ERROR_MAX_LINES lines and one path today. A refusal note quotes at most one
+ * path of MEMORY_CONSOLIDATION_PATH_MAX_CHARS, but a guarded run's redaction can lengthen it past
+ * this cap (a path of `token=a&` segments), so every note over it is cut, with a marker. The tool
+ * still returns the whole error to the model.
  */
 export const MEMORY_CONSOLIDATION_NOTE_MAX_CHARS = 1024;
 /**
