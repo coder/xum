@@ -1406,6 +1406,10 @@ describe("addsSecretLike", () => {
     expect(addsSecretLike(`password: old-secret\nsk-\nABCDEFGHIJKLMNO\n`, `${KEY}\n`)).toBe(true);
   });
 
+  it("flags a credential swapped for another of the same shape", () => {
+    expect(addsSecretLike("key sk-ABCDEFGHIJKLMNO\n", "key sk-PQRSTUVWXYZABCD\n")).toBe(true);
+  });
+
   it("flags a second copy of a credential the file held once", () => {
     expect(addsSecretLike(`${KEY}\n`, `${KEY}\n${KEY}\n`)).toBe(true);
   });

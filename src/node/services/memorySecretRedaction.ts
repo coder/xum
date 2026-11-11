@@ -39,6 +39,7 @@ function followPositions(positions: number[], edits: Edit[]): number[] {
       shift += edits[next].added - edits[next].removed;
       next++;
     }
+    // mutation-equivalent: no edit starts at a tracked `]`, a marker's head comes before it
     if (next < edits.length && edits[next].at <= position) continue;
     followed.push(position + shift);
   }
@@ -47,13 +48,14 @@ function followPositions(positions: number[], edits: Edit[]): number[] {
 
 /**
  * `text.replace(pattern, ...)` for a global pattern, and what each match became. `marked` holds the
- * position in the new text of the last character of each replacement whose match `marks` accepts.
+ * position in the new text of the last character of each replacement whose match `marks` accepts (none
+ * when it is omitted).
  */
 function replaceMatches(
   text: string,
   pattern: RegExp,
   replacer: (match: RegExpExecArray) => string,
-  marks: (match: RegExpExecArray) => boolean
+  marks?: (match: RegExpExecArray) => boolean
 ): { text: string; edits: Edit[]; marked: number[] } {
   const parts: string[] = [];
   const edits: Edit[] = [];
@@ -65,7 +67,7 @@ function replaceMatches(
     const replacement = replacer(match);
     parts.push(text.slice(from, at), replacement);
     edits.push({ at, removed: match[0].length, added: replacement.length });
-    if (marks(match)) marked.push(at + shift + replacement.length - 1);
+    if (marks?.(match)) marked.push(at + shift + replacement.length - 1);
     shift += replacement.length - match[0].length;
     from = at + match[0].length;
   }
@@ -84,6 +86,7 @@ function removeAt(text: string, positions: number[]): string {
   let from = 0;
   for (const position of positions) {
     assert(
+      // mutation-equivalent: an invariant check that no valid position can fail
       position >= from && text.charAt(position) === "]" && text.charAt(position + 1) === "]",
       "a tracked position is not a `]` that a `]` follows"
     );
@@ -630,7 +633,6 @@ function runRedactionPasses(
     }
   );
   let artifacts: number[] = [];
-  const never = (): boolean => false;
   for (const pattern of STANDALONE_SECRET_PATTERNS) {
     const replaced = replaceMatches(
       redacted,
@@ -643,20 +645,15 @@ function runRedactionPasses(
         MARKER_HEAD.test(match[0]) && match.input.charAt(match.index + match[0].length) === "]"
     );
     redacted = replaced.text;
-    artifacts = [...followPositions(artifacts, replaced.edits), ...replaced.marked].sort(
-      (a, b) => a - b
-    );
+    // Only the signed-URL pattern marks, and no pattern before it did, so the two lists are never both
+    // in play and the result stays ascending. `removeAt` asserts it.
+    artifacts = [...followPositions(artifacts, replaced.edits), ...replaced.marked];
   }
-  const keyValue = replaceMatches(
-    redacted,
-    SECRET_KEY_VALUE_PATTERN,
-    (match) => {
-      const prefix = match[1];
-      fromRegex(match[0].slice(prefix.length));
-      return `${prefix}${REDACTED}`;
-    },
-    never
-  );
+  const keyValue = replaceMatches(redacted, SECRET_KEY_VALUE_PATTERN, (match) => {
+    const prefix = match[1];
+    fromRegex(match[0].slice(prefix.length));
+    return `${prefix}${REDACTED}`;
+  });
   redacted = keyValue.text;
   // A key's prefix holds no marker, so the whole match counts as the span that was replaced.
   artifacts = followPositions(artifacts, keyValue.edits);
