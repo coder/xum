@@ -445,17 +445,24 @@ function isFacelessControl(page: LayoutPage, el: Element): boolean {
   return auditedText(page, el) === "" && isRequiredControl(el);
 }
 
-// A line that a clipping box cuts away keeps its line box (the lines past a line clamp, text past
-// an overflow-hidden edge), but the user never sees it, so nothing can cover it. Its center must
-// be inside every box that clips it on that axis: the element's own and its clipping ancestors'.
-function isShownLine(boxes: readonly ClippingBoundary[], line: Box): boolean {
-  const x = line.left + line.width / 2;
-  const y = line.top + line.height / 2;
-  return boxes.every(
-    ({ box, axes }) =>
-      (!axes.includes("horizontal") || (x >= box.left && x <= box.right)) &&
-      (!axes.includes("vertical") || (y >= box.top && y <= box.bottom))
-  );
+// A line that a clipping box cuts keeps its whole line box (the lines past a line clamp, the
+// end of an ellipsized line), but the user sees only the part inside every box that clips it on
+// that axis: the element's own and its clipping ancestors'. Only that part can be covered, so
+// only it is sampled. A line cut away entirely has none.
+function shownPart(boxes: readonly ClippingBoundary[], line: Box): Box | null {
+  let { left, right, top, bottom } = line;
+  for (const { box, axes } of boxes) {
+    if (axes.includes("horizontal")) {
+      left = Math.max(left, box.left);
+      right = Math.min(right, box.right);
+    }
+    if (axes.includes("vertical")) {
+      top = Math.max(top, box.top);
+      bottom = Math.min(bottom, box.bottom);
+    }
+  }
+  if (right <= left || bottom <= top) return null;
+  return { left, right, top, bottom, width: right - left, height: bottom - top };
 }
 
 // The rectangles whose points are sampled: the shown text lines, or the box of a faceless control.
@@ -467,7 +474,7 @@ function sampleRects(pass: AuditPass, el: Element): Box[] {
   } else {
     const own = clippingBoundaryOf(page, el);
     const clips = [...(own ? [own] : []), ...clippingBoundariesFor(page, el)];
-    rects = textFragments(page, el).filter((line) => isShownLine(clips, line));
+    rects = textFragments(page, el).flatMap((line) => shownPart(clips, line) ?? []);
   }
   return rects.filter((rect) => rect.width * rect.height >= THRESHOLDS.minFragmentArea);
 }
