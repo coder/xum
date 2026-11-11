@@ -24,6 +24,8 @@ import type { ViewportOutcome } from "./viewportOutcome";
 setDefaultTimeout(60_000);
 
 const RUN_ORDER: LayoutAuditViewportWidth[] = [390, 1440, 768];
+// The calls of a clean run: `set offline on`, three widths of set, open and eval, then the close.
+const CALLS_OF_A_CLEAN_RUN = 11;
 const FILE_URL = "file:///tmp/artifacts/chart.html";
 // The run only forwards the script: any text will do.
 const PAGE_SCRIPT = "(() => Promise.resolve({ marker: 1 }))()";
@@ -82,7 +84,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   /** Subcommand of each call: the first argv field that is not a global flag or its value. */
   const subcommands = (calls: string[][]) =>
     calls.map((argv) => {
-      const flagsWithValue = ["--session", "--config", "--idle-timeout"];
+      const flagsWithValue = ["--session", "--config", "--idle-timeout", "--args"];
       for (let index = 0; index < argv.length; index++) {
         if (flagsWithValue.includes(argv[index] ?? "")) index += 1;
         else if (argv[index] !== "--json") return argv[index];
@@ -112,6 +114,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     const calls = await fake.calls();
     expect(subcommands(calls)).toEqual([
       "set",
+      "set",
       "open",
       "eval",
       "set",
@@ -123,8 +126,8 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       "close",
     ]);
     expectOneOwnSession(calls);
-    const sets = calls.filter((argv) => argv.includes("set"));
-    expect(sets.map((argv) => argv.slice(argv.indexOf("viewport")))).toEqual(
+    const [, ...viewportSets] = calls.filter((argv) => argv.includes("set"));
+    expect(viewportSets.map((argv) => argv.slice(argv.indexOf("viewport")))).toEqual(
       LAYOUT_AUDIT_VIEWPORTS.map((viewport) => [
         "viewport",
         String(viewport.width),
@@ -132,6 +135,67 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       ])
     );
     expect(await fake.openedUrls()).toEqual([FILE_URL, FILE_URL, FILE_URL]);
+  });
+
+  test("turns the network off once, before the first page opens", async () => {
+    const { fake } = await run({});
+    const calls = await fake.calls();
+    const offline = calls.flatMap((argv, index) =>
+      argv.join(" ").endsWith("set offline on") ? [index] : []
+    );
+    expect(offline).toEqual([0]);
+    expect(subcommands(calls).indexOf("open")).toBeGreaterThan(0);
+  });
+
+  // `set offline` covers one tab. A window the page opens is another tab, so the whole browser
+  // also launches with flags that send every connection to a dead end.
+  const NETWORK_OFF_FLAGS = [
+    "--proxy-server=127.0.0.1:9",
+    "--proxy-bypass-list=<-loopback>",
+    "--host-resolver-rules=MAP * ~NOTFOUND",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+  ];
+
+  test("launches the whole browser with the network-off flags, on every call, the close included", async () => {
+    const { fake } = await run({});
+    const calls = await fake.calls();
+    const values = calls.map((argv) => argv[argv.indexOf("--args") + 1]);
+    // The first call launches the browser; the others must not give it other launch settings.
+    expect(new Set(values).size).toBe(1);
+    expect(calls.every((argv) => argv.includes("--args"))).toBe(true);
+    expect(values[0]?.split(",")).toEqual(NETWORK_OFF_FLAGS);
+    expect(subcommands(calls).at(-1)).toBe("close");
+  });
+
+  // A window the page opens takes over the browser's active tab, and eval then runs there.
+  test.each([
+    ["a window that failed to load", "chrome-error://chromewebdata/"],
+    ["a window on another host", "http://127.0.0.1:9/window-open"],
+    ["another file", "file:///tmp/artifacts/other.html"],
+    ["a blank window", "about:blank"],
+    ["no address", ""],
+  ])("a pass from %s is not a clean result, and the other widths stand", async (_name, href) => {
+    const { outcomes } = await run({ eval: { 1440: { kind: "pass", href } } });
+    expect(summary(outcomes)).toEqual([
+      "390 complete",
+      "1440 failed script-failed",
+      "768 complete",
+    ]);
+  });
+
+  test("a pass from the artifact is accepted whatever the page did to its hash, query or escaping", async () => {
+    const fileUrl = "file:///tmp/artifacts/a%26b%5B1%5D.html";
+    const { outcomes } = await run(
+      {
+        eval: {
+          390: { kind: "pass", href: "file:///tmp/artifacts/a&b[1].html" },
+          1440: { kind: "pass", href: `${fileUrl}#section` },
+          768: { kind: "pass", href: `${fileUrl}?tab=2` },
+        },
+      },
+      { fileUrl }
+    );
+    expect(summary(outcomes)).toEqual(["390 complete", "1440 complete", "768 complete"]);
   });
 
   test("evaluates the page script, piped on stdin and never put on the command line", async () => {
@@ -229,7 +293,22 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       "768 failed browser-failed",
     ]);
     const calls = await fake.calls();
-    expect(subcommands(calls)).toEqual(["set", "open", "close"]);
+    expect(subcommands(calls)).toEqual(["set", "set", "open", "close"]);
+    expectOneOwnSession(calls);
+  });
+
+  // Fail closed: a network that cannot be turned off is not "clean", it is not checked. The call
+  // starts the browser, so the close still runs.
+  test("a network that will not go off stops the run before any page opens and still closes", async () => {
+    const { outcomes, fake } = await run({ offlineFails: true });
+    expect(summary(outcomes)).toEqual([
+      "390 failed browser-failed",
+      "1440 failed browser-failed",
+      "768 failed browser-failed",
+    ]);
+    expect(await fake.openedUrls()).toEqual([]);
+    const calls = await fake.calls();
+    expect(subcommands(calls)).toEqual(["set", "close"]);
     expectOneOwnSession(calls);
   });
 
@@ -268,7 +347,16 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       "768 failed timeout",
     ]);
     const calls = await fake.calls();
-    expect(subcommands(calls)).toEqual(["set", "open", "eval", "set", "open", "eval", "close"]);
+    expect(subcommands(calls)).toEqual([
+      "set",
+      "set",
+      "open",
+      "eval",
+      "set",
+      "open",
+      "eval",
+      "close",
+    ]);
     expectOneOwnSession(calls);
   });
 
@@ -353,7 +441,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     // Every call, the close included, saw the one folder, and it existed while they ran.
     expect(new Set(seen.map((call) => call.dir))).toEqual(new Set([`/tmp/${session}`]));
     expect(seen.every((call) => call.existed)).toBe(true);
-    expect(seen).toHaveLength(10);
+    expect(seen).toHaveLength(CALLS_OF_A_CLEAN_RUN);
     expect(
       await fs.stat(`/tmp/${session}`).then(
         () => true,
@@ -367,15 +455,15 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       AGENT_BROWSER_CDP: "1",
       AGENT_BROWSER_PROFILE: "/nonexistent-profile",
       AGENT_BROWSER_FUTURE_FLAG: "1",
+      AGENT_BROWSER_ARGS: "--proxy-server=direct://",
     };
     Object.assign(process.env, inherited);
     try {
       const { outcomes, fake } = await run({});
       expect(summary(outcomes)).toEqual(["390 complete", "1440 complete", "768 complete"]);
-      // The ten calls (three widths of set, open and eval, then the close) each saw the run's
-      // own folder and nothing else.
+      // Every call of the run saw its own folder and nothing else.
       expect(await fake.agentBrowserEnvNames()).toEqual(
-        Array.from({ length: 10 }, () => ["AGENT_BROWSER_SOCKET_DIR"])
+        Array.from({ length: CALLS_OF_A_CLEAN_RUN }, () => ["AGENT_BROWSER_SOCKET_DIR"])
       );
     } finally {
       for (const name of Object.keys(inherited)) delete process.env[name];
@@ -397,7 +485,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     const { outcomes, fake } = await run({ toolEnvLines: [line] });
     expect(summary(outcomes)).toEqual(RUN_ORDER.map((width) => `${width} complete`));
     expect(await fake.agentBrowserEnvNames()).toEqual(
-      Array.from({ length: 10 }, () => ["AGENT_BROWSER_SOCKET_DIR"])
+      Array.from({ length: CALLS_OF_A_CLEAN_RUN }, () => ["AGENT_BROWSER_SOCKET_DIR"])
     );
     const dirs = new Set((await fake.socketDirs()).map((call) => call.dir));
     expect([...dirs]).toEqual([`/tmp/${(await fake.calls())[0]?.[1]}`]);
@@ -408,7 +496,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     const { fake } = await run({});
     const dirs = (await fake.socketDirs()).map((call) => call.dir);
     const configs = await fake.configs();
-    expect(configs).toHaveLength(10);
+    expect(configs).toHaveLength(CALLS_OF_A_CLEAN_RUN);
     expect(new Set(dirs).size).toBe(1);
     for (const config of configs) {
       expect(config.path).toBe(`${dirs[0]}/config.json`);

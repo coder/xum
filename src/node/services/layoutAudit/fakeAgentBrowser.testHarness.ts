@@ -7,11 +7,11 @@ import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 
 /**
  * A POSIX-sh stand-in for the `agent-browser` CLI, reached the way production reaches the real
- * one: a trusted project's `.xum/tool_env` puts its folder first on PATH. It answers the five
- * calls the layout audit makes (`set viewport`, `open`, `--json eval --stdin`, `close`) and logs
- * every call, so a test sees the exact argv, the opened URLs and the stdin of each eval. For
- * every call it also logs the NAMES of the AGENT_BROWSER_* variables it inherited, and of
- * SHELLOPTS and BASHOPTS (never a value), and the content of the file `--config` names.
+ * one: a trusted project's `.xum/tool_env` puts its folder first on PATH. It answers the calls
+ * the layout audit makes (`set offline on`, `set viewport`, `open`, `--json eval --stdin`,
+ * `close`) and logs every call, so a test sees the exact argv, the opened URLs and the stdin of
+ * each eval. For every call it also logs the NAMES of the AGENT_BROWSER_* variables it inherited,
+ * and of SHELLOPTS and BASHOPTS (never a value), and the content of the file `--config` names.
  */
 
 /** What `eval` prints and returns for one width. The default is a clean, complete pass. */
@@ -20,6 +20,8 @@ export type FakeEvalReply =
       kind: "pass";
       complete?: boolean;
       viewportWidth?: number;
+      /** The page's address. The default is the URL of the last `open`, like a page that stayed. */
+      href?: string;
       findings?: LayoutAuditPageFinding[];
     }
   /** A value that succeeds in the CLI but is not a page result (the audit must reject it). */
@@ -38,6 +40,8 @@ export interface FakeAgentBrowserScript {
   toolEnvFails?: boolean;
   /** Shell lines appended to a tool_env that sources, after the PATH line. */
   toolEnvLines?: string[];
+  /** `set offline on` exits 1. */
+  offlineFails?: boolean;
   /** `open` exits 1. */
   openFails?: boolean;
   /** `close` never answers, like a daemon that is still executing a command. */
@@ -78,6 +82,9 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+// Stands where the page's address goes; the fake's eval fills in the URL of the last `open`.
+const HREF_OF_LAST_OPEN = "@@HREF@@";
+
 function envelopeFor(reply: FakeEvalReply, width: number): { out: string; exit: number } {
   switch (reply.kind) {
     case "pass":
@@ -91,6 +98,7 @@ function envelopeFor(reply: FakeEvalReply, width: number): { out: string; exit: 
             result: {
               complete: reply.complete ?? true,
               viewportWidth: reply.viewportWidth ?? width,
+              href: reply.href ?? HREF_OF_LAST_OPEN,
               findings: reply.findings ?? [],
             },
           },
@@ -137,7 +145,7 @@ if [ -f "$config" ]; then content=$(cat "$config"); else content=MISSING; fi
 printf '%s\\t%s\\n' "$config" "$content" >> "$STATE/configs.log"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --session|--config|--idle-timeout) shift 2 ;;
+    --session|--config|--idle-timeout|--args) shift 2 ;;
     --json) shift ;;
     *) break ;;
   esac
@@ -146,11 +154,15 @@ command="$1"
 shift
 case "$command" in
   set)
-    printf '%s' "$2" > "$STATE/viewport"
+    case "$1" in
+      offline) [ -f "$STATE/offline-fails" ] && exit 1 ;;
+      viewport) printf '%s' "$2" > "$STATE/viewport" ;;
+    esac
     ;;
   open)
     [ -f "$STATE/open-fails" ] && exit 1
     printf '%s\\n' "$1" >> "$STATE/opened.log"
+    printf '%s' "$1" > "$STATE/href"
     ;;
   close)
     [ -f "$STATE/close-hangs" ] && sleep 60 </dev/null
@@ -162,7 +174,14 @@ case "$command" in
       : > "$STATE/hang-started"
       sleep 60 </dev/null
     fi
-    cat "$STATE/eval-$width.out"
+    out=$(cat "$STATE/eval-$width.out")
+    case "$out" in
+      *${HREF_OF_LAST_OPEN}*)
+        href=$(sed -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g' "$STATE/href" 2>/dev/null)
+        out="\${out%%${HREF_OF_LAST_OPEN}*}$href\${out#*${HREF_OF_LAST_OPEN}}"
+        ;;
+    esac
+    printf '%s' "$out"
     exit "$(cat "$STATE/eval-$width.exit")"
     ;;
 esac
@@ -200,6 +219,7 @@ export async function installFakeAgentBrowser(
         "",
       ].join("\n");
   await fs.writeFile(path.join(projectDir, ".xum", "tool_env"), toolEnv);
+  if (script.offlineFails) await fs.writeFile(path.join(stateDir, "offline-fails"), "");
   if (script.openFails) await fs.writeFile(path.join(stateDir, "open-fails"), "");
   if (script.closeHangs) await fs.writeFile(path.join(stateDir, "close-hangs"), "");
   for (const { width } of LAYOUT_AUDIT_VIEWPORTS) {

@@ -21,7 +21,7 @@ import type { LayoutPage, SettleSignals } from "./layoutPage";
 export async function runLayoutAudit(
   page: LayoutPage,
   signals: SettleSignals
-): Promise<LayoutAuditPagePass> {
+): Promise<Omit<LayoutAuditPagePass, "href">> {
   await signals.fontsReady();
   await signals.layoutQuiet(SETTLE.quietMs, SETTLE.quietMaxMs);
   const animationsSettled = await signals.finiteAnimationsSettled(SETTLE.animationMaxMs);

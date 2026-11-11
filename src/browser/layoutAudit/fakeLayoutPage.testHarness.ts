@@ -208,9 +208,13 @@ export interface FakeBrowserWindow {
  * createRange) on the returned window.
  */
 export function createFakeBrowserWindow(
-  options: { width?: number; height?: number; bodyHtml?: string } = {}
+  options: { width?: number; height?: number; bodyHtml?: string; url?: string } = {}
 ): FakeBrowserWindow {
-  const window = new Window({ width: options.width ?? 390, height: options.height ?? 844 });
+  const window = new Window({
+    width: options.width ?? 390,
+    height: options.height ?? 844,
+    url: options.url,
+  });
   window.document.body.innerHTML = options.bodyHtml ?? "";
   return {
     // happy-dom's Window is not structurally the DOM lib's Window & typeof globalThis.

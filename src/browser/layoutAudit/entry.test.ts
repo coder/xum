@@ -8,8 +8,19 @@ describe("auditWindow", () => {
     expect(await auditWindow(fake.win)).toEqual({
       complete: true,
       viewportWidth: 390,
+      href: "about:blank",
       findings: [],
     });
+  });
+
+  test("says which page it measured, a finished pass and a crashed one alike", async () => {
+    const url = "file:///tmp/artifacts/page.html#top";
+    using fake = createFakeBrowserWindow({ width: 390, bodyHtml: "<p>hello world</p>", url });
+    expect((await auditWindow(fake.win)).href).toBe(url);
+    fake.win.getComputedStyle = () => {
+      throw new Error("style broke");
+    };
+    expect((await auditWindow(fake.win)).href).toBe(url);
   });
 
   test("a crash while waiting gives an incomplete pass with no findings, never a rejection", async () => {
@@ -23,6 +34,7 @@ describe("auditWindow", () => {
     expect(await auditWindow(fake.win)).toEqual({
       complete: false,
       viewportWidth: 390,
+      href: "about:blank",
       findings: [],
     });
   });
@@ -36,6 +48,7 @@ describe("auditWindow", () => {
     expect(await auditWindow(fake.win)).toEqual({
       complete: false,
       viewportWidth: 0,
+      href: "about:blank",
       findings: [],
     });
   });

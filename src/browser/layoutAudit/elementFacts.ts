@@ -118,9 +118,24 @@ export function isVisible(page: LayoutPage, el: Element): boolean {
   return !selfAndAncestors(el).some((node) => isHiddenStyle(page.style(node)));
 }
 
-/** A horizontal scroller between `el` and the root: content past its edge is reachable. */
+function hasHorizontalScroller(page: LayoutPage, chain: readonly Element[]): boolean {
+  return chain.some((node) => isScrolling(page.style(node).overflowX));
+}
+
+/**
+ * Text in a horizontal scroller, the scroller's own text included (upstream's walk): scrolling
+ * shows it.
+ */
+export function isInsideHorizontalScroller(page: LayoutPage, el: Element): boolean {
+  return hasHorizontalScroller(page, chainBelowRoot(page, el));
+}
+
+/**
+ * A horizontal scroller between `el`'s parent and the root, for a control: scrolling a control's
+ * own contents (a textarea scrolls by default) never moves the control into view.
+ */
 export function hasHorizontalScrollerAncestor(page: LayoutPage, el: Element): boolean {
-  return chainBelowRoot(page, el).some((node) => isScrolling(page.style(node).overflowX));
+  return hasHorizontalScroller(page, chainBelowRoot(page, el.parentElement));
 }
 
 export function hasReachableVerticalScrollerAncestor(
