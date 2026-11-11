@@ -37,9 +37,9 @@ test("settling the open review opens the next one, and the queue ends empty", ()
   const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")]));
 
   expect(result.current.open?.name).toBe("a");
-  act(() => result.current.settle(result.current.open!));
+  act(() => result.current.settle(result.current.open));
   expect(result.current.open?.name).toBe("b");
-  act(() => result.current.settle(result.current.open!));
+  act(() => result.current.settle(result.current.open));
   expect(result.current.open).toBeNull();
 });
 
