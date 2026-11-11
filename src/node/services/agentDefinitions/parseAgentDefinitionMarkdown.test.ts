@@ -96,6 +96,19 @@ Body
     ).toThrow("missing the closing '---' delimiter");
   });
 
+  test("reads the frontmatter after an opening delimiter that has a trailing no-break space", () => {
+    // JavaScript trim() accepts the opening line, so the YAML text must start after it: YAML
+    // refuses a first line of `---` plus a no-break space.
+    const content = "---\u00A0\nname: Reviewer\ndescription: Reviews code\n---\nBody\n";
+    const { frontmatter, body } = parseAgentDefinitionMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+    });
+    expect(frontmatter.name).toBe("Reviewer");
+    expect(frontmatter.description).toBe("Reviews code");
+    expect(body).toBe("Body\n");
+  });
+
   test("throws on missing frontmatter", () => {
     expect(() =>
       parseAgentDefinitionMarkdown({
