@@ -1281,12 +1281,18 @@ describe("redactSecretLike", () => {
     return (used.user + used.system) / 1000;
   }
 
-  /** The least CPU time of up to `runs` runs, which stop at the first one past the ceiling. */
+  /**
+   * The least CPU time of up to `runs` runs. One run can be slow for no fault of the scan: a 50 ms
+   * scan once measured 350 ms (the process's CPU time counts all its threads). So the runs stop
+   * only when two in a row are past the ceiling, which a quadratic scan does every time, and a
+   * failing test does not repeat for long.
+   */
   function bestCpuMilliseconds(run: () => void, runs: number): number {
     let best = Number.POSITIVE_INFINITY;
     for (let attempt = 0; attempt < runs; attempt++) {
-      best = Math.min(best, cpuMilliseconds(run));
-      if (best >= SCAN_CPU_CEILING_MS) break;
+      const cpuMs = cpuMilliseconds(run);
+      best = Math.min(best, cpuMs);
+      if (attempt >= 1 && best >= SCAN_CPU_CEILING_MS) break;
     }
     return best;
   }
