@@ -737,6 +737,21 @@ describe("overlapping-text", () => {
       `<div id="stage-${id}"><p id="${id}" data-box="10 ${top} 200 20" data-lines="10 ${top} 200 20">Hello world text</p>
         <div data-box="0 ${top - 10} 300 60" data-css="background-color: rgb(255, 255, 255)" data-z="1"></div></div>`;
 
+    test("lines a clamp or a clipping box cuts away are not sampled", () => {
+      // One shown line, then 19 hidden lines over an opaque block that starts right below it.
+      const lines = Array.from({ length: 20 }, (_, i) => `10 ${1200 + i * 20} 200 20`).join("; ");
+      const clamped = (css: string, height: number) =>
+        `<div id="stage"><p id="c" data-box="10 1200 200 ${height}" data-css="${css}" data-lines="${lines}">Clamped text that goes on</p>
+        <div data-box="0 1220 300 400" data-css="background-color: rgb(255, 255, 255)" data-z="1"></div></div>`;
+      expect(
+        auditScrolling(clamped("overflow-y: hidden; webkit-line-clamp: 1", 20)).findings
+      ).toEqual([]);
+      // The same lines shown, in a box that holds them all, are covered: 19 of 20.
+      expect(auditScrolling(clamped("", 400)).findings).toEqual([
+        finding("overlapping-text", "p#c", "horizontal", 0),
+      ]);
+    });
+
     test("covered text a user reaches by scrolling is reported", () => {
       expect(auditScrolling(AT(1200)).findings).toEqual([
         finding("overlapping-text", "p#t", "horizontal", 0),
