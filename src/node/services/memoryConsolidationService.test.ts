@@ -19,21 +19,26 @@ import {
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
   MEMORY_CONSOLIDATION_TIMEOUT_MS,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
 } from "@/common/constants/memory";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
   analyzerJobLockPath,
+  analyzerJobLockTimeoutMs,
+  dreamLockWaitMs,
   dreamStreamLockPath,
   HARVEST_MAX_ATTEMPTS,
   harvestResumeState,
   MemoryConsolidationService,
+  organizerRunEnd,
   resolveDreamAgentBody,
   resolveDreamModelString,
   resolveHeadlessAgentModelString,
   resolveHeadlessAgentSettings,
   resolveHeadlessAgentBody,
   resolveHeadlessAgentDefinition,
+  RUN_TIMEOUT_NOTE,
   sidecarLockPath,
   staleExhaustedHarvestFailure,
 } from "./memoryConsolidationService";
@@ -5488,6 +5493,390 @@ describe("MemoryConsolidationService", () => {
       expect(result.success).toBe(false);
       if (!result.success) expect(result.error).toContain("being removed");
     });
+  });
+
+  describe("dream edit limit", () => {
+    // The organizer reads the user's limit at each run and states it in its prompt; the prompt's
+    // number is also the budget its memory tool enforces (see runMemoryConsolidation).
+    it.each([
+      [undefined, "You have 8 mutating commands this run."],
+      [24, "You have 24 mutating commands this run."],
+      // Unlimited runs at the safety cap.
+      [0, `You have ${MEMORY_DREAM_EDIT_LIMIT_MAX} mutating commands this run.`],
+    ])("runs an organizer pass for a saved limit of %p with its budget", async (limit, line) => {
+      using fixture = await createFixture();
+      // Other preferences, but no memory group unless a limit is saved: the run still reads it.
+      await fixture.config.updateUserPreferences([{ appearance: { vimEnabled: true } }]);
+      if (limit !== undefined) {
+        await fixture.config.updateUserPreferences([{ memory: { dreamEditLimit: limit } }]);
+      }
+
+      expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+
+      expect(fixture.modelPrompts.at(-1)).toContain(line);
+    });
+  });
+
+  describe("dream run timeout", () => {
+    const minute = 60_000;
+
+    function setTimeoutMinutes(fixture: Fixture, minutes: number): Promise<void> {
+      return fixture.config.updateUserPreferences([
+        { memory: { dreamRunTimeoutMinutes: minutes } },
+      ]);
+    }
+
+    /**
+     * A model whose first step creates a workspace file (unless `editFirst` is false) and whose
+     * next step hangs until its stream is aborted. Aborting `timeout` stands in for the run timeout
+     * firing; the hanging step aborts it itself once the edit has landed.
+     */
+    function hangingModel(timeout: AbortController, editFirst: boolean): MockLanguageModelV3 {
+      let calls = 0;
+      const usage = {
+        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 0, text: 0, reasoning: 0 },
+      };
+      return new MockLanguageModelV3({
+        doStream: (options) => {
+          calls += 1;
+          if (editFirst && calls === 1) {
+            const chunks: LanguageModelV3StreamPart[] = [
+              {
+                type: "tool-call",
+                toolCallId: "edit",
+                toolName: "memory",
+                input: JSON.stringify({
+                  command: "create",
+                  path: "/memories/workspace/split.md",
+                  file_text: "fact\n",
+                }),
+              },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
+            ];
+            return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+          }
+          return new Promise((_resolve, reject) => {
+            options.abortSignal?.addEventListener("abort", () =>
+              reject(new Error("stalled provider call aborted"))
+            );
+            timeout.abort(new DOMException("run timeout", "TimeoutError"));
+          });
+        },
+      });
+    }
+
+    it("waits for the longest healthy holder, never under the constant", () => {
+      expect(dreamLockWaitMs(MEMORY_CONSOLIDATION_TIMEOUT_MS)).toBe(
+        MEMORY_CONSOLIDATION_TIMEOUT_MS
+      );
+      expect(dreamLockWaitMs(30 * minute)).toBe(30 * minute);
+      // A shorter organizer timeout does not shorten the wait for an analyzer chunk holder.
+      expect(dreamLockWaitMs(minute)).toBe(MEMORY_CONSOLIDATION_TIMEOUT_MS);
+      // No timeout: waiters keep the floor and give up instead of waiting forever.
+      expect(dreamLockWaitMs(null)).toBe(MEMORY_CONSOLIDATION_TIMEOUT_MS);
+    });
+
+    it("lets an analyzer job wait out every chunk's dream wait and stream", () => {
+      // The default keeps the wait it had before the setting: (2 × 12 + 1) × 5 minutes.
+      expect(analyzerJobLockTimeoutMs(MEMORY_CONSOLIDATION_TIMEOUT_MS)).toBe(125 * minute);
+      expect(analyzerJobLockTimeoutMs(null)).toBe(125 * minute);
+      // 12 chunks, each waiting 30 minutes and streaming 5, then 5 for the reads and saves.
+      expect(analyzerJobLockTimeoutMs(30 * minute)).toBe((12 * 35 + 5) * minute);
+    });
+
+    describe("organizerRunEnd", () => {
+      const applied = [
+        { command: "create" as const, path: "/memories/workspace/a.md", applied: true },
+      ];
+      const refused = [
+        { command: "create" as const, path: "/memories/workspace/a.md", applied: false },
+      ];
+      const fired = () => AbortSignal.abort(new DOMException("run timeout", "TimeoutError"));
+      const live = () => new AbortController().signal;
+
+      it("keeps the record and the note of a stream that ended on its own", () => {
+        expect(
+          organizerRunEnd({ ops: [], note: "stopped at the cost ceiling after $1.00" }, live())
+        ).toEqual({
+          kind: "record",
+          note: "stopped at the cost ceiling after $1.00",
+        });
+      });
+
+      it("keeps the record of a run that its timeout's abort ended after an applied edit", () => {
+        const runTimeout = fired();
+        expect(
+          organizerRunEnd(
+            { ops: applied, streamError: "cut short", abortReason: runTimeout.reason },
+            runTimeout
+          )
+        ).toEqual({ kind: "record", note: RUN_TIMEOUT_NOTE });
+      });
+
+      it.each([
+        // A provider error leaves no abort reason, even when the timeout fired right after it.
+        ["a provider error ended it near the deadline", applied, undefined],
+        // Workspace removal fired first: the stream's reason is the removal's, not the timeout's.
+        ["removal aborted it", applied, new DOMException("removed", "AbortError")],
+        ["no edit was applied", refused, "timeout"],
+      ] as const)("fails a stream error when %s", (_why, ops, reason) => {
+        const runTimeout = fired();
+        const abortReason: unknown = reason === "timeout" ? runTimeout.reason : reason;
+        expect(
+          organizerRunEnd({ ops: [...ops], streamError: "cut short", abortReason }, runTimeout)
+        ).toEqual({ kind: "failed", error: "consolidation stream failed: cut short" });
+      });
+
+      it.each([
+        ["the timeout did not fire", live()],
+        ["the run had no timeout", undefined],
+      ])("fails an aborted stream when %s", (_why, runTimeout) => {
+        expect(
+          organizerRunEnd(
+            { ops: applied, streamError: "cut short", abortReason: new DOMException("x") },
+            runTimeout
+          )
+        ).toEqual({ kind: "failed", error: "consolidation stream failed: cut short" });
+      });
+
+      it("fails a provider error while the timeout has not fired, though neither has a reason", () => {
+        // A live signal's reason is undefined, like a provider error's abort reason.
+        expect(
+          organizerRunEnd(
+            { ops: applied, streamError: "provider 500", abortReason: undefined },
+            live()
+          )
+        ).toEqual({ kind: "failed", error: "consolidation stream failed: provider 500" });
+      });
+    });
+
+    it("cuts the organizer stream at the saved timeout and keeps the record of its edits", async () => {
+      const timeout = new AbortController();
+      using fixture = await createFixture({ modelFactory: () => hangingModel(timeout, true) });
+      await setTimeoutMinutes(fixture, 30);
+      const timeouts: number[] = [];
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+        timeouts.push(ms);
+        return timeout.signal;
+      });
+      try {
+        const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+        expect(timeouts).toContain(30 * minute);
+        expect(result.success).toBe(true);
+        const record = await fixture.service.getRecord("ws-dream");
+        expect(record?.note).toBe(RUN_TIMEOUT_NOTE);
+        expect(record?.ops.filter((op) => op.applied).map((op) => op.path)).toEqual([
+          "/memories/workspace/split.md",
+        ]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    // The timeout's state afterwards does not decide it: a provider error that ends the stream as
+    // the deadline passes is an ordinary failure, so the debounce does not hold off its retry.
+    it("fails a run that a provider error ended near its deadline, even after an edit", async () => {
+      const timeout = new AbortController();
+      let calls = 0;
+      const usage = {
+        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 0, text: 0, reasoning: 0 },
+      };
+      using fixture = await createFixture({
+        modelFactory: () =>
+          new MockLanguageModelV3({
+            doStream: () => {
+              calls += 1;
+              const chunks: LanguageModelV3StreamPart[] =
+                calls === 1
+                  ? [
+                      {
+                        type: "tool-call",
+                        toolCallId: "edit",
+                        toolName: "memory",
+                        input: JSON.stringify({
+                          command: "create",
+                          path: "/memories/workspace/split.md",
+                          file_text: "fact\n",
+                        }),
+                      },
+                      {
+                        type: "finish",
+                        finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                        usage,
+                      },
+                    ]
+                  : [{ type: "error", error: new Error("provider exploded") }];
+              if (calls === 1)
+                return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+              // The provider fails first; the deadline passes right after it.
+              const stream = new ReadableStream<LanguageModelV3StreamPart>({
+                pull: (controller) => {
+                  controller.error(new Error("provider exploded"));
+                  timeout.abort(new DOMException("run timeout", "TimeoutError"));
+                },
+              });
+              return Promise.resolve({ stream });
+            },
+          }),
+      });
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation(() => timeout.signal);
+      try {
+        const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+        expect(timeout.signal.aborted).toBe(true);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("provider exploded");
+        expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("fails a run its timeout cut before any edit, and saves no record", async () => {
+      const timeout = new AbortController();
+      using fixture = await createFixture({ modelFactory: () => hangingModel(timeout, false) });
+      // Other preferences, but no memory group: the run still gets the default timeout.
+      await fixture.config.updateUserPreferences([{ appearance: { vimEnabled: true } }]);
+      const timeouts: number[] = [];
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+        timeouts.push(ms);
+        return timeout.signal;
+      });
+      try {
+        const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+        // No saved value: the constant.
+        expect(timeouts).toContain(MEMORY_CONSOLIDATION_TIMEOUT_MS);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("consolidation stream failed");
+        expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    // With the timeout off, a hung run holds the in-process turn: a run queued behind it waits,
+    // as on main, until the hung one is removed, and then runs. The user chose this with the
+    // field's warning.
+    it("with the timeout off, runs the organizer without one, and a run behind it waits for it", async () => {
+      let hung!: () => void;
+      const started = new Promise<void>((resolve) => (hung = resolve));
+      let calls = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          calls += 1;
+          if (calls > 1) return scriptedModel();
+          return new MockLanguageModelV3({
+            doStream: (options) => {
+              hung();
+              return new Promise((_resolve, reject) => {
+                options.abortSignal?.addEventListener("abort", () =>
+                  reject(new Error("stalled provider call aborted"))
+                );
+              });
+            },
+          });
+        },
+      });
+      await fixture.addWorkspace("ws-other");
+      await setTimeoutMinutes(fixture, 0);
+
+      const timeouts: number[] = [];
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+        timeouts.push(ms);
+        return new AbortController().signal;
+      });
+      try {
+        const hanging = fixture.service.maybeRun("ws-dream", "manual");
+        await started;
+        // The organizer stream got no timeout.
+        expect(timeouts).toEqual([]);
+
+        const start = Date.now();
+        const waiter = fixture.service.maybeRun("ws-other", "manual");
+        expect(await settlesWithin(waiter, 800)).toBe(false);
+        // Past the 5-minute floor of the lock wait: a run queued in this process still waits, so
+        // no deadline that reads Date.now() cut its turn.
+        setSystemTime(new Date(start + 6 * minute));
+        expect(await settlesWithin(waiter, 800)).toBe(false);
+
+        await fixture.service.cancelInFlightConsolidation("ws-dream");
+        expect((await hanging).success).toBe(false);
+        expect((await waiter).success).toBe(true);
+      } finally {
+        setSystemTime();
+        spy.mockRestore();
+      }
+    }, 30_000);
+
+    /** Resolves once `promise` settled, or false after `ms` of real time. */
+    async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+      let settled = false;
+      void promise.finally(() => (settled = true));
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return settled;
+    }
+
+    // The lock helper's deadline reads Date.now(), so moving the clock past the constant but not
+    // past the saved timeout shows which wait the run passed.
+    it("waits for another backend's dream for the saved timeout, not the constant", async () => {
+      using fixture = await createFixture();
+      await setTimeoutMinutes(fixture, 30);
+      const releaseForeign = await holdForeignDreamLock(fixture);
+      const start = Date.now();
+      try {
+        const run = fixture.service.maybeRun("ws-dream", "manual");
+        for (let tick = 0; tick < 400 && fixture.modelCalls.length === 0; tick++) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        expect(fixture.modelCalls).toHaveLength(1);
+        // Let the lock wait take its deadline from the real clock first.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+
+        setSystemTime(new Date(start + 6 * minute));
+        expect(await settlesWithin(run, 800)).toBe(false);
+
+        setSystemTime(new Date(start + 31 * minute));
+        const result = await run;
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("Another Xum process is running");
+      } finally {
+        setSystemTime();
+        await releaseForeign();
+      }
+    }, 30_000);
+
+    it("lets an analyzer job wait for another backend's job as long as the saved timeout needs", async () => {
+      using fixture = await createFixture({ modelFactory: () => harvestCandidateModel() });
+      await setTimeoutMinutes(fixture, 30);
+      await appendBulkRows(fixture);
+      const metadata = await seedCompactionEpoch(fixture);
+      const releaseForeign = await acquireCrossProcessLock({
+        lockPath: analyzerJobLockPath(fixture.xumHome, "ws-dream"),
+        acquireTimeoutMs: 1_000,
+        staleMs: 60_000,
+        timeoutMessage: "test holder",
+      });
+      const start = Date.now();
+      let run: Promise<unknown> | undefined;
+      try {
+        run = fixture.service.maybeHarvestThenSweep(metadata);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+
+        // Past the 125 minutes of the default timeout, short of the 425 that 30 minutes needs.
+        setSystemTime(new Date(start + 130 * minute));
+        expect(await settlesWithin(run, 800)).toBe(false);
+      } finally {
+        setSystemTime();
+        await releaseForeign();
+      }
+      await run;
+      // It waited the foreign job out and then ran, instead of failing at the default's wait.
+      expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+    }, 30_000);
   });
 
   describe("dream cost ceiling", () => {
