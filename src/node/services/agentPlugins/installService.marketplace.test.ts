@@ -756,6 +756,7 @@ describe("AgentPluginInstallService marketplaces", () => {
           { name: "afile", source: "afile" },
           { name: "linked", source: "linked" },
           { name: "through", source: "through/inner" },
+          { name: "past-file", source: "afile/x" },
         ],
       }),
       afile: "not a folder\n",
@@ -795,6 +796,11 @@ describe("AgentPluginInstallService marketplaces", () => {
         false,
         "Xum cannot install the entry's folder 'through/inner': it is a symbolic link or runs through one",
       ],
+      [
+        "past-file",
+        false,
+        "Xum cannot install the entry's folder 'afile/x': it runs through a file",
+      ],
     ]);
     // The listing offers what the preview installs, and refuses what it refuses.
     expect((await previewCursorEntry("rooted")).method).toEqual({ kind: "agent-plugin" });
@@ -803,6 +809,8 @@ describe("AgentPluginInstallService marketplaces", () => {
     await expect(previewCursorEntry("through")).rejects.toThrow("is a symbolic link");
   }, 20_000);
 
+  // Four staging runs (preview, install, update review, update): 14 s at load 30 on a shared
+  // host, and over 20 s when four test files run at once.
   test("an installed Cursor entry lists its not-applied parts and updates by its folder", async () => {
     await writeCursorMarketplace();
     const variables: AgentPluginNotApplied = {
@@ -826,7 +834,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(await installedSkills("kit")).toEqual(["format", "lint"]);
     const updated = (await service.list()).find((item) => item.name === "kit");
     expect([updated?.lockedSha, updated?.source?.subpath]).toEqual([head, "kit"]);
-  }, 20_000);
+  }, 60_000);
 
   test("not-applied names show invisible characters as marks", async () => {
     await writeCursorMarketplace();

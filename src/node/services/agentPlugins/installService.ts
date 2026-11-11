@@ -1404,6 +1404,8 @@ async function realEntryFolder(
   try {
     entryDir = await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? ""));
   } catch (error) {
+    // ENOTDIR's own message names the staging path: say what the preview says instead.
+    if (hasErrorCode(error, "ENOTDIR")) return { why: "it runs through a file" };
     return { why: hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error) };
   }
   if (entryDir !== path.join(await fsPromises.realpath(stagedDir), subpath ?? "")) {
