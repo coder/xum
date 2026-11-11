@@ -33,19 +33,23 @@ const review = (name: string): AgentPluginUpdateReview => ({
   warnings: [],
 });
 
+const cardsFor = (...names: string[]) => names.map((name) => item(name));
+
 test("settling the open review opens the next one, and the queue ends empty", () => {
-  const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")]));
+  const { result } = renderHook(() =>
+    useUpdateReviewQueue([review("a"), review("b")], cardsFor("a", "b"))
+  );
 
   expect(result.current.open?.name).toBe("a");
-  act(() => result.current.settle(result.current.open));
+  act(() => result.current.settle(result.current.open ?? undefined));
   expect(result.current.open?.name).toBe("b");
-  act(() => result.current.settle(result.current.open));
+  act(() => result.current.settle(result.current.open ?? undefined));
   expect(result.current.open).toBeNull();
 });
 
 test("settling removes that review wherever it is, and nothing for a review that is not queued", () => {
   const queued = [review("a"), review("b"), review("c")];
-  const { result } = renderHook(() => useUpdateReviewQueue(queued));
+  const { result } = renderHook(() => useUpdateReviewQueue(queued, cardsFor("a", "b", "c")));
 
   act(() => result.current.settle(queued[1]));
   expect(result.current.waiting).toEqual([queued[0], queued[2]]);
@@ -57,7 +61,9 @@ test("settling removes that review wherever it is, and nothing for a review that
 
 test("showing reviews replaces the open one and the queue behind it, and the old reviews no longer settle anything", () => {
   const first = review("a");
-  const { result } = renderHook(() => useUpdateReviewQueue([first, review("b")]));
+  const { result } = renderHook(() =>
+    useUpdateReviewQueue([first, review("b")], cardsFor("a", "b", "c", "d"))
+  );
   const shown = [review("c"), review("d")];
 
   act(() => result.current.show(shown));
@@ -67,7 +73,9 @@ test("showing reviews replaces the open one and the queue behind it, and the old
 });
 
 test("clearing drops the open review and the queue behind it", () => {
-  const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")]));
+  const { result } = renderHook(() =>
+    useUpdateReviewQueue([review("a"), review("b")], cardsFor("a", "b"))
+  );
 
   act(() => result.current.clear());
   expect(result.current.open).toBeNull();
@@ -76,7 +84,7 @@ test("clearing drops the open review and the queue behind it", () => {
 
 test("dropping the open review opens the next one, and dropping a queued one leaves the open one", () => {
   const { result } = renderHook(() =>
-    useUpdateReviewQueue([review("a"), review("b"), review("c")])
+    useUpdateReviewQueue([review("a"), review("b"), review("c")], cardsFor("a", "b", "c"))
   );
 
   act(() => result.current.drop("b"));
@@ -88,6 +96,37 @@ test("dropping the open review opens the next one, and dropping a queued one lea
 
   act(() => result.current.drop("unknown"));
   expect(result.current.open?.name).toBe("c");
+});
+
+test("the open review is the first waiting one whose plugin has a managed card, and the queue order stays", () => {
+  const queued = [review("ghost"), review("a"), review("shared"), review("b")];
+  const cards = [item("a"), item("shared", false), item("b")];
+  const { result } = renderHook(() => useUpdateReviewQueue(queued, cards));
+
+  expect(result.current.open).toBe(queued[1]);
+  act(() => result.current.settle(result.current.open ?? undefined));
+  expect(result.current.open).toBe(queued[3]);
+  expect(result.current.waiting).toEqual([queued[0], queued[2], queued[3]]);
+  act(() => result.current.settle(result.current.open ?? undefined));
+  expect(result.current.open).toBeNull();
+  expect(result.current.waiting).toEqual([queued[0], queued[2]]);
+});
+
+test("no review is open until the plugin list has a card for it", () => {
+  const queued = [review("a")];
+  const { result, rerender } = renderHook(
+    (props: { cards: readonly AgentPluginListItem[] | null }) =>
+      useUpdateReviewQueue(queued, props.cards),
+    { initialProps: { cards: null as readonly AgentPluginListItem[] | null } }
+  );
+  expect(result.current.open).toBeNull();
+  expect(result.current.waiting).toEqual(queued);
+
+  rerender({ cards: [item("a")] });
+  expect(result.current.open).toBe(queued[0]);
+
+  rerender({ cards: [] });
+  expect(result.current.open).toBeNull();
 });
 
 test("the button renders only while a plugin has an update waiting, and clicks run it", () => {

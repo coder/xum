@@ -478,6 +478,35 @@ test("reviews a palette Update All found open in the section the same way", asyn
   await waitFor(() => expect(updates.map((update) => update.name)).toEqual(["epsilon"]));
 });
 
+test("a queued review whose plugin has no managed card does not hide the reviews behind it", async () => {
+  const { api, updates } = createApi({
+    names: ["epsilon"],
+    unmanaged: ["beta"],
+    pending: { epsilon: capabilityChanging("epsilon") },
+  });
+  // `ghost` was uninstalled from another client, and `beta` only exists as an unmanaged plugin.
+  publishPluginsSectionIntent({
+    type: "review-updates",
+    reviews: [
+      capabilityChanging("ghost"),
+      capabilityChanging("beta"),
+      capabilityChanging("epsilon"),
+    ],
+  });
+  const view = mount(api);
+
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  const text = view.container.textContent ?? "";
+  expect(text).toContain("adds skill 'epsilon'");
+  expect(text).not.toContain("adds skill 'ghost'");
+  expect(text).not.toContain("adds skill 'beta'");
+  expect(openReviews(view)[0].disabled).toBe(false);
+
+  fireEvent.click(openReviews(view)[0]);
+  await waitFor(() => expect(updates.map((update) => update.name)).toEqual(["epsilon"]));
+  await waitFor(() => expect(openReviews(view)).toHaveLength(0));
+});
+
 test("a confirm that fails keeps the queue where it is, with the same review open", async () => {
   const { api, updates } = createApi({
     names: ["beta", "epsilon"],
