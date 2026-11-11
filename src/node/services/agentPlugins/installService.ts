@@ -101,6 +101,7 @@ import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles
 import {
   assertEntryNamesPlugin,
   chooseStagedMethod,
+  hasPluginManifest,
   detectInstallMethods,
   generatesManifest,
   isOwnManifestMethod,
@@ -115,6 +116,7 @@ import {
   type SkillsPackageRoot,
 } from "./installMethods";
 import {
+  MARKETPLACE_FILE_RULES,
   MARKETPLACE_RELATIVE_PATHS,
   MAX_CLAUDE_MARKETPLACE_BYTES,
   findMarketplaceEntry,
@@ -1385,6 +1387,59 @@ function resolvePreviewRef(
     );
   }
   return parsedRef ?? (explicit.length > 0 ? explicit : undefined);
+}
+
+/**
+ * The real folder at `subpath`, or why the preview would not stage it (extractSubpath): missing,
+ * escaping the repository, a file, or a path through a symbolic link. A constant number of calls
+ * per build: a marketplace lists up to 1,500 builds, and a per-segment walk of deep paths that
+ * all name one folder made a hostile listing take over a minute. The realpath already resolved
+ * every segment, so a link anywhere on the path shows as a realpath that differs from the path.
+ */
+async function realEntryFolder(
+  stagedDir: string,
+  subpath: string | undefined
+): Promise<{ entryDir: string } | { why: string }> {
+  let entryDir: string;
+  try {
+    entryDir = await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? ""));
+  } catch (error) {
+    // ENOTDIR's own message names the staging path: say what the preview says instead.
+    if (hasErrorCode(error, "ENOTDIR")) return { why: "it runs through a file" };
+    return { why: hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error) };
+  }
+  if (entryDir !== path.join(await fsPromises.realpath(stagedDir), subpath ?? "")) {
+    return { why: "it is a symbolic link or runs through one" };
+  }
+  if (!(await fsPromises.lstat(entryDir)).isDirectory()) return { why: "it is a file" };
+  return { entryDir };
+}
+
+/**
+ * The folder of a relative marketplace build, or why the listing does not offer it: the preview
+ * would fail on a folder that realEntryFolder refuses, and on a Cursor or Agent Plugins folder
+ * without a plugin manifest of its own (entryInstallMethods). The reason names the folder, not
+ * the staging path.
+ */
+async function checkedEntryFolder(
+  stagedDir: string,
+  subpath: string | undefined,
+  file: MarketplaceFile
+): Promise<{ entryDir: string } | { reason: string }> {
+  const shown = subpath ?? ".";
+  const folder = await realEntryFolder(stagedDir, subpath);
+  if ("why" in folder) {
+    return { reason: `Xum cannot install the entry's folder '${shown}': ${folder.why}` };
+  }
+  if (
+    !MARKETPLACE_FILE_RULES[file].entryIsManifest &&
+    !(await hasPluginManifest(folder.entryDir))
+  ) {
+    return {
+      reason: `The entry's folder '${shown}' has no plugin manifest, so Xum cannot install it.`,
+    };
+  }
+  return folder;
 }
 
 /** The git source that preview returns and install persists. */
@@ -3924,9 +3979,11 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * A relative build's skill count: the skills its preview accepts (collectSkills), not the
-   * paths its entry lists. An entry in another repository keeps the count of paths: Xum has not
-   * cloned it. Each build reads its own file's entry.
+   * A relative build as its preview would see it: its folder must exist inside the repository,
+   * a Cursor or Agent Plugins folder needs its own plugin manifest (the entry is never one), and
+   * the skill count is the skills its preview accepts (collectSkills), not the paths its entry
+   * lists. An entry in another repository keeps the count of paths: Xum has not cloned it. Each
+   * build reads its own file's entry.
    */
   private async withAcceptedSkillCount(
     stagedDir: string,
@@ -3938,26 +3995,13 @@ export class AgentPluginInstallService {
     /** Scans of this listing by folder, skills list and plugin name. */
     scans: Map<string, Promise<Set<string>>>
   ): Promise<AgentPluginMarketplaceBuild> {
-    if (build.skillCount === undefined || !build.installable || build.sourceKind !== "relative") {
-      return build;
-    }
+    if (!build.installable || build.sourceKind !== "relative") return build;
     const entry = findMarketplaceEntry(marketplace, name);
     const resolved = resolveEntrySource(marketplace, source.url, entry);
     assert(resolved.kind === "relative", "withAcceptedSkillCount: a relative entry resolves here");
-    const folder = path.join(stagedDir, resolved.subpath ?? "");
-    let entryDir: string;
-    try {
-      entryDir = await ensurePluginPathContained(stagedDir, folder);
-    } catch (error) {
-      // A missing or escaping folder would fail the entry's preview, so the listing does not
-      // offer it. The reason names the folder, not the staging path.
-      const why = hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error);
-      return {
-        ...build,
-        installable: false,
-        reason: `Xum cannot install the entry's folder '${resolved.subpath ?? "."}': ${why}`,
-      };
-    }
+    const folder = await checkedEntryFolder(stagedDir, resolved.subpath, build.file);
+    if ("reason" in folder) return { ...build, installable: false, reason: folder.reason };
+    if (build.skillCount === undefined) return build;
     let manifest: Record<string, unknown>;
     try {
       ({ manifest } = marketplaceManifest({
@@ -3970,8 +4014,19 @@ export class AgentPluginInstallService {
       // No plugin name fits the entry name: its own preview fails with the reason.
       return build;
     }
+    const scan = this.entrySkillScan(folder.entryDir, manifest, entry.name, scans);
+    return { ...build, skillCount: (await scan).size };
+  }
+
+  /** The accepted skills of an entry's folder under its manifest, one scan per shared key. */
+  private entrySkillScan(
+    entryDir: string,
+    manifest: Record<string, unknown>,
+    entryName: string,
+    scans: Map<string, Promise<Set<string>>>
+  ): Promise<Set<string>> {
     const declared = declaredSkills(manifest);
-    const pluginName = typeof manifest.name === "string" ? manifest.name : entry.name;
+    const pluginName = typeof manifest.name === "string" ? manifest.name : entryName;
     // The plugin name names only a skill at the plugin root itself (a declared "."), so
     // entries that share a folder and skills list share one scan otherwise.
     const namesRootSkill =
@@ -3983,7 +4038,7 @@ export class AgentPluginInstallService {
       scan = this.acceptedSkillNames(entryDir, { declared, pluginName });
       scans.set(key, scan);
     }
-    return { ...build, skillCount: (await scan).size };
+    return scan;
   }
 
   /**

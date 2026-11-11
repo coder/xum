@@ -8,6 +8,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { parseClaudeMarketplace } from "./claudeMarketplace";
 import { discoverAgentPluginAt } from "./discovery";
 import {
+  assertEntryNamesPlugin,
   chooseInstallMethod,
   detectInstallMethods,
   entryInstallMethods,
@@ -323,6 +324,27 @@ describe("entryInstallMethods", () => {
     expect(() => entryInstallMethods([{ kind: "skills" }], { ...ctx, relative: false })).toThrow(
       refusal
     );
+  });
+
+  test("an Agent Plugins entry must name its plugin exactly; other files do not check", () => {
+    const entryOf = (file: "agents" | "cursor" | "claude", name: string) => ({
+      file,
+      entry: parseClaudeMarketplace(
+        JSON.stringify({ name: "m", plugins: [{ name, source: "./x" }] }),
+        file
+      ).entries[0],
+      relative: true,
+      rootSource: false,
+    });
+    expect(() => assertEntryNamesPlugin(entryOf("agents", "kit"), "kit")).not.toThrow();
+    // Exact, as Codex compares: a case-only difference is another name.
+    expect(() => assertEntryNamesPlugin(entryOf("agents", "Kit"), "kit")).toThrow(
+      "points to a plugin named 'kit'"
+    );
+    for (const file of ["cursor", "claude"] as const) {
+      expect(() => assertEntryNamesPlugin(entryOf(file, "Kit"), "kit")).not.toThrow();
+    }
+    expect(() => assertEntryNamesPlugin(undefined, "kit")).not.toThrow();
   });
 
   test("a Claude entry still becomes its own manifest when its folder has none", () => {

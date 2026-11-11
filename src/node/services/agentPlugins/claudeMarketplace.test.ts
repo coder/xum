@@ -592,6 +592,10 @@ describe("the Agent Plugins marketplace file", () => {
       kind: "remote",
       ref: "release-v2",
     });
+    const sha = "A".repeat(40);
+    expect(resolveEntry({ source: { ...source, sha: ` ${sha} ` } })).toMatchObject({
+      ref: sha.toLowerCase(),
+    });
     expect(resolveEntry({ source: { ...source, ref: "", sha: "" } })).toMatchObject({
       kind: "remote",
       ref: undefined,
