@@ -1390,28 +1390,11 @@ function resolvePreviewRef(
 }
 
 /**
- * Why `subpath` is not a real folder of `stagedDir`, checked segment by segment as the preview
- * checks it (extractSubpath): a file or a symbolic link anywhere on the path fails the preview.
- */
-async function subpathNotAFolderReason(
-  stagedDir: string,
-  subpath: string | undefined
-): Promise<string | undefined> {
-  const segments = subpath?.split("/") ?? [];
-  for (let depth = 1; depth <= segments.length; depth++) {
-    const prefix = segments.slice(0, depth).join("/");
-    const stat = await fsPromises.lstat(path.join(stagedDir, prefix)).catch(() => undefined);
-    if (stat === undefined) return "it does not exist";
-    if (!stat.isDirectory()) {
-      return `'${prefix}' is ${stat.isSymbolicLink() ? "a symbolic link" : "a file"}`;
-    }
-  }
-  return undefined;
-}
-
-/**
- * The real folder at `subpath`, or why the preview would not stage it: missing, escaping the
- * repository, or a path through a file or a symbolic link.
+ * The real folder at `subpath`, or why the preview would not stage it (extractSubpath): missing,
+ * escaping the repository, a file, or a path through a symbolic link. A constant number of calls
+ * per build: a marketplace lists up to 1,500 builds, and a per-segment walk of deep paths that
+ * all name one folder made a hostile listing take over a minute. The realpath already resolved
+ * every segment, so a link anywhere on the path shows as a realpath that differs from the path.
  */
 async function realEntryFolder(
   stagedDir: string,
@@ -1423,8 +1406,11 @@ async function realEntryFolder(
   } catch (error) {
     return { why: hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error) };
   }
-  const notAFolder = await subpathNotAFolderReason(stagedDir, subpath);
-  return notAFolder !== undefined ? { why: notAFolder } : { entryDir };
+  if (entryDir !== path.join(await fsPromises.realpath(stagedDir), subpath ?? "")) {
+    return { why: "it is a symbolic link or runs through one" };
+  }
+  if (!(await fsPromises.lstat(entryDir)).isDirectory()) return { why: "it is a file" };
+  return { entryDir };
 }
 
 /**

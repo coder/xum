@@ -325,7 +325,7 @@ describe("AgentPluginInstallService marketplaces", () => {
         false,
         "Xum cannot install the entry's folder 'plugins/gone-bare': it does not exist",
       ],
-      ["a-file", false, "Xum cannot install the entry's folder 'notes.txt': 'notes.txt' is a file"],
+      ["a-file", false, "Xum cannot install the entry's folder 'notes.txt': it is a file"],
     ]);
   });
 
@@ -755,6 +755,7 @@ describe("AgentPluginInstallService marketplaces", () => {
           { name: "gone", source: "plugins/gone" },
           { name: "afile", source: "afile" },
           { name: "linked", source: "linked" },
+          { name: "through", source: "through/inner" },
         ],
       }),
       afile: "not a folder\n",
@@ -765,9 +766,12 @@ describe("AgentPluginInstallService marketplaces", () => {
       "rooted/skills/a/SKILL.md": skillMd("a"),
       "clauded/.claude-plugin/plugin.json": JSON.stringify({ name: "clauded" }),
       "clauded/skills/b/SKILL.md": skillMd("b"),
+      "deep/inner/.cursor-plugin/plugin.json": JSON.stringify({ name: "through" }),
     });
-    // The preview refuses a symlinked folder even when it holds a manifest (extractSubpath).
+    // The preview refuses a symlinked folder even when it holds a manifest (extractSubpath),
+    // and a folder reached through a symlinked parent.
     await fsPromises.symlink("rooted", path.join(marketDir, "linked"));
+    await fsPromises.symlink("deep", path.join(marketDir, "through"));
     await commit(marketDir, "Cursor entries with a root manifest, a Claude manifest and no folder");
     const listing = await listMarketplace();
     expect(
@@ -780,17 +784,23 @@ describe("AgentPluginInstallService marketplaces", () => {
       ["rooted", true, undefined],
       ["clauded", true, undefined],
       ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
-      ["afile", false, "Xum cannot install the entry's folder 'afile': 'afile' is a file"],
+      ["afile", false, "Xum cannot install the entry's folder 'afile': it is a file"],
       [
         "linked",
         false,
-        "Xum cannot install the entry's folder 'linked': 'linked' is a symbolic link",
+        "Xum cannot install the entry's folder 'linked': it is a symbolic link or runs through one",
+      ],
+      [
+        "through",
+        false,
+        "Xum cannot install the entry's folder 'through/inner': it is a symbolic link or runs through one",
       ],
     ]);
     // The listing offers what the preview installs, and refuses what it refuses.
     expect((await previewCursorEntry("rooted")).method).toEqual({ kind: "agent-plugin" });
     expect((await previewCursorEntry("clauded")).method).toEqual({ kind: "claude-plugin" });
     await expect(previewCursorEntry("linked")).rejects.toThrow("is a symbolic link");
+    await expect(previewCursorEntry("through")).rejects.toThrow("is a symbolic link");
   }, 20_000);
 
   test("an installed Cursor entry lists its not-applied parts and updates by its folder", async () => {
