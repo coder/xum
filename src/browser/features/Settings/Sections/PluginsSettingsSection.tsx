@@ -2086,11 +2086,15 @@ export const PluginsSettingsSection: React.FC = () => {
     setError(null);
     try {
       // Only the shown components get consent records (#6498).
-      await applyUpdate(review.name, {
-        fromSha: review.fromSha,
-        toSha: review.toSha,
-        reviewed: reviewedComponents(review),
-      });
+      await applyUpdate(
+        review.name,
+        {
+          fromSha: review.fromSha,
+          toSha: review.toSha,
+          reviewed: reviewedComponents(review),
+        },
+        review
+      );
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -2099,7 +2103,11 @@ export const PluginsSettingsSection: React.FC = () => {
   };
 
   /** Shared tail of both update paths; callers own busy state and error capture. */
-  const applyUpdate = async (name: string, consent: AgentPluginUpdateConsent | undefined) => {
+  const applyUpdate = async (
+    name: string,
+    consent: AgentPluginUpdateConsent | undefined,
+    settled?: AgentPluginUpdateReview
+  ) => {
     if (!api) return;
     const result = await api.agentPlugins.update({ name, consent: consent ?? null });
     if (result.success) {
@@ -2116,7 +2124,7 @@ export const PluginsSettingsSection: React.FC = () => {
     if (result.success) {
       // After the refresh, so the next queued review does not open while this update still holds
       // `busyPlugin` (its own name is not the busy one, so its controls would look enabled).
-      updateReviews.next();
+      updateReviews.settle(settled);
     } else {
       setError(result.error);
     }
@@ -2405,7 +2413,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       selective={item.importedComponents !== undefined}
                       busy={isBusy}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
-                      onCancel={updateReviews.next}
+                      onCancel={() => updateReviews.settle(updateReview)}
                     />
                   )}
                   <ComponentReviewRow

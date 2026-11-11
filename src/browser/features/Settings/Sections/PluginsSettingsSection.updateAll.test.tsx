@@ -502,6 +502,32 @@ test("a confirm that fails keeps the queue where it is, with the same review ope
   await waitFor(() => expect(shows("adds skill 'epsilon'")).toBe(true));
 });
 
+test("a confirm that settles after a palette run replaced the queue leaves the palette's reviews alone", async () => {
+  const { api, holdChecks } = createApi({
+    names: ["beta", "epsilon", "gamma", "delta"],
+    pending: { beta: capabilityChanging("beta"), epsilon: capabilityChanging("epsilon") },
+  });
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(shows("adds skill 'beta'")).toBe(true));
+  const hold = holdChecks();
+  fireEvent.click(openReviews(view)[0]);
+  await hold.entered;
+  publishPluginsSectionIntent({
+    type: "review-updates",
+    reviews: [capabilityChanging("gamma"), capabilityChanging("delta")],
+  });
+  await waitFor(() => expect(shows("adds skill 'gamma'")).toBe(true));
+
+  hold.release();
+
+  await waitFor(() => expect(buttonNamed(view, /Update all/)?.textContent).toContain("(1)"));
+  expect(shows("adds skill 'gamma'")).toBe(true);
+  expect(shows("adds skill 'delta'")).toBe(false);
+});
+
 async function uninstallPlugin(view: RenderResult, name: string) {
   fireEvent.click(view.container.querySelector(`button[aria-label="Uninstall ${name}"]`)!);
   const confirm = await waitFor(() => {

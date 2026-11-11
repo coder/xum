@@ -33,25 +33,37 @@ const review = (name: string): AgentPluginUpdateReview => ({
   warnings: [],
 });
 
-test("the review queue opens its reviews in order and ends empty", () => {
+test("settling the open review opens the next one, and the queue ends empty", () => {
   const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")]));
 
   expect(result.current.open?.name).toBe("a");
-  act(() => result.current.next());
+  act(() => result.current.settle(result.current.open!));
   expect(result.current.open?.name).toBe("b");
-  act(() => result.current.next());
-  expect(result.current.open).toBeNull();
-  act(() => result.current.next());
+  act(() => result.current.settle(result.current.open!));
   expect(result.current.open).toBeNull();
 });
 
-test("showing reviews replaces the open one and the queue behind it", () => {
-  const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")]));
+test("settling removes that review wherever it is, and nothing for a review that is not queued", () => {
+  const queued = [review("a"), review("b"), review("c")];
+  const { result } = renderHook(() => useUpdateReviewQueue(queued));
 
-  act(() => result.current.show([review("c")]));
+  act(() => result.current.settle(queued[1]));
+  expect(result.current.waiting).toEqual([queued[0], queued[2]]);
+
+  act(() => result.current.settle({ ...queued[0] }));
+  act(() => result.current.settle(undefined));
+  expect(result.current.waiting).toEqual([queued[0], queued[2]]);
+});
+
+test("showing reviews replaces the open one and the queue behind it, and the old reviews no longer settle anything", () => {
+  const first = review("a");
+  const { result } = renderHook(() => useUpdateReviewQueue([first, review("b")]));
+  const shown = [review("c"), review("d")];
+
+  act(() => result.current.show(shown));
   expect(result.current.open?.name).toBe("c");
-  act(() => result.current.next());
-  expect(result.current.open).toBeNull();
+  act(() => result.current.settle(first));
+  expect(result.current.waiting).toEqual(shown);
 });
 
 test("clearing drops the open review and the queue behind it", () => {
@@ -60,8 +72,6 @@ test("clearing drops the open review and the queue behind it", () => {
   act(() => result.current.clear());
   expect(result.current.open).toBeNull();
   expect(result.current.waiting).toEqual([]);
-  act(() => result.current.next());
-  expect(result.current.open).toBeNull();
 });
 
 test("dropping the open review opens the next one, and dropping a queued one leaves the open one", () => {

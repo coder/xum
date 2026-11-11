@@ -25,7 +25,10 @@ export function useUpdateReviewQueue(initial: Reviews) {
     open: reviews[0] ?? null,
     waiting: reviews,
     show: (shown: Reviews) => setReviews(shown),
-    next: () => setReviews((current) => current.slice(1)),
+    // By identity, not position: a palette run can replace the queue while a confirm is in
+    // flight, and the review that settled is then no longer in it. `undefined` settles nothing.
+    settle: (settled: AgentPluginUpdateReview | undefined) =>
+      setReviews((current) => current.filter((review) => review !== settled)),
     clear: () => setReviews([]),
     // A plugin that is gone has no card to hold its review, so nothing could settle it.
     drop: (name: string) => setReviews((current) => current.filter((r) => r.name !== name)),
@@ -40,6 +43,7 @@ interface UpdateAllDeps {
   updateChecks: ReadonlyMap<string, AgentPluginUpdateCheck>;
   /** The reviews this run left that still wait for the user. */
   waitingReviews: Reviews;
+  /** The host drops what a new run replaces: the open reviews and the earlier status. */
   onStart: () => void;
   onReviews: (reviews: Reviews) => void;
   refresh: () => Promise<void>;
@@ -61,7 +65,6 @@ export function useUpdateAll(deps: UpdateAllDeps) {
   const run = async () => {
     if (!deps.api || deps.busyPlugin !== null) return;
     setRunning(true);
-    setLastRun(null);
     deps.onStart();
     try {
       // The progress callback keeps `busyPlugin` set, which disables every per-card action.
