@@ -721,6 +721,48 @@ describe("MemoryService", () => {
       }
     });
 
+    it("refuses an edit that writes a value behind a marker, and passes one that quotes a marker with punctuation", async () => {
+      // `password=[redacted]SEKRIT` is no redaction shape of its own (the key pattern skips a value
+      // that starts with the marker), so the guard reads what goes on behind the marker.
+      using fixture = await createFixture();
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/notes.md",
+        "# deploy\npassword=[redacted]\n",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const edit = (oldText: string, newText: string) =>
+        fixture.service.strReplace(
+          fixture.ctx,
+          "/memories/global/notes.md",
+          oldText,
+          newText,
+          "agent",
+          undefined,
+          undefined,
+          GUARDED
+        );
+
+      const refused = [
+        await edit("password=[redacted]", "password=[redacted]SEKRIT"),
+        await edit("password=[redacted]", "password=[redacted]秘密"),
+        await edit("# deploy", "# deploy\n?sig=[redacted]SEKRIT"),
+      ];
+      const quoted = await edit(
+        "# deploy",
+        "# deploy: `API_KEY=[redacted]`, then password=[redacted]。"
+      );
+
+      expect(refused.map((result) => result.success)).toEqual([false, false, false]);
+      expect(quoted.success).toBe(true);
+      expect(await fsPromises.readFile(physical(fixture, "notes.md"), "utf-8")).toBe(
+        "# deploy: `API_KEY=[redacted]`, then password=[redacted]。\npassword=[redacted]\n"
+      );
+    });
+
     it("refuses an edit that assembles a new key in a file that already held a credential", async () => {
       // An old password must not switch the guard off for the rest of the file: joining `sk-` and
       // its suffix there adds a second credential shape, which the count of shapes sees.
@@ -6087,6 +6129,47 @@ describe("MemoryService refinement journal", () => {
       expect([renamed.success, deleted.success]).toEqual([true, true]);
 
       expect(await readRefinementEvents(sessionDirOf(fixture))).toHaveLength(2);
+    });
+
+    // A note that quotes a marker puts punctuation behind it. That is no value, so the guard reads
+    // no credential in it and the row of its cleanup keeps its pre-image, as it does on main. A value
+    // behind the marker is one: that row is dropped.
+    it("journals a guarded delete of a note that quotes a marker with punctuation behind it, and none of one with a value", async () => {
+      using fixture = await createFixture();
+      const notes = [
+        ["full-stop.md", "The CI password=[redacted]."],
+        ["code-span.md", "Deploy reads `API_KEY=[redacted]` from the vault."],
+        ["ideographic.md", "密码 password=[redacted]。"],
+        ["value.md", "password=[redacted]SEKRIT"],
+        ["cjk-value.md", "password=[redacted]秘密"],
+      ];
+      for (const [name, text] of notes) {
+        await fixture.service.create(fixture.ctx, `/memories/global/${name}`, `${text}\n`, "agent");
+      }
+      for (const [name] of notes) {
+        const deleted = await fixture.service.deletePath(
+          fixture.ctx,
+          `/memories/global/${name}`,
+          "agent",
+          undefined,
+          undefined,
+          undefined,
+          GUARDED
+        );
+        expect(deleted.success).toBe(true);
+      }
+
+      const events = await readRefinementEvents(sessionDirOf(fixture));
+      const rows = events.map((event) => {
+        const action = MemoryRefinementActionSchema.parse(event.data.action);
+        return `${action.op} ${action.path}`;
+      });
+      expect(rows).toEqual([
+        ...notes.map(([name]) => `create /memories/global/${name}`),
+        "delete /memories/global/full-stop.md",
+        "delete /memories/global/code-span.md",
+        "delete /memories/global/ideographic.md",
+      ]);
     });
   });
 
