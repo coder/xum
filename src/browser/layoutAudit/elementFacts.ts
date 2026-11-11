@@ -104,6 +104,9 @@ export function isRequiredControl(el: Element): boolean {
 
 // `visibility` is not here: it inherits and a descendant may switch it back on (see isVisible).
 function isHiddenStyle(style: LayoutStyle): boolean {
+  // An element without a box of its own ignores opacity and content-visibility: its children
+  // paint as if they were its parent's.
+  if (style.display === "contents") return false;
   const opacity = Number.parseFloat(style.opacity || "1");
   return (
     style.display === "none" ||
