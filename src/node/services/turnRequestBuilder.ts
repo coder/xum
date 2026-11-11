@@ -152,6 +152,7 @@ import {
   buildProviderOptions,
   buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
+  resolveRequestProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -1454,8 +1455,10 @@ export class TurnRequestBuilder {
       overridesIdentity.modelString,
       options.effectiveModelString
     );
-    const namespaceKey = resolveProviderOptionsNamespaceKey(
+    const namespaceKey = resolveRequestProviderOptionsNamespaceKey(
       options.wireProviderName,
+      options.optionsModelString,
+      options.providersConfigSnapshot,
       options.routeProvider
     );
     const extrasWireCompatible =

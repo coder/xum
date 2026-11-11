@@ -152,6 +152,34 @@ function resolveOptionsCoderWire(
     : resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder);
 }
 
+/** Whether a request goes to a google-typed Coder instance (see CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE). */
+function isCoderGoogleWire(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
+): boolean {
+  const rawPrefix = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
+  return (
+    !isCustomProviderConfig(providersConfig?.[rawPrefix]) &&
+    resolveOptionsCoderWire(modelString, providersConfig, routeProvider)?.providerType === "google"
+  );
+}
+
+/**
+ * The providerOptions namespace buildProviderOptions writes for a request: the
+ * one its SDK client reads, so model-parameter extras must merge there too.
+ */
+export function resolveRequestProviderOptionsNamespaceKey(
+  wireProviderName: string,
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
+): string {
+  return isCoderGoogleWire(modelString, providersConfig, routeProvider)
+    ? CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE
+    : resolveProviderOptionsNamespaceKey(wireProviderName, routeProvider);
+}
+
 /**
  * Gemini thinking config for a Xum level, shared by the native Google payload
  * and Gemini's OpenAI compatibility layer behind google-typed Coder instances.
@@ -872,8 +900,7 @@ export function buildProviderOptions(
   // copies this namespace's extra_body into the request verbatim.
   if (
     formatProvider === "openai" &&
-    !isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata]) &&
-    resolveOptionsCoderWire(modelString, providersConfig, routeProvider)?.providerType === "google"
+    isCoderGoogleWire(modelString, providersConfig, routeProvider)
   ) {
     const thinkingConfig = geminiThinkingConfig(capModelName, effectiveThinking);
     const options = {
