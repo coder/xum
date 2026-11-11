@@ -16,7 +16,8 @@ import { execBuffered, type ExecResult } from "@/node/utils/runtime/helpers";
 
 /**
  * Runs the page script in agent-browser on the workspace's runtime: the browser has to be on the
- * machine where agent-browser and the artifact file are. Two execs, never more:
+ * machine where agent-browser and the artifact file are. Two execs, and a third only when the
+ * second did not end well (it removes the run's folder, after the audit's budget):
  *
  * 1. RUN opens one fresh browser session and, for each width in run order, sets the viewport,
  *    loads the file anew, evaluates the script and prints one framed record. It stops at the
