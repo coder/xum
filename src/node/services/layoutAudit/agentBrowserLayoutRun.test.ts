@@ -174,6 +174,8 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     ["a window that failed to load", "chrome-error://chromewebdata/"],
     ["a window on another host", "http://127.0.0.1:9/window-open"],
     ["another file", "file:///tmp/artifacts/other.html"],
+    // A file URL with an authority names a file server: the same path there is another file.
+    ["the same path on a file server", FILE_URL.replace("file://", "file://server-b")],
     ["a blank window", "about:blank"],
     ["no address", ""],
   ])("a pass from %s is not a clean result, and the other widths stand", async (_name, href) => {
@@ -183,6 +185,15 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       "1440 failed script-failed",
       "768 complete",
     ]);
+  });
+
+  test("a run whose setup used the whole budget runs nothing and reads as timed out", async () => {
+    // Some runtimes read a zero timeout as no limit: nothing may be started with one.
+    const exec = spyOn(runtime, "exec");
+    const { outcomes, fake } = await run({}, { budgetMs: -1 });
+    expect(summary(outcomes)).toEqual(RUN_ORDER.map((width) => `${width} failed timeout`));
+    expect(exec).not.toHaveBeenCalled();
+    expect(await fake.calls()).toEqual([]);
   });
 
   test("a pass from the artifact is accepted whatever the page did to its hash, query or escaping", async () => {
