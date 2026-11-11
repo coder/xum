@@ -3472,6 +3472,27 @@ describe("AgentPluginInstallService", () => {
     expect(preview.warnings[0]).toMatch(/^skills\/poteto-mode: .*'Poteto Mode'.*'poteto-mode'/);
   });
 
+  test("preview lists a skill with a description over the cap, cut like runtime discovery", async () => {
+    // Runtime discovery loads such a skill with the description cut: the preview must
+    // promise it, not warn that it will not load.
+    const description = Array.from({ length: 1069 }, (_, i) =>
+      String.fromCharCode(97 + (i % 26))
+    ).join("");
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "long-desc"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "long-desc", "SKILL.md"),
+      `---\nname: long-desc\ndescription: ${description}\n---\n\nBody.\n`
+    );
+    await commitAll(remoteDir, "adds a skill with a long description");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["greet", "long-desc"]);
+    expect(preview.warnings).toEqual([]);
+    const listed = preview.skills.find((skill) => skill.name === "long-desc")?.description;
+    expect(listed).toHaveLength(1024);
+    expect(description.startsWith(listed ?? "")).toBe(true);
+  });
+
   test("preview and list show the interface; the logo is a contained data URL", async () => {
     // A 48×48 PNG header (OpenAI's smallest square logo): the check reads the size from IHDR.
     const png = pngHeader(48, 48);
