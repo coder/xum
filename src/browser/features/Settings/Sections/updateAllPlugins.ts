@@ -104,12 +104,35 @@ function summaryParts(result: UpdateAllResult, pointToSettings: boolean): string
 const isUnexpected = (result: UpdateAllResult): boolean =>
   result.failures.length > 0 || result.checkFailures.length > 0 || result.tagMoved.length > 0;
 
+const NOTHING_TO_UPDATE: UpdateAllSummary = {
+  tone: "success",
+  message: "All plugins are up to date.",
+};
+
+function summarize(result: UpdateAllResult, pointToSettings: boolean): UpdateAllSummary | null {
+  const parts = summaryParts(result, pointToSettings);
+  if (parts.length === 0) return null;
+  return { tone: isUnexpected(result) ? "error" : "success", message: parts.join(". ") };
+}
+
 /** `pointToSettings`: the reader is outside Settings → Plugins (the palette toast). */
 export function summarizeUpdateAll(
   result: UpdateAllResult,
   pointToSettings = false
 ): UpdateAllSummary {
-  const parts = summaryParts(result, pointToSettings);
-  if (parts.length === 0) return { tone: "success", message: "All plugins are up to date." };
-  return { tone: isUnexpected(result) ? "error" : "success", message: parts.join(". ") };
+  // mutation-equivalent: a summary is an object or null, so ?? and || agree
+  return summarize(result, pointToSettings) ?? NOTHING_TO_UPDATE;
+}
+
+/**
+ * The summary of a run once only the `waiting` reviews still need the user. Reviews are matched
+ * by identity, so a review that settled never returns when a later run queues the same plugin.
+ * `null` when nothing is left to say.
+ */
+export function summarizeRemaining(
+  result: UpdateAllResult,
+  waiting: readonly AgentPluginUpdateReview[]
+): UpdateAllSummary | null {
+  const reviews = result.reviews.filter((review) => waiting.includes(review));
+  return summarize({ ...result, reviews }, false);
 }

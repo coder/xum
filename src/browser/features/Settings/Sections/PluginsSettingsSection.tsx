@@ -1882,8 +1882,7 @@ export const PluginsSettingsSection: React.FC = () => {
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
   /** Pending update whose capability changes await the user's confirmation. */
   const updateReviews = useUpdateReviewQueue(
-    initialIntent?.type === "review-updates" ? initialIntent.reviews : [],
-    () => updateAll.dismissStatus()
+    initialIntent?.type === "review-updates" ? initialIntent.reviews : []
   );
   const updateReview = updateReviews.open;
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
@@ -2035,6 +2034,7 @@ export const PluginsSettingsSection: React.FC = () => {
   const startUpdate = () => {
     setError(null);
     updateReviews.clear();
+    updateAll.dismissStatus();
     // The update moves lockedSha, so an open component review would confirm against a stale tree.
     componentReview.close();
   };
@@ -2045,6 +2045,7 @@ export const PluginsSettingsSection: React.FC = () => {
     setBusyPlugin,
     items,
     updateChecks,
+    waitingReviews: updateReviews.waiting,
     onStart: startUpdate,
     onReviews: updateReviews.show,
     refresh,
@@ -2085,11 +2086,15 @@ export const PluginsSettingsSection: React.FC = () => {
     setError(null);
     try {
       // Only the shown components get consent records (#6498).
-      await applyUpdate(review.name, {
-        fromSha: review.fromSha,
-        toSha: review.toSha,
-        reviewed: reviewedComponents(review),
-      });
+      await applyUpdate(
+        review.name,
+        {
+          fromSha: review.fromSha,
+          toSha: review.toSha,
+          reviewed: reviewedComponents(review),
+        },
+        review
+      );
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -2098,7 +2103,11 @@ export const PluginsSettingsSection: React.FC = () => {
   };
 
   /** Shared tail of both update paths; callers own busy state and error capture. */
-  const applyUpdate = async (name: string, consent: AgentPluginUpdateConsent | undefined) => {
+  const applyUpdate = async (
+    name: string,
+    consent: AgentPluginUpdateConsent | undefined,
+    settled?: AgentPluginUpdateReview
+  ) => {
     if (!api) return;
     const result = await api.agentPlugins.update({ name, consent: consent ?? null });
     if (result.success) {
@@ -2115,7 +2124,7 @@ export const PluginsSettingsSection: React.FC = () => {
     if (result.success) {
       // After the refresh, so the next queued review does not open while this update still holds
       // `busyPlugin` (its own name is not the busy one, so its controls would look enabled).
-      updateReviews.next();
+      updateReviews.settle(settled);
     } else {
       setError(result.error);
     }
@@ -2133,6 +2142,7 @@ export const PluginsSettingsSection: React.FC = () => {
         publishAgentPluginsMutated();
         setUninstallTarget(null);
         await refresh();
+        updateReviews.drop(name);
       } else {
         // Keep the confirmation open and surface the error after the list
         // refresh (whose success path clears error state).
@@ -2403,7 +2413,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       selective={item.importedComponents !== undefined}
                       busy={isBusy}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
-                      onCancel={updateReviews.next}
+                      onCancel={() => updateReviews.settle(updateReview)}
                     />
                   )}
                   <ComponentReviewRow

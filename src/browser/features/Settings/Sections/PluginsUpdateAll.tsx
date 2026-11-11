@@ -8,34 +8,30 @@ import type {
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
-import { summarizeUpdateAll, updateAllPlugins, type UpdateAllSummary } from "./updateAllPlugins";
+import {
+  summarizeRemaining,
+  updateAllPlugins,
+  type UpdateAllResult,
+  type UpdateAllSummary,
+} from "./updateAllPlugins";
 
 type Reviews = readonly AgentPluginUpdateReview[];
 
-interface ReviewQueue {
-  open: AgentPluginUpdateReview | null;
-  queued: Reviews;
-}
-
-const queueOf = (reviews: Reviews): ReviewQueue => ({
-  open: reviews[0] ?? null,
-  queued: reviews.slice(1),
-});
-
-/** Once a review settles, the Update all status no longer describes what is left. */
-export function useUpdateReviewQueue(initial: Reviews, onSettled: () => void) {
-  const [queue, setQueue] = useState(() => queueOf(initial));
+/** The open review is the first; the rest wait behind it. */
+export function useUpdateReviewQueue(initial: Reviews) {
+  const [reviews, setReviews] = useState(initial);
   return {
-    open: queue.open,
-    show: (reviews: Reviews) => setQueue(queueOf(reviews)),
-    next: () => {
-      onSettled();
-      setQueue((current) => queueOf(current.queued));
-    },
-    clear: () => {
-      onSettled();
-      setQueue(queueOf([]));
-    },
+    // mutation-equivalent: a review is an object, so ?? and || agree
+    open: reviews[0] ?? null,
+    waiting: reviews,
+    show: (shown: Reviews) => setReviews(shown),
+    // By identity, not position: a palette run can replace the queue while a confirm is in
+    // flight, and the review that settled is then no longer in it. `undefined` settles nothing.
+    settle: (settled: AgentPluginUpdateReview | undefined) =>
+      setReviews((current) => current.filter((review) => review !== settled)),
+    clear: () => setReviews([]),
+    // A plugin that is gone has no card to hold its review, so nothing could settle it.
+    drop: (name: string) => setReviews((current) => current.filter((r) => r.name !== name)),
   };
 }
 
@@ -45,6 +41,9 @@ interface UpdateAllDeps {
   setBusyPlugin: (name: string | null) => void;
   items: readonly AgentPluginListItem[] | null;
   updateChecks: ReadonlyMap<string, AgentPluginUpdateCheck>;
+  /** The reviews this run left that still wait for the user. */
+  waitingReviews: Reviews;
+  /** The host drops what a new run replaces: the open reviews and the earlier status. */
   onStart: () => void;
   onReviews: (reviews: Reviews) => void;
   refresh: () => Promise<void>;
@@ -52,11 +51,13 @@ interface UpdateAllDeps {
 }
 
 export function useUpdateAll(deps: UpdateAllDeps) {
-  const [status, setStatus] = useState<UpdateAllSummary | null>(null);
+  const [lastRun, setLastRun] = useState<UpdateAllResult | null>(null);
   const [running, setRunning] = useState(false);
   // Managed rows only, like the per-card Update: an unmanaged plugin in another container can
   // share a managed plugin's name.
+  // mutation-equivalent: the items are an array or null, so ?? and || agree
   const checks = (deps.items ?? []).flatMap((item) =>
+    // mutation-equivalent: a check is an object or absent, so ?? and || agree
     item.managed ? (deps.updateChecks.get(item.name) ?? []) : []
   );
   const count = checks.filter((check) => check.status === "update-available").length;
@@ -64,7 +65,6 @@ export function useUpdateAll(deps: UpdateAllDeps) {
   const run = async () => {
     if (!deps.api || deps.busyPlugin !== null) return;
     setRunning(true);
-    setStatus(null);
     deps.onStart();
     try {
       // The progress callback keeps `busyPlugin` set, which disables every per-card action.
@@ -78,13 +78,14 @@ export function useUpdateAll(deps: UpdateAllDeps) {
       // shown earlier could be confirmed or cancelled while the run still holds the busy state, and
       // the status written afterwards would describe a review that is already settled.
       deps.onReviews(result.reviews);
-      setStatus(summarizeUpdateAll(result));
+      setLastRun(result);
     } finally {
       deps.setBusyPlugin(null);
       setRunning(false);
     }
   };
-  return { count, running, status, run, dismissStatus: () => setStatus(null) };
+  const status = lastRun === null ? null : summarizeRemaining(lastRun, deps.waitingReviews);
+  return { count, running, status, run, dismissStatus: () => setLastRun(null) };
 }
 
 export const UpdateAllButton: React.FC<{
