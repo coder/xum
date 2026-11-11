@@ -1236,6 +1236,14 @@ describe("redactSecretLike", () => {
       ["a superscript digit", "password=[redacted]²"],
       ["an astral letter", "password=[redacted]𝒜"],
       ["an astral digit", "password=[redacted]𝟜"],
+      // The ends of the surrogate ranges: a pair starts at 0xd800 and ends at 0xdfff.
+      ["the first astral letter, a pair that starts at 0xd800", "password=[redacted]\u{10000}"],
+      ["a pair that starts at 0xd835 and ends at 0xdc00", "password=[redacted]\u{1D400}"],
+      ["the last mathematical digit, a pair that ends at 0xdfff", "password=[redacted]\u{1D7FF}"],
+      // A lone surrogate is one character that is no letter or digit and no end of a value. It does not
+      // join the character before it or after it in a pair, so the `]` before a letter still goes on.
+      ["a bracket, a lone low surrogate and a letter", "password=[redacted]]\udc00秘"],
+      ["a lone high surrogate, a bracket and a letter", "password=[redacted]\ud800]x"],
       ["punctuation before the letters", "token=[redacted]。秘密"],
       ["letters after a full-width bracket", "token=[redacted]」秘密"],
       ["a signature of CJK letters", "?sig=[redacted]秘密&x=1"],
@@ -1244,6 +1252,24 @@ describe("redactSecretLike", () => {
     ])("refuses a tail of %s", (_label, text) => {
       expect(containsSecretLike(text)).toBe(true);
       expect(addsSecretLike("", text)).toBe(true);
+    });
+
+    // One character decides: the first and the last of each ASCII class count, and the character next
+    // to each of them does not.
+    it.each(["0", "9", "a", "z", "A", "Z"])("refuses a tail of %s alone", (char) => {
+      expect(containsSecretLike(`password=[redacted]${char}`)).toBe(true);
+    });
+
+    it.each(["/", ":", "@", "[", "`", "{", "_", "-", "~"])("passes a tail of %s alone", (char) => {
+      expect(containsSecretLike(`password=[redacted]${char}`)).toBe(false);
+    });
+
+    // A `]` ends the tail when a value end or the end of the text follows it, and goes on when a value
+    // character does (`[redacted]]SEKRIT`): the `]` that ends it is no part of the tail.
+    it("ends a tail at a bracket that no value character follows", () => {
+      expect(addsSecretLike("password=[redacted]abc]", "password=[redacted]abc")).toBe(false);
+      expect(addsSecretLike("password=[redacted]abc] x", "password=[redacted]abc x")).toBe(false);
+      expect(addsSecretLike("password=[redacted]abc]d", "password=[redacted]abc")).toBe(true);
     });
 
     // An already-redacted value is no credential, and a note that quotes what the harvest showed

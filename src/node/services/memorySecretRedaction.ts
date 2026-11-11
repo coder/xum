@@ -595,13 +595,18 @@ const LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
 function characterAt(text: string, i: number): string {
   const unit = text.charCodeAt(i);
   const next = text.charCodeAt(i + 1);
+  // mutation-equivalent: the high surrogate 0xdbff starts only private-use code points, which are
+  // no letter or digit, so reading one as two lone surrogates counts the same
   const paired = unit >= 0xd800 && unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff;
   return paired ? text.slice(i, i + 2) : text[i];
 }
 
 /** A letter or a digit of any script. The ASCII ones are decided without the regex. */
 function isLetterOrDigit(char: string): boolean {
+  // mutation-equivalent: the regex decides an ASCII character as the check below does, so reading
+  // another unit only skips the shortcut
   const code = char.charCodeAt(0);
+  // mutation-equivalent: U+0080 is no letter or digit, so the shortcut and the regex agree on it
   if (code < 0x80) return (code >= 48 && code <= 57) || ((code | 32) >= 97 && (code | 32) <= 122);
   return LETTER_OR_DIGIT.test(char);
 }
@@ -654,6 +659,7 @@ function holdsNewTail(held: string[], now: string[]): boolean {
   const left = new Map<string, number>();
   for (const tail of held) left.set(tail, (left.get(tail) ?? 0) + 1);
   for (const tail of now) {
+    // mutation-equivalent: a count of 0 and a missing one both read as 0
     const count = left.get(tail) ?? 0;
     if (count === 0) return true;
     left.set(tail, count - 1);
@@ -685,6 +691,8 @@ export function addsSecretLike(previous: string, updated: string): boolean {
   });
   if (added) return true;
   const tails = markerTails(updatedRedacted);
+  // mutation-equivalent: with no tail in `updated`, holdsNewTail is false whatever `previous` holds,
+  // so the check only skips reading the tails of `previous`
   return tails.length > 0 && holdsNewTail(markerTails(previousRedacted), tails);
 }
 
