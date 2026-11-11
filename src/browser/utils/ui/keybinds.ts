@@ -411,6 +411,12 @@ export const KEYBINDS = {
    */
   SET_DEFAULT_ISOLATION: { key: "d", code: "KeyD", ctrl: true, alt: true, shift: true },
 
+  /**
+   * New-workspace page: open the environment panel (where it runs, isolation, base branch).
+   * Shift for the same reason as SET_DEFAULT_ISOLATION: AltGr+E types a character on some layouts.
+   */
+  OPEN_CREATION_ENVIRONMENT: { key: "e", code: "KeyE", ctrl: true, alt: true, shift: true },
+
   /** Send message after current turn ends */
   SEND_MESSAGE_AFTER_TURN: { key: "Enter", ctrl: true },
 
