@@ -42,6 +42,10 @@ import {
 } from "@/node/services/agentSkills/agentSkillsService";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  toolSandboxGate,
+  type FileToolSandboxGate,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { ensurePathContained, hasErrorCode, isSameHostDirectory } from "./skillFileUtils";
@@ -81,6 +85,8 @@ interface ListedSkillsRoot {
   ruleFile?: string | undefined;
   /** Plugin roots only: snake_case folders load under kebab-case names (pluginSkillNameOfFolder). */
   plugin?: true;
+  /** Project roots outside plugins: commands can change them (readAgentSkill's `sandboxGate`). */
+  sandboxGate?: FileToolSandboxGate;
 }
 
 /**
@@ -140,7 +146,8 @@ async function readContainedSkillFile(
   directoryName: string,
   scope: "global" | "project",
   containmentRoot: string,
-  fileName: string
+  fileName: string,
+  sandboxGate: FileToolSandboxGate | undefined
 ): Promise<{ content: string; byteSize: number } | null> {
   const skillFilePath = path.join(skillDir, fileName);
 
@@ -153,6 +160,7 @@ async function readContainedSkillFile(
   try {
     await ensurePathContained(containmentRoot, skillDir);
     containedPath = await ensurePathContained(containmentRoot, skillFilePath);
+    await sandboxGate?.(containedPath, "read");
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
       log.warn(
@@ -207,7 +215,8 @@ async function readSkillDescriptor(
   scope: "global" | "project",
   containmentRoot: string,
   skillConsent?: PluginSkillConsentGate,
-  fileKind: PluginSkillFileKind = {}
+  fileKind: PluginSkillFileKind = {},
+  sandboxGate?: FileToolSandboxGate
 ): Promise<AgentSkillDescriptor | null> {
   const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
   if (!parsedDirectoryName.success) {
@@ -221,7 +230,8 @@ async function readSkillDescriptor(
     directoryName,
     scope,
     containmentRoot,
-    pluginSkillFileName(directoryName, fileKind)
+    pluginSkillFileName(directoryName, fileKind),
+    sandboxGate
   );
   if (file === null) return null;
 
@@ -305,6 +315,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               containment: skillCtx.containment,
               runtimeFactory: toolRuntimeFactory(config),
               dedupeByName: false,
+              sandboxGate: toolSandboxGate(config),
             })
           );
           const seenByScope = new Set<string>();
@@ -348,12 +359,14 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             throw new Error("Project-local skill context requires explicit roots");
           }
           const containmentRoot = xumScope.checkoutRoot ?? xumScope.projectRoot;
+          const sandboxGate = toolSandboxGate(config);
           roots.unshift(
             ...getProjectSkillRoots(skillCtx.roots).map((skillsRoot) => ({
               // Project skills are nearest-directory first, before global ones.
               skillsRoot,
               containmentRoot,
               scope: "project" as const,
+              sandboxGate,
             }))
           );
         }
@@ -432,6 +445,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           commandSkill,
           ruleFile,
           plugin,
+          sandboxGate,
         } of roots) {
           let skillsRootReal: string;
           try {
@@ -469,7 +483,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               scope,
               containmentRoot,
               skillConsent,
-              { command: commandSkill, rule: ruleFile }
+              { command: commandSkill, rule: ruleFile },
+              sandboxGate
             );
             if (!descriptor) {
               continue;

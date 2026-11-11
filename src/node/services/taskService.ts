@@ -115,7 +115,12 @@ import {
   type PendingTaskStartWaiter,
   type PendingTaskWaiter,
 } from "@/node/services/taskWaiters";
-import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceDirTrusted,
+  isWorkspaceProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import {
@@ -193,6 +198,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   isDockerRuntime,
   isLocalProjectRuntime,
+  isSshSharedProjectDirRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeConfig,
@@ -5305,7 +5311,12 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
     // #6426: one cached config load per call (not per candidate or per read).
-    const projectPluginsTrusted = isProjectTrusted(this.config, entry.projectPath);
+    // An SSH+None task runs in a host directory that also needs its own trust.
+    const projectPluginsTrusted = isWorkspaceProjectTrusted(this.config, {
+      kind: undefined,
+      projectPath: entry.projectPath,
+      runtimeConfig: entry.workspace.runtimeConfig,
+    });
 
     const workspacePath = coerceNonEmptyString(entry.workspace.path);
     const workspaceName = coerceNonEmptyString(entry.workspace.name) ?? entry.workspace.id;
@@ -8744,7 +8755,12 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     const secrets = await secretsToRecord(
-      this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+      secretsForWorkspace(
+        this.secretsStore,
+        this.config,
+        plan.parentMeta.projectPath,
+        plan.taskRuntimeConfig
+      )
     );
     // The sanitize and secrets awaits above leave a window in which the parent can cancel this
     // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
@@ -9682,8 +9698,7 @@ export class TaskService implements AgentTaskIntegration {
       parentMetadata: plan.parentMeta,
       allowCreateFallback: true,
       ...(preferredTrunkBranch != null ? { preferredTrunkBranch } : {}),
-      trusted:
-        this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
+      trusted: this.taskInitTrusted(plan),
       multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
         EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
       ),
@@ -9815,7 +9830,12 @@ export class TaskService implements AgentTaskIntegration {
     // mutate the live parent workspace — skip it entirely.
     if (!plan.useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+        secretsForWorkspace(
+          this.secretsStore,
+          this.config,
+          plan.parentMeta.projectPath,
+          plan.taskRuntimeConfig
+        )
       );
       this.registerTaskBackgroundInit(plan, checkout, secrets);
     }
@@ -9862,6 +9882,23 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /** Starts a launched task's init in its own checkout (callers skip a shared parent checkout). */
+  /**
+   * Whether a task's init may run repo-controlled code (.xum/init, git hooks). A task forked from
+   * an SSH+None parent shares the parent's host directory, which project trust alone does not
+   * cover, so this is project trust AND that directory's trust (isWorkspaceDirTrusted). For every
+   * other parent runtime the directory check is true.
+   */
+  private taskInitTrusted(plan: {
+    readonly configProjectPath: string;
+    readonly parentRuntimeConfig: RuntimeConfig;
+  }): boolean {
+    const projects = this.config.loadConfigOrDefault().projects;
+    return (
+      (projects.get(plan.configProjectPath)?.trusted ?? false) &&
+      isWorkspaceDirTrusted(projects, plan.configProjectPath, plan.parentRuntimeConfig)
+    );
+  }
+
   private registerTaskBackgroundInit(
     plan: TaskLaunchSource,
     checkout: Omit<TaskLaunchCheckout, "forkedRuntimeConfig">,
@@ -9886,9 +9923,7 @@ export class TaskService implements AgentTaskIntegration {
           env,
           abortSignal: initAbortController.signal,
           skipInitHook: plan.skipInitHook,
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
-            false,
+          trusted: this.taskInitTrusted(plan),
         },
         plan.taskId,
         workspaceUseLeasesFor(this.config)
@@ -10823,6 +10858,7 @@ export class TaskService implements AgentTaskIntegration {
         isWorkspaceProjectTrustedIn(cfg.projects, {
           kind: workspace.kind,
           projectPath: entry.projectPath,
+          runtimeConfig: workspace.runtimeConfig,
         })
       );
     } catch (error) {
@@ -18769,6 +18805,7 @@ export class TaskService implements AgentTaskIntegration {
           projectPluginsTrusted: isWorkspaceProjectTrustedIn(context.config.projects, {
             kind: parentEntry.workspace.kind,
             projectPath: parentEntry.projectPath,
+            runtimeConfig: context.parentRuntimeConfig,
           }),
           runtimeFactory: nodeRuntimeFactory,
         }
@@ -24345,10 +24382,14 @@ export class TaskService implements AgentTaskIntegration {
 
 /**
  * Removal deletes no checkout for isolation "none" children (they share the parent's) or for
- * project-dir local runtimes (deleteWorkspace is a no-op there), so it cannot lose their files.
+ * project-dir runtimes, local or SSH+None (deleteWorkspace is a no-op there), so it cannot lose
+ * their files.
  */
 function subagentRemovalPreservesCheckout(ws: WorkspaceConfigEntry): boolean {
+  const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
   return (
-    ws.taskIsolation === "none" || isLocalProjectRuntime(ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG)
+    ws.taskIsolation === "none" ||
+    isLocalProjectRuntime(runtimeConfig) ||
+    isSshSharedProjectDirRuntime(runtimeConfig)
   );
 }

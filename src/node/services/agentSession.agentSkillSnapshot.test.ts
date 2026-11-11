@@ -11,6 +11,7 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { AIService } from "@/node/services/aiService";
 
+import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import * as agentSkillsService from "@/node/services/agentSkills/agentSkillsService";
 import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
@@ -141,6 +142,52 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(userMessage.role).toBe("user");
     const userText = userMessage.parts.find((p) => p.type === "text")?.text;
     expect(userText).toBe("do X");
+  });
+
+  it("refuses a project skill whose SKILL.md links to a file the agent sandbox hides", async () => {
+    const workspacePath = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-hidden-"))
+    );
+    const token = path.join(workspacePath, "hf-token");
+    await fs.writeFile(token, "---\nname: leak\ndescription: Leak\n---\n\nhf_secret\n");
+    await fs.mkdir(path.join(workspacePath, ".mux", "skills", "leak"), { recursive: true });
+    await fs.symlink(token, path.join(workspacePath, ".mux", "skills", "leak", "SKILL.md"));
+    const policy = spyOn(LocalBaseRuntime.prototype, "agentSandboxPolicy").mockImplementation(
+      (input) => ({
+        writeRoots: [workspacePath],
+        gitCommonDirs: [],
+        denyWrite: [],
+        denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+        allowRead: [workspacePath],
+        network: "allowlist",
+        allowedHosts: [],
+        allowLocalBinding: true,
+      })
+    );
+    try {
+      const { session, messages } = await createSessionHarness({
+        workspacePath,
+        aiServiceOverrides: {
+          getWorkspaceSandboxEnv: mock(() => Promise.resolve({ HF_TOKEN_PATH: token })),
+        },
+      });
+
+      const result = await session.sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/leak",
+          skillName: "leak",
+          scope: "project",
+        },
+      });
+
+      expect(result.success).toBe(false);
+      expect(JSON.stringify(messages)).not.toContain("hf_secret");
+    } finally {
+      policy.mockRestore();
+    }
   });
 
   it("honors disableWorkspaceAgents when resolving skill snapshots", async () => {

@@ -772,6 +772,15 @@ function validatePatchRuntimePathComponent(value: string, label: string): string
   return `${label} must be a safe path component.`;
 }
 
+/**
+ * ExecOptions.sandboxRoots for a command that reads or writes `runtimeTempPath`: the patch file
+ * and the dry-run worktree live in runtimeTempDir (~/.xum-tmp), outside the agent sandbox policy.
+ * These git commands stay sandboxed, as `git am` and `git worktree add` can run the repo's hooks.
+ */
+function runtimeTempSandboxRoots(runtimeTempPath: string): string[] {
+  return [path.posix.dirname(runtimeTempPath)];
+}
+
 function buildRuntimeTempPath(params: {
   runtimeTempDir: string;
   filename: string;
@@ -1147,6 +1156,7 @@ async function checkDirtyPatchPathOverlap(params: {
     {
       cwd: params.cwd,
       timeout: 30,
+      sandboxRoots: runtimeTempSandboxRoots(params.remotePatchPath),
     }
   );
   const numstatPaths = parseGitApplyNumstatZ(numstatResult.stdout);
@@ -1159,6 +1169,7 @@ async function checkDirtyPatchPathOverlap(params: {
     {
       cwd: params.cwd,
       timeout: 30,
+      sandboxRoots: runtimeTempSandboxRoots(params.remotePatchPath),
     }
   );
 
@@ -1179,6 +1190,7 @@ async function checkDirtyPatchPathOverlap(params: {
     {
       cwd: params.cwd,
       timeout: 30,
+      sandboxRoots: runtimeTempSandboxRoots(params.remotePatchPath),
     }
   );
   const metadataPaths = parsePatchMetadataPaths(metadataResult.stdout);
@@ -1397,7 +1409,11 @@ async function applyProjectPatch(params: {
       const addResult = await execBuffered(
         params.runtime,
         `${gitPrefix}git worktree add --detach ${shellQuote(dryRunWorktreePath)} HEAD`,
-        { cwd: params.repoCwd, timeout: 60 }
+        {
+          cwd: params.repoCwd,
+          timeout: 60,
+          sandboxRoots: runtimeTempSandboxRoots(dryRunWorktreePath),
+        }
       );
       if (addResult.exitCode !== 0) {
         return {
@@ -1422,6 +1438,7 @@ async function applyProjectPatch(params: {
         const amResult = await execBuffered(params.runtime, amCmd, {
           cwd: dryRunWorktreePath,
           timeout: 300,
+          sandboxRoots: runtimeTempSandboxRoots(remotePatchPath),
         });
 
         if (amResult.exitCode !== 0) {
@@ -1505,11 +1522,17 @@ async function applyProjectPatch(params: {
           });
         }
 
+        // `git worktree remove` and `prune` run no hooks. Once the dry-run worktree exists, the
+        // sandbox keeps its metadata in the main .git read-only, so a sandboxed cleanup failed and
+        // left the worktree behind after every dry run (Codex review); like `git worktree add` for
+        // a workspace, Xum's own cleanup runs outside the sandbox. It needs nothing from the
+        // user's PATH, where a sandboxed command can plant a git (an activated .venv/bin), so it
+        // takes git from the system folders.
         try {
           const removeResult = await execBuffered(
             params.runtime,
             `${gitPrefix}git worktree remove --force ${shellQuote(dryRunWorktreePath)}`,
-            { cwd: params.repoCwd, timeout: 60 }
+            { cwd: params.repoCwd, timeout: 60, sandbox: "internal" }
           );
           if (removeResult.exitCode !== 0) {
             log.debug("task_apply_git_patch: dry-run git worktree remove failed", {
@@ -1536,6 +1559,7 @@ async function applyProjectPatch(params: {
           const pruneResult = await execBuffered(params.runtime, `${gitPrefix}git worktree prune`, {
             cwd: params.repoCwd,
             timeout: 60,
+            sandbox: "internal",
           });
           if (pruneResult.exitCode !== 0) {
             log.debug("task_apply_git_patch: dry-run git worktree prune failed", {
@@ -1614,6 +1638,7 @@ async function applyProjectPatch(params: {
     const amResult = await execBuffered(params.runtime, amCmd, {
       cwd: params.repoCwd,
       timeout: 300,
+      sandboxRoots: runtimeTempSandboxRoots(remotePatchPath),
     });
 
     if (amResult.exitCode !== 0) {
@@ -1717,6 +1742,7 @@ async function cleanupRuntimePatchFile(params: {
       {
         cwd: params.repoCwd,
         timeout: 30,
+        sandboxRoots: runtimeTempSandboxRoots(params.remotePatchPath),
       }
     );
     if (result.exitCode !== 0) {

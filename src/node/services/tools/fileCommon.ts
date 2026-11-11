@@ -1,6 +1,10 @@
 import { createPatch } from "diff";
 import type { FileStat, Runtime } from "@/node/runtime/Runtime";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import {
+  assertFileToolSandboxAllows,
+  type FileToolSandboxContext,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 
 /**
  * Maximum file size for file operations (1MB)
@@ -154,14 +158,10 @@ export function validateNoRedundantPrefix(
 }
 
 /**
- * Resolve a file-tool path after applying redundant-prefix auto-correction.
- *
- * Despite the historical name, this helper no longer enforces a cwd boundary.
- * Bash already exposes unrestricted filesystem access, so file tools should resolve
- * the exact path the user asked us to touch instead of imposing a stricter
- * workspace-only rule.
+ * Resolve a file-tool path after applying redundant-prefix auto-correction, without any access
+ * check: for callers that only need the path a file tool touched.
  */
-export function resolvePathWithinCwd(
+export function resolveFileToolPath(
   filePath: string,
   cwd: string,
   runtime: Runtime
@@ -173,4 +173,23 @@ export function resolvePathWithinCwd(
     resolvedPath: runtime.normalizePath(correctedPath, cwd),
     warning: redundantPrefixResult?.warning,
   };
+}
+
+/**
+ * resolveFileToolPath() for a file tool about to read or write the path.
+ *
+ * Despite the historical name, this helper does not enforce a cwd boundary: bash reaches the
+ * same files, so file tools resolve the exact path asked for. When the macOS agent sandbox
+ * applies, it throws AgentSandboxPathError for a path the sandbox closes to bash for `access`.
+ */
+export async function resolvePathWithinCwd(
+  filePath: string,
+  cwd: string,
+  runtime: Runtime,
+  access: "read" | "write",
+  sandbox?: FileToolSandboxContext
+): Promise<{ correctedPath: string; resolvedPath: string; warning?: string }> {
+  const resolved = resolveFileToolPath(filePath, cwd, runtime);
+  await assertFileToolSandboxAllows(runtime, cwd, resolved.resolvedPath, access, sandbox);
+  return resolved;
 }

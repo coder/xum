@@ -6,6 +6,12 @@ export const RuntimeModeSchema = z.enum(["local", "worktree", "ssh", "docker", "
 export { RuntimeEnablementIdSchema } from "@/common/schemas/ids";
 
 /**
+ * The workspace isolations an SSH host can run today. Widen this (and the matrix in
+ * src/common/types/isolation.ts) when a container backend learns to run over SSH.
+ */
+export const SshWorkspaceIsolationSchema = z.enum(["worktree", "none"]);
+
+/**
  * Runtime configuration union type.
  *
  * COMPATIBILITY NOTE:
@@ -94,6 +100,18 @@ export const RuntimeConfigSchema = z.union([
     port: z.number().optional().meta({ description: "SSH port (default: 22)" }),
     coder: CoderWorkspaceConfigSchema.optional().meta({
       description: "Coder workspace configuration (when using Coder as SSH backend)",
+    }),
+    // Workspace isolation on the SSH host (see src/common/types/isolation.ts). Absent means
+    // "worktree" so configs written before the split keep their meaning. A build that predates
+    // this field strips it and looks for a worktree that does not exist: tightly scoped breakage
+    // for SSH+None workspaces only, accepted instead of a migration.
+    workspaceIsolation: SshWorkspaceIsolationSchema.optional().meta({
+      description:
+        "How workspaces are isolated on the host: per-workspace git worktree (default) or none",
+    }),
+    projectDir: z.string().optional().meta({
+      description:
+        "Existing project directory on the host; workspaces run in it directly when workspaceIsolation is none",
     }),
   }),
   // Docker runtime - each workspace runs in its own container

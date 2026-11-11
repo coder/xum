@@ -358,6 +358,38 @@ Use clear examples.
     }
   });
 
+  test("claims a git clone for SSH worktrees but not for SSH without isolation", async () => {
+    const environmentFor = async (runtimeConfig: WorkspaceMetadata["runtimeConfig"]) =>
+      extractTagContent(
+        await buildSystemMessage(
+          {
+            id: "test-workspace",
+            name: "test-workspace",
+            projectName: "test-project",
+            projectPath: projectDir,
+            runtimeConfig,
+          },
+          runtime,
+          workspaceDir
+        ),
+        "environment"
+      ) ?? "";
+    const ssh = { type: "ssh", host: "example.test", srcBaseDir: "/srv/src" } as const;
+
+    const worktree = await environmentFor(ssh);
+    const shared = await environmentFor({
+      ...ssh,
+      workspaceIsolation: "none",
+      projectDir: "/srv/app",
+    });
+    // The shared directory may not be git and is not isolated from other workspaces.
+    expect(worktree).toContain("This IS a git repository");
+    expect(shared).not.toContain("This IS a git repository");
+    expect(shared).not.toContain("isolated from the user and other agents");
+    // It is still remote: $XUM_PROJECT_PATH is the user's local path, not this one.
+    expect(shared).toContain("$XUM_PROJECT_PATH refers to the user's local machine");
+  });
+
   test("describes the agent interface status page only while that view is active", async () => {
     const metadata: WorkspaceMetadata = {
       id: "test-workspace",
@@ -711,6 +743,41 @@ Include the secondary project context too.
     const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
     expect(customInstructions).toContain("Use the primary project context.");
     expect(customInstructions).toContain("Include the secondary project context too.");
+  });
+
+  // In a Local project the container links to the project folder itself, so the fallback read of
+  // the project folder must follow the agent sandbox too.
+  test("withholds a multi-project instruction file that links to a file the sandbox hides", async () => {
+    const { metadata, primaryWorkspaceRepoDir } = await createMultiProjectFixture();
+    const real = await fs.realpath(tempDir);
+    await fs.mkdir(path.join(tempDir, "secret"));
+    await fs.writeFile(path.join(tempDir, "secret", "id_rsa"), "PRIVATE KEY");
+    await fs.symlink(
+      path.join(tempDir, "secret", "id_rsa"),
+      path.join(primaryWorkspaceRepoDir, "AGENTS.md")
+    );
+    const localMetadata: WorkspaceMetadata = {
+      ...metadata,
+      projectPath: primaryWorkspaceRepoDir,
+      projects: [
+        { projectName: "primary", projectPath: primaryWorkspaceRepoDir },
+        ...(metadata.projects ?? []).slice(1),
+      ],
+    };
+    runtime.agentSandboxPolicy = () => ({
+      writeRoots: [real],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: [path.join(real, "secret")],
+      allowRead: [],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+
+    const systemMessage = await buildSystemMessage(localMetadata, runtime, workspaceDir);
+
+    expect(systemMessage).not.toContain("PRIVATE KEY");
   });
 
   describe("project customInstructions from config", () => {
@@ -1331,6 +1398,48 @@ OpenAI-only instructions.
 
         scenario.assert(systemMessage);
       });
+    }
+  });
+});
+
+// Bash adds the project's secrets to its environment, where one can move a credential file.
+describe("loadWorkspaceInstructionSources under the agent sandbox", () => {
+  test("withholds an instruction file that links to a file the project's secrets name", async () => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "instr-env-")));
+    try {
+      const token = path.join(root, "hf-token");
+      await fs.writeFile(token, "hf_secret");
+      await fs.symlink(token, path.join(root, "AGENTS.md"));
+      const runtime = new LocalRuntime(root);
+      runtime.agentSandboxPolicy = (input) => ({
+        writeRoots: [root],
+        gitCommonDirs: [],
+        denyWrite: [],
+        denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+        allowRead: [root],
+        network: "allowlist",
+        allowedHosts: [],
+        allowLocalBinding: true,
+      });
+
+      const sources = await loadWorkspaceInstructionSources(
+        {
+          id: "ws",
+          name: "ws",
+          projectName: "p",
+          projectPath: root,
+          runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        },
+        runtime,
+        root,
+        undefined,
+        false,
+        { files: createMemoryHost().files, sandboxEnv: { HF_TOKEN_PATH: token } }
+      );
+
+      expect(sources.context.map((set) => set.combinedContent).join("")).not.toContain("hf_secret");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 });

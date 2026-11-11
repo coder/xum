@@ -10,16 +10,21 @@ import {
   MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES,
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_DREAM_MAX_STEPS,
+  MEMORY_CONSOLIDATION_NOTE_MAX_CHARS,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
   MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+  MEMORY_STR_REPLACE_ERROR_MAX_LINES,
 } from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { Config } from "@/node/config";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
+  organizerEditBudget,
   runMemoryConsolidation,
   type MemoryConsolidationOp,
 } from "./memoryConsolidation";
@@ -637,6 +642,221 @@ describe("consolidation memory tool rails", () => {
       expect(fixture.getMutationCount()).toBe(0);
     });
 
+    // A failed str_replace's error cannot reach the note cap any more: it names at most
+    // MEMORY_STR_REPLACE_ERROR_MAX_LINES lines and quotes one path of at most
+    // MEMORY_CONSOLIDATION_PATH_MAX_CHARS characters, so it stays under 800 characters. The tests
+    // below that guard the note cut therefore make the long error up, as the redaction test does.
+    const madeUpError = (length: number) =>
+      "0123456789".repeat(Math.ceil(length / 10)).slice(0, length);
+    const NOTE_CUT_MARKER = " [note cut]";
+    const cutNote = (error: string) =>
+      `${error.slice(0, MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - NOTE_CUT_MARKER.length)}${NOTE_CUT_MARKER}`;
+
+    it("bounds every row a run of failed edits journals, and returns each error whole", async () => {
+      // The unlimited budget: each failed str_replace spends an edit and journals a row.
+      using fixture = await createFixture({ guard: { budget: organizerEditBudget(null).budget } });
+      const error = madeUpError(4 * MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      const strReplace = spyOn(fixture.memoryService, "strReplace").mockResolvedValue({
+        success: false,
+        error,
+      });
+
+      const failures = 10;
+      try {
+        for (let index = 0; index < failures; index++) {
+          const result = await execute(fixture.tool, {
+            command: "str_replace",
+            path: "/memories/global/big.md",
+            old_str: "x",
+            new_str: "y",
+          });
+          expect(result.success).toBe(false);
+          if (result.success) continue;
+          // The model still gets the whole error.
+          expect(result.error).toBe(error);
+          const row = fixture.journal.at(-1);
+          expect(row?.applied).toBe(false);
+          expect(row?.note).toBe(cutNote(error));
+        }
+      } finally {
+        strReplace.mockRestore();
+      }
+
+      expect(fixture.journal).toHaveLength(failures);
+      // Every row stays within what the caps allow (path, newPath and note, plus its JSON keys),
+      // so the journal's size is bounded by its row count.
+      const maxRowChars =
+        2 * MEMORY_CONSOLIDATION_PATH_MAX_CHARS + MEMORY_CONSOLIDATION_NOTE_MAX_CHARS + 100;
+      for (const row of fixture.journal) {
+        expect(JSON.stringify(row).length).toBeLessThanOrEqual(maxRowChars);
+      }
+    });
+
+    it("journals a failed edit's error whole when it is exactly the note cap long, and cuts it one character over", async () => {
+      using fixture = await createFixture();
+      const exact = madeUpError(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      const over = madeUpError(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS + 1);
+      const strReplace = spyOn(fixture.memoryService, "strReplace")
+        .mockResolvedValueOnce({ success: false, error: exact })
+        .mockResolvedValueOnce({ success: false, error: over });
+      try {
+        for (const error of [exact, over]) {
+          const result = await execute(fixture.tool, {
+            command: "str_replace",
+            path: "/memories/global/a.md",
+            old_str: "x",
+            new_str: "y",
+          });
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toBe(error);
+        }
+      } finally {
+        strReplace.mockRestore();
+      }
+
+      expect(fixture.journal.map((row) => row.note)).toEqual([exact, cutNote(over)]);
+    });
+
+    it("journals a dry run's long validation error cut to the note cap", async () => {
+      using fixture = await createFixture({ dryRun: true });
+      const error = madeUpError(4 * MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      const validate = spyOn(fixture.memoryService, "validateMutation").mockResolvedValue({
+        ok: false,
+        error,
+      });
+      try {
+        const result = await execute(fixture.tool, {
+          command: "str_replace",
+          path: "/memories/global/a.md",
+          old_str: "x",
+          new_str: "y",
+        });
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toBe(error);
+      } finally {
+        validate.mockRestore();
+      }
+
+      expect(fixture.journal.at(-1)?.note).toBe(cutNote(error));
+    });
+
+    // The real chain: a str_replace that matches every line of a near-full file fails with a short
+    // error that names the first lines and counts the rest, so the journal keeps it whole.
+    it.each([
+      ["a live run", false],
+      ["a dry run", true],
+    ])(
+      "journals the capped line list of an ambiguous str_replace whole in %s",
+      async (_label, dryRun) => {
+        using fixture = await createFixture({ dryRun });
+        const line = `x${"-".repeat(126)}\n`;
+        const lines = MEMORY_MAX_FILE_BYTES / line.length - 1;
+        await fsPromises.writeFile(
+          path.join(fixture.globalMemoryDir, "big.md"),
+          line.repeat(lines)
+        );
+
+        const result = await execute(fixture.tool, {
+          command: "str_replace",
+          path: "/memories/global/big.md",
+          old_str: "x",
+          new_str: "y",
+        });
+
+        expect(result.success).toBe(false);
+        if (result.success) return;
+        expect(result.error).toContain(`matches ${lines} locations`);
+        expect(result.error).toContain(`, and ${lines - MEMORY_STR_REPLACE_ERROR_MAX_LINES} more)`);
+        expect(result.error.length).toBeLessThan(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+        expect(fixture.journal.at(-1)?.note).toBe(result.error);
+      }
+    );
+
+    it("redacts a guarded run's error before it cuts the note, so no credential fragment is kept", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      // A made-up key that starts 13 characters before the cut: cut first, the kept fragment is too
+      // short for the redaction pattern to match, so it would stay in the journal.
+      const fakeKey = "sk-fakeFAKEfakeFAKE0123456789";
+      const keepsBeforeMarker = MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - " [note cut]".length;
+      const error = `${"x".repeat(keepsBeforeMarker - 14)} ${fakeKey} ${"z".repeat(200)}`;
+      const strReplace = spyOn(fixture.memoryService, "strReplace").mockResolvedValue({
+        success: false,
+        error,
+      });
+      try {
+        const result = await execute(fixture.tool, {
+          command: "str_replace",
+          path: "/memories/global/a.md",
+          old_str: "x",
+          new_str: "y",
+        });
+        expect(result.success).toBe(false);
+      } finally {
+        strReplace.mockRestore();
+      }
+
+      const note = fixture.journal.at(-1)?.note ?? "";
+      expect(note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      expect(note).not.toContain("sk-fake");
+    });
+
+    describe("a refusal note that redaction lengthens", () => {
+      // A path under the length cap whose `token=a` segments a guarded run redacts one by one: the
+      // scope refusal quotes it, and the redacted note grows past the note cap.
+      const prefix = "/memories/session/";
+      const segments = Math.floor((MEMORY_CONSOLIDATION_PATH_MAX_CHARS - prefix.length - 4) / 8);
+      const expanding = `${prefix}${"token=a&".repeat(segments)}x.md`;
+      const guard = { rejectSecretLike: true, budget: organizerEditBudget(null).budget };
+
+      it("is cut to the note cap", async () => {
+        using fixture = await createFixture({ guard });
+
+        const result = await execute(fixture.tool, {
+          command: "create",
+          path: expanding,
+          file_text: "x\n",
+        });
+
+        expect(expanding.length).toBeLessThanOrEqual(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+        expect(result.success).toBe(false);
+        expect(fixture.journal).toHaveLength(1);
+        expect(fixture.journal[0]?.note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      });
+
+      it("keeps the full note whole inside the cap when it takes the last slot", async () => {
+        using fixture = await createFixture({ guard });
+        for (let index = 0; index < MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1; index++) {
+          await execute(fixture.tool, {
+            command: "create",
+            path: `/memories/session/n${index}.md`,
+            file_text: "x\n",
+          });
+        }
+
+        await execute(fixture.tool, { command: "create", path: expanding, file_text: "x\n" });
+
+        expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES);
+        const note = fixture.journal.at(-1)?.note ?? "";
+        expect(note).toEndWith("later refusals of this run are not recorded.");
+        expect(note.length).toBeLessThanOrEqual(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      });
+    });
+
+    it("journals a failed edit's error whole when it fits the note cap", async () => {
+      using fixture = await createFixture();
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "small.md"), "x\nx\n");
+
+      const result = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/small.md",
+        old_str: "x",
+        new_str: "y",
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(fixture.journal[0]?.note).toBe(result.error);
+    });
+
     it("accepts a path of exactly the cap", async () => {
       using fixture = await createFixture();
       // Directories of 100 characters stay under the filesystem's name limit.
@@ -719,6 +939,30 @@ describe("consolidation memory tool rails", () => {
       expect(renamed.success).toBe(true);
       expect(deleted.success).toBe(true);
       expect(fixture.journal.map((op) => op.applied)).toEqual([true, true]);
+      expect(JSON.stringify(fixture.journal)).not.toContain(githubToken);
+    });
+
+    it("journals a dry run's rows of a credential-named file without the credential", async () => {
+      // A redacting dry run (the debug CLI's --dry-run) stages a delete of such a file, or refuses
+      // one whose file is missing with a note that quotes the path: both rows are persisted like
+      // a real run's, so they must not keep the name either.
+      using fixture = await createFixture({ dryRun: true, guard: { rejectSecretLike: true } });
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, `${githubToken}.md`), "a\n");
+
+      const staged = await execute(fixture.tool, {
+        command: "delete",
+        path: `/memories/global/${githubToken}.md`,
+      });
+      const missing = await execute(fixture.tool, {
+        command: "delete",
+        path: `/memories/global/gone-${githubToken}.md`,
+      });
+
+      expect(staged.success).toBe(true);
+      expect(missing.success).toBe(false);
+      expect(fixture.journal.map((op) => op.note === "dry-run")).toEqual([true, false]);
+      expect(fixture.journal[1]?.note).toBeDefined();
       expect(JSON.stringify(fixture.journal)).not.toContain(githubToken);
     });
 
@@ -1453,6 +1697,50 @@ describe("consolidation memory tool rails", () => {
   });
 });
 
+describe("organizerEditBudget", () => {
+  /** Whether the budget's step ceiling stops the run at exactly `steps` steps, not one earlier. */
+  async function stopsAt(editBudget: ReturnType<typeof organizerEditBudget>, steps: number) {
+    expect(editBudget.stepCeiling).toHaveLength(1);
+    const stopWhen = editBudget.stepCeiling[0];
+    const at = (count: number) => stopWhen({ steps: Array.from({ length: count }) });
+    return !(await at(steps - 1)) && (await at(steps));
+  }
+
+  it.each([
+    [undefined, MEMORY_CONSOLIDATION_OP_BUDGET, MEMORY_CONSOLIDATION_MAX_STEPS],
+    [24, 24, 96],
+    [1, 1, MEMORY_CONSOLIDATION_MAX_STEPS],
+    // 4 steps per edit would be 4000: the fixed step ceiling holds, which no setting raises.
+    [MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_MAX_STEPS],
+    // Only null is unlimited here: the service turns the user's 0 into null before the run.
+    [0, 0, MEMORY_CONSOLIDATION_MAX_STEPS],
+    // Unlimited, and any limit over the safety cap, runs at the cap.
+    [null, MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_MAX_STEPS],
+    [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_MAX_STEPS],
+    [1_000_000, MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_MAX_STEPS],
+    // NaN would make Math.min NaN, a budget that never refuses.
+    [Number.NaN, MEMORY_CONSOLIDATION_OP_BUDGET, MEMORY_CONSOLIDATION_MAX_STEPS],
+  ])(
+    "gives a limit of %p a budget of %p, a prompt line that says so, and %p steps",
+    async (editLimit, limit, steps) => {
+      const editBudget = organizerEditBudget(editLimit);
+
+      expect(editBudget.budget.limit).toBe(limit);
+      expect(editBudget.promptLine).toBe(`You have ${limit} mutating commands this run.`);
+      expect(await stopsAt(editBudget, steps)).toBe(true);
+    }
+  );
+
+  it("refuses the edit after the safety cap when unlimited", () => {
+    const editBudget = organizerEditBudget(null);
+
+    for (let i = 0; i < MEMORY_DREAM_EDIT_LIMIT_MAX; i++) {
+      expect(editBudget.budget.tryConsume()).toBe(true);
+    }
+    expect(editBudget.budget.tryConsume()).toBe(false);
+  });
+});
+
 describe("createMutationBudget", () => {
   // Bounded, so a budget that never refuses (NaN, -Infinity) fails the test instead of hanging it.
   function consumeAll(budget: ReturnType<typeof createMutationBudget>): number {
@@ -1881,6 +2169,168 @@ describe("runMemoryConsolidation", () => {
       expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
       expect(scripted.calls.every((cap) => cap === undefined)).toBe(true);
     });
+  });
+
+  describe("edit limit", () => {
+    async function run(
+      fixture: Fixture,
+      model: MockLanguageModelV3,
+      options: { editLimit?: number | null; ceilingUsd?: number; dryRun?: boolean } = {}
+    ) {
+      return runMemoryConsolidation({
+        model,
+        pricingModel: PRICED_MODEL,
+        agentBody: "Consolidate the memory directories.",
+        memoryService: fixture.memoryService,
+        metaService: fixture.metaService,
+        ctx: fixture.ctx,
+        dryRun: false,
+        ...options,
+      });
+    }
+
+    /** A model whose first step creates `count` workspace files at once and whose second ends. */
+    function creatingModel(count: number): { model: MockLanguageModelV3; prompts: string[] } {
+      const prompts: string[] = [];
+      let calls = 0;
+      const usage = {
+        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 0, text: 0, reasoning: 0 },
+      };
+      const model = new MockLanguageModelV3({
+        doStream: (options) => {
+          calls += 1;
+          prompts.push(JSON.stringify(options.prompt));
+          const creates: LanguageModelV3StreamPart[] = Array.from({ length: count }, (_, i) => ({
+            type: "tool-call",
+            toolCallId: `create-${i}`,
+            toolName: "memory",
+            input: JSON.stringify({
+              command: "create",
+              path: `/memories/workspace/f${i}.md`,
+              file_text: "fact\n",
+            }),
+          }));
+          const chunks: LanguageModelV3StreamPart[] =
+            calls === 1
+              ? [
+                  ...creates,
+                  {
+                    type: "finish",
+                    finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                    usage,
+                  },
+                ]
+              : [{ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage }];
+          return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+        },
+      });
+      return { model, prompts };
+    }
+
+    it("spends the configured limit and refuses the edit after it", async () => {
+      using fixture = await createFixture();
+      const scripted = creatingModel(5);
+
+      const result = await run(fixture, scripted.model, { editLimit: 3 });
+
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(3);
+      expect(result.budgetExhausted).toBe(true);
+      expect(scripted.prompts[0]).toContain("You have 3 mutating commands this run.");
+    });
+
+    // Memory contents are untrusted model input: unlimited runs at the safety cap, so one run's
+    // accepted writes, and its journal rows, stay bounded (organizerEditBudget's tests refuse the
+    // edit after the cap; a cap's worth of parallel creates here would only slow the suite down).
+    it("states the safety cap as the budget of an unlimited run", async () => {
+      using fixture = await createFixture();
+      const scripted = creatingModel(MEMORY_CONSOLIDATION_OP_BUDGET + 4);
+
+      const result = await run(fixture, scripted.model, { editLimit: null });
+
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(
+        MEMORY_CONSOLIDATION_OP_BUDGET + 4
+      );
+      expect(scripted.prompts[0]).toContain(
+        `You have ${MEMORY_DREAM_EDIT_LIMIT_MAX} mutating commands this run.`
+      );
+    });
+
+    // The journal saves every accepted command, so the cap is what keeps an unlimited run's journal
+    // bounded. Dry run: the commands are accepted and journaled like real ones without a cap's
+    // worth of file writes.
+    it("stops accepting edits at the safety cap when unlimited, so its journal stays bounded", async () => {
+      using fixture = await createFixture();
+      const scripted = creatingModel(MEMORY_DREAM_EDIT_LIMIT_MAX + 3);
+
+      const result = await run(fixture, scripted.model, { editLimit: null, dryRun: true });
+
+      const accepted = result.ops.filter((op) => op.note === "dry-run");
+      expect(accepted).toHaveLength(MEMORY_DREAM_EDIT_LIMIT_MAX);
+      expect(result.budgetExhausted).toBe(true);
+      expect(result.ops.length).toBeLessThanOrEqual(
+        MEMORY_DREAM_EDIT_LIMIT_MAX + MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES
+      );
+    }, 120_000);
+
+    it("keeps the default budget for a caller that passes no limit", async () => {
+      using fixture = await createFixture();
+      const scripted = creatingModel(MEMORY_CONSOLIDATION_OP_BUDGET + 1);
+
+      const result = await run(fixture, scripted.model);
+
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(MEMORY_CONSOLIDATION_OP_BUDGET);
+      expect(scripted.prompts[0]).toContain(
+        `You have ${MEMORY_CONSOLIDATION_OP_BUDGET} mutating commands this run.`
+      );
+    });
+
+    // Up to 96 model steps: slow on a loaded host, so a longer timeout than the default 5 s.
+    it("takes 4 steps for each edit of a raised limit", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted.model, { editLimit: 24 });
+
+      expect(scripted.calls).toHaveLength(96);
+    }, 30_000);
+
+    it.each([
+      ["a limit under the default", 2],
+      ["no limit passed (the default)", undefined],
+    ])("never takes fewer steps than the default limit allows: %s", async (_why, editLimit) => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted.model, { editLimit });
+
+      expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
+    });
+
+    // Read-only calls spend no edit, so only the fixed step ceiling stops a run that never edits:
+    // no setting raises it, and the cost ceiling is optional. A limit of 1000 is the same budget
+    // (organizerEditBudget's table). Hundreds of model steps: slow on a loaded host, so a long
+    // timeout.
+    it("stops an unlimited read-only run at the fixed step ceiling", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      const result = await run(fixture, scripted.model, { editLimit: null });
+
+      expect(scripted.calls).toHaveLength(MEMORY_DREAM_MAX_STEPS);
+      expect(result.ops).toEqual([]);
+    }, 120_000);
+
+    it("lets an unlimited run take more than the default 32 steps", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      // $0.50 a step: the 40th step reaches the $20 ceiling, past the default 32 steps.
+      const result = await run(fixture, scripted.model, { editLimit: null, ceilingUsd: 20 });
+
+      expect(scripted.calls).toHaveLength(40);
+      expect(result.note).toBe("stopped at the cost ceiling after $20.00");
+    }, 30_000);
   });
 
   it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {

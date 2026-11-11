@@ -365,7 +365,8 @@ function resolvedAgentResultFor(
       },
       agentDiscoveryRuntime: new LocalRuntime(metadata.projectPath),
       agentDiscoveryPath: metadata.projectPath,
-      isSubagentWorkspace: false,
+      // As resolveAgentForStream decides it.
+      isSubagentWorkspace: Boolean(metadata.parentWorkspaceId),
       agentInheritanceChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentAiSettingsChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentIsPlanLike: false,
@@ -2371,6 +2372,34 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     expect(goalIds).toEqual(["goal-dispatched", undefined]);
   });
+
+  // The sub-agent denial of ask_user_question lives in the agent policy, not the caller's.
+  it.each([
+    { kind: "root", parentWorkspaceId: undefined, expected: false },
+    { kind: "sub-agent", parentWorkspaceId: "parent-workspace", expected: true },
+  ])(
+    "refuses sandbox approval cards at once only in a sub-agent ($kind)",
+    async ({ kind, parentWorkspaceId, expected }) => {
+      using xumHome = new DisposableTempDir(`ai-service-no-interactive-user-${kind}`);
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = `workspace-no-interactive-user-${kind}`;
+      const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, {
+        ...(parentWorkspaceId != null ? { parentWorkspaceId } : {}),
+      });
+      const harness = createHarness(xumHome.path, metadata);
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+
+      expect(result.success).toBe(true);
+      expect(harness.getToolsForModelSpy.mock.calls.at(-1)?.[1]?.noInteractiveUser).toBe(expected);
+    }
+  );
 
   // Sub-agents own goals, but a turn TaskService drove (here: a recovery re-drive) carries its
   // provenance into the goal tool context and must not set one.

@@ -5,6 +5,10 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS, buildMemoryToolDescription } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  GLOBAL_WRITE_SANDBOX_ERROR,
+  agentSandboxCoversTools,
+} from "@/node/services/agentSandbox/fileToolSandbox";
+import {
   MEMORY_SCOPES,
   MEMORY_VIRTUAL_ROOT,
   SHARED_MEMORY_SCOPES,
@@ -134,6 +138,9 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
         success: false,
         error: `The ${scope} memory scope is read-only for this agent; only 'view' is allowed.`,
       };
+    }
+    if (scope === "global" && agentSandboxCoversTools(config)) {
+      return { success: false, error: GLOBAL_WRITE_SANDBOX_ERROR };
     }
     return null;
   }

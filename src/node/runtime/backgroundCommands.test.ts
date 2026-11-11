@@ -7,7 +7,8 @@ import {
   shellQuote,
   buildWrapperScript,
   buildSpawnCommand,
-  buildTerminateCommand,
+  buildKillGroupCommand,
+  buildPublishExitCodeCommand,
   parseExitCode,
   parsePid,
 } from "./backgroundCommands";
@@ -206,27 +207,29 @@ describe("backgroundCommands", () => {
     });
   });
 
-  describe("buildTerminateCommand", () => {
+  describe("buildKillGroupCommand", () => {
     it("sends SIGTERM then SIGKILL to process group using negative PID", () => {
-      const result = buildTerminateCommand(1234, "/tmp/exit_code");
+      const result = buildKillGroupCommand(1234);
 
       expect(result).toContain("kill -15 -1234 2>/dev/null || true");
       expect(result).toContain("sleep 2");
       expect(result).toContain("kill -0 -1234");
       expect(result).toContain("kill -9 -1234 2>/dev/null || true");
-      expect(result).toContain("echo 137 >"); // SIGKILL exit code
-      expect(result).toContain("echo 143 >"); // SIGTERM exit code (written after process exits)
+      expect(result).toContain("echo 137;"); // SIGKILL exit code
+      expect(result).toContain("echo 143;"); // SIGTERM exit code (printed after process exits)
     });
+  });
 
+  describe("buildPublishExitCodeCommand", () => {
     it("quotes exit code path with spaces", () => {
-      const result = buildTerminateCommand(1234, "/tmp/my dir/exit_code");
+      const result = buildPublishExitCodeCommand(143, "/tmp/my dir/exit_code");
 
-      expect(result).toContain("'/tmp/my dir/exit_code'");
+      expect(result).toContain("echo 143 > '/tmp/my dir/exit_code'");
     });
 
     it("uses custom quotePath function for SSH tilde expansion", () => {
       const expandTilde = (p: string) => (p.startsWith("~/") ? `"$HOME/${p.slice(2)}"` : `"${p}"`);
-      const result = buildTerminateCommand(1234, "~/mux/exit_code", expandTilde);
+      const result = buildPublishExitCodeCommand(143, "~/mux/exit_code", expandTilde);
 
       expect(result).toContain('"$HOME/mux/exit_code"');
     });
@@ -320,7 +323,9 @@ describe("backgroundCommands", () => {
     it("records 143 when terminated during an exec", async () => {
       const { pid, exitCodePath, outputPath } = spawnScript("echo started\nexec sleep 30");
       expect(await waitForFile(outputPath, "started")).not.toBeNull();
-      execFileSync("bash", ["-c", buildTerminateCommand(pid, exitCodePath)]);
+      const killed = execFileSync("bash", ["-c", buildKillGroupCommand(pid)], { encoding: "utf8" });
+      expect(killed.trim()).toBe("143");
+      execFileSync("bash", ["-c", buildPublishExitCodeCommand(143, exitCodePath)]);
       expect(await recordedExitCode(exitCodePath)).toBe(143);
     }, 10000);
   });

@@ -3,12 +3,15 @@
  *
  * Creates a client that matches the AppRouter interface with configurable mock data.
  */
+import { isolationFromRuntimeId, type IsolationChoice } from "@/common/types/isolation";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
+import { patchAgentSandbox, type AgentSandboxPatch } from "@/common/config/schemas/agentSandbox";
+import type { AgentSandboxState } from "@/common/orpc/schemas/agentSandbox";
 import type { ExperimentId } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -216,6 +219,7 @@ export interface MockORPCClientOptions {
   /** Initial runtime enablement for config.getConfig */
   runtimeEnablement?: Record<string, boolean>;
   /** Initial default runtime for config.getConfig (global) */
+  /** Legacy flat default runtime, converted to the served defaultIsolation (stories stay terse). */
   defaultRuntime?: RuntimeEnablementId | null;
   /** Initial global heartbeat default prompt for config.getConfig */
   heartbeatDefaultPrompt?: string;
@@ -225,6 +229,8 @@ export interface MockORPCClientOptions {
   goalDefaults?: GoalDefaults;
   /** Agent resource limits and their status (Settings → Agents); off when omitted. */
   agentResourceLimits?: AgentResourceLimitsState;
+  /** Agent sandbox setting and support (Settings → Agents); off and supported when omitted. */
+  agentSandbox?: AgentSandboxState;
   /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
   autoModelRouting?: AutoModelRoutingConfig;
   /**
@@ -567,6 +573,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
     agentResourceLimits: initialAgentResourceLimits,
+    agentSandbox: initialAgentSandbox,
     autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
     timelineEvents = [],
@@ -746,11 +753,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     devcontainer: true,
   };
 
-  let defaultRuntime: RuntimeEnablementId | null = initialDefaultRuntime ?? null;
+  let defaultIsolation: IsolationChoice | null =
+    initialDefaultRuntime != null ? isolationFromRuntimeId(initialDefaultRuntime) : null;
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let agentResourceLimitsState =
     initialAgentResourceLimits ?? mockAgentResourceLimitsState(false, {});
+  let agentSandboxState: AgentSandboxState = initialAgentSandbox ?? {
+    global: {},
+    projects: {},
+    support: { state: "supported" },
+  };
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
   let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
@@ -977,7 +990,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           coderWorkspaceArchiveBehavior,
           worktreeArchiveBehavior,
           runtimeEnablement,
-          defaultRuntime,
+          defaultIsolation,
           agentAiDefaults,
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
@@ -1133,11 +1146,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       updateRuntimeEnablement: (input: {
         projectPath?: string | null;
         runtimeEnablement?: Record<string, boolean> | null;
-        defaultRuntime?: RuntimeEnablementId | null;
+        defaultIsolation?: IsolationChoice | null;
         runtimeOverridesEnabled?: boolean | null;
       }) => {
         const shouldUpdateRuntimeEnablement = input.runtimeEnablement !== undefined;
-        const shouldUpdateDefaultRuntime = input.defaultRuntime !== undefined;
+        const shouldUpdateDefaultIsolation = input.defaultIsolation !== undefined;
         const shouldUpdateOverridesEnabled = input.runtimeOverridesEnabled !== undefined;
         const projectPath = input.projectPath?.trim();
 
@@ -1171,11 +1184,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               }
             }
 
-            if (shouldUpdateDefaultRuntime) {
-              if (input.defaultRuntime !== null && input.defaultRuntime !== undefined) {
-                nextProject.defaultRuntime = input.defaultRuntime;
+            if (shouldUpdateDefaultIsolation) {
+              if (input.defaultIsolation != null) {
+                nextProject.defaultIsolation = input.defaultIsolation;
               } else {
-                delete nextProject.defaultRuntime;
+                delete nextProject.defaultIsolation;
               }
             }
 
@@ -1201,8 +1214,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           }
         }
 
-        if (shouldUpdateDefaultRuntime) {
-          defaultRuntime = input.defaultRuntime ?? null;
+        if (shouldUpdateDefaultIsolation) {
+          defaultIsolation = input.defaultIsolation ?? null;
         }
 
         notifyConfigChanged();
@@ -2178,6 +2191,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({ success: true as const, data: undefined });
       },
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
+      answerSandboxApproval: () => Promise.resolve({ success: true, data: undefined }),
       setQueuedMessageDispatchMode: () => Promise.resolve({ success: true, data: true }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),
       truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
@@ -2742,6 +2756,26 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           projects
         );
         return Promise.resolve(agentResourceLimitsState);
+      },
+    },
+    // Saves are field patches (null removes a field), applied as the backend does.
+    agentSandbox: {
+      get: () => Promise.resolve(agentSandboxState),
+      set: (patch: AgentSandboxPatch) => {
+        const global = patchAgentSandbox(agentSandboxState.global, patch) ?? {};
+        agentSandboxState = { ...agentSandboxState, global };
+        return Promise.resolve(agentSandboxState);
+      },
+      setProject: (input: { projectPath: string; sandbox: AgentSandboxPatch }) => {
+        const projects = { ...agentSandboxState.projects };
+        const next = patchAgentSandbox(projects[input.projectPath], input.sandbox);
+        if (next === undefined) {
+          delete projects[input.projectPath];
+        } else {
+          projects[input.projectPath] = next;
+        }
+        agentSandboxState = { ...agentSandboxState, projects };
+        return Promise.resolve(agentSandboxState);
       },
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by

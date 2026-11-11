@@ -22,6 +22,10 @@ import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommo
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
 import { RuntimeError, isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
+import {
+  toolSandboxGate,
+  type FileToolSandboxGate,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 import { resolveContainedSkillFilePath } from "./skillFileUtils";
 import {
   resolveContainedSkillFilePathOnRuntime,
@@ -148,7 +152,8 @@ export async function resolveSkillFileTarget(
   resolvedSkill: ResolvedAgentSkill,
   skillRuntime: Runtime,
   containment: SkillStorageContext["containment"],
-  filePath: string
+  filePath: string,
+  sandboxGate?: FileToolSandboxGate
 ): Promise<string> {
   const shouldUseRuntimeContainment =
     isRemoteRuntime(skillRuntime) ||
@@ -156,6 +161,11 @@ export async function resolveSkillFileTarget(
   const { resolvedPath } = shouldUseRuntimeContainment
     ? await resolveContainedSkillFilePathOnRuntime(skillRuntime, resolvedSkill.skillDir, filePath)
     : await resolveContainedSkillFilePath(resolvedSkill.skillDir, filePath);
+  // A command can link a project skill folder at a file its sandbox hides, and the read returns
+  // it to the model (Codex review). Plugin folders are read-only to commands.
+  if (resolvedSkill.package.scope === "project" && resolvedSkill.pluginRoot == null) {
+    await sandboxGate?.(resolvedPath, "read");
+  }
   return resolvedPath;
 }
 
@@ -239,6 +249,7 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
         };
       }
 
+      const sandboxGate = toolSandboxGate(config);
       try {
         if (offset != null && offset < 1) {
           return {
@@ -252,6 +263,7 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           containment: skillCtx.containment,
           runtimeFactory: toolRuntimeFactory(config),
           includeClaudeSkills,
+          sandboxGate,
         });
 
         // Built-in skills are embedded in the app bundle (no filesystem access).
@@ -289,7 +301,8 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
             resolvedSkill,
             skillRuntime,
             skillCtx.containment,
-            filePath
+            filePath,
+            sandboxGate
           );
         } catch (error) {
           const message = getErrorMessage(error);

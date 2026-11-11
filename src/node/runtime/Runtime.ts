@@ -2,6 +2,10 @@ import type { RuntimeConfig, RuntimeMode } from "@/common/types/runtime";
 import type { RuntimeStatusEvent as StreamRuntimeStatusEvent } from "@/common/types/stream";
 import type { Result } from "@/common/types/result";
 import type { HolderEvidence } from "@/node/utils/concurrency/processLiveness";
+import type {
+  AgentSandboxPolicy,
+  AgentSandboxPolicyInput,
+} from "@/node/runtime/sandbox/agentSandboxTargets";
 
 /**
  * Runtime abstraction for executing tools in different environments.
@@ -78,6 +82,40 @@ export interface ExecOptions {
   abortSignal?: AbortSignal;
   /** Force PTY allocation (SSH only - adds -t flag) */
   forcePTY?: boolean;
+  /**
+   * Runs the command outside the macOS agent sandbox (local runtimes only). "off" is for MCP
+   * servers, which the user configured and which start outside the sandbox, a bash call the
+   * user approved to run outside it once, and Xum's own git that the sandbox would block: the
+   * submodule checkout when Xum creates a worktree, which needs the user's PATH (git-lfs).
+   * "internal" is for fixed Xum-internal scripts that never run agent or repo code (plan file
+   * moves, temp cleanup, skill path probes, the removal of a patch dry-run worktree): while the
+   * sandbox is on for any project they take bash and their tools from the system folders,
+   * because the inherited PATH can hold a folder that sandboxed commands write. Agent-reachable
+   * paths (bash, background bash, tool hooks, the init hook, web_fetch) never set it otherwise.
+   */
+  sandbox?: "off" | "internal";
+  /**
+   * Workspace folders the sandbox opens like cwd: the checkouts of a multi-project workspace, or
+   * the workspace of a background command that starts in /tmp and cd's into it.
+   */
+  sandboxRoots?: string[];
+  /**
+   * Files the sandbox also opens for reads, like extraReadPaths: the chat transcript that a Cursor
+   * hook gets in `transcript_path`, which is in Xum's home folder, and a tool hook's payload files.
+   */
+  sandboxReadPaths?: string[];
+  /**
+   * The projects of a multi-project workspace: a command there can change each checkout, so the
+   * sandbox applies the strictest of their settings.
+   */
+  sandboxProjectPaths?: string[];
+  /**
+   * Hands the end of the sandbox's network allow list to the caller (local runtimes, when the
+   * sandbox applies). Without it the list ends when the command's shell exits, so a command that
+   * leaves a process running after that (background bash) passes this and calls `release` once
+   * that process ends. `release` may run more than once.
+   */
+  keepSandboxNetwork?: (release: () => void) => void;
 }
 
 export type BackgroundMonitorProbeResult<T> =
@@ -180,6 +218,11 @@ export interface ExecStream {
   exitCode: Promise<number>;
   /** Promise that resolves with wall clock duration in milliseconds */
   duration: Promise<number>;
+  /**
+   * Set when the command runs in the macOS agent sandbox: what the sandbox blocked, read once the
+   * command exited. `failed` allows a short bounded wait for the system log.
+   */
+  sandboxDenials?: (failed: boolean) => Promise<string[]>;
 }
 
 /**
@@ -501,6 +544,13 @@ export interface Runtime {
    */
   readonly location?: RuntimeLocation;
   /**
+   * The macOS agent sandbox policy of a command of this runtime in `input.cwd`, or null when no
+   * sandbox applies (off, not macOS, or not a Local or Worktree runtime). File tools check paths
+   * against it, so they follow the same rules as the shell. Throws AgentSandboxStartError when
+   * the sandbox applies but no safe policy exists for `input.cwd`.
+   */
+  agentSandboxPolicy?(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null;
+  /**
    * The runtime type of a workspace config (`ssh`, `docker`, `devcontainer`), for text that names
    * the runtime to a user or a model. SSHRuntime (and CoderSSHRuntime), DockerRuntime and
    * DevcontainerRuntime give it as prototype getters, like `location`. Other runtimes and
@@ -510,7 +560,7 @@ export interface Runtime {
   /**
    * The runtimes this one delegates to (MultiProjectRuntime: one per project), for code that
    * must look through a wrapper without importing its class. Such a wrapper leaves `location`
-   * and `mode` absent: its answer is its projects' answers.
+   * and `mode` absent: its answer is its projects' answers. The first one runs its exec().
    */
   readonly wrappedRuntimes?: readonly Runtime[];
   /**

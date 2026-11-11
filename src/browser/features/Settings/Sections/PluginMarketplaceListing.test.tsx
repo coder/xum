@@ -151,3 +151,58 @@ test("a row whose only installable build is the Claude one is picked first", () 
   expect(radios.map((radio) => radio.checked)).toEqual([true, false]);
   expect(radios[0].disabled).toBe(false);
 });
+
+test("a name in all three marketplace files has an action per build; the Agent Plugins one selects its own file", () => {
+  const { view, previewed } = renderListing(
+    listingOf([{ name: "e2e", builds: [build("cursor"), build("claude"), build("agents")] }])
+  );
+
+  expect(view.queryByRole("button", { name: "Preview e2e" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Preview Agent Plugins build" }));
+  expect(previewed).toEqual([{ kind: "agents-marketplace", entry: "e2e" }]);
+});
+
+test("a refused Agent Plugins build is disabled with its reason while the other builds preview", () => {
+  const reason = "The marketplace marks this plugin policy.installation NOT_AVAILABLE.";
+  const { view, previewed } = renderListing(
+    listingOf([
+      {
+        name: "e2e",
+        builds: [build("cursor"), build("agents", { installable: false, reason })],
+      },
+    ])
+  );
+
+  view.getByText(reason);
+  const agents = view.getByRole("button", { name: "Preview Agent Plugins build" });
+  expect((agents as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(agents);
+  fireEvent.click(view.getByRole("button", { name: "Preview Cursor build" }));
+  expect(previewed).toEqual([{ kind: "cursor-marketplace", entry: "e2e" }]);
+});
+
+test("the header names every marketplace file the rows come from, in build order", () => {
+  const header = (entries: AgentPluginMarketplaceEntry[]) => {
+    const { view } = renderListing(listingOf(entries));
+    const text = view.getByText(/[Mm]arketplaces? ·/).textContent;
+    view.unmount();
+    return text;
+  };
+
+  expect(header([{ name: "a", builds: [build("agents")] }])).toBe(
+    "Agent Plugins marketplace · 1 plugin"
+  );
+  expect(header([{ name: "a", builds: [build("claude"), build("cursor")] }])).toBe(
+    "Cursor and Claude Code marketplaces · 1 plugin"
+  );
+  // The files come from all rows, not the first: a row of the last file alone does not hide Cursor.
+  expect(
+    header([
+      { name: "a", builds: [build("agents")] },
+      { name: "b", builds: [build("claude")] },
+      { name: "c", builds: [build("cursor")] },
+    ])
+  ).toBe("Cursor, Claude Code and Agent Plugins marketplaces · 3 plugins");
+  // A marketplace that lists nothing names no file.
+  expect(header([])).toBe("Marketplace · 0 plugins");
+});

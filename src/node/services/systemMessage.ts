@@ -4,7 +4,7 @@ import path from "node:path";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { MCPServerMap } from "@/common/types/mcp";
 import type { RuntimeMode } from "@/common/types/runtime";
-import { RUNTIME_MODE } from "@/common/types/runtime";
+import { RUNTIME_MODE, isSshSharedProjectDirRuntime } from "@/common/types/runtime";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import {
   INSTRUCTION_SCOPE,
@@ -113,7 +113,8 @@ function buildEnvironmentContext(
   workspacePath: string,
   runtimeType: RuntimeMode,
   bestOf: WorkspaceMetadata["bestOf"] | undefined,
-  scratchDirSet: boolean
+  scratchDirSet: boolean,
+  sshSharedProjectDir: boolean
 ): string {
   // Common lines shared across git-based runtimes
   const gitCommonLines = [
@@ -146,6 +147,16 @@ function buildEnvironmentContext(
       break;
 
     case RUNTIME_MODE.SSH:
+      if (sshSharedProjectDir) {
+        // SSH+None works directly in the user's existing directory on the host, like local
+        // project-dir: no per-workspace clone, and it may or may not be git.
+        description = `You are working directly in the shared project directory ${workspacePath} on a remote host (not an isolated clone)`;
+        lines = [
+          "- Tools run here automatically",
+          "- Other workspaces may use this same directory - do not discard changes you did not make",
+        ];
+        break;
+      }
       // SSH runtime clones the repository on a remote host
       description = `Your working directory is ${workspacePath} (a git repository clone)`;
       lines = gitCommonLines;
@@ -435,6 +446,11 @@ function subProjectAwareWorkspaceRoot(
 export interface InstructionHost {
   files?: HostFiles;
   paths?: HostPaths;
+  /**
+   * The project's secrets, which bash adds to its environment: the workspace reads follow the
+   * agent sandbox with them (AgentSandboxPolicyInput.env).
+   */
+  sandboxEnv?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -464,13 +480,15 @@ async function readMultiProjectContextInstructions(
   metadata: WorkspaceMetadata,
   runtime: Runtime,
   workspaceRootPath: string,
-  files: HostFiles | undefined
+  host: InstructionHost
 ): Promise<InstructionSet[]> {
   const sets: InstructionSet[] = [];
   const workspaceInstructions = await readInstructionSetFromRuntime(
     runtime,
     workspaceRootPath,
-    INSTRUCTION_SCOPE.WORKSPACE
+    INSTRUCTION_SCOPE.WORKSPACE,
+    undefined,
+    host.sandboxEnv
   );
   if (workspaceInstructions) {
     sets.push(workspaceInstructions);
@@ -489,18 +507,23 @@ async function readMultiProjectContextInstructions(
     seenProjectNames.add(project.projectName);
 
     const workspaceProjectPath = path.join(workspaceRootPath, project.projectName);
+    // A Local project's checkout is the project folder itself, which the agent can write, so the
+    // fallback read follows the agent sandbox as well.
     const projectInstructions =
       (await readInstructionSetFromRuntime(
         runtime,
         workspaceProjectPath,
         INSTRUCTION_SCOPE.PROJECT,
-        project.projectName
+        project.projectName,
+        host.sandboxEnv
       )) ??
       (await readInstructionSet(
         project.projectPath,
         INSTRUCTION_SCOPE.PROJECT,
         project.projectName,
-        files
+        host.files,
+        runtime,
+        host.sandboxEnv
       ));
     if (projectInstructions) {
       sets.push(projectInstructions);
@@ -513,7 +536,8 @@ async function readMultiProjectContextInstructions(
 async function readSingleProjectContextInstructions(
   metadata: WorkspaceMetadata,
   runtime: Runtime,
-  workspaceRootPath: string
+  workspaceRootPath: string,
+  sandboxEnv: NodeJS.ProcessEnv | undefined
 ): Promise<InstructionSet[]> {
   // Read parent + sub-project AGENTS.md from the workspace's *own* checkout
   // (via the runtime). For worktree/SSH/Docker flows the parent project's host
@@ -538,12 +562,20 @@ async function readSingleProjectContextInstructions(
     : null;
 
   const [parentInstructions, subProjectInstructions] = await Promise.all([
-    readInstructionSetFromRuntime(runtime, workspaceRootPath, INSTRUCTION_SCOPE.WORKSPACE),
+    readInstructionSetFromRuntime(
+      runtime,
+      workspaceRootPath,
+      INSTRUCTION_SCOPE.WORKSPACE,
+      undefined,
+      sandboxEnv
+    ),
     subProjectInstructionsDir
       ? readInstructionSetFromRuntime(
           runtime,
           subProjectInstructionsDir,
-          INSTRUCTION_SCOPE.SUBPROJECT
+          INSTRUCTION_SCOPE.SUBPROJECT,
+          undefined,
+          sandboxEnv
         )
       : Promise.resolve(null),
   ]);
@@ -612,8 +644,8 @@ export async function loadInstructionSources(
       : Promise.resolve(null),
     readInstructionSet(paths.xumHome(), INSTRUCTION_SCOPE.GLOBAL, undefined, host.files),
     isMultiProject(metadata)
-      ? readMultiProjectContextInstructions(metadata, runtime, workspaceRootPath, host.files)
-      : readSingleProjectContextInstructions(metadata, runtime, workspaceRootPath),
+      ? readMultiProjectContextInstructions(metadata, runtime, workspaceRootPath, host)
+      : readSingleProjectContextInstructions(metadata, runtime, workspaceRootPath, host.sandboxEnv),
   ]);
   const global = [claudeCompatGlobal, nativeGlobal].filter(
     (set): set is InstructionSet => set != null
@@ -781,7 +813,8 @@ export function buildSystemMessageFromSources(
     workspacePath,
     runtimeType,
     metadata.bestOf,
-    options?.scratchDirSet === true
+    options?.scratchDirSet === true,
+    isSshSharedProjectDirRuntime(metadata.runtimeConfig)
   )}`;
 
   if (metadata.kind === "scratch") {
