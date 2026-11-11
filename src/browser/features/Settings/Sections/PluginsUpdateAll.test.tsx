@@ -135,6 +135,8 @@ function updateAllDeps(config: {
   checks: AgentPluginUpdateCheck[];
   reviews?: AgentPluginUpdateReview[];
   failing?: string[];
+  /** Updates wait for this before they answer. */
+  holdUpdates?: Promise<void>;
   overrides?: Partial<UpdateAllDeps>;
 }) {
   const api = createMockORPCClient({});
@@ -145,13 +147,12 @@ function updateAllDeps(config: {
       data: found ?? { ...review(input.name), changes: [] },
     });
   });
-  const update = mock((input: { name: string }) =>
-    Promise.resolve(
-      config.failing?.includes(input.name)
-        ? { success: false, error: "swap failed" }
-        : { success: true }
-    )
-  );
+  const update = mock(async (input: { name: string }) => {
+    await config.holdUpdates;
+    return config.failing?.includes(input.name)
+      ? { success: false, error: "swap failed" }
+      : { success: true };
+  });
   api.agentPlugins.previewUpdate =
     previewUpdate as unknown as typeof api.agentPlugins.previewUpdate;
   api.agentPlugins.update = update as unknown as typeof api.agentPlugins.update;
@@ -198,6 +199,26 @@ test("a run tells the host it started before it updates anything", async () => {
 
   expect(deps.onStart).toHaveBeenCalledTimes(1);
   expect(update).toHaveBeenCalledTimes(1);
+});
+
+test("a run reports that it is running only while it is in flight", async () => {
+  const release = Promise.withResolvers<void>();
+  const { deps } = updateAllDeps({
+    checks: [check("alpha", "update-available")],
+    holdUpdates: release.promise,
+  });
+  const hook = renderHook(() => useUpdateAll(deps));
+  expect(hook.result.current.running).toBe(false);
+
+  let run: Promise<void> = Promise.resolve();
+  act(() => {
+    run = hook.result.current.run();
+  });
+  expect(hook.result.current.running).toBe(true);
+
+  release.resolve();
+  await act(() => run);
+  expect(hook.result.current.running).toBe(false);
 });
 
 test.each([

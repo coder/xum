@@ -21,6 +21,7 @@ type Reviews = readonly AgentPluginUpdateReview[];
 export function useUpdateReviewQueue(initial: Reviews) {
   const [reviews, setReviews] = useState(initial);
   return {
+    // mutation-equivalent: a review is an object, so ?? and || agree
     open: reviews[0] ?? null,
     waiting: reviews,
     show: (shown: Reviews) => setReviews(shown),
@@ -50,7 +51,9 @@ export function useUpdateAll(deps: UpdateAllDeps) {
   const [running, setRunning] = useState(false);
   // Managed rows only, like the per-card Update: an unmanaged plugin in another container can
   // share a managed plugin's name.
+  // mutation-equivalent: the items are an array or null, so ?? and || agree
   const checks = (deps.items ?? []).flatMap((item) =>
+    // mutation-equivalent: a check is an object or absent, so ?? and || agree
     item.managed ? (deps.updateChecks.get(item.name) ?? []) : []
   );
   const count = checks.filter((check) => check.status === "update-available").length;

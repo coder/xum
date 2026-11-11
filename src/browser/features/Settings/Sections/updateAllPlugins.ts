@@ -104,14 +104,19 @@ function summaryParts(result: UpdateAllResult, pointToSettings: boolean): string
 const isUnexpected = (result: UpdateAllResult): boolean =>
   result.failures.length > 0 || result.checkFailures.length > 0 || result.tagMoved.length > 0;
 
+function summarize(result: UpdateAllResult, pointToSettings: boolean): UpdateAllSummary | null {
+  const parts = summaryParts(result, pointToSettings);
+  if (parts.length === 0) return null;
+  return { tone: isUnexpected(result) ? "error" : "success", message: parts.join(". ") };
+}
+
 /** `pointToSettings`: the reader is outside Settings → Plugins (the palette toast). */
 export function summarizeUpdateAll(
   result: UpdateAllResult,
   pointToSettings = false
 ): UpdateAllSummary {
-  const parts = summaryParts(result, pointToSettings);
-  if (parts.length === 0) return { tone: "success", message: "All plugins are up to date." };
-  return { tone: isUnexpected(result) ? "error" : "success", message: parts.join(". ") };
+  const summary = summarize(result, pointToSettings);
+  return summary === null ? { tone: "success", message: "All plugins are up to date." } : summary;
 }
 
 /**
@@ -123,6 +128,6 @@ export function summarizeRemaining(
   result: UpdateAllResult,
   waiting: readonly AgentPluginUpdateReview[]
 ): UpdateAllSummary | null {
-  const remaining = { ...result, reviews: result.reviews.filter((r) => waiting.includes(r)) };
-  return summaryParts(remaining, false).length === 0 ? null : summarizeUpdateAll(remaining);
+  const reviews = result.reviews.filter((review) => waiting.includes(review));
+  return summarize({ ...result, reviews }, false);
 }

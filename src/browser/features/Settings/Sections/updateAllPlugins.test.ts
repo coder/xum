@@ -248,6 +248,7 @@ describe("summarizeRemaining", () => {
     for (const kept of ["alpha", "echo", "charlie", "clone failed", "moved", "offline"]) {
       expect(message).toContain(kept);
     }
+    expect(message).not.toContain("Settings");
   });
 
   test("keeps the tone that the failures give the run", () => {
