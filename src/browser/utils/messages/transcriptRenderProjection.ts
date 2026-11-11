@@ -257,6 +257,12 @@ function collectEditedFiles(editedFiles: Set<string>, message: WorkBundleRow): v
  * failed) has no reply: that narration announced work, it did not report on it. The work after
  * it gets a line of its own below it, so the narration does not read as the turn's answer.
  *
+ * A call that left a background process running folds like any other step, although the routine
+ * fold below keeps its row (see isRoutineToolCall). That is deliberate. The row cannot tell
+ * whether the process still runs, and showing every spawn through the fold would return the log
+ * this density removes. The composer's activity line (BackgroundProcessesBanner) lists the
+ * processes that are running, with their output and terminate controls, whatever is folded here.
+ *
  * A live stretch shows two more things through the fold so the user can see what the agent is
  * doing without the whole log: calls that are still running, and its latest step.
  */
