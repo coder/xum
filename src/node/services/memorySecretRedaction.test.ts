@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 
-import { addsSecretLike, containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
+import {
+  addsSecretLike,
+  containsSecretLike,
+  redactSecretLike,
+  redactWithinCap,
+} from "./memorySecretRedaction";
 
 describe("redactSecretLike", () => {
   const FAKE = {
@@ -1147,6 +1152,50 @@ describe("redactSecretLike", () => {
       scan(text);
       expect(performance.now() - started).toBeLessThan(100);
     }
+  });
+});
+
+describe("redactWithinCap", () => {
+  const CAP = 100;
+  const KEY = `ghp_${"a1B2".repeat(5)}`;
+
+  it("cuts text without a secret where redaction alone would, and reads the lookahead for none", () => {
+    const text = "lorem ".repeat(300);
+    expect(redactWithinCap(text, CAP)).toBe(text.slice(0, CAP));
+  });
+
+  it("returns the whole redaction of a text that fits under the cap", () => {
+    expect(redactWithinCap(`a ${KEY} b`, CAP)).toBe("a [redacted] b");
+  });
+
+  it("takes a secret that starts the text and crosses the cap whole", () => {
+    expect(redactWithinCap(`${KEY} tail`, 10)).toBe("[redacted]");
+  });
+
+  it("takes a secret that crosses the cap whole, and shows no part of it", () => {
+    const text = `${"x".repeat(CAP - 11)} ${KEY} tail`;
+    expect(redactWithinCap(text, CAP)).toBe(`${"x".repeat(CAP - 11)} [redacted]`);
+  });
+
+  // A value that redaction shortens must not let what lies past the cap into the output.
+  it("shows no text from past the cap when redaction shortens the text before it", () => {
+    expect(redactWithinCap(`password=${"z".repeat(300)} visible beyond the cap`, 50)).toBe(
+      "password=[redacted]"
+    );
+  });
+
+  // The window is the cap and its lookahead. Its end can cut a key: what is left is too short to
+  // match, so it shows as it is. Redaction shortens the window, so a cut of the output at the cap
+  // reached it.
+  it("shows nothing of the lookahead's end when redaction shortens the text by more than it", () => {
+    const window = `password=${"z".repeat(CAP + 512 - 21)} sk-QBNDZ8P3`;
+    expect(window).toHaveLength(CAP + 512);
+    expect(redactWithinCap(window, CAP)).toBe("password=[redacted]");
+  });
+
+  it("keeps a pair whose value goes past the cap redacted whole", () => {
+    const text = `password=${"z".repeat(600)}`;
+    expect(redactWithinCap(text, CAP)).toBe("password=[redacted]");
   });
 });
 
