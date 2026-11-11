@@ -688,6 +688,8 @@ export function redactWithinCap(text: string, cap: number): string {
   if (text.length <= cap) return whole;
   const head = redactSecretLike(text.slice(0, cap));
   let same = 0;
+  // mutation-equivalent: past the end of both texts `undefined === undefined` takes one more step,
+  // which returns the whole text, and then the whole text is the head
   while (same < head.length && head[same] === whole[same]) same++;
   if (same === head.length) return head;
   return whole.slice(0, whole.startsWith(REDACTED, same) ? same + REDACTED.length : same);
