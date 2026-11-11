@@ -35,14 +35,19 @@ console.log(JSON.stringify(calls.map(([name, ...args]) => guards[name](...args))
   return JSON.parse(child.stdout.toString());
 }
 
-// The timing rows in this file compare CPU time, not wall-clock time. Wall-clock time also counts the time other
-// processes keep the CPU from this one, so a loaded host, or a second test run on the same CPU,
-// stretched a 66 ms scan past its 100 ms budget, and the mutation gate dropped the whole file at
-// its baseline. CPU time is the process's own, and it stayed within 7% when two runs shared one
-// CPU. A budget alone is not enough: the slowest linear scan takes about 90 ms, so a budget low
-// enough to catch a regression on the faster ones would fail it. Each row therefore also runs its
-// text cut to a half, a quarter and an eighth, and checks how the cost per character grows from
-// each size to the next.
+// The timing rows in this file compare CPU time, not wall-clock time. Wall-clock time also counts
+// the time other processes keep the CPU from this one, so a loaded host, or a second test run on
+// the same CPU, stretched a 66 ms scan past its 100 ms budget, and the mutation gate dropped the
+// whole file at its baseline. CPU time is the process's own, and it stayed within 7% when two runs
+// shared one CPU. A budget alone is not enough: the slowest linear scan takes about 90 ms, so a
+// budget low enough to catch a regression on the faster ones would fail it. Each row therefore
+// also runs its text at a half, a quarter and an eighth of its size, and checks how the cost per
+// character grows from each size to the next.
+//
+// A smaller text must keep the shape of the row. A slice of the text drops what the row ends with
+// (a trailing space that ends a run before the window's end, a dot and the payload after it), so
+// the cost of a regression that needs that shape shows at one size only. A row with such a shape
+// builds its text at each size (`TextAt`, `repeated`), and the other rows are sliced.
 //
 // One ratio against the first eighth does not work. Bun 1.4 runs a regex about 70 times cheaper
 // per character on a text shorter than some length (near 65,000 characters for the cookie rows,
@@ -90,27 +95,43 @@ function bestCpuMilliseconds(run: () => void, runs: number): number {
   return best;
 }
 
+/** A row's text at a fraction of its full size (1 is the full text), in the row's own shape. */
+type TextAt = (fraction: number) => string;
+
+/** `count` repeats of `unit` and then `tail`, at a fraction of the repeats. */
+const repeated =
+  (unit: string, count: number, tail = ""): TextAt =>
+  (fraction) =>
+    `${unit.repeat(Math.round(count * fraction))}${tail}`;
+
 /** The CPU time of the whole text, and the median growth of the cost per character per doubling. */
 function measureScan(
   scan: (text: string) => unknown,
-  text: string
+  text: string | TextAt
 ): { fullMs: number; growth: number } {
-  const timesMs = SCAN_SIZE_DIVISORS.map((divisor) => {
-    const part = text.slice(0, Math.floor(text.length / divisor));
+  const textAt: TextAt =
+    typeof text === "string"
+      ? (fraction) => text.slice(0, Math.floor(text.length * fraction))
+      : text;
+  const parts = SCAN_SIZE_DIVISORS.map((divisor) => textAt(1 / divisor));
+  const timesMs = parts.map((part, i) => {
     scan(part);
-    return bestCpuMilliseconds(() => scan(part), divisor >= 4 ? 5 : 3);
+    return bestCpuMilliseconds(() => scan(part), SCAN_SIZE_DIVISORS[i] >= 4 ? 5 : 3);
   });
-  // Each size is twice the one before, so the cost per character grew by `next / (2 * previous)`.
+  // Each size is about twice the one before, and the cost per character grew by this much.
   const growths = timesMs
     .slice(1)
-    .map((next, i) => next / (2 * Math.max(timesMs[i], SCAN_CPU_FLOOR_MS)))
+    .map(
+      (next, i) =>
+        next / parts[i + 1].length / (Math.max(timesMs[i], SCAN_CPU_FLOOR_MS) / parts[i].length)
+    )
     .sort((a, b) => a - b);
   // Four sizes give three growths, so the middle one is the median.
   return { fullMs: timesMs[timesMs.length - 1], growth: growths[Math.floor(growths.length / 2)] };
 }
 
 /** Fails when `scan` costs 300 ms or more on `text`, or more than linear time as `text` grows. */
-function expectLinearScan(scan: (text: string) => unknown, text: string): void {
+function expectLinearScan(scan: (text: string) => unknown, text: string | TextAt): void {
   const { fullMs, growth } = measureScan(scan, text);
   expect(fullMs).toBeLessThan(SCAN_CPU_CEILING_MS);
   expect(growth).toBeLessThan(SCAN_GROWTH_PER_DOUBLING_LIMIT);
@@ -1878,17 +1899,22 @@ describe("redactSecretLike", () => {
       expect(addsSecretLike(nested, nested)).toBe(false);
     });
 
-    it("reads keys nested in one tail of 100 KiB in linear time", () => {
-      const text = `${"password=[redacted]".repeat(5_400)}x`;
-      expect(text.length).toBeGreaterThan(100_000);
-      containsSecretLike("warm up password=[redacted]x"); // keep a cold regex compile out of the timing
-      const started = performance.now();
-      const refused = containsSecretLike(text);
-      const added = addsSecretLike("", text);
-      // A rescan of the tail from each key takes seconds here. The budget is generous for a loaded host.
-      expect(performance.now() - started).toBeLessThan(1_000);
-      expect([refused, added]).toEqual([true, true]);
-    });
+    it(
+      "reads keys nested in one tail of 100 KiB in linear time",
+      () => {
+        const nested = repeated("password=[redacted]", 5_400, "x");
+        const text = nested(1);
+        expect(text.length).toBeGreaterThan(100_000);
+        expect([containsSecretLike(text), addsSecretLike("", text)]).toEqual([true, true]);
+        containsSecretLike("warm up password=[redacted]x"); // keep a cold regex compile out of the timing
+        // A rescan of the tail from each key takes seconds here.
+        expectLinearScan((window) => {
+          containsSecretLike(window);
+          addsSecretLike("", window);
+        }, nested);
+      },
+      SCAN_TEST_TIMEOUT_MS
+    );
   });
 
   it("keeps the userinfo's host readable", () => {
@@ -2176,15 +2202,15 @@ describe("redactWithinCap", () => {
   // against a few milliseconds. A row fails at 300 ms of CPU or when the cost per character grows
   // with the window (see `measureScan`), so a loaded test host does not fail it.
   it.each([
-    ["JWT starts", `${"eyJ".repeat(30_000)} `],
-    ["JWT starts with a dash after each", `${"eyJ-".repeat(32_000)} `],
-    ["JWT starts with an underscore after each", `${"eyJ_".repeat(32_000)} `],
+    ["JWT starts", repeated("eyJ", 30_000, " ")],
+    ["JWT starts with a dash after each", repeated("eyJ-", 32_000, " ")],
+    ["JWT starts with an underscore after each", repeated("eyJ_", 32_000, " ")],
   ])(
     "cuts a window of %s that miss its end in linear time",
-    (_label, text) => {
+    (_label, textAt) => {
       // Keep a cold regex compile out of the timing.
       redactWithinCap("warm up eyJabc.def", 10, { cut: true });
-      expectLinearScan(cutBefore(REDACTION_LOOKAHEAD_CHARS), text);
+      expectLinearScan(cutBefore(REDACTION_LOOKAHEAD_CHARS), textAt);
     },
     SCAN_TEST_TIMEOUT_MS
   );
@@ -2192,17 +2218,23 @@ describe("redactWithinCap", () => {
   // The cut reads the redacted window once more. Its cost must not grow faster than the window: a
   // quadratic scan of these shapes takes seconds at this size.
   it.each([
-    ["dots between JWT starts", "eyJ.".repeat(7_500)],
-    ["JWT starts with a dot after each", "eyJabc.".repeat(4_300)],
-    ["one long header and one long payload", `eyJ${"a".repeat(15_000)}.${"b".repeat(15_000)} x`],
-    ["many long parts", `eyJ${"a".repeat(1_000)}.`.repeat(30)],
+    ["dots between JWT starts", repeated("eyJ.", 7_500)],
+    ["JWT starts with a dot after each", repeated("eyJabc.", 4_300)],
+    [
+      "one long header and one long payload",
+      (fraction: number) => {
+        const part = Math.round(15_000 * fraction);
+        return `eyJ${"a".repeat(part)}.${"b".repeat(part)} x`;
+      },
+    ],
+    ["many long parts", repeated(`eyJ${"a".repeat(1_000)}.`, 30)],
   ])(
     "cuts the window of %s in linear time",
-    (_label, text) => {
+    (_label, textAt) => {
       redactWithinCap("warm up eyJabc.def", 10, { cut: true }); // keep a cold regex compile out of the timing
-      // The cap is 29,000 characters of a window of about 30,000: it stays that far from the end when
-      // the window is cut for the growth check.
-      expectLinearScan(cutBefore(text.length - 29_000), text);
+      // The cap is 29,000 characters of a window of about 30,000: it stays that far from the end at
+      // every size of the window.
+      expectLinearScan(cutBefore(textAt(1).length - 29_000), textAt);
     },
     SCAN_TEST_TIMEOUT_MS
   );
