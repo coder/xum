@@ -596,35 +596,15 @@ function redactCookieHeaders(
 type RemovalSource = "regex" | "reader";
 
 /**
- * The redaction passes, in order, each on the previous pass's output. `onRemoved` hears what each
- * replacement took out, so a caller can tell credentials apart instead of only counting them.
- *
- * The signed-URL pattern's value stops before `]`, so on a marker that is already in the text it
- * matches `[redacted` and writes `[redacted]` in front of the `]` that was there: `[redacted]]`, one
- * more `]` on every pass. The passes keep doing that, because the write guard compares what they take
- * out and the later passes read what they leave. `artifacts` lists where each `]` that such a match
- * added ended up in the returned text, so `redactSecretLike` can take it out and the `]` stops
- * growing. Each pass after the signed-URL pattern must report its edits to `followPositions`. Other
- * second-pass changes (a key next to a marker) stay as they are on main.
+ * The standalone patterns, in order, and where each `]` that the signed-URL pattern added ended up in
+ * the result. The edits of a pass are logged only once a `]` is tracked: a text without one costs
+ * what it cost before.
  */
-function runRedactionPasses(
+function redactStandalone(
   text: string,
-  onRemoved: (removed: string, source: RemovalSource) => void
+  fromRegex: (removed: string) => void
 ): { text: string; artifacts: number[] } {
-  const fromRegex = (removed: string): void => onRemoved(removed, "regex");
-  // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
-  // would end the value there and leave its tail readable.
-  let redacted = text.replace(
-    COOKIE_HEADER_PATTERN,
-    (match: string, prefix: string, opener: string | undefined) => {
-      // mutation-equivalent: `opener` is undefined or a string, and "" or undefined both add nothing
-      const kept = `${prefix}${opener ?? ""}`;
-      fromRegex(match.slice(kept.length));
-      return `${kept}${REDACTED}`;
-    }
-  );
-  // The edits of each pass are logged only once a `]` is tracked: a text without one costs what it
-  // cost before.
+  let redacted = text;
   let artifacts: number[] = [];
   let edits: Edit[] | null = null;
   let added: number[] | null = null;
@@ -649,6 +629,38 @@ function runRedactionPasses(
     // are never both in play and the result stays ascending. `removeAt` asserts it.
     if (added !== null) artifacts = [...artifacts, ...added];
   }
+  return { text: redacted, artifacts };
+}
+
+/**
+ * The redaction passes, in order, each on the previous pass's output. `onRemoved` hears what each
+ * replacement took out, so a caller can tell credentials apart instead of only counting them.
+ *
+ * The signed-URL pattern's value stops before `]`, so on a marker that is already in the text it
+ * matches `[redacted` and writes `[redacted]` in front of the `]` that was there: `[redacted]]`, one
+ * more `]` on every pass. The passes keep doing that, because the write guard compares what they take
+ * out and the later passes read what they leave. `artifacts` lists where each `]` that such a match
+ * added ended up in the returned text, so `redactSecretLike` can take it out and the `]` stops
+ * growing. Each pass after the signed-URL pattern must report its edits to `followPositions`. Other
+ * second-pass changes (a key next to a marker) stay as they are on main.
+ */
+function runRedactionPasses(
+  text: string,
+  onRemoved: (removed: string, source: RemovalSource) => void
+): { text: string; artifacts: number[] } {
+  const fromRegex = (removed: string): void => onRemoved(removed, "regex");
+  // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
+  // would end the value there and leave its tail readable.
+  const afterCookies = text.replace(
+    COOKIE_HEADER_PATTERN,
+    (match: string, prefix: string, opener: string | undefined) => {
+      // mutation-equivalent: `opener` is undefined or a string, and "" or undefined both add nothing
+      const kept = `${prefix}${opener ?? ""}`;
+      fromRegex(match.slice(kept.length));
+      return `${kept}${REDACTED}`;
+    }
+  );
+  let { text: redacted, artifacts } = redactStandalone(afterCookies, fromRegex);
   const replaceKeyValue = (match: string, prefix: string): string => {
     fromRegex(match.slice(prefix.length));
     return `${prefix}${REDACTED}`;
