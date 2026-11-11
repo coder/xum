@@ -1560,6 +1560,194 @@ describe("redactSecretLike", () => {
       expect(addsSecretLike("password=[redacted]SEKRIT", "Cookie: [redacted]SEKRIT")).toBe(true);
       expect(addsSecretLike("Cookie: [redacted]SEKRIT", "password=[redacted]SEKRIT")).toBe(true);
     });
+
+    // The start of a tail is read by two patterns, one for key pairs and one for signed-URL parameters.
+    // Each row puts a tail behind a marker that the previous text held bare.
+    it.each([
+      ["sig", "sig"],
+      ["signature", "signature"],
+      ["an upper-case parameter", "SIGNATURE"],
+      ["X-Amz-Signature", "X-Amz-Signature"],
+      ["an upper-case X-Amz-Signature", "X-AMZ-SIGNATURE"],
+      ["X-Goog-Signature", "X-Goog-Signature"],
+      ["a lower-case x-goog-signature", "x-goog-signature"],
+    ])("refuses an edit that adds a tail behind a %s parameter", (_label, param) => {
+      const held = `https://h/p?a=1&${param}=[redacted]&x=1`;
+      expect(addsSecretLike(held, `https://h/p?a=1&${param}=[redacted]SEKRIT&x=1`)).toBe(true);
+      expect(addsSecretLike(held, `https://h/p?a=1&${param}=[redacted]\u79d8\u5bc6&x=1`)).toBe(
+        true
+      );
+      expect(addsSecretLike(held, held)).toBe(false);
+    });
+
+    it.each([
+      [
+        "after a question mark",
+        "https://h/p?sig=[redacted]&x=1",
+        "https://h/p?sig=[redacted]SEKRIT&x=1",
+      ],
+      [
+        "after an ampersand",
+        "https://h/p?a=1&sig=[redacted]&x=1",
+        "https://h/p?a=1&sig=[redacted]SEKRIT&x=1",
+      ],
+      [
+        "after an XML-escaped ampersand",
+        "https://h/p?a=1&amp;sig=[redacted]&amp;x=1",
+        "https://h/p?a=1&amp;sig=[redacted]SEKRIT&amp;x=1",
+      ],
+      ["behind an upper-case marker", "?sig=[REDACTED]&x=1", "?sig=[REDACTED]SEKRIT&x=1"],
+      ["behind a mixed-case marker", "?sig=[Redacted]&x=1", "?sig=[Redacted]SEKRIT&x=1"],
+    ])("refuses an edit that adds a tail to a signature %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(true);
+      expect(addsSecretLike(updated, updated)).toBe(false);
+    });
+
+    // A signed-URL value starts in query position only, and a name that is no secret has no value start.
+    it.each([
+      ["a parameter outside query position", "sig=[redacted]", "sig=[redacted]SEKRIT"],
+      ["a comparison", "token === [redacted]", "token === [redacted]SEKRIT"],
+      ["a doubled equals sign", "password==[redacted]", "password==[redacted]SEKRIT"],
+    ])("accepts an edit that adds a word behind a marker after %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(false);
+      expect(containsSecretLike(updated)).toBe(false);
+    });
+
+    // The key's name, its quotes and the gaps around the separator are the key pattern's own.
+    it.each([
+      ["a name with a suffix", "AWS_SECRET_ACCESS_KEY=[redacted]SEKRIT"],
+      ["a name with a long suffix", "client_secret_basic_auth_method_x: [redacted]SEKRIT"],
+      ["a gap before the separator", "api_key = [redacted]SEKRIT"],
+      ["a gap before and after the separator", "password   :   [redacted]SEKRIT"],
+      ["a quoted key", '"password": [redacted]SEKRIT'],
+      ["a key in single quotes", "'password': [redacted]SEKRIT"],
+      ["a key and a bracket after its quote", 'os.environ["API_KEY"] = [redacted]SEKRIT'],
+      ["an escaped quote around the key", String.raw`{\"password\": [redacted]SEKRIT}`],
+    ])("refuses a tail behind %s", (_label, text) => {
+      expect(containsSecretLike(text)).toBe(true);
+      expect(addsSecretLike("", text)).toBe(true);
+      expect(addsSecretLike(text.replace("SEKRIT", ""), text)).toBe(true);
+    });
+
+    // A key pair's value does not end at `<`, `>` or `#`, and a signed-URL value does.
+    it.each(["<", ">", "#"])("refuses a key pair's tail that starts with %s", (char) => {
+      expect(containsSecretLike(`token=[redacted]${char}SEKRIT`)).toBe(true);
+      expect(addsSecretLike("token=[redacted]", `token=[redacted]${char}SEKRIT`)).toBe(true);
+    });
+
+    it.each(["<", ">", "#"])("ends a signature's tail at %s", (char) => {
+      expect(addsSecretLike(`?sig=[redacted]${char}x`, `?sig=[redacted]${char}SEKRIT`)).toBe(false);
+    });
+
+    // Each end of a value ends a tail at once: what follows it is prose, not the value.
+    it.each([" ", "\t", "\n", '"', "'", "\\", ",", ";", "&", "}", ")", "\u00a0", "\ufeff"])(
+      "ends a key pair's tail at %j",
+      (char) => {
+        const text = `password=[redacted]${char}SEKRIT`;
+        expect(containsSecretLike(text)).toBe(false);
+        expect(addsSecretLike("", text)).toBe(false);
+      }
+    );
+
+    it.each([
+      " ",
+      "\t",
+      "\n",
+      '"',
+      "'",
+      "\\",
+      ",",
+      ";",
+      "&",
+      "#",
+      "<",
+      ">",
+      "}",
+      ")",
+      "\u00a0",
+      "\ufeff",
+    ])("ends a signature's tail at %j", (char) => {
+      expect(addsSecretLike(`?sig=[redacted]${char}x`, `?sig=[redacted]${char}SEKRIT`)).toBe(false);
+    });
+
+    // A `]` ends a tail when another `]` follows it: the first of two is the end, as for a list.
+    it("ends a tail at a bracket that a bracket follows", () => {
+      expect(containsSecretLike("password=[redacted]]]SEKRIT")).toBe(false);
+      expect(addsSecretLike("?sig=[redacted]]]x", "?sig=[redacted]]]SEKRIT")).toBe(false);
+    });
+
+    // The passes' output of the previous and of the new text is what the tails are read in, not the
+    // text itself: a key's value that an earlier pass cut leaves a marker, and the tail behind it is
+    // the text after the cut.
+    it.each([
+      ["a key pair cut at a bracket", "password=abc]OLD", "password=abc]SEKRIT"],
+      [
+        "a signature whose value holds a key",
+        "?sig=abc.sk-ABCDEFGHIJKLMNOPQ.OLD end",
+        "?sig=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT end",
+      ],
+    ])("refuses an edit that changes the tail behind %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(true);
+      expect(addsSecretLike(updated, updated)).toBe(false);
+      expect(addsSecretLike(previous, previous)).toBe(false);
+    });
+
+    // The extra `]` that the passes write behind a signature's marker is taken out before the tails are
+    // read, on both sides: `]OLD` and `SEKRIT` are the tails, not `]]OLD` and `]SEKRIT`.
+    it.each([
+      ["a tail behind a bare marker", "?sig=[redacted]&x=1", "?sig=[redacted]]SEKRIT&x=1"],
+      [
+        "a changed tail that starts with a bracket",
+        "?sig=[redacted]]OLD&x=1",
+        "?sig=[redacted]]SEKRIT&x=1",
+      ],
+      ["a bare marker that gains a tail", "?sig=[redacted]", "?sig=[redacted]SEKRIT"],
+    ])("reads a signature's tail without the added bracket: %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(true);
+      expect(addsSecretLike(updated, updated)).toBe(false);
+    });
+
+    // Tails compare as strings (see the risk named in the body), so a tail that a held signature has
+    // excuses the same string behind a key, once the added bracket is out of the signature's tail. The
+    // other way round main's own verdict refuses: the signature's value is a value that the previous
+    // text did not hold.
+    it("compares a held signature's tail with a key's tail as the same string", () => {
+      expect(addsSecretLike("?sig=[redacted]SEKRIT", "password=[redacted]SEKRIT")).toBe(false);
+      expect(addsSecretLike("password=[redacted]SEKRIT", "?sig=[redacted]SEKRIT")).toBe(true);
+    });
+
+    // Markers inside a tail are skipped whole (ten characters), and the tail goes on behind them.
+    it("reads a tail through a run of markers and a bracket", () => {
+      expect(containsSecretLike("password=[redacted][redacted]]SEKRIT")).toBe(true);
+      expect(
+        addsSecretLike("password=[redacted][redacted]", "password=[redacted][redacted]]SEKRIT")
+      ).toBe(true);
+      expect(containsSecretLike("password=[redacted][redacted][redacted]]SEKRIT")).toBe(true);
+      expect(containsSecretLike("password=[REDACTED][Redacted]]SEKRIT")).toBe(true);
+      expect(containsSecretLike("password=[redacted][redacted]]")).toBe(false);
+    });
+
+    // A tail swallows the keys that stand inside it, and the search for the next tail resumes after
+    // it: one tail, not one per key (a quadratic rescan took seconds at this size).
+    it("holds keys nested in one tail as one tail", () => {
+      const nested = "token=[redacted]password=[redacted]x";
+      // Two tails would make the held text excuse a lone `x`.
+      expect(addsSecretLike(nested, "password=[redacted]x")).toBe(true);
+      expect(addsSecretLike("password=[redacted]x", nested)).toBe(true);
+      expect(addsSecretLike(nested, nested)).toBe(false);
+    });
+
+    it("reads keys nested in one tail of 100 KiB in linear time", () => {
+      const text = `${"password=[redacted]".repeat(5_400)}x`;
+      expect(text.length).toBeGreaterThan(100_000);
+      containsSecretLike("warm up password=[redacted]x"); // keep a cold regex compile out of the timing
+      const started = performance.now();
+      const refused = containsSecretLike(text);
+      const added = addsSecretLike("", text);
+      // A rescan of the tail from each key takes seconds here. The budget is generous for a loaded host.
+      expect(performance.now() - started).toBeLessThan(1_000);
+      expect([refused, added]).toEqual([true, true]);
+    });
   });
 
   it("keeps the userinfo's host readable", () => {
