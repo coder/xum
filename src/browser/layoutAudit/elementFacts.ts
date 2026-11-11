@@ -281,7 +281,7 @@ function clippedAxes(style: LayoutStyle): LayoutAuditAxis[] {
 
 // A box that cuts its contents on purpose (a mask, rounded corners with overflow hidden) is no
 // boundary: it cuts glyph ink at its edge by design.
-export function clippingBoundaryOf(page: LayoutPage, node: Element): ClippingBoundary | null {
+function clippingBoundaryOf(page: LayoutPage, node: Element): ClippingBoundary | null {
   const style = page.style(node);
   const axes = clippedAxes(style);
   if (axes.length === 0 || hasVisualMask(style) || isRoundedOverflowMask(style)) return null;

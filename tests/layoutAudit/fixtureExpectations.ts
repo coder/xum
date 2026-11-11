@@ -74,9 +74,6 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   ),
   // A long page with a sticky header and a fixed chip over scrolling text: no cover.
   "below-fold-clean": CLEAN,
-  // A clamped paragraph below the first screen, an opaque panel right after it: the lines past
-  // the clamp keep their line boxes under the panel, but nobody sees them.
-  "line-clamp-below-fold-clean": CLEAN,
   // An input, a select and an icon-only button have no text node, and neither has an input inside
   // a label (the label's text is no face for it). The input at the end is free.
   "faceless-controls-covered": everyWidth(
