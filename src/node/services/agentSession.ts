@@ -10996,18 +10996,30 @@ export class AgentSession {
       parts: payload.parts,
     });
     if (statusPageNudge != null) nudges.push(statusPageNudge);
-    // A machine turn can change a page as well as a user turn, so this one is not limited to
-    // user-started turns. The audit runs a browser for seconds, so it is skipped when the turn's
-    // continuation would be dropped anyway (runTurnStopHooks).
-    const layoutNudge = provenance.externallyOwnedTurn
-      ? null
-      : await this.aiService.layoutTurnEndNudge?.(this.workspaceId, {
-          parts: payload.parts,
-          streamStartedAtMs: provenance.streamStartedAtMs,
-          abortSignal,
-        });
+    const layoutNudge = await this.readLayoutNudge(payload, provenance, abortSignal);
     if (layoutNudge != null) nudges.push(layoutNudge);
     return nudges;
+  }
+
+  /**
+   * The layout nudge (see AgentSessionAIService.layoutTurnEndNudge). A machine turn can change a
+   * page as well as a user turn, so it is not limited to user-started turns. The audit runs a
+   * browser for seconds, so it is skipped when the turn's continuation would be dropped anyway
+   * (runTurnStopHooks).
+   */
+  private async readLayoutNudge(
+    payload: StreamEndEvent,
+    provenance: StopContinuationProvenance,
+    abortSignal: AbortSignal
+  ): Promise<string | null> {
+    if (provenance.externallyOwnedTurn) return null;
+    return (
+      (await this.aiService.layoutTurnEndNudge?.(this.workspaceId, {
+        parts: payload.parts,
+        streamStartedAtMs: provenance.streamStartedAtMs,
+        abortSignal,
+      })) ?? null
+    );
   }
 
   /** Records whether the sent message whose stream starts now began a user turn. */

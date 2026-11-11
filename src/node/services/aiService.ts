@@ -104,7 +104,10 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { madeSuccessfulToolCall, needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
-import { workspaceHasNewLayoutIssueAtTurnEnd } from "./layoutAudit/turnEndLayoutAudit";
+import {
+  workspaceHasNewLayoutIssueAtTurnEnd,
+  type WorkspaceTurnEndLayoutAudit,
+} from "./layoutAudit/turnEndLayoutAudit";
 import { isStatusPageAgentEnabledInSettings } from "./statusPageAgentService";
 import {
   LAYOUT_TURN_END_NUDGE,
@@ -669,18 +672,12 @@ export class AIService extends EventEmitter {
       return null;
     }
     try {
-      const metadata = await this.getWorkspaceMetadata(workspaceId);
-      const workspace = this.config.findWorkspace(workspaceId);
-      if (!metadata.success || !workspace) return null;
-      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
-      if (!context.success) return null;
+      const target = await this.layoutAuditTarget(workspaceId);
+      if (target == null) return null;
       const found = await workspaceHasNewLayoutIssueAtTurnEnd({
         workspaceId,
-        // As createWorkspaceRuntimeContext: the persisted workspace root, not a derived one.
-        metadata: { ...metadata.data, namedWorkspacePath: workspace.workspacePath },
         config: this.config,
-        runtime: context.data.runtime,
-        cwd: context.data.workspacePath,
+        ...target,
         streamStartedAtMs: input.streamStartedAtMs,
         abortSignal: input.abortSignal,
       });
@@ -689,6 +686,23 @@ export class AIService extends EventEmitter {
       log.debug("Turn-end layout audit failed", { workspaceId, error: getErrorMessage(error) });
       return null;
     }
+  }
+
+  /** Where the turn-end layout audit of a workspace runs, or null when that cannot be resolved. */
+  private async layoutAuditTarget(
+    workspaceId: string
+  ): Promise<Pick<WorkspaceTurnEndLayoutAudit, "metadata" | "runtime" | "cwd"> | null> {
+    const metadata = await this.getWorkspaceMetadata(workspaceId);
+    const workspace = this.config.findWorkspace(workspaceId);
+    if (!metadata.success || !workspace) return null;
+    const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+    if (!context.success) return null;
+    return {
+      // As createWorkspaceRuntimeContext: the persisted workspace root, not a derived one.
+      metadata: { ...metadata.data, namedWorkspacePath: workspace.workspacePath },
+      runtime: context.data.runtime,
+      cwd: context.data.workspacePath,
+    };
   }
 
   private isStatusPageAgentStillOn(): boolean {

@@ -924,7 +924,7 @@ describe("AIService layout turn-end nudge", () => {
     });
     const audit = spyOn(turnEndLayoutAudit, "workspaceHasNewLayoutIssueAtTurnEnd");
     const nudge = (
-      parts: CompletedMessagePart[],
+      parts: readonly CompletedMessagePart[],
       streamStartedAtMs: number | undefined,
       abortSignal = new AbortController().signal
     ) => harness.service.layoutTurnEndNudge(workspaceId, { parts, streamStartedAtMs, abortSignal });
@@ -943,11 +943,12 @@ describe("AIService layout turn-end nudge", () => {
       expect(call).toMatchObject({
         workspaceId,
         streamStartedAtMs: 1_234,
-        metadata: { id: workspaceId, projectPath },
+        metadata: { id: workspaceId, projectPath, namedWorkspacePath: projectPath },
+        // The agent's cwd, where a publish runs its audit too.
+        cwd: projectPath,
       });
       // Identity, not structure: two AbortSignals match each other structurally.
       expect(call?.abortSignal).toBe(stop.signal);
-      expect(call?.cwd).toBeString();
     } finally {
       await testHistory.cleanup();
     }
