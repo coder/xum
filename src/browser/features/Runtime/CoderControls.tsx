@@ -63,6 +63,36 @@ function hasTemplateDuplicateName(template: CoderTemplate, allTemplates: CoderTe
   );
 }
 
+/**
+ * Which of the form's three selects to mark invalid: one whose list failed to load, or the one a
+ * refused Send is waiting for. Marking that control (not only the form's border) lets the
+ * environment panel put the keyboard on it. The missing one follows the order in which creation
+ * validation checks the form: the workspace, or the template and then the preset.
+ */
+export function invalidCoderControls(input: {
+  hasError: boolean;
+  mode: "new" | "existing";
+  template: string | undefined;
+  templatesError: unknown;
+  presetsError: unknown;
+  workspacesError: unknown;
+}): Record<"template" | "preset" | "workspace", true | undefined> {
+  const missing = !input.hasError
+    ? null
+    : input.mode === "existing"
+      ? "workspace"
+      : (input.template ?? "").trim() === ""
+        ? "template"
+        : "preset";
+  const mark = (field: string, loadError: unknown) =>
+    Boolean(loadError) || missing === field ? true : undefined;
+  return {
+    template: mark("template", input.templatesError),
+    preset: mark("preset", input.presetsError),
+    workspace: mark("workspace", input.workspacesError),
+  };
+}
+
 export type CoderAvailabilityState =
   | { state: "loading"; reason: string; shouldShowRuntimeButton: false }
   | { state: "outdated"; reason: string; shouldShowRuntimeButton: true }
@@ -173,16 +203,14 @@ export function CoderWorkspaceForm(props: CoderWorkspaceFormProps) {
     (mode === "existing" && Boolean(workspacesError)) ||
     (mode === "new" && Boolean(templatesError ?? presetsError))
   );
-  // The one control a refused Send is waiting for, so it (not just the form's border) is marked
-  // invalid and the environment panel can put the keyboard on it. Mirrors the order in which
-  // creation validation checks the form: workspace, or template and then preset.
-  const missingField: "workspace" | "template" | "preset" | null = !hasError
-    ? null
-    : mode === "existing"
-      ? "workspace"
-      : !(coderConfig?.template ?? "").trim()
-        ? "template"
-        : "preset";
+  const invalid = invalidCoderControls({
+    hasError: hasError ?? false,
+    mode,
+    template: coderConfig?.template,
+    templatesError,
+    presetsError,
+    workspacesError,
+  });
   const templateErrorId = templatesError ? "coder-template-error" : undefined;
   const presetErrorId = presetsError ? "coder-preset-error" : undefined;
   const workspaceErrorId = workspacesError ? "coder-workspace-error" : undefined;
@@ -380,9 +408,7 @@ export function CoderWorkspaceForm(props: CoderWorkspaceFormProps) {
                   <SelectTrigger
                     className="h-7 w-[180px] text-xs"
                     data-testid="coder-template-select"
-                    aria-invalid={
-                      Boolean(templatesError) || missingField === "template" || undefined
-                    }
+                    aria-invalid={invalid.template}
                     aria-describedby={templateErrorId}
                   >
                     <SelectValue placeholder={templatePlaceholder} />
@@ -424,7 +450,7 @@ export function CoderWorkspaceForm(props: CoderWorkspaceFormProps) {
                   <SelectTrigger
                     className="h-7 w-[180px] text-xs"
                     data-testid="coder-preset-select"
-                    aria-invalid={Boolean(presetsError) || missingField === "preset" || undefined}
+                    aria-invalid={invalid.preset}
                     aria-describedby={presetErrorId}
                   >
                     <SelectValue placeholder={presetPlaceholder} />
@@ -463,9 +489,7 @@ export function CoderWorkspaceForm(props: CoderWorkspaceFormProps) {
                   <SelectTrigger
                     className="h-7 w-[180px] text-xs"
                     data-testid="coder-workspace-select"
-                    aria-invalid={
-                      Boolean(workspacesError) || missingField === "workspace" || undefined
-                    }
+                    aria-invalid={invalid.workspace}
                     aria-describedby={workspaceErrorId}
                   >
                     <SelectValue placeholder={workspacePlaceholder} />

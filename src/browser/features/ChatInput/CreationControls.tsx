@@ -23,7 +23,11 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { Loader2, Wand2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
-import { CreationEnvironmentPanel, type IsolationSelectOption } from "./CreationEnvironmentPanel";
+import {
+  CreationEnvironmentPanel,
+  type EnvironmentBranchPicker,
+  type IsolationSelectOption,
+} from "./CreationEnvironmentPanel";
 import {
   describeEnvironment,
   environmentUsesBaseBranch,
@@ -32,12 +36,16 @@ import {
   type RuntimeFieldError,
 } from "./creationEnvironmentSummary";
 import { CreationProjectSelect } from "./CreationProjectSelect";
-import { SetDefaultIsolationButton, useSetDefaultIsolation } from "./SetDefaultIsolationButton";
+import {
+  DefaultSaveError,
+  SetDefaultIsolationButton,
+  setDefaultShortcut,
+  useSetDefaultIsolation,
+} from "./SetDefaultIsolationButton";
 import { SshDirectoryTrustNotice } from "./SshDirectoryTrustNotice";
 import { SshHostSuggestions } from "./SshHostSuggestions";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
-import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
@@ -708,6 +716,26 @@ function workspaceIsolationFields(input: {
   return null;
 }
 
+/** The base-branch column's data, with the optional list extras defaulted. */
+function branchPickerFor(
+  props: CreationControlsProps,
+  branchOptions: string[]
+): EnvironmentBranchPicker {
+  return {
+    load: props.branchLoad,
+    options: branchOptions,
+    selected: props.trunkBranch,
+    defaultBranch: props.defaultBranch ?? null,
+    recentBranches: props.recentBranches ?? [],
+    onRetry: props.onReloadBranches ?? noop,
+    onSelect: props.onTrunkBranchChange,
+  };
+}
+
+function noop(): void {
+  // Nothing to reload when the host gave no reload (stories, tests).
+}
+
 function CreationControlsContent(props: CreationControlsProps) {
   usePerfRenderMarker("chat-input.creation-controls");
   const { nameState, runtimeAvailabilityState } = props;
@@ -1043,34 +1071,17 @@ function CreationControlsContent(props: CreationControlsProps) {
             })}
             branch={
               environmentUsesBaseBranch(environmentInput)
-                ? {
-                    load: props.branchLoad,
-                    options: branchOptions,
-                    selected: props.trunkBranch,
-                    defaultBranch: props.defaultBranch ?? null,
-                    recentBranches: props.recentBranches ?? [],
-                    onRetry: props.onReloadBranches ?? (() => undefined),
-                    onSelect: props.onTrunkBranchChange,
-                  }
+                ? branchPickerFor(props, branchOptions)
                 : null
             }
             fieldError={fieldError}
             fieldErrorAttempt={props.runtimeFieldErrorAttempt ?? 0}
             footerAction={<SetDefaultIsolationButton saver={defaultSaver} />}
-            footerShortcut={
-              defaultSaver.canSave
-                ? { keybind: KEYBINDS.SET_DEFAULT_ISOLATION, run: () => void defaultSaver.save() }
-                : null
-            }
+            footerShortcut={setDefaultShortcut(defaultSaver)}
           />
         </div>
 
-        {/* A failed save from the shortcut has no open panel to report in. */}
-        {defaultSaver.error !== null && (
-          <span role="alert" className="text-error text-xs">
-            {defaultSaver.error}
-          </span>
-        )}
+        <DefaultSaveError saver={defaultSaver} />
 
         {/* The directory's trust stays on the page, under the chip, not inside the panel: its
             pending and error state must survive the panel closing, and the trust state stands

@@ -5,7 +5,12 @@ import { KeyHint } from "@/browser/components/KeyHint/KeyHint";
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAppConfig } from "@/browser/stores/AppConfigStore";
-import { formatKeybind, formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  formatKeybindForAria,
+  KEYBINDS,
+  type Keybind,
+} from "@/browser/utils/ui/keybinds";
 import type { IsolationChoice } from "@/common/types/isolation";
 import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -22,6 +27,27 @@ interface SetDefaultIsolationProps {
 }
 
 export type DefaultIsolationSaver = ReturnType<typeof useSetDefaultIsolation>;
+
+/**
+ * The saver's shortcut for the environment panel to run while it is open, or null while the
+ * action would not run (already the default, saving, or locked).
+ */
+export function setDefaultShortcut(
+  saver: DefaultIsolationSaver
+): { keybind: Keybind; run: () => void } | null {
+  if (!saver.canSave) return null;
+  return { keybind: KEYBINDS.SET_DEFAULT_ISOLATION, run: () => void saver.save() };
+}
+
+/** A failed save, on the page: a save from the shortcut has no open panel to report in. */
+export function DefaultSaveError(props: { saver: DefaultIsolationSaver }) {
+  if (props.saver.error === null) return null;
+  return (
+    <span role="alert" className="text-error text-xs">
+      {props.saver.error}
+    </span>
+  );
+}
 
 /**
  * One click from the creation page to make what it shows the project's default for new

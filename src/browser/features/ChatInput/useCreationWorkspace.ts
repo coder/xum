@@ -1,5 +1,5 @@
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
-import { createElement, useState, useEffect, useCallback, useRef } from "react";
+import { createElement, useState, useEffect, useCallback, useReducer, useRef } from "react";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type {
   CoderWorkspaceConfig,
@@ -266,6 +266,11 @@ async function resolveCreationName(input: {
 }
 
 /** True for a real (non-blank) creation draft ID. */
+/** Reducer for a counter that only says "again": each dispatch is a new value. */
+function countUp(count: number): number {
+  return count + 1;
+}
+
 function isDraftId(draftId: string | null | undefined): draftId is string {
   return typeof draftId === "string" && draftId.trim().length > 0;
 }
@@ -350,7 +355,7 @@ export function useCreationWorkspace({
   const [recentBranches, setRecentBranches] = useState<string[]>([]);
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
   // Bumped by "Retry" after a failed branch list: the load effect runs again.
-  const [branchReloads, setBranchReloads] = useState(0);
+  const [branchReloads, reloadBranches] = useReducer(countUp, 0);
   const [toast, setToast] = useState<Toast | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [trustPrompt, setTrustPrompt] = useState<{
@@ -406,8 +411,8 @@ export function useCreationWorkspace({
         if (outcome.status === "loaded") {
           setBranches(outcome.branches);
           setRecommendedTrunk(outcome.recommendedTrunk);
-          setRecentBranches(outcome.recentBranches ?? []);
-          setDefaultBranch(outcome.defaultBranch ?? null);
+          setRecentBranches(outcome.recentBranches);
+          setDefaultBranch(outcome.defaultBranch);
         }
         setBranchLoad(outcome.status);
       }
@@ -1075,7 +1080,7 @@ export function useCreationWorkspace({
     recommendedTrunk,
     recentBranches,
     defaultBranch,
-    reloadBranches: () => setBranchReloads((count) => count + 1),
+    reloadBranches,
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,
     selectedRuntime: settings.selectedRuntime,
