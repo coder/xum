@@ -91,6 +91,10 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   // Two opaque panels meet over the text, 60% and 40% of the box: each is under the share that one
   // cover must hold, together they hide all of it.
   "cover-in-two-panels": everyWidth(found("overlapping-text", "p#totals")),
+  // A clamped container that is not positioned holds a label that an absolutely positioned box
+  // places elsewhere (in the section around it). The container's clip does not cut the label, so
+  // the white block over the label hides it: one finding.
+  "absolute-label-outside-clamp": everyWidth(found("overlapping-text", "p#tag")),
   // The only text with something to cover sits below the visible part of a 120 px panel, which
   // the page loads scrolled by 40 px. Only a scroll of the panel reaches it, and the audit puts
   // the panel back where it found it.

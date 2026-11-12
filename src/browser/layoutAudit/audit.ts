@@ -16,6 +16,7 @@ import {
   isScrolling,
   isVisible,
   isVisibleTextHolder,
+  judgedTextLines,
   nestedClippingBoundaries,
   paddingBox,
   rootVerticalScrollLocked,
@@ -471,13 +472,15 @@ function isScrollReachable(point: Point, metrics: PageMetrics): boolean {
 // The rectangles whose points are sampled: the text lines, or for a control with no text line of
 // its own the control's box. That is an <input value>, a <select>, an icon-only button, or a
 // <textarea> that holds text (its value is drawn from a shadow tree, and a Range over the text it
-// holds has no rectangle). Each is cut to the part that a clipping box leaves visible: a
-// clipped-away line has a rectangle, and a point on it would find whatever sits there instead.
+// holds has no rectangle). Each is cut to the part that a clipping box leaves visible, as seen
+// from the element it is drawn in: a clipped-away line has a rectangle, and a point on it would
+// find whatever sits there instead.
 function sampleRects(pass: AuditPass, el: Element): Box[] {
-  const lines = textFragments(pass.page, el);
-  const rects = lines.length === 0 && isRequiredControl(el) ? [pass.page.box(el)] : lines;
-  return rects.flatMap((rect) => {
-    const visible = visiblePart(pass.page, el, rect);
+  const lines = judgedTextLines(pass.page, el);
+  const rects =
+    lines.length === 0 && isRequiredControl(el) ? [{ rect: pass.page.box(el), holder: el }] : lines;
+  return rects.flatMap(({ rect, holder }) => {
+    const visible = visiblePart(pass.page, holder, rect);
     return visible && visible.width * visible.height >= THRESHOLDS.minFragmentArea ? [visible] : [];
   });
 }

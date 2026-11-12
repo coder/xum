@@ -797,6 +797,52 @@ describe("overlapping-text", () => {
       expect(audit(`<div id="stage">${wide}${COVER_FROM("60 0 600 600")}</div>`)).toEqual([]);
     });
 
+    // A line is cut by the boxes that contain the element it is drawn in, and that is not always the
+    // paragraph that holds the element in the markup. A paragraph that judges the text of a span
+    // inside it reads its lines through the span.
+    describe("text that a paragraph holds in an element of its own", () => {
+      const PARAGRAPH = (inside: string) =>
+        `<p id="t" data-box="10 10 200 440" data-css="webkit-line-clamp: 2">Hello ${inside}</p>`;
+      const CLAMPED = (css: string) =>
+        `<span id="c" data-box="10 10 200 40" data-css="${css}" data-lines="${LINES(22)}">world</span>`;
+
+      test.each([
+        ["a line clamp", "overflow-y: hidden; webkit-line-clamp: 2"],
+        ["a short box", "overflow-y: hidden"],
+      ])("the lines that %s cuts away are not sampled", (_name, css) => {
+        const page = `<div id="stage">${PARAGRAPH(CLAMPED(css))}${BELOW_TWO_LINES}</div>`;
+        const rules = audit(page).map((found) => found.rule);
+        expect(rules).not.toContain("overlapping-text");
+      });
+
+      test("the lines that show are still sampled: a cover over them is reported", () => {
+        const page = `<div id="stage">${PARAGRAPH(CLAMPED("overflow-y: hidden; webkit-line-clamp: 2"))}${COVER_FROM("0 0 300 500")}</div>`;
+        expect(audit(page)).toEqual(COVERED);
+      });
+
+      // The paragraph's own box clips, and its span sits at y 100: wholly outside that box. The
+      // span is absolutely positioned, so the nearest positioned ancestor holds it, and the
+      // paragraph's clip does not cut it.
+      describe("an absolutely positioned span outside the paragraph's clipping box", () => {
+        const CLIP = "overflow-x: hidden; overflow-y: hidden";
+        const SPAN =
+          '<span data-box="10 100 200 20" data-lines="10 100 200 20" data-css="position: absolute">world text</span>';
+        const PAGE = (stageCss: string, paragraphCss: string) =>
+          `<div id="stage" data-box="10 10 50 20" data-css="${stageCss}"><p id="t" data-box="10 10 50 20" data-css="${paragraphCss}">Hello ${SPAN}</p>${COVER_FROM("0 90 300 60")}</div>`;
+
+        test("is sampled where it is: a cover over it is reported", () => {
+          expect(audit(PAGE("position: relative", `${CLIP}; webkit-line-clamp: 2`))).toEqual(
+            COVERED
+          );
+        });
+
+        test("is still cut by what contains it", () => {
+          const stage = `position: relative; ${CLIP}`;
+          expect(audit(PAGE(stage, `${CLIP}; webkit-line-clamp: 2`))).toEqual([]);
+        });
+      });
+    });
+
     // An overflow box clips the boxes that it contains: an absolutely positioned box is placed in
     // its nearest positioned ancestor, so a clipper between the two does not cut it, and a fixed
     // box is placed in the viewport, so no clipper does. The text sits at y 100, wholly outside the
