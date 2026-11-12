@@ -28,6 +28,7 @@ const PASS_TIMEOUT_MS = 60_000;
 interface Row {
   fixture: string;
   width: LayoutAuditViewportWidth;
+  height: number;
   pass: LayoutAuditPagePass;
   ms: number;
   /** The window's scroll position after the pass: the audit must put back the one it found. */
@@ -63,6 +64,7 @@ async function auditFixture(
     return {
       fixture,
       width: viewport.width,
+      height: viewport.height,
       pass: LayoutAuditPagePassSchema.parse(raw),
       ms,
       scrollY,
@@ -97,7 +99,7 @@ function formatRow(row: Row): string {
 const describeFinding = (finding: { rule: string; selector: string }) =>
   `${finding.rule} ${finding.selector}`;
 
-/** Mismatches between a row and its expectation: a settled pass, the width, the scroll, the findings. */
+/** Mismatches between a row and its expectation: a settled pass, the size, the scroll, the findings. */
 function mismatches(row: Row): string[] {
   const expected = FIXTURE_EXPECTATIONS[row.fixture]?.[row.width] ?? [];
   const found = row.pass.findings.map(describeFinding).sort();
@@ -105,6 +107,9 @@ function mismatches(row: Row): string[] {
   if (!row.pass.complete) problems.push("the pass is not complete");
   if (row.pass.viewportWidth !== row.width) {
     problems.push(`the page reported width ${row.pass.viewportWidth}`);
+  }
+  if (row.pass.viewportHeight !== row.height) {
+    problems.push(`the page reported height ${row.pass.viewportHeight}`);
   }
   // A fresh page starts at the top, and the overlap rule scrolls the window to sample text below
   // the screen: it must leave the window where it found it.

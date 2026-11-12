@@ -20,6 +20,7 @@ export type FakeEvalReply =
       kind: "pass";
       complete?: boolean;
       viewportWidth?: number;
+      viewportHeight?: number;
       /** The page's address. The default is the URL of the last `open`, like a page that stayed. */
       href?: string;
       findings?: LayoutAuditPageFinding[];
@@ -69,6 +70,11 @@ export interface FakeAgentBrowser {
    */
   agentBrowserEnvNames(): Promise<string[][]>;
   /**
+   * Per call, in order: the value of AGENT_BROWSER_NO_VERSION_CHECK the call saw, or "unset". The
+   * one value the fake logs: it is a 0/1 switch, not a secret.
+   */
+  versionCheckSwitches(): Promise<string[]>;
+  /**
    * Per call, in order: the `--config` path, and its content when the file existed then (the
    * run's folder is gone afterwards).
    */
@@ -85,7 +91,10 @@ function shellQuote(value: string): string {
 // Stands where the page's address goes; the fake's eval fills in the URL of the last `open`.
 const HREF_OF_LAST_OPEN = "@@HREF@@";
 
-function envelopeFor(reply: FakeEvalReply, width: number): { out: string; exit: number } {
+function envelopeFor(
+  reply: FakeEvalReply,
+  viewport: { width: number; height: number }
+): { out: string; exit: number } {
   switch (reply.kind) {
     case "pass":
       return {
@@ -97,7 +106,8 @@ function envelopeFor(reply: FakeEvalReply, width: number): { out: string; exit: 
             origin: "file:///fake.html",
             result: {
               complete: reply.complete ?? true,
-              viewportWidth: reply.viewportWidth ?? width,
+              viewportWidth: reply.viewportWidth ?? viewport.width,
+              viewportHeight: reply.viewportHeight ?? viewport.height,
               href: reply.href ?? HREF_OF_LAST_OPEN,
               findings: reply.findings ?? [],
             },
@@ -133,6 +143,7 @@ printf '%s\\037' "$@" >> "$STATE/calls.log"
 printf '\\n' >> "$STATE/calls.log"
 if [ -d "\${AGENT_BROWSER_SOCKET_DIR-}" ]; then existed=yes; else existed=no; fi
 printf '%s %s\\n' "$existed" "\${AGENT_BROWSER_SOCKET_DIR-}" >> "$STATE/socket-dirs.log"
+printf '%s\\n' "\${AGENT_BROWSER_NO_VERSION_CHECK-unset}" >> "$STATE/version-check.log"
 env | sed -n -e 's/^\\(AGENT_BROWSER_[A-Za-z0-9_]*\\)=.*/\\1/p' -e 's/^\\(SHELLOPTS\\)=.*/\\1/p' -e 's/^\\(BASHOPTS\\)=.*/\\1/p' | sort | tr '\\n' ' ' >> "$STATE/env-names.log"
 printf '\\n' >> "$STATE/env-names.log"
 config=
@@ -222,9 +233,9 @@ export async function installFakeAgentBrowser(
   if (script.offlineFails) await fs.writeFile(path.join(stateDir, "offline-fails"), "");
   if (script.openFails) await fs.writeFile(path.join(stateDir, "open-fails"), "");
   if (script.closeHangs) await fs.writeFile(path.join(stateDir, "close-hangs"), "");
-  for (const { width } of LAYOUT_AUDIT_VIEWPORTS) {
+  for (const { width, height } of LAYOUT_AUDIT_VIEWPORTS) {
     const reply = script.eval?.[width] ?? { kind: "pass" };
-    const { out, exit } = envelopeFor(reply, width);
+    const { out, exit } = envelopeFor(reply, { width, height });
     await fs.writeFile(path.join(stateDir, `eval-${width}.out`), out);
     await fs.writeFile(path.join(stateDir, `eval-${width}.exit`), String(exit));
     if (reply.kind === "hang") await fs.writeFile(path.join(stateDir, `eval-${width}.hang`), "");
@@ -253,6 +264,8 @@ export async function installFakeAgentBrowser(
         .split("\n")
         .filter((line) => line !== "")
         .map((line) => line.split(" ").filter(Boolean)),
+    versionCheckSwitches: async () =>
+      ((await read("version-check.log")) ?? "").split("\n").filter((line) => line !== ""),
     configs: async () =>
       ((await read("configs.log")) ?? "")
         .split("\n")

@@ -31,6 +31,8 @@ export type LayoutAuditPageFinding = z.infer<typeof LayoutAuditPageFindingSchema
 export const LayoutAuditPagePassSchema = z.object({
   complete: z.boolean(),
   viewportWidth: z.number().finite(),
+  /** Vertical reachability and the below-the-fold occlusion samples depend on it, like the width. */
+  viewportHeight: z.number().finite(),
   href: z.string(),
   findings: z.array(LayoutAuditPageFindingSchema).max(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS),
 });
