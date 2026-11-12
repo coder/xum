@@ -45,6 +45,7 @@ import {
   COMPUTER_USE_SCROLL_DIRECTIONS,
 } from "@/common/constants/computerUse";
 import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
+import { LayoutAuditReportSchema } from "@/common/types/artifactLayoutAudit";
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { SkillLookupNameSchema, SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
@@ -2098,6 +2099,12 @@ export const ArtifactToolSuccessResultSchema = z.object({
   kind: ArtifactKindSchema,
   title: z.string(),
   pin: z.enum(["project", "global"]).nullable(),
+  /**
+   * HTML only: what the publish-time layout audit found. `.catch`: a stored row whose `layout` this
+   * build cannot read (a reason a newer build added) drops the field instead of failing the whole
+   * parse, so the chat card still renders after a downgrade. The card never reads it.
+   */
+  layout: LayoutAuditReportSchema.optional().catch(undefined),
 });
 export type ArtifactToolSuccessResult = z.infer<typeof ArtifactToolSuccessResultSchema>;
 
@@ -3113,7 +3120,8 @@ export const TOOL_DEFINITIONS = {
       'JSON {"$xum":"table","columns":[..],"rows":[..]} is a table (columns optional; rows: objects or arrays). ' +
       "HTML is sandboxed (its CSP blocks network, not guaranteed): never put secrets in it. Inline JS/CSS or use relative files; scripts may load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com, cdn.tailwindcss.com if the user allows. " +
       "HTML may call window.xum.send(text, data?) from a click handler (sent at once; the user did not review the text; arrives as an <artifact_interaction> message) and window.xum.setState(obj) (shown here). " +
-      "If agent-browser is available, screenshot new HTML via file:// at 390px and desktop widths and attach_file them (unsandboxed there: CDN content can differ).",
+      "Publishing HTML with the artifact tool checks its layout in agent-browser (when installed) at phone, tablet and desktop widths and lists clipped or overflowing text and unreachable or covered controls in the result's `layout`: fix those and publish again. " +
+      "A screenshot via file:// and attach_file is an optional visual check (unsandboxed there: CDN content can differ).",
     schema: z
       .object({
         scope: z
@@ -3140,7 +3148,8 @@ export const TOOL_DEFINITIONS = {
     resultSchema: ArtifactToolResultSchema,
     description:
       "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ in the user's Artifacts tab, shown as a chat card. " +
-      "The tab shows the file as it is now, so edit it in place; publish again to show a new card or to change its title, kind or pin.",
+      "The tab shows the file as it is now, so edit it in place; publish again to show a new card or to change its title, kind or pin. " +
+      "For HTML the result's `layout` lists layout issues found in agent-browser; `checked: false` means a width was not checked, never that the page is clean.",
     schema: z
       .object({
         path: z.string().describe("Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),
