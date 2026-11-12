@@ -178,7 +178,7 @@ describe("WorkspaceLifecycleToolCall", () => {
     const labels = [...view.container.querySelectorAll("div")]
       .filter((el) => el.children.length === 0)
       .map((el) => el.textContent);
-    expect(labels).toContain("Untracked files deleted");
+    expect(labels).toContain("Untracked files not kept");
     expect(labels).toContain("Paths");
   });
 

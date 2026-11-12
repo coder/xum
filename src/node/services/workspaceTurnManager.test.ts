@@ -1211,6 +1211,8 @@ describe("WorkspaceTurnManager", () => {
       forbidWorktreeCheckoutDeletion: false,
       forbidCoderWorkspaceDeletion: false,
       refuseLiveUserActivity: true,
+      // A forced archive always lists the sub-agent checkouts it may delete, even none.
+      acknowledgedSubagentCheckoutDeletions: [] as string[],
     };
 
     async function setArchivePolicy(
@@ -1469,6 +1471,8 @@ describe("WorkspaceTurnManager", () => {
       });
       expect(harness.archive).toHaveBeenCalledWith("childworkspace", undefined, {
         ...forcedSinkOptions,
+        // Only the sub-agent the preflight listed may lose its checkout.
+        acknowledgedSubagentCheckoutDeletions: ["sub-1"],
         worktreeArchiveBehaviorOverride: "delete",
         coderWorkspaceArchiveBehaviorOverride: "stop",
       });
@@ -1506,6 +1510,82 @@ describe("WorkspaceTurnManager", () => {
         worktreeArchiveBehaviorOverride: "keep",
         coderWorkspaceArchiveBehaviorOverride: "delete",
       });
+    });
+
+    test("a forced archive that fails after archiving a sub-agent reports what that sub-agent lost", async () => {
+      const preflightArchiveCascade = mock(() =>
+        Promise.resolve(
+          Ok({
+            targetPaths: [],
+            subagents: [
+              { workspaceId: "sub-done", title: "Done one", paths: ["notes.txt"] },
+              { workspaceId: "sub-late", title: "Late one", paths: ["late.txt"] },
+            ],
+          })
+        )
+      );
+      const harness = await createWorkspaceLifecycleHarness({
+        preflightArchiveCascade,
+        archive: mock(async (): Promise<Result<{ kind: "archived" }>> => {
+          // The cascade archived the first sub-agent, then refused the second.
+          await harness.config.editConfig((cfg) => {
+            for (const [, project] of cfg.projects) {
+              const row = project.workspaces.find((w) => w.id === "sub-done");
+              if (row) row.archivedAt = new Date().toISOString();
+            }
+            return cfg;
+          });
+          return Err("Cannot archive sub-agent Late one (sub-late): its untracked files changed");
+        }),
+      });
+      await setArchivePolicy(harness.config, { worktree: "snapshot" });
+      await harness.config.editConfig((cfg) => {
+        for (const [projectPath, project] of cfg.projects) {
+          for (const id of ["sub-done", "sub-late"]) {
+            project.workspaces.push({
+              path: path.join(projectPath, id),
+              id,
+              name: id,
+              createdAt: new Date().toISOString(),
+              runtimeConfig: { type: "local" },
+            });
+          }
+        }
+        return cfg;
+      });
+
+      const result = archivedFields(
+        await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+          harness.parentId,
+          { workspaceId: "childworkspace" },
+          { force: true }
+        )
+      );
+
+      expect(result.status).toBe("error");
+      expect(result.status === "error" ? result.error : "").toContain("sub-late");
+      // The archived sub-agent's file is reported. The one that never archived lost nothing.
+      expect(result.note).toContain("sub-done: notes.txt");
+      expect(result.note).not.toContain("late.txt");
+    });
+
+    test("a failed archive that is not forced adds no loss note", async () => {
+      const harness = await createWorkspaceLifecycleHarness({
+        archive: mock(
+          (): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Err("sink refused"))
+        ),
+      });
+
+      const result = archivedFields(
+        await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+          harness.parentId,
+          { workspaceId: "childworkspace" },
+          {}
+        )
+      );
+
+      expect(result.status).toBe("error");
+      expect(result.note).toBeUndefined();
     });
 
     test("force reports nothing extra when the archive deletes no saved state", async () => {

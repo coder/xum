@@ -383,6 +383,40 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     }
   });
 
+  test("a forced archive under the delete policy refuses a sub-agent that appeared after it listed the checkouts", async () => {
+    await setArchiveBehavior("delete");
+    // The grandchild is not part of the tree yet: another backend creates it under the child
+    // right after the target's own listing, before the archive fences sub-agent creation.
+    await a.config.editConfig((config) => {
+      const row = [...config.projects.values()][0].workspaces.find((w) => w.id === grandchildId)!;
+      delete row.parentWorkspaceId;
+      return config;
+    });
+    const preflightArchive = a.workspaceService.preflightArchive.bind(a.workspaceService);
+    spyOn(a.workspaceService, "preflightArchive").mockImplementation(async (id, options) => {
+      const listed = await preflightArchive(id, options);
+      if (id === rootId) {
+        await a.config.editConfig((config) => {
+          const row = [...config.projects.values()][0].workspaces.find(
+            (w) => w.id === grandchildId
+          )!;
+          row.parentWorkspaceId = childId;
+          return config;
+        });
+      }
+      return listed;
+    });
+
+    const result = await modelArchiveRoot({ force: true });
+
+    assert(result.success, "the lifecycle archive returns a result");
+    expect(result.data.status).toBe("error");
+    expect(result.data.error).toContain(grandchildId);
+    // Its checkout was never in the forced list, so it is neither archived nor deleted.
+    expect(findWorkspaceInConfig(a.config, grandchildId)?.archivedAt).toBeUndefined();
+    expect(await exists(checkouts.get(grandchildId)!)).toBe(true);
+  });
+
   test("a forced archive under the delete policy still refuses while an external editor or native terminal is open on a sub-agent", async () => {
     await setArchiveBehavior("delete");
     spyOn(a.workspaceService, "hasUntrackableExternalAppOpen").mockImplementation((id) =>

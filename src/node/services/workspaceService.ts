@@ -1057,6 +1057,21 @@ function remoteBoxArchiveBehavior(
 }
 
 /**
+ * Whether a cascaded sub-agent's archive must refuse the "delete" behavior. A caller that lists the
+ * sub-agents it accepts (a forced archive) still refuses one that is not on the list.
+ */
+function forbidsSubagentCheckoutDeletion(
+  options: ArchiveWorkspaceOptions | undefined,
+  subagentId: string
+): boolean {
+  const acknowledged = options?.acknowledgedSubagentCheckoutDeletions;
+  return (
+    options?.forbidWorktreeCheckoutDeletion === true ||
+    (acknowledged != null && !acknowledged.includes(subagentId))
+  );
+}
+
+/**
  * Whether archiving takes the structural mutation gate (#4476): it deletes the managed checkout,
  * or stops or deletes a dedicated Coder workspace (#4871).
  */
@@ -11945,7 +11960,7 @@ export class WorkspaceService
       {
         // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
         // user-facing archive passes none of them.
-        forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
+        forbidWorktreeCheckoutDeletion: forbidsSubagentCheckoutDeletion(options, descendantId),
         refuseLiveUserActivity: options?.refuseLiveUserActivity,
         forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
         worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,

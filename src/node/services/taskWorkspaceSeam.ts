@@ -301,6 +301,13 @@ export interface ArchiveWorkspaceOptions {
    */
   acknowledgedSubagentUntrackedPaths?: Record<string, string[]>;
   /**
+   * The sub-agent workspace IDs whose checkout the "delete" behavior may delete although
+   * forbidWorktreeCheckoutDeletion is off. A forced archive lists them under its locks, so a
+   * sub-agent that appears later (another backend created it) is refused, like the untracked
+   * files nobody acknowledged. Without a list, forbidWorktreeCheckoutDeletion alone decides.
+   */
+  acknowledgedSubagentCheckoutDeletions?: string[];
+  /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
    * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
    * agent-driven archive into an unconfirmed checkout deletion; enforced against the same

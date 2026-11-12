@@ -101,6 +101,7 @@ import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/type
 import type { ProjectsConfig } from "@/common/types/project";
 import {
   describeForcedArchiveLoss,
+  describeForcedLossBeforeFailure,
   forcedArchiveAcknowledgements,
   subagentPathLines,
   type ForcedArchiveLoss,
@@ -247,7 +248,6 @@ const CASCADE_LOSSY_REFUSAL_ADVICE =
 // wrote to the checkout since, so nothing was deleted for it.
 const FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL =
   "The untracked files changed after force listed them, so the archive deleted nothing for this workspace. " +
-  "Sub-agents that were archived before this check stay archived, with the files force listed for them deleted. " +
   "The files now listed in paths would be deleted; archive again with force to delete them.";
 
 const DELETE_CODER_WORKSPACE_ARCHIVE_REFUSAL =
@@ -4876,14 +4876,14 @@ export class WorkspaceTurnManager {
     forcedLoss: ForcedArchiveLoss | undefined
   ): Promise<WorkspaceLifecycleResult> {
     const forced = forcedLoss != null;
-    const acknowledged = forcedLoss != null ? forcedArchiveAcknowledgements(forcedLoss) : undefined;
+    const acknowledged = forcedArchiveAcknowledgements(forcedLoss);
     const result = await this.workspaceService.archiveWhileTaskTreeLocked(
       resolved.workspaceId,
       // Never a caller-supplied acknowledgement (#3950). Without force there is none, so the
       // sink's own rechecks refuse any lossy untracked files, including ones that appeared after
       // the preflight. With force it is exactly the list the preflight made under the locks: a
       // changed set refuses instead of deleting files that nobody listed.
-      acknowledged?.targetPaths,
+      acknowledged.targetPaths,
       // Enforced at the sink: forbidWorktreeCheckoutDeletion / forbidCoderWorkspaceDeletion
       // close the settings-flip races the early behavior checks cannot cover (a forced archive
       // accepts both), refuseLiveUserActivity fails closed (and holds turn admission) if user
@@ -4895,12 +4895,24 @@ export class WorkspaceTurnManager {
         refuseLiveUserActivity: true,
         worktreeArchiveBehaviorOverride: policy.worktreeArchiveBehavior,
         coderWorkspaceArchiveBehaviorOverride: policy.coderArchiveBehavior,
-        ...(acknowledged?.subagentPaths != null
-          ? { acknowledgedSubagentUntrackedPaths: acknowledged.subagentPaths }
-          : {}),
+        ...acknowledged.options,
       }
     );
     return this.archiveSinkResult(resolved, result, forcedLoss);
+  }
+
+  /**
+   * A failed forced archive may have archived sub-agents first, and with them deleted their listed
+   * files and checkouts: say so in the result, because the failure is all the caller reads.
+   */
+  private lossBeforeFailureNote(forcedLoss: ForcedArchiveLoss | undefined): { note?: string } {
+    if (forcedLoss == null) return {};
+    const config = this.config.loadConfigOrDefault();
+    const note = describeForcedLossBeforeFailure(forcedLoss, (workspaceId) => {
+      const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+      return row != null && isWorkspaceArchived(row.archivedAt, row.unarchivedAt);
+    });
+    return note != null ? { note } : {};
   }
 
   private archiveSinkResult(
@@ -4908,15 +4920,23 @@ export class WorkspaceTurnManager {
     result: Awaited<ReturnType<WorkspaceHost["archiveWhileTaskTreeLocked"]>>,
     forcedLoss: ForcedArchiveLoss | undefined
   ): WorkspaceLifecycleResult {
-    if (!result.success) return this.archiveErrorResult(resolved, result.error);
+    if (!result.success) {
+      return {
+        ...this.archiveErrorResult(resolved, result.error),
+        ...this.lossBeforeFailureNote(forcedLoss),
+      };
+    }
     if (result.data.kind === "confirm-lossy-untracked-files") {
-      return this.lossySnapshotArchiveRefusal(
-        resolved,
-        result.data.paths,
-        forcedLoss != null
-          ? FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL
-          : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL
-      );
+      return {
+        ...this.lossySnapshotArchiveRefusal(
+          resolved,
+          result.data.paths,
+          forcedLoss != null
+            ? FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL
+            : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL
+        ),
+        ...this.lossBeforeFailureNote(forcedLoss),
+      };
     }
     return {
       status: "archived",

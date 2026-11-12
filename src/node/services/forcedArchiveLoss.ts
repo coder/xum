@@ -1,4 +1,7 @@
-import type { ArchiveCascadePreflight } from "@/node/services/taskWorkspaceSeam";
+import type {
+  ArchiveCascadePreflight,
+  ArchiveWorkspaceOptions,
+} from "@/node/services/taskWorkspaceSeam";
 
 /**
  * What a forced model-facing archive deletes: the saved state its refusals normally protect.
@@ -26,21 +29,33 @@ export function subagentPathLines(subagents: ArchiveCascadePreflight["subagents"
 }
 
 /**
- * The acknowledgements the sink compares with the files it finds. An empty list acknowledges
- * nothing, the same as no list, so a file that appears after the listing still refuses.
+ * The acknowledgements the sink checks against what it finds. An empty list acknowledges
+ * nothing, the same as no list, so a file that appears after the listing still refuses. The
+ * sub-agent checkouts it may delete are always a list, even an empty one: a sub-agent missing from
+ * it (another backend created it after the listing) is refused.
  */
-export function forcedArchiveAcknowledgements(loss: ForcedArchiveLoss): {
+export function forcedArchiveAcknowledgements(loss: ForcedArchiveLoss | undefined): {
   targetPaths: string[] | undefined;
-  subagentPaths: Record<string, string[]> | undefined;
+  options: Pick<
+    ArchiveWorkspaceOptions,
+    "acknowledgedSubagentUntrackedPaths" | "acknowledgedSubagentCheckoutDeletions"
+  >;
 } {
+  if (loss == null) return { targetPaths: undefined, options: {} };
   return {
     targetPaths: loss.targetPaths.length > 0 ? loss.targetPaths : undefined,
-    subagentPaths:
-      loss.subagents.length > 0
-        ? Object.fromEntries(
-            loss.subagents.map((subagent) => [subagent.workspaceId, subagent.paths])
-          )
-        : undefined,
+    options: {
+      ...(loss.subagents.length > 0
+        ? {
+            acknowledgedSubagentUntrackedPaths: Object.fromEntries(
+              loss.subagents.map((subagent) => [subagent.workspaceId, subagent.paths])
+            ),
+          }
+        : {}),
+      acknowledgedSubagentCheckoutDeletions: loss.deletedSubagentCheckouts.map(
+        (subagent) => subagent.workspaceId
+      ),
+    },
   };
 }
 
@@ -53,12 +68,12 @@ export function describeForcedArchiveLoss(loss: ForcedArchiveLoss): {
   const parts: string[] = [];
   if (paths.length > 0) {
     parts.push(
-      "Force deleted the untracked files listed in paths, because the snapshot archive cannot keep them. A path that starts with a workspace ID belongs to that sub-agent."
+      "Force let the archive delete the untracked files listed in paths, because the snapshot archive cannot keep them. A path that starts with a workspace ID belongs to that sub-agent."
     );
   }
   if (loss.deletedCheckoutPath != null) {
     parts.push(
-      `Force let the "Delete checkout" archive policy delete the checkout at ${loss.deletedCheckoutPath}: uncommitted changes there are gone, and its commits stay on the branch.`
+      `Force let the "Delete checkout" archive policy delete the checkout at ${loss.deletedCheckoutPath}. Uncommitted changes in it are lost once it is deleted, and its commits stay on the branch.`
     );
   }
   if (loss.deletedSubagentCheckouts.length > 0) {
@@ -66,7 +81,7 @@ export function describeForcedArchiveLoss(loss: ForcedArchiveLoss): {
       .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
       .join(", ");
     parts.push(
-      `The same policy deleted the checkouts of the sub-agents archived with it: ${subagents}.`
+      `Force also let that policy delete the checkouts of the sub-agents archived with it: ${subagents}.`
     );
   }
   if (loss.deletedCoderWorkspaceName != null) {
@@ -74,8 +89,33 @@ export function describeForcedArchiveLoss(loss: ForcedArchiveLoss): {
       `Force let the Coder "delete" archive policy delete the dedicated Coder workspace ${loss.deletedCoderWorkspaceName}; unarchive cannot recreate it.`
     );
   }
+  if (parts.length > 0) {
+    // The checkout and Coder deletions run after the archive is saved and are best effort.
+    parts.push("A deletion that failed leaves the path or workspace in place.");
+  }
   return {
     ...(paths.length > 0 ? { paths } : {}),
     ...(parts.length > 0 ? { note: parts.join(" ") } : {}),
   };
+}
+
+/**
+ * What a forced archive had already deleted when it failed part-way: it archives the sub-agents
+ * first, so those it archived before the failure lost their listed files and checkouts. The
+ * target's own state goes only with a successful archive. Undefined when nothing went.
+ */
+export function describeForcedLossBeforeFailure(
+  loss: ForcedArchiveLoss,
+  isArchived: (workspaceId: string) => boolean
+): string | undefined {
+  const files = subagentPathLines(loss.subagents.filter((s) => isArchived(s.workspaceId)));
+  const checkouts = loss.deletedSubagentCheckouts
+    .filter((s) => isArchived(s.workspaceId))
+    .map((s) => `${s.title} (${s.workspaceId})`);
+  const parts = [
+    ...(files.length > 0 ? [`their untracked files (${files.join(", ")})`] : []),
+    ...(checkouts.length > 0 ? [`the checkouts of ${checkouts.join(", ")}`] : []),
+  ];
+  if (parts.length === 0) return undefined;
+  return `The archive failed after it archived some sub-agents. Force had already let it delete ${parts.join(" and ")}.`;
 }

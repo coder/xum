@@ -230,7 +230,7 @@ export const ForcedArchiveReport: Story = {
           workspaceId: "24e33167af",
           displayName: "Fix streaming resume",
           paths: ["scratch/notes.md", "24e33167af-sub: debug.log"],
-          note: 'Force deleted the untracked files listed in paths, because the snapshot archive cannot keep them. A path that starts with a workspace ID belongs to that sub-agent. Force let the "Delete checkout" archive policy delete the checkout at ~/.xum/src/xum/fix-streaming-resume: uncommitted changes there are gone, and its commits stay on the branch.',
+          note: 'Force let the archive delete the untracked files listed in paths, because the snapshot archive cannot keep them. A path that starts with a workspace ID belongs to that sub-agent. Force let the "Delete checkout" archive policy delete the checkout at ~/.xum/src/xum/fix-streaming-resume. Uncommitted changes in it are lost once it is deleted, and its commits stay on the branch. A deletion that failed leaves the path or workspace in place.',
         },
         {
           status: "archived",
@@ -243,7 +243,7 @@ export const ForcedArchiveReport: Story = {
   },
   play: ({ canvasElement }) => {
     const text = canvasElement.textContent ?? "";
-    for (const expected of ["Untracked files deleted", "scratch/notes.md", "debug.log"]) {
+    for (const expected of ["Untracked files not kept", "scratch/notes.md", "debug.log"]) {
       if (!text.includes(expected)) {
         throw new Error(`WorkspaceLifecycle forced archive row did not render ${expected}`);
       }

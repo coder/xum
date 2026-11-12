@@ -304,14 +304,15 @@ function blockedHint(
 }
 
 // An "error" row with paths is the lossy-snapshot refusal (#3950). An "archived" row with paths
-// is a forced archive that already deleted those untracked files.
+// is a forced archive: the snapshot did not keep those untracked files (their removal is best
+// effort, so the label does not claim they are gone).
 function pathsLabel(status: TaskWorkspaceLifecycleStatus): string {
   switch (status) {
     case "requires_confirmation":
     case "error":
       return "Untracked files that would be lost";
     case "archived":
-      return "Untracked files deleted";
+      return "Untracked files not kept";
     default:
       return "Paths";
   }

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   describeForcedArchiveLoss,
+  describeForcedLossBeforeFailure,
   forcedArchiveAcknowledgements,
   type ForcedArchiveLoss,
 } from "./forcedArchiveLoss";
@@ -24,7 +25,10 @@ describe("forcedArchiveAcknowledgements", () => {
       )
     ).toEqual({
       targetPaths: ["a.txt", "b.txt"],
-      subagentPaths: { "sub-1": ["x.txt"], "sub-2": ["y.txt", "z.txt"] },
+      options: {
+        acknowledgedSubagentUntrackedPaths: { "sub-1": ["x.txt"], "sub-2": ["y.txt", "z.txt"] },
+        acknowledgedSubagentCheckoutDeletions: [],
+      },
     });
   });
 
@@ -36,13 +40,37 @@ describe("forcedArchiveAcknowledgements", () => {
           subagents: [{ workspaceId: "sub-1", title: "One", paths: ["x.txt"] }],
         })
       )
-    ).toEqual({ targetPaths: ["a.txt"], subagentPaths: { "sub-1": ["x.txt"] } });
+    ).toEqual({
+      targetPaths: ["a.txt"],
+      options: {
+        acknowledgedSubagentUntrackedPaths: { "sub-1": ["x.txt"] },
+        acknowledgedSubagentCheckoutDeletions: [],
+      },
+    });
+  });
+
+  test("lists the sub-agents whose checkout may be deleted, so a later one is refused", () => {
+    expect(
+      forcedArchiveAcknowledgements(
+        loss({ deletedSubagentCheckouts: [{ workspaceId: "sub-1", title: "One" }] })
+      )
+    ).toEqual({
+      targetPaths: undefined,
+      options: { acknowledgedSubagentCheckoutDeletions: ["sub-1"] },
+    });
   });
 
   test("acknowledges nothing when nothing was listed, so the sink refuses any file it finds", () => {
     expect(forcedArchiveAcknowledgements(loss())).toEqual({
       targetPaths: undefined,
-      subagentPaths: undefined,
+      options: { acknowledgedSubagentCheckoutDeletions: [] },
+    });
+  });
+
+  test("passes no acknowledgement for an archive that is not forced", () => {
+    expect(forcedArchiveAcknowledgements(undefined)).toEqual({
+      targetPaths: undefined,
+      options: {},
     });
   });
 });
@@ -86,5 +114,44 @@ describe("describeForcedArchiveLoss", () => {
     expect(described.note).toContain("/src/repo/feature");
     expect(described.note).toContain("One (sub-1)");
     expect(described.note).toContain("xum-box-7");
+  });
+});
+
+describe("describeForcedLossBeforeFailure", () => {
+  const forced = loss({
+    targetPaths: ["own.txt"],
+    subagents: [
+      { workspaceId: "sub-1", title: "One", paths: ["x.txt"] },
+      { workspaceId: "sub-2", title: "Two", paths: ["y.txt"] },
+    ],
+    deletedSubagentCheckouts: [
+      { workspaceId: "sub-1", title: "One" },
+      { workspaceId: "sub-3", title: "Three" },
+    ],
+    deletedCheckoutPath: "/src/repo/target",
+    deletedCoderWorkspaceName: "xum-box-7",
+  });
+
+  test("reports nothing when no sub-agent was archived before the failure", () => {
+    expect(describeForcedLossBeforeFailure(forced, () => false)).toBeUndefined();
+  });
+
+  test("names the files and checkouts of the sub-agents that were archived, not the target's", () => {
+    const note = describeForcedLossBeforeFailure(forced, (id) => id === "sub-1");
+
+    expect(note).toContain("sub-1: x.txt");
+    expect(note).toContain("One (sub-1)");
+    expect(note).not.toContain("sub-2");
+    expect(note).not.toContain("sub-3");
+    expect(note).not.toContain("own.txt");
+    expect(note).not.toContain("/src/repo/target");
+    expect(note).not.toContain("xum-box-7");
+  });
+
+  test("names a sub-agent whose checkout alone went", () => {
+    const note = describeForcedLossBeforeFailure(forced, (id) => id === "sub-3");
+
+    expect(note).toContain("Three (sub-3)");
+    expect(note).not.toContain("x.txt");
   });
 });
