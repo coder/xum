@@ -160,6 +160,11 @@ jobs:
               - 'scripts/perf/fixtures/neutralSeed/**'
               - 'scripts/perf/serverToken.ts'
               - 'scripts/precompress-static.ts'
+              # The layout audit that HTML artifact publishes run (its script is a tracked,
+              # generated string) and the fixture pages it is proved on.
+              - 'src/node/services/layoutAudit/layoutAuditPageScript.generated.ts'
+              - 'tests/layoutAudit/**'
+              - 'tests/fixtures/layout-audit/**'
               - 'scripts/stamp-service-worker.ts'
               - '.github/workflows/pr.yml'
               - '.github/actions/setup-xum/**'
@@ -194,6 +199,7 @@ jobs:
               - 'scripts/generate-builtin-skills.sh'
               - 'scripts/gen_builtin_skills.ts'
               - 'scripts/gen_workflow_runtime_sources.ts'
+              - 'scripts/gen_layout_audit_script.ts'
               - 'scripts/precompress-static.ts'
               - 'scripts/stamp-service-worker.ts'
               - 'scripts/perf/firstLoadJs.ts'
@@ -917,6 +923,8 @@ jobs:
     # It does not wait for `tests`: index.html, public/ and patches/ build the page too and are in
     # neither the src nor the config filter, so a PR that changes only them has tests false.
     # Like `tests`, it skips the push that the merge queue's own merge makes on main.
+    # It also runs the HTML artifact layout audit over its fixture pages (make
+    # test-layout-audit-browser), because this job already sets up Playwright's Chromium.
     name: Test / Phone chrome
     # Five runs took 2 min 13 s to 2 min 32 s (the build is 1 of those minutes). 15 minutes is about
     # 6 times the longest, and a job that hangs holds a runner until GitHub's 6 h limit without it.
@@ -942,6 +950,9 @@ jobs:
       # says. These are the build prerequisites of its sibling generate-phone-chrome.
       - run: make build-main build-renderer build-static
       - run: make check-phone-chrome
+      # The HTML artifact layout audit, as shipped, over the lavish-axi fixture pages at 390, 1440
+      # and 768 px, in the Chromium that setup-playwright installed (it needs no build).
+      - run: make test-layout-audit-browser
 
   bugbash-sandbox:
     # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,

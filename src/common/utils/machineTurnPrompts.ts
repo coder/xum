@@ -92,7 +92,20 @@ You ended your turn without a status update, and the status page the user sees i
 
 const STATUS_PAGE_TURN_END_NUDGES = [STATUS_PAGE_TURN_END_NUDGE, STATUS_PAGE_AGENT_TURN_END_NUDGE];
 
-/** Joins Xum's turn-end nudges (TODO first, then the status page) into one continuation. */
+/**
+ * The turn-end layout nudge. Once a turn ends, Xum audits every published HTML artifact that
+ * changed since its last audit (layoutAudit/turnEndLayoutAudit.ts), and sends this prompt as a
+ * turn.stop continuation, at most once per user turn, only when a page has an issue that no
+ * publish result has listed yet. Constant, like the other nudges: the issue text comes from the
+ * page, so no path, selector or count of it may come back as a user row. A publish result
+ * carries the issues, and commits them to the fix-loop memory, so the next turn end stays silent
+ * for them.
+ */
+export const LAYOUT_TURN_END_NUDGE = `<notification>
+You ended your turn, but Xum checked the layout of a published HTML artifact that changed since you last published it and found an issue that no publish result has shown you. Publish each HTML artifact that changed since you last published it again with the artifact tool: its result lists the layout issues. Fix the ones that matter and publish again to confirm. Do not redo work you already did.
+</notification>`;
+
+/** Joins Xum's turn-end nudges (TODO, status page, then layout) into one continuation. */
 export const TURN_END_NUDGE_SEPARATOR = "\n\n";
 
 /**
@@ -113,6 +126,31 @@ export function classifyStatusPageTurnEndNudgePrompt(
     classifyTodoTurnEndNudgePrompt(text.slice(0, -statusSuffix.length)) === "current"
     ? "todo-and-status-page"
     : null;
+}
+
+/** Which nudges a turn-end layout nudge row was joined after, in one continuation. */
+export interface LayoutTurnEndNudgeParts {
+  todo: boolean;
+  statusPage: boolean;
+}
+
+/**
+ * Whether `text` is exactly the turn-end layout nudge, alone or after the TODO and/or status page
+ * nudge in one continuation (the order they are joined in), and which of those it follows, so the
+ * collapsed row can name every action the hidden prompt asked for. Any other text, a plugin's
+ * prompt included, is null: that row keeps its full bubble.
+ */
+export function classifyLayoutTurnEndNudgePrompt(text: string): LayoutTurnEndNudgeParts | null {
+  if (text === LAYOUT_TURN_END_NUDGE) return { todo: false, statusPage: false };
+  const suffix = `${TURN_END_NUDGE_SEPARATOR}${LAYOUT_TURN_END_NUDGE}`;
+  if (!text.endsWith(suffix)) return null;
+  const before = text.slice(0, -suffix.length);
+  if (classifyTodoTurnEndNudgePrompt(before) === "current") {
+    return { todo: true, statusPage: false };
+  }
+  const statusPage = classifyStatusPageTurnEndNudgePrompt(before);
+  if (statusPage == null) return null;
+  return { todo: statusPage === "todo-and-status-page", statusPage: true };
 }
 
 const PROMPT_OPENINGS_BY_KIND: ReadonlyArray<{
