@@ -29,7 +29,7 @@ async function exerciseSettings(canvasElement: HTMLElement) {
 
 export const Desktop: AppStory = {
   globals: { viewport: { value: "desktop", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["desktop"] } } },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["desktop"] } } },
   render: () => <AppWithMocks setup={setup} />,
   play: async ({ canvasElement }) => exerciseSettings(canvasElement),
 };
@@ -37,6 +37,6 @@ export const Desktop: AppStory = {
 export const Phone: AppStory = {
   ...Desktop,
   globals: { viewport: { value: "mobile1", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
   play: async ({ canvasElement }) => exerciseSettings(canvasElement),
 };

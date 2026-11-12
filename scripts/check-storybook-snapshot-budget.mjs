@@ -57,8 +57,10 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // +2 snapshots: the Claude Code marketplace list of the Add panel (PluginsSettingsSection.stories.tsx
 // AddPluginMarketplace, laptop in dark, and AddPluginMarketplacePhoneViewport, phone in dark; no
 // other story shows the list).
-const MAX_SNAPSHOTS = 690;
-const MAX_SNAPSHOT_ENABLED_FILES = 120;
+// +2 snapshots / +1 file: Voice settings need desktop and phone coverage; no existing story shows local model controls.
+// App.voiceSettings.stories.tsx uses dark-only variants to avoid duplicate theme coverage.
+const MAX_SNAPSHOTS = 692;
+const MAX_SNAPSHOT_ENABLED_FILES = 121;
 
 const { values } = parseArgs({
   options: {
