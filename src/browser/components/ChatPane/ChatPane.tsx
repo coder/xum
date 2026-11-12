@@ -62,6 +62,7 @@ import { TRANSCRIPT_MAX_MOUNTED_ROWS } from "@/common/constants/ui";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
+  useBashSandboxApprovalToolCallIds,
   useWorkspaceAggregator,
   useWorkspaceState,
   useWorkspaceUsage,
@@ -670,11 +671,13 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [workspaceId, latestMessageId, onOpenTerminal]
   );
 
+  const approvalToolCallIds = useBashSandboxApprovalToolCallIds(workspaceId);
   const transcriptBundles = useTranscriptBundles({
     workspaceId,
     messages: deferredMessages,
     transcriptDensity,
     isTurnActive: isStreamStarting || canInterrupt,
+    approvalToolCallIds,
   });
 
   // After the bundles: bash_output poll groups stop at work-line boundaries.

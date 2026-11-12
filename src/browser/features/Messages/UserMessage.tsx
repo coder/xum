@@ -302,7 +302,6 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   const syntheticClassName = cn(
     className,
     isSynthetic && !subagentReport && !subagentFailure && "opacity-70",
-    (subagentReport ?? subagentFailure) && "ml-0 w-full",
     (isGoalContinuation || isBudgetLimitWrapup) && "italic"
   );
 
@@ -342,7 +341,9 @@ export const UserMessage: React.FC<UserMessageProps> = ({
       message={message}
       buttons={buttons}
       className={syntheticClassName}
-      variant="user"
+      // A sub-agent's report or failure reaches the model as a prompt, but the user did not
+      // write it: it is a step of the work, and a user bubble made it the loudest row there.
+      variant={subagentReport != null || subagentFailure != null ? "step" : "user"}
     >
       {renderedContent}
     </MessageWindow>

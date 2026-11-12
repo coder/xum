@@ -125,12 +125,17 @@ describe("TranscriptBundleRows", () => {
     };
   }
 
-  function Transcript(props: { messages: DisplayedMessage[]; isTurnActive: boolean }) {
+  function Transcript(props: {
+    messages: DisplayedMessage[];
+    isTurnActive: boolean;
+    approvalToolCallIds?: ReadonlySet<string>;
+  }) {
     const bundles = useTranscriptBundles({
       workspaceId: "ws",
       messages: props.messages,
       transcriptDensity: "hyper",
       isTurnActive: props.isTurnActive,
+      approvalToolCallIds: props.approvalToolCallIds,
     });
     return (
       <TranscriptBundleRows
@@ -169,9 +174,22 @@ describe("TranscriptBundleRows", () => {
     expect(steps.contains(view.getByTestId("operational-bundle"))).toBe(true);
   });
 
-  test("a live turn shows its latest step on its own, without the run it belongs to", () => {
+  test("a live turn mounts no step under its closed line, which names the step instead", () => {
     const messages = [say("narration"), read("read-1"), read("read-2", "executing")];
     const view = render(<Transcript messages={messages} isTurnActive />);
+
+    expect(shownRows(view.container)).toEqual(["narration"]);
+    expect(view.queryByTestId("operational-bundle")).toBeNull();
+    const line = view.getByTestId("work-bundle");
+    expect(line.getAttribute("aria-expanded")).toBe("false");
+    expect(line.textContent).toContain("Reading a file");
+  });
+
+  test("a call that waits for approval shows on its own, without the run it belongs to", () => {
+    const messages = [say("narration"), read("read-1"), read("read-2", "executing")];
+    const view = render(
+      <Transcript messages={messages} isTurnActive approvalToolCallIds={new Set(["read-2"])} />
+    );
 
     expect(shownRows(view.container)).toEqual(["narration", "read-2"]);
     expect(view.queryByTestId("operational-bundle")).toBeNull();

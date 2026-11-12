@@ -42,6 +42,11 @@ function formatWorkLine(item: WorkBundleInfo, liveDurationMs: number | undefined
     durationMs === undefined || (!isLive && durationMs < 1000)
       ? verb
       : `${verb} for ${formatElapsed(durationMs)}`;
+  // A live turn says what it is doing right now. The text changes in place: no row mounts
+  // under the line for a step and unmounts for the next one.
+  if (isLive) {
+    return item.liveStep === undefined ? worked : `${worked} · ${item.liveStep}`;
+  }
   // How long says little about a turn; that it changed files is what the user must not miss.
   if (item.editedFileCount === 0) {
     return worked;
@@ -56,7 +61,8 @@ interface WorkBundleMessageProps {
 }
 
 /**
- * The one line a turn's work folds into at compact density: "Worked for 2m 14s · edited 2 files".
+ * The one line a turn's work folds into at compact density: "Worked for 2m 14s · edited 2 files",
+ * or "Working for 42s · Running the unit tests" while the turn runs.
  * The label starts where the reply's text starts and the chevron follows it, the way Codex writes
  * a finished turn. A leading chevron indented every label past the reply and put a column of
  * chevrons down the page.

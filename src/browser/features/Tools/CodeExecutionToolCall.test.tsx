@@ -26,6 +26,12 @@ function Providers(props: { children: ReactNode }) {
 }
 
 type ScriptProps = Partial<ComponentProps<typeof CodeExecutionToolCall>>;
+type ScriptResult = NonNullable<ScriptProps["result"]>;
+
+/** A settled script's result: the fields under test, with the bookkeeping ones filled in. */
+function scriptResult(fields: Partial<ScriptResult> & Pick<ScriptResult, "success">): ScriptResult {
+  return { toolCalls: [], consoleOutput: [], duration_ms: 5, ...fields };
+}
 
 function renderScript(props: ScriptProps) {
   return render(
@@ -67,19 +73,23 @@ afterEach(() => {
 
 describe("CodeExecutionToolCall result view", () => {
   test("shows the return value as text, or says that there is none", () => {
-    const withObject = renderScript({ result: { success: true, result: { files: 2 } } });
+    const withObject = renderScript({
+      result: scriptResult({ success: true, result: { files: 2 } }),
+    });
     fireEvent.click(withObject.getByRole("button", { name: "Result" }));
     expect(withObject.container.textContent).toContain('"files": 2');
     withObject.unmount();
 
     // A string is shown as it is, not as a JSON string literal.
-    const withString = renderScript({ result: { success: true, result: "all done" } });
+    const withString = renderScript({
+      result: scriptResult({ success: true, result: "all done" }),
+    });
     fireEvent.click(withString.getByRole("button", { name: "Result" }));
     expect(withString.getByText("all done")).toBeDefined();
     expect(withString.container.textContent).not.toContain('"all done"');
     withString.unmount();
 
-    const withNothing = renderScript({ result: { success: true, result: undefined } });
+    const withNothing = renderScript({ result: scriptResult({ success: true }) });
     fireEvent.click(withNothing.getByRole("button", { name: "Result" }));
     expect(withNothing.getByText("No return value")).toBeDefined();
   });
@@ -87,7 +97,7 @@ describe("CodeExecutionToolCall result view", () => {
   test("a failed script opens on its error without a click", () => {
     const view = renderScript({
       status: "failed",
-      result: { success: false, error: "ReferenceError: run is not defined" },
+      result: scriptResult({ success: false, error: "ReferenceError: run is not defined" }),
     });
     expect(view.getByText("ReferenceError: run is not defined")).toBeDefined();
     expect(view.getByRole("button", { name: "Result" }).getAttribute("aria-pressed")).toBe("true");
@@ -121,7 +131,7 @@ describe("CodeExecutionToolCall nested calls", () => {
   test("shows the latest calls, and the earlier ones on request", () => {
     const total = COLLAPSED_NESTED_CALL_LIMIT + 2;
     const calls = Array.from({ length: total }, (_, index) => bashCall(index + 1));
-    const view = renderScript({ nestedCalls: calls, result: { success: true, result: undefined } });
+    const view = renderScript({ nestedCalls: calls, result: scriptResult({ success: true }) });
     openScript(view);
 
     const shownSteps = () =>
@@ -141,7 +151,7 @@ describe("CodeExecutionToolCall nested calls", () => {
   test("offers no cut when every call already shows, and counts one earlier call in the singular", () => {
     const few = renderScript({
       nestedCalls: Array.from({ length: COLLAPSED_NESTED_CALL_LIMIT }, (_, i) => bashCall(i + 1)),
-      result: { success: true, result: undefined },
+      result: scriptResult({ success: true }),
     });
     openScript(few);
     expect(few.queryByRole("button", { name: /earlier call/ })).toBeNull();
@@ -151,7 +161,7 @@ describe("CodeExecutionToolCall nested calls", () => {
       nestedCalls: Array.from({ length: COLLAPSED_NESTED_CALL_LIMIT + 1 }, (_, i) =>
         bashCall(i + 1)
       ),
-      result: { success: true, result: undefined },
+      result: scriptResult({ success: true }),
     });
     openScript(oneMore);
     expect(oneMore.getByRole("button", { name: "Show 1 earlier call" })).toBeDefined();
@@ -162,16 +172,15 @@ describe("CodeExecutionToolCall carrier attachments", () => {
   test("opens a script that carries attachments and shows each kind", () => {
     const view = renderScript({
       nestedCalls: [bashCall(1)],
-      result: {
+      result: scriptResult({
         success: true,
-        result: undefined,
         attachments: [
           { type: "media", mediaType: "image/png", data: PNG_DATA, filename: "shot.png" },
           // The gallery refuses a PDF: it gets a download card.
           { type: "media", mediaType: "application/pdf", data: "JVBERi0=", filename: "report.pdf" },
           { type: "display_file", mediaType: "text/csv", data: "YSxi", filename: "data.csv" },
         ],
-      },
+      }),
     });
 
     // Attachments are something to look at, so the script is open without a click.
@@ -184,12 +193,14 @@ describe("CodeExecutionToolCall carrier attachments", () => {
   });
 
   test("ignores malformed attachments from replayed history", () => {
-    const malformed = ["not a part", { type: "media" }, null] as unknown as NonNullable<
-      ScriptProps["result"]
-    >["attachments"];
+    const malformed = [
+      "not a part",
+      { type: "media" },
+      null,
+    ] as unknown as ScriptResult["attachments"];
     const view = renderScript({
       nestedCalls: [bashCall(1)],
-      result: { success: true, result: undefined, attachments: malformed },
+      result: scriptResult({ success: true, attachments: malformed }),
     });
     // Nothing to show, so the routine script stays one closed line.
     expect(view.getByRole("button", { name: /^Script/ }).getAttribute("aria-expanded")).toBe(
@@ -199,11 +210,10 @@ describe("CodeExecutionToolCall carrier attachments", () => {
 
     const notAnArray = renderScript({
       nestedCalls: [bashCall(1)],
-      result: {
+      result: scriptResult({
         success: true,
-        result: undefined,
-        attachments: "oops" as unknown as NonNullable<ScriptProps["result"]>["attachments"],
-      },
+        attachments: "oops" as unknown as ScriptResult["attachments"],
+      }),
     });
     expect(notAnArray.getAllByRole("button", { name: /^Script/ })).toHaveLength(2);
   });

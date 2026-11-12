@@ -76,6 +76,31 @@ describe("WorkBundleMessage", () => {
     expect(view.getByText(/^Working for \d+s$/)).toBeDefined();
   });
 
+  test("a live turn names its current step, and not yet the files it edited", () => {
+    const live: WorkBundleInfo = {
+      ...item,
+      state: "live",
+      startedAtMs: undefined,
+      durationMs: undefined,
+      editedFileCount: 2,
+      liveStep: "Running the unit tests",
+    };
+    const view = render(
+      <WorkBundleMessage item={live} expanded={false} onToggle={() => undefined} />
+    );
+    expect(view.getByText("Working · Running the unit tests")).toBeDefined();
+
+    // The same line once the turn is done: what it did, not what it was doing.
+    view.rerender(
+      <WorkBundleMessage
+        item={{ ...live, state: "settled", liveStep: undefined, durationMs: 134_000 }}
+        expanded={false}
+        onToggle={() => undefined}
+      />
+    );
+    expect(view.getByText("Worked for 2m 14s · edited 2 files")).toBeDefined();
+  });
+
   test("drops a duration that is unknown or too short to read", () => {
     const view = render(
       <WorkBundleMessage

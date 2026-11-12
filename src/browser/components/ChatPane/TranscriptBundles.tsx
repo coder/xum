@@ -39,8 +39,10 @@ export function useTranscriptBundles(params: {
   messages: DisplayedMessage[];
   transcriptDensity: TranscriptDensity;
   isTurnActive: boolean;
+  /** Tool calls that wait for the user's approval; their rows never fold (hosts that have any). */
+  approvalToolCallIds?: ReadonlySet<string>;
 }): TranscriptBundles {
-  const { workspaceId, messages, transcriptDensity, isTurnActive } = params;
+  const { workspaceId, messages, transcriptDensity, isTurnActive, approvalToolCallIds } = params;
 
   // Expansion choices belong to one workspace's transcript: the overrides are stored with their
   // workspace and read as empty for any other, so a switch never renders the previous
@@ -66,9 +68,9 @@ export function useTranscriptBundles(params: {
   const workBundleInfos = useMemo(
     () =>
       transcriptDensity === "hyper"
-        ? computeWorkBundleInfos(messages, { isTurnActive })
+        ? computeWorkBundleInfos(messages, { isTurnActive, approvalToolCallIds })
         : undefined,
-    [isTurnActive, messages, transcriptDensity]
+    [approvalToolCallIds, isTurnActive, messages, transcriptDensity]
   );
 
   const operationalBundleInfos = useMemo(
@@ -155,8 +157,8 @@ export function TranscriptBundleRows(props: {
     const index = props.indexOffset + revealOffset;
     const rowKey = `${workspaceId}:${msg.id}`;
     const workBundle = workBundleInfos?.[index];
-    // A work line is closed until the user opens it. A live turn is not opened for them: it
-    // shows its latest step through the fold instead (see computeWorkBundleInfos).
+    // A work line is closed until the user opens it. A live turn is not opened for them: its
+    // line names its latest step instead (see computeWorkBundleInfos).
     const isWorkBundleExpanded =
       workBundle !== undefined && (workBundleExpansionOverrides.get(workBundle.key) ?? false);
     // The work line sits above the stretch's first row. ChatPane only cuts the tail-first reveal

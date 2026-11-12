@@ -32,20 +32,30 @@ const QUIET_META_ROW_CLASS =
   "opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100";
 
 /**
- * A prompt's row sits beside its bubble (to the left, on the bubble's line), so a hidden row
- * reserves no height and the prompt stays next to the work it started. It drops below the bubble
- * when the two do not fit on one line. It must never float over the row below: when one prompt
- * follows another, that row is the next prompt's bubble, which then takes the clicks meant for
- * Edit. On touch the row is always shown, so it keeps its own line below the bubble.
+ * A prompt's row sits under its bubble, at the bubble's right edge, like a reply's row sits
+ * under the reply. Beside the bubble (to its left, where it was for a while to save the line)
+ * it read as a stray label in the middle of the page, far from the message it belongs to.
+ *
+ * The row is in the flow, so it never floats over the row below: when one prompt follows
+ * another, that row is the next prompt's bubble, which would take the clicks meant for Edit.
+ * A hidden row still takes its line, so the block gives part of it back with a negative margin:
+ * the prompt stays near the work it started. The margin is no larger than the smallest top
+ * margin a transcript row has, so the row never overlaps what follows. On touch the row is
+ * always shown and keeps its full line.
  */
 const USER_BLOCK_CLASS = cn(
-  "ml-auto w-fit max-w-full flex-row-reverse flex-wrap items-center gap-x-2 gap-y-0.5",
-  "[@media(hover:none)]:flex-col [@media(hover:none)]:flex-nowrap [@media(hover:none)]:items-stretch [@media(hover:none)]:gap-y-2"
+  "ml-auto w-fit max-w-full flex-col items-end gap-y-0.5 -mb-2",
+  "[@media(hover:none)]:items-stretch [@media(hover:none)]:gap-y-2 [@media(hover:none)]:mb-1"
 );
 
 interface MessageWindowProps {
   label: ReactNode;
-  variant?: "assistant" | "user";
+  /**
+   * "step" is a row the machine wrote in the middle of the agent's work (a sub-agent's report):
+   * it lies where a reply lies (left, full width, no bubble), since the user did not say it,
+   * and keeps a prompt's action row, which is there whenever the row is.
+   */
+  variant?: "assistant" | "user" | "step";
   message: MuxMessage | DisplayedMessage | QueuedMessage;
   buttons?: ButtonConfig[];
   children: ReactNode;
@@ -83,17 +93,19 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
     !message.isPartial &&
     !("isStreaming" in message && message.isStreaming);
 
-  const showMetaRow = variant === "user" || showAssistantMetaRow;
+  const showMetaRow = variant !== "assistant" || showAssistantMetaRow;
 
   const isLatestRow = useIsLatestRow(message.id);
-  const isQuietMetaRow = !isShowingJson && (variant === "user" || !isLatestRow);
+  const isQuietMetaRow = !isShowingJson && (variant !== "assistant" || !isLatestRow);
 
   return (
     <div
       className={cn(
         "group/message mt-4 mb-1 flex relative isolate",
         variant === "user" && USER_BLOCK_CLASS,
-        variant === "assistant" && "flex-col w-full text-foreground",
+        variant !== "user" && "flex-col w-full text-foreground",
+        // A step keeps the pitch of the tool rows it sits among.
+        variant === "step" && "my-2",
         // On touch the row always shows, so the gap to the next turn starts under it, not
         // under the reply: without more room there the next prompt reads as part of this turn.
         showAssistantMetaRow && "[@media(hover:none)]:mb-4",
@@ -106,7 +118,7 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
         className={cn(
           variant === "user" &&
             "min-w-0 bg-[var(--color-user-surface)] border border-[var(--color-user-border)] rounded-lg px-3 py-2 overflow-x-auto shadow-sm",
-          variant === "assistant" && "px-1 py-1"
+          variant !== "user" && "px-1 py-1"
         )}
       >
         {backgroundEffect}
@@ -124,7 +136,7 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
       </div>
       {showMetaRow && (
         <MessageMetaRow
-          variant={variant}
+          variant={variant === "user" ? "user" : "assistant"}
           quiet={isQuietMetaRow}
           buttons={buttons}
           jsonToggle={

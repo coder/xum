@@ -21,7 +21,7 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
         aria-hidden="true"
         className={cn("mt-0.5 size-4 shrink-0", isSuperseded ? "text-muted" : "text-error")}
       />
-      <div className="min-w-0 flex-1 text-sm text-[var(--color-user-text)]">
+      <div className="min-w-0 flex-1 text-sm">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
           <span className="font-medium">
             {isSuperseded
@@ -44,7 +44,7 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
             <ChevronRight aria-hidden="true" className="size-3 shrink-0 group-open:rotate-90" />
             Technical details
           </summary>
-          <div className="mt-2 border-t border-[var(--color-user-border)] pt-2">
+          <div className="mt-2 border-border border-t pt-2">
             <dl className="space-y-1 text-xs">
               {metadata.map(([label, value]) =>
                 value ? (
