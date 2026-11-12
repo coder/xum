@@ -14,20 +14,24 @@ export const COLLAPSED_NESTED_CALL_LIMIT = 4;
 
 /**
  * The nested calls a script shows: all of them once the user asks, else the latest few plus every
- * earlier call that has not finished. An unfinished call may be waiting for the user (its row
- * holds the approval card and its shortcuts), so the cut never hides one. `hiddenCount` is how
- * many calls sit behind "Show N earlier".
+ * earlier call the cut must not hide:
+ *  - A call that has not finished. It may be waiting for the user (its row holds the approval
+ *    card and its shortcuts).
+ *  - A call that carries an MCP App view. The view is something the user works in, and cutting
+ *    its row while the script makes more calls would unmount a view the user has open. The work
+ *    line keeps such a script in the conversation for the same reason (see showsAppView).
+ * `hiddenCount` is how many calls sit behind "Show N earlier".
  */
-export function selectVisibleNestedCalls<T extends { state: string }>(
-  calls: T[],
-  showAll: boolean
-): { visible: T[]; hiddenCount: number } {
+export function selectVisibleNestedCalls<
+  T extends { state: string; mcpServer?: { app?: unknown } },
+>(calls: T[], showAll: boolean): { visible: T[]; hiddenCount: number } {
   const firstRecent = Math.max(0, calls.length - COLLAPSED_NESTED_CALL_LIMIT);
   if (showAll || firstRecent === 0) {
     return { visible: calls, hiddenCount: 0 };
   }
   const visible = calls.filter(
-    (call, index) => index >= firstRecent || call.state === "input-available"
+    (call, index) =>
+      index >= firstRecent || call.state === "input-available" || call.mcpServer?.app != null
   );
   return { visible, hiddenCount: calls.length - visible.length };
 }

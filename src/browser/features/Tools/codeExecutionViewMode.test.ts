@@ -56,6 +56,29 @@ describe("selectVisibleNestedCalls", () => {
   });
 });
 
+describe("selectVisibleNestedCalls with MCP App views", () => {
+  const done = (id: string) => ({ id, state: "output-available" });
+
+  // The user may have the view open while the script makes more calls: cutting its row would
+  // unmount the view.
+  test("never cuts an earlier call that carries an MCP App view", () => {
+    const calls = [
+      done("a"),
+      { ...done("board"), mcpServer: { app: { resourceUri: "ui://board" } } },
+      // A plain MCP call has no view to keep.
+      { ...done("c"), mcpServer: {} },
+      done("d"),
+      done("e"),
+      done("f"),
+      done("g"),
+    ];
+
+    const cut = selectVisibleNestedCalls(calls, false);
+    expect(cut.visible.map((call) => call.id)).toEqual(["board", "d", "e", "f", "g"]);
+    expect(cut.hiddenCount).toBe(2);
+  });
+});
+
 describe("resolveCodeExecutionViewMode", () => {
   test("uses the code view immediately for successful completed executions with no nested tools", () => {
     expect(

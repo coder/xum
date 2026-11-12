@@ -1067,16 +1067,30 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   return (
     <>
       <ToolContainer expanded={expanded}>
-        <ToolHeader onClick={toggleExpanded}>
-          <ExpandIcon expanded={expanded} />
-          {/* Set like the work lines around it (prose font): a plan is part of the conversation. */}
-          <ToolName className={FOLDED_ROW_TEXT_CLASS}>Plan</ToolName>
-          {/* A folded plan is its title: the card that carries the title is out of sight. */}
-          {!expanded && (
-            <span className={cn("text-text min-w-0 truncate", FOLDED_ROW_TEXT_CLASS)}>
-              {planTitle}
-            </span>
-          )}
+        <ToolHeader className="cursor-default">
+          {/* The disclosure is a real button. An earlier plan folds by itself, and its body is
+              not mounted while folded, so without a focusable control a keyboard user could not
+              read it again (Tab, then Enter or Space). It fills the row, so a click anywhere on
+              the header still toggles. */}
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={toggleExpanded}
+            className={cn(
+              "flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-sm text-left",
+              "focus-visible:outline-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+            )}
+          >
+            <ExpandIcon expanded={expanded} />
+            {/* Set like the work lines around it (prose font): a plan is part of the conversation. */}
+            <ToolName className={FOLDED_ROW_TEXT_CLASS}>Plan</ToolName>
+            {/* A folded plan is its title: the card that carries the title is out of sight. */}
+            {!expanded && (
+              <span className={cn("text-text min-w-0 truncate", FOLDED_ROW_TEXT_CLASS)}>
+                {planTitle}
+              </span>
+            )}
+          </button>
           <StatusIndicator status={status}>{statusDisplay}</StatusIndicator>
         </ToolHeader>
 

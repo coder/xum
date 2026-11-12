@@ -518,6 +518,22 @@ describe("ProposePlanToolCall", () => {
     expect(view.container.querySelector("pre")).toBeNull();
   });
 
+  // An earlier plan folds by itself and its body is not mounted while folded, so its header must
+  // be a control a keyboard user can reach and operate, not a clickable div.
+  test("an earlier plan folds behind a button that opens it again", () => {
+    const view = renderCompletedPlan({ isLatest: false });
+    const quoteRoots = () => view.container.querySelectorAll("[data-transcript-quote-root]");
+
+    const disclosure = view.getByRole("button", { name: /^Plan/ });
+    expect(disclosure.tagName).toBe("BUTTON");
+    expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+    expect(quoteRoots()).toHaveLength(0);
+
+    fireEvent.click(disclosure);
+    expect(disclosure.getAttribute("aria-expanded")).toBe("true");
+    expect(quoteRoots()).toHaveLength(1);
+  });
+
   test("exposes the plan body as an explicit transcript quote root", () => {
     expectSingleQuoteRoot(renderCompletedPlan(), PLAN_CONTENT);
   });
