@@ -283,15 +283,20 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     ]);
   });
 
-  test("a browser that applies another height is not a result either", async () => {
-    // The height decides which controls the user can scroll to and which samples are in view.
-    const { outcomes } = await run({ eval: { 1440: { kind: "pass", viewportHeight: 800 } } });
-    expect(summary(outcomes)).toEqual([
-      "390 complete",
-      "1440 failed wrong-viewport",
-      "768 complete",
-    ]);
-  });
+  // The height decides which controls the user can scroll to and which samples are in view. Both
+  // directions count: a taller window shows more than the audit was asked to judge, a shorter one
+  // less (the 1440 pass is configured at 1000).
+  test.each([800, 1200])(
+    "a browser that applies a height of %i is not a result either",
+    async (viewportHeight) => {
+      const { outcomes } = await run({ eval: { 1440: { kind: "pass", viewportHeight } } });
+      expect(summary(outcomes)).toEqual([
+        "390 complete",
+        "1440 failed wrong-viewport",
+        "768 complete",
+      ]);
+    }
+  );
 
   test("no agent-browser on PATH: nothing runs and there is nothing to close", async () => {
     const { outcomes, fake } = await run({ missing: true });

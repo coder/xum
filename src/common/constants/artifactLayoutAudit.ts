@@ -49,7 +49,7 @@ export const LAYOUT_AUDIT_NOT_CHECKED_REASONS = [
   "script-failed",
   // The pass ran but the page kept animating or changing, so its findings are not trusted.
   "unsettled",
-  // The page reported a different width than the one requested.
+  // The page reported a different width or height than the one requested.
   "wrong-viewport",
 ] as const;
 export type LayoutAuditNotCheckedReason = (typeof LAYOUT_AUDIT_NOT_CHECKED_REASONS)[number];
