@@ -494,6 +494,37 @@ describe("TaskService", () => {
     expect(received).toEqual(warnings);
   });
 
+  test("a forced removal that leaves part of the checkout behind says so instead of claiming a full deletion", async () => {
+    const parentWorkspaceId = "parent-remove-forced-leftover";
+    const childTaskId = "child-remove-forced-leftover";
+    const { childPath, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+
+    const complete = await removeAsModel(childTaskId, "force");
+    assert(complete.success && complete.data.status === "removed", "force must remove the child");
+    const completeReport = complete.data.deletedWork;
+    assert(completeReport != null, "a forced removal of unsaved work reports it");
+    // A complete deletion carries no caveat about work that remains.
+    expect(completeReport).not.toContain("may remain");
+
+    // Forced removal succeeds when the runtime cannot delete everything: it returns warnings.
+    const leftover = "/devcontainer-left-behind was left behind; remove it manually.";
+    const withLeftover: Result<void> & { warnings?: WorkspaceRemoveWarning[] } = {
+      ...Ok(undefined),
+      warnings: [{ kind: "leftover", description: leftover }],
+    };
+    remove.mockImplementation(() => Promise.resolve(withLeftover));
+    const partial = await removeAsModel(childTaskId, "force");
+    assert(partial.success && partial.data.status === "removed", "force still removes the row");
+    // The report keeps what was found, names what remains, and lists the same paths.
+    expect(partial.data.deletedWork).toContain(completeReport);
+    expect(partial.data.deletedWork).toContain(leftover);
+    expect(partial.data.paths).toEqual(["notes.txt"]);
+  });
+
   test("the user can preview and then confirm removing a sub-agent the model must not remove (#5106)", async () => {
     const parentWorkspaceId = "parent-remove-user";
     const childTaskId = "child-remove-user";

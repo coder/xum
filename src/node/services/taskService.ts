@@ -497,21 +497,41 @@ function reportInactiveTaskRemoval(
     removal.options?.onRemovalWarnings?.(result.warnings);
   return Ok(
     result.success
-      ? {
-          status: "removed",
-          action: "remove",
-          ...removal.target,
-          ...(removal.forcedDeletion != null
-            ? {
-                deletedWork: removal.forcedDeletion.deletedWork,
-                ...(removal.forcedDeletion.paths.length > 0
-                  ? { paths: removal.forcedDeletion.paths }
-                  : {}),
-              }
-            : {}),
-        }
+      ? describeRemoved(removal, result.warnings)
       : { status: "error", action: "remove", ...removal.target, error: result.error }
   );
+}
+
+/**
+ * The removed result. A forced removal adds what it deleted, and says so when the runtime left
+ * part of the checkout behind (forced removal succeeds then, with warnings): the deleted-work
+ * report must not claim a deletion that did not happen.
+ */
+function describeRemoved(
+  removal: InactiveTaskRemoval,
+  warnings: readonly WorkspaceRemoveWarning[] = []
+): WorkspaceLifecycleResult {
+  const forced = removal.forcedDeletion;
+  return {
+    status: "removed",
+    action: "remove",
+    ...removal.target,
+    ...(forced != null
+      ? {
+          deletedWork: qualifyDeletedWork(forced.deletedWork, warnings),
+          ...(forced.paths.length > 0 ? { paths: forced.paths } : {}),
+        }
+      : {}),
+  };
+}
+
+function qualifyDeletedWork(
+  deletedWork: string,
+  warnings: readonly WorkspaceRemoveWarning[]
+): string {
+  if (warnings.length === 0) return deletedWork;
+  const leftovers = warnings.map((warning) => warning.description).join(" ");
+  return `${deletedWork} Removal did not delete everything, so some of this work may remain: ${leftovers}`;
 }
 
 /** What removing a sub-agent's checkout deletes: one finding, worded for the refusal and the report. */
