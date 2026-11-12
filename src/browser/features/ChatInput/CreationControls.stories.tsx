@@ -308,15 +308,13 @@ export const SshWithoutIsolation: Story = {
     const canvas = within(storyRoot);
     const body = within(document.body);
 
-    // Narrow-layout contract: the chip and "Set as default" stay inside the phone-width frame.
+    // Narrow-layout contract: the chip stays inside the phone-width frame.
     const frame = canvas.getByTestId("isolation-picker-frame").getBoundingClientRect();
     const chip = await canvas.findByTestId("creation-environment", {}, { timeout: 10000 });
     await expect(chip.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
     // Closed, the chip names the host and the shared directory, not "SSH" and "None".
     await expect(chip).toHaveTextContent("devbox.internal");
     await expect(chip).toHaveTextContent("~/src/my-app");
-    const setDefault = canvas.getByRole("button", { name: "Set as default" });
-    await expect(setDefault.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
 
     // The project is trusted but this host directory is not: its own trust is offered, on the
     // page (checked before the panel opens: the panel is modal and hides the page from queries).

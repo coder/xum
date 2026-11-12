@@ -21,7 +21,13 @@ export async function auditWindow(win: BrowserWindow): Promise<LayoutAuditPagePa
     );
     return { ...pass, href };
   } catch {
-    return { complete: false, viewportWidth: win.innerWidth || 0, href, findings: [] };
+    return {
+      complete: false,
+      viewportWidth: win.innerWidth || 0,
+      viewportHeight: win.innerHeight || 0,
+      href,
+      findings: [],
+    };
   }
 }
 

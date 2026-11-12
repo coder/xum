@@ -94,4 +94,68 @@ describe("FilterList", () => {
       .map((option) => option.textContent);
     expect(selected).toEqual(["develop"]);
   });
+
+  describe("rows with a path, a tag, an aside and a separator", () => {
+    const PROJECTS = [
+      { value: "/src/coder", label: "coder", detail: "/src/coder", badge: "pinned" },
+      { value: "/src/docs", label: "docs", detail: "/src/docs" },
+      { value: "scratch", label: "Scratch", aside: "No project", divider: true },
+    ];
+
+    function renderProjects() {
+      const view = render(
+        <FilterList
+          items={PROJECTS}
+          selected="/src/coder"
+          onSelect={() => undefined}
+          label="Select project"
+          placeholder="Find a project…"
+          noun="projects"
+          twoLine
+          footer={<button type="button">Add project…</button>}
+        />
+      );
+      const input = view.getByRole("combobox") as HTMLInputElement;
+      const labels = () =>
+        Array.from(view.container.querySelectorAll("[data-filter-list-label]")).map(
+          (label) => label.textContent
+        );
+      const separators = () =>
+        view.container.querySelectorAll('[role="listbox"] [role="presentation"]');
+      return {
+        view,
+        input,
+        labels,
+        separators,
+        user: userEvent.setup({ document: input.ownerDocument }),
+      };
+    }
+
+    test("the path is searched; the tag and the aside are not", async () => {
+      const { input, labels, user } = renderProjects();
+      await user.type(input, "/src/d");
+      expect(labels()).toEqual(["docs"]);
+      await user.clear(input);
+      await user.type(input, "pinned");
+      expect(labels()).toEqual([]);
+      await user.clear(input);
+      await user.type(input, "no project");
+      expect(labels()).toEqual([]);
+    });
+
+    test("the separator is drawn between rows, never above the first one shown", async () => {
+      const { input, labels, separators, user } = renderProjects();
+      expect(separators().length).toBe(1);
+      await user.type(input, "scr");
+      expect(labels()).toEqual(["Scratch"]);
+      expect(separators().length).toBe(0);
+    });
+
+    test("the footer action stays when the filter matches nothing", async () => {
+      const { view, input, user } = renderProjects();
+      await user.type(input, "zzz");
+      expect(view.queryAllByRole("option")).toEqual([]);
+      expect(view.getByRole("button", { name: "Add project…" })).toBeTruthy();
+    });
+  });
 });

@@ -1118,8 +1118,8 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) var(--safe-area-right)
-      env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right) env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 0px) !important;
   }
 
   .right-sidebar-fullscreen .right-sidebar-fullscreen-header {
@@ -1184,10 +1184,12 @@ body,
     /* Text that scrolls under the band fades out instead of being cut mid-letter. Both fades stay
        clear of the glyphs, which start 16px into the column and end 20px above the band's bottom. */
     -webkit-mask-image:
-      linear-gradient(to right, transparent, #000 16px), linear-gradient(to top, transparent, #000 16px);
+      linear-gradient(to right, transparent, #000 16px),
+      linear-gradient(to top, transparent, #000 16px);
     -webkit-mask-composite: source-in;
     mask-image:
-      linear-gradient(to right, transparent, #000 16px), linear-gradient(to top, transparent, #000 16px);
+      linear-gradient(to right, transparent, #000 16px),
+      linear-gradient(to top, transparent, #000 16px);
     mask-composite: intersect;
     /* The OS draws over this band and takes no touches there, so the reserve takes none either. */
     pointer-events: none;
@@ -1212,8 +1214,8 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) var(--safe-area-right)
-      env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right) env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 0px) !important;
   }
 
   .right-sidebar-fullscreen .right-sidebar-fullscreen-header {
@@ -1645,3 +1647,15 @@ html[data-renderer-inactive] *::after {
 .titlebar-safe-right-gutter-2 {
   --titlebar-safe-right-gutter: 0.5rem;
 } /* px-2 */
+
+/* The creation page's environment panel is a bottom sheet on a touch phone. Radix positions a
+   popover through inline styles on a wrapper it owns, so the wrapper is matched by the marker on
+   its content and pinned to the bottom edge instead. */
+@media (max-width: 768px) and (pointer: coarse) {
+  [data-radix-popper-content-wrapper]:has(> [data-phone-sheet]) {
+    position: fixed !important;
+    inset: auto 0 0 0 !important;
+    transform: none !important;
+    min-width: 0 !important;
+  }
+}

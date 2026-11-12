@@ -941,6 +941,11 @@ export const projects = {
     input: z.object({ projectPath: z.string() }),
     output: BranchListResultSchema,
   },
+  /** Host aliases from ~/.ssh/config, to suggest on the new-workspace page. */
+  listSshConfigHosts: {
+    input: z.void(),
+    output: z.object({ hosts: z.array(z.string()) }),
+  },
   gitInit: {
     input: z.object({ projectPath: z.string() }),
     output: ResultSchema(z.void(), z.string()),

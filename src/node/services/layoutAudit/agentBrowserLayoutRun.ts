@@ -38,6 +38,11 @@ import { execBuffered, type ExecResult } from "@/node/utils/runtime/helpers";
  * shorten it for `open` or `eval`), and the idle timeout below then shuts the daemon down. So
  * after a hung page the browser lives up to about half a minute past the audit's result.
  *
+ * What the audit cannot see: `eval` runs in the page's own JS world (agent-browser 0.33.2 has no
+ * isolated world for it). A page script that patches DOM or builtin methods can blind the audit,
+ * and the pass then reads as clean. This is accepted: the page's author is the audit's user, and
+ * a sound fix needs a separate JS world, not a restore of prototypes.
+ *
  * agent-browser's JSON envelope stays inside this file.
  */
 
@@ -119,7 +124,8 @@ const FRAME_END = "@@xum-layout-end";
  * The audit must only ever drive the browser it launched. So every inherited AGENT_BROWSER_*
  * variable is unset (an inherited AGENT_BROWSER_CDP would attach to an existing browser and
  * navigate a live tab; the profile, provider and engine variables change which browser runs and
- * what it restores), and only what the run sets is exported. An explicit `--config` replaces the
+ * what it restores), and only what the run sets is exported (the socket folder, and the switch
+ * that stops agent-browser's own version check). An explicit `--config` replaces the
  * user-level and project agent-browser configs, which can name the same things; the run writes
  * an empty one into its own folder. `env` feeds only the sweep's sed: its output (values
  * included) never reaches stdout or stderr. `cd /` keeps the daemon outside the workspace. Every
@@ -138,6 +144,11 @@ const FRAME_END = "@@xum-layout-end";
 const SHELL_COMMON = String.raw`
 for v in $(env | sed -n 's/^\(AGENT_BROWSER_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR"
+# Set after the sweep, which removes it. Newer agent-browser versions ask Google whether their
+# Chrome is outdated, unless this is 1. That request is made by the CLI itself, outside the browser
+# proxy and the tab offline switch, so it would break the no-network rule and could use up the
+# deadline of the audit.
+export AGENT_BROWSER_NO_VERSION_CHECK=1
 ab_wrap=
 ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --config "$XUM_LAYOUT_SOCKET_DIR/config.json" --idle-timeout ${IDLE_TIMEOUT} --args "$XUM_LAYOUT_BROWSER_ARGS" "$@"; }
 cd / || exit ${EXIT_SETUP_FAILED}
@@ -305,8 +316,9 @@ function outcomeOf(
   if (pass === undefined || !isArtifactPage(pass.href, fileUrl)) {
     return { viewport, status: "failed", reason: "script-failed" };
   }
-  // A browser that ignored the viewport measured another layout: that is no result.
-  if (pass.viewportWidth !== viewport.width) {
+  // A browser that ignored the viewport measured another layout: that is no result. The height
+  // counts too: it decides which controls can be reached by scrolling and which samples are seen.
+  if (pass.viewportWidth !== viewport.width || pass.viewportHeight !== viewport.height) {
     return { viewport, status: "failed", reason: "wrong-viewport" };
   }
   return pass.complete

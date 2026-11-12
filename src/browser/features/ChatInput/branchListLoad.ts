@@ -11,8 +11,27 @@ export type BranchLoadStatus = "loading" | "loaded" | "failed";
 export const BRANCH_LIST_TIMEOUT_MS = 15_000;
 
 export type BranchListLoadOutcome =
-  | ({ status: "loaded" } & BranchListResult)
+  | {
+      status: "loaded";
+      branches: string[];
+      recommendedTrunk: string | null;
+      /** The repository's default branch; null when the backend does not know it. */
+      defaultBranch: string | null;
+      /** The branches committed to most recently; empty when the backend names none. */
+      recentBranches: string[];
+    }
   | { status: "failed" };
+
+/** A loaded list with its optional fields filled in, so callers need not default them. */
+function loadedOutcome(result: BranchListResult): BranchListLoadOutcome {
+  return {
+    status: "loaded",
+    branches: result.branches,
+    recommendedTrunk: result.recommendedTrunk,
+    defaultBranch: result.defaultBranch ?? null,
+    recentBranches: result.recentBranches ?? [],
+  };
+}
 
 /**
  * Starts one branch-list load and reports its outcome. It reports "failed" when the list rejects
@@ -31,7 +50,7 @@ export function startBranchListLoad(
   load().then(
     (result) => {
       clearTimeout(timer);
-      if (active) onOutcome({ status: "loaded", ...result });
+      if (active) onOutcome(loadedOutcome(result));
     },
     (error: unknown) => {
       clearTimeout(timer);

@@ -164,6 +164,7 @@ import {
 } from "./routerSubscriptions";
 
 import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
+import { listSSHConfigHosts } from "@/node/runtime/sshConfigParser";
 
 import { getAgentSkill, listAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import {
@@ -1553,6 +1554,10 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.projectService.listBranches(input.projectPath)
         ),
+      listSshConfigHosts: t
+        .input(schemas.projects.listSshConfigHosts.input)
+        .output(schemas.projects.listSshConfigHosts.output)
+        .handler(async () => ({ hosts: await listSSHConfigHosts() })),
       gitInit: t
         .input(schemas.projects.gitInit.input)
         .output(schemas.projects.gitInit.output)

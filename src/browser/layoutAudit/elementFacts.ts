@@ -16,8 +16,13 @@ const TEXT_NODE = 3;
 const SEMANTIC_TEXT_BOUNDARY =
   "p,h1,h2,h3,h4,h5,h6,button,label,a[href],li,dt,dd,th,td,legend,figcaption,summary,[role='button'],[role='link'],[role='alert'],[role='status']";
 // Upstream also lists [data-lavish-action] (Lavish's own UI), which Xum never injects.
-const CONTROL = "button,input,select,textarea,a[href],summary,[role]";
+const NATIVE_CONTROL = "button,input,select,textarea,a[href],summary";
+const CONTROL = `${NATIVE_CONTROL},[role]`;
 const DISABLED_CONTROL = "input[type='hidden'],[disabled],[aria-disabled='true']";
+// The WAI-ARIA widget roles that a user operates on one element by itself. Left out: a container
+// role (menu, tablist, listbox, grid, tree: its items are the controls), `gridcell` (operated
+// through its grid, and every cell of a data grid carries it), `separator` (operable only as a
+// focusable splitter) and `progressbar` and `tabpanel` (not operable).
 const CONTROL_ROLES = new Set([
   "button",
   "link",
@@ -25,7 +30,17 @@ const CONTROL_ROLES = new Set([
   "radio",
   "switch",
   "textbox",
+  "searchbox",
   "combobox",
+  "slider",
+  "spinbutton",
+  "menuitem",
+  "menuitemcheckbox",
+  "menuitemradio",
+  "option",
+  "scrollbar",
+  "tab",
+  "treeitem",
 ]);
 // Diagram surfaces stay outside the general audit. Upstream also lists [data-lavish-ui].
 const DIAGRAM = ".mermaid,svg";
@@ -98,7 +113,10 @@ export function isNestedInTextBoundary(page: LayoutPage, el: Element): boolean {
 
 export function isRequiredControl(el: Element): boolean {
   if (!el.matches(CONTROL) || el.matches(DISABLED_CONTROL)) return false;
-  if (!el.hasAttribute("role")) return true;
+  // A native control stays one under any role (`<button role="menuitem">`): a role on an
+  // element with no native behavior decides, and only an interactive one makes it a control.
+  if (el.matches(NATIVE_CONTROL)) return true;
+  // mutation-equivalent: a missing role is null, and ?? and || both turn it into "" (no role matches)
   return CONTROL_ROLES.has((el.getAttribute("role") ?? "").toLowerCase());
 }
 
@@ -129,8 +147,18 @@ export function isVisible(page: LayoutPage, el: Element): boolean {
 }
 
 /**
- * isVisible without its area test, for an element that holds text: its own box can be empty
- * (`display: contents`) while its text paints.
+ * isVisible for an element that is judged by the lines of its text, not by its box: a
+ * `display: contents` element (a paragraph with one) has no box, so no area, while its text
+ * paints. Any other empty box stays hidden: a collapsed panel (`height: 0; overflow: hidden`)
+ * holds text that nobody sees.
+ */
+export function isVisibleTextHolder(page: LayoutPage, el: Element): boolean {
+  return page.style(el).display === "contents" ? paintsContent(page, el) : isVisible(page, el);
+}
+
+/**
+ * isVisible without its area test: whether the element's content is painted at all, whatever
+ * its box.
  */
 export function paintsContent(page: LayoutPage, el: Element): boolean {
   // `collapse` hides like `hidden` outside table rows and columns, and text is never one.
@@ -201,11 +229,24 @@ function collectTextNodes(parent: Node, descend: boolean, found: Text[]): void {
   }
 }
 
-/** The rendered line rectangles of the text `el` is judged on. */
+// Text a user sees and the rules judge. A Range still measures the text of a `visibility: hidden`
+// or transparent element, one held by `content-visibility: hidden`, a diagram, a mask or a
+// screen-reader-only element, so none of it is evidence of a clip, an escape or a cover.
+function isJudgedTextHolder(page: LayoutPage, holder: Element | null): holder is Element {
+  return holder !== null && !isExcludedElement(page, holder) && paintsContent(page, holder);
+}
+
+/**
+ * The rendered line rectangles of the text `el` is judged on. A text boundary reads the text of
+ * what it holds, minus the text that is not shown there. The caller has already judged `el`
+ * itself, so its own text is not checked again.
+ */
 export function textFragments(page: LayoutPage, el: Element): Box[] {
   const nodes: Text[] = [];
   collectTextNodes(el, isSemanticTextBoundary(el), nodes);
-  return nodes.flatMap((node) => page.textLines(node));
+  return nodes
+    .filter((node) => node.parentElement === el || isJudgedTextHolder(page, node.parentElement))
+    .flatMap((node) => page.textLines(node));
 }
 
 /** Which cut the author asked for; a line clamp wins over an ellipsis (it covers both axes). */
@@ -348,17 +389,9 @@ export function nestedClippingBoundaries(page: LayoutPage, el: Element): NestedC
   const clips = new Map<Element, NestedClip | null>();
   for (const node of nodes) {
     const clippers = clippersHolding(page, node, el, clips);
-    // Hidden text keeps its line boxes (a Range still measures `visibility: hidden` text), so
-    // only text the user can see is evidence that a clipper cuts something.
-    const holder = node.parentElement;
-    if (
-      clippers.length === 0 ||
-      !holder ||
-      isExcludedElement(page, holder) ||
-      !paintsContent(page, holder)
-    ) {
-      continue;
-    }
+    // Hidden text keeps its line boxes, so only text the user can see is evidence that a
+    // clipper cuts something.
+    if (clippers.length === 0 || !isJudgedTextHolder(page, node.parentElement)) continue;
     const lines = page.textLines(node);
     for (const clip of clippers) clip.fragments.push(...lines);
   }

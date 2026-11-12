@@ -1,10 +1,16 @@
 import { useState } from "react";
-import { Check, Loader2, Pin } from "lucide-react";
+import { Check, Loader2 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { KeyHint } from "@/browser/components/KeyHint/KeyHint";
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAppConfig } from "@/browser/stores/AppConfigStore";
-import { formatKeybind, formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  formatKeybindForAria,
+  KEYBINDS,
+  type Keybind,
+} from "@/browser/utils/ui/keybinds";
 import type { IsolationChoice } from "@/common/types/isolation";
 import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -20,25 +26,45 @@ interface SetDefaultIsolationProps {
   rememberShownFields: () => void;
 }
 
+export type DefaultIsolationSaver = ReturnType<typeof useSetDefaultIsolation>;
+
+/**
+ * The saver's shortcut for the environment panel to run while it is open, or null while the
+ * action would not run (already the default, saving, or locked).
+ */
+export function setDefaultShortcut(
+  saver: DefaultIsolationSaver
+): { keybind: Keybind; run: () => void } | null {
+  if (!saver.canSave) return null;
+  return { keybind: KEYBINDS.SET_DEFAULT_ISOLATION, run: () => void saver.save() };
+}
+
+/** A failed save, on the page: a save from the shortcut has no open panel to report in. */
+export function DefaultSaveError(props: { saver: DefaultIsolationSaver }) {
+  if (props.saver.error === null) return null;
+  return (
+    <span role="alert" className="text-error text-xs">
+      {props.saver.error}
+    </span>
+  );
+}
+
 /**
  * One click from the creation page to make what it shows the project's default for new
  * workspaces, instead of a trip to Settings → Runtimes. It saves the isolation pair as the
  * project's default; the host, directory and image it shows are the project's remembered values,
  * which new workspaces start from with that pair. Once saved it reads "Default".
+ *
+ * It sits in the environment panel's footer, next to the sentence that says what would become
+ * the default. The saver is owned by the page (see {@link useSetDefaultIsolation}), so the
+ * shortcut also works while the panel is closed.
  */
-export function SetDefaultIsolationButton(props: SetDefaultIsolationProps) {
-  const saver = useSetDefaultIsolation(props);
-  // Every operation has a shortcut (AGENTS.md); it works only while the button would.
-  useCreationShortcut(
-    !saver.isDefault && !props.disabled,
-    KEYBINDS.SET_DEFAULT_ISOLATION,
-    saver.save
-  );
-
+export function SetDefaultIsolationButton(props: { saver: DefaultIsolationSaver }) {
+  const { saver } = props;
   if (saver.isDefault) {
     return (
       <span
-        className="text-muted inline-flex shrink-0 items-center gap-1 text-xs"
+        className="text-foreground inline-flex shrink-0 items-center gap-1.5 text-xs"
         data-component="IsolationDefaultState"
       >
         <Check aria-hidden className="size-3.5" />
@@ -47,36 +73,37 @@ export function SetDefaultIsolationButton(props: SetDefaultIsolationProps) {
     );
   }
 
-  const Icon = saver.saving ? Loader2 : Pin;
   return (
-    <span className="inline-flex shrink-0 items-center gap-2">
-      <Button
-        variant="ghost"
-        size="xs"
-        // h-7 and text-xs match the branch select beside it, so the two share a centre line.
-        className="text-muted hover:text-foreground h-7 px-1.5 text-xs"
-        disabled={props.disabled || saver.saving}
-        aria-busy={saver.saving}
-        aria-keyshortcuts={formatKeybindForAria(KEYBINDS.SET_DEFAULT_ISOLATION)}
-        // The shared tooltip shows the shortcut on hover; touch devices never hover, so phones
-        // do not show it.
-        title={`Make this the project's default (${formatKeybind(KEYBINDS.SET_DEFAULT_ISOLATION)})`}
-        onClick={() => void saver.save()}
-      >
-        <Icon aria-hidden className={saver.saving ? "animate-spin" : undefined} />
-        Set as default
-      </Button>
+    <span className="inline-flex min-w-0 shrink-0 items-center gap-2">
+      {/* An alert here too: the panel is modal, so the page's copy of this error is hidden from
+          assistive technology while the panel is open. */}
       {saver.error !== null && (
-        <span role="alert" className="text-error text-xs">
+        <span role="alert" className="text-error min-w-0 text-xs">
           {saver.error}
         </span>
       )}
+      <Button
+        variant="outline"
+        size="xs"
+        className="text-foreground h-7 gap-2 px-2.5 text-xs font-normal"
+        disabled={!saver.canSave}
+        aria-busy={saver.saving}
+        aria-keyshortcuts={formatKeybindForAria(KEYBINDS.SET_DEFAULT_ISOLATION)}
+        onClick={() => void saver.save()}
+      >
+        {saver.saving && <Loader2 aria-hidden className="animate-spin" />}
+        Set as default
+        <KeyHint>{formatKeybind(KEYBINDS.SET_DEFAULT_ISOLATION)}</KeyHint>
+      </Button>
     </span>
   );
 }
 
-/** Whether the shown isolation already is the project's default, and how to make it so. */
-function useSetDefaultIsolation(props: SetDefaultIsolationProps) {
+/**
+ * Whether the shown isolation already is the project's default, and how to make it so. Also owns
+ * the shortcut: every operation has one (AGENTS.md), and it works only while the button would.
+ */
+export function useSetDefaultIsolation(props: SetDefaultIsolationProps) {
   const { api } = useAPI();
   const { userProjects, refreshProjects } = useProjectContext();
   const globalDefault = useAppConfig((config) => config.defaultIsolation);
@@ -103,8 +130,18 @@ function useSetDefaultIsolation(props: SetDefaultIsolationProps) {
     }
   };
 
+  const isDefault = isProjectDefaultIsolation(
+    project,
+    globalDefault,
+    globalEnablement,
+    props.isolation
+  );
+  const canSave = !isDefault && !props.disabled && !saving;
+  useCreationShortcut(canSave, KEYBINDS.SET_DEFAULT_ISOLATION, save);
+
   return {
-    isDefault: isProjectDefaultIsolation(project, globalDefault, globalEnablement, props.isolation),
+    isDefault,
+    canSave,
     saving,
     error,
     save,
