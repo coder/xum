@@ -195,7 +195,8 @@ function OptionColumn<T extends string>(props: {
                         Set up
                       </DocsLink>
                     </TooltipTrigger>
-                    <TooltipContent className="max-w-72 break-words">
+                    {/* Below the link: above it, the tooltip covered the rows the pointer came from. */}
+                    <TooltipContent side="bottom" align="end" className="max-w-72 break-words">
                       {option.disabledReason}
                     </TooltipContent>
                   </Tooltip>
@@ -220,13 +221,17 @@ function BranchColumn(props: {
   className?: string;
   /** The list's height: a column on desktop, most of the sheet on a phone. */
   listClassName?: string;
+  /** The phone's branch view names itself in the sheet's header. */
+  hideTitle?: boolean;
 }) {
   const { branch } = props;
   return (
     <div data-environment-column className={cn(COLUMN_CLASSES, props.className)}>
-      <div className={COLUMN_HEADER_CLASSES}>
-        <span className={COLUMN_TITLE_CLASSES}>Base branch</span>
-      </div>
+      {!props.hideTitle && (
+        <div className={COLUMN_HEADER_CLASSES}>
+          <span className={COLUMN_TITLE_CLASSES}>Base branch</span>
+        </div>
+      )}
       {branch.load === "loading" ? (
         <div className="flex flex-col gap-3 px-2.5 pt-2 pb-2.5" aria-busy role="status">
           <span className="sr-only">Loading branches</span>
@@ -562,6 +567,7 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
             }}
             disabled={props.disabled}
             listClassName="max-h-[55dvh] p-0"
+            hideTitle
           />
         ) : (
           <>

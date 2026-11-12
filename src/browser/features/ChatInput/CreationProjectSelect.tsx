@@ -195,7 +195,7 @@ function ProjectSwitcher(props: {
           placeholder="Find a project…"
           noun="projects"
           disabled={props.disabled}
-          listClassName="max-h-72"
+          listClassName="max-h-[26rem]"
           twoLine
           renderLeading={(item) => <ProjectTile scope={item.value} label={item.label} />}
           filterHint={<KeyHint>esc</KeyHint>}
