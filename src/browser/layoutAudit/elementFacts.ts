@@ -315,6 +315,20 @@ function containingBlockOf(page: LayoutPage, node: Element): Element | null {
   return parent;
 }
 
+type Edges = Pick<Box, "left" | "top" | "right" | "bottom">;
+
+// `rect` cut at a clipping box, on the axes that it clips.
+function cutAt(rect: Edges, { box, axes }: ClippingBoundary): Edges {
+  const across = axes.includes("horizontal");
+  const down = axes.includes("vertical");
+  return {
+    left: across ? Math.max(rect.left, box.left) : rect.left,
+    right: across ? Math.min(rect.right, box.right) : rect.right,
+    top: down ? Math.max(rect.top, box.top) : rect.top,
+    bottom: down ? Math.min(rect.bottom, box.bottom) : rect.bottom,
+  };
+}
+
 /**
  * The part of `rect`, a rendered line or the box of `el`, that overflow leaves visible: `rect`
  * cut at the padding box of `el` and of each element that clips (`overflow: hidden | clip`) among
@@ -323,22 +337,16 @@ function containingBlockOf(page: LayoutPage, node: Element): Element | null {
  * through this. Null when none is left.
  */
 export function visiblePart(page: LayoutPage, el: Element, rect: Box): Box | null {
-  let { left, top, right, bottom } = rect;
+  let cut: Edges = rect;
   for (
     let node: Element | null = el;
     node && !isRootElement(page, node);
     node = containingBlockOf(page, node)
   ) {
     const clip = clippingBoundaryOf(page, node);
-    if (clip?.axes.includes("horizontal")) {
-      left = Math.max(left, clip.box.left);
-      right = Math.min(right, clip.box.right);
-    }
-    if (clip?.axes.includes("vertical")) {
-      top = Math.max(top, clip.box.top);
-      bottom = Math.min(bottom, clip.box.bottom);
-    }
+    if (clip) cut = cutAt(cut, clip);
   }
+  const { left, top, right, bottom } = cut;
   if (right <= left || bottom <= top) return null;
   return { left, top, right, bottom, width: right - left, height: bottom - top };
 }
