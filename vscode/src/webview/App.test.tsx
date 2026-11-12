@@ -534,6 +534,11 @@ describe("vscode webview workspace selection", () => {
       tokens: 1,
       timestamp: 2,
     });
+    // A running call is named on the turn's work line; its card is behind the line.
+    await act(async () => {
+      fireEvent.click(view.getByTestId("work-bundle"));
+      await Promise.resolve();
+    });
     // Live output renders inside the expanded card.
     await act(async () => {
       fireEvent.click(view.getByText("make build"));
@@ -3231,6 +3236,11 @@ describe("vscode webview background processes strip (#5092)", () => {
     // bridge refuses sendToBackground (bashForegroundControls is unsupported in the webview).
     await emitBackgroundBashes(bridge, workspace.id, [], ["call-fg"]);
 
+    // A running call is named on the turn's work line; its card is behind the line.
+    await act(async () => {
+      fireEvent.click(view.getByTestId("work-bundle"));
+      await Promise.resolve();
+    });
     expect(view.container.textContent).toContain("make build");
     expect(view.queryByRole("button", { name: "Send to background" })).toBeNull();
   });

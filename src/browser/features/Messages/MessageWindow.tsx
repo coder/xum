@@ -25,15 +25,14 @@ export interface ButtonConfig {
  * A message's actions and time are there when the pointer or the keyboard is on the message, and
  * out of sight otherwise: repeated under every prompt and every reply they were the loudest
  * thing in a quiet transcript. Only the latest reply keeps its row in view, since that is the
- * one the user acts on. A hidden row takes no clicks. Touch has no hover: there every row is
- * always shown.
+ * one the user acts on. Touch has no hover: there every row is always shown.
+ *
+ * A hidden row still takes clicks. The pointer cannot reach it unseen (the row is part of its
+ * message, so it shows as soon as the pointer is on it), and a script that clicks Edit without
+ * hovering first must keep working.
  */
-const QUIET_META_ROW_CLASS = cn(
-  "pointer-events-none opacity-0 transition-opacity",
-  "group-hover/message:pointer-events-auto group-hover/message:opacity-100",
-  "focus-within:pointer-events-auto focus-within:opacity-100",
-  "[@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100"
-);
+const QUIET_META_ROW_CLASS =
+  "opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100";
 
 /**
  * Where a hover device puts the row of a prompt or a step: floating, so a hidden row reserves
