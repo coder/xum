@@ -32,6 +32,7 @@ import {
   isSessionTapeReplayRenderer,
 } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import {
+  MAX_DISPLAYED_MESSAGES,
   StreamingMessageAggregator,
   type LoadedSkill,
   type SkillLoadError,
@@ -55,7 +56,6 @@ import {
 } from "@/browser/stores/subscriptionTransport";
 import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { TRANSCRIPT_WORKSPACE_ATTRIBUTE } from "@/common/constants/ui";
 import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { LiveBashOutputSourceContext } from "@/browser/stores/liveBashOutputSource";
 import {
@@ -6361,82 +6361,41 @@ export function pinTimelineRevealTarget(
  * newer proposal from another backend that this renderer never displayed,
  * so the backend cannot infer the displayed proposal from the transcript
  * alone. Scans newest-first for a refine-summary row carrying a
- * stagedSetHash, restricted to rows the transcript actually RENDERS (r68):
- * a row the aggregator holds is not always on the page, and approving a
- * proposal that is not would apply memory/skill edits the user never saw.
- * Three things keep a row off the page: the aggregator's display cap (the
- * VS Code webview), the chat pane's mount window (a proposal with enough
- * later chat after it is above the window until the user loads older rows),
- * and a fold (compact density's work line). So the check is the page
- * itself: the row must be mounted in this workspace's own transcript, and
- * that transcript must be laid out (see getMountedTranscriptHistoryIds).
- * A hidden newer proposal also cannot be
- * applied via an older visible hash — the backend re-hashes the staged set
- * and refuses the mismatch — so filtering here fails safe.
+ * stagedSetHash, restricted to the transcript's most recent rows (r68):
+ * a proposal buried behind enough later chat (e.g. a window opened after a
+ * foreign backend staged it) is one the user may never have seen, and
+ * approving it would apply memory/skill edits unaudited. A hidden newer
+ * proposal also cannot be applied via an older visible hash — the backend
+ * re-hashes the staged set and refuses the mismatch — so filtering here
+ * fails safe.
+ *
+ * "Most recent" is the aggregator's display cap, whether or not the cap
+ * is applied: the desktop chat shows the whole transcript (its pane bounds
+ * what it mounts), but this check keeps the cap's reach, so showing more
+ * of the transcript did not widen what /refine apply accepts. An older
+ * proposal is refused, and running /refine again stages a current one.
  */
 export function getDisplayedRefineProposalHash(workspaceId: string): string | null {
   const aggregator = getStoreInstance().getAggregator(workspaceId);
-  return aggregator
-    ? findRenderedRefineProposalHash(
-        aggregator,
-        getMountedTranscriptHistoryIds(document, workspaceId)
-      )
-    : null;
+  return aggregator ? findRenderedRefineProposalHash(aggregator) : null;
 }
 
-/** Whether an element takes part in layout: false under `display: none`, as a hidden pane is. */
-function hasLayoutBox(element: Element): boolean {
-  return element.getClientRects().length > 0;
-}
-
-/**
- * History ids of the rows mounted in the transcripts of `workspaceId` under `root`: a chat pane
- * names its transcript's workspace (TRANSCRIPT_WORKSPACE_ATTRIBUTE), and MessageRenderer tags
- * every row it mounts with its message's id (data-message-id).
- *
- * Only that workspace's transcripts count, and only ones that are laid out. Another pane can
- * hold a row with the same id (a side chat copies its parent's transcript, and stays mounted
- * while its sidebar is hidden), and such a row is not one the user saw in this chat.
- */
-export function getMountedTranscriptHistoryIds(
-  root: ParentNode,
-  workspaceId: string,
-  isLaidOut: (transcript: Element) => boolean = hasLayoutBox
-): Set<string> {
-  const historyIds = new Set<string>();
-  for (const transcript of root.querySelectorAll(`[${TRANSCRIPT_WORKSPACE_ATTRIBUTE}]`)) {
-    if (transcript.getAttribute(TRANSCRIPT_WORKSPACE_ATTRIBUTE) !== workspaceId) continue;
-    if (!isLaidOut(transcript)) continue;
-    for (const row of transcript.querySelectorAll("[data-message-id]")) {
-      const historyId = row.getAttribute("data-message-id");
-      if (historyId !== null) {
-        historyIds.add(historyId);
-      }
+/** History ids of the rows the display cap keeps in view: the newest MAX_DISPLAYED_MESSAGES. */
+function collectRecentHistoryIds(aggregator: StreamingMessageAggregator): Set<string> {
+  const recentHistoryIds = new Set<string>();
+  for (const displayed of aggregator.getDisplayedMessages().slice(-MAX_DISPLAYED_MESSAGES)) {
+    if ("historyId" in displayed) {
+      recentHistoryIds.add(displayed.historyId);
     }
   }
-  return historyIds;
-}
-
-/** History ids the transcript renders: displayed by the aggregator (capped in the webview) and mounted. */
-function collectRenderedHistoryIds(
-  aggregator: StreamingMessageAggregator,
-  mountedHistoryIds: ReadonlySet<string>
-): Set<string> {
-  const renderedHistoryIds = new Set<string>();
-  for (const displayed of aggregator.getDisplayedMessages()) {
-    if ("historyId" in displayed && mountedHistoryIds.has(displayed.historyId)) {
-      renderedHistoryIds.add(displayed.historyId);
-    }
-  }
-  return renderedHistoryIds;
+  return recentHistoryIds;
 }
 
 /** Pure scan behind getDisplayedRefineProposalHash, exported for tests. */
 export function findRenderedRefineProposalHash(
-  aggregator: StreamingMessageAggregator,
-  mountedHistoryIds: ReadonlySet<string>
+  aggregator: StreamingMessageAggregator
 ): string | null {
-  const renderedHistoryIds = collectRenderedHistoryIds(aggregator, mountedHistoryIds);
+  const renderedHistoryIds = collectRecentHistoryIds(aggregator);
   const messages = aggregator.getAllMessages();
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];

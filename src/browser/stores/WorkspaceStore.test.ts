@@ -65,7 +65,6 @@ import {
   areActivityGoalsEqual,
   findLastContextUsage,
   findRenderedRefineProposalHash,
-  getMountedTranscriptHistoryIds,
   mergeTimelineEvents,
   resolveSidebarAgentStatus,
   sumSessionCostUsage,
@@ -9804,66 +9803,41 @@ describe("findRenderedRefineProposalHash", () => {
       })
     );
 
-  const MOUNTED = new Set(["refine-1"]);
-
   it("returns the newest rendered proposal hash", () => {
     const aggregator = new StreamingMessageAggregator(CREATED_AT);
     aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(3, 2)], false);
-    expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBe(HASH);
+    expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
   });
 
-  it("ignores a proposal row hidden by the display cap until Load all reveals it (r68)", () => {
+  it("ignores a proposal row buried behind more chat than the display cap keeps (r68)", () => {
     // A staged proposal (e.g. from a foreign backend) buried behind enough
-    // later chat falls out of the rendered window: approving it would apply
-    // edits this user never saw, so the scan must not surface its hash from
-    // internal history.
+    // later chat is one this user may never have seen: approving it would
+    // apply unaudited edits, so the scan must not surface its hash.
     const aggregator = new StreamingMessageAggregator(CREATED_AT);
     aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(200, 2)], false);
-    expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBeNull();
-    // "Load all" disables the cap: the proposal is now actually rendered.
+    expect(findRenderedRefineProposalHash(aggregator)).toBeNull();
+    // The desktop chat shows the whole transcript (no cap). Showing more of it must not
+    // widen what /refine apply accepts: the check keeps the cap's reach.
     aggregator.setShowAllMessages(true);
-    expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBe(HASH);
+    expect(findRenderedRefineProposalHash(aggregator)).toBeNull();
   });
 
-  // The desktop chat has no display cap: its pane mounts a window of the transcript, and
-  // compact density folds rows. A proposal the aggregator displays is rendered only if its row
-  // is on the page.
-  it("ignores a proposal row that is displayed but not mounted", () => {
+  it("accepts a proposal within the cap's reach when the whole transcript shows", () => {
     const aggregator = new StreamingMessageAggregator(CREATED_AT);
     aggregator.setShowAllMessages(true);
-    aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(200, 2)], false);
-
-    expect(findRenderedRefineProposalHash(aggregator, new Set())).toBeNull();
-    expect(findRenderedRefineProposalHash(aggregator, new Set(["filler-199"]))).toBeNull();
-    expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBe(HASH);
-  });
-
-  // Another pane can hold a row with the same message id: a side chat copies its parent's
-  // transcript, and stays mounted while its sidebar is hidden.
-  it("reads the mounted rows of the workspace's own transcript, and only one that is laid out", () => {
-    const page = new GlobalWindow().document;
-    page.body.innerHTML = `
-      <div data-transcript-workspace-id="ws-main" data-shown="true">
-        <div data-message-id="filler-0"></div>
-        <div></div>
-      </div>
-      <div data-transcript-workspace-id="ws-side" data-shown="true">
-        <div data-message-id="refine-1"></div>
-      </div>
-      <div data-transcript-workspace-id="ws-main" data-shown="false">
-        <div data-message-id="refine-1"></div>
-      </div>
-      <div data-message-id="refine-1"></div>`;
-    const isShown = (transcript: Element) => transcript.getAttribute("data-shown") === "true";
-    const mounted = (workspaceId: string) => [
-      ...getMountedTranscriptHistoryIds(page as unknown as Document, workspaceId, isShown),
-    ];
-
-    // The proposal row is in the side chat, in a hidden copy of this transcript and outside any
-    // transcript: none of those is this chat's page.
-    expect(mounted("ws-main")).toEqual(["filler-0"]);
-    expect(mounted("ws-side")).toEqual(["refine-1"]);
-    expect(mounted("ws-other")).toEqual([]);
+    const later = Array.from({ length: 10 }, (_, i) =>
+      createMuxMessage(`later-${i}`, "assistant", `later ${i}`, {
+        timestamp: 300 + i,
+        historySequence: 300 + i,
+      })
+    );
+    const proposal = createMuxMessage("refine-1", "assistant", "Staged 2 edits", {
+      timestamp: 250,
+      historySequence: 250,
+      muxMetadata: { type: "refine-summary", stagedSetHash: HASH },
+    });
+    aggregator.loadHistoricalMessages([...assistantFiller(200, 1), proposal, ...later], false);
+    expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
   });
 });
 
