@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { PHONE_TOUCH_QUERY } from "@/browser/utils/env";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX, SHORT_VIEWPORT_MAX_HEIGHT_PX } from "@/constants/layout";
 
 const NARROW_VIEWPORT_QUERY = `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`;
@@ -34,6 +35,14 @@ function getServerSnapshot(): boolean {
 /** True at phone and narrow-browser widths (the same breakpoint as the `max-width: 768px` CSS). */
 export function useNarrowViewport(): boolean {
   return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+}
+
+const subscribePhoneTouch = (onChange: () => void) => subscribeToQuery(PHONE_TOUCH_QUERY, onChange);
+const getPhoneTouchSnapshot = () => queryMatches(PHONE_TOUCH_QUERY);
+
+/** True on a touch phone (narrow and a coarse pointer): where panels become bottom sheets. */
+export function usePhoneTouchViewport(): boolean {
+  return useSyncExternalStore(subscribePhoneTouch, getPhoneTouchSnapshot, getServerSnapshot);
 }
 
 /** True at short viewport heights, such as a phone in landscape. */
