@@ -315,7 +315,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
 
   // `force` lets the model-facing archive delete what it otherwise refuses to lose. It lists
   // the files itself under the locks, deletes exactly those and reports them.
-  async function useSnapshotArchive(): Promise<void> {
+  async function enableSnapshotArchive(): Promise<void> {
     await setArchiveBehavior("snapshot");
     a.workspaceService.setWorktreeArchiveSnapshotService(
       new WorktreeArchiveSnapshotService(a.config)
@@ -323,7 +323,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   }
 
   test("a forced model-facing snapshot archive deletes the parent's and the sub-agent's untracked files and reports them", async () => {
-    await useSnapshotArchive();
+    await enableSnapshotArchive();
     await fsPromises.writeFile(path.join(checkouts.get(rootId)!, "notes.txt"), "unsaved\n");
     await fsPromises.writeFile(path.join(checkouts.get(grandchildId)!, "notes.txt"), "unsaved\n");
 
@@ -341,7 +341,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   });
 
   test("a forced model-facing archive does not delete a sub-agent file that appeared after it listed the files", async () => {
-    await useSnapshotArchive();
+    await enableSnapshotArchive();
     const checkout = checkouts.get(grandchildId)!;
     await fsPromises.writeFile(path.join(checkout, "notes.txt"), "unsaved\n");
     // The file lands after the forced archive's last listing, which it makes right before the
@@ -442,8 +442,8 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     ["the snapshot policy", "snapshot"],
   ] as const;
 
-  async function useForcedPolicy(policy: "delete" | "snapshot"): Promise<void> {
-    if (policy === "snapshot") await useSnapshotArchive();
+  async function setUpForcedPolicy(policy: "delete" | "snapshot"): Promise<void> {
+    if (policy === "snapshot") await enableSnapshotArchive();
     else await setArchiveBehavior("delete");
     // The deepest sub-agent holds a file that the snapshot policy cannot keep.
     await fsPromises.writeFile(path.join(checkouts.get(grandchildId)!, "gc-notes.txt"), "x\n");
@@ -460,7 +460,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   test.each(forcedPolicies)(
     "a forced archive under %s refuses before it archives anything when a middle sub-agent has an external editor or terminal open",
     async (_name, policy) => {
-      await useForcedPolicy(policy);
+      await setUpForcedPolicy(policy);
       spyOn(a.workspaceService, "hasUntrackableExternalAppOpen").mockImplementation((id) =>
         Promise.resolve(id === childId)
       );
@@ -478,7 +478,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   test.each(forcedPolicies)(
     "a forced archive under %s refuses before it archives anything while a sub-agent has a terminal open",
     async (_name, policy) => {
-      await useForcedPolicy(policy);
+      await setUpForcedPolicy(policy);
       const listLive = a.workspaceService.listLiveWorkspaceActivity.bind(a.workspaceService);
       spyOn(a.workspaceService, "listLiveWorkspaceActivity").mockImplementation((id) => ({
         ...listLive(id),
@@ -496,7 +496,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   );
 
   test("a forced archive refuses before it archives anything while a sub-agent runs background bash", async () => {
-    await useForcedPolicy("delete");
+    await setUpForcedPolicy("delete");
     spyOn(a.workspaceService, "hasRunningBackgroundBashProcesses").mockImplementation((id) =>
       Promise.resolve(id === childId)
     );
@@ -510,7 +510,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   });
 
   test("a forced snapshot archive refuses before it archives anything when the target's files changed after the listing", async () => {
-    await useForcedPolicy("snapshot");
+    await setUpForcedPolicy("snapshot");
     const rootCheckout = checkouts.get(rootId)!;
     const preflightArchive = a.workspaceService.preflightArchive.bind(a.workspaceService);
     let listings = 0;
@@ -549,7 +549,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   test.each(forcedPolicies)(
     "a forced archive under %s whose middle sub-agent refuses at the sink reports what the archived sub-agent lost",
     async (_name, policy) => {
-      await useForcedPolicy(policy);
+      await setUpForcedPolicy(policy);
       // Calls 1 and 2 are the listing and the second listing: the marker appears after them.
       flipOnNthCall(childId, 3);
 
@@ -571,7 +571,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   );
 
   test("a forced snapshot archive whose target's files change during the cascade reports what the archived sub-agent lost", async () => {
-    await useForcedPolicy("snapshot");
+    await setUpForcedPolicy("snapshot");
     const rootCheckout = checkouts.get(rootId)!;
     // Call 1 is the lifecycle manager's early check. Call 2 is the sink's, after the sub-agents.
     flipOnNthCall(rootId, 2, () =>
