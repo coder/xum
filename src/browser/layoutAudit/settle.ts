@@ -33,9 +33,11 @@ export async function runLayoutAudit(
   const domQuiet = await signals.domQuiet(SETTLE.quietMs, SETTLE.quietMaxMs);
   const final = domQuiet ? auditLayout(page) : second;
   const complete = animationsSettled && signals.documentComplete() && domQuiet;
+  const { viewportWidth, viewportHeight } = page.metrics();
   return {
     complete,
-    viewportWidth: page.metrics().viewportWidth,
+    viewportWidth,
+    viewportHeight,
     findings: findStableLayoutFindings(domQuiet ? second : first, final),
   };
 }

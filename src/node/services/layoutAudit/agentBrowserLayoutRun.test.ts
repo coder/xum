@@ -26,6 +26,9 @@ setDefaultTimeout(60_000);
 const RUN_ORDER: LayoutAuditViewportWidth[] = [390, 1440, 768];
 // The calls of a clean run: `set offline on`, three widths of set, open and eval, then the close.
 const CALLS_OF_A_CLEAN_RUN = 11;
+// The only AGENT_BROWSER_* variables a call may see (sorted, as the fake prints them): the run's
+// own folder, and the switch that stops agent-browser's own request to Google.
+const OWN_AGENT_BROWSER_NAMES = ["AGENT_BROWSER_NO_VERSION_CHECK", "AGENT_BROWSER_SOCKET_DIR"];
 const FILE_URL = "file:///tmp/artifacts/chart.html";
 // The run only forwards the script: any text will do.
 const PAGE_SCRIPT = "(() => Promise.resolve({ marker: 1 }))()";
@@ -280,6 +283,16 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     ]);
   });
 
+  test("a browser that applies another height is not a result either", async () => {
+    // The height decides which controls the user can scroll to and which samples are in view.
+    const { outcomes } = await run({ eval: { 1440: { kind: "pass", viewportHeight: 800 } } });
+    expect(summary(outcomes)).toEqual([
+      "390 complete",
+      "1440 failed wrong-viewport",
+      "768 complete",
+    ]);
+  });
+
   test("no agent-browser on PATH: nothing runs and there is nothing to close", async () => {
     const { outcomes, fake } = await run({ missing: true });
     expect(summary(outcomes)).toEqual([
@@ -469,18 +482,33 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       AGENT_BROWSER_PROFILE: "/nonexistent-profile",
       AGENT_BROWSER_FUTURE_FLAG: "1",
       AGENT_BROWSER_ARGS: "--proxy-server=direct://",
+      // The user turned the switch off: the run still sets it (see the next test).
+      AGENT_BROWSER_NO_VERSION_CHECK: "0",
     };
     Object.assign(process.env, inherited);
     try {
       const { outcomes, fake } = await run({});
       expect(summary(outcomes)).toEqual(["390 complete", "1440 complete", "768 complete"]);
-      // Every call of the run saw its own folder and nothing else.
+      // Every call of the run saw its own folder and its own switch, nothing else.
       expect(await fake.agentBrowserEnvNames()).toEqual(
-        Array.from({ length: CALLS_OF_A_CLEAN_RUN }, () => ["AGENT_BROWSER_SOCKET_DIR"])
+        Array.from({ length: CALLS_OF_A_CLEAN_RUN }, () => OWN_AGENT_BROWSER_NAMES)
+      );
+      expect(await fake.versionCheckSwitches()).toEqual(
+        Array.from({ length: CALLS_OF_A_CLEAN_RUN }, () => "1")
       );
     } finally {
       for (const name of Object.keys(inherited)) delete process.env[name];
     }
+  });
+
+  // The sweep removes every AGENT_BROWSER_* variable, so the switch has to be set again after it:
+  // without it agent-browser makes its own request to Google before the proxy and the offline
+  // switch apply, and an offline audit would not be offline.
+  test("every call, the close included, switches agent-browser's own version check off", async () => {
+    const { fake } = await run({});
+    expect(await fake.versionCheckSwitches()).toEqual(
+      Array.from({ length: CALLS_OF_A_CLEAN_RUN }, () => "1")
+    );
   });
 
   // The scripts run in a new shell, so tool_env's shell state stays behind: a readonly variable
@@ -498,7 +526,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     const { outcomes, fake } = await run({ toolEnvLines: [line] });
     expect(summary(outcomes)).toEqual(RUN_ORDER.map((width) => `${width} complete`));
     expect(await fake.agentBrowserEnvNames()).toEqual(
-      Array.from({ length: CALLS_OF_A_CLEAN_RUN }, () => ["AGENT_BROWSER_SOCKET_DIR"])
+      Array.from({ length: CALLS_OF_A_CLEAN_RUN }, () => OWN_AGENT_BROWSER_NAMES)
     );
     const dirs = new Set((await fake.socketDirs()).map((call) => call.dir));
     expect([...dirs]).toEqual([`/tmp/${(await fake.calls())[0]?.[1]}`]);
