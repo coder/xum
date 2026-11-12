@@ -9,6 +9,7 @@
 import type { AnthropicProviderOptions } from "@ai-sdk/anthropic";
 import type { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
 import type { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
+import type { OpenAICompatibleLanguageModelChatOptions } from "@ai-sdk/openai-compatible";
 import type { JSONValue } from "@ai-sdk/provider";
 import type { ZaiLanguageModelChatOptions } from "@ai-sdk/zai";
 import type {
@@ -193,7 +194,13 @@ type ProviderOptions =
   | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
   | { bedrock: BedrockProviderOptions }
+  | { openaiCompatible: OpenAICompatibleLanguageModelChatOptions }
   | Record<string, never>; // Empty object for unsupported providers
+
+/** GLM 5.3's reasoning effort for a level, on Z.ai and on OpenAI-compatible hosts alike. */
+function glm53ReasoningEffort(thinking: ThinkingLevel): "low" | "high" | "max" {
+  return thinking === "max" ? "max" : thinking === "high" || thinking === "xhigh" ? "high" : "low";
+}
 
 // Simple direct providers have self-contained reasoning controls. Keep these
 // separate from the gateway/OpenAI branches so vendor-only settings cannot leak.
@@ -218,10 +225,12 @@ const DIRECT_REASONING_BUILDERS: Record<
   },
   zai: (model, thinking): ProviderOptions => {
     if (!isGlm53Model(model)) return {};
-    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
-      thinking === "max" ? "max" : thinking === "high" || thinking === "xhigh" ? "high" : "low";
     return {
-      zai: { thinking: { type: "enabled" }, reasoningEffort, toolStream: true },
+      zai: {
+        thinking: { type: "enabled" },
+        reasoningEffort: glm53ReasoningEffort(thinking),
+        toolStream: true,
+      },
     };
   },
 };
@@ -741,8 +750,9 @@ export function buildProviderOptions(
   // openai.<model> namespace, which the GPT-6 effort matchers miss. A canonical
   // model routed onto Coder keeps its own identity, not the instance's wire.
   const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
+  const rawPrefixConfig = providersConfig?.[rawPrefixForMetadata];
   const metadataModel =
-    isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata]) ||
+    isCustomProviderConfig(rawPrefixConfig) ||
     resolveCoderGatewayMetadataModel(modelString, providersConfig) != null
       ? modelString
       : resolveOptionsCanonicalModel(modelString, providersConfig);
@@ -1171,7 +1181,33 @@ export function buildProviderOptions(
     routeProvider,
     providerOptionsNamespaceKey,
   });
-  return {};
+  return openaiCompatibleGlm53Options(rawPrefixConfig, capabilityModel, effectiveThinking);
+}
+
+/**
+ * Custom OpenAI-compatible endpoints get no reasoning field by default, since a
+ * strict server may reject unknown fields. GLM 5.3's chat template runs at max
+ * effort unless reasoning_effort is exactly "low" or "high", so a model Xum
+ * recognizes as GLM 5.3 (by id or mappedToModel) gets it. Every OpenAI-compatible
+ * chat model reads the `openaiCompatible` key, whatever the custom provider's id.
+ */
+function openaiCompatibleGlm53Options(
+  providerConfig: ProvidersConfigMap[string] | undefined,
+  capabilityModel: string,
+  thinking: ThinkingLevel
+): ProviderOptions {
+  if (
+    !isCustomProviderConfig(providerConfig) ||
+    providerConfig.providerType !== "openai-compatible" ||
+    !isGlm53Model(capabilityModel)
+  ) {
+    return {};
+  }
+  const options = {
+    openaiCompatible: { reasoningEffort: glm53ReasoningEffort(thinking) },
+  } satisfies { openaiCompatible: OpenAICompatibleLanguageModelChatOptions };
+  log.debug("buildProviderOptions: Returning OpenAI-compatible GLM 5.3 options", options);
+  return options;
 }
 
 // ---------------------------------------------------------------------------
