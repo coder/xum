@@ -1064,7 +1064,6 @@ function liveActivityLabels(live: WorkspaceLiveActivity): string[] {
   const labels: Array<[boolean, string]> = [
     [live.streaming, "an active stream"],
     [live.queuedMessages, "queued messages"],
-    [live.backgroundBashProcesses, "running background bash processes"],
     [live.terminalSessions, "open terminal sessions"],
     [live.desktopViewers, "an open desktop viewer or popout"],
   ];
@@ -11748,9 +11747,25 @@ export class WorkspaceService
     return null;
   }
 
+  /** What a cascaded sub-agent still runs that its archive would terminate, as the sink words it. */
+  private async liveSubagentActivity(workspaceId: string): Promise<string[]> {
+    const labels = liveActivityLabels(this.listLiveWorkspaceActivity(workspaceId));
+    if (await this.hasRunningBackgroundBashProcesses(workspaceId)) {
+      labels.push("running background bash processes");
+    }
+    if (
+      hasInProcessWorkflowWork(workspaceId) ||
+      (await this.agentTaskIntegration?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId)) ===
+        true
+    ) {
+      labels.push("a workflow run starting or running");
+    }
+    return labels;
+  }
+
   /**
-   * The sink's refusals for a cascaded sub-agent that do not depend on a race: live activity that
-   * archiving would terminate, and a native terminal or external editor whose lifetime cannot be
+   * The sink's refusals for a cascaded sub-agent that do not depend on a race: live activity
+   * (including workflow runs) that archiving would terminate, and a native terminal or external editor whose lifetime cannot be
    * tracked while the archive removes the checkout.
    */
   private async refuseBusyCascadeSubagent(
@@ -11759,10 +11774,7 @@ export class WorkspaceService
   ): Promise<string | null> {
     const id = descendant.workspaceId;
     const label = `sub-agent ${descendant.title} (${id})`;
-    const activity = liveActivityLabels(this.listLiveWorkspaceActivity(id));
-    if (await this.hasRunningBackgroundBashProcesses(id)) {
-      activity.push("running background bash processes");
-    }
+    const activity = await this.liveSubagentActivity(id);
     if (activity.length > 0) {
       return `Cannot archive ${label}: it has live activity (${activity.join(", ")}) that archiving would terminate. Wait for it to finish or ask the user to archive manually.`;
     }

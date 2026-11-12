@@ -134,7 +134,6 @@ describe("describeForcedLossBeforeFailure", () => {
       { workspaceId: "sub-3", title: "Three", branch: "br-three" },
     ],
     deletedCheckout: { path: "/src/repo/target", branch: "target-branch" },
-    deletedCoderWorkspaceName: "xum-box-7",
   });
 
   test("reports nothing when no sub-agent was archived before the failure", () => {
@@ -150,7 +149,6 @@ describe("describeForcedLossBeforeFailure", () => {
     expect(note).not.toContain("sub-3");
     expect(note).not.toContain("own.txt");
     expect(note).not.toContain("/src/repo/target");
-    expect(note).not.toContain("xum-box-7");
   });
 
   test("names a sub-agent whose checkout alone went", () => {
@@ -158,6 +156,15 @@ describe("describeForcedLossBeforeFailure", () => {
 
     expect(note).toContain("Three (sub-3, branch br-three)");
     expect(note).not.toContain("x.txt");
+  });
+
+  test("names the target's Coder workspace, which goes before the archive is saved", () => {
+    const withCoder = { ...forced, deletedCoderWorkspaceName: "xum-box-7" };
+
+    expect(describeForcedLossBeforeFailure(withCoder, () => false)).toContain("xum-box-7");
+    const both = describeForcedLossBeforeFailure(withCoder, (id) => id === "sub-1");
+    expect(both).toContain("xum-box-7");
+    expect(both).toContain("sub-1: x.txt");
   });
 });
 
@@ -190,6 +197,13 @@ describe("sameForcedArchiveLoss", () => {
     ).toBe(false);
     expect(sameForcedArchiveLoss(listed, { ...same(), subagents: [] })).toBe(false);
     expect(sameForcedArchiveLoss(listed, { ...same(), deletedSubagentCheckouts: [] })).toBe(false);
+    // Renamed since the first listing: its commits stay on another branch.
+    expect(
+      sameForcedArchiveLoss(listed, {
+        ...same(),
+        deletedSubagentCheckouts: [{ workspaceId: "sub-2", title: "Two", branch: "renamed" }],
+      })
+    ).toBe(false);
   });
 });
 

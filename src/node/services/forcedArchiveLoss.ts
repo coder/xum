@@ -40,7 +40,8 @@ export function sameForcedArchiveLoss(a: ForcedArchiveLoss, b: ForcedArchiveLoss
     JSON.stringify([
       loss.targetPaths,
       loss.subagents.map((subagent) => [subagent.workspaceId, subagent.paths]),
-      loss.deletedSubagentCheckouts.map((subagent) => subagent.workspaceId),
+      // The branch too: a sub-agent renamed between two listings names another branch for its commits.
+      loss.deletedSubagentCheckouts.map((subagent) => [subagent.workspaceId, subagent.branch]),
     ]);
   return shape(a) === shape(b);
 }
@@ -131,11 +132,25 @@ export function describeForcedArchiveLoss(loss: ForcedArchiveLoss): {
 }
 
 /**
- * What a forced archive had already deleted when it failed part-way: it archives the sub-agents
- * first, so those it archived before the failure lost their listed files and checkouts. The
- * target's own state goes only with a successful archive. Undefined when nothing went.
+ * What a forced archive had already deleted, or may have deleted, when it failed: it archives the
+ * sub-agents first, so those it archived before the failure lost their listed files and
+ * checkouts. The target's own files and checkout go only with a successful archive. Its dedicated
+ * Coder workspace goes before the archive is saved, so a failure can come after that deletion.
+ * Undefined when nothing went.
  */
 export function describeForcedLossBeforeFailure(
+  loss: ForcedArchiveLoss,
+  isArchived: (workspaceId: string) => boolean
+): string | undefined {
+  const notes = [
+    describeArchivedSubagentLoss(loss, isArchived),
+    describeCoderLossBeforeFailure(loss),
+  ];
+  const present = notes.filter((note) => note != null);
+  return present.length > 0 ? present.join(" ") : undefined;
+}
+
+function describeArchivedSubagentLoss(
   loss: ForcedArchiveLoss,
   isArchived: (workspaceId: string) => boolean
 ): string | undefined {
@@ -149,4 +164,9 @@ export function describeForcedLossBeforeFailure(
   ];
   if (parts.length === 0) return undefined;
   return `The archive failed after it archived some sub-agents. Force had already let it delete ${parts.join(" and ")}.`;
+}
+
+function describeCoderLossBeforeFailure(loss: ForcedArchiveLoss): string | undefined {
+  if (loss.deletedCoderWorkspaceName == null) return undefined;
+  return `The archive failed. Force let it delete the dedicated Coder workspace ${loss.deletedCoderWorkspaceName} before it saves the archive, so check whether that workspace still exists: unarchive cannot recreate it.`;
 }

@@ -1683,6 +1683,29 @@ describe("WorkspaceTurnManager", () => {
       expect(result.note).not.toContain("gone.txt");
     });
 
+    test("a forced archive under the Coder delete policy that fails says the Coder workspace may be gone", async () => {
+      const harness = await createWorkspaceLifecycleHarness({
+        archive: mock(
+          (): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Err("config write failed"))
+        ),
+      });
+      await setArchivePolicy(harness.config, {
+        coder: "delete",
+        runtimeConfig: dedicatedCoderRuntime,
+      });
+
+      const result = archivedFields(
+        await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+          harness.parentId,
+          { workspaceId: "childworkspace" },
+          { force: true }
+        )
+      );
+
+      expect(result.status).toBe("error");
+      expect(result.note).toContain("xum-dedicated-box");
+    });
+
     test("a failed archive that is not forced adds no loss note", async () => {
       const harness = await createWorkspaceLifecycleHarness({
         archive: mock(

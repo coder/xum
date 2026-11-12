@@ -509,6 +509,24 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     await expectNothingArchivedOrDeleted();
   });
 
+  test.each(forcedPolicies)(
+    "a forced archive under %s refuses before it archives anything while a sub-agent owns an active workflow run",
+    async (_name, policy) => {
+      await setUpForcedPolicy(policy);
+      spyOn(a.taskService, "hasActiveTopLevelWorkflowRunsForWorkspace").mockImplementation((id) =>
+        Promise.resolve(id === childId)
+      );
+
+      const result = await modelArchiveRoot({ force: true });
+
+      assert(result.success, "the lifecycle archive returns a result");
+      expect(result.data.status).toBe("error");
+      expect(result.data.error).toContain(childId);
+      expect(result.data.error).toContain("workflow run");
+      await expectNothingArchivedOrDeleted();
+    }
+  );
+
   test("a forced snapshot archive refuses before it archives anything when the target's files changed after the listing", async () => {
     await setUpForcedPolicy("snapshot");
     const rootCheckout = checkouts.get(rootId)!;
