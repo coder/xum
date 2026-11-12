@@ -46,6 +46,9 @@ export const FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL =
 export function sameForcedArchiveLoss(a: ForcedArchiveLoss, b: ForcedArchiveLoss): boolean {
   const shape = (loss: ForcedArchiveLoss) =>
     JSON.stringify([
+      // The target's own checkout: a rename since the first listing moves it to another path and branch.
+      loss.deletedCheckout?.path,
+      loss.deletedCheckout?.branch,
       loss.targetPaths,
       loss.subagents.map((subagent) => [subagent.workspaceId, subagent.paths]),
       // The branch too: a sub-agent renamed between two listings names another branch for its commits.

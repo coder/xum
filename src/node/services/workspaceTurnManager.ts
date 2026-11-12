@@ -4865,6 +4865,25 @@ export class WorkspaceTurnManager {
   }
 
   /**
+   * The policy with the checkout it deletes read again. The policy is pinned for the operation,
+   * but another backend can rename the target meanwhile: the sink deletes the checkout it finds
+   * under the new name, so the listing must name that one.
+   */
+  private async withCurrentDeletedCheckout(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    policy: ArchivePolicy
+  ): Promise<ArchivePolicy> {
+    if (policy.deletedCheckout == null) return policy;
+    const current = await this.findWorkspaceLifecycleMetadata(resolved.workspaceId);
+    // A target that is gone cannot be listed: the sink refuses it with its own error.
+    if (current == null) return policy;
+    return {
+      ...policy,
+      deletedCheckout: { path: current.namedWorkspacePath, branch: current.name },
+    };
+  }
+
+  /**
    * The listing a forced archive made can be older than the sink call: it can wait for turns to
    * settle first. List again right before the sink and refuse when what force would delete or
    * refuse has changed. A change inside the cascade itself is the sink's to refuse, and the
@@ -4876,7 +4895,11 @@ export class WorkspaceTurnManager {
     forcedLoss: ForcedArchiveLoss | undefined
   ): Promise<WorkspaceLifecycleResult | null> {
     if (forcedLoss == null) return null;
-    const latest = await this.preflightArchiveLoss(resolved, policy, true);
+    const latest = await this.preflightArchiveLoss(
+      resolved,
+      await this.withCurrentDeletedCheckout(resolved, policy),
+      true
+    );
     if ("refusal" in latest) return latest.refusal;
     if (latest.forcedLoss == null || sameForcedArchiveLoss(forcedLoss, latest.forcedLoss)) {
       return null;

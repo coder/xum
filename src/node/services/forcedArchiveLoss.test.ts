@@ -205,6 +205,22 @@ describe("sameForcedArchiveLoss", () => {
       })
     ).toBe(false);
   });
+
+  test("is false when the target's checkout moved to another path or branch since the first listing", () => {
+    const checkout = { path: "/src/repo/target", branch: "target-branch" };
+    const withCheckout = loss({ deletedCheckout: checkout });
+
+    expect(sameForcedArchiveLoss(withCheckout, loss({ deletedCheckout: { ...checkout } }))).toBe(
+      true
+    );
+    expect(
+      sameForcedArchiveLoss(withCheckout, loss({ deletedCheckout: { ...checkout, path: "/src/repo/renamed" } }))
+    ).toBe(false);
+    expect(
+      sameForcedArchiveLoss(withCheckout, loss({ deletedCheckout: { ...checkout, branch: "renamed" } }))
+    ).toBe(false);
+    expect(sameForcedArchiveLoss(withCheckout, loss({}))).toBe(false);
+  });
 });
 
 describe("forcedArchivePaths", () => {

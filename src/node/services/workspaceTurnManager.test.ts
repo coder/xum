@@ -1387,6 +1387,45 @@ describe("WorkspaceTurnManager", () => {
       expect(harness.archive).not.toHaveBeenCalled();
     });
 
+    test("a forced archive under the delete policy refuses when another backend renamed the target after the listing", async () => {
+      // The rename lands between the first listing and the one right before the sink.
+      let renameTarget: () => Promise<void> = () => Promise.resolve();
+      const preflightArchiveCascade = mock(() =>
+        Promise.resolve(Ok({ targetPaths: [], subagents: [] }))
+      );
+      preflightArchiveCascade.mockImplementationOnce(async () => {
+        await renameTarget();
+        return Ok({ targetPaths: [], subagents: [] });
+      });
+      const harness = await createWorkspaceLifecycleHarness({ preflightArchiveCascade });
+      await setArchivePolicy(harness.config, {
+        worktree: "delete",
+        runtimeConfig: managedWorktreeRuntime,
+      });
+      renameTarget = () =>
+        harness.config.editConfig((cfg) => {
+          for (const [, project] of cfg.projects) {
+            const child = project.workspaces.find((w) => w.id === "childworkspace");
+            if (child) child.name = "renamed-child";
+          }
+          return cfg;
+        });
+
+      const result = archivedFields(
+        await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+          harness.parentId,
+          { workspaceId: "childworkspace" },
+          { force: true }
+        )
+      );
+
+      expect(result.status).toBe("error");
+      expect(result.status === "error" ? result.error : undefined).toBe(
+        FORCED_ARCHIVE_LOSS_CHANGED_REFUSAL
+      );
+      expect(harness.archive).not.toHaveBeenCalled();
+    });
+
     test("a forced archive lists again right before the sink and refuses when a sub-agent's checkout joined the deletions", async () => {
       const preflightArchiveCascade = mock(() =>
         Promise.resolve(Ok({ targetPaths: [], subagents: [] }))
