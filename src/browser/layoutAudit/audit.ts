@@ -21,6 +21,7 @@ import {
   textFragments,
   textTruncation,
   type ClippingBoundary,
+  visiblePart,
 } from "./elementFacts";
 import {
   classifyMaterialRectEscape,
@@ -434,8 +435,13 @@ function isInsideViewport(point: Point, metrics: PageMetrics): boolean {
   );
 }
 
-function isBelowViewport(point: Point, metrics: PageMetrics): boolean {
-  return point.x >= 0 && point.x <= metrics.viewportWidth && point.y > metrics.viewportHeight;
+// Off the screen, above or below, where a scroll can bring it. Content above the screen is there
+// to find when the page loaded already scrolled (an autofocus, a script that restores a position).
+// Above the top of the page (document y under 0) no scroll reaches it.
+function isScrollReachable(point: Point, metrics: PageMetrics): boolean {
+  const { viewportWidth, viewportHeight, scrollY } = metrics;
+  if (point.x < 0 || point.x > viewportWidth) return false;
+  return point.y > viewportHeight || (point.y < 0 && point.y + scrollY >= 0);
 }
 
 // A control with no text of its own (an <input value>, a <select>, an icon-only button): its face
@@ -444,12 +450,17 @@ function isFacelessControl(page: LayoutPage, el: Element): boolean {
   return auditedText(page, el) === "" && isRequiredControl(el);
 }
 
-// The rectangles whose points are sampled: the text lines, or the box of a faceless control.
+// The rectangles whose points are sampled: the text lines, or the box of a faceless control, as
+// far as a clipping box leaves them visible (a clipped-away line has a rectangle, and a point on
+// it would find whatever sits there instead).
 function sampleRects(pass: AuditPass, el: Element): Box[] {
   const rects = isFacelessControl(pass.page, el)
     ? [pass.page.box(el)]
     : textFragments(pass.page, el);
-  return rects.filter((rect) => rect.width * rect.height >= THRESHOLDS.minFragmentArea);
+  return rects.flatMap((rect) => {
+    const visible = visiblePart(pass.page, el, rect);
+    return visible && visible.width * visible.height >= THRESHOLDS.minFragmentArea ? [visible] : [];
+  });
 }
 
 /** What the sample points of one candidate found so far. */
@@ -457,36 +468,37 @@ interface OcclusionSamples {
   el: Element;
   /** The cover found at each sampled point, null where nothing covers it. */
   covers: Array<Element | null>;
-  /** Points below the screen, in document coordinates: sampled after a scroll. */
-  below: Point[];
+  /** Points above or below the screen, in document coordinates: sampled after a scroll. */
+  offscreen: Point[];
 }
 
-// Points inside the viewport are sampled where they are. Points below it wait for a scroll (every
-// rect is read here, before any scroll, so all of them are in the one coordinate frame).
+// Points inside the viewport are sampled where they are. Points above or below it wait for a
+// scroll (every rect is read here, before any scroll, so all of them are in the one coordinate
+// frame).
 function sampleOnScreen(pass: AuditPass, el: Element): OcclusionSamples {
-  const samples: OcclusionSamples = { el, covers: [], below: [] };
+  const samples: OcclusionSamples = { el, covers: [], offscreen: [] };
   for (const point of sampleRects(pass, el).flatMap(fragmentSamplePoints)) {
     if (isInsideViewport(point, pass.metrics)) {
       samples.covers.push(opaqueSiblingBlocker(pass, el, point));
-    } else if (isBelowViewport(point, pass.metrics)) {
-      samples.below.push({ x: point.x, y: point.y + pass.metrics.scrollY });
+    } else if (isScrollReachable(point, pass.metrics)) {
+      samples.offscreen.push({ x: point.x, y: point.y + pass.metrics.scrollY });
     }
   }
   return samples;
 }
 
 /**
- * Samples the points below the screen, which a user reaches by scrolling. The points are taken
- * in page order. One that is not in the middle half of the viewport scrolls the window to put it
- * in the middle (the scroll is instant, whatever the page's `scroll-behavior`), and the points
- * that follow reuse that position. The scroll that was reached is read back: a point the page
- * could not bring on screen is skipped, not sampled where it is not. A page that cannot scroll
- * (its root clips vertically) shows a user none of this text. The scroll position is put back
- * before this returns, so a later pass measures the same page.
+ * Samples the points above and below the screen, which a user reaches by scrolling. The points
+ * are taken in page order. One that is not in the middle half of the viewport scrolls the window
+ * to put it in the middle (the scroll is instant, whatever the page's `scroll-behavior`), and the
+ * points that follow reuse that position. The scroll that was reached is read back: a point the
+ * page could not bring on screen is skipped, not sampled where it is not. A page that cannot
+ * scroll (its root clips vertically) shows a user none of this text. The scroll position is put
+ * back before this returns, so a later pass measures the same page.
  */
-function sampleBelowScreen(pass: AuditPass, all: readonly OcclusionSamples[]): void {
+function sampleOffScreen(pass: AuditPass, all: readonly OcclusionSamples[]): void {
   const { page, metrics } = pass;
-  const pending = all.flatMap((samples) => samples.below.map((point) => ({ samples, point })));
+  const pending = all.flatMap((samples) => samples.offscreen.map((point) => ({ samples, point })));
   if (pending.length === 0 || rootVerticalScrollLocked(page)) return;
   pending.sort((a, b) => a.point.y - b.point.y);
   const { viewportHeight } = metrics;
@@ -505,14 +517,11 @@ function sampleBelowScreen(pass: AuditPass, all: readonly OcclusionSamples[]): v
   }
 }
 
-// How many sample points one blocker covers, of how many in all.
+// How many of the sample points sit under a cover, of how many in all. Covers add up: two panels
+// side by side that together hide the text make it as unreadable as one panel does.
 function occlusionOf(samples: OcclusionSamples) {
-  const coveredBy = new Map<Element, number>();
-  for (const cover of samples.covers) {
-    if (cover) coveredBy.set(cover, (coveredBy.get(cover) ?? 0) + 1);
-  }
   return {
-    occludedSamples: Math.max(0, ...coveredBy.values()),
+    occludedSamples: samples.covers.filter((cover) => cover !== null).length,
     totalSamples: samples.covers.length,
   };
 }
@@ -536,7 +545,7 @@ function occlusionCheck(pass: AuditPass, elements: readonly Element[]): void {
     .filter((el) => isOcclusionCandidate(pass, el))
     .slice(0, THRESHOLDS.maxOcclusionCandidates);
   const sampled = candidates.map((el) => sampleOnScreen(pass, el));
-  sampleBelowScreen(pass, sampled);
+  sampleOffScreen(pass, sampled);
   const failedRoots: Element[] = [];
   for (const samples of sampled) {
     const { el } = samples;
@@ -567,7 +576,7 @@ function createPass(page: LayoutPage): AuditPass {
 
 /**
  * One measurement of the page. It never changes the DOM. The overlap rule scrolls the window to
- * sample text below the screen and puts it back before this returns.
+ * sample text above and below the screen and puts it back before this returns.
  */
 export function auditLayout(page: LayoutPage): LayoutAuditPageFinding[] {
   const pass = createPass(page);

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Text covered by two panels that meet</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      .stack {
+        position: relative;
+        display: inline-block;
+        padding: 18px;
+        border: 1px solid #aebbc4;
+      }
+      .stack p {
+        margin: 0;
+        padding: 18px;
+        font-size: 20px;
+        white-space: nowrap;
+      }
+      /* The panels are opaque and meet at 60% of the box. The text sits under both: the left panel
+         alone holds two thirds of it, the right panel one third. */
+      .cover {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        background: #fff;
+      }
+      .left {
+        left: 0;
+        width: 60%;
+      }
+      .right {
+        left: 60%;
+        right: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Order status</h1>
+      <div class="stack">
+        <p id="totals">Totals are covered</p>
+        <div class="cover left"></div>
+        <div class="cover right"></div>
+      </div>
+    </main>
+  </body>
+</html>

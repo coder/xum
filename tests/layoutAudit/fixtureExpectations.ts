@@ -85,6 +85,12 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   // An ellipsis does not excuse lines lost below a short box. A one-line ellipsis and a line
   // clamp are the author's cut.
   "ellipsis-clipped-lines": everyWidth(found("clipped-text", "p#lost-lines")),
+  // A line clamp cuts the lines below the paragraph away, but the browser still reports a box for
+  // each of them, and an opaque card follows right after. Nobody sees a covered line: no finding.
+  "clamped-lines-over-block": CLEAN,
+  // Two opaque panels meet over the text, 60% and 40% of the box: each is under the share that one
+  // cover must hold, together they hide all of it.
+  "cover-in-two-panels": everyWidth(found("overlapping-text", "p#totals")),
   "occlusion-exclusions-clean": CLEAN,
   "real-animated-entry": CLEAN,
   "real-carousel": CLEAN,

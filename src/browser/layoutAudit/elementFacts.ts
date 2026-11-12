@@ -300,6 +300,29 @@ export function clippingBoundariesFor(page: LayoutPage, el: Element): ClippingBo
   );
 }
 
+/**
+ * The part of `rect`, a rendered line or the box of `el`, that overflow leaves visible: `rect`
+ * cut at the padding box of `el` and of each ancestor that clips (`overflow: hidden | clip`), on
+ * the axes it clips. A line clamp or a short box still has line rectangles for the lines it cuts
+ * away, so a rule that samples what a user sees reads them through this. Null when none is left.
+ */
+export function visiblePart(page: LayoutPage, el: Element, rect: Box): Box | null {
+  const own = clippingBoundaryOf(page, el);
+  let { left, top, right, bottom } = rect;
+  for (const { box, axes } of [...(own ? [own] : []), ...clippingBoundariesFor(page, el)]) {
+    if (axes.includes("horizontal")) {
+      left = Math.max(left, box.left);
+      right = Math.min(right, box.right);
+    }
+    if (axes.includes("vertical")) {
+      top = Math.max(top, box.top);
+      bottom = Math.min(bottom, box.bottom);
+    }
+  }
+  if (right <= left || bottom <= top) return null;
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
+
 /** A clipping element inside a text boundary, and the rendered lines of the text it holds. */
 export interface NestedClip {
   boundary: ClippingBoundary;
