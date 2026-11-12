@@ -1,6 +1,6 @@
 import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
-import { appMeta, AppWithMocks, PIXEL_DUAL_THEME } from "@/browser/stories/meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, PIXEL_DUAL_THEME } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar } from "@/browser/stories/helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
@@ -293,6 +293,103 @@ export const CompactStopsAndLiveTurn: AppStory = {
     // Stops stay in the conversation.
     await canvas.findByText("Here is the plan.");
     await canvas.findByText("Session cleanup job");
+  },
+};
+
+const LONG_SESSION_TURNS = 6;
+const LONG_SESSION_STEPS_PER_TURN = 30;
+
+/**
+ * A long session: every turn is dozens of steps, so the transcript is hundreds of rows while it
+ * reads as six short exchanges.
+ */
+function createLongSession(): ChatMuxMessage[] {
+  const start = STABLE_TIMESTAMP - 6 * 3_600_000;
+  const messages: ChatMuxMessage[] = [];
+  for (let turn = 1; turn <= LONG_SESSION_TURNS; turn++) {
+    const turnStart = start + turn * 600_000;
+    const steps: NonNullable<Parameters<typeof createAssistantMessage>[2]["toolCalls"]> = [];
+    for (let step = 1; step <= LONG_SESSION_STEPS_PER_TURN; step++) {
+      const id = `long-${turn}-${step}`;
+      if (step % 3 === 0) {
+        steps.push(
+          text(`Step ${step} of part ${turn}: checking the next module.`, turnStart + step * 9_000)
+        );
+      }
+      steps.push(
+        step % 5 === 0
+          ? createFileEditTool(id, `src/part${turn}/module${step}.ts`, EDIT_DIFF)
+          : step % 2 === 0
+            ? createBashTool(id, `make test-part-${turn}`, "ok", 0, 30, 4_000, "Running the tests")
+            : createFileReadTool(id, `src/part${turn}/module${step}.ts`, "export {};")
+      );
+    }
+    steps.push(
+      text(
+        `Part ${turn} is done: its six modules are migrated and their tests pass.`,
+        turnStart + 290_000
+      )
+    );
+    messages.push(
+      createUserMessage(`long-user-${turn}`, `Migrate part ${turn} to the new session API`, {
+        historySequence: turn * 2 - 1,
+        timestamp: turnStart,
+      }),
+      createAssistantMessage(`long-assistant-${turn}`, "", {
+        historySequence: turn * 2,
+        timestamp: turnStart + 2_000,
+        toolCalls: steps,
+      })
+    );
+  }
+  return messages;
+}
+
+/**
+ * A long session in compact density. Nothing is cut out of it: every earlier turn still shows
+ * its prompt, its work line and its reply.
+ */
+export const CompactLongSession: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-density-long",
+          userPreferences: { appearance: { transcriptDensity: "hyper" } },
+          messages: createLongSession(),
+        });
+      }}
+    />
+  ),
+  // The play function is the contract here; CompactTurns is the snapshot of the same layout.
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The oldest turn is in the transcript with the newest: nothing is replaced by a marker.
+    await canvas.findByText("Migrate part 1 to the new session API", undefined, {
+      timeout: 15_000,
+    });
+    const oldestReply = await canvas.findByText(/^Part 1 is done/);
+    const latestReply = await canvas.findByText(new RegExp(`^Part ${LONG_SESSION_TURNS} is done`));
+    await expect(canvas.queryByText(/hidden for performance/i)).toBeNull();
+    await expect(canvas.queryByRole("button", { name: /load older/i })).toBeNull();
+    await waitFor(() =>
+      expect(canvas.getAllByRole("button", { name: /^Worked for /u })).toHaveLength(
+        LONG_SESSION_TURNS
+      )
+    );
+
+    // With a pointer, only the latest reply keeps its actions in view; an older reply shows
+    // them when the pointer or the keyboard is on it. Touch always shows them.
+    if (window.matchMedia("(hover: hover)").matches) {
+      const metaOpacity = (reply: HTMLElement) => {
+        const meta = reply.closest("[data-message-block]")?.querySelector("[data-message-meta]");
+        return meta ? getComputedStyle(meta).opacity : undefined;
+      };
+      await expect(metaOpacity(latestReply)).toBe("1");
+      await expect(metaOpacity(oldestReply)).toBe("0");
+    }
   },
 };
 

@@ -1,6 +1,7 @@
 /**
- * UI integration test for chat truncation behavior.
- * Verifies a generic hidden-history indicator is surfaced and assistant meta rows remain intact.
+ * UI integration test for a long transcript: more rows than the old 64-row display cap.
+ * The chat pane bounds what it mounts with a tail-first window, so nothing is cut out of the
+ * transcript: every turn shows, with no "hidden for performance" marker.
  */
 
 import "../dom";
@@ -15,7 +16,6 @@ import {
 } from "../../ipc/helpers";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import { HistoryService } from "@/node/services/historyService";
-import { MAX_HISTORY_HIDDEN_SEGMENTS } from "@/browser/utils/messages/transcriptTruncationPlan";
 import { createMuxMessage } from "@/common/types/message";
 
 import { installDom } from "../dom";
@@ -75,12 +75,12 @@ async function seedHistoryWithToolCalls(
   }
 }
 
-describe("Chat truncation UI", () => {
+describe("Long transcript UI", () => {
   beforeAll(async () => {
     await preloadTestModules();
   });
 
-  test("shows a generic hidden indicator and preserves assistant meta rows", async () => {
+  test("shows every turn of a long transcript, with no hidden-messages marker", async () => {
     const env = await createTestEnvironment();
     const repoPath = await createTempGitRepo();
     await trustProject(env, repoPath);
@@ -90,7 +90,7 @@ describe("Chat truncation UI", () => {
 
     try {
       const trunkBranch = await detectDefaultTrunkBranch(repoPath);
-      const branchName = generateBranchName("ui-truncation");
+      const branchName = generateBranchName("ui-long-transcript");
 
       const createResult = await env.orpc.workspace.create({
         projectPath: repoPath,
@@ -112,69 +112,23 @@ describe("Chat truncation UI", () => {
       await setupWorkspaceView(view, createResult.metadata, workspaceId);
       await waitForWorkspaceChatToRender(view.container);
 
-      // Must match MAX_DISPLAYED_MESSAGES in StreamingMessageAggregator.ts
-      const maxDisplayedMessages = 64;
-      const totalDisplayedMessages = pairCount * 4;
-      const oldDisplayedMessages = totalDisplayedMessages - maxDisplayedMessages;
-      const oldPairs = oldDisplayedMessages / 4;
-      const expectedHiddenCount = oldPairs * 3;
-
-      const indicators = await waitFor(
-        () => {
-          const nodes = Array.from(
-            view?.container.querySelectorAll('[data-testid="chat-message"]') ?? []
-          ).filter((node) => /some messages are hidden for performance/i.exec(node.textContent));
-          if (nodes.length === 0) {
-            throw new Error("Truncation indicator not found");
-          }
-          return nodes;
-        },
+      // The oldest turn mounts with the rest: the mount window reveals it tail-first, and
+      // nothing in a transcript this long is replaced by a marker.
+      const oldestReply = await waitFor(() => view!.getByText("assistant-0"), {
         // Full integration runs can hydrate the seeded transcript slower than
         // Testing Library's default 1s wait, even though the chat window exists.
-        { timeout: 30_000 }
-      );
+        timeout: 30_000,
+      });
+      const transcriptText = view.container.textContent ?? "";
+      expect(transcriptText).not.toMatch(/hidden for performance/i);
+      expect(view.queryByRole("button", { name: /load all/i })).toBeNull();
+      for (let i = 0; i < pairCount; i++) {
+        expect(view.getByText(`user-${i}`)).toBeTruthy();
+        expect(view.getByText(`assistant-${i}`)).toBeTruthy();
+      }
 
-      expect(indicators).toHaveLength(MAX_HISTORY_HIDDEN_SEGMENTS);
-
-      const sumIndicatorCounts = (pattern: RegExp): number => {
-        return indicators.reduce((sum, node) => {
-          const match = node.textContent?.match(pattern);
-          return sum + (match ? Number(match[1]) : 0);
-        }, 0);
-      };
-
-      expect(sumIndicatorCounts(/(\d+)\s+messages? hidden/i)).toBe(expectedHiddenCount);
-      expect(sumIndicatorCounts(/(\d+)\s+tool call/i)).toBe(oldPairs);
-      expect(sumIndicatorCounts(/(\d+)\s+thinking block/i)).toBe(oldPairs);
-      expect(view.getAllByRole("button", { name: /load all/i })).toHaveLength(
-        MAX_HISTORY_HIDDEN_SEGMENTS
-      );
-
-      const messageBlocks = Array.from(
-        view.container.querySelectorAll('[data-testid="chat-message"]')
-      );
-      const hiddenIndicatorCount = messageBlocks.filter((node) =>
-        /some messages are hidden for performance/i.exec(node.textContent)
-      ).length;
-      expect(hiddenIndicatorCount).toBe(MAX_HISTORY_HIDDEN_SEGMENTS);
-      const indicatorIndex = messageBlocks.findIndex((node) =>
-        /some messages are hidden for performance/i.exec(node.textContent)
-      );
-      expect(indicatorIndex).toBeGreaterThan(0);
-      // The earliest marker still appears at the first omission seam: after user-0's turn
-      // (which the workspace creation card follows) and before user-1.
-      const rowsBeforeIndicator = messageBlocks
-        .slice(0, indicatorIndex)
-        .map((node) => node.textContent ?? "");
-      expect(rowsBeforeIndicator.some((text) => text.includes("user-0"))).toBe(true);
-      expect(rowsBeforeIndicator.some((text) => text.includes("user-1"))).toBe(false);
-      expect(messageBlocks[indicatorIndex + 1]?.textContent).toContain("user-1");
-
-      // Verify assistant meta rows survive in the recent (non-truncated) section.
-      // assistant-0 is now in the old section and gets omitted; pick a visible one instead.
-      const firstRecentPairIndex = oldPairs;
-      const assistantText = view.getByText(`assistant-${firstRecentPairIndex}`);
-      const messageBlock = assistantText.closest("[data-message-block]");
+      // Every reply keeps its actions and time, the oldest included.
+      const messageBlock = oldestReply.closest("[data-message-block]");
       expect(messageBlock).toBeTruthy();
       expect(messageBlock?.querySelector("[data-message-meta]")).not.toBeNull();
     } finally {

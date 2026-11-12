@@ -240,7 +240,6 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
           <HistoryHiddenMessage
             message={message}
             className={className}
-            workspaceId={workspaceId}
             onShowAll={onShowAllHistory}
           />
         );

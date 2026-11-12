@@ -436,6 +436,83 @@ function assignWorkBundle(
 }
 
 /**
+ * The rows the transcript's mount window counts, as indices into the transcript, or undefined
+ * when that is every row (detailed density).
+ *
+ * The window (useBoundedTranscriptReveal) budgets rows: how many mount first, how many per
+ * step, where it pauses and where it caps. A row folded behind a closed work line mounts
+ * nothing, so counting it made each budget many times too small in compact density: the first
+ * paint of a long session was its last turn alone, with the turns above popping in over the
+ * next frames, and "Load older messages" came after two or three long turns.
+ *
+ * The window tracks its edges by row id, so the rows it is given must be stable there:
+ *  - The first row of a stretch always counts (the work line renders at it, and it is the only
+ *    place the window may cut), and so does the last (the newest row of the transcript is
+ *    always one, and the window restarts when the newest row it knew disappears).
+ *  - Every row of a live stretch counts. Its rows show through the fold one after another, and
+ *    rows that come and go under the tail would read as a replaced tail.
+ * A line the user opened mounts its steps without counting them: they come on request only.
+ */
+export function computeWindowRowIndices(
+  workBundleInfos: ReadonlyArray<WorkBundleInfo | undefined> | undefined
+): number[] | undefined {
+  if (workBundleInfos === undefined) return undefined;
+  const indices: number[] = [];
+  for (let index = 0; index < workBundleInfos.length; index++) {
+    const info = workBundleInfos[index];
+    const mounts =
+      info === undefined ||
+      info.state === "live" ||
+      info.role === "answer" ||
+      info.visibleWhenFolded ||
+      info.headIndex === index ||
+      workBundleInfos[index + 1]?.key !== info.key;
+    if (mounts) indices.push(index);
+  }
+  return indices.length === workBundleInfos.length ? undefined : indices;
+}
+
+/** The rows a mount window counts, with its indices translated to and from the transcript's. */
+export interface TranscriptWindowRows<Row> {
+  rows: readonly Row[];
+  /** Transcript index of the window row at `windowIndex`; the transcript's length past the end. */
+  toTranscriptIndex: (windowIndex: number) => number;
+  /** The last window row at or before the transcript row at `transcriptIndex`. */
+  toWindowIndex: (transcriptIndex: number) => number;
+}
+
+/**
+ * `messages` narrowed to `windowRowIndices` (see computeWindowRowIndices; undefined keeps every
+ * row). A range of window rows [from, to) is the transcript range between the same two rows, so
+ * it takes the uncounted rows between them with it: they sit inside stretches, and the window
+ * only cuts at the first row of one.
+ */
+export function selectTranscriptWindowRows<Row>(
+  messages: readonly Row[],
+  windowRowIndices: readonly number[] | undefined
+): TranscriptWindowRows<Row> {
+  if (windowRowIndices === undefined) {
+    return { rows: messages, toTranscriptIndex: (index) => index, toWindowIndex: (index) => index };
+  }
+  return {
+    rows: windowRowIndices.map((index) => messages[index]),
+    toTranscriptIndex: (windowIndex) =>
+      windowIndex < windowRowIndices.length ? windowRowIndices[windowIndex] : messages.length,
+    toWindowIndex: (transcriptIndex) => {
+      // Binary search for the last counted row at or before the target.
+      let low = 0;
+      let high = windowRowIndices.length - 1;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (windowRowIndices[middle] <= transcriptIndex) low = middle;
+        else high = middle - 1;
+      }
+      return low;
+    },
+  };
+}
+
+/**
  * Tools whose collapsed card carries no information the user must act on or review, so a run of
  * them can fold into one summary row. Deliberately an allowlist: an unknown or new tool keeps its
  * own card until someone decides it is routine.

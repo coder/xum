@@ -3,8 +3,10 @@ import { TRANSCRIPT_REVEAL_STEP_CHARS } from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import {
   computeOperationalBundleInfos,
+  computeWindowRowIndices,
   computeWorkBundleInfos,
   estimateTranscriptRowWeight,
+  selectTranscriptWindowRows,
   summarizeOperationalBundle,
 } from "./transcriptRenderProjection";
 
@@ -446,6 +448,101 @@ describe("work bundles (compact density)", () => {
     expect(live[1]?.durationMs).toBeUndefined();
   });
 });
+describe("mount window rows (compact density)", () => {
+  const A = { historyId: "history-a" };
+  const B = { historyId: "history-b" };
+
+  function windowRows(messages: DisplayedMessage[], isTurnActive = false) {
+    const indices = computeWindowRowIndices(computeWorkBundleInfos(messages, { isTurnActive }));
+    return { indices, rows: selectTranscriptWindowRows(messages, indices) };
+  }
+
+  test("counts every row when no work is folded", () => {
+    // Detailed density has no work lines.
+    expect(computeWindowRowIndices(undefined)).toBeUndefined();
+    // Nor does a compact transcript of plain exchanges.
+    const messages = [user("prompt"), assistant("reply", A)];
+    const { indices, rows } = windowRows(messages);
+    expect(indices).toBeUndefined();
+    expect(rows.rows).toBe(messages);
+    expect(rows.toTranscriptIndex(2)).toBe(2);
+    expect(rows.toWindowIndex(1)).toBe(1);
+  });
+
+  test("leaves out the steps folded behind a finished turn's work line", () => {
+    const messages = [
+      user("prompt-1"),
+      tool({ id: "read-1", ...A }),
+      tool({ id: "read-2", ...A }),
+      tool({ id: "read-3", ...A }),
+      assistant("reply-1", A),
+      user("prompt-2"),
+      tool({ id: "read-4", ...B }),
+      tool({ id: "read-5", ...B }),
+      tool({ id: "read-6", ...B }),
+    ];
+    const { indices, rows } = windowRows(messages);
+
+    // The first row of a stretch carries the work line, and the reply shows. The second
+    // stretch has no reply: its last row counts, so the transcript's newest row always does.
+    expect(indices).toEqual([0, 1, 4, 5, 6, 8]);
+    expect(rows.rows.map((row) => row.id)).toEqual([
+      "prompt-1",
+      "read-1",
+      "reply-1",
+      "prompt-2",
+      "read-4",
+      "read-6",
+    ]);
+  });
+
+  test("counts every row of the live turn, and a settled row that still needs the user", () => {
+    const live = [
+      user("prompt"),
+      tool({ id: "read-1", ...A }),
+      tool({ id: "read-2", ...A }),
+      tool({ id: "tests", toolName: "bash", status: "executing", ...A }),
+    ];
+    // Rows that came and went under the tail would read as a replaced tail.
+    expect(windowRows(live, true).indices).toBeUndefined();
+
+    const stopped = [
+      user("prompt"),
+      tool({ id: "read-1", ...A }),
+      tool({
+        id: "tests",
+        toolName: "bash",
+        status: "interrupted",
+        isPartial: true,
+        isLastPartOfMessage: true,
+        ...A,
+      }),
+      tool({ id: "todo", toolName: "todo_write", ...A }),
+      tool({ id: "notify", toolName: "notify", ...A }),
+    ];
+    // "tests" shows through the fold (it holds the interrupted divider); "todo" is folded.
+    expect(windowRows(stopped).indices).toEqual([0, 1, 2, 4]);
+  });
+
+  test("translates window indices to the transcript and back", () => {
+    const messages = [
+      user("prompt-1"),
+      tool({ id: "read-1", ...A }),
+      tool({ id: "read-2", ...A }),
+      tool({ id: "read-3", ...A }),
+      assistant("reply-1", A),
+      user("prompt-2"),
+    ];
+    const { rows } = windowRows(messages);
+    // Window rows: prompt-1, read-1 (the work line), reply-1, prompt-2.
+    expect([0, 1, 2, 3].map(rows.toTranscriptIndex)).toEqual([0, 1, 4, 5]);
+    // One past the last window row is one past the last transcript row.
+    expect(rows.toTranscriptIndex(4)).toBe(messages.length);
+    // A folded step is reached through the row its work line renders at.
+    expect([0, 1, 2, 3, 4, 5].map(rows.toWindowIndex)).toEqual([0, 1, 1, 1, 2, 3]);
+  });
+});
+
 describe("task_await poll grouping", () => {
   test("leaves standalone waits visible and collapses consecutive polls", () => {
     const first = tool({ id: "await-1", toolName: "task_await", status: "completed" });

@@ -5397,6 +5397,12 @@ export class WorkspaceStore {
     if (!this.aggregators.has(workspaceId)) {
       // Create new aggregator with required createdAt and workspaceId for localStorage persistence
       const aggregator = new StreamingMessageAggregator(createdAt, workspaceId, unarchivedAt);
+      // Nothing is cut out of the transcript here. The chat pane bounds what it mounts with a
+      // tail-first window (useBoundedTranscriptReveal), so the aggregator's row cap is not
+      // needed, and it did harm: it replaced older replies with "hidden for performance"
+      // markers, which in compact density (a turn is three rows) reached the first screen. The
+      // cap stays for the VS Code webview, which has no mount window.
+      aggregator.setShowAllMessages(true);
       // Wire up navigation callback for notification clicks
       if (this.navigateToWorkspaceCallback) {
         aggregator.onNavigateToWorkspace = this.navigateToWorkspaceCallback;
@@ -6309,24 +6315,6 @@ export function pinTimelineRevealTarget(
   const aggregator = store.getAggregator(workspaceId);
   if (aggregator) {
     aggregator.setTranscriptRevealTarget(target);
-    store.bumpState(workspaceId);
-  }
-}
-
-/**
- * Disable the displayed message cap for a workspace and trigger a re-render.
- * Used by HistoryHiddenMessage “Load all”.
- */
-export function showAllMessages(workspaceId: string): void {
-  assert(
-    typeof workspaceId === "string" && workspaceId.length > 0,
-    "showAllMessages requires workspaceId"
-  );
-
-  const store = getStoreInstance();
-  const aggregator = store.getAggregator(workspaceId);
-  if (aggregator) {
-    aggregator.setShowAllMessages(true);
     store.bumpState(workspaceId);
   }
 }

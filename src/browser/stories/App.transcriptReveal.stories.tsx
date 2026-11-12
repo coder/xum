@@ -34,11 +34,10 @@ export default { ...appMeta, title: "App/TranscriptReveal" };
 
 const LARGE_ROWS = 300;
 /**
- * History rows whose DISPLAYED transcript exceeds the automatic budget by more than a chunk and
- * stays below two budgets. The transcript truncation keeps every user prompt (odd rows collapse
- * behind history-hidden markers), so the user prompts alone must exceed the budget.
+ * A transcript that exceeds the automatic budget by more than a chunk and stays below two
+ * budgets. Every history row is a displayed row: nothing is cut out of the transcript.
  */
-const OVER_BUDGET_ROWS = 2 * (TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + 2 * TRANSCRIPT_REVEAL_CHUNK_ROWS);
+const OVER_BUDGET_ROWS = TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + 2 * TRANSCRIPT_REVEAL_CHUNK_ROWS;
 const rowId = (index: number) => `reveal-row-${index}`;
 const rowText = (index: number) => `Transcript row ${index} of the tail-first reveal.`;
 
@@ -382,7 +381,7 @@ const setupOverBudget = () => setup(OVER_BUDGET_ROWS);
 const pauseAtBudget: AppStory["play"] = async ({ canvasElement, step }) => {
   const canvas = within(canvasElement);
   await findVisibleText(canvasElement, "A short transcript.");
-  // Every mounted transcript row, history-hidden markers included (they have no message id).
+  // Every mounted transcript row.
   const mountedCount = () =>
     canvasElement.querySelectorAll('[data-testid="message-window"] [data-testid="chat-message"]')
       .length;
@@ -490,8 +489,8 @@ export const PauseAtBudgetPhone: AppStory = {
   },
 };
 
-/** Displayed rows (every user prompt is kept) beyond the mounted-row cap by over one budget. */
-const CAPPED_ROWS = 2 * (TRANSCRIPT_MAX_MOUNTED_ROWS + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+/** A transcript beyond the mounted-row cap by one budget. */
+const CAPPED_ROWS = TRANSCRIPT_MAX_MOUNTED_ROWS + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
 const setupCapped = () => setup(CAPPED_ROWS);
 
 /**

@@ -1,5 +1,6 @@
 import { cn } from "@/common/lib/utils";
 import type { DisplayedMessage, MuxMessage, QueuedMessage } from "@/common/types/message";
+import { useOptionalMessageListContext } from "./MessageListContext";
 import { TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 import { formatTimestamp } from "@/browser/utils/ui/dateTime";
 import { Code2Icon } from "lucide-react";
@@ -21,17 +22,25 @@ export interface ButtonConfig {
 }
 
 /**
- * A prompt's actions and time are there when the pointer or the keyboard is on the message, and
- * out of sight otherwise: under every prompt they were the loudest thing left in a quiet
- * transcript. The row keeps its place in the flow (a tighter one than a reply's), so nothing
- * moves when it shows. It must not float over the row below instead: when one prompt follows
- * another, that row is the next prompt's bubble, which then takes the clicks meant for Edit.
- * Touch has no hover: there the row is always shown, at its usual spacing. A reply keeps its row
- * (one per turn).
+ * A message's actions and time are there when the pointer or the keyboard is on the message, and
+ * out of sight otherwise: repeated under every prompt and every reply they were the loudest
+ * thing in a quiet transcript. Only the latest reply keeps its row in view, since that is the
+ * one the user acts on. A quiet row keeps its place in the layout, so nothing moves when it
+ * shows. Touch has no hover: there every row is always shown.
  */
-const USER_META_ROW_CLASS = cn(
-  "mt-0.5 opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100",
-  "[@media(hover:none)]:mt-2 [@media(hover:none)]:opacity-100"
+const QUIET_META_ROW_CLASS =
+  "opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100";
+
+/**
+ * A prompt's row sits beside its bubble (to the left, on the bubble's line), so a hidden row
+ * reserves no height and the prompt stays next to the work it started. It drops below the bubble
+ * when the two do not fit on one line. It must never float over the row below: when one prompt
+ * follows another, that row is the next prompt's bubble, which then takes the clicks meant for
+ * Edit. On touch the row is always shown, so it keeps its own line below the bubble.
+ */
+const USER_BLOCK_CLASS = cn(
+  "ml-auto w-fit max-w-full flex-row-reverse flex-wrap items-center gap-x-2 gap-y-0.5",
+  "[@media(hover:none)]:flex-col [@media(hover:none)]:flex-nowrap [@media(hover:none)]:items-stretch [@media(hover:none)]:gap-y-2"
 );
 
 interface MessageWindowProps {
@@ -76,16 +85,21 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
 
   const showMetaRow = variant === "user" || showAssistantMetaRow;
 
+  // Without a message list (a transcript dialog, a test) no row is known to be the latest, and
+  // every reply keeps its row in view.
+  const messageList = useOptionalMessageListContext();
+  const isLatestRow = messageList === null || messageList.latestMessageId === message.id;
+  const isQuietMetaRow = !isShowingJson && (variant === "user" || !isLatestRow);
+
   return (
     <div
       className={cn(
-        "group/message mt-4 mb-1 flex flex-col relative isolate",
-        variant === "user" && "ml-auto w-fit max-w-full",
-        variant === "assistant" && "w-full text-foreground",
-        // Pair the extra bottom margin with the meta row so the surrounding transcript
-        // space only changes at the same (settled) moment as the meta row appearing,
-        // avoiding a second separate tear step.
-        showAssistantMetaRow && "mb-4",
+        "group/message mt-4 mb-1 flex relative isolate",
+        variant === "user" && USER_BLOCK_CLASS,
+        variant === "assistant" && "flex-col w-full text-foreground",
+        // On touch the row always shows, so the gap to the next turn starts under it, not
+        // under the reply: without more room there the next prompt reads as part of this turn.
+        showAssistantMetaRow && "[@media(hover:none)]:mb-4",
         // Caller-supplied classes apply to the outer message block.
         className
       )}
@@ -94,7 +108,7 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
       <div
         className={cn(
           variant === "user" &&
-            "bg-[var(--color-user-surface)] border border-[var(--color-user-border)] rounded-lg px-3 py-2 overflow-x-auto shadow-sm",
+            "min-w-0 bg-[var(--color-user-surface)] border border-[var(--color-user-border)] rounded-lg px-3 py-2 overflow-x-auto shadow-sm",
           variant === "assistant" && "px-1 py-1"
         )}
       >
@@ -114,9 +128,10 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
       {showMetaRow && (
         <div
           className={cn(
-            "mt-2 flex flex-wrap items-center justify-between gap-3 text-[11px]",
-            variant === "user" ? "ml-auto text-muted" : "text-muted",
-            variant === "user" && !isShowingJson && USER_META_ROW_CLASS
+            "text-muted flex flex-wrap items-center justify-between gap-3 text-[11px]",
+            // A prompt's block spaces its row itself (see USER_BLOCK_CLASS).
+            variant === "user" ? "ml-auto" : "mt-1",
+            isQuietMetaRow && QUIET_META_ROW_CLASS
           )}
           data-message-meta
         >
