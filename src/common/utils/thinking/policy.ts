@@ -150,6 +150,31 @@ const ALWAYS_ON_FIVE_LEVEL_MODELS = [
 const DEFAULT_THINKING_POLICY: ThinkingPolicy = ["off", "low", "medium", "high"];
 
 /**
+ * Gemini-family thinking policies, by name on the bare model ID. Hydrogen documents
+ * no minimal level (default thinking high) but exposes a native xhigh, while 3.8
+ * Flash and Argon/Carbon have no minimal either, so thinking cannot be disabled and
+ * "off" clamps to "low". Older Flash chat models expose minimal as "off"; Pro only
+ * supports low/high. Returns null when no Gemini rule matches.
+ */
+function geminiExplicitThinkingPolicy(modelName: string): ThinkingPolicy | null {
+  if (isGeminiHydrogenModelName(modelName)) {
+    return ["low", "medium", "high", "xhigh"];
+  }
+  if (isGeminiLowMediumHighModelName(modelName)) {
+    return ["low", "medium", "high"];
+  }
+  // Older Gemini Flash chat models support minimal/low/medium/high. Xum exposes minimal as "off".
+  if (isGeminiFlashThinkingLevelModelName(modelName)) {
+    return ["off", "low", "medium", "high"];
+  }
+  // Gemini 3 Pro only supports "low" and "high" reasoning levels
+  if (modelName.includes("gemini-3")) {
+    return ["low", "high"];
+  }
+  return null;
+}
+
+/**
  * Returns the policy for a model that matches an explicit reasoning rule, or `null`
  * when the model falls through to {@link DEFAULT_THINKING_POLICY}.
  *
@@ -193,23 +218,9 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }
 
-  // Gemini 3.8 Flash and Gemini 4 Argon/Carbon have no "minimal" level, so thinking cannot be
-  // disabled; "off" clamps to "low". Gemini 4 Hydrogen additionally exposes native xhigh.
-  if (isGeminiHydrogenModelName(withoutProviderNamespace)) {
-    return ["low", "medium", "high", "xhigh"];
-  }
-  if (isGeminiLowMediumHighModelName(withoutProviderNamespace)) {
-    return ["low", "medium", "high"];
-  }
-
-  // Older Gemini Flash chat models support minimal/low/medium/high. Xum exposes minimal as "off".
-  if (isGeminiFlashThinkingLevelModelName(withoutProviderNamespace)) {
-    return ["off", "low", "medium", "high"];
-  }
-
-  // Gemini 3 Pro only supports "low" and "high" reasoning levels
-  if (withoutProviderNamespace.includes("gemini-3")) {
-    return ["low", "high"];
+  const geminiPolicy = geminiExplicitThinkingPolicy(withoutProviderNamespace);
+  if (geminiPolicy) {
+    return geminiPolicy;
   }
 
   // Grok Fast switches model variants: it has reasoning off/on, not graded effort.
