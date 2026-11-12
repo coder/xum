@@ -28,6 +28,17 @@ describe("forcedArchiveAcknowledgements", () => {
     });
   });
 
+  test("acknowledges a single listed file, for the target and for a sub-agent", () => {
+    expect(
+      forcedArchiveAcknowledgements(
+        loss({
+          targetPaths: ["a.txt"],
+          subagents: [{ workspaceId: "sub-1", title: "One", paths: ["x.txt"] }],
+        })
+      )
+    ).toEqual({ targetPaths: ["a.txt"], subagentPaths: { "sub-1": ["x.txt"] } });
+  });
+
   test("acknowledges nothing when nothing was listed, so the sink refuses any file it finds", () => {
     expect(forcedArchiveAcknowledgements(loss())).toEqual({
       targetPaths: undefined,
@@ -51,6 +62,15 @@ describe("describeForcedArchiveLoss", () => {
 
     expect(described.paths).toEqual(["a.txt", "sub-1: x.txt", "sub-1: dir/y.txt"]);
     expect(described.note).toBeDefined();
+  });
+
+  test("reports a single deleted file or a single deletion on its own", () => {
+    expect(describeForcedArchiveLoss(loss({ targetPaths: ["a.txt"] })).paths).toEqual(["a.txt"]);
+    expect(describeForcedArchiveLoss(loss({ targetPaths: ["a.txt"] })).note).toBeDefined();
+
+    const remoteOnly = describeForcedArchiveLoss(loss({ deletedCoderWorkspaceName: "xum-box-7" }));
+    expect(remoteOnly.paths).toBeUndefined();
+    expect(remoteOnly.note).toContain("xum-box-7");
   });
 
   test("names every checkout and remote workspace the policies deleted, without listing files", () => {

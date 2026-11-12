@@ -182,6 +182,22 @@ describe("WorkspaceLifecycleToolCall", () => {
     expect(labels).toContain("Paths");
   });
 
+  test("an archived row without deleted files shows no file list", () => {
+    const view = renderWithProviders(
+      <WorkspaceLifecycleToolCall
+        args={{ action: "archive", targets: [{ workspaceId: "ws-clean" }] }}
+        status="completed"
+        defaultExpanded
+        result={{
+          results: [{ status: "archived", action: "archive", workspaceId: "ws-clean", paths: [] }],
+        }}
+      />
+    );
+
+    expect(view.queryByText("ws-clean")).not.toBeNull();
+    expect(view.container.querySelector("ul")).toBeNull();
+  });
+
   test("renders captured workspace display name while keeping identifiers visible", () => {
     const view = renderWithProviders(
       <WorkspaceLifecycleToolCall
