@@ -198,7 +198,15 @@ describeIntegration("SSH+None directory trust (UI)", () => {
       const { user } = await openSshNoneForm(view, projectPath, "/srv/app");
       // "Set as default" is in the panel's footer.
       await openCreationEnvironment(view.container);
-      await user.click(await findButtonEventually(page(), "Set as default"));
+      // Its text also holds the shortcut's keycap, so it is found by its start.
+      const setDefault = await waitFor(() => {
+        const button = Array.from(page().querySelectorAll("button")).find((candidate) =>
+          candidate.textContent?.trim().startsWith("Set as default")
+        );
+        if (!button) throw new Error("Set as default button not found");
+        return button;
+      });
+      await user.click(setDefault);
 
       await waitFor(() => {
         const state = page().querySelector('[data-component="IsolationDefaultState"]');

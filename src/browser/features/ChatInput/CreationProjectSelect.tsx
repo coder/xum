@@ -11,7 +11,6 @@ import {
 import { KeyHint } from "@/browser/components/KeyHint/KeyHint";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
-import { cn } from "@/common/lib/utils";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import type { ProjectConfig } from "@/common/types/project";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
@@ -83,21 +82,18 @@ export function CreationProjectSelect(props: CreationProjectSelectProps) {
  * A project's mark: its first letter in a small tile (a pencil for Scratch), so the heading and
  * the rows read as projects at a glance and a long list can be scanned by letter.
  */
-function ProjectTile(props: { scope: string; label: string; className?: string }) {
+function ProjectTile(props: { scope: string; label: string }) {
+  const scratch = props.scope === SCRATCH_PROJECT_CONFIG_KEY;
   return (
     <span
       aria-hidden
-      className={cn(
-        "border-border-medium bg-hover text-foreground flex size-[22px] shrink-0 items-center justify-center rounded-[5px] border font-mono text-[11px] font-medium",
-        props.className
-      )}
+      // The letter is drawn from the attribute, not as text: the heading's and the rows' text
+      // stays the project's name alone (tests and copy-paste read it).
+      // The first code point, not the first UTF-16 unit: a name may start with an astral character.
+      data-letter={scratch ? undefined : (Array.from(props.label.trim())[0] ?? "?")}
+      className="border-border-medium bg-hover text-foreground flex size-[22px] shrink-0 items-center justify-center rounded-[5px] border font-mono text-[11px] font-medium before:content-[attr(data-letter)]"
     >
-      {props.scope === SCRATCH_PROJECT_CONFIG_KEY ? (
-        <Pencil className="size-3" />
-      ) : (
-        // The first code point, not the first UTF-16 unit: a name may start with an astral character.
-        (Array.from(props.label.trim())[0] ?? "?")
-      )}
+      {scratch && <Pencil className="size-3" />}
     </span>
   );
 }
