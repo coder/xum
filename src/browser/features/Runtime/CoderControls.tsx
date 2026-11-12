@@ -76,7 +76,7 @@ export function invalidCoderControls(input: {
   templatesError: unknown;
   presetsError: unknown;
   workspacesError: unknown;
-}): Record<"template" | "preset" | "workspace", true | undefined> {
+}): Partial<Record<"template" | "preset" | "workspace", true>> {
   const missing = !input.hasError
     ? null
     : input.mode === "existing"
