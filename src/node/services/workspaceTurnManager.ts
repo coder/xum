@@ -102,8 +102,10 @@ import type { ProjectsConfig } from "@/common/types/project";
 import {
   describeForcedArchiveLoss,
   describeForcedLossBeforeFailure,
-  FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL,
+  FORCED_ARCHIVE_LOSS_CHANGED_REFUSAL,
   forcedArchiveAcknowledgements,
+  forcedArchivePaths,
+  sameForcedArchiveLoss,
   subagentPathLines,
   type ForcedArchiveLoss,
 } from "@/node/services/forcedArchiveLoss";
@@ -829,8 +831,8 @@ class LiveWorkspaceTurnRegistrations extends Map<string, LiveWorkspaceTurnRegist
 interface ArchivePolicy {
   worktreeArchiveBehavior: WorktreeArchiveBehavior;
   coderArchiveBehavior: CoderWorkspaceArchiveBehavior;
-  /** The checkout the "delete" worktree behavior deletes, when it deletes the target's. */
-  deletedCheckoutPath: string | undefined;
+  /** The checkout the "delete" worktree behavior deletes, with the branch that keeps its commits. */
+  deletedCheckout: { path: string; branch: string } | undefined;
   /** The dedicated (Xum-created) Coder workspace the Coder "delete" behavior deletes. */
   deletedCoderWorkspaceName: string | undefined;
   /** The Coder behavior stops or deletes the target's dedicated Coder workspace. */
@@ -865,7 +867,9 @@ function readArchivePolicy(
   return {
     worktreeArchiveBehavior: worktreeBehavior,
     coderArchiveBehavior: coderBehavior,
-    deletedCheckoutPath: deletesCheckout ? metadata.namedWorkspacePath : undefined,
+    deletedCheckout: deletesCheckout
+      ? { path: metadata.namedWorkspacePath, branch: metadata.name }
+      : undefined,
     deletedCoderWorkspaceName: coderBehavior === "delete" ? coderWorkspaceName : undefined,
     changesCoderWorkspace: coderWorkspaceName != null && coderBehavior !== "keep",
   };
@@ -878,7 +882,7 @@ function readArchivePolicy(
  */
 function archivePolicyRefusal(policy: ArchivePolicy, force: boolean): string | undefined {
   if (force) return undefined;
-  if (policy.deletedCheckoutPath != null) return DELETE_CHECKOUT_ARCHIVE_REFUSAL;
+  if (policy.deletedCheckout != null) return DELETE_CHECKOUT_ARCHIVE_REFUSAL;
   if (policy.deletedCoderWorkspaceName != null) return DELETE_CODER_WORKSPACE_ARCHIVE_REFUSAL;
   return undefined;
 }
@@ -4300,7 +4304,7 @@ export class WorkspaceTurnManager {
               worktreeArchiveBehavior,
               resolved.metadata
             ) ||
-            policy.deletedCheckoutPath != null ||
+            policy.deletedCheckout != null ||
             policy.changesCoderWorkspace;
           if (
             untrackableAppArchiveHazard &&
@@ -4828,7 +4832,7 @@ export class WorkspaceTurnManager {
     const cascade = await this.workspaceService.preflightArchiveCascade(
       resolved.workspaceId,
       policy.worktreeArchiveBehavior,
-      { allowCheckoutDeletion: force }
+      { forced: force }
     );
     if (!cascade.success) return { refusal: this.archiveErrorResult(resolved, cascade.error) };
     if (!force) {
@@ -4854,9 +4858,33 @@ export class WorkspaceTurnManager {
         subagents: cascade.subagents,
         // mutation-equivalent: deletedCheckouts is an array or undefined, so ?? and || agree
         deletedSubagentCheckouts: cascade.deletedCheckouts ?? [],
-        deletedCheckoutPath: policy.deletedCheckoutPath,
+        deletedCheckout: policy.deletedCheckout,
         deletedCoderWorkspaceName: policy.deletedCoderWorkspaceName,
       },
+    };
+  }
+
+  /**
+   * The listing a forced archive made can be older than the sink call: it can wait for turns to
+   * settle first. List again right before the sink and refuse when what force would delete or
+   * refuse has changed. A change inside the cascade itself is the sink's to refuse, and the
+   * result then reports what the archived sub-agents lost (lossBeforeFailureNote).
+   */
+  private async refuseChangedForcedLoss(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    policy: ArchivePolicy,
+    forcedLoss: ForcedArchiveLoss | undefined
+  ): Promise<WorkspaceLifecycleResult | null> {
+    if (forcedLoss == null) return null;
+    const latest = await this.preflightArchiveLoss(resolved, policy, true);
+    if ("refusal" in latest) return latest.refusal;
+    if (latest.forcedLoss == null || sameForcedArchiveLoss(forcedLoss, latest.forcedLoss)) {
+      return null;
+    }
+    const paths = forcedArchivePaths(latest.forcedLoss);
+    return {
+      ...this.archiveErrorResult(resolved, FORCED_ARCHIVE_LOSS_CHANGED_REFUSAL),
+      ...(paths.length > 0 ? { paths } : {}),
     };
   }
 
@@ -4871,6 +4899,8 @@ export class WorkspaceTurnManager {
     forcedLoss: ForcedArchiveLoss | undefined
   ): Promise<WorkspaceLifecycleResult> {
     const forced = forcedLoss != null;
+    const changed = await this.refuseChangedForcedLoss(resolved, policy, forcedLoss);
+    if (changed != null) return changed;
     const acknowledged = forcedArchiveAcknowledgements(forcedLoss);
     const result = await this.workspaceService.archiveWhileTaskTreeLocked(
       resolved.workspaceId,
@@ -4926,9 +4956,7 @@ export class WorkspaceTurnManager {
         ...this.lossySnapshotArchiveRefusal(
           resolved,
           result.data.paths,
-          forcedLoss != null
-            ? FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL
-            : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL
+          forcedLoss != null ? FORCED_ARCHIVE_LOSS_CHANGED_REFUSAL : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL
         ),
         ...this.lossBeforeFailureNote(forcedLoss),
       };

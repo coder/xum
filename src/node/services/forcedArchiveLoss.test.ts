@@ -4,6 +4,8 @@ import {
   describeForcedArchiveLoss,
   describeForcedLossBeforeFailure,
   forcedArchiveAcknowledgements,
+  forcedArchivePaths,
+  sameForcedArchiveLoss,
   type ForcedArchiveLoss,
 } from "./forcedArchiveLoss";
 
@@ -52,7 +54,9 @@ describe("forcedArchiveAcknowledgements", () => {
   test("lists the sub-agents whose checkout may be deleted, so a later one is refused", () => {
     expect(
       forcedArchiveAcknowledgements(
-        loss({ deletedSubagentCheckouts: [{ workspaceId: "sub-1", title: "One" }] })
+        loss({
+          deletedSubagentCheckouts: [{ workspaceId: "sub-1", title: "One", branch: "br-one" }],
+        })
       )
     ).toEqual({
       targetPaths: undefined,
@@ -104,15 +108,16 @@ describe("describeForcedArchiveLoss", () => {
   test("names every checkout and remote workspace the policies deleted, without listing files", () => {
     const described = describeForcedArchiveLoss(
       loss({
-        deletedCheckoutPath: "/src/repo/feature",
-        deletedSubagentCheckouts: [{ workspaceId: "sub-1", title: "One" }],
+        deletedCheckout: { path: "/src/repo/feature", branch: "feature-branch" },
+        deletedSubagentCheckouts: [{ workspaceId: "sub-1", title: "One", branch: "br-one" }],
         deletedCoderWorkspaceName: "xum-box-7",
       })
     );
 
     expect(described.paths).toBeUndefined();
     expect(described.note).toContain("/src/repo/feature");
-    expect(described.note).toContain("One (sub-1)");
+    expect(described.note).toContain("feature-branch");
+    expect(described.note).toContain("One (sub-1, branch br-one)");
     expect(described.note).toContain("xum-box-7");
   });
 });
@@ -125,10 +130,10 @@ describe("describeForcedLossBeforeFailure", () => {
       { workspaceId: "sub-2", title: "Two", paths: ["y.txt"] },
     ],
     deletedSubagentCheckouts: [
-      { workspaceId: "sub-1", title: "One" },
-      { workspaceId: "sub-3", title: "Three" },
+      { workspaceId: "sub-1", title: "One", branch: "br-one" },
+      { workspaceId: "sub-3", title: "Three", branch: "br-three" },
     ],
-    deletedCheckoutPath: "/src/repo/target",
+    deletedCheckout: { path: "/src/repo/target", branch: "target-branch" },
     deletedCoderWorkspaceName: "xum-box-7",
   });
 
@@ -140,7 +145,7 @@ describe("describeForcedLossBeforeFailure", () => {
     const note = describeForcedLossBeforeFailure(forced, (id) => id === "sub-1");
 
     expect(note).toContain("sub-1: x.txt");
-    expect(note).toContain("One (sub-1)");
+    expect(note).toContain("One (sub-1, branch br-one)");
     expect(note).not.toContain("sub-2");
     expect(note).not.toContain("sub-3");
     expect(note).not.toContain("own.txt");
@@ -151,7 +156,52 @@ describe("describeForcedLossBeforeFailure", () => {
   test("names a sub-agent whose checkout alone went", () => {
     const note = describeForcedLossBeforeFailure(forced, (id) => id === "sub-3");
 
-    expect(note).toContain("Three (sub-3)");
+    expect(note).toContain("Three (sub-3, branch br-three)");
     expect(note).not.toContain("x.txt");
+  });
+});
+
+describe("sameForcedArchiveLoss", () => {
+  const listed = loss({
+    targetPaths: ["a.txt"],
+    subagents: [{ workspaceId: "sub-1", title: "One", paths: ["x.txt"] }],
+    deletedSubagentCheckouts: [{ workspaceId: "sub-2", title: "Two", branch: "br-two" }],
+  });
+  const same = () =>
+    loss({
+      targetPaths: ["a.txt"],
+      subagents: [{ workspaceId: "sub-1", title: "One", paths: ["x.txt"] }],
+      deletedSubagentCheckouts: [{ workspaceId: "sub-2", title: "Two", branch: "br-two" }],
+    });
+
+  test("is true for two listings of the same files and checkouts", () => {
+    expect(sameForcedArchiveLoss(listed, same())).toBe(true);
+  });
+
+  test("is false when a file of the target, of a sub-agent, or a checkout was added or removed", () => {
+    expect(sameForcedArchiveLoss(listed, { ...same(), targetPaths: ["a.txt", "late.txt"] })).toBe(
+      false
+    );
+    expect(
+      sameForcedArchiveLoss(listed, {
+        ...same(),
+        subagents: [{ workspaceId: "sub-1", title: "One", paths: ["x.txt", "late.txt"] }],
+      })
+    ).toBe(false);
+    expect(sameForcedArchiveLoss(listed, { ...same(), subagents: [] })).toBe(false);
+    expect(sameForcedArchiveLoss(listed, { ...same(), deletedSubagentCheckouts: [] })).toBe(false);
+  });
+});
+
+describe("forcedArchivePaths", () => {
+  test("lists the target's files, then each sub-agent's with its workspace ID in front", () => {
+    expect(
+      forcedArchivePaths(
+        loss({
+          targetPaths: ["a.txt"],
+          subagents: [{ workspaceId: "sub-1", title: "One", paths: ["x.txt"] }],
+        })
+      )
+    ).toEqual(["a.txt", "sub-1: x.txt"]);
   });
 });

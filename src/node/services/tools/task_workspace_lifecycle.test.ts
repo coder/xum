@@ -78,15 +78,18 @@ describe("task_workspace_lifecycle tool", () => {
         mockToolCallOptions
       )
     );
-    await Promise.resolve(
-      tool.execute!(
-        { action: "archive", targets: [{ workspaceId: "child-a" }], force: null },
-        mockToolCallOptions
-      )
-    );
+    for (const force of [null, false]) {
+      await Promise.resolve(
+        tool.execute!(
+          { action: "archive", targets: [{ workspaceId: "child-a" }], force },
+          mockToolCallOptions
+        )
+      );
+    }
 
     expect(archiveOwnedWorkspaceTurnWorkspace.mock.calls.map((call) => call[2])).toEqual([
       { interruptActive: false, force: true },
+      { interruptActive: false, force: false },
       { interruptActive: false, force: false },
     ]);
     // The archived row keeps the deletion report: the model and the card both read it.

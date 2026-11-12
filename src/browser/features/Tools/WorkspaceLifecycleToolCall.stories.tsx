@@ -230,7 +230,7 @@ export const ForcedArchiveReport: Story = {
           workspaceId: "24e33167af",
           displayName: "Fix streaming resume",
           paths: ["scratch/notes.md", "24e33167af-sub: debug.log"],
-          note: 'Force let the archive delete the untracked files listed in paths, because the snapshot archive cannot keep them. A path that starts with a workspace ID belongs to that sub-agent. Force let the "Delete checkout" archive policy delete the checkout at ~/.xum/src/xum/fix-streaming-resume. Uncommitted changes in it are lost once it is deleted, and its commits stay on the branch. A deletion that failed leaves the path or workspace in place.',
+          note: 'Force let the archive delete the untracked files listed in paths, because the snapshot archive cannot keep them. A path that starts with a workspace ID belongs to that sub-agent. Force let the "Delete checkout" archive policy delete the checkout at ~/.xum/src/xum/fix-streaming-resume. Uncommitted changes in it are lost once it is deleted, and its commits stay on branch fix-streaming-resume. A deletion that failed leaves the path or workspace in place.',
         },
         {
           status: "archived",

@@ -15,8 +15,8 @@ export interface ForcedArchiveLoss {
   subagents: ArchiveCascadePreflight["subagents"];
   /** Cascaded sub-agents whose checkout the "delete" policy deletes. */
   deletedSubagentCheckouts: NonNullable<ArchiveCascadePreflight["deletedCheckouts"]>;
-  /** The target's checkout path, when the "delete" policy deletes it. */
-  deletedCheckoutPath?: string | undefined;
+  /** The target's checkout and the branch that keeps its commits, when the "delete" policy deletes it. */
+  deletedCheckout?: { path: string; branch: string } | undefined;
   /** The dedicated Coder workspace the Coder "delete" policy deletes. */
   deletedCoderWorkspaceName?: string | undefined;
 }
@@ -25,12 +25,38 @@ export interface ForcedArchiveLoss {
 const BEST_EFFORT_DELETION = "A deletion that failed leaves the path or workspace in place.";
 
 /**
- * A forced archive deletes only the files it listed: a different set at the sink means someone
- * wrote to the checkout since, so nothing was deleted for it.
+ * A forced archive deletes only what it listed. A file that appeared or changed since means
+ * someone or something still works in that checkout (the "keep working" refusals of the archive),
+ * so the answer is to find out who, not to force again.
  */
-export const FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL =
-  "The untracked files changed after force listed them, so the archive deleted nothing for this workspace. " +
-  "The files now listed in paths would be deleted; archive again with force to delete them.";
+export const FORCED_ARCHIVE_LOSS_CHANGED_REFUSAL =
+  "What force would delete changed after it listed it, so something still writes in these checkouts and the archive deleted nothing for this workspace. " +
+  "Find out what writes there before you archive again, and use force again only when the user asked for cleanup or the work is provably saved. " +
+  "The files that would be deleted now are listed in paths.";
+
+/** Whether two listings name the same files and checkouts: what force may delete is unchanged. */
+export function sameForcedArchiveLoss(a: ForcedArchiveLoss, b: ForcedArchiveLoss): boolean {
+  const shape = (loss: ForcedArchiveLoss) =>
+    JSON.stringify([
+      loss.targetPaths,
+      loss.subagents.map((subagent) => [subagent.workspaceId, subagent.paths]),
+      loss.deletedSubagentCheckouts.map((subagent) => subagent.workspaceId),
+    ]);
+  return shape(a) === shape(b);
+}
+
+/** The target's and the sub-agents' files that a forced archive deletes, one list for the result. */
+export function forcedArchivePaths(loss: ForcedArchiveLoss): string[] {
+  return [...loss.targetPaths, ...subagentPathLines(loss.subagents)];
+}
+
+function subagentCheckoutList(
+  checkouts: NonNullable<ArchiveCascadePreflight["deletedCheckouts"]>
+): string {
+  return checkouts
+    .map((subagent) => `${subagent.title} (${subagent.workspaceId}, branch ${subagent.branch})`)
+    .join(", ");
+}
 
 /** A sub-agent's path, prefixed with its workspace ID: each path is relative to its checkout. */
 export function subagentPathLines(subagents: ArchiveCascadePreflight["subagents"]): string[] {
@@ -75,24 +101,21 @@ export function describeForcedArchiveLoss(loss: ForcedArchiveLoss): {
   paths?: string[];
   note?: string;
 } {
-  const paths = [...loss.targetPaths, ...subagentPathLines(loss.subagents)];
+  const paths = forcedArchivePaths(loss);
   const parts: string[] = [];
   if (paths.length > 0) {
     parts.push(
       "Force let the archive delete the untracked files listed in paths, because the snapshot archive cannot keep them. A path that starts with a workspace ID belongs to that sub-agent."
     );
   }
-  if (loss.deletedCheckoutPath != null) {
+  if (loss.deletedCheckout != null) {
     parts.push(
-      `Force let the "Delete checkout" archive policy delete the checkout at ${loss.deletedCheckoutPath}. Uncommitted changes in it are lost once it is deleted, and its commits stay on the branch.`
+      `Force let the "Delete checkout" archive policy delete the checkout at ${loss.deletedCheckout.path}. Uncommitted changes in it are lost once it is deleted, and its commits stay on branch ${loss.deletedCheckout.branch}.`
     );
   }
   if (loss.deletedSubagentCheckouts.length > 0) {
-    const subagents = loss.deletedSubagentCheckouts
-      .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
-      .join(", ");
     parts.push(
-      `Force also let that policy delete the checkouts of the sub-agents archived with it: ${subagents}.`
+      `Force also let that policy delete the checkouts of the sub-agents archived with it: ${subagentCheckoutList(loss.deletedSubagentCheckouts)}. Their commits stay on those branches.`
     );
   }
   if (loss.deletedCoderWorkspaceName != null) {
@@ -119,7 +142,7 @@ export function describeForcedLossBeforeFailure(
   const files = subagentPathLines(loss.subagents.filter((s) => isArchived(s.workspaceId)));
   const checkouts = loss.deletedSubagentCheckouts
     .filter((s) => isArchived(s.workspaceId))
-    .map((s) => `${s.title} (${s.workspaceId})`);
+    .map((s) => `${s.title} (${s.workspaceId}, branch ${s.branch})`);
   const parts = [
     ...(files.length > 0 ? [`their untracked files (${files.join(", ")})`] : []),
     ...(checkouts.length > 0 ? [`the checkouts of ${checkouts.join(", ")}`] : []),

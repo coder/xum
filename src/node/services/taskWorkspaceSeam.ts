@@ -287,10 +287,10 @@ export interface ArchiveCascadePreflight {
   targetPaths: string[];
   subagents: Array<{ workspaceId: string; title: string; paths: string[] }>;
   /**
-   * Sub-agents whose checkout the "delete" policy deletes. Present only when the caller allowed
-   * that deletion (allowCheckoutDeletion); otherwise the preflight refuses instead.
+   * Sub-agents whose checkout the "delete" policy deletes, with the branch that keeps their
+   * commits. Present only for a forced archive: otherwise the preflight refuses instead.
    */
-  deletedCheckouts?: Array<{ workspaceId: string; title: string }>;
+  deletedCheckouts?: Array<{ workspaceId: string; title: string; branch: string }>;
 }
 
 export interface ArchiveWorkspaceOptions {
@@ -756,7 +756,7 @@ export interface WorkspaceLifecycleHost {
   preflightArchiveCascade(
     workspaceId: string,
     worktreeArchiveBehavior: WorktreeArchiveBehavior,
-    options?: { allowCheckoutDeletion?: boolean }
+    options?: { forced?: boolean }
   ): Promise<Result<ArchiveCascadePreflight>>;
   acquirePreInterruptionArchiveHold(
     workspaceId: string,
