@@ -1366,9 +1366,7 @@ describe("WorkspaceTurnManager", () => {
         Promise.resolve(Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt"] }))
       );
       preflightArchive.mockImplementationOnce(() =>
-        Promise.resolve(
-          Ok({ kind: "confirm-lossy-untracked-files", paths: ["late.txt", "scratch.txt"] })
-        )
+        Promise.resolve(Ok({ kind: "confirm-lossy-untracked-files", paths: ["late.txt"] }))
       );
       const harness = await createWorkspaceLifecycleHarness({ preflightArchive });
       await setArchivePolicy(harness.config, { worktree: "snapshot" });
@@ -1385,7 +1383,7 @@ describe("WorkspaceTurnManager", () => {
       expect(result.status === "error" ? result.error : undefined).toBe(
         FORCED_ARCHIVE_LOSS_CHANGED_REFUSAL
       );
-      expect(result.paths).toEqual(["late.txt", "scratch.txt"]);
+      expect(result.paths).toEqual(["late.txt"]);
       expect(harness.archive).not.toHaveBeenCalled();
     });
 
