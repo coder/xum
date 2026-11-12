@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import type { DisplayedMessage } from "@/common/types/message";
+import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
+import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { useTranscriptRowDerivations, useUserMessageNavigation } from "./transcriptRowDerivations";
 
 const NO_MESSAGES: DisplayedMessage[] = [];
@@ -118,6 +120,40 @@ describe("useTranscriptRowDerivations", () => {
         nextUserMessageId: "h6",
       });
       expect(result.current?.get("h2")).toMatchObject({ nextUserMessageId: "h4" });
+    });
+
+    // A prompt the machine wrote mid-work is a step, not a prompt: compact density folds it
+    // behind a work line, where a jump to it would find no mounted row.
+    test("skips prompts the machine wrote, so next and previous reach the human prompts", () => {
+      const machine = (n: number, content: string): DisplayedMessage => ({
+        type: "user",
+        id: `u${n}`,
+        historyId: `h${n}`,
+        content,
+        historySequence: n,
+        isSynthetic: true,
+      });
+      const report = machine(
+        3,
+        formatSubagentReportEnvelope({
+          taskId: "task-1",
+          agentType: "explore",
+          status: "completed",
+          title: "Done",
+          reportMarkdown: "Body",
+        })
+      );
+      const nudge = machine(5, TODO_TURN_END_NUDGE);
+      const { result } = renderHook(() =>
+        useUserMessageNavigation({
+          messages: [u2, report, u4, nudge, u6],
+          onNavigateToMessage: onNavigate,
+        })
+      );
+
+      expect([...(result.current?.keys() ?? [])]).toEqual(["h2", "h4", "h6"]);
+      expect(result.current?.get("h2")).toMatchObject({ nextUserMessageId: "h4" });
+      expect(result.current?.get("h6")).toMatchObject({ prevUserMessageId: "h4" });
     });
   });
 });

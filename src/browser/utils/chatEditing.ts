@@ -6,10 +6,12 @@ import {
 } from "@/browser/features/ChatInput/stagedAttachments";
 import type {
   CompactionFollowUpRequest,
+  DisplayedMessage,
   DisplayedUserMessage,
   QueuedMessage,
   ReviewNoteDataForDisplay,
 } from "@/common/types/message";
+import { isMachineRow } from "@/browser/utils/messages/machineRows";
 import { getEditableUserMessageDraftContent } from "@/browser/utils/messages/messageUtils";
 
 // Keep pending edit data normalized with required arrays so edits can't drop attachments/reviews.
@@ -107,6 +109,24 @@ export const canEditDisplayedUserMessage = (message: DisplayedUserMessage): bool
   }
   return true;
 };
+
+/**
+ * The prompt ArrowUp edits: the newest one the user wrote. A prompt the machine wrote mid-work
+ * (a wake-up, a nudge, a sub-agent report) is a step, not the user's last prompt, and compact
+ * density folds it behind a work line: editing it would fill the composer from a row that is not
+ * on screen. Its own Edit action still works where the row shows.
+ */
+export function findLastEditablePrompt(
+  messages: readonly DisplayedMessage[]
+): DisplayedUserMessage | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message.type === "user" && !isMachineRow(message) && canEditDisplayedUserMessage(message)) {
+      return message;
+    }
+  }
+  return undefined;
+}
 
 export const buildPendingFromDisplayed = (message: DisplayedUserMessage): PendingUserMessage => {
   const draft = getEditableUserMessageDraftContent(message);

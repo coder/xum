@@ -6,6 +6,8 @@ import {
   type DisplayedUserMessage,
   type QueuedMessage,
 } from "@/common/types/message";
+import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
+import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import {
   buildEditingStateFromCompaction,
@@ -13,6 +15,7 @@ import {
   buildPendingFromDisplayed,
   buildPendingFromRestoredInput,
   canEditDisplayedUserMessage,
+  findLastEditablePrompt,
   normalizeQueuedMessage,
 } from "./chatEditing";
 
@@ -83,13 +86,29 @@ describe("canEditDisplayedUserMessage", () => {
       false
     );
     // Same selection as ChatPane's ArrowUp handler: the newest editable displayed user row.
-    const target = aggregator
-      .getDisplayedMessages()
-      .findLast(
-        (message): message is DisplayedUserMessage =>
-          message.type === "user" && canEditDisplayedUserMessage(message)
-      );
-    expect(target?.historyId).toBe("user");
+    expect(findLastEditablePrompt(aggregator.getDisplayedMessages())?.historyId).toBe("user");
+  });
+
+  // Compact density folds these rows behind a work line, so ArrowUp would otherwise fill the
+  // composer from a row that is not on screen.
+  test("ArrowUp skips the prompts the machine wrote after the user's last one", () => {
+    const prompt = userMessage({ id: "prompt", historyId: "prompt" });
+    const machine = (id: string, content: string) =>
+      userMessage({ id, historyId: id, content, isSynthetic: true });
+    const report = machine(
+      "report",
+      formatSubagentReportEnvelope({
+        taskId: "task-1",
+        agentType: "explore",
+        status: "completed",
+        title: "Done",
+        reportMarkdown: "Body",
+      })
+    );
+    const nudge = machine("nudge", TODO_TURN_END_NUDGE);
+
+    expect(findLastEditablePrompt([prompt, report, nudge])?.historyId).toBe("prompt");
+    expect(findLastEditablePrompt([report, nudge])).toBeUndefined();
   });
 
   test("excludes local command output messages", () => {

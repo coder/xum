@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import type { UserMessageNavigation } from "@/browser/features/Messages/UserMessage";
+import { isMachineRow } from "@/browser/utils/messages/machineRows";
 import {
   computeBashOutputGroupInfos,
   type BashOutputGroupInfo,
@@ -119,14 +120,10 @@ export function useUserMessageNavigation(params: {
   return useMemo(() => {
     const userMessages: Array<Extract<DisplayedMessage, { type: "user" }>> = [];
     for (const message of messages) {
-      // Machine wakes and budget warnings should not interrupt navigation between human prompts.
-      if (
-        message.type === "user" &&
-        message.isPendingSend == null &&
-        message.bashMonitorWake == null &&
-        message.agentPeerMessageTrigger == null &&
-        message.contextBudgetWarning == null
-      ) {
+      // Prompts the machine wrote mid-work (wake-ups, nudges, sub-agent reports, budget
+      // warnings) should not interrupt navigation between human prompts. Compact density also
+      // folds them behind a work line, so a jump to one would land on a row that is not mounted.
+      if (message.type === "user" && message.isPendingSend == null && !isMachineRow(message)) {
         userMessages.push(message);
       }
     }

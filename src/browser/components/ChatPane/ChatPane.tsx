@@ -122,7 +122,7 @@ import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import {
   buildEditingStateFromDisplayed,
-  canEditDisplayedUserMessage,
+  findLastEditablePrompt,
   normalizeQueuedMessage,
   type EditingMessageState,
 } from "@/browser/utils/chatEditing";
@@ -1254,13 +1254,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // Otherwise, edit last user message. `current.messages` may be a cached/provisional view
     // while the replay is still running, so ArrowUp must not enter edit mode until caught up.
     if (!isTranscriptMutationAllowed(workspaceId)) return;
-    const transformedMessages = mergeConsecutiveStreamErrors(current.messages);
-    const lastUserMessage = [...transformedMessages]
-      .reverse()
-      .find(
-        (msg): msg is Extract<DisplayedMessage, { type: "user" }> =>
-          msg.type === "user" && canEditDisplayedUserMessage(msg)
-      );
+    const lastUserMessage = findLastEditablePrompt(mergeConsecutiveStreamErrors(current.messages));
 
     if (!lastUserMessage) {
       return;
