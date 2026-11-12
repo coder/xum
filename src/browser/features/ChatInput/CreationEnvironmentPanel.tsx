@@ -703,7 +703,9 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
           {props.description} ({formatKeybind(KEYBINDS.OPEN_CREATION_ENVIRONMENT)})
         </TooltipContent>
       </Tooltip>
-      <EnvironmentPanelContent {...props} onClose={() => setOpen(false)} />
+      {/* Mounted only while open: Radix unmounts the popover's content, but not this component,
+          and the phone's branch view must not still be showing at the next open. */}
+      {open && <EnvironmentPanelContent {...props} onClose={() => setOpen(false)} />}
     </Popover>
   );
 }

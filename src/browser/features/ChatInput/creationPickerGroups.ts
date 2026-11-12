@@ -47,7 +47,7 @@ const RECENT_PROJECT_COUNT = 3;
  */
 export function groupProjectsByRecency(
   projectPaths: readonly string[],
-  workspaces: Iterable<{ id: string; projectPath: string }>,
+  workspaces: Iterable<{ id: string; projectPath: string; subProjectPath?: string | null }>,
   recency: Readonly<Record<string, number>>
 ): { recent: string[]; rest: string[] } {
   if (projectPaths.length < PROJECT_GROUPS_MIN_PROJECTS)
@@ -55,8 +55,10 @@ export function groupProjectsByRecency(
   const lastActive = new Map<string, number>();
   for (const workspace of workspaces) {
     const at = recency[workspace.id] ?? 0;
-    if (at > (lastActive.get(workspace.projectPath) ?? 0))
-      lastActive.set(workspace.projectPath, at);
+    // A sub-project's workspace names its owning project in projectPath; the scope the user
+    // picked, and the row to rank, is the sub-project.
+    const scope = workspace.subProjectPath ?? workspace.projectPath;
+    if (at > (lastActive.get(scope) ?? 0)) lastActive.set(scope, at);
   }
   const recent = projectPaths
     .filter((path) => lastActive.has(path))

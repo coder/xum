@@ -53,6 +53,15 @@ describe("groupProjectsByRecency", () => {
     expect(groupProjectsByRecency(projects, workspaces, { w5: 3 }).recent).toEqual(["/p5"]);
   });
 
+  test("a sub-project's workspace ranks the sub-project, not its owning project", () => {
+    const groups = groupProjectsByRecency(
+      projects,
+      [{ id: "w", projectPath: "/p1", subProjectPath: "/p4" }],
+      { w: 5 }
+    );
+    expect(groups.recent).toEqual(["/p4"]);
+  });
+
   test("a short list is not grouped", () => {
     const groups = groupProjectsByRecency(projects.slice(0, 3), workspaces, { w1: 5 });
     expect(groups).toEqual({ recent: [], rest: ["/p1", "/p2", "/p3"] });

@@ -267,8 +267,11 @@ async function loadSSHConfig(): Promise<SSHConfig | null> {
   }
 }
 
-/** The most host aliases a suggestion list is given. */
-const MAX_LISTED_HOSTS = 50;
+/**
+ * A bound on the reply, not a page size: the caller filters by what the user types, so a lower
+ * cap would hide every alias after it even when typed in full.
+ */
+const MAX_LISTED_HOSTS = 2000;
 
 /**
  * The host aliases `~/.ssh/config` names with a `Host` line, in file order: what a user would
