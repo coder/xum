@@ -131,4 +131,26 @@ describe("TaskStopToolCall and TaskRemoveToolCall", () => {
     expect(rowB.textContent).toContain("Uncommitted changes.");
     expect(rowB.textContent).not.toContain(paths[0]);
   });
+
+  test("task_remove shows what a forced removal deleted on the removed row only", () => {
+    const deletedWork = "Deleted 2 commit(s). Checkout: /worktrees/task-a. Branch: task-a.";
+    const view = renderTool(
+      "task_remove",
+      { ...args, force: true },
+      {
+        status: "completed",
+        result: {
+          results: [
+            { status: "removed", taskId: "task-a", deletedWork, paths: ["notes.txt"] },
+            { status: "removed", taskId: "task-b" },
+          ],
+        } satisfies TaskRemoveToolSuccessResult,
+      }
+    );
+    fireEvent.click(view.getByText("task_remove"));
+
+    expect(rowOf(view, "task-a").textContent).toContain(deletedWork);
+    expect(rowOf(view, "task-a").textContent).toContain("notes.txt");
+    expect(rowOf(view, "task-b").textContent).not.toContain("Deleted");
+  });
 });
