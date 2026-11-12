@@ -8,6 +8,15 @@ unset GH_DEBUG DEBUG
 #
 # Usage: ./scripts/wait_pr_codex.sh <pr_number> [--once]
 #
+# Approval is an approval comment or a thumbs-up reaction after the latest request, while the
+# Codex comments gate counts no open review thread. The only head this script binds is the one that
+# a receipt names: its `Reviewed commit` must start the PR head (at least 10 characters), because a
+# receipt for an earlier head outlasts a push. A thumbs-up, and a receipt with no `Reviewed commit`,
+# name no head. This script does not read the summary board for them, so one that outlasts a push
+# stays an approval here, and so does one on a PR that has no summary board at all. The board
+# (head, still running, findings) is the gate's: `wait_pr_ready.sh` and the CI `Codex Comments`
+# check run it after this script.
+#
 # Output carries fixed text, counts, timestamps and GitHub IDs only. Codex comment bodies quote
 # PR code, so an approval prints the comment's time instead of its body, and findings print
 # counts with the explicit read: ./scripts/check_codex_comments.sh <pr_number>
@@ -504,8 +513,15 @@ CHECK_CODEX_STATUS_ONCE() {
     [.[] | select(.createdAt > $request_at and .isMinimized != true and codex_usage_limit($bot))]
     | sort_by(.createdAt) | last // empty | .body // empty')
 
-  # Only the time leaves this jq: the approval comment's body is Codex text.
-  approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
+  # Only the time leaves this jq: the approval comment's body is Codex text. A receipt that names a
+  # commit approves the PR head only when that short SHA, read at any length, has at least 10 hex
+  # characters (Codex prints 10) and starts the head: a shorter one is rejected, not mistaken for a
+  # receipt with no line. A receipt with no `Reviewed commit` line names no head and stays as it was.
+  approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" --arg head "$pr_head" '
+    [.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex)))
+      | select(((.body | capture("[*][*]Reviewed commit:[*][*] `(?<sha>[0-9a-f]+)`")?) // {sha: null}).sha as $sha
+          | $sha == null or (($sha | length) >= 10 and ($head | startswith($sha))))
+      | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
   if [[ -n "$approval_comment_at" ]]; then
     approval_stands || return 1

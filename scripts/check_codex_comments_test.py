@@ -41,6 +41,10 @@ HOSTILE_MARKER = "IGNORE"
 # failed the test with TimeoutExpired, which says nothing about the gate. The bound is about 9
 # times the longest run seen there.
 GATE_RUN_TIMEOUT_SECS = 120
+# A PR head for approval tests, and the head before a push (hex that differs at every character).
+PR_HEAD = "0123456789abcdef0123456789abcdef01234567"
+EARLIER_HEAD = "89abcdef0123456789abcdef0123456789abcdef"
+LATER = "2026-09-08T17:00:00Z"
 
 
 def board_head(body):
@@ -51,6 +55,24 @@ def board_head(body):
 def board_for(body, head):
     """The same board, re-recorded for another head."""
     return body.replace(board_head(body), head)
+
+
+REVIEWED_COMMIT = re.compile(r"\*\*Reviewed commit:\*\* `([0-9a-f]+)`")
+
+
+def receipt_head(body):
+    """A PR head that the receipt's `Reviewed commit` names (the printed short SHA, padded), or
+    None for a receipt that names no commit."""
+    match = REVIEWED_COMMIT.search(body)
+    return match.group(1).ljust(40, "0") if match else None
+
+
+def code_receipt(sha, created_at=AFTER):
+    """The clean code-review receipt Codex posts for a review request, naming `sha`."""
+    body = FIXTURES["code_review_no_findings"]["body"]
+    named = REVIEWED_COMMIT.sub(f"**Reviewed commit:** `{sha}`", body)
+    assert f"`{sha}`" in named, sha
+    return comment(named, BOT, created_at)
 
 
 RUNNING_LABEL = "🔄 Running"
@@ -1090,15 +1112,17 @@ else:
         request = comment("@codex review", "maintainer", REQUEST)
         for name, fixture in FIXTURES.items():
             with self.subTest(name=name):
-                result = self.run_gate(
-                    snapshot([request, comment(fixture["body"])]), "wait_pr_codex.sh"
-                )
                 # Completed informational envelopes and in-progress summaries keep
                 # polling for approval; unknown reports remain failures under the CI policy.
                 # A fixture can name its own readiness result: the clean code-review
                 # receipt is approval, and the account notice is a failed review.
                 expected = fixture.get(
                     "wait_exit_code", 10 if fixture["expected_exit_code"] in (0, 10) else 1
+                )
+                # A receipt approves the head it names, so an approving fixture is read on that head.
+                head = receipt_head(fixture["body"]) if expected == 0 else None
+                result = self.run_gate(
+                    snapshot([request, comment(fixture["body"])], head=head), "wait_pr_codex.sh"
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
@@ -1511,6 +1535,59 @@ else:
                     ],
                 )
                 self.assert_gate(expected, data, "wait_pr_codex.sh")
+
+    def test_approval_comment_must_not_name_another_head(self):
+        # A receipt for an earlier head stays after the latest request when a push follows it
+        # (observed on #7967 and #7998). It approves only the head it names.
+        request = comment("@codex review", "maintainer", REQUEST)
+        running = comment(board_for(FIXTURES["running_summary"]["body"], PR_HEAD))
+        commitless = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        for case, comments, expected in (
+            ("10 characters of the head", [request, code_receipt(PR_HEAD[:10])], 0),
+            ("the whole head", [request, code_receipt(PR_HEAD)], 0),
+            # Any receipt for the head approves it, whichever receipt is newest.
+            ("a later receipt for an earlier head", [request, code_receipt(PR_HEAD[:10]), code_receipt(EARLIER_HEAD[:10], LATER)], 0),
+            # A receipt that names no commit names no head: it approves as before.
+            ("no reviewed commit", [request, commitless], 0),
+            ("an earlier head", [request, code_receipt(EARLIER_HEAD[:10])], 1),
+            ("an earlier head, 11 characters", [request, code_receipt(EARLIER_HEAD[:11])], 1),
+            ("an earlier head, 40 characters", [request, code_receipt(EARLIER_HEAD)], 1),
+            # The head's own review is still running: wait for it, do not report the old receipt.
+            ("an earlier head, the head's review running", [request, running, code_receipt(EARLIER_HEAD[:10])], 10),
+            # A short SHA is cheap to collide: Codex prints 10 characters. It is read as a SHA, and
+            # is not mistaken for a receipt with no line.
+            ("7 characters of the head", [request, code_receipt(PR_HEAD[:7])], 1),
+            ("9 characters of the head", [request, code_receipt(PR_HEAD[:9])], 1),
+            ("the head's start with another end", [request, code_receipt(PR_HEAD[:9] + "f")], 1),
+            # A long SHA is read whole: its first 10 characters do not stand for it.
+            ("11 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f")], 1),
+            ("20 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 10)], 1),
+            ("40 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 30)], 1),
+        ):
+            with self.subTest(case=case):
+                result = self.assert_gate(expected, snapshot(comments, head=PR_HEAD), "wait_pr_codex.sh")
+                self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
+
+    def test_a_scanned_thumbs_up_needs_the_real_bot_and_a_fresh_time(self):
+        # With more than 100 thumbs-ups the script reads every page of them. The author and time
+        # rules hold there as in the newest 100: only the double's pages hold the reaction.
+        request = comment("@codex review", "maintainer", REQUEST)
+        for author, created_at, expected in (
+            (BOT, AFTER, 0),
+            (BOT + "[bot]", AFTER, 0),
+            ("human-reviewer", AFTER, 10),
+            (BOT + "-impostor[bot]", AFTER, 10),
+            (BOT, BEFORE, 10),
+            (BOT + "[bot]", BEFORE, 10),
+        ):
+            with self.subTest(author=author, created_at=created_at):
+                data = snapshot([request])
+                data["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
+                served = [{"user": {"login": author}, "createdAt": created_at}]
+                result = self.run_gate(
+                    data, "wait_pr_codex.sh", env_extra={"CODEX_GATE_REACTIONS_NODES": json.dumps(served)}
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
