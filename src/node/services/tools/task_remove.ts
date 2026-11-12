@@ -2,12 +2,18 @@ import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TaskRemoveToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import type { LossyWorkPolicy } from "@/node/services/taskService";
 import {
   dedupeStrings,
   parseToolResult,
   requireTaskService,
   requireWorkspaceId,
 } from "./toolUtils";
+
+/** Only `force: true` forces: false, null (strict-mode providers) and an omitted flag refuse. */
+function lossyWorkPolicyFor(force: boolean | null | undefined): LossyWorkPolicy {
+  return force === true ? "force" : "refuse";
+}
 
 export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
@@ -35,7 +41,7 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
         const result = await taskService.removeInactiveDescendantAgentTask(
           ownerWorkspaceId,
           taskId,
-          { lossyWorkPolicy: args.force === true ? "force" : "refuse" }
+          { lossyWorkPolicy: lossyWorkPolicyFor(args.force) }
         );
         if (!result.success) {
           results.push({ status: "error" as const, taskId, error: result.error });
@@ -44,14 +50,6 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
         const data = result.data;
         switch (data.status) {
           case "removed":
-            results.push({
-              status: data.status,
-              taskId,
-              ...(data.workspaceId != null ? { workspaceId: data.workspaceId } : {}),
-              ...(data.deletedWork != null ? { deletedWork: data.deletedWork } : {}),
-              ...(data.paths != null ? { paths: data.paths } : {}),
-            });
-            break;
           case "already_removed":
           case "active":
           case "not_found":
@@ -60,6 +58,9 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
               status: data.status,
               taskId,
               ...(data.workspaceId != null ? { workspaceId: data.workspaceId } : {}),
+              // Only a forced removal sets these; otherwise they are undefined and leave the JSON.
+              deletedWork: data.deletedWork,
+              paths: data.paths,
             });
             break;
           case "error":

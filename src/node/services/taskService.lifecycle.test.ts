@@ -14,7 +14,7 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { defaultModel } from "@/common/utils/ai/models";
-import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceMetadata, WorkspaceRemoveWarning } from "@/common/types/workspace";
 import assert from "node:assert";
 import {
   createAIServiceMocks,
@@ -412,7 +412,7 @@ describe("TaskService", () => {
     // the commit count, the checkout and the task branch.
     expect(forced.data.deletedWork).toContain("1 commit(s) not captured");
     expect(forced.data.deletedWork).toContain(childPath);
-    expect(forced.data.deletedWork).toContain("child");
+    expect(forced.data.deletedWork).toContain("Branch: child.");
     expect(forced.data.error).toBeUndefined();
     // A removed row now reads as already removed: the tombstone was written.
     await config.editConfig((cfg) => {
@@ -444,11 +444,15 @@ describe("TaskService", () => {
     const refusal = await removeAsModel(childTaskId, "refuse");
     assert(refusal.success && refusal.data.status === "error", "an unverifiable child refuses");
     expect(remove).not.toHaveBeenCalled();
+    // The refusal is how a model learns that the override exists, and no file was found to list.
+    expect(refusal.data.error).toContain("force: true");
+    expect(refusal.data.paths).toBeUndefined();
 
     const forced = await removeAsModel(childTaskId, "force");
     assert(forced.success && forced.data.status === "removed", "force must remove the child");
     expect(remove).toHaveBeenCalledTimes(1);
     expect(forced.data.deletedWork).toContain("could not be checked");
+    expect(forced.data.paths).toBeUndefined();
   });
 
   test("the force policy reports nothing when the child holds no unsaved work", async () => {
@@ -461,6 +465,33 @@ describe("TaskService", () => {
     expect(remove).toHaveBeenCalledTimes(1);
     expect(result.data.deletedWork).toBeUndefined();
     expect(result.data.paths).toBeUndefined();
+  });
+
+  test("removal warnings reach a handler when the caller gives one and do not fail a caller without one", async () => {
+    const parentWorkspaceId = "parent-remove-warnings";
+    const childTaskId = "child-remove-warnings";
+    const { remove, taskService, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    const warnings: WorkspaceRemoveWarning[] = [{ kind: "leftover", description: "/leftover" }];
+    const withWarnings: Result<void> & { warnings?: WorkspaceRemoveWarning[] } = {
+      ...Ok(undefined),
+      warnings,
+    };
+    remove.mockImplementation(() => Promise.resolve(withWarnings));
+
+    // No options at all, and options without a handler (the model's): neither may call a missing one.
+    expect(
+      await taskService.removeInactiveDescendantAgentTask(parentWorkspaceId, childTaskId)
+    ).toMatchObject(Ok({ status: "removed" }));
+    expect(await removeAsModel(childTaskId, "force")).toMatchObject(Ok({ status: "removed" }));
+
+    const received: WorkspaceRemoveWarning[] = [];
+    await taskService.removeInactiveDescendantAgentTask(parentWorkspaceId, childTaskId, {
+      onRemovalWarnings: (removalWarnings) => received.push(...removalWarnings),
+    });
+    expect(received).toEqual(warnings);
   });
 
   test("the user can preview and then confirm removing a sub-agent the model must not remove (#5106)", async () => {
