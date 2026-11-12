@@ -1326,6 +1326,13 @@ describe("WorkspaceTurnManager", () => {
       const harness = await createWorkspaceLifecycleHarness({ archive, preflightArchive });
       await setArchivePolicy(harness.config, { worktree: "snapshot" });
 
+      const plain = archivedFields(
+        await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+          harness.parentId,
+          { workspaceId: "childworkspace" },
+          {}
+        )
+      );
       const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
         harness.parentId,
         { workspaceId: "childworkspace" },
@@ -1336,8 +1343,13 @@ describe("WorkspaceTurnManager", () => {
       expect(data.status).toBe("error");
       expect(data.paths).toEqual(["late.txt", "scratch.txt"]);
       expect(data.note).toBeUndefined();
-      expect(archive).toHaveBeenCalledTimes(1);
-      expect(archive.mock.calls[0]?.[1]).toEqual(["scratch.txt"]);
+      expect(archive).toHaveBeenCalledTimes(2);
+      expect(archive.mock.calls[1]?.[1]).toEqual(["scratch.txt"]);
+      // A changed set is not the plain "ask the user" refusal: the model must not read it as a
+      // refusal that force could never lift, nor the reverse.
+      expect(data.status === "error" ? data.error : plain.status).not.toBe(
+        plain.status === "error" ? plain.error : data.status
+      );
     });
 
     test("force lists a cascaded sub-agent's untracked files, acknowledges them per sub-agent and reports them", async () => {
@@ -1366,6 +1378,7 @@ describe("WorkspaceTurnManager", () => {
       const refused = archivedFields(refusal);
       expect(refused.status).toBe("error");
       expect(refused.paths).toEqual(["sub-1: notes.txt"]);
+      expect(typeof (refused.status === "error" ? refused.error : undefined)).toBe("string");
       expect(harness.archive).not.toHaveBeenCalled();
 
       const forced = archivedFields(
@@ -1384,6 +1397,27 @@ describe("WorkspaceTurnManager", () => {
         coderWorkspaceArchiveBehaviorOverride: "stop",
         acknowledgedSubagentUntrackedPaths: { "sub-1": ["notes.txt"] },
       });
+    });
+
+    test("without force a sub-agent tree's own untracked file refuses before anything is archived", async () => {
+      const preflightArchiveCascade = mock(() =>
+        Promise.resolve(Ok({ targetPaths: ["scratch.txt"], subagents: [] }))
+      );
+      const harness = await createWorkspaceLifecycleHarness({ preflightArchiveCascade });
+      await setArchivePolicy(harness.config, { worktree: "snapshot" });
+
+      const refusal = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+        harness.parentId,
+        { workspaceId: "childworkspace" },
+        {}
+      );
+
+      expectLossyArchiveRefusal(refusal, {
+        workspaceId: "childworkspace",
+        displayName: "Child workspace",
+        paths: ["scratch.txt"],
+      });
+      expect(harness.archive).not.toHaveBeenCalled();
     });
 
     test("force archives under the delete checkout policy, lifts the sink's checkout guard and names the deleted checkout", async () => {

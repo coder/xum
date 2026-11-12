@@ -848,10 +848,10 @@ function readArchivePolicy(
   config: ProjectsConfig,
   metadata: FrontendWorkspaceMetadata
 ): ArchivePolicy {
-  const worktreeArchiveBehavior =
-    config.worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR;
-  const coderArchiveBehavior =
-    config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR;
+  // mutation-equivalent: the behaviors are non-empty strings, so ?? and || agree
+  const worktreeBehavior = config.worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR;
+  // mutation-equivalent: the behaviors are non-empty strings, so ?? and || agree
+  const coderBehavior = config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR;
   const coderWorkspaceName = dedicatedCoderWorkspaceName(metadata.runtimeConfig);
   // The delete policy can only destroy work when the archive would actually run
   // managed-worktree deletion: non-worktree runtimes (SSH/Coder, Docker, project-dir
@@ -859,15 +859,15 @@ function readArchivePolicy(
   // by the worktree archive hook, so an unrelated global worktree setting must not make
   // reversible archive unavailable for those targets. Mirrored at the sink.
   const deletesCheckout =
-    worktreeArchiveBehavior === "delete" &&
+    worktreeBehavior === "delete" &&
     isWorktreeRuntime(metadata.runtimeConfig) &&
     metadata.taskIsolation !== "none";
   return {
-    worktreeArchiveBehavior,
-    coderArchiveBehavior,
+    worktreeArchiveBehavior: worktreeBehavior,
+    coderArchiveBehavior: coderBehavior,
     deletedCheckoutPath: deletesCheckout ? metadata.namedWorkspacePath : undefined,
-    deletedCoderWorkspaceName: coderArchiveBehavior === "delete" ? coderWorkspaceName : undefined,
-    changesCoderWorkspace: coderWorkspaceName != null && coderArchiveBehavior !== "keep",
+    deletedCoderWorkspaceName: coderBehavior === "delete" ? coderWorkspaceName : undefined,
+    changesCoderWorkspace: coderWorkspaceName != null && coderBehavior !== "keep",
   };
 }
 
@@ -4854,6 +4854,7 @@ export class WorkspaceTurnManager {
       forcedLoss: {
         targetPaths: target.data.kind === "confirm-lossy-untracked-files" ? target.data.paths : [],
         subagents: cascade.subagents,
+        // mutation-equivalent: deletedCheckouts is an array or undefined, so ?? and || agree
         deletedSubagentCheckouts: cascade.deletedCheckouts ?? [],
         deletedCheckoutPath: policy.deletedCheckoutPath,
         deletedCoderWorkspaceName: policy.deletedCoderWorkspaceName,
