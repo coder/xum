@@ -1,19 +1,23 @@
 import { streamText, tool } from "ai";
-import type { LanguageModel } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { Duration, Effect } from "effect";
 import type { AIService } from "./aiService";
+import type { PinnedModelOptions } from "./providerModelFactory";
 import { log } from "./log";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { mapModelCreationError, mapNameGenerationError } from "./workspaceTitleGenerator";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { NameGenerationError } from "@/common/types/errors";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   TOOL_DEFINITIONS,
   ProposeStatusToolArgsSchema,
 } from "@/common/utils/tools/toolDefinitions";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
+import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 
 /**
  * AI-generated sidebar status: emoji + short verb-led phrase, matching
@@ -200,13 +204,15 @@ function generateWorkspaceStatusEffect(
     for (let i = 0; i < maxAttempts; i++) {
       const modelString = candidates[i];
 
-      // Pinned creation: the returned metadataModel comes from the SAME config
-      // snapshot as the SDK model, so usage recorded below cannot be
-      // re-attributed by a concurrent Coder catalog refresh. A construction
-      // rejection defects through the facade unchanged (v4 rethrows the raw
-      // error), matching the pre-Effect uncaught await.
+      // Pinned creation: the returned metadataModel and request options come
+      // from the SAME config snapshot as the SDK model, so usage recorded below
+      // cannot be re-attributed by a concurrent Coder catalog refresh. A
+      // construction rejection defects through the facade unchanged (v4
+      // rethrows the raw error), matching the pre-Effect uncaught await.
+      const creationThinking = statusThinkingLevel(modelString, aiService.getProvidersConfig());
       const modelResult = yield* Effect.promise(async () =>
-        aiService.createModelWithPinnedMetadata(modelString, {
+        aiService.createModelWithPinnedOptions(modelString, {
+          thinkingLevel: creationThinking,
           agentInitiated: true,
         })
       );
@@ -215,9 +221,32 @@ function generateWorkspaceStatusEffect(
         log.debug(`Status generation: skipping ${modelString} (${modelResult.error.type})`);
         continue;
       }
+      const pinned = modelResult.data;
+
+      // The request must carry the level the model was created for (xAI picks
+      // its non-reasoning variant only for "off"). If the pinned snapshot
+      // resolves another level, skip the candidate, as workspaceTitleGenerator does.
+      const thinkingLevel = statusThinkingLevel(
+        pinned.optionsModelString,
+        pinned.optionsProvidersConfig
+      );
+      if (thinkingLevel !== creationThinking) {
+        runLanguageModelCleanup(pinned.model);
+        lastError = {
+          type: "configuration",
+          raw: `Thinking level for ${modelString} changed after model creation (${creationThinking} -> ${thinkingLevel})`,
+        };
+        continue;
+      }
       reachedProvider = true;
 
-      const attempt = yield* attemptCandidate(transcript, modelString, modelResult.data, options);
+      const attempt = yield* attemptCandidate(
+        transcript,
+        modelString,
+        pinned,
+        thinkingLevel,
+        options
+      );
       if (attempt.success) return Ok(attempt.data);
       lastError = attempt.error;
     }
@@ -233,6 +262,20 @@ function generateWorkspaceStatusEffect(
 }
 
 /**
+ * Status summaries run with no thinking: "off", or the lowest level the
+ * model's policy allows. The level must still be sent explicitly: without
+ * provider options a provider runs its own default, and some default high
+ * (GLM's chat template treats an absent reasoning_effort as Max). The
+ * per-model slider floor is not applied to this background call.
+ */
+function statusThinkingLevel(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null
+): ThinkingLevel {
+  return enforceThinkingPolicy(modelString, "off", undefined, providersConfig);
+}
+
+/**
  * One candidate attempt. The pre-Effect body was a single whole-attempt
  * try/catch/finally, so the pipeline mirrors that classification exactly:
  * every failure — typed channel or defect — folds into an `Err` so the
@@ -242,7 +285,8 @@ function generateWorkspaceStatusEffect(
 function attemptCandidate(
   transcript: string,
   modelString: string,
-  created: { model: LanguageModel; metadataModel: string },
+  created: PinnedModelOptions,
+  thinkingLevel: ThinkingLevel,
   options: GenerateWorkspaceStatusOptions
 ): Effect.Effect<Result<GenerateWorkspaceStatusResult, NameGenerationError>> {
   const foldAttemptFailure = (
@@ -263,6 +307,17 @@ function attemptCandidate(
         const currentStream = streamText({
           model: created.model,
           prompt: buildWorkspaceStatusPrompt(transcript, options),
+          providerOptions: buildProviderOptions(
+            created.optionsModelString,
+            thinkingLevel,
+            undefined,
+            undefined,
+            created.optionsMuxProviderOptions,
+            undefined,
+            undefined,
+            created.optionsProvidersConfig,
+            created.optionsRouteProvider
+          ) as Parameters<typeof streamText>[0]["providerOptions"],
           tools: {
             propose_status: tool({
               description: TOOL_DEFINITIONS.propose_status.description,
