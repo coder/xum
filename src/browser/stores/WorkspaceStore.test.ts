@@ -65,6 +65,7 @@ import {
   areActivityGoalsEqual,
   findLastContextUsage,
   findRenderedRefineProposalHash,
+  getMountedTranscriptHistoryIds,
   mergeTimelineEvents,
   resolveSidebarAgentStatus,
   sumSessionCostUsage,
@@ -9803,10 +9804,12 @@ describe("findRenderedRefineProposalHash", () => {
       })
     );
 
+  const MOUNTED = new Set(["refine-1"]);
+
   it("returns the newest rendered proposal hash", () => {
     const aggregator = new StreamingMessageAggregator(CREATED_AT);
     aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(3, 2)], false);
-    expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
+    expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBe(HASH);
   });
 
   it("ignores a proposal row hidden by the display cap until Load all reveals it (r68)", () => {
@@ -9816,10 +9819,31 @@ describe("findRenderedRefineProposalHash", () => {
     // internal history.
     const aggregator = new StreamingMessageAggregator(CREATED_AT);
     aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(200, 2)], false);
-    expect(findRenderedRefineProposalHash(aggregator)).toBeNull();
+    expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBeNull();
     // "Load all" disables the cap: the proposal is now actually rendered.
     aggregator.setShowAllMessages(true);
-    expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
+    expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBe(HASH);
+  });
+
+  // The desktop chat has no display cap: its pane mounts a window of the transcript, and
+  // compact density folds rows. A proposal the aggregator displays is rendered only if its row
+  // is on the page.
+  it("ignores a proposal row that is displayed but not mounted", () => {
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.setShowAllMessages(true);
+    aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(200, 2)], false);
+
+    expect(findRenderedRefineProposalHash(aggregator, new Set())).toBeNull();
+    expect(findRenderedRefineProposalHash(aggregator, new Set(["filler-199"]))).toBeNull();
+    expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBe(HASH);
+  });
+
+  it("reads the mounted rows from the page", () => {
+    const page = new GlobalWindow().document;
+    page.body.innerHTML =
+      '<div data-message-id="refine-1"></div><div data-message-id="filler-0"></div><div></div>';
+    const mounted = getMountedTranscriptHistoryIds(page as unknown as Document);
+    expect([...mounted]).toEqual(["refine-1", "filler-0"]);
   });
 });
 

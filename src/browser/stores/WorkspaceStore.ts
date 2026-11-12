@@ -6361,29 +6361,58 @@ export function pinTimelineRevealTarget(
  * so the backend cannot infer the displayed proposal from the transcript
  * alone. Scans newest-first for a refine-summary row carrying a
  * stagedSetHash, restricted to rows the transcript actually RENDERS (r68):
- * the DOM display cap can hide a proposal row from internal history (e.g. a
- * window opened after a foreign backend staged it, with enough later chat
- * to push it past the cap), and approving a hidden proposal would apply
- * memory/skill edits the user never saw. A hidden newer proposal also
- * cannot be applied via an older visible hash — the backend re-hashes the
- * staged set and refuses the mismatch — so filtering here fails safe.
+ * a row the aggregator holds is not always on the page, and approving a
+ * proposal that is not would apply memory/skill edits the user never saw.
+ * Three things keep a row off the page: the aggregator's display cap (the
+ * VS Code webview), the chat pane's mount window (a proposal with enough
+ * later chat after it is above the window until the user loads older rows),
+ * and a fold (compact density's work line). So the check is the page
+ * itself: the row must be mounted. A hidden newer proposal also cannot be
+ * applied via an older visible hash — the backend re-hashes the staged set
+ * and refuses the mismatch — so filtering here fails safe.
  */
 export function getDisplayedRefineProposalHash(workspaceId: string): string | null {
   const aggregator = getStoreInstance().getAggregator(workspaceId);
-  return aggregator ? findRenderedRefineProposalHash(aggregator) : null;
+  return aggregator
+    ? findRenderedRefineProposalHash(aggregator, getMountedTranscriptHistoryIds(document))
+    : null;
+}
+
+/**
+ * History ids of the transcript rows mounted under `root`: MessageRenderer tags every row it
+ * mounts with its message's id (data-message-id).
+ */
+export function getMountedTranscriptHistoryIds(root: ParentNode): Set<string> {
+  const historyIds = new Set<string>();
+  for (const row of root.querySelectorAll("[data-message-id]")) {
+    const historyId = row.getAttribute("data-message-id");
+    if (historyId !== null) {
+      historyIds.add(historyId);
+    }
+  }
+  return historyIds;
+}
+
+/** History ids the transcript renders: displayed by the aggregator (capped in the webview) and mounted. */
+function collectRenderedHistoryIds(
+  aggregator: StreamingMessageAggregator,
+  mountedHistoryIds: ReadonlySet<string>
+): Set<string> {
+  const renderedHistoryIds = new Set<string>();
+  for (const displayed of aggregator.getDisplayedMessages()) {
+    if ("historyId" in displayed && mountedHistoryIds.has(displayed.historyId)) {
+      renderedHistoryIds.add(displayed.historyId);
+    }
+  }
+  return renderedHistoryIds;
 }
 
 /** Pure scan behind getDisplayedRefineProposalHash, exported for tests. */
 export function findRenderedRefineProposalHash(
-  aggregator: StreamingMessageAggregator
+  aggregator: StreamingMessageAggregator,
+  mountedHistoryIds: ReadonlySet<string>
 ): string | null {
-  // The rendered row set: display-capped unless "Load all" disabled the cap.
-  const renderedHistoryIds = new Set<string>();
-  for (const displayed of aggregator.getDisplayedMessages()) {
-    if ("historyId" in displayed) {
-      renderedHistoryIds.add(displayed.historyId);
-    }
-  }
+  const renderedHistoryIds = collectRenderedHistoryIds(aggregator, mountedHistoryIds);
   const messages = aggregator.getAllMessages();
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
