@@ -91,6 +91,18 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   // Two opaque panels meet over the text, 60% and 40% of the box: each is under the share that one
   // cover must hold, together they hide all of it.
   "cover-in-two-panels": everyWidth(found("overlapping-text", "p#totals")),
+  // Four sections, each read wrongly before the element facts were fixed. A textarea that holds
+  // text, covered inside its label, was a miss: a browser gives that text no line, so the control is
+  // sampled by its box. The menu row was reported as clipped-text instead of the clipped-control it
+  // is: a button with role menuitem is a control. The card was a miss: a paragraph with
+  // `display: contents` has no box, and its one long word is cut by the card (its ellipsis cuts and
+  // excuses nothing). The note was a false alarm (clipped-text): the long line that is hidden inside
+  // the clipping note does not clip it.
+  "text-controls-and-boundaries": everyWidth(
+    found("clipped-control", "div#menu"),
+    found("clipped-text", "div#card"),
+    found("overlapping-text", "textarea#notes")
+  ),
   "occlusion-exclusions-clean": CLEAN,
   "real-animated-entry": CLEAN,
   "real-carousel": CLEAN,

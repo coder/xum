@@ -14,6 +14,7 @@ import {
   isRequiredControl,
   isRootElement,
   isVisible,
+  isVisibleTextHolder,
   nestedClippingBoundaries,
   paddingBox,
   rootVerticalScrollLocked,
@@ -80,8 +81,8 @@ function isRootFailure(pass: AuditPass, el: Element): boolean {
 /**
  * Not a diagram, mask or screen-reader-only text, not a span that its paragraph judges, and not
  * near motion. The part of every text and control rule that does not depend on the rule. A
- * paragraph judges the text of what it holds, never a box: an element that is judged by its own
- * box (`byOwnBox`) is not exempt for sitting inside one.
+ * paragraph judges the text of what it holds, never a control: a control (`byOwnBox`) is not
+ * exempt for sitting inside one.
  */
 function isJudgeable(pass: AuditPass, el: Element, byOwnBox = false): boolean {
   return (
@@ -92,7 +93,9 @@ function isJudgeable(pass: AuditPass, el: Element, byOwnBox = false): boolean {
 }
 
 function isVisibleText(pass: AuditPass, el: Element): boolean {
-  return isJudgeable(pass, el) && auditedText(pass.page, el) !== "" && isVisible(pass.page, el);
+  return (
+    isJudgeable(pass, el) && auditedText(pass.page, el) !== "" && isVisibleTextHolder(pass.page, el)
+  );
 }
 
 /** Absolute, fixed or sticky text stays put on purpose; a positioned control is still checked. */
@@ -129,7 +132,8 @@ function elementEscapesRightEdge(pass: AuditPass, el: Element): boolean {
     ? hasHorizontalScrollerAncestor(pass.page, el)
     : isInsideHorizontalScroller(pass.page, el);
   if (scrolled || !isJudgeable(pass, el)) return false;
-  if (!isVisible(pass.page, el) || isPositionedNonControl(pass, el)) return false;
+  const visible = control ? isVisible(pass.page, el) : isVisibleTextHolder(pass.page, el);
+  if (!visible || isPositionedNonControl(pass, el)) return false;
   if (!control) return textEscapesRightEdge(pass, el);
   const rect = pass.page.box(el);
   return viewportEscape(pass, rect, THRESHOLDS.controlMinOutsidePx)?.side === "end";
@@ -303,14 +307,19 @@ function clipAtBoundary(
 function strongestTextClip(pass: AuditPass, el: Element): TextClip | null {
   const style = pass.page.style(el);
   const fragments = textFragments(pass.page, el);
-  const truncation = textTruncation(style);
-  const own = classifySevereTextOverflow({
-    fragments,
-    box: paddingBox(pass.page, el),
-    overflowX: style.overflowX,
-    overflowY: style.overflowY,
-    truncation,
-  });
+  // A `display: contents` element has no box: its `overflow` cannot clip, and its ellipsis and line
+  // clamp cannot cut or excuse a line, since no box lays the text out. None of them is read.
+  const boxless = style.display === "contents";
+  const truncation: TextTruncation = boxless ? "none" : textTruncation(style);
+  const own = boxless
+    ? null
+    : classifySevereTextOverflow({
+        fragments,
+        box: paddingBox(pass.page, el),
+        overflowX: style.overflowX,
+        overflowY: style.overflowY,
+        truncation,
+      });
   let clip: TextClip | null = own && { root: el, ...own };
   // A nested clipper's own ellipsis or line clamp is the author's cut of the text it holds, so it
   // is read from that clipper (`<span class="truncate">` in a paragraph is common).
@@ -444,19 +453,14 @@ function isScrollReachable(point: Point, metrics: PageMetrics): boolean {
   return point.y > viewportHeight || (point.y < 0 && point.y + scrollY >= 0);
 }
 
-// A control with no text of its own (an <input value>, a <select>, an icon-only button): its face
-// is not a text node, so it is sampled by its box.
-function isFacelessControl(page: LayoutPage, el: Element): boolean {
-  return auditedText(page, el) === "" && isRequiredControl(el);
-}
-
-// The rectangles whose points are sampled: the text lines, or the box of a faceless control, as
-// far as a clipping box leaves them visible (a clipped-away line has a rectangle, and a point on
-// it would find whatever sits there instead).
+// The rectangles whose points are sampled: the text lines, or for a control with no text line of
+// its own the control's box. That is an <input value>, a <select>, an icon-only button, or a
+// <textarea> that holds text (its value is drawn from a shadow tree, and a Range over the text it
+// holds has no rectangle). Each is cut to the part that a clipping box leaves visible: a
+// clipped-away line has a rectangle, and a point on it would find whatever sits there instead.
 function sampleRects(pass: AuditPass, el: Element): Box[] {
-  const rects = isFacelessControl(pass.page, el)
-    ? [pass.page.box(el)]
-    : textFragments(pass.page, el);
+  const lines = textFragments(pass.page, el);
+  const rects = lines.length === 0 && isRequiredControl(el) ? [pass.page.box(el)] : lines;
   return rects.flatMap((rect) => {
     const visible = visiblePart(pass.page, el, rect);
     return visible && visible.width * visible.height >= THRESHOLDS.minFragmentArea ? [visible] : [];
@@ -526,16 +530,17 @@ function occlusionOf(samples: OcclusionSamples) {
   };
 }
 
-// Long enough to read (any length for a control, and none at all: it is sampled by its box),
-// static (positioned text overlaps on purpose), and not shown by a paragraph around it. A control
-// with no text is no text for a paragraph to show, so it is a candidate inside one too.
+// Long enough to read (any length for a control), static (positioned text overlaps on purpose),
+// and not shown by a paragraph around it. A control is a candidate inside one too: the
+// paragraph's lines are no stand-in for its face, and have none for a control with no text line.
 function isOcclusionCandidate(pass: AuditPass, el: Element): boolean {
   const text = auditedText(pass.page, el);
-  const sampled = text.length >= THRESHOLDS.occlusionMinTextChars || isRequiredControl(el);
+  const control = isRequiredControl(el);
+  const sampled = text.length >= THRESHOLDS.occlusionMinTextChars || control;
   return (
     sampled &&
-    isJudgeable(pass, el, isFacelessControl(pass.page, el)) &&
-    isVisible(pass.page, el) &&
+    isJudgeable(pass, el, control) &&
+    isVisibleTextHolder(pass.page, el) &&
     pass.page.style(el).position === "static"
   );
 }
