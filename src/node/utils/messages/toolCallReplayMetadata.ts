@@ -31,6 +31,17 @@ export function toolCallReplayMetadataFrom(value: unknown): ToolCallReplayMetada
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
+/**
+ * The Gemini namespace a built request's provider options were written under
+ * (buildProviderOptions keys them by the namespace its client reads), if any.
+ */
+export function toolCallReplayNamespaceOf(requestProviderOptions: unknown): string | undefined {
+  if (!isPlainObject(requestProviderOptions)) return undefined;
+  return TOOL_CALL_SIGNATURE_SOURCES.map(([namespace]) => namespace).find(
+    (namespace) => namespace in requestProviderOptions
+  );
+}
+
 /** Request-only: convertToModelMessages turns this into the tool call's providerOptions. */
 type ToolPartWithReplayMetadata = MuxToolPart & {
   callProviderMetadata?: Record<string, { thoughtSignature: string }>;
