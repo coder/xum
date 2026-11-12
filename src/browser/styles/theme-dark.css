@@ -356,6 +356,9 @@
      right inset keep clear of the column. Shared components (Dialog, toasts) read it, so the
      webview defines it too. */
   --safe-area-right: max(env(safe-area-inset-right, 0px), var(--ios-cover-column, 0px));
+  /* The top inset the app shell and its phone header keep clear of. globals.css lowers it on the
+     iPhone Duo's inner display in portrait, where the status bar is only a corner. */
+  --safe-area-top: env(safe-area-inset-top, 0px);
 
   --font-primary:
     -apple-system, BlinkMacSystemFont, "Geist", system-ui, "Segoe UI", "Roboto", "Helvetica Neue",

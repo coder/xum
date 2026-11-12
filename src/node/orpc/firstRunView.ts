@@ -57,8 +57,8 @@ export function firstRunViewHtml(gitDescribe: string): string {
   </style>
   <div class="h-full">
     <div class="bg-surface-primary h-full">
-      <div class="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
-        <div class="left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center gap-1 fixed top-[env(safe-area-inset-top)] left-[env(safe-area-inset-left)] z-[1050] h-8">
+      <div class="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-(--safe-area-top) pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
+        <div class="left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center gap-1 fixed top-(--safe-area-top) left-[env(safe-area-inset-left)] z-[1050] h-8">
           <button class="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium text-muted hover:text-foreground h-6 w-6 shrink-0 mobile-menu-btn"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-panel-left h-3.5 w-3.5"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M9 3v18"></path></svg></button>
         </div>
         <div class="mobile-overlay fixed inset-0 z-40 hidden before:absolute before:inset-0 before:bg-black/50 before:backdrop-blur-sm" data-pre="e"></div>
