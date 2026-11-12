@@ -544,6 +544,7 @@ import {
   searchFileCompletions,
   type FileCompletionsIndex,
 } from "@/node/services/fileCompletionsIndex";
+import { FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL } from "@/node/services/forcedArchiveLoss";
 import { taskQueueDebug } from "@/node/services/taskQueueDebug";
 import {
   getSubagentGitPatchMboxPath,
@@ -12056,10 +12057,12 @@ export class WorkspaceService
       }
     );
     if (!result.success) return result.error;
+    if (result.data.kind === "archived") return null;
     // Untracked files that the user did not confirm (or that appeared after the confirmation)
-    // refuse; the dialog's retry preflights again and lists them.
-    return result.data.kind === "archived"
-      ? null
+    // refuse; the dialog's retry preflights again and lists them. A forced archive has no dialog:
+    // it lists the files itself, so a file that changed since means someone still works there.
+    return options?.acknowledgedSubagentCheckoutDeletions != null
+      ? FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL
       : "its untracked files would be lost by the snapshot archive and were not confirmed; archive again to review them";
   }
 

@@ -34,6 +34,14 @@ export const FORCED_ARCHIVE_LOSS_CHANGED_REFUSAL =
   "Find out what writes there before you archive again, and use force again only when the user asked for cleanup or the work is provably saved. " +
   "The files that would be deleted now are listed in paths.";
 
+/**
+ * The same refusal for a cascaded sub-agent, which the sink reports after the deeper sub-agents
+ * were archived. The failure note lists what they lost.
+ */
+export const FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL =
+  "the untracked files that force listed for its checkout changed, so something still writes there and its archive deleted nothing. " +
+  "Find out what writes there before you archive again, and use force again only when the user asked for cleanup or the work is provably saved.";
+
 /** Whether two listings name the same files and checkouts: what force may delete is unchanged. */
 export function sameForcedArchiveLoss(a: ForcedArchiveLoss, b: ForcedArchiveLoss): boolean {
   const shape = (loss: ForcedArchiveLoss) =>

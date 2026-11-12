@@ -15,6 +15,7 @@ import * as path from "path";
 
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok } from "@/common/types/result";
+import { FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL } from "@/node/services/forcedArchiveLoss";
 import { HistoryService } from "@/node/services/historyService";
 import type { TaskService } from "@/node/services/taskService";
 import {
@@ -364,6 +365,8 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     assert(result.success, "the lifecycle archive returns a result");
     expect(result.data.status).toBe("error");
     expect(result.data.error).toContain(grandchildId);
+    // No dialog to retry in: the refusal tells the agent to find out what writes there.
+    expect(result.data.error).toContain(FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL);
     expect(wroteLateFile).toBe(true);
     for (const id of allIds) {
       expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
@@ -497,15 +500,22 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
 
   test("a forced archive refuses before it archives anything while a sub-agent runs background bash", async () => {
     await setUpForcedPolicy("delete");
+    // Both signals see the process: the refusal still names it once.
     spyOn(a.workspaceService, "hasRunningBackgroundBashProcesses").mockImplementation((id) =>
       Promise.resolve(id === childId)
     );
+    const listLive = a.workspaceService.listLiveWorkspaceActivity.bind(a.workspaceService);
+    spyOn(a.workspaceService, "listLiveWorkspaceActivity").mockImplementation((id) => ({
+      ...listLive(id),
+      backgroundBashProcesses: id === childId,
+    }));
 
     const result = await modelArchiveRoot({ force: true });
 
     assert(result.success, "the lifecycle archive returns a result");
     expect(result.data.status).toBe("error");
     expect(result.data.error).toContain("running background bash processes");
+    expect(result.data.error?.match(/running background bash processes/g)).toHaveLength(1);
     await expectNothingArchivedOrDeleted();
   });
 
@@ -722,7 +732,10 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
       acknowledgedSubagentUntrackedPaths: { [grandchildId]: ["notes.txt"] },
     });
 
-    expect(result.success).toBe(false);
+    assert(!result.success, "the archive refuses the file created after the confirmation");
+    // The dialog's retry lists the file again: only the user's archive says so.
+    expect(result.error).toContain("archive again to review them");
+    expect(result.error).not.toContain(FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL);
     for (const id of allIds) {
       expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
     }

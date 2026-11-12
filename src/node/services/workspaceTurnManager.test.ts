@@ -1840,6 +1840,47 @@ describe("WorkspaceTurnManager", () => {
       expect(stillRunning?.status).toBe("running");
     });
 
+    // The interrupt path's own lossy check runs before the turns stop: under force it must let
+    // the files that the forced listing already names go, where the plain call refuses.
+    test("force interrupts active turns and archives while the listing still names untracked files", async () => {
+      const preflightArchive = mock(() =>
+        Promise.resolve(Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt"] }))
+      );
+      const harness = await createWorkspaceLifecycleHarness({ preflightArchive });
+      await setArchivePolicy(harness.config, { worktree: "snapshot" });
+      await harness.taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord(harness.parentId, "childworkspace", "wst_running", "running", {
+          turnId: "turn-running",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        })
+      );
+      markWorkspaceTurnActive(
+        harness.taskService,
+        "childworkspace",
+        "wst_running",
+        harness.parentId
+      );
+
+      const result = archivedFields(
+        await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+          harness.parentId,
+          { workspaceId: "childworkspace" },
+          { force: true, interruptActive: true }
+        )
+      );
+
+      expect(result.status).toBe("archived");
+      expect(result.paths).toEqual(["scratch.txt"]);
+      expect(harness.archive).toHaveBeenCalledTimes(1);
+      expect(harness.archive.mock.calls[0]?.[1]).toEqual(["scratch.txt"]);
+      const interrupted = await harness.taskHandleStore.getWorkspaceTurn(
+        harness.parentId,
+        "wst_running"
+      );
+      expect(interrupted?.status).toBe("interrupted");
+    });
+
     test("force still refuses an unowned workspace", async () => {
       const harness = await createWorkspaceLifecycleHarness();
 
