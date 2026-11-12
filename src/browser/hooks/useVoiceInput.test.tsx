@@ -8,8 +8,10 @@ import {
   setSystemTime,
   test,
 } from "bun:test";
+import { StrictMode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
+import type { VoiceModelId } from "@/common/constants/localVoiceModels";
 import { useVoiceInput } from "./useVoiceInput";
 import { createTestApiClient } from "@/browser/testUtils";
 
@@ -114,7 +116,7 @@ function sampleFrames(count: number): void {
   for (let index = 0; index < count; index += 1) sample();
 }
 
-function renderVoiceInput(useRecordingKeybinds = false) {
+function renderVoiceInput(useRecordingKeybinds = false, strict = false) {
   const transcribe = mock((_input: { audioBase64: string }) =>
     Promise.resolve({
       success: true as const,
@@ -122,14 +124,16 @@ function renderVoiceInput(useRecordingKeybinds = false) {
     })
   );
   const onSend = mock(() => undefined);
-  const hook = renderHook(() =>
-    useVoiceInput({
-      useRecordingKeybinds,
-      onSend,
-      api: createTestApiClient({ voice: { transcribe } }),
-      isTranscriptionAvailable: true,
-      onTranscript: mock(() => undefined),
-    })
+  const hook = renderHook(
+    () =>
+      useVoiceInput({
+        useRecordingKeybinds,
+        onSend,
+        api: createTestApiClient({ voice: { transcribe } }),
+        isTranscriptionAvailable: true,
+        onTranscript: mock(() => undefined),
+      }),
+    strict ? { wrapper: StrictMode } : undefined
   );
 
   return { ...hook, transcribe, onSend };
@@ -172,6 +176,78 @@ describe("useVoiceInput", () => {
     } else {
       Reflect.deleteProperty(globalThis.navigator, "mediaDevices");
     }
+  });
+
+  test("the first recording survives Strict Mode effect replay", async () => {
+    const { result, transcribe } = renderVoiceInput(false, true);
+    act(() => result.current.start());
+    await waitFor(() => expect(result.current.state).toBe("recording"));
+    sampleByte = 160;
+    sampleFrames(5);
+    setSystemTime(new Date("2026-08-20T12:00:00.600Z"));
+    act(() => result.current.stop());
+    await waitFor(() => expect(transcribe).toHaveBeenCalledTimes(1));
+  });
+
+  test("Escape cancels transcription and restores the composer", async () => {
+    const onTranscript = mock(() => undefined);
+    const onError = mock(() => undefined);
+    let signal: AbortSignal | undefined;
+    const transcribe = mock(
+      (_input: { audioBase64: string }, options?: { signal?: AbortSignal }) => {
+        signal = options?.signal;
+        return new Promise<{ success: true; data: string }>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("Cancelled")), { once: true });
+        });
+      }
+    );
+    const api = createTestApiClient({ voice: { transcribe } });
+    const { result } = renderHook(() =>
+      useVoiceInput({
+        api,
+        onTranscript,
+        onError,
+        isTranscriptionAvailable: true,
+        useRecordingKeybinds: true,
+      })
+    );
+    act(() => result.current.start());
+    await waitFor(() => expect(result.current.state).toBe("recording"));
+    sampleByte = 160;
+    sampleFrames(5);
+    setSystemTime(new Date("2026-08-20T12:00:00.600Z"));
+    act(() => result.current.stop());
+    await waitFor(() => expect(transcribe).toHaveBeenCalledTimes(1));
+    act(() => {
+      window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    await waitFor(() => expect(result.current.state).toBe("idle"));
+    expect(signal?.aborted).toBe(true);
+    expect(onTranscript).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  test("a settings change does not redirect an active recording", async () => {
+    const transcribe = mock(() => Promise.resolve({ success: true as const, data: "speech" }));
+    const api = createTestApiClient({ voice: { transcribe } });
+    const { result, rerender } = renderHook(
+      (props: { voiceModel: VoiceModelId | null }) =>
+        useVoiceInput({
+          api,
+          voiceModel: props.voiceModel,
+          isTranscriptionAvailable: true,
+          onTranscript: () => undefined,
+        }),
+      { initialProps: { voiceModel: "openai" as VoiceModelId | null } }
+    );
+    act(() => result.current.start());
+    await waitFor(() => expect(result.current.state).toBe("recording"));
+    rerender({ voiceModel: null });
+    sampleByte = 160;
+    sampleFrames(5);
+    setSystemTime(new Date("2026-08-20T12:00:00.600Z"));
+    act(() => result.current.stop());
+    await waitFor(() => expect(transcribe).toHaveBeenCalledTimes(1));
   });
 
   function desktopCanvas() {

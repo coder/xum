@@ -34,6 +34,7 @@ import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
 import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
+import { useVoiceModel } from "@/browser/hooks/useVoiceModel";
 import { hasOpenAIApiKey } from "@/common/utils/providers/codexOauthRouting";
 import {
   useAdditionalSystemContextHydrated,
@@ -690,7 +691,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Track transcription provider prerequisites from Settings → Providers.
   const [openAIKeySet, setOpenAIKeySet] = useState(false);
   const [openAIProviderEnabled, setOpenAIProviderEnabled] = useState(true);
-  const isTranscriptionAvailable = openAIProviderEnabled && openAIKeySet;
+  const { model: voiceModel, state: localVoiceState } = useVoiceModel();
+  const isTranscriptionAvailable =
+    voiceModel === "openai"
+      ? openAIProviderEnabled && openAIKeySet
+      : voiceModel !== null && localVoiceState.downloaded.includes(voiceModel);
 
   // Voice input - appends transcribed text to input
   const voiceInput = useVoiceInput({
@@ -705,12 +710,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     },
     onSend: () => void handleSend(),
     isTranscriptionAvailable,
+    voiceModel,
     useRecordingKeybinds: true,
     api: liveApi,
   });
 
   const voiceInputUnavailableMessage =
-    "Voice input requires an enabled OpenAI provider with an API key. Configure in Settings → Providers.";
+    "Select a downloaded local model or configure OpenAI in Settings → Voice.";
 
   // Start creation tutorial when entering creation mode
   useEffect(() => {
