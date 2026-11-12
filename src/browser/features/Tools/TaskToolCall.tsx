@@ -1972,6 +1972,7 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
     status?: string;
     error?: string;
     paths?: string[];
+    deletedWork?: string;
   }> = results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
   const removed = results.filter((result) => result.status === "removed").length;
   return (
@@ -1996,6 +1997,11 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
                 {result.status != null && <TaskStatusBadge status={result.status} />}
                 {result.error != null && (
                   <div className="text-danger mt-1 text-[11px]">{result.error}</div>
+                )}
+                {result.deletedWork != null && (
+                  <div className="text-secondary mt-1 text-[11px] break-words">
+                    {result.deletedWork}
+                  </div>
                 )}
                 {result.paths?.map((filePath) => (
                   <div key={filePath} className="text-secondary font-mono text-[11px] break-all">

@@ -1212,6 +1212,13 @@ export const TaskStopToolResultSchema = z
 export const TaskRemoveToolArgsSchema = z
   .object({
     task_ids: z.array(z.string().min(1)).min(1).describe("Inactive child task IDs to remove."),
+    force: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Remove even if the child holds unsaved work, and delete that work. " +
+          "Set only when the user asked for cleanup or the work is provably saved (pushed, merged, or in an applied patch)."
+      ),
   })
   .strict();
 
@@ -1220,6 +1227,8 @@ const TaskRemoveToolBaseResultSchema = z.object({
   workspaceId: z.string().optional(),
   descendantTaskIds: z.array(z.string()).optional(),
   paths: z.array(z.string()).optional(),
+  /** What a forced removal deleted: the work, the checkout and the branch. */
+  deletedWork: z.string().optional(),
   error: z.string().optional(),
 });
 
@@ -1405,6 +1414,8 @@ const TaskWorkspaceLifecycleBaseResultSchema = z.object({
   workspaceId: z.string().optional(),
   displayName: z.string().optional(),
   paths: z.array(z.string()).optional(),
+  /** What a forced removal deleted: the work, the checkout and the branch. */
+  deletedWork: z.string().optional(),
   activeTaskIds: z.array(z.string()).optional(),
   descendantTaskIds: z.array(z.string()).optional(),
   note: z.string().optional(),
@@ -3024,7 +3035,7 @@ export const TOOL_DEFINITIONS = {
   task_remove: {
     resultSchema: TaskRemoveToolResultSchema,
     description:
-      "Irreversibly remove inactive child workspaces you own; they cannot be restored or reawakened. Use it only for consumed best-of candidates, overlapping or obsolete roles, a bench over its limit, or a user request, not as routine cleanup. Remove descendants first. A child with uncommitted or untracked work, or commits without a ready patch artifact, is refused; only the user can discard that work.",
+      "Irreversibly remove inactive child workspaces you own; they cannot be restored or reawakened. Use it only for consumed best-of candidates, overlapping or obsolete roles, a bench over its limit, or a user request, not as routine cleanup. Remove descendants first. A child with uncommitted or untracked work, or commits without a ready patch artifact, is refused unless you set force, which deletes that work and reports it. Set force only when the user asked for cleanup or the work is provably saved.",
     schema: TaskRemoveToolArgsSchema,
   },
   task_workspace_lifecycle: {

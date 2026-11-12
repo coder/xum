@@ -30,11 +30,12 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
 
       const results = [];
       for (const taskId of taskIds) {
-        // The model's decision is not user consent: refuse removals that would lose work (#4723).
+        // The model's decision is not user consent: refuse removals that would lose work (#4723),
+        // unless the call sets `force`, which deletes that work and reports it on the result.
         const result = await taskService.removeInactiveDescendantAgentTask(
           ownerWorkspaceId,
           taskId,
-          { lossyWorkPolicy: "refuse" }
+          { lossyWorkPolicy: args.force === true ? "force" : "refuse" }
         );
         if (!result.success) {
           results.push({ status: "error" as const, taskId, error: result.error });
@@ -43,6 +44,14 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
         const data = result.data;
         switch (data.status) {
           case "removed":
+            results.push({
+              status: data.status,
+              taskId,
+              ...(data.workspaceId != null ? { workspaceId: data.workspaceId } : {}),
+              ...(data.deletedWork != null ? { deletedWork: data.deletedWork } : {}),
+              ...(data.paths != null ? { paths: data.paths } : {}),
+            });
+            break;
           case "already_removed":
           case "active":
           case "not_found":

@@ -1,6 +1,8 @@
 /**
- * Finds work that removing a sub-agent checkout would destroy and nothing preserves (#4723). Only
- * model-driven task_remove consults it; user-confirmed and automatic removals keep force-removing.
+ * Finds work that removing a sub-agent checkout would destroy and nothing preserves (#4723).
+ * Model-driven task_remove consults it: by default a finding refuses the removal, and with the
+ * tool's `force` flag the removal goes on and reports the finding as what it deleted.
+ * User-confirmed and automatic removals keep force-removing without consulting it.
  */
 import assert from "node:assert/strict";
 

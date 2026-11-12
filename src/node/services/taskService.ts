@@ -434,9 +434,17 @@ function buildReportWaitRequest(
   return { taskId, options, timeoutMs, requestingWorkspaceId };
 }
 
-/** "refuse" is for model-driven task_remove (#4723); user-confirmed and automatic removals omit it. */
+/**
+ * What a model-driven task_remove does about a checkout holding unsaved work (#4723). Omitted for
+ * user-confirmed and automatic removals, which never refuse. Either value keeps the live-writer
+ * guards (background bash, an external editor or native terminal): they protect work someone is
+ * still changing. "refuse" also refuses unsaved work; "force" (the tool's `force` flag) deletes it
+ * and reports what it deleted on the removed result.
+ */
+export type LossyWorkPolicy = "refuse" | "force";
+
 export interface SubagentRemovalOptions {
-  lossyWorkPolicy?: "refuse";
+  lossyWorkPolicy?: LossyWorkPolicy;
   /** The caller holds the sub-agent's mutation gate (a parent removal gates its tree, #4477). */
   mutationGateHeld?: boolean;
   /** Receives what the forced removal left behind, for the parent removal's result (#5143). */
@@ -460,6 +468,14 @@ interface InactiveTaskRemoval {
   readonly entry: { projectPath: string; workspace: WorkspaceConfigEntry };
   readonly target: { taskId: string; workspaceId: string; displayName?: string };
   readonly options: SubagentRemovalOptions | undefined;
+  /** Set under the "force" policy when the removal deletes unsaved work: reported on success. */
+  readonly forcedDeletion?: ForcedSubagentDeletion;
+}
+
+/** What a forced removal deleted, read under the locks right before the removal. */
+interface ForcedSubagentDeletion {
+  deletedWork: string;
+  paths: string[];
 }
 
 /** The removal under the patch operation lock, with the patch artifact read there. */
@@ -481,9 +497,65 @@ function reportInactiveTaskRemoval(
     removal.options?.onRemovalWarnings?.(result.warnings);
   return Ok(
     result.success
-      ? { status: "removed", action: "remove", ...removal.target }
+      ? {
+          status: "removed",
+          action: "remove",
+          ...removal.target,
+          ...(removal.forcedDeletion != null
+            ? {
+                deletedWork: removal.forcedDeletion.deletedWork,
+                ...(removal.forcedDeletion.paths.length > 0
+                  ? { paths: removal.forcedDeletion.paths }
+                  : {}),
+              }
+            : {}),
+        }
       : { status: "error", action: "remove", ...removal.target, error: result.error }
   );
+}
+
+/** What removing a sub-agent's checkout deletes: one finding, worded for the refusal and the report. */
+interface UnpreservedSubagentWorkDescription {
+  /** Before the removal: what it would delete, or that this could not be verified. */
+  summary: string;
+  /** After a forced removal: the same finding in the past tense. */
+  deletedSummary: string;
+  paths: string[];
+}
+
+/** The refusal task_remove returns by default, with the way to override it. */
+function lossyRefusalFields(lost: UnpreservedSubagentWorkDescription): {
+  error: string;
+  paths?: string[];
+} {
+  const guidance =
+    "By default this tool does not delete a sub-agent's unsaved work, and you must not delete that work yourself to get around it. " +
+    "If the user asked for cleanup, or the work is provably saved (pushed, merged, or in an applied patch), retry with force: true: it deletes this work and reports what it deleted. " +
+    "Otherwise leave the sub-agent in place and tell the user what it holds.";
+  return {
+    error: `${lost.summary} ${guidance}`,
+    ...(lost.paths.length > 0 ? { paths: lost.paths } : {}),
+  };
+}
+
+/**
+ * What the forced removal of this sub-agent deletes, for the removed result: the finding, the
+ * checkout and the branch. Every runtime that gets here forked the checkout with
+ * `newWorkspaceName: plan.workspaceName` (taskForkOptions), which each runtime's fork turns into
+ * the task branch of that name, and removal deletes the branch by that name. Project-dir
+ * checkouts have no branch to report but never reach this (they preserve the checkout).
+ */
+function describeForcedDeletion(
+  lost: UnpreservedSubagentWorkDescription,
+  ws: WorkspaceConfigEntry
+): ForcedSubagentDeletion {
+  const checkoutPath = coerceNonEmptyString(ws.path);
+  const branch = coerceNonEmptyString(ws.name);
+  const where = [
+    ...(checkoutPath != null ? [`Checkout: ${checkoutPath}.`] : []),
+    ...(branch != null ? [`Branch: ${branch}.`] : []),
+  ];
+  return { deletedWork: [lost.deletedSummary, ...where].join(" "), paths: lost.paths };
 }
 
 interface TaskParentAiMeta {
@@ -16866,7 +16938,7 @@ export class TaskService implements AgentTaskIntegration {
     // Only when removal deletes the checkout (see subagentRemovalPreservesCheckout): a preserved
     // checkout loses no files, and the sticky app marker would block its removal forever.
     const guardLiveWriters =
-      removal.options?.lossyWorkPolicy === "refuse" &&
+      removal.options?.lossyWorkPolicy != null &&
       !subagentRemovalPreservesCheckout(removal.entry.workspace);
     // The fresh background-process check first, as model-driven archive does: it refreshes exit
     // statuses (the hold's snapshot may still list an exited process) and sees crash orphans.
@@ -16913,29 +16985,34 @@ export class TaskService implements AgentTaskIntegration {
     removal: GuardedInactiveTaskRemoval
   ): Promise<Result<WorkspaceLifecycleResult, string>> {
     // Checked under the tree and patch-artifact locks, right before the tombstone and removal.
-    if (removal.options?.lossyWorkPolicy === "refuse") {
-      // An editor or native terminal opened earlier is not trackable, so it may still write.
-      if (
-        removal.guardLiveWriters &&
-        (await this.workspaceService.hasUntrackableExternalAppOpen(removal.taskId))
-      ) {
-        return Ok({
-          status: "error",
-          action: "remove",
-          ...removal.target,
-          error:
-            "An external editor or native terminal was opened in this sub-agent's checkout and may still write to it. Ask the user to remove the sub-agent.",
-        });
-      }
-      const refusal = await this.refuseLossySubagentRemoval(
-        removal.taskId,
-        removal.entry,
-        removal.patchArtifact ?? null
-      );
-      if (refusal != null)
-        return Ok({ status: "error", action: "remove", ...removal.target, ...refusal });
+    const policy = removal.options?.lossyWorkPolicy;
+    if (policy == null) return await this.refuseChangedWorkBeforeRemoval(removal);
+    // An editor or native terminal opened earlier is not trackable, so it may still write. The
+    // force policy keeps this guard: it is about work still changing, not about unsaved work.
+    if (
+      removal.guardLiveWriters &&
+      (await this.workspaceService.hasUntrackableExternalAppOpen(removal.taskId))
+    ) {
+      return Ok({
+        status: "error",
+        action: "remove",
+        ...removal.target,
+        error:
+          "An external editor or native terminal was opened in this sub-agent's checkout and may still write to it. Ask the user to remove the sub-agent.",
+      });
     }
-    return await this.refuseChangedWorkBeforeRemoval(removal);
+    const verdict = await this.settleLossySubagentRemoval(
+      removal.taskId,
+      removal.entry,
+      removal.patchArtifact ?? null,
+      policy
+    );
+    if (verdict?.kind === "refused") {
+      return Ok({ status: "error", action: "remove", ...removal.target, ...verdict.refusal });
+    }
+    return await this.refuseChangedWorkBeforeRemoval(
+      verdict?.kind === "forced" ? { ...removal, forcedDeletion: verdict.forcedDeletion } : removal
+    );
   }
 
   /** #5106: refuses when the work found under the locks differs from what the user confirmed. */
@@ -16989,29 +17066,31 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * #4723: a model's task_remove must not discard a child's unsaved work (the rule #3950 applies
-   * to peer archives). Returns the refusal fields, or null when removal loses nothing.
+   * #4723: a model's task_remove must not discard a child's unsaved work unless it set `force` (the
+   * rule #3950 applies to peer archives). Returns null when removal loses nothing, otherwise the
+   * refusal for the "refuse" policy or what the "force" policy deletes, for the removed result.
    */
-  private async refuseLossySubagentRemoval(
+  private async settleLossySubagentRemoval(
     taskId: string,
     entry: { projectPath: string; workspace: WorkspaceConfigEntry },
-    patchArtifact: SubagentGitPatchArtifact | null
-  ): Promise<{ error: string; paths?: string[] } | null> {
+    patchArtifact: SubagentGitPatchArtifact | null,
+    policy: LossyWorkPolicy
+  ): Promise<
+    | { kind: "refused"; refusal: ReturnType<typeof lossyRefusalFields> }
+    | { kind: "forced"; forcedDeletion: ForcedSubagentDeletion }
+    | null
+  > {
     const lost = await this.describeUnpreservedSubagentWork(taskId, entry, patchArtifact);
     if (lost == null) return null;
-    const guidance =
-      "This tool cannot approve losing a sub-agent's work, and you must not delete that work to get around it. " +
-      "Leave the sub-agent in place and tell the user what it holds; the user can save or clear it and ask you to retry, " +
-      "or remove the sub-agent themselves from the command palette (Remove Current Sub-agent or Remove Workspace), whose confirmation lists this work.";
-    return {
-      error: `${lost.summary} ${guidance}`,
-      ...(lost.paths.length > 0 ? { paths: lost.paths } : {}),
-    };
+    return policy === "refuse"
+      ? { kind: "refused", refusal: lossyRefusalFields(lost) }
+      : { kind: "forced", forcedDeletion: describeForcedDeletion(lost, entry.workspace) };
   }
 
   /**
    * What removing this sub-agent would permanently delete, or null when nothing. Shared by the
-   * model's refusal and the user's confirmation (#5106), so both report the same work.
+   * model's refusal, the model's forced removal report and the user's confirmation (#5106), so all
+   * report the same work.
    */
   private async describeUnpreservedSubagentWork(
     taskId: string,
@@ -17019,7 +17098,7 @@ export class TaskService implements AgentTaskIntegration {
     patchArtifact: SubagentGitPatchArtifact | null,
     /** Where the reader finds the paths: the model gets a `paths` field, the dialog a list. */
     pathsLocation = "listed in paths"
-  ): Promise<{ summary: string; paths: string[] } | null> {
+  ): Promise<UnpreservedSubagentWorkDescription | null> {
     const ws = entry.workspace;
     const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
     if (subagentRemovalPreservesCheckout(ws)) return null;
@@ -17062,6 +17141,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!check.success) {
       return {
         summary: `Cannot verify that removing this sub-agent keeps its work (${check.error}).`,
+        deletedSummary: `Its checkout could not be checked (${check.error}), so any unsaved work in it was deleted.`,
         paths: [],
       };
     }
@@ -17085,8 +17165,10 @@ export class TaskService implements AgentTaskIntegration {
         : []),
     ];
     assert(lost.length > 0, "a lossy removal result must name what would be lost");
+    const lostWork = lost.join(" and ");
     return {
-      summary: `Removing this sub-agent would permanently delete ${lost.join(" and ")}.`,
+      summary: `Removing this sub-agent would permanently delete ${lostWork}.`,
+      deletedSummary: `Deleted ${lostWork}.`,
       paths: work.paths,
     };
   }

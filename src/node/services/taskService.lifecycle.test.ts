@@ -38,6 +38,7 @@ import {
   removeWorkspaceFromTestConfig,
 } from "@/node/services/taskService.shared.testHarness";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { LossyWorkPolicy } from "@/node/services/taskService";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -351,9 +352,9 @@ describe("TaskService", () => {
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const { workspaceService } = createWorkspaceServiceMocks({ removeWhileTaskTreeLocked: remove });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const removeAsModel = (taskId: string) =>
+    const removeAsModel = (taskId: string, lossyWorkPolicy: LossyWorkPolicy = "refuse") =>
       taskService.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId, {
-        lossyWorkPolicy: "refuse",
+        lossyWorkPolicy,
       });
     return { config, projectPath, childPath, remove, taskService, workspaceService, removeAsModel };
   }
@@ -383,6 +384,83 @@ describe("TaskService", () => {
       )
     ).toEqual(Ok(undefined));
     expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  test("the force policy removes a child holding an uncommitted file and an uncaptured commit, and reports both", async () => {
+    const parentWorkspaceId = "parent-remove-forced";
+    const childTaskId = "child-remove-forced";
+    const { config, childPath, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    await fsPromises.writeFile(path.join(childPath, "committed.txt"), "committed\n");
+    execSync('git add committed.txt && git commit -m "uncaptured"', {
+      cwd: childPath,
+      stdio: "ignore",
+    });
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+
+    // The default policy still refuses this very checkout, so only the policy differs below.
+    expect(await removeAsModel(childTaskId, "refuse")).toMatchObject(Ok({ status: "error" }));
+    expect(remove).not.toHaveBeenCalled();
+
+    const forced = await removeAsModel(childTaskId, "force");
+    assert(forced.success && forced.data.status === "removed", "force must remove the child");
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(forced.data.paths).toEqual(["notes.txt"]);
+    // The report names every kind of work lost, and where it was: the files (listed in paths),
+    // the commit count, the checkout and the task branch.
+    expect(forced.data.deletedWork).toContain("1 commit(s) not captured");
+    expect(forced.data.deletedWork).toContain(childPath);
+    expect(forced.data.deletedWork).toContain("child");
+    expect(forced.data.error).toBeUndefined();
+    // A removed row now reads as already removed: the tombstone was written.
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        project.workspaces = project.workspaces.filter((row) => row.id !== childTaskId);
+      }
+      return cfg;
+    });
+    expect(await removeAsModel(childTaskId, "force")).toMatchObject(
+      Ok({ status: "already_removed" })
+    );
+  });
+
+  test("the force policy reports a checkout it could not check and still removes it", async () => {
+    const parentWorkspaceId = "parent-remove-forced-unverifiable";
+    const childTaskId = "child-remove-forced-unverifiable";
+    const { config, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    // Without a task base commit the commits cannot be counted: the check fails closed.
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const child = project.workspaces.find((row) => row.id === childTaskId);
+        if (child != null) delete child.taskBaseCommitSha;
+      }
+      return cfg;
+    });
+    const refusal = await removeAsModel(childTaskId, "refuse");
+    assert(refusal.success && refusal.data.status === "error", "an unverifiable child refuses");
+    expect(remove).not.toHaveBeenCalled();
+
+    const forced = await removeAsModel(childTaskId, "force");
+    assert(forced.success && forced.data.status === "removed", "force must remove the child");
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(forced.data.deletedWork).toContain("could not be checked");
+  });
+
+  test("the force policy reports nothing when the child holds no unsaved work", async () => {
+    const { remove, removeAsModel } = await createChildCheckoutHarness(
+      "parent-remove-forced-clean",
+      "child-remove-forced-clean"
+    );
+    const result = await removeAsModel("child-remove-forced-clean", "force");
+    assert(result.success && result.data.status === "removed", "a clean child is removed");
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(result.data.deletedWork).toBeUndefined();
+    expect(result.data.paths).toBeUndefined();
   });
 
   test("the user can preview and then confirm removing a sub-agent the model must not remove (#5106)", async () => {
@@ -534,56 +612,62 @@ describe("TaskService", () => {
   // removal. Model-driven removal takes the archive path's admission hold, refuses while such
   // activity exists, and keeps the hold (no new sends, bash, terminals or opens) through the
   // check and the removal.
-  test("model-driven task removal refuses live writers and holds admission through the check and removal", async () => {
-    const parentWorkspaceId = "parent-remove-live";
-    const childTaskId = "child-remove-live";
-    const { config, remove, workspaceService, removeAsModel } = await createChildCheckoutHarness(
-      parentWorkspaceId,
-      childTaskId
-    );
-    const events: string[] = [];
-    let liveActivity: string | undefined = "open terminal sessions";
-    const hold = spyOn(workspaceService, "acquirePreInterruptionArchiveHold").mockImplementation(
-      (workspaceId: string) => {
-        expect(workspaceId).toBe(childTaskId);
-        if (liveActivity !== undefined) return Err(`Workspace has live activity (${liveActivity})`);
-        events.push("hold");
-        return Ok({ [Symbol.dispose]: () => events.push("release") });
-      }
-    );
-    let editorOpen = false;
-    spyOn(workspaceService, "hasUntrackableExternalAppOpen").mockImplementation(() =>
-      Promise.resolve(editorOpen)
-    );
-    // The fresh check (exit statuses refreshed, crash orphans included) refuses before the hold.
-    let backgroundRunning = true;
-    spyOn(workspaceService, "hasRunningBackgroundBashProcesses").mockImplementation(() =>
-      Promise.resolve(backgroundRunning)
-    );
-    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
-    expect(hold).not.toHaveBeenCalled();
-    backgroundRunning = false;
-    remove.mockImplementation(() => {
-      events.push("remove");
-      return Promise.resolve(Ok(undefined));
-    });
+  // The force policy skips only the unsaved-work refusal: someone still working in the checkout
+  // is not unsaved work, so both policies keep these guards.
+  test.each<LossyWorkPolicy>(["refuse", "force"])(
+    "model-driven task removal with the %s policy refuses live writers and holds admission through the check and removal",
+    async (policy) => {
+      const parentWorkspaceId = "parent-remove-live";
+      const childTaskId = "child-remove-live";
+      const { config, remove, workspaceService, removeAsModel } = await createChildCheckoutHarness(
+        parentWorkspaceId,
+        childTaskId
+      );
+      const events: string[] = [];
+      let liveActivity: string | undefined = "open terminal sessions";
+      const hold = spyOn(workspaceService, "acquirePreInterruptionArchiveHold").mockImplementation(
+        (workspaceId: string) => {
+          expect(workspaceId).toBe(childTaskId);
+          if (liveActivity !== undefined)
+            return Err(`Workspace has live activity (${liveActivity})`);
+          events.push("hold");
+          return Ok({ [Symbol.dispose]: () => events.push("release") });
+        }
+      );
+      let editorOpen = false;
+      spyOn(workspaceService, "hasUntrackableExternalAppOpen").mockImplementation(() =>
+        Promise.resolve(editorOpen)
+      );
+      // The fresh check (exit statuses refreshed, crash orphans included) refuses before the hold.
+      let backgroundRunning = true;
+      spyOn(workspaceService, "hasRunningBackgroundBashProcesses").mockImplementation(() =>
+        Promise.resolve(backgroundRunning)
+      );
+      expect(await removeAsModel(childTaskId, policy)).toMatchObject(Ok({ status: "error" }));
+      expect(hold).not.toHaveBeenCalled();
+      backgroundRunning = false;
+      remove.mockImplementation(() => {
+        events.push("remove");
+        return Promise.resolve(Ok(undefined));
+      });
 
-    const refusal = await removeAsModel(childTaskId);
-    assert(refusal.success && refusal.data.status === "error", "live writers must refuse");
-    expect(refusal.data.error).toContain("open terminal sessions");
-    // An external editor opened earlier is untrackable: it refuses too, and releases the hold.
-    liveActivity = undefined;
-    editorOpen = true;
-    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
-    expect(events).toEqual(["hold", "release"]);
-    expect(remove).not.toHaveBeenCalled();
-    expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
+      const refusal = await removeAsModel(childTaskId, policy);
+      assert(refusal.success && refusal.data.status === "error", "live writers must refuse");
+      expect(refusal.data.error).toContain("open terminal sessions");
+      // An external editor opened earlier is untrackable: it refuses too, and releases the hold.
+      liveActivity = undefined;
+      editorOpen = true;
+      expect(await removeAsModel(childTaskId, policy)).toMatchObject(Ok({ status: "error" }));
+      expect(events).toEqual(["hold", "release"]);
+      expect(remove).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
 
-    editorOpen = false;
-    events.length = 0;
-    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "removed" }));
-    expect(events).toEqual(["hold", "remove", "release"]);
-  });
+      editorOpen = false;
+      events.length = 0;
+      expect(await removeAsModel(childTaskId, policy)).toMatchObject(Ok({ status: "removed" }));
+      expect(events).toEqual(["hold", "remove", "release"]);
+    }
+  );
 
   test("task removal preserves an inactive child while its patch artifact is pending", async () => {
     const config = await createTestConfig(rootDir);
