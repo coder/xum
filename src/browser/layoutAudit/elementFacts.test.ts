@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { selectorFor, textFragments, textTruncation } from "./elementFacts";
+import {
+  isRequiredControl,
+  isVisibleTextHolder,
+  nestedClippingBoundaries,
+  selectorFor,
+  textFragments,
+  textTruncation,
+} from "./elementFacts";
 import { createFakeLayoutPage } from "./fakeLayoutPage.testHarness";
 
 /** The selectors of every element matching `query`, in document order. */
@@ -96,5 +103,103 @@ describe("textFragments", () => {
   test("a descendant that switches visibility back on is read", () => {
     const inner = `<i data-css="visibility: hidden">${span("visibility: visible")}</i>`;
     expect(paragraphLines(inner)).toEqual([100, 500]);
+  });
+});
+
+describe("isRequiredControl", () => {
+  function isControl(html: string): boolean {
+    using fake = createFakeLayoutPage(html);
+    const el = fake.page.document.body.firstElementChild;
+    if (el === null) throw new Error("no element");
+    return isRequiredControl(el);
+  }
+
+  test.each([
+    "<button>Go</button>",
+    "<input>",
+    "<select></select>",
+    "<textarea></textarea>",
+    '<a href="#x">Go</a>',
+    "<summary>Go</summary>",
+    '<button role="menuitem">Go</button>',
+    '<button role="presentation">Go</button>',
+    '<div role="slider"></div>',
+    '<div role="MenuItemRadio"></div>',
+  ])("%s is a control", (html) => {
+    expect(isControl(html)).toBe(true);
+  });
+
+  test.each([
+    "<div>Go</div>",
+    "<a>Go</a>",
+    '<div role="presentation">Go</div>',
+    '<ul role="menu"></ul>',
+    '<div role="tablist"></div>',
+    "<input type='hidden'>",
+    "<button disabled>Go</button>",
+    '<button aria-disabled="true">Go</button>',
+    '<div role="button" aria-disabled="true">Go</div>',
+    '<div role="button" disabled>Go</div>',
+  ])("%s is not", (html) => {
+    expect(isControl(html)).toBe(false);
+  });
+});
+
+describe("isVisibleTextHolder", () => {
+  function holders(html: string): Record<string, boolean> {
+    using fake = createFakeLayoutPage(html);
+    const found: Record<string, boolean> = {};
+    for (const el of Array.from(fake.page.document.body.querySelectorAll("[id]"))) {
+      found[el.id] = isVisibleTextHolder(fake.page, el);
+    }
+    return found;
+  }
+
+  test("an element with no box paints its text only when it has display: contents", () => {
+    expect(
+      holders(`
+        <p id="contents" data-css="display: contents">x</p>
+        <p id="collapsed" data-box="0 0 100 0">x</p>
+        <p id="shown" data-box="0 0 100 20">x</p>
+        <p id="hidden-contents" data-css="display: contents; visibility: hidden">x</p>
+        <div data-css="display: none"><p id="in-hidden" data-css="display: contents">x</p></div>`)
+    ).toEqual({
+      contents: true,
+      collapsed: false,
+      shown: true,
+      "hidden-contents": false,
+      "in-hidden": false,
+    });
+  });
+});
+
+describe("nestedClippingBoundaries", () => {
+  const CLIPPER = 'data-box="0 0 60 20" data-css="overflow-x: hidden"';
+  function nested(html: string, tag = "p") {
+    using fake = createFakeLayoutPage(html);
+    const boundary = fake.page.document.querySelector(tag);
+    if (boundary === null) throw new Error(`no <${tag}>`);
+    return nestedClippingBoundaries(fake.page, boundary).map((clip) => ({
+      id: clip.boundary.el.id,
+      widths: clip.fragments.map((fragment) => fragment.width),
+    }));
+  }
+
+  test("lists each clipper in a text boundary with the lines it holds, and no other element", () => {
+    const html = `<p>Intro <span id="s" ${CLIPPER}><b data-lines="0 0 200 20">long</b></span>
+      <span id="plain" data-lines="0 0 30 20">tail</span></p>`;
+    expect(nested(html)).toEqual([{ id: "s", widths: [200] }]);
+  });
+
+  test("text that is not shown is no line of a clipper", () => {
+    const hidden = `<p><span id="s" ${CLIPPER}><b data-lines="0 0 40 20">short</b>
+      <i data-css="visibility: hidden" data-lines="0 0 400 20">hidden</i></span></p>`;
+    expect(nested(hidden)).toEqual([{ id: "s", widths: [40] }]);
+  });
+
+  test("an element that is no text boundary has none", () => {
+    expect(
+      nested(`<div><span id="s" ${CLIPPER} data-lines="0 0 200 20">long</span></div>`, "div")
+    ).toEqual([]);
   });
 });

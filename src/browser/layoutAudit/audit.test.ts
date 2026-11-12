@@ -732,9 +732,16 @@ describe("overlapping-text", () => {
     expect(audit(button)).toEqual([finding("overlapping-text", "button#go", "horizontal", 0)]);
   });
 
-  test("a line smaller than 16 square px is not sampled", () => {
-    const tiny = STAGE(COVER()).replace('data-lines="10 10 200 20"', 'data-lines="10 10 3 5"');
-    expect(audit(tiny)).toEqual([]);
+  test("a line of 16 square px is sampled, one of 15 is not", () => {
+    const line = (size: string) =>
+      STAGE(COVER()).replace('data-lines="10 10 200 20"', `data-lines="10 10 ${size}"`);
+    expect(audit(line("4 4"))).toEqual(COVERED);
+    expect(audit(line("3 5"))).toEqual([]);
+  });
+
+  test("text of 8 characters is long enough to read, 7 is not", () => {
+    expect(audit(STAGE(COVER(), "12345678"))).toEqual(COVERED);
+    expect(audit(STAGE(COVER(), "1234567"))).toEqual([]);
   });
 
   test("positioned text overlaps on purpose, and motion makes the sample unreliable", () => {

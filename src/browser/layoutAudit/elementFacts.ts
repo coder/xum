@@ -113,6 +113,7 @@ export function isRequiredControl(el: Element): boolean {
   // A native control stays one under any role (`<button role="menuitem">`): a role on an
   // element with no native behavior decides, and only an interactive one makes it a control.
   if (el.matches(NATIVE_CONTROL)) return true;
+  // mutation-equivalent: a missing role is null, and ?? and || both turn it into "" (no role matches)
   return CONTROL_ROLES.has((el.getAttribute("role") ?? "").toLowerCase());
 }
 
