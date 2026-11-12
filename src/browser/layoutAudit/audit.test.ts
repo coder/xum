@@ -391,6 +391,7 @@ describe("clipped-control", () => {
       "menuitemcheckbox",
       "menuitemradio",
       "option",
+      "scrollbar",
       "tab",
       "slider",
       "spinbutton",
@@ -410,8 +411,9 @@ describe("clipped-control", () => {
     ]);
   });
 
-  test("a container role is no control: its items are", () => {
-    for (const role of ["menu", "tablist", "listbox", "grid", "tree", "toolbar", "group"]) {
+  test("a container role, and a role that is not operable by itself, is no control", () => {
+    const roles = ["menu", "tablist", "listbox", "grid", "tree", "toolbar", "group"];
+    for (const role of [...roles, "gridcell", "separator", "progressbar", "tabpanel"]) {
       expect(audit(IN_BAR(`<div role="${role}" data-box="150 5 100 30">Buy</div>`))).toEqual([]);
     }
   });
@@ -988,7 +990,38 @@ describe("text in an element with no box (display: contents)", () => {
     expect(audit(inside("content-visibility: hidden"))).toEqual([]);
   });
 
-  test("any other element with no area holds text nobody sees: a collapsed panel is no finding", () => {
+  test("its ellipsis and line clamp cut and excuse nothing: a clipping ancestor still reports the line", () => {
+    const card = (axis: string, size: string, inner: string) =>
+      `<div id="card" data-box="${size}" data-css="overflow-${axis}: hidden">${inner}</div>`;
+    const ellipsis = (inner: string) => card("x", "0 0 200 40", inner);
+    const cutLine = CONTENTS("0 0 300 20", "text-overflow: ellipsis");
+    expect(audit(ellipsis(cutLine))).toEqual([
+      finding("clipped-text", "div#card", "horizontal", 100),
+    ]);
+    const clamp = card(
+      "y",
+      "0 0 200 22",
+      CONTENTS("0 0 180 20; 0 24 150 20", "webkit-line-clamp: 2")
+    );
+    expect(audit(clamp)).toEqual([finding("clipped-text", "div#card", "vertical", 22)]);
+    // A paragraph that has a box lays its text out, so its ellipsis is the author's cut.
+    const boxed = `<p data-box="0 0 300 20" data-css="text-overflow: ellipsis" data-lines="0 0 300 20">Paragraph text that paints</p>`;
+    expect(audit(ellipsis(boxed))).toEqual([]);
+  });
+
+  // The collapsed panel is a known false alarm (docs): a paragraph in it has a box and its text is
+  // cut by the panel. A paragraph with `display: contents` is judged the same way.
+  test("a paragraph in a collapsed panel is reported on the panel, with a box or without", () => {
+    const panel = (css: string, box: string) =>
+      `<div id="panel" data-box="0 0 200 0" data-css="overflow-y: hidden"><p data-box="${box}" data-css="${css}" data-lines="0 0 180 20">Collapsed panel text</p></div>`;
+    const reported = [finding("clipped-text", "div#panel", "vertical", 20)];
+    expect(audit(panel("", "0 0 200 20"))).toEqual(reported);
+    expect(audit(panel("display: contents", ""))).toEqual(reported);
+  });
+
+  // The fake sizes the inner paragraph by its `data-box`, so this one has no height. A browser
+  // gives a block paragraph in a collapsed panel its line height: see the test above.
+  test("an element whose box has no area is hidden, whatever its text and lines are", () => {
     const collapsed = `<div data-box="0 0 200 0" data-css="overflow-y: hidden"><p data-box="0 0 200 0" data-lines="0 0 180 20; 0 24 150 20">Collapsed text</p></div>`;
     expect(audit(collapsed)).toEqual([]);
   });

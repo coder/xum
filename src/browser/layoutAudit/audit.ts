@@ -306,18 +306,19 @@ function clipAtBoundary(
 function strongestTextClip(pass: AuditPass, el: Element): TextClip | null {
   const style = pass.page.style(el);
   const fragments = textFragments(pass.page, el);
-  const truncation = textTruncation(style);
-  // A `display: contents` element has no box to clip with, whatever its `overflow` says.
-  const own =
-    style.display === "contents"
-      ? null
-      : classifySevereTextOverflow({
-          fragments,
-          box: paddingBox(pass.page, el),
-          overflowX: style.overflowX,
-          overflowY: style.overflowY,
-          truncation,
-        });
+  // A `display: contents` element has no box: its `overflow` cannot clip, and its ellipsis and line
+  // clamp cannot cut or excuse a line, since no box lays the text out. None of them is read.
+  const boxless = style.display === "contents";
+  const truncation: TextTruncation = boxless ? "none" : textTruncation(style);
+  const own = boxless
+    ? null
+    : classifySevereTextOverflow({
+        fragments,
+        box: paddingBox(pass.page, el),
+        overflowX: style.overflowX,
+        overflowY: style.overflowY,
+        truncation,
+      });
   let clip: TextClip | null = own && { root: el, ...own };
   // A nested clipper's own ellipsis or line clamp is the author's cut of the text it holds, so it
   // is read from that clipper (`<span class="truncate">` in a paragraph is common).

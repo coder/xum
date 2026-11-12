@@ -19,8 +19,10 @@ const SEMANTIC_TEXT_BOUNDARY =
 const NATIVE_CONTROL = "button,input,select,textarea,a[href],summary";
 const CONTROL = `${NATIVE_CONTROL},[role]`;
 const DISABLED_CONTROL = "input[type='hidden'],[disabled],[aria-disabled='true']";
-// The ARIA widget roles that one element fills by itself. A container role (menu, tablist,
-// listbox, grid, tree) is no control: its items are.
+// The WAI-ARIA widget roles that a user operates on one element by itself. Left out: a container
+// role (menu, tablist, listbox, grid, tree: its items are the controls), `gridcell` (operated
+// through its grid, and every cell of a data grid carries it), `separator` (operable only as a
+// focusable splitter) and `progressbar` and `tabpanel` (not operable).
 const CONTROL_ROLES = new Set([
   "button",
   "link",
@@ -36,6 +38,7 @@ const CONTROL_ROLES = new Set([
   "menuitemcheckbox",
   "menuitemradio",
   "option",
+  "scrollbar",
   "tab",
   "treeitem",
 ]);

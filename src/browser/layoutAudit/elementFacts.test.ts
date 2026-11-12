@@ -125,6 +125,7 @@ describe("isRequiredControl", () => {
     '<button role="presentation">Go</button>',
     '<div role="slider"></div>',
     '<div role="MenuItemRadio"></div>',
+    '<div role="scrollbar"></div>',
   ])("%s is a control", (html) => {
     expect(isControl(html)).toBe(true);
   });
@@ -135,6 +136,8 @@ describe("isRequiredControl", () => {
     '<div role="presentation">Go</div>',
     '<ul role="menu"></ul>',
     '<div role="tablist"></div>',
+    '<div role="gridcell"></div>',
+    '<div role="separator"></div>',
     "<input type='hidden'>",
     "<button disabled>Go</button>",
     '<button aria-disabled="true">Go</button>',
