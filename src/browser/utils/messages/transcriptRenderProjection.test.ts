@@ -316,9 +316,9 @@ describe("work bundles (compact density)", () => {
     // next one started.
     const working = work([user("prompt"), update, first, latest], true);
     expect(working[1]).toBeUndefined();
-    expect(working.slice(2)).toEqual([
-      expect.objectContaining({ state: "live", visibleWhenFolded: false }),
-      expect.objectContaining({ state: "live", visibleWhenFolded: false }),
+    expect(working.slice(2).map((info) => [info?.state, info?.visibleWhenFolded])).toEqual([
+      ["live", false],
+      ["live", false],
     ]);
     expect(working[2]?.summary).toBe("Running the unit tests");
 
