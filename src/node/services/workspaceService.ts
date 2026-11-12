@@ -1056,6 +1056,27 @@ function remoteBoxArchiveBehavior(
 }
 
 /**
+ * Whether archiving removes what a live external editor or native terminal may still use: the
+ * checkout (a snapshot capture, or the "delete" behavior) or a stopped or deleted dedicated
+ * Coder workspace. Only a caller that does not forbid the "delete" behaviors reaches it under
+ * them: a forced archive.
+ */
+function archiveRemovesExternalAppEnvironment(args: {
+  needsSnapshotCapture: boolean;
+  remoteBoxBehavior: CoderWorkspaceArchiveBehavior;
+  worktreeArchiveBehavior: WorktreeArchiveBehavior;
+  metadata: WorkspaceMetadata | undefined;
+}): boolean {
+  return (
+    args.needsSnapshotCapture ||
+    args.remoteBoxBehavior !== "keep" ||
+    (args.worktreeArchiveBehavior === "delete" &&
+      args.metadata != null &&
+      archiveDeletesManagedWorktree(args.metadata, args.worktreeArchiveBehavior))
+  );
+}
+
+/**
  * Whether archiving takes the structural mutation gate (#4476): it deletes the managed checkout,
  * or stops or deletes a dedicated Coder workspace (#4871).
  */
@@ -11624,10 +11645,13 @@ export class WorkspaceService
    * sub-agents, it also lists the target's own lossy paths: the cascade archives the sub-agents
    * first, so the target's refusal at the sink would come after they were archived. The sink
    * rechecks each workspace, so a file created after this scan still refuses.
+   * allowCheckoutDeletion (a forced archive) lists the sub-agents whose checkout the "delete"
+   * policy deletes in deletedCheckouts instead of refusing.
    */
   async preflightArchiveCascade(
     workspaceId: string,
-    worktreeArchiveBehavior: WorktreeArchiveBehavior
+    worktreeArchiveBehavior: WorktreeArchiveBehavior,
+    options?: { allowCheckoutDeletion?: boolean }
   ): Promise<Result<ArchiveCascadePreflight>> {
     const descendants = this.listUnarchivedDescendants(workspaceId);
     if (descendants.length === 0) return Ok({ targetPaths: [], subagents: [] });
@@ -11635,15 +11659,14 @@ export class WorkspaceService
       return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
     }
     const subagents: ArchiveCascadePreflight["subagents"] = [];
+    const deletedCheckouts: NonNullable<ArchiveCascadePreflight["deletedCheckouts"]> = [];
     for (const descendant of descendants) {
       const label = `sub-agent ${descendant.title} (${descendant.workspaceId})`;
       if (worktreeArchiveBehavior === "delete") {
-        const metadata = await this.aiService.getWorkspaceMetadata(descendant.workspaceId);
-        if (!metadata.success) return Err(`Cannot archive ${label}: ${metadata.error}`);
-        if (archiveDeletesManagedWorktree(metadata.data, worktreeArchiveBehavior)) {
-          return Err(
-            `Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the checkout of ${label} without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".`
-          );
+        const deletion = await this.preflightCascadeCheckoutDeletion(descendant, label, options);
+        if (!deletion.success) return Err(deletion.error);
+        if (deletion.data) {
+          deletedCheckouts.push({ workspaceId: descendant.workspaceId, title: descendant.title });
         }
         continue;
       }
@@ -11666,7 +11689,28 @@ export class WorkspaceService
     return Ok({
       targetPaths: target.data.kind === "confirm-lossy-untracked-files" ? target.data.paths : [],
       subagents,
+      deletedCheckouts,
     });
+  }
+
+  /**
+   * Under the "delete" behavior: whether archiving this sub-agent deletes its checkout. It
+   * refuses when it would, unless the caller allows that deletion (a forced archive).
+   */
+  private async preflightCascadeCheckoutDeletion(
+    descendant: WorkspaceRemovalDescendant,
+    label: string,
+    options: { allowCheckoutDeletion?: boolean } | undefined
+  ): Promise<Result<boolean>> {
+    const metadata = await this.aiService.getWorkspaceMetadata(descendant.workspaceId);
+    if (!metadata.success) return Err(`Cannot archive ${label}: ${metadata.error}`);
+    if (!archiveDeletesManagedWorktree(metadata.data, "delete")) return Ok(false);
+    if (options?.allowCheckoutDeletion !== true) {
+      return Err(
+        `Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the checkout of ${label} without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".`
+      );
+    }
+    return Ok(true);
   }
 
   /**
@@ -12178,12 +12222,18 @@ export class WorkspaceService
       // the managed worktree — or stop a dedicated remote Coder workspace the user may still
       // be connected to through such an app — a model-driven archive must not pull the
       // environment out from under a user's live shell or editor. Mirrors the lifecycle
-      // caller's early refusal against the same pinned behavior reads. ("delete" for a
-      // dedicated Coder workspace is refused outright above, so non-"keep" here means stop.)
-      const stopsDedicatedCoderWorkspace = remoteBoxBehavior !== "keep";
+      // caller's early refusal against the same pinned behavior reads. Only a caller that does
+      // not forbid the "delete" behaviors (a forced archive) reaches this check under them, and
+      // a live external app must still stop it: non-"keep" for a dedicated Coder workspace
+      // means stop or delete.
       if (
         options?.refuseLiveUserActivity === true &&
-        (needsSnapshotCapture || stopsDedicatedCoderWorkspace) &&
+        archiveRemovesExternalAppEnvironment({
+          needsSnapshotCapture,
+          remoteBoxBehavior,
+          worktreeArchiveBehavior,
+          metadata: beforeArchiveMetadata,
+        }) &&
         (await this.hasUntrackableExternalAppOpen(workspaceId))
       ) {
         return Err(

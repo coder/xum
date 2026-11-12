@@ -22,6 +22,7 @@ import {
   type QueueCutAttributionSnapshot,
   type ResolvedWorkspaceAiSettings,
   type WorkspaceHost,
+  type ArchiveCascadePreflight,
   type WorkspaceLifecycleResult,
   type WorkspaceTurnHost,
   type WorkspaceTurnManagerHost,
@@ -98,6 +99,12 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
+import {
+  describeForcedArchiveLoss,
+  forcedArchiveAcknowledgements,
+  subagentPathLines,
+  type ForcedArchiveLoss,
+} from "@/node/services/forcedArchiveLoss";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -130,7 +137,10 @@ import { resolveWorkspaceTurnOwners } from "@/node/services/workspaceTurnOwners"
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
 import type { StreamErrorType } from "@/common/types/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
+import {
+  DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
+  type WorktreeArchiveBehavior,
+} from "@/common/config/worktreeArchiveBehavior";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
   type CoderWorkspaceArchiveBehavior,
@@ -208,22 +218,45 @@ interface WorkspaceLifecycleTarget {
 
 // Deliberately no untracked-file acknowledgement option (#3950): any path list returned to the
 // model can be echoed straight back, so a model-side "confirmation" is not user consent. Lossy
-// snapshot archives are refused here; the user archives through the UI confirmation dialog.
+// snapshot archives are refused here unless `force` is set: then the backend lists the files
+// itself, deletes exactly those and reports them. Otherwise the user archives through the UI
+// confirmation dialog.
 interface WorkspaceLifecycleOptions {
   interruptActive?: boolean;
+  /**
+   * Skip only the refusals that protect saved state: the "Delete checkout" and Coder "delete"
+   * policies and untracked files a snapshot archive drops (target and cascaded sub-agents).
+   * Live user activity, an untrackable external app, workflow runs, active turns and scope
+   * still refuse.
+   */
+  force?: boolean;
 }
 
 const LOSSY_SNAPSHOT_ARCHIVE_REFUSAL =
   "Archiving would permanently delete the untracked files listed in paths, because the snapshot archive behavior cannot preserve them. " +
-  "This tool cannot approve that loss, and you must not delete the files to get around it. " +
-  "Ask the user to archive this workspace manually; the archive dialog lists the files and asks for confirmation.";
+  "You must not delete the files yourself to get around it. " +
+  "Ask the user to archive this workspace manually (the archive dialog lists the files and asks for confirmation). " +
+  "If the user asked you to clean up, or the work is provably saved, archive again with force.";
+
+// A forced archive deletes only the files it listed: a different set at the sink means someone
+// wrote to the checkout since, so nothing was deleted for it.
+const FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL =
+  "The untracked files changed after force listed them, so the archive deleted nothing for this workspace. " +
+  "Sub-agents that were archived before this check stay archived, with the files force listed for them deleted. " +
+  "The files now listed in paths would be deleted; archive again with force to delete them.";
+
+const DELETE_CODER_WORKSPACE_ARCHIVE_REFUSAL =
+  'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop". If the user asked you to clean up, or the work is provably saved, archive again with force.';
+
+const DELETE_CHECKOUT_ARCHIVE_REFUSAL =
+  'Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the workspace checkout without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot". If the user asked you to clean up, or the work is provably saved, archive again with force.';
 
 interface ResolvedWorkspaceLifecycleTarget {
   action: WorkspaceLifecycleAction;
   taskId?: string;
   taskTitle?: string;
   workspaceId: string;
-  metadata: WorkspaceMetadata | null;
+  metadata: FrontendWorkspaceMetadata | null;
 }
 
 type ExecutionMirror = Pick<WorkspaceConfigEntry, "taskExecutionId" | "taskExecutionStatus">;
@@ -790,16 +823,63 @@ class LiveWorkspaceTurnRegistrations extends Map<string, LiveWorkspaceTurnRegist
 }
 
 /**
- * Why an agent-driven archive must refuse a permanent remote deletion: a dedicated Coder
- * workspace under the Coder "delete" policy, which unarchive cannot recreate.
+ * The archive policies of one lifecycle operation, read once and pinned through it: a settings
+ * flip cannot change what the operation deletes after its checks ran.
  */
-function remoteBoxDeletionRefusal(
-  isDedicatedCoderWorkspace: boolean,
-  coderArchiveBehavior: CoderWorkspaceArchiveBehavior
-): string | undefined {
-  if (isDedicatedCoderWorkspace && coderArchiveBehavior === "delete") {
-    return 'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".';
-  }
+interface ArchivePolicy {
+  worktreeArchiveBehavior: WorktreeArchiveBehavior;
+  coderArchiveBehavior: CoderWorkspaceArchiveBehavior;
+  /** The checkout the "delete" worktree behavior deletes, when it deletes the target's. */
+  deletedCheckoutPath: string | undefined;
+  /** The dedicated (Xum-created) Coder workspace the Coder "delete" behavior deletes. */
+  deletedCoderWorkspaceName: string | undefined;
+  /** The Coder behavior stops or deletes the target's dedicated Coder workspace. */
+  changesCoderWorkspace: boolean;
+}
+
+function dedicatedCoderWorkspaceName(runtimeConfig: RuntimeConfig): string | undefined {
+  if (!isSSHRuntime(runtimeConfig)) return undefined;
+  const coder = runtimeConfig.coder;
+  if (coder == null || coder.existingWorkspace === true) return undefined;
+  return coerceNonEmptyString(coder.workspaceName);
+}
+
+function readArchivePolicy(
+  config: ProjectsConfig,
+  metadata: FrontendWorkspaceMetadata
+): ArchivePolicy {
+  const worktreeArchiveBehavior =
+    config.worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR;
+  const coderArchiveBehavior =
+    config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR;
+  const coderWorkspaceName = dedicatedCoderWorkspaceName(metadata.runtimeConfig);
+  // The delete policy can only destroy work when the archive would actually run
+  // managed-worktree deletion: non-worktree runtimes (SSH/Coder, Docker, project-dir
+  // local) and isolation:none tasks (which point at an ancestor's checkout) are skipped
+  // by the worktree archive hook, so an unrelated global worktree setting must not make
+  // reversible archive unavailable for those targets. Mirrored at the sink.
+  const deletesCheckout =
+    worktreeArchiveBehavior === "delete" &&
+    isWorktreeRuntime(metadata.runtimeConfig) &&
+    metadata.taskIsolation !== "none";
+  return {
+    worktreeArchiveBehavior,
+    coderArchiveBehavior,
+    deletedCheckoutPath: deletesCheckout ? metadata.namedWorkspacePath : undefined,
+    deletedCoderWorkspaceName: coderArchiveBehavior === "delete" ? coderWorkspaceName : undefined,
+    changesCoderWorkspace: coderWorkspaceName != null && coderArchiveBehavior !== "keep",
+  };
+}
+
+/**
+ * Why an agent-driven archive must refuse a permanent deletion: the checkout under the "delete"
+ * worktree policy, or a dedicated Coder workspace under the Coder "delete" policy, which
+ * unarchive cannot recreate. A forced archive accepts both and reports them.
+ */
+function archivePolicyRefusal(policy: ArchivePolicy, force: boolean): string | undefined {
+  if (force) return undefined;
+  if (policy.deletedCheckoutPath != null) return DELETE_CHECKOUT_ARCHIVE_REFUSAL;
+  if (policy.deletedCoderWorkspaceName != null) return DELETE_CODER_WORKSPACE_ARCHIVE_REFUSAL;
   return undefined;
 }
 
@@ -4181,80 +4261,47 @@ export class WorkspaceTurnManager {
           }
 
           // Model-facing safety: with the "delete" worktree archive behavior, archiving runs
-          // `git worktree remove --force` with no snapshot and no user confirmation, so an
-          // agent-driven archive could erase uncommitted work. Fail closed and route that
-          // policy through user-mediated archive instead. This early check gives a friendly
-          // refusal before any turn interruption; workspaceService.archive re-enforces it at
-          // the sink (forbidWorktreeCheckoutDeletion) against the same read that drives the
-          // snapshot/deletion decisions, closing the settings-flip race.
-          // This single read is pinned through the whole operation: it drives the delete refusal,
-          // the mutation-sensitivity check, the preflight, and (via worktreeArchiveBehaviorOverride)
+          // `git worktree remove --force` with no snapshot and no user confirmation, and the
+          // Coder "delete" behavior permanently deletes a dedicated remote Coder workspace that
+          // unarchive cannot recreate, so an agent-driven archive could erase uncommitted work.
+          // Fail closed and route those policies through user-mediated archive instead, unless
+          // the caller set force. This early check gives a friendly refusal before any turn
+          // interruption; workspaceService.archive re-enforces it at the sink
+          // (forbidWorktreeCheckoutDeletion, forbidCoderWorkspaceDeletion) against the same
+          // read that drives the snapshot/deletion decisions, closing the settings-flip race.
+          // This single read is pinned through the whole operation: it drives the refusals,
+          // the mutation-sensitivity check, the preflight, and (via the behavior overrides)
           // every snapshot/deletion decision at the sink, so a concurrent settings flip cannot
           // change archive eligibility after turns were interrupted.
-          const worktreeArchiveBehavior =
-            this.config.loadConfigOrDefault().worktreeArchiveBehavior ??
-            DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR;
-          // The delete policy can only destroy work when the archive would actually run
-          // managed-worktree deletion: non-worktree runtimes (SSH/Coder, Docker, project-dir
-          // local) and isolation:none tasks (which point at an ancestor's checkout) are skipped
-          // by the worktree archive hook, so an unrelated global worktree setting must not make
-          // reversible archive unavailable for those targets. Mirrored at the sink.
-          const runsManagedWorktreeDeletion =
-            isWorktreeRuntime(resolved.metadata.runtimeConfig) &&
-            resolved.metadata.taskIsolation !== "none";
-          if (worktreeArchiveBehavior === "delete" && runsManagedWorktreeDeletion) {
+          const force = options.force === true;
+          const policy = readArchivePolicy(this.config.loadConfigOrDefault(), resolved.metadata);
+          const { worktreeArchiveBehavior } = policy;
+          const policyRefusal = archivePolicyRefusal(policy, force);
+          if (policyRefusal != null) {
             return Ok({
               status: "error",
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
-              error:
-                'Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the workspace checkout without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".',
-            });
-          }
-
-          // Same fail-closed rule for the Coder policy: under "delete", the before-archive hook
-          // permanently deletes a dedicated (mux-created) remote Coder workspace and unarchive
-          // cannot recreate it, so a nominally reversible agent-driven archive must refuse.
-          // Re-enforced at the sink (forbidCoderWorkspaceDeletion) against the same read passed
-          // to the hook, closing the settings-flip race.
-          const targetRuntimeConfig = resolved.metadata.runtimeConfig;
-          const coderArchiveBehavior =
-            this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
-            DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-          const isDedicatedCoderWorkspace =
-            isSSHRuntime(targetRuntimeConfig) &&
-            targetRuntimeConfig.coder != null &&
-            targetRuntimeConfig.coder.existingWorkspace !== true &&
-            (targetRuntimeConfig.coder.workspaceName?.trim() ?? "") !== "";
-          const remoteDeletion = remoteBoxDeletionRefusal(
-            isDedicatedCoderWorkspace,
-            coderArchiveBehavior
-          );
-          if (remoteDeletion) {
-            return Ok({
-              status: "error",
-              action: "archive",
-              ...this.lifecycleTargetFields(resolved),
-              error: remoteDeletion,
+              error: policyRefusal,
             });
           }
 
           // Native terminals and external editors spawn detached apps that never register
           // session activity and whose lifetime cannot be tracked (they daemonize or are deep
-          // links, so process exit is meaningless). When the snapshot policy would remove this
-          // managed worktree's checkout — or the pinned Coder policy would stop the dedicated
-          // remote workspace the user's shell/editor may still be connected to ("delete" is
-          // refused above, so non-"keep" here means stop) — archiving could pull the
-          // environment out from under the user's live app — fail closed and route through
-          // user-mediated archive. Sticky (durable markers) because closure is undetectable.
-          // Re-enforced at the sink.
+          // links, so process exit is meaningless). When the snapshot or (forced) delete policy
+          // would remove this managed worktree's checkout — or the pinned Coder policy would
+          // stop or delete the dedicated remote workspace the user's shell/editor may still be
+          // connected to — archiving could pull the environment out from under the user's live
+          // app — fail closed and route through user-mediated archive, force or not. Sticky
+          // (durable markers) because closure is undetectable. Re-enforced at the sink.
           const untrackableAppArchiveHazard =
             this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
               resolved.workspaceId,
               worktreeArchiveBehavior,
               resolved.metadata
             ) ||
-            (isDedicatedCoderWorkspace && coderArchiveBehavior !== "keep");
+            policy.deletedCheckoutPath != null ||
+            policy.changesCoderWorkspace;
           if (
             untrackableAppArchiveHazard &&
             (await this.workspaceService.hasUntrackableExternalAppOpen(resolved.workspaceId))
@@ -4378,41 +4425,12 @@ export class WorkspaceTurnManager {
           // #4930: the archive cascades over the target's unarchived sub-agents. Refuse before
           // anything is interrupted or archived when a sub-agent is active, the delete policy
           // would delete its checkout, or its (or the target's) snapshot archive would lose
-          // untracked files: no tool acknowledgement can approve that loss (#3950), so list the
-          // paths instead.
-          const cascadePreflight = await this.workspaceService.preflightArchiveCascade(
-            resolved.workspaceId,
-            worktreeArchiveBehavior
-          );
-          if (!cascadePreflight.success) {
-            return Ok({
-              status: "error",
-              action: "archive",
-              ...this.lifecycleTargetFields(resolved),
-              error: cascadePreflight.error,
-            });
-          }
-          const { subagents, targetPaths } = cascadePreflight.data;
-          if (subagents.length > 0) {
-            return Ok({
-              status: "error",
-              action: "archive",
-              ...this.lifecycleTargetFields(resolved),
-              // Prefixed with the sub-agent's workspace ID: each path is relative to its checkout.
-              paths: subagents.flatMap((subagent) =>
-                subagent.paths.map((p) => `${subagent.workspaceId}: ${p}`)
-              ),
-              error:
-                `Archiving this workspace also archives its sub-agents, and that would permanently delete the untracked files listed in paths from sub-agent(s) ${subagents
-                  .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
-                  .join(", ")}, because the snapshot archive behavior cannot preserve them. ` +
-                "This tool cannot approve that loss, and you must not delete the files to get around it. " +
-                "Ask the user to archive this workspace manually; the archive dialog lists the sub-agents' files and asks for confirmation.",
-            });
-          }
-          if (targetPaths.length > 0) {
-            return Ok(this.lossySnapshotArchiveRefusal(resolved, targetPaths));
-          }
+          // untracked files: no caller-supplied acknowledgement can approve that loss (#3950),
+          // so list the paths instead. A forced archive lists them itself and deletes exactly
+          // those at the sink.
+          const loss = await this.preflightArchiveLoss(resolved, policy, force);
+          if ("refusal" in loss) return Ok(loss.refusal);
+          const forcedLoss = loss.forcedLoss;
 
           // Held (when interrupting) from before the first turn interruption through the
           // archive sink so user activity cannot be admitted between turn destruction and
@@ -4483,7 +4501,7 @@ export class WorkspaceTurnManager {
               // preflightArchive cannot exercise that hook without side effects, and interrupted
               // streams cannot be restored. Refuse to interrupt; the caller stops the turns
               // explicitly, after which a failed archive is retryable without further loss.
-              if (isDedicatedCoderWorkspace && coderArchiveBehavior !== "keep") {
+              if (policy.changesCoderWorkspace) {
                 return Ok({
                   status: "active",
                   action: "archive",
@@ -4508,7 +4526,7 @@ export class WorkspaceTurnManager {
                   error: preflight.error,
                 });
               }
-              if (preflight.data.kind === "confirm-lossy-untracked-files") {
+              if (!force && preflight.data.kind === "confirm-lossy-untracked-files") {
                 return Ok(this.lossySnapshotArchiveRefusal(resolved, preflight.data.paths));
               }
               // Arm the sink's admission gate BEFORE destroying anything: in-flight user
@@ -4576,42 +4594,7 @@ export class WorkspaceTurnManager {
               }
             }
 
-            // WhileTaskTreeLocked: the tree lock is already held for the whole lifecycle operation
-            // (see the lock-order comment above), so the plain archive() wrapper would self-deadlock.
-            const result = await this.workspaceService.archiveWhileTaskTreeLocked(
-              resolved.workspaceId,
-              // Never an acknowledgement (#3950): with none, the sink's own rechecks refuse any
-              // lossy untracked files, including ones that appeared after the preflight above.
-              undefined,
-              // Enforced at the sink: forbidWorktreeCheckoutDeletion / forbidCoderWorkspaceDeletion
-              // close the settings-flip races the early behavior checks above cannot cover,
-              // refuseLiveUserActivity fails closed (and holds turn admission) if user activity was
-              // admitted after the earlier live-activity snapshot, and the behavior override pins
-              // every sink decision to the same read that drove interruption eligibility.
-              {
-                forbidWorktreeCheckoutDeletion: true,
-                forbidCoderWorkspaceDeletion: true,
-                refuseLiveUserActivity: true,
-                worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
-                coderWorkspaceArchiveBehaviorOverride: coderArchiveBehavior,
-              }
-            );
-            if (!result.success) {
-              return Ok({
-                status: "error",
-                action: "archive",
-                ...this.lifecycleTargetFields(resolved),
-                error: result.error,
-              });
-            }
-            if (result.data.kind === "confirm-lossy-untracked-files") {
-              return Ok(this.lossySnapshotArchiveRefusal(resolved, result.data.paths));
-            }
-            return Ok({
-              status: "archived",
-              action: "archive",
-              ...this.lifecycleTargetFields(resolved),
-            });
+            return Ok(await this.archiveAtSink(resolved, policy, forcedLoss));
           } finally {
             preInterruptionHold?.[Symbol.dispose]();
           }
@@ -4786,7 +4769,8 @@ export class WorkspaceTurnManager {
   // plus the lossy paths so the model can tell the user which files block the archive.
   private lossySnapshotArchiveRefusal(
     resolved: ResolvedWorkspaceLifecycleTarget,
-    paths: string[]
+    paths: string[],
+    forced = false
   ): WorkspaceLifecycleResult {
     assert(paths.length > 0, "a lossy snapshot archive refusal must list the untracked paths");
     return {
@@ -4794,7 +4778,133 @@ export class WorkspaceTurnManager {
       action: "archive",
       ...this.lifecycleTargetFields(resolved),
       paths,
-      error: LOSSY_SNAPSHOT_ARCHIVE_REFUSAL,
+      error: forced ? FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL,
+    };
+  }
+
+  private archiveErrorResult(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    error: string
+  ): WorkspaceLifecycleResult {
+    return { status: "error", action: "archive", ...this.lifecycleTargetFields(resolved), error };
+  }
+
+  /** The refusal for the untracked files the archive's snapshots of the sub-agent tree would lose. */
+  private cascadeLossRefusal(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    cascade: ArchiveCascadePreflight
+  ): WorkspaceLifecycleResult | null {
+    if (cascade.subagents.length > 0) {
+      return {
+        status: "error",
+        action: "archive",
+        ...this.lifecycleTargetFields(resolved),
+        paths: subagentPathLines(cascade.subagents),
+        error:
+          `Archiving this workspace also archives its sub-agents, and that would permanently delete the untracked files listed in paths from sub-agent(s) ${cascade.subagents
+            .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
+            .join(", ")}, because the snapshot archive behavior cannot preserve them. ` +
+          "You must not delete the files yourself to get around it. " +
+          "Ask the user to archive this workspace manually (the archive dialog lists the sub-agents' files and asks for confirmation). " +
+          "If the user asked you to clean up, or the work is provably saved, archive again with force.",
+      };
+    }
+    if (cascade.targetPaths.length > 0) {
+      return this.lossySnapshotArchiveRefusal(resolved, cascade.targetPaths);
+    }
+    return null;
+  }
+
+  /**
+   * What the archive would delete that its refusals protect (#4930). Without force it returns
+   * the refusal for the first such loss. With force it returns the loss to delete and report,
+   * listed here under the lifecycle locks: the sink deletes only what this lists.
+   */
+  private async preflightArchiveLoss(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    policy: ArchivePolicy,
+    force: boolean
+  ): Promise<
+    { refusal: WorkspaceLifecycleResult } | { forcedLoss: ForcedArchiveLoss | undefined }
+  > {
+    const cascade = await this.workspaceService.preflightArchiveCascade(
+      resolved.workspaceId,
+      policy.worktreeArchiveBehavior,
+      { allowCheckoutDeletion: force }
+    );
+    if (!cascade.success) return { refusal: this.archiveErrorResult(resolved, cascade.error) };
+    if (!force) {
+      const refusal = this.cascadeLossRefusal(resolved, cascade.data);
+      return refusal != null ? { refusal } : { forcedLoss: undefined };
+    }
+    return await this.listForcedArchiveLoss(resolved, policy, cascade.data);
+  }
+
+  private async listForcedArchiveLoss(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    policy: ArchivePolicy,
+    cascade: ArchiveCascadePreflight
+  ): Promise<{ refusal: WorkspaceLifecycleResult } | { forcedLoss: ForcedArchiveLoss }> {
+    // The cascade lists the target's own files only when the target has sub-agents.
+    const target = await this.workspaceService.preflightArchive(resolved.workspaceId, {
+      worktreeArchiveBehaviorOverride: policy.worktreeArchiveBehavior,
+    });
+    if (!target.success) return { refusal: this.archiveErrorResult(resolved, target.error) };
+    return {
+      forcedLoss: {
+        targetPaths: target.data.kind === "confirm-lossy-untracked-files" ? target.data.paths : [],
+        subagents: cascade.subagents,
+        deletedSubagentCheckouts: cascade.deletedCheckouts ?? [],
+        deletedCheckoutPath: policy.deletedCheckoutPath,
+        deletedCoderWorkspaceName: policy.deletedCoderWorkspaceName,
+      },
+    };
+  }
+
+  /**
+   * The archive sink, called with the tree lock already held for the whole lifecycle operation
+   * (see the lock-order comment in archiveOwnedWorkspaceTurnWorkspace): the plain archive()
+   * wrapper would self-deadlock.
+   */
+  private async archiveAtSink(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    policy: ArchivePolicy,
+    forcedLoss: ForcedArchiveLoss | undefined
+  ): Promise<WorkspaceLifecycleResult> {
+    const forced = forcedLoss != null;
+    const acknowledged = forcedLoss != null ? forcedArchiveAcknowledgements(forcedLoss) : undefined;
+    const result = await this.workspaceService.archiveWhileTaskTreeLocked(
+      resolved.workspaceId,
+      // Never a caller-supplied acknowledgement (#3950). Without force there is none, so the
+      // sink's own rechecks refuse any lossy untracked files, including ones that appeared after
+      // the preflight. With force it is exactly the list the preflight made under the locks: a
+      // changed set refuses instead of deleting files that nobody listed.
+      acknowledged?.targetPaths,
+      // Enforced at the sink: forbidWorktreeCheckoutDeletion / forbidCoderWorkspaceDeletion
+      // close the settings-flip races the early behavior checks cannot cover (a forced archive
+      // accepts both), refuseLiveUserActivity fails closed (and holds turn admission) if user
+      // activity was admitted after the earlier live-activity snapshot, and the behavior
+      // overrides pin every sink decision to the same read that drove interruption eligibility.
+      {
+        forbidWorktreeCheckoutDeletion: !forced,
+        forbidCoderWorkspaceDeletion: !forced,
+        refuseLiveUserActivity: true,
+        worktreeArchiveBehaviorOverride: policy.worktreeArchiveBehavior,
+        coderWorkspaceArchiveBehaviorOverride: policy.coderArchiveBehavior,
+        ...(acknowledged?.subagentPaths != null
+          ? { acknowledgedSubagentUntrackedPaths: acknowledged.subagentPaths }
+          : {}),
+      }
+    );
+    if (!result.success) return this.archiveErrorResult(resolved, result.error);
+    if (result.data.kind === "confirm-lossy-untracked-files") {
+      return this.lossySnapshotArchiveRefusal(resolved, result.data.paths, forced);
+    }
+    return {
+      status: "archived",
+      action: "archive",
+      ...this.lifecycleTargetFields(resolved),
+      ...(forcedLoss != null ? describeForcedArchiveLoss(forcedLoss) : {}),
     };
   }
 
@@ -4818,7 +4928,7 @@ export class WorkspaceTurnManager {
 
   private async findWorkspaceLifecycleMetadata(
     workspaceId: string
-  ): Promise<WorkspaceMetadata | null> {
+  ): Promise<FrontendWorkspaceMetadata | null> {
     assert(
       workspaceId.trim().length > 0,
       "workspace lifecycle metadata lookup requires workspaceId"

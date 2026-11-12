@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
 import { execFileSync } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
@@ -223,13 +223,14 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
   // keeping its lossy-removal contract: it refuses with the at-risk paths, never with an ack.
   const ownerId = "owner-archive";
 
-  async function modelArchiveRoot() {
+  async function modelArchiveRoot(options?: { force?: boolean }) {
     await workspaceTurnManagerInternals(a.taskService).taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(ownerId, rootId, "wst_root", "completed", { createdWorkspace: true })
     );
     return await workspaceTurnManagerFor(a.taskService).archiveOwnedWorkspaceTurnWorkspace(
       ownerId,
-      { workspaceId: rootId }
+      { workspaceId: rootId },
+      options
     );
   }
 
@@ -297,6 +298,136 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     for (const id of allIds) {
       expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
     }
+  });
+
+  // `force` lets the model-facing archive delete what it otherwise refuses to lose. It lists
+  // the files itself under the locks, deletes exactly those and reports them.
+  async function useSnapshotArchive(): Promise<void> {
+    await setArchiveBehavior("snapshot");
+    a.workspaceService.setWorktreeArchiveSnapshotService(
+      new WorktreeArchiveSnapshotService(a.config)
+    );
+  }
+
+  test("a forced model-facing snapshot archive deletes the parent's and the sub-agent's untracked files and reports them", async () => {
+    await useSnapshotArchive();
+    await fsPromises.writeFile(path.join(checkouts.get(rootId)!, "notes.txt"), "unsaved\n");
+    await fsPromises.writeFile(path.join(checkouts.get(grandchildId)!, "notes.txt"), "unsaved\n");
+
+    const result = await modelArchiveRoot({ force: true });
+
+    assert(result.success, "the lifecycle archive returns a result");
+    expect(result.data.status).toBe("archived");
+    expect(result.data.paths).toEqual(["notes.txt", `${grandchildId}: notes.txt`]);
+    expect(result.data.note).toBeDefined();
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(b.config, id)?.archivedAt).toBeDefined();
+      // The snapshot archive removes the checkout: the reported files are really gone.
+      expect(await exists(path.join(checkouts.get(id)!, "notes.txt"))).toBe(false);
+    }
+    // Two real snapshot captures: slower than the 5 s default on a loaded host.
+  }, 60_000);
+
+  test("a forced model-facing archive does not delete a sub-agent file that appeared after it listed the files", async () => {
+    await useSnapshotArchive();
+    const checkout = checkouts.get(grandchildId)!;
+    await fsPromises.writeFile(path.join(checkout, "notes.txt"), "unsaved\n");
+    // The file lands right after the target's own listing, which follows the sub-agents'.
+    const preflightArchive = a.workspaceService.preflightArchive.bind(a.workspaceService);
+    let wroteLateFile = false;
+    spyOn(a.workspaceService, "preflightArchive").mockImplementation(async (id, options) => {
+      const listed = await preflightArchive(id, options);
+      if (id === rootId && !wroteLateFile) {
+        wroteLateFile = true;
+        await fsPromises.writeFile(path.join(checkout, "late.txt"), "written after the listing\n");
+      }
+      return listed;
+    });
+
+    const result = await modelArchiveRoot({ force: true });
+
+    assert(result.success, "the lifecycle archive returns a result");
+    expect(result.data.status).toBe("error");
+    expect(result.data.error).toContain(grandchildId);
+    expect(wroteLateFile).toBe(true);
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
+      expect(await exists(checkouts.get(id)!)).toBe(true);
+    }
+    expect(await exists(path.join(checkout, "late.txt"))).toBe(true);
+    expect(await exists(path.join(checkout, "notes.txt"))).toBe(true);
+  });
+
+  test("a forced model-facing archive under the delete policy deletes the tree's checkouts and names them, while an unforced one refuses", async () => {
+    await setArchiveBehavior("delete");
+
+    const unforced = await modelArchiveRoot();
+
+    assert(unforced.success, "the lifecycle archive returns a result");
+    expect(unforced.data.status).toBe("error");
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
+      expect(await exists(checkouts.get(id)!)).toBe(true);
+    }
+
+    const forced = await modelArchiveRoot({ force: true });
+
+    assert(forced.success, "the lifecycle archive returns a result");
+    expect(forced.data.status).toBe("archived");
+    expect(forced.data.note).toContain(checkouts.get(rootId)!);
+    expect(forced.data.note).toContain(childId);
+    expect(forced.data.note).toContain(grandchildId);
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(b.config, id)?.archivedAt).toBeDefined();
+      expect(await exists(checkouts.get(id)!)).toBe(false);
+    }
+  });
+
+  test("a forced archive under the delete policy still refuses while an external editor or native terminal is open on a sub-agent", async () => {
+    await setArchiveBehavior("delete");
+    spyOn(a.workspaceService, "hasUntrackableExternalAppOpen").mockImplementation((id) =>
+      Promise.resolve(id === grandchildId)
+    );
+
+    const result = await modelArchiveRoot({ force: true });
+
+    assert(result.success, "the lifecycle archive returns a result");
+    expect(result.data.status).toBe("error");
+    expect(result.data.error).toContain("native terminal or external editor");
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
+      expect(await exists(checkouts.get(id)!)).toBe(true);
+    }
+  });
+
+  test("the sink refuses a delete-policy archive that a forcing caller allowed while an external app is open", async () => {
+    await setArchiveBehavior("delete");
+    spyOn(a.workspaceService, "hasUntrackableExternalAppOpen").mockResolvedValue(true);
+
+    // The caller's own early check is bypassed here: only the sink's recheck stands.
+    const result = await a.workspaceService.archiveWhileTaskTreeLocked(grandchildId, undefined, {
+      forbidWorktreeCheckoutDeletion: false,
+      refuseLiveUserActivity: true,
+      worktreeArchiveBehaviorOverride: "delete",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.success ? "" : result.error).toContain("native terminal or external editor");
+    expect(findWorkspaceInConfig(a.config, grandchildId)?.archivedAt).toBeUndefined();
+    expect(await exists(checkouts.get(grandchildId)!)).toBe(true);
+  });
+
+  test("the cascade preflight lists the sub-agent checkouts the delete policy would delete only for a caller that allows it", async () => {
+    const refused = await a.workspaceService.preflightArchiveCascade(rootId, "delete");
+    const allowed = await a.workspaceService.preflightArchiveCascade(rootId, "delete", {
+      allowCheckoutDeletion: true,
+    });
+
+    expect(refused.success).toBe(false);
+    assert(allowed.success, "an allowed cascade preflight lists the checkouts");
+    expect(allowed.data.deletedCheckouts?.map((subagent) => subagent.workspaceId).sort()).toEqual(
+      [childId, grandchildId].sort()
+    );
   });
 
   // The user's archive confirms a sub-agent's lossy files in the parent's dialog instead of

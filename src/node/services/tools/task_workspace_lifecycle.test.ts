@@ -36,13 +36,70 @@ describe("task_workspace_lifecycle tool", () => {
       )
     );
 
+    // Force is opt-in: leaving it out must reach the manager as not forced.
     expect(archiveOwnedWorkspaceTurnWorkspace).toHaveBeenCalledWith(
       "root-workspace",
       { workspaceId: "child-a" },
-      { interruptActive: true }
+      { interruptActive: true, force: false }
     );
     expect(result).toEqual({
       results: [{ status: "archived", action: "archive", workspaceId: "child-a" }],
+    });
+  });
+
+  it("passes force to archive only when it is exactly true, and reports what the archive deleted", async () => {
+    using tempDir = new TestTempDir("test-task-workspace-lifecycle-force");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+
+    const archiveOwnedWorkspaceTurnWorkspace = mock(
+      (
+        _owner: string,
+        _target: { workspaceId?: string },
+        _options?: { interruptActive?: boolean; force?: boolean }
+      ): Promise<Result<WorkspaceLifecycleResult, string>> =>
+        Promise.resolve(
+          Ok({
+            status: "archived" as const,
+            action: "archive" as const,
+            workspaceId: "child-a",
+            paths: ["scratch.txt"],
+            note: "Force deleted the untracked files listed in paths.",
+          })
+        )
+    );
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      archiveOwnedWorkspaceTurnWorkspace,
+    });
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
+
+    const forced: unknown = await Promise.resolve(
+      tool.execute!(
+        { action: "archive", targets: [{ workspaceId: "child-a" }], force: true },
+        mockToolCallOptions
+      )
+    );
+    await Promise.resolve(
+      tool.execute!(
+        { action: "archive", targets: [{ workspaceId: "child-a" }], force: null },
+        mockToolCallOptions
+      )
+    );
+
+    expect(archiveOwnedWorkspaceTurnWorkspace.mock.calls.map((call) => call[2])).toEqual([
+      { interruptActive: false, force: true },
+      { interruptActive: false, force: false },
+    ]);
+    // The archived row keeps the deletion report: the model and the card both read it.
+    expect(forced).toEqual({
+      results: [
+        {
+          status: "archived",
+          action: "archive",
+          workspaceId: "child-a",
+          paths: ["scratch.txt"],
+          note: "Force deleted the untracked files listed in paths.",
+        },
+      ],
     });
   });
 
@@ -97,10 +154,15 @@ describe("task_workspace_lifecycle tool", () => {
     });
     const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
 
-    // interrupt_active applies to archive only; unarchive must never receive it.
+    // interrupt_active and force apply to archive only; unarchive must never receive them.
     const result: unknown = await Promise.resolve(
       tool.execute!(
-        { action: "unarchive", targets: [{ taskId: "wst_child" }], interrupt_active: true },
+        {
+          action: "unarchive",
+          targets: [{ taskId: "wst_child" }],
+          interrupt_active: true,
+          force: true,
+        },
         mockToolCallOptions
       )
     );

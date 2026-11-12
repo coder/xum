@@ -141,6 +141,47 @@ describe("WorkspaceLifecycleToolCall", () => {
     expect(view.queryByText("notes/draft.md")).not.toBeNull();
   });
 
+  test("an archived row shows the files a forced archive deleted and what else went", () => {
+    const view = renderWithProviders(
+      <WorkspaceLifecycleToolCall
+        args={{
+          action: "archive",
+          targets: [{ workspaceId: "ws-forced" }, { workspaceId: "ws-listed" }],
+          force: true,
+        }}
+        status="completed"
+        defaultExpanded
+        result={{
+          results: [
+            {
+              status: "archived",
+              action: "archive",
+              workspaceId: "ws-forced",
+              paths: ["scratch.txt", "sub-1: notes.md"],
+              note: "Deleted the checkout at /src/repo/ws-forced.",
+            },
+            {
+              status: "deleted_worktree",
+              action: "delete_worktree",
+              workspaceId: "ws-listed",
+              paths: ["listed.txt"],
+            },
+          ],
+        }}
+      />
+    );
+
+    expect(view.queryByText("scratch.txt")).not.toBeNull();
+    expect(view.queryByText("sub-1: notes.md")).not.toBeNull();
+    expect(view.queryByText(/\/src\/repo\/ws-forced/)).not.toBeNull();
+    // Only an archived row's paths are files that are already gone.
+    const labels = [...view.container.querySelectorAll("div")]
+      .filter((el) => el.children.length === 0)
+      .map((el) => el.textContent);
+    expect(labels).toContain("Untracked files deleted");
+    expect(labels).toContain("Paths");
+  });
+
   test("renders captured workspace display name while keeping identifiers visible", () => {
     const view = renderWithProviders(
       <WorkspaceLifecycleToolCall
