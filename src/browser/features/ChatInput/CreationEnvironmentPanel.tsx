@@ -175,7 +175,7 @@ function OptionColumn<T extends string>(props: {
                       <>
                         <span
                           aria-hidden
-                          className="text-warning-text/85 truncate text-xs leading-snug"
+                          className="text-warning-text truncate text-xs leading-snug"
                         >
                           {why.summary}
                         </span>
