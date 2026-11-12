@@ -33,25 +33,35 @@ function workVerb(item: WorkBundleInfo): string {
   return isLive ? "Working" : "Worked";
 }
 
-function formatWorkLine(item: WorkBundleInfo, liveDurationMs: number | undefined): string {
+/** "Worked for 2m 14s", or the verb alone when the time is unknown or too short to read. */
+function formatWorked(item: WorkBundleInfo, liveDurationMs: number | undefined): string {
   const isLive = item.state === "live";
   const verb = workVerb(item);
   const durationMs = isLive ? liveDurationMs : item.durationMs;
   // Under a second there is nothing worth reading: "Worked" alone says it.
-  const worked =
-    durationMs === undefined || (!isLive && durationMs < 1000)
-      ? verb
-      : `${verb} for ${formatElapsed(durationMs)}`;
+  return durationMs === undefined || (!isLive && durationMs < 1000)
+    ? verb
+    : `${verb} for ${formatElapsed(durationMs)}`;
+}
+
+/** What the line says after the time, if anything. */
+function formatWorkDetail(item: WorkBundleInfo): string | undefined {
   // A live turn says what it is doing right now. The text changes in place: no row mounts
   // under the line for a step and unmounts for the next one.
-  if (isLive) {
-    return item.liveStep === undefined ? worked : `${worked} · ${item.liveStep}`;
+  if (item.state === "live") {
+    return item.liveStep;
   }
   // How long says little about a turn; that it changed files is what the user must not miss.
   if (item.editedFileCount === 0) {
-    return worked;
+    return undefined;
   }
-  return `${worked} · edited ${item.editedFileCount} ${item.editedFileCount === 1 ? "file" : "files"}`;
+  return `edited ${item.editedFileCount} ${item.editedFileCount === 1 ? "file" : "files"}`;
+}
+
+function formatWorkLine(item: WorkBundleInfo, liveDurationMs: number | undefined): string {
+  const worked = formatWorked(item, liveDurationMs);
+  const detail = formatWorkDetail(item);
+  return detail === undefined ? worked : `${worked} · ${detail}`;
 }
 
 interface WorkBundleMessageProps {

@@ -44,7 +44,7 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
             <ChevronRight aria-hidden="true" className="size-3 shrink-0 group-open:rotate-90" />
             Technical details
           </summary>
-          <div className="mt-2 border-border border-t pt-2">
+          <div className="border-border mt-2 border-t pt-2">
             <dl className="space-y-1 text-xs">
               {metadata.map(([label, value]) =>
                 value ? (
