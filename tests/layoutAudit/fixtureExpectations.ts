@@ -34,6 +34,13 @@ const everyWidth = (...findings: ExpectedFinding[]): WidthExpectations => ({
   768: findings,
 });
 
+const OVERFLOW_AND_REACH = [
+  found("viewport-unreachable-control", "button#fab"),
+  found("clipped-text", "p#spill"),
+  found("clipped-text", "div#clamp"),
+];
+const OVERFLOW_AND_REACH_WIDE = [found("page-horizontal-overflow", "html"), ...OVERFLOW_AND_REACH];
+
 export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> = {
   "calibration-small-overflow": CLEAN,
   // Upstream: 3 at 390 and 3 at 1440. A clipped control row and two clipped texts. Measured at
@@ -97,6 +104,15 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
     found("clipped-text", "div#card"),
     found("overlapping-text", "textarea#notes")
   ),
+  // An image that widens the page (at 390 and 768, where 900 px does not fit), a fixed control
+  // past the right edge, a text box with no height whose text spills, and a word cut sideways in a
+  // line-clamped box are findings. A sticky control below the fold and a wrapper with no box that
+  // has `overflow: hidden` are not.
+  "overflow-and-reach": {
+    390: OVERFLOW_AND_REACH_WIDE,
+    1440: OVERFLOW_AND_REACH,
+    768: OVERFLOW_AND_REACH_WIDE,
+  },
   "occlusion-exclusions-clean": CLEAN,
   "real-animated-entry": CLEAN,
   "real-carousel": CLEAN,

@@ -119,7 +119,7 @@ describe("clipped-text", () => {
 
   test.each([
     ["ellipsis", "; text-overflow: ellipsis"],
-    ["line-clamp", "; webkit-line-clamp: 2"],
+    ["an ellipsis and a line clamp", "; text-overflow: ellipsis; webkit-line-clamp: 2"],
     ["a mask image", "; mask-image: linear-gradient(black, transparent)"],
     ["a clip-path", "; clip-path: inset(0)"],
     ["rounded corners with overflow hidden", "; border-top-left-radius: 8px"],
@@ -129,6 +129,12 @@ describe("clipped-text", () => {
     ["opacity 0.01", "; opacity: 0.01"],
   ])("text with %s is never reported", (_name, css) => {
     expect(audit(TEXT(css))).toEqual([]);
+  });
+
+  // A line clamp drops whole lines. A browser paints no ellipsis on a word that is cut sideways
+  // anywhere but the clamp's last line, so the clamp is no excuse for the word.
+  test("a line clamp does not excuse a word cut sideways", () => {
+    expect(audit(TEXT("; webkit-line-clamp: 2"))).toEqual(BASE);
   });
 
   test("opacity 0.02 is still shown, so it is still judged", () => {
@@ -270,7 +276,7 @@ describe("clipped-text", () => {
 
     test.each([
       ["ellipsis", "; text-overflow: ellipsis"],
-      ["a line clamp", "; webkit-line-clamp: 2"],
+      ["an ellipsis and a line clamp", "; text-overflow: ellipsis; webkit-line-clamp: 2"],
       ["a mask image", "; mask-image: linear-gradient(black, transparent)"],
       ["rounded corners", "; border-top-left-radius: 8px"],
       ["visibility hidden", "; visibility: hidden"],
@@ -283,6 +289,12 @@ describe("clipped-text", () => {
           name === "a running animation" ? html.replace("<span ", "<span data-animated ") : html
         )
       ).toEqual([]);
+    });
+
+    test("with a line clamp but no ellipsis still cuts a word sideways", () => {
+      expect(audit(NESTED(CLIPPING + "; webkit-line-clamp: 2"))).toEqual([
+        finding("clipped-text", "span#s", "horizontal", 140),
+      ]);
     });
 
     test("that clips only the other axis, or only scrolls, cuts nothing", () => {
@@ -492,15 +504,57 @@ describe("viewport-unreachable-control", () => {
     ]);
   });
 
-  test("a fixed or sticky control must fit the viewport, however long the page", () => {
+  test("a fixed control must fit the viewport, however long the page", () => {
     const tall = { viewport: { width: 390, height: 844, scrollHeight: 5000 } };
-    for (const position of ["fixed", "sticky"]) {
-      const button = `<button data-css="position: ${position}" data-box="10 900 100 40">Buy</button>`;
-      expect(audit(button, tall)).toEqual([
-        finding("viewport-unreachable-control", TOP_BUTTON, "vertical", 96),
-      ]);
-    }
+    const button = '<button data-css="position: fixed" data-box="10 900 100 40">Buy</button>';
+    expect(audit(button, tall)).toEqual([
+      finding("viewport-unreachable-control", TOP_BUTTON, "vertical", 96),
+    ]);
     expect(audit('<button data-box="10 900 100 40">Buy</button>', tall)).toEqual([]);
+  });
+
+  // A sticky control sits in the flow until the user scrolls to it: below the fold is not lost.
+  test("a sticky control below the fold is reached by scrolling, like one in the flow", () => {
+    const tall = { viewport: { width: 390, height: 844, scrollHeight: 5000 } };
+    const sticky = (box: string) =>
+      `<button data-css="position: sticky" data-box="${box}">Buy</button>`;
+    expect(audit(sticky("10 900 100 40"), tall)).toEqual([]);
+    // Past the end of the page, nothing scrolls to it.
+    expect(audit(sticky("10 5100 100 40"), tall)).toEqual([
+      finding("viewport-unreachable-control", TOP_BUTTON, "vertical", 140),
+    ]);
+  });
+
+  test("a sticky control on a page that cannot scroll must fit the viewport", () => {
+    const tall = { viewport: { width: 390, height: 844, scrollHeight: 5000 } };
+    using fake = createFakeLayoutPage(
+      '<button data-css="position: sticky" data-box="10 900 100 40">Buy</button>',
+      tall
+    );
+    fake.page.document.documentElement.setAttribute("data-css", "overflow-y: hidden");
+    expect(auditLayout(fake.page)).toEqual([
+      finding("viewport-unreachable-control", TOP_BUTTON, "vertical", 96),
+    ]);
+  });
+
+  // A control past the right edge widens the page: page-horizontal-overflow reports that. A fixed
+  // one does not, so it is reported on its own.
+  test("a fixed control past the right edge is reported, one in the flow is not", () => {
+    const fixed = (box: string) =>
+      `<button id="fab" data-css="position: fixed" data-box="${box}">Help</button>`;
+    expect(audit(fixed("340 10 100 40"))).toEqual([
+      finding("viewport-unreachable-control", "button#fab", "horizontal", 50),
+    ]);
+    expect(audit(fixed("0 10 100 40"))).toEqual([]);
+    // 3 px past the edge is tolerated, as at the left edge.
+    expect(audit(fixed("293 10 100 40"))).toEqual([]);
+    expect(audit('<button data-box="340 10 100 40">Help</button>')).toEqual([]);
+  });
+
+  test("a fixed control that a horizontal scroller holds is left alone at the right edge", () => {
+    const html = `<div data-box="0 0 390 50" data-css="overflow-x: auto">
+      <button data-css="position: fixed" data-box="340 10 100 40">Help</button></div>`;
+    expect(audit(html)).toEqual([]);
   });
 
   test("when the page cannot scroll, a control must fit the viewport unless a scroller holds it", () => {
@@ -604,6 +658,51 @@ describe("page-horizontal-overflow", () => {
     ]);
     expect(auditBodyText({ box: "0 0 390 20", lines: "0 0 300 20" }, wide(642))).toEqual([]);
     expect(auditBodyText(wideBody, wide(413))).toEqual([]);
+  });
+
+  // An image has no text line: its box is where it ends, as a control's is.
+  test.each(["img", "video", "canvas", "iframe", "embed", "object"])(
+    "a visible <%s> past the edge is evidence",
+    (tag) => {
+      const html = `<${tag} data-box="0 0 642 100"></${tag}>`;
+      expect(audit(html, wide(642))).toEqual([
+        finding("page-horizontal-overflow", "html", "horizontal", 252),
+      ]);
+      expect(audit(html, wide(413))).toEqual([]);
+    }
+  );
+
+  test("an image in a link, a list item or a table cell is evidence: no paragraph judges it", () => {
+    const html = '<ul><li data-box="0 0 642 100"><img data-box="0 0 642 100"></li></ul>';
+    expect(audit(html, wide(642))).toEqual([
+      finding("page-horizontal-overflow", "html", "horizontal", 252),
+    ]);
+  });
+
+  test.each([
+    ["positioned", '<img data-css="position: absolute" data-box="0 0 642 100">'],
+    ["fixed", '<img data-css="position: fixed" data-box="0 0 642 100">'],
+    ["visibility hidden", '<img data-css="visibility: hidden" data-box="0 0 642 100">'],
+    ["transparent", '<img data-css="opacity: 0" data-box="0 0 642 100">'],
+    ["without a box", "<img>"],
+    ["animated", '<img data-animated data-box="0 0 642 100">'],
+    ["in a diagram", '<div class="mermaid"><img data-box="0 0 642 100"></div>'],
+    [
+      "in a horizontal scroller",
+      '<div data-box="0 0 390 100" data-css="overflow-x: auto"><img data-box="0 0 642 100"></div>',
+    ],
+  ])("an image that is %s is not evidence", (_name, html) => {
+    expect(audit(html, wide(642))).toEqual([]);
+  });
+
+  // A box with no height does not hide text that spills out of it (the text paints).
+  test("text that spills out of a box with no height is evidence", () => {
+    const html = '<p data-box="0 0 390 0" data-lines="0 0 642 20">Wide spilled text</p>';
+    expect(audit(html, wide(642))).toEqual([
+      finding("page-horizontal-overflow", "html", "horizontal", 252),
+      // The line is lost below its box too, as for any box that is too short.
+      finding("clipped-text", TOP_P, "vertical", 20),
+    ]);
   });
 
   test("a scrolling <body> is not a scroller that holds its own text", () => {
@@ -908,6 +1007,73 @@ describe("overlapping-text", () => {
   });
 });
 
+// An element with no area is not an element nobody sees: its text can still paint.
+describe("an element whose box has no area", () => {
+  const wide = (scrollWidth: number) => ({ viewport: { width: 390, height: 844, scrollWidth } });
+  // The line sticks out of a box with no height: it is lost below its box, as for any short box.
+  const LOST_BELOW = finding("clipped-text", TOP_P, "vertical", 20);
+
+  test("text that spills out of a box with no height is judged by its lines", () => {
+    const spill = (left: number) =>
+      `<p data-box="${left} 0 100 0" data-lines="${left} 0 100 20">Text spilling out</p>`;
+    expect(audit(spill(-80))).toEqual([
+      finding("viewport-unreachable-content", TOP_P, "horizontal", 80),
+      LOST_BELOW,
+    ]);
+    expect(audit(spill(0))).toEqual([LOST_BELOW]);
+  });
+
+  test("text that spills out of a box with no height can be covered", () => {
+    const html = `<div><p id="t" data-box="10 10 200 0" data-lines="10 10 200 20">Hello world text</p>
+      <div data-box="0 0 300 60" data-css="background-color: rgb(255, 255, 255)" data-z="1"></div></div>`;
+    expect(audit(html)).toEqual([
+      finding("clipped-text", "p#t", "vertical", 20),
+      finding("overlapping-text", "p#t", "horizontal", 0),
+    ]);
+  });
+
+  // A collapsed panel (`height: 0; overflow: hidden`) holds text that nobody sees.
+  test.each([
+    [
+      "itself",
+      '<div data-box="0 0 390 0" data-css="overflow-y: hidden" data-lines="0 0 642 20">Panel text</div>',
+    ],
+    [
+      "an ancestor",
+      '<div data-box="0 0 390 0" data-css="overflow-y: hidden"><p data-box="0 0 390 0" data-lines="0 0 642 20">Panel text</p></div>',
+    ],
+  ])("text in a box with no area that %s clips is hidden, not judged", (_name, html) => {
+    expect(audit(html, wide(642))).toEqual([]);
+  });
+
+  test("an ancestor with an area that clips is for the clipping rules to judge", () => {
+    const html = `<div id="card" data-box="0 0 100 100" data-css="overflow-x: hidden">
+      <p data-box="0 0 100 0" data-lines="0 0 300 20">Text in a card</p></div>`;
+    expect(audit(html)).toEqual([finding("clipped-text", "div#card", "horizontal", 200)]);
+  });
+
+  test("a `display: contents` element's overflow clips nothing: no box holds its text", () => {
+    const FITS = '<p data-box="0 0 300 20" data-lines="0 0 300 20">A paragraph that fits</p>';
+    const wrapper = (inner: string, attributes = "") =>
+      `<div id="w" ${attributes} data-css="display: contents; overflow-x: hidden">${inner}</div>`;
+    // Its empty rectangle is no clip for the text it holds, nor for a control.
+    expect(audit(wrapper(FITS))).toEqual([]);
+    expect(audit(wrapper('<button data-box="10 10 100 30">Go</button>'))).toEqual([]);
+    // Nor for its own text.
+    expect(audit(wrapper("Its own text", 'data-lines="0 0 200 20"'))).toEqual([]);
+    // A box with the same overflow does cut.
+    const boxed = FITS.replace("<p ", '<p id="inner" ');
+    const card = `<div id="card" data-box="0 0 100 20" data-css="overflow-x: hidden">${boxed}</div>`;
+    expect(audit(card)).toEqual([finding("clipped-text", "div#card", "horizontal", 200)]);
+  });
+
+  test("a `display: contents` paragraph is judged by its lines, and a card around it clips them", () => {
+    const html = `<div id="card" data-box="0 0 100 20" data-css="overflow-x: hidden">
+      <p data-css="display: contents" data-lines="0 0 300 20">A long paragraph without a box</p></div>`;
+    expect(audit(html)).toEqual([finding("clipped-text", "div#card", "horizontal", 200)]);
+  });
+});
+
 describe("text a text boundary holds that is not shown", () => {
   // A Range still measures the text of a hidden or transparent element: the fake gives the span
   // its lines too. Only what the user sees is evidence.
@@ -1010,13 +1176,15 @@ describe("text in an element with no box (display: contents)", () => {
   });
 
   // The collapsed panel is a known false alarm (docs): a paragraph in it has a box and its text is
-  // cut by the panel. A paragraph with `display: contents` is judged the same way.
-  test("a paragraph in a collapsed panel is reported on the panel, with a box or without", () => {
+  // cut by the panel. A paragraph with `display: contents` has no area, and the panel that clips it
+  // has none either, so nobody sees it: it is hidden, like any element with no area.
+  test("a paragraph in a collapsed panel is reported on the panel, unless it has no box", () => {
     const panel = (css: string, box: string) =>
       `<div id="panel" data-box="0 0 200 0" data-css="overflow-y: hidden"><p data-box="${box}" data-css="${css}" data-lines="0 0 180 20">Collapsed panel text</p></div>`;
-    const reported = [finding("clipped-text", "div#panel", "vertical", 20)];
-    expect(audit(panel("", "0 0 200 20"))).toEqual(reported);
-    expect(audit(panel("display: contents", ""))).toEqual(reported);
+    expect(audit(panel("", "0 0 200 20"))).toEqual([
+      finding("clipped-text", "div#panel", "vertical", 20),
+    ]);
+    expect(audit(panel("display: contents", ""))).toEqual([]);
   });
 
   // The fake sizes the inner paragraph by its `data-box`, so this one has no height. A browser

@@ -44,6 +44,9 @@ const CONTROL_ROLES = new Set([
 ]);
 // Diagram surfaces stay outside the general audit. Upstream also lists [data-lavish-ui].
 const DIAGRAM = ".mermaid,svg";
+// Content a browser draws from outside the page's text (an image, a video, a frame): no text line
+// to measure, so its box is what the rules read. Upstream does not read these.
+const REPLACED_CONTENT = "img,video,canvas,iframe,embed,object";
 
 /** A clipping ancestor: the padding box that cuts its descendants, on the axes it clips. */
 export interface ClippingBoundary {
@@ -111,6 +114,10 @@ export function isNestedInTextBoundary(page: LayoutPage, el: Element): boolean {
   return chainBelowRoot(page, el.parentElement).some(isSemanticTextBoundary);
 }
 
+export function isReplacedContent(el: Element): boolean {
+  return el.matches(REPLACED_CONTENT);
+}
+
 export function isRequiredControl(el: Element): boolean {
   if (!el.matches(CONTROL) || el.matches(DISABLED_CONTROL)) return false;
   // A native control stays one under any role (`<button role="menuitem">`): a role on an
@@ -141,19 +148,26 @@ function isHiddenStyle(style: LayoutStyle): boolean {
  * descendant, so those walk the ancestors.
  */
 export function isVisible(page: LayoutPage, el: Element): boolean {
-  const rect = page.box(el);
-  if (rect.width <= 0 || rect.height <= 0) return false;
-  return paintsContent(page, el);
+  return hasArea(page.box(el)) && paintsContent(page, el);
+}
+
+function hasArea(rect: Box): boolean {
+  return rect.width > 0 && rect.height > 0;
 }
 
 /**
- * isVisible for an element that is judged by the lines of its text, not by its box: a
- * `display: contents` element (a paragraph with one) has no box, so no area, while its text
- * paints. Any other empty box stays hidden: a collapsed panel (`height: 0; overflow: hidden`)
- * holds text that nobody sees.
+ * isVisible for an element that is judged by the lines of its text, not by its box. An empty box
+ * (a `display: contents` element has none, `height: 0` makes one) does not hide text that
+ * overflows it: the text paints, so the rules judge its lines. It does hide the text when a box
+ * with no area clips it, whether the element's own or an ancestor's: that is a collapsed panel
+ * (`height: 0; overflow: hidden`), and nobody sees what it holds. An ancestor with an area that
+ * clips is for the clipping rules to judge.
  */
 export function isVisibleTextHolder(page: LayoutPage, el: Element): boolean {
-  return page.style(el).display === "contents" ? paintsContent(page, el) : isVisible(page, el);
+  if (!paintsContent(page, el)) return false;
+  if (hasArea(page.box(el))) return true;
+  const collapsed = (node: Element) => clipsAsBox(page.style(node)) && !hasArea(page.box(node));
+  return !chainBelowRoot(page, el).some(collapsed);
 }
 
 /**
@@ -249,10 +263,13 @@ export function textFragments(page: LayoutPage, el: Element): Box[] {
     .flatMap((node) => page.textLines(node));
 }
 
-/** Which cut the author asked for; a line clamp wins over an ellipsis (it covers both axes). */
+/** Which cuts the author asked for: an ellipsis (sideways), a line clamp (lines), or both. */
 export function textTruncation(style: LayoutStyle): TextTruncation {
-  if (Number.parseInt(style.webkitLineClamp || "0", 10) > 0) return "line-clamp";
-  return style.textOverflow === "ellipsis" ? "ellipsis" : "none";
+  const ellipsis = style.textOverflow === "ellipsis";
+  if (Number.parseInt(style.webkitLineClamp || "0", 10) > 0) {
+    return ellipsis ? "ellipsis-and-line-clamp" : "line-clamp";
+  }
+  return ellipsis ? "ellipsis" : "none";
 }
 
 function isSet(value: string): boolean {
@@ -266,6 +283,11 @@ function hasVisualMask(style: LayoutStyle): boolean {
 
 function clipsOverflow(style: LayoutStyle): boolean {
   return isClipping(style.overflowX) || isClipping(style.overflowY);
+}
+
+// A `display: contents` element generates no box, so its `overflow` clips nothing.
+function clipsAsBox(style: LayoutStyle): boolean {
+  return style.display !== "contents" && clipsOverflow(style);
 }
 
 // A rounded box with overflow hidden cuts glyph ink at its corners on purpose.
@@ -326,11 +348,12 @@ function clippedAxes(style: LayoutStyle): LayoutAuditAxis[] {
 }
 
 // A box that cuts its contents on purpose (a mask, rounded corners with overflow hidden) is no
-// boundary: it cuts glyph ink at its edge by design.
+// boundary: it cuts glyph ink at its edge by design. Nor is a `display: contents` element: it has
+// no box, and its empty rectangle would "clip" everything it holds.
 function clippingBoundaryOf(page: LayoutPage, node: Element): ClippingBoundary | null {
   const style = page.style(node);
   const axes = clippedAxes(style);
-  if (axes.length === 0 || hasVisualMask(style) || isRoundedOverflowMask(style)) return null;
+  if (!clipsAsBox(style) || hasVisualMask(style) || isRoundedOverflowMask(style)) return null;
   return { el: node, box: paddingBox(page, node), axes };
 }
 

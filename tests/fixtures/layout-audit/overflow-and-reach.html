@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Overflow and reach</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      p {
+        margin: 0 0 18px;
+        font-size: 18px;
+        line-height: 1.4;
+      }
+      /* An image with a fixed width and no max-width: it widens the page on a phone and a tablet. */
+      #banner {
+        display: block;
+        width: 900px;
+        height: 80px;
+        background: #bac6cd;
+      }
+      /* A box with no height: its text spills out and paints below it. */
+      #spill {
+        height: 0;
+      }
+      /* A line clamp keeps two lines. It does not authorize a word cut sideways: this one is the
+         last line and nothing follows it, so the browser paints no ellipsis. */
+      #clamp {
+        width: 150px;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+        margin-bottom: 18px;
+      }
+      /* A wrapper with no box clips nothing: its paragraph fits the page. */
+      #wrapper {
+        display: contents;
+        overflow: hidden;
+      }
+      #spacer {
+        height: 2000px;
+      }
+      /* A sticky control below the fold stays in the flow: a scroll reaches it. */
+      #late {
+        position: sticky;
+        top: 0;
+        padding: 10px 16px;
+      }
+      /* A fixed control past the right edge: it does not widen the page and no scroll reaches it. */
+      #fab {
+        position: fixed;
+        top: 120px;
+        left: calc(100vw - 40px);
+        width: 100px;
+        padding: 10px 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <img
+      id="banner"
+      alt="Banner"
+      src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="
+    />
+    <p id="spill">Text that spills out of a box with no height</p>
+    <div id="clamp">Short Supercalifragilisticexpialidocious_unbreakable_token</div>
+    <div id="wrapper"><p>A paragraph inside a wrapper that has no box of its own.</p></div>
+    <div id="spacer"></div>
+    <button id="late" type="button">Reached by scrolling</button>
+    <button id="fab" type="button">Help</button>
+  </body>
+</html>

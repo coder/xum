@@ -115,12 +115,12 @@ describe("classifySevereTextOverflow", () => {
   test("text the author truncated, and a missing line list, are never failures", () => {
     const wide = [box(0, 0, 400, 20)];
     expect(textOverflow(wide, BOX_300x20, "hidden", "hidden", "ellipsis")).toBeNull();
-    expect(textOverflow(wide, BOX_300x20, "hidden", "hidden", "line-clamp")).toBeNull();
     expect(textOverflow([], BOX_300x20)).toBeNull();
   });
 
-  // An ellipsis marks where a line ends: it never authorizes lines lost below a short box.
-  test("an ellipsis exempts the sideways axis only; a line clamp exempts both", () => {
+  // An ellipsis marks where a line ends: it never authorizes lines lost below a short box. A line
+  // clamp drops whole lines: it never authorizes a word cut sideways.
+  test("an ellipsis exempts the sideways axis only, a line clamp the lines axis only", () => {
     const frame = { left: 0, right: 300, top: 0, bottom: 22 };
     const lost = [box(0, 0, 200, 20), box(0, 24, 200, 20)];
     const sideways = [box(0, 0, 400, 20)];
@@ -130,10 +130,21 @@ describe("classifySevereTextOverflow", () => {
     });
     expect(textOverflow(lost, frame, "hidden", "hidden", "line-clamp")).toBeNull();
     expect(textOverflow(sideways, frame, "hidden", "hidden", "ellipsis")).toBeNull();
+    expect(textOverflow(sideways, frame, "hidden", "hidden", "line-clamp")).toEqual({
+      axis: "horizontal",
+      overflowPx: 100,
+    });
     expect(textOverflow(sideways, frame, "hidden", "hidden", "none")).toEqual({
       axis: "horizontal",
       overflowPx: 100,
     });
+  });
+
+  test("a box with an ellipsis and a line clamp excuses both axes", () => {
+    const frame = { left: 0, right: 300, top: 0, bottom: 22 };
+    const both = "ellipsis-and-line-clamp";
+    expect(textOverflow([box(0, 0, 400, 20)], frame, "hidden", "hidden", both)).toBeNull();
+    expect(textOverflow([box(0, 24, 200, 20)], frame, "hidden", "hidden", both)).toBeNull();
   });
 
   test("a line with no size, or with a non-finite edge, is ignored", () => {

@@ -11,6 +11,7 @@ import {
   isInsideHorizontalScroller,
   isNearAnimation,
   isNestedInTextBoundary,
+  isReplacedContent,
   isRequiredControl,
   isRootElement,
   isVisible,
@@ -124,16 +125,22 @@ function textEscapesRightEdge(pass: AuditPass, el: Element): boolean {
   );
 }
 
-/** Real content, not a scroll dimension, past the right edge: the evidence for page overflow. */
+/**
+ * Real content, not a scroll dimension, past the right edge: the evidence for page overflow. A
+ * control and a replaced element (an image, a video) are judged by their box, as nothing else
+ * says where they end. Text is judged by its lines.
+ */
 function elementEscapesRightEdge(pass: AuditPass, el: Element): boolean {
-  const control = isRequiredControl(el);
-  const scrolled = control
+  const replaced = isReplacedContent(el);
+  const byBox = replaced || isRequiredControl(el);
+  const scrolled = byBox
     ? hasHorizontalScrollerAncestor(pass.page, el)
     : isInsideHorizontalScroller(pass.page, el);
-  if (scrolled || !isJudgeable(pass, el)) return false;
-  const visible = control ? isVisible(pass.page, el) : isVisibleTextHolder(pass.page, el);
+  // An image in a link or a table cell is no text for the paragraph around it to judge.
+  if (scrolled || !isJudgeable(pass, el, replaced)) return false;
+  const visible = byBox ? isVisible(pass.page, el) : isVisibleTextHolder(pass.page, el);
   if (!visible || isPositionedNonControl(pass, el)) return false;
-  if (!control) return textEscapesRightEdge(pass, el);
+  if (!byBox) return textEscapesRightEdge(pass, el);
   const rect = pass.page.box(el);
   return viewportEscape(pass, rect, THRESHOLDS.controlMinOutsidePx)?.side === "end";
 }
@@ -185,10 +192,13 @@ function clippedControlCheck(pass: AuditPass, el: Element, rect: Box): void {
   });
 }
 
-function leftEdgeControlCheck(pass: AuditPass, el: Element, rect: Box): void {
+// A control past the right edge widens the page, and page-horizontal-overflow reports that. A
+// fixed control does not widen it, and no scroll brings it back, so its right edge is checked
+// here like its left.
+function viewportEdgeControlCheck(pass: AuditPass, el: Element, rect: Box): void {
   if (hasHorizontalScrollerAncestor(pass.page, el)) return;
   const escape = viewportEscape(pass, rect, THRESHOLDS.controlMinOutsidePx);
-  if (escape?.side !== "start") return;
+  if (escape === null || (escape.side === "end" && !isFixed(pass, el))) return;
   report(pass, {
     rule: "viewport-unreachable-control",
     selector: selectorFor(pass.page, el),
@@ -197,11 +207,15 @@ function leftEdgeControlCheck(pass: AuditPass, el: Element, rect: Box): void {
   });
 }
 
-// A fixed or sticky control, or any control when the root cannot scroll and no scroller on screen
-// holds it, must fit the viewport; otherwise it must fit the scrollable page.
+function isFixed(pass: AuditPass, el: Element): boolean {
+  return pass.page.style(el).position === "fixed";
+}
+
+// A fixed control, or any control when the root cannot scroll and no scroller on screen holds it,
+// must fit the viewport; otherwise it must fit the scrollable page. A sticky control is not
+// pinned: it sits in the flow until the user scrolls to it, so one below the fold is reachable.
 function isPinnedToViewport(pass: AuditPass, el: Element): boolean {
-  const position = pass.page.style(el).position;
-  if (position === "fixed" || position === "sticky") return true;
+  if (isFixed(pass, el)) return true;
   const { page, metrics } = pass;
   return (
     rootVerticalScrollLocked(page) &&
@@ -245,7 +259,7 @@ function controlChecks(pass: AuditPass, el: Element): void {
   if (!isVisible(page, el)) return;
   const rect = page.box(el);
   clippedControlCheck(pass, el, rect);
-  leftEdgeControlCheck(pass, el, rect);
+  viewportEdgeControlCheck(pass, el, rect);
   verticalControlCheck(pass, el, rect);
 }
 

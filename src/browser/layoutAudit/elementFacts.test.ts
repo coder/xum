@@ -56,11 +56,13 @@ describe("textTruncation", () => {
     return textTruncation(fake.page.style(paragraph));
   }
 
-  test("names the cut the author asked for, and a line clamp wins over an ellipsis", () => {
+  test("names each cut the author asked for, an ellipsis and a line clamp together too", () => {
     expect(truncationOf("")).toBe("none");
     expect(truncationOf("text-overflow: ellipsis")).toBe("ellipsis");
     expect(truncationOf("webkit-line-clamp: 2")).toBe("line-clamp");
-    expect(truncationOf("text-overflow: ellipsis; webkit-line-clamp: 2")).toBe("line-clamp");
+    expect(truncationOf("text-overflow: ellipsis; webkit-line-clamp: 2")).toBe(
+      "ellipsis-and-line-clamp"
+    );
     expect(truncationOf("webkit-line-clamp: none")).toBe("none");
   });
 });
@@ -158,17 +160,33 @@ describe("isVisibleTextHolder", () => {
     return found;
   }
 
-  test("an element with no box paints its text only when it has display: contents", () => {
+  // An element with no area (a `display: contents` one has no box, `height: 0` makes an empty one)
+  // still paints the text that overflows it. A box with no area that clips hides the text.
+  test("an element with no area paints its text unless a box with no area clips it", () => {
     expect(
       holders(`
         <p id="contents" data-css="display: contents">x</p>
-        <p id="collapsed" data-box="0 0 100 0">x</p>
+        <p id="contents-clipping" data-css="display: contents; overflow-x: hidden">x</p>
+        <p id="spilling" data-box="0 0 100 0">x</p>
+        <p id="clipping" data-box="0 0 100 0" data-css="overflow-y: hidden">x</p>
+        <div data-box="0 0 100 0" data-css="overflow-y: hidden">
+          <p id="in-collapsed" data-box="0 0 100 0">x</p>
+          <p id="contents-in-collapsed" data-css="display: contents">x</p></div>
+        <div data-box="0 0 100 50" data-css="overflow-y: hidden">
+          <p id="in-card" data-box="0 0 100 0">x</p>
+          <p id="contents-in-card" data-css="display: contents">x</p></div>
         <p id="shown" data-box="0 0 100 20">x</p>
         <p id="hidden-contents" data-css="display: contents; visibility: hidden">x</p>
         <div data-css="display: none"><p id="in-hidden" data-css="display: contents">x</p></div>`)
     ).toEqual({
       contents: true,
-      collapsed: false,
+      "contents-clipping": true,
+      spilling: true,
+      clipping: false,
+      "in-collapsed": false,
+      "contents-in-collapsed": false,
+      "in-card": true,
+      "contents-in-card": true,
       shown: true,
       "hidden-contents": false,
       "in-hidden": false,
