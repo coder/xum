@@ -209,9 +209,10 @@ function generateWorkspaceStatusEffect(
       // cannot be re-attributed by a concurrent Coder catalog refresh. A
       // construction rejection defects through the facade unchanged (v4
       // rethrows the raw error), matching the pre-Effect uncaught await.
+      const creationThinking = statusThinkingLevel(modelString, aiService.getProvidersConfig());
       const modelResult = yield* Effect.promise(async () =>
         aiService.createModelWithPinnedOptions(modelString, {
-          thinkingLevel: statusThinkingLevel(modelString, aiService.getProvidersConfig()),
+          thinkingLevel: creationThinking,
           agentInitiated: true,
         })
       );
@@ -220,9 +221,32 @@ function generateWorkspaceStatusEffect(
         log.debug(`Status generation: skipping ${modelString} (${modelResult.error.type})`);
         continue;
       }
+      const pinned = modelResult.data;
+
+      // The request must carry the level the model was created for (xAI picks
+      // its non-reasoning variant only for "off"). If the pinned snapshot
+      // resolves another level, skip the candidate, as workspaceTitleGenerator does.
+      const thinkingLevel = statusThinkingLevel(
+        pinned.optionsModelString,
+        pinned.optionsProvidersConfig
+      );
+      if (thinkingLevel !== creationThinking) {
+        runLanguageModelCleanup(pinned.model);
+        lastError = {
+          type: "configuration",
+          raw: `Thinking level for ${modelString} changed after model creation (${creationThinking} -> ${thinkingLevel})`,
+        };
+        continue;
+      }
       reachedProvider = true;
 
-      const attempt = yield* attemptCandidate(transcript, modelString, modelResult.data, options);
+      const attempt = yield* attemptCandidate(
+        transcript,
+        modelString,
+        pinned,
+        thinkingLevel,
+        options
+      );
       if (attempt.success) return Ok(attempt.data);
       lastError = attempt.error;
     }
@@ -262,6 +286,7 @@ function attemptCandidate(
   transcript: string,
   modelString: string,
   created: PinnedModelOptions,
+  thinkingLevel: ThinkingLevel,
   options: GenerateWorkspaceStatusOptions
 ): Effect.Effect<Result<GenerateWorkspaceStatusResult, NameGenerationError>> {
   const foldAttemptFailure = (
@@ -284,7 +309,7 @@ function attemptCandidate(
           prompt: buildWorkspaceStatusPrompt(transcript, options),
           providerOptions: buildProviderOptions(
             created.optionsModelString,
-            statusThinkingLevel(created.optionsModelString, created.optionsProvidersConfig),
+            thinkingLevel,
             undefined,
             undefined,
             created.optionsMuxProviderOptions,

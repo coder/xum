@@ -1,6 +1,6 @@
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { Config, ProvidersConfigStore } from "@/node/config";
 import { AIService } from "./aiService";
 import { HistoryService } from "./historyService";
@@ -154,5 +154,31 @@ describe("generateWorkspaceStatus thinking", () => {
     expect(bodies).toHaveLength(2);
     expect(bodies[0].reasoning_effort).toBe("low");
     expect((bodies[1].reasoning as { effort?: unknown } | undefined)?.effort).toBe("low");
+  });
+
+  test("skips a candidate whose pinned snapshot resolves a different level", async () => {
+    const service = createService();
+    // The creation-time read maps the model to one that allows "off"; the pinned
+    // snapshot (the file on disk) does not, so it resolves GLM's "low".
+    spyOn(service, "getProvidersConfig").mockReturnValue({
+      omlx: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "openai-compatible",
+        models: [{ id: "GLM-5.3-Flash-oQ4e-mtp", mappedToModel: "anthropic:claude-haiku-4-5" }],
+      },
+    });
+
+    const result = await generateWorkspaceStatus(
+      "user: fix the login bug",
+      ["omlx:GLM-5.3-Flash-oQ4e-mtp"],
+      service
+    );
+
+    expect(bodies).toHaveLength(0);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.error.type).toBe("configuration");
   });
 });
