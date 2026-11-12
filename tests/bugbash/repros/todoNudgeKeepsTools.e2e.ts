@@ -22,6 +22,8 @@ test(
 
     await sendMessage(screen, `[mock:todo-nudge] ${Date.now()}`);
     await expect(screen.getByText(NUDGE_REPLY).last()).toBeVisible({ timeout: 30_000 });
+    // The nudge is a step of the work it starts: it is behind that work's line.
+    await screen.getByTestId("work-bundle").last().click();
     await expect(screen.getByText(NUDGE_ROW).last()).toBeVisible();
 
     const nudges = await todoNudgeToolPolicies(app);
