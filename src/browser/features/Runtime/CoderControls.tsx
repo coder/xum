@@ -173,6 +173,16 @@ export function CoderWorkspaceForm(props: CoderWorkspaceFormProps) {
     (mode === "existing" && Boolean(workspacesError)) ||
     (mode === "new" && Boolean(templatesError ?? presetsError))
   );
+  // The one control a refused Send is waiting for, so it (not just the form's border) is marked
+  // invalid and the environment panel can put the keyboard on it. Mirrors the order in which
+  // creation validation checks the form: workspace, or template and then preset.
+  const missingField: "workspace" | "template" | "preset" | null = !hasError
+    ? null
+    : mode === "existing"
+      ? "workspace"
+      : !(coderConfig?.template ?? "").trim()
+        ? "template"
+        : "preset";
   const templateErrorId = templatesError ? "coder-template-error" : undefined;
   const presetErrorId = presetsError ? "coder-preset-error" : undefined;
   const workspaceErrorId = workspacesError ? "coder-workspace-error" : undefined;
@@ -370,7 +380,9 @@ export function CoderWorkspaceForm(props: CoderWorkspaceFormProps) {
                   <SelectTrigger
                     className="h-7 w-[180px] text-xs"
                     data-testid="coder-template-select"
-                    aria-invalid={Boolean(templatesError) || undefined}
+                    aria-invalid={
+                      Boolean(templatesError) || missingField === "template" || undefined
+                    }
                     aria-describedby={templateErrorId}
                   >
                     <SelectValue placeholder={templatePlaceholder} />
@@ -412,7 +424,7 @@ export function CoderWorkspaceForm(props: CoderWorkspaceFormProps) {
                   <SelectTrigger
                     className="h-7 w-[180px] text-xs"
                     data-testid="coder-preset-select"
-                    aria-invalid={Boolean(presetsError) || undefined}
+                    aria-invalid={Boolean(presetsError) || missingField === "preset" || undefined}
                     aria-describedby={presetErrorId}
                   >
                     <SelectValue placeholder={presetPlaceholder} />
@@ -451,7 +463,9 @@ export function CoderWorkspaceForm(props: CoderWorkspaceFormProps) {
                   <SelectTrigger
                     className="h-7 w-[180px] text-xs"
                     data-testid="coder-workspace-select"
-                    aria-invalid={Boolean(workspacesError) || undefined}
+                    aria-invalid={
+                      Boolean(workspacesError) || missingField === "workspace" || undefined
+                    }
                     aria-describedby={workspaceErrorId}
                   >
                     <SelectValue placeholder={workspacePlaceholder} />

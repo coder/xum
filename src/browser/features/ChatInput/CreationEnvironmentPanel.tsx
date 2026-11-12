@@ -1,5 +1,12 @@
 import { useId, useRef, useState, type ReactNode } from "react";
-import { AlertTriangle, Check, ChevronDown, GitBranch } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  GitBranch,
+} from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { FilterList } from "@/browser/components/FilterList/FilterList";
@@ -11,6 +18,7 @@ import {
 } from "@/browser/components/Popover/Popover";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
+import { usePhoneTouchViewport } from "@/browser/hooks/useNarrowViewport";
 import type { IsolationOptionUi } from "@/browser/utils/runtimeUi";
 import {
   formatKeybind,
@@ -210,6 +218,8 @@ function BranchColumn(props: {
   branch: EnvironmentBranchPicker;
   disabled: boolean;
   className?: string;
+  /** The list's height: a column on desktop, most of the sheet on a phone. */
+  listClassName?: string;
 }) {
   const { branch } = props;
   return (
@@ -251,7 +261,7 @@ function BranchColumn(props: {
           mono
           boxedFilter
           disabled={props.disabled}
-          listClassName="max-h-56 p-0"
+          listClassName={props.listClassName ?? "max-h-56 p-0"}
         />
       )}
     </div>
@@ -346,6 +356,44 @@ function ChipSummary(props: {
   );
 }
 
+/**
+ * The base branch on a phone: one row that opens the branch list as its own view. A filter and a
+ * list of branches do not fit under two option groups on a phone screen, and the keyboard the
+ * filter raises would cover them.
+ */
+function PhoneBranchRow(props: {
+  branch: EnvironmentBranchPicker;
+  disabled: boolean;
+  onOpen: () => void;
+}) {
+  const { branch } = props;
+  return (
+    <div className={cn(COLUMN_CLASSES, "border-border-light border-t")}>
+      <div className={COLUMN_HEADER_CLASSES}>
+        <span className={COLUMN_TITLE_CLASSES}>Base branch</span>
+      </div>
+      <button
+        type="button"
+        disabled={props.disabled}
+        onClick={props.onOpen}
+        className="hover:bg-hover/60 focus-visible:ring-accent flex min-h-12 w-full items-center gap-2.5 rounded-md px-2.5 text-left outline-none focus-visible:ring-1 disabled:opacity-50"
+      >
+        <GitBranch aria-hidden className="text-muted size-3.5 shrink-0" />
+        <span className="min-w-0 flex-1 truncate font-mono text-[13px]">
+          {branch.load === "loaded" ? (
+            branch.selected
+          ) : branch.load === "failed" ? (
+            <span className="text-error font-sans">Could not load branches</span>
+          ) : (
+            <span className="text-muted font-sans">Loading branches…</span>
+          )}
+        </span>
+        <ChevronRight aria-hidden className="text-muted size-4 shrink-0" />
+      </button>
+    </div>
+  );
+}
+
 /** Three columns on desktop, stacked on a phone. Literal classes: Tailwind only finds literals. */
 function columnsClass(props: Pick<CreationEnvironmentPanelProps, "branch" | "isolation">): string {
   if (props.branch === null) return "md:grid-cols-2";
@@ -373,6 +421,16 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
     if (props.fieldError !== null) setOpen(true);
   }
   const contentRef = useRef<HTMLDivElement>(null);
+  // On a touch phone the panel is a sheet from the bottom edge, where a thumb reaches it, and
+  // the branch list is a second view inside it.
+  const phone = usePhoneTouchViewport();
+  const [branchViewOpen, setBranchViewOpen] = useState(false);
+  const showBranchView = phone && branchViewOpen && props.branch !== null;
+  const changeOpen = (next: boolean) => {
+    setOpen(next);
+    // The sheet always opens on the overview.
+    if (!next) setBranchViewOpen(false);
+  };
   const descriptionId = useId();
 
   useCreationShortcut(!props.disabled && !open, KEYBINDS.OPEN_CREATION_ENVIRONMENT, () =>
@@ -396,7 +454,7 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
   };
 
   return (
-    <Popover modal open={open} onOpenChange={setOpen}>
+    <Popover modal open={open} onOpenChange={changeOpen}>
       <Tooltip>
         {/* Hover only. Radix also opens a tooltip on focus, and closing the panel returns focus to
             the chip: the tooltip then sat on top of the project heading, which could not be
@@ -440,6 +498,8 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
         // Keeps the same gap to both screen edges on a phone, where the panel is as wide as the
         // viewport allows and would otherwise start at the chip and end flush with the edge.
         collisionPadding={8}
+        // globals.css pins the popover carrying this to the bottom edge on a touch phone.
+        data-phone-sheet={phone ? "" : undefined}
         aria-label="Environment"
         aria-describedby={descriptionId}
         onKeyDown={(event) => {
@@ -448,7 +508,12 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
         }}
         // Wide enough for three columns on desktop; on a phone it spans the viewport and the
         // columns stack, scrolling inside the space the popover has.
-        className="flex max-h-(--radix-popover-content-available-height) w-[min(56.25rem,calc(100vw-1rem))] flex-col overflow-y-auto rounded-[10px] p-0 shadow-xl"
+        className={cn(
+          "flex flex-col overflow-y-auto p-0 shadow-xl",
+          phone
+            ? "max-h-[85dvh] w-screen rounded-t-[14px] rounded-b-none border-x-0 border-b-0 pb-[env(safe-area-inset-bottom)]"
+            : "max-h-(--radix-popover-content-available-height) w-[min(56.25rem,calc(100vw-1rem))] rounded-[10px]"
+        )}
         onOpenAutoFocus={(event) => {
           const target = environmentOpenFocusTarget(contentRef.current);
           if (!target) return;
@@ -456,54 +521,110 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
           target.focus();
         }}
       >
-        {/* Arrow keys move between the rows inside; the rows themselves are the controls. */}
-        <div role="presentation" className={cn("grid grid-cols-1", columnsClass(props))}>
-          <OptionColumn
-            title="Run on"
-            ariaLabel="Project isolation"
-            value={props.isolation.project}
-            options={props.projectOptions}
-            onChange={(project) =>
-              props.onSelectIsolation({ project, workspace: props.isolation.workspace })
-            }
+        {phone && (
+          <div className="flex shrink-0 flex-col">
+            <span aria-hidden className="bg-border-medium mx-auto mt-2 h-1 w-9 rounded-full" />
+            <div className="flex min-h-11 items-center gap-1 pr-2 pl-2">
+              {showBranchView ? (
+                <button
+                  type="button"
+                  aria-label="Back to environment"
+                  onClick={() => setBranchViewOpen(false)}
+                  className="text-foreground flex size-11 items-center justify-center"
+                >
+                  <ChevronLeft aria-hidden className="size-4" />
+                </button>
+              ) : (
+                <span className="w-2" />
+              )}
+              <span className="text-foreground flex-1 text-[15px] font-semibold">
+                {showBranchView ? "Base branch" : "Environment"}
+              </span>
+              <button
+                type="button"
+                onClick={() => changeOpen(false)}
+                className="text-foreground flex h-11 items-center px-2 text-sm font-medium"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        )}
+        {showBranchView && props.branch !== null ? (
+          <BranchColumn
+            branch={{
+              ...props.branch,
+              // A pick answers the question this view asked, so it returns to the overview.
+              onSelect: (name) => {
+                props.branch?.onSelect(name);
+                setBranchViewOpen(false);
+              },
+            }}
             disabled={props.disabled}
-            fields={props.projectFields}
+            listClassName="max-h-[55dvh] p-0"
           />
-          <OptionColumn
-            title="Isolation"
-            ariaLabel="Workspace isolation"
-            value={props.isolation.workspace}
-            options={props.workspaceOptions}
-            onChange={(workspace) =>
-              props.onSelectIsolation({ project: props.isolation.project, workspace })
-            }
-            disabled={props.disabled}
-            fields={props.workspaceFields}
-            className="border-border-light border-t md:border-t-0 md:border-l"
-          />
-          {props.branch !== null && (
-            <BranchColumn
-              branch={props.branch}
-              disabled={props.disabled}
-              className="border-border-light border-t md:border-t-0 md:border-l"
-            />
-          )}
-        </div>
-        <div className="border-border-light flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-t px-3.5 py-2.5">
-          <span id={descriptionId} className="text-muted min-w-0 flex-1 basis-48 text-xs">
-            {props.description}
-          </span>
-          {props.footerAction}
-          {/* The panel's one primary action, so it is the light button: every pick applies at
+        ) : (
+          <>
+            {/* Arrow keys move between the rows inside; the rows themselves are the controls. */}
+            <div role="presentation" className={cn("grid grid-cols-1", columnsClass(props))}>
+              <OptionColumn
+                title="Run on"
+                ariaLabel="Project isolation"
+                value={props.isolation.project}
+                options={props.projectOptions}
+                onChange={(project) =>
+                  props.onSelectIsolation({ project, workspace: props.isolation.workspace })
+                }
+                disabled={props.disabled}
+                fields={props.projectFields}
+              />
+              <OptionColumn
+                title="Isolation"
+                ariaLabel="Workspace isolation"
+                value={props.isolation.workspace}
+                options={props.workspaceOptions}
+                onChange={(workspace) =>
+                  props.onSelectIsolation({ project: props.isolation.project, workspace })
+                }
+                disabled={props.disabled}
+                fields={props.workspaceFields}
+                className="border-border-light border-t md:border-t-0 md:border-l"
+              />
+              {props.branch !== null &&
+                (phone ? (
+                  <PhoneBranchRow
+                    branch={props.branch}
+                    disabled={props.disabled}
+                    onOpen={() => setBranchViewOpen(true)}
+                  />
+                ) : (
+                  <BranchColumn
+                    branch={props.branch}
+                    disabled={props.disabled}
+                    className="border-border-light border-t md:border-t-0 md:border-l"
+                  />
+                ))}
+            </div>
+            <div className="border-border-light flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-t px-3.5 py-2.5">
+              <span id={descriptionId} className="text-muted min-w-0 flex-1 basis-48 text-xs">
+                {props.description}
+              </span>
+              {props.footerAction}
+              {/* The panel's one primary action, so it is the light button: every pick applies at
               once and Done only closes. */}
-          <Button
-            size="xs"
-            className="bg-foreground text-background hover:bg-foreground/90 h-7 px-3 text-xs font-medium"
-            onClick={() => setOpen(false)}
-          >
-            Done
-          </Button>
-        </div>
+              {/* On a phone Done is in the sheet's header, within reach while the list scrolls. */}
+              {!phone && (
+                <Button
+                  size="xs"
+                  className="bg-foreground text-background hover:bg-foreground/90 h-7 px-3 text-xs font-medium"
+                  onClick={() => changeOpen(false)}
+                >
+                  Done
+                </Button>
+              )}
+            </div>
+          </>
+        )}
       </PopoverContent>
     </Popover>
   );
