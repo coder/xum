@@ -276,6 +276,39 @@ function reuseEqualBashOutputGroupInfo(
   return info;
 }
 
+/** The work line a row sits behind, if any (compact density only). */
+function workLineKeyAt(
+  workBundleInfos: ReadonlyArray<{ readonly key: string } | undefined> | undefined,
+  index: number
+): string | undefined {
+  return workBundleInfos?.[index]?.key;
+}
+
+/**
+ * Last row of the run of bash_output polls of one process that starts at `start`. The run stops
+ * at a row behind another work line (see computeBashOutputGroupInfos).
+ */
+function findBashOutputGroupEnd(
+  messages: DisplayedMessage[],
+  start: number,
+  processId: string,
+  workBundleInfos: ReadonlyArray<{ readonly key: string } | undefined> | undefined
+): number {
+  const workLineKey = workLineKeyAt(workBundleInfos, start);
+  let groupEnd = start;
+  while (groupEnd < messages.length - 1) {
+    const nextMsg = messages[groupEnd + 1];
+    if (!isBashOutputTool(nextMsg) || nextMsg.args.process_id !== processId) {
+      break;
+    }
+    if (workLineKeyAt(workBundleInfos, groupEnd + 1) !== workLineKey) {
+      break;
+    }
+    groupEnd++;
+  }
+  return groupEnd;
+}
+
 /**
  * Precompute bash_output grouping metadata for all rows in one linear pass.
  *
@@ -302,18 +335,7 @@ export function computeBashOutputGroupInfos(
     }
 
     const processId = msg.args.process_id;
-    let groupEnd = index;
-
-    while (groupEnd < messages.length - 1) {
-      const nextMsg = messages[groupEnd + 1];
-      if (!isBashOutputTool(nextMsg) || nextMsg.args.process_id !== processId) {
-        break;
-      }
-      if (workBundleInfos?.[groupEnd + 1]?.key !== workBundleInfos?.[index]?.key) {
-        break;
-      }
-      groupEnd++;
-    }
+    const groupEnd = findBashOutputGroupEnd(messages, index, processId, workBundleInfos);
 
     const groupSize = groupEnd - index + 1;
     if (groupSize >= 3) {

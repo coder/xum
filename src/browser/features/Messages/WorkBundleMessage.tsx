@@ -24,10 +24,18 @@ function useActiveNowMs(isActive: boolean): number {
   return nowMs;
 }
 
+/** "Worked" or "Thought", in the present while the stretch is live. */
+function workVerb(item: WorkBundleInfo): string {
+  const isLive = item.state === "live";
+  if (item.kind === "thought") {
+    return isLive ? "Thinking" : "Thought";
+  }
+  return isLive ? "Working" : "Worked";
+}
+
 function formatWorkLine(item: WorkBundleInfo, liveDurationMs: number | undefined): string {
   const isLive = item.state === "live";
-  const verb =
-    item.kind === "thought" ? (isLive ? "Thinking" : "Thought") : isLive ? "Working" : "Worked";
+  const verb = workVerb(item);
   const durationMs = isLive ? liveDurationMs : item.durationMs;
   // Under a second there is nothing worth reading: "Worked" alone says it.
   const worked =

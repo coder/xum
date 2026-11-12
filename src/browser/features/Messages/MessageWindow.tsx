@@ -85,10 +85,7 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
 
   const showMetaRow = variant === "user" || showAssistantMetaRow;
 
-  // Without a message list (a transcript dialog, a test) no row is known to be the latest, and
-  // every reply keeps its row in view.
-  const messageList = useOptionalMessageListContext();
-  const isLatestRow = messageList === null || messageList.latestMessageId === message.id;
+  const isLatestRow = useIsLatestRow(message.id);
   const isQuietMetaRow = !isShowingJson && (variant === "user" || !isLatestRow);
 
   return (
@@ -126,48 +123,90 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
         </div>
       </div>
       {showMetaRow && (
-        <div
-          className={cn(
-            "text-muted flex flex-wrap items-center justify-between gap-3 text-[11px]",
-            // A prompt's block spaces its row itself (see USER_BLOCK_CLASS).
-            variant === "user" ? "ml-auto" : "mt-1",
-            isQuietMetaRow && QUIET_META_ROW_CLASS
-          )}
-          data-message-meta
-        >
-          <div className="flex flex-wrap items-center gap-0.5" data-message-meta-actions>
-            {buttons.map((button, index) => (
-              <IconActionButton key={index} button={button} />
-            ))}
-            {canShowJson && (
-              <IconActionButton
-                button={{
-                  label: isShowingJson ? "Hide JSON" : "Show JSON",
-                  icon: <Code2Icon />,
-                  active: isShowingJson,
-                  onClick: () => setShowJson(!isShowingJson),
-                  tooltip: isShowingJson ? "Hide raw JSON" : "Show raw JSON",
-                }}
-              />
-            )}
-          </div>
-          {/* flex-auto, not flex-1: with a zero basis this block shrank beside the action buttons
-              (44px each on touch phones) and wrapped the model and time onto two lines that sat off
-              the buttons' line. A content basis lets the row wrap the whole block below instead. */}
-          <div
-            className="text-muted flex min-w-0 flex-auto flex-wrap items-center gap-2 text-xs"
-            data-message-meta-right
-          >
-            {rightLabel}
-            {label && (
-              <div className="inline-flex min-w-0 items-center gap-2 whitespace-nowrap">
-                {label}
-              </div>
-            )}
-            {formattedTimestamp && <span data-message-timestamp>{formattedTimestamp}</span>}
-          </div>
-        </div>
+        <MessageMetaRow
+          variant={variant}
+          quiet={isQuietMetaRow}
+          buttons={buttons}
+          jsonToggle={
+            canShowJson
+              ? { shown: isShowingJson, onToggle: () => setShowJson(!isShowingJson) }
+              : undefined
+          }
+          rightLabel={rightLabel}
+          label={label}
+          timestampLabel={formattedTimestamp}
+        />
       )}
+    </div>
+  );
+};
+
+/**
+ * Whether this row is the latest of its message list. Without a list (a transcript dialog, a
+ * test) no row is known to be the latest, and every row counts as it: each reply keeps its
+ * action row in view.
+ */
+function useIsLatestRow(messageId: string): boolean {
+  const messageList = useOptionalMessageListContext();
+  return messageList === null || messageList.latestMessageId === messageId;
+}
+
+interface MessageMetaRowProps {
+  variant: "assistant" | "user";
+  /** Out of sight until the pointer or the keyboard is on the message (see QUIET_META_ROW_CLASS). */
+  quiet: boolean;
+  buttons: ButtonConfig[];
+  /** The raw-JSON toggle, on hosts that support the view. */
+  jsonToggle: { shown: boolean; onToggle: () => void } | undefined;
+  rightLabel: ReactNode;
+  label: ReactNode;
+  timestampLabel: string | null;
+}
+
+/** A message's action row: its buttons, then its model label and time. */
+const MessageMetaRow: React.FC<MessageMetaRowProps> = (props) => {
+  const jsonToggle = props.jsonToggle;
+  return (
+    <div
+      className={cn(
+        "text-muted flex flex-wrap items-center justify-between gap-3 text-[11px]",
+        // A prompt's block spaces its row itself (see USER_BLOCK_CLASS).
+        props.variant === "user" ? "ml-auto" : "mt-1",
+        props.quiet && QUIET_META_ROW_CLASS
+      )}
+      data-message-meta
+    >
+      <div className="flex flex-wrap items-center gap-0.5" data-message-meta-actions>
+        {props.buttons.map((button, index) => (
+          <IconActionButton key={index} button={button} />
+        ))}
+        {jsonToggle && (
+          <IconActionButton
+            button={{
+              label: jsonToggle.shown ? "Hide JSON" : "Show JSON",
+              icon: <Code2Icon />,
+              active: jsonToggle.shown,
+              onClick: jsonToggle.onToggle,
+              tooltip: jsonToggle.shown ? "Hide raw JSON" : "Show raw JSON",
+            }}
+          />
+        )}
+      </div>
+      {/* flex-auto, not flex-1: with a zero basis this block shrank beside the action buttons
+          (44px each on touch phones) and wrapped the model and time onto two lines that sat off
+          the buttons' line. A content basis lets the row wrap the whole block below instead. */}
+      <div
+        className="text-muted flex min-w-0 flex-auto flex-wrap items-center gap-2 text-xs"
+        data-message-meta-right
+      >
+        {props.rightLabel}
+        {props.label && (
+          <div className="inline-flex min-w-0 items-center gap-2 whitespace-nowrap">
+            {props.label}
+          </div>
+        )}
+        {props.timestampLabel && <span data-message-timestamp>{props.timestampLabel}</span>}
+      </div>
     </div>
   );
 };

@@ -324,19 +324,29 @@ export function computeWorkBundleInfos(
   return infos;
 }
 
-function assignWorkBundle(
-  infos: Array<WorkBundleInfo | undefined>,
+/** What one pass over a stretch finds: where its work and its narration end, and whether it runs. */
+interface StretchScan {
+  /** Last row that is not narration (reasoning or a tool call); -1 when the stretch has none. */
+  lastWorkIndex: number;
+  /** Last narration row; -1 when the stretch has none. */
+  lastTextIndex: number;
+  /**
+   * The agent is still in this stretch: it is the transcript's tail, and the turn is running. A
+   * row that is itself still running also counts, for hosts that do not report the turn (and so
+   * a stale partial call does not look finished).
+   */
+  isLive: boolean;
+}
+
+function scanStretch(
   messages: DisplayedMessage[],
   start: number,
   end: number,
   isTurnActive: boolean
-): void {
+): StretchScan {
   let lastWorkIndex = -1;
   let lastTextIndex = -1;
   let hasRunningRow = false;
-  let startedAtMs =
-    messages[start - 1]?.type === "user" ? getMessageTimestamp(messages[start - 1]) : undefined;
-  let endedAtMs: number | undefined;
   for (let index = start; index <= end; index++) {
     const message = messages[index];
     if (!isWorkBundleRow(message)) {
@@ -348,91 +358,169 @@ function assignWorkBundle(
       lastWorkIndex = index;
     }
     hasRunningRow ||= isRunningWorkBundleRow(message);
-    const timestamp = getMessageTimestamp(message);
-    startedAtMs ??= timestamp;
-    // The latest timestamp, not the last row's: a row without its own carries its message's start.
-    if (timestamp !== undefined && (endedAtMs === undefined || timestamp > endedAtMs)) {
-      endedAtMs = timestamp;
-    }
   }
-  // A reply with no work behind it needs no work line.
-  if (lastWorkIndex === -1) {
-    return;
-  }
-
-  // Live means the agent is still in this stretch: it is the transcript's tail, and the turn is
-  // running. A row that is itself still running also counts, for hosts that do not report the
-  // turn (and so a stale partial call does not look finished).
   const isLive = end === messages.length - 1 && (isTurnActive || hasRunningRow);
+  return { lastWorkIndex, lastTextIndex, isLive };
+}
 
-  // A finished stretch that worked on after its last narration is two stretches: the one that
-  // narration closes, and the work after it. Each half is assigned on its own (the first now ends
-  // on its narration and the second has none, so neither splits again).
-  if (!isLive && lastTextIndex !== -1 && lastTextIndex < end) {
-    let workedOn = false;
-    for (let index = lastTextIndex + 1; index <= end && !workedOn; index++) {
-      workedOn = isWorkAfterNarration(messages[index]);
+/**
+ * When a stretch started and how long it took. It starts at the prompt before it, or else at its
+ * first row with a timestamp. It ends at its latest timestamp, not its last row's: a row without
+ * its own carries its message's start.
+ */
+function measureStretch(
+  messages: DisplayedMessage[],
+  start: number,
+  end: number
+): { startedAtMs: number | undefined; durationMs: number | undefined } {
+  const prompt = messages[start - 1];
+  let startedAtMs = prompt?.type === "user" ? getMessageTimestamp(prompt) : undefined;
+  let endedAtMs = Number.NEGATIVE_INFINITY;
+  for (let index = start; index <= end; index++) {
+    const timestamp = getMessageTimestamp(messages[index]);
+    if (timestamp === undefined) {
+      continue;
     }
-    if (workedOn) {
-      assignWorkBundle(infos, messages, start, lastTextIndex, isTurnActive);
-      assignWorkBundle(infos, messages, lastTextIndex + 1, end, isTurnActive);
-      return;
+    startedAtMs ??= timestamp;
+    endedAtMs = Math.max(endedAtMs, timestamp);
+  }
+  // No start, or no row with a timestamp after it (endedAtMs is still -Infinity): no duration.
+  const elapsedMs = startedAtMs === undefined ? 0 : endedAtMs - startedAtMs;
+  return { startedAtMs, durationMs: elapsedMs > 0 ? elapsedMs : undefined };
+}
+
+/** Whether the stretch did real work after its last narration (which then is not a reply). */
+function workedOnAfterNarration(
+  messages: DisplayedMessage[],
+  lastTextIndex: number,
+  end: number
+): boolean {
+  if (lastTextIndex === -1) {
+    return false;
+  }
+  for (let index = lastTextIndex + 1; index <= end; index++) {
+    if (isWorkAfterNarration(messages[index])) {
+      return true;
     }
   }
+  return false;
+}
 
-  // The reply is the last narration, with any narration directly before it. Bookkeeping that
-  // follows it (a todo update, a notification) folds like the rest, so it never hides a reply.
-  let answerStart = lastTextIndex;
-  while (answerStart > start && messages[answerStart - 1].type === "assistant") {
-    answerStart -= 1;
+/** Rows `first` to `last`; empty when `first` is above `last`. */
+interface RowRange {
+  first: number;
+  last: number;
+}
+
+const isInRange = (range: RowRange, index: number) => index >= range.first && index <= range.last;
+
+/**
+ * The reply of a stretch: its last narration, with any narration directly before it. Bookkeeping
+ * that follows it (a todo update, a notification) folds like the rest, so it never hides a reply.
+ * The range is empty when the stretch has no narration.
+ */
+function findAnswerRange(
+  messages: DisplayedMessage[],
+  start: number,
+  lastTextIndex: number
+): RowRange {
+  if (lastTextIndex === -1) {
+    return { first: 0, last: -1 };
   }
-  const isAnswer = (index: number) =>
-    lastTextIndex !== -1 && index >= answerStart && index <= lastTextIndex;
+  let first = lastTextIndex;
+  while (first > start && messages[first - 1].type === "assistant") {
+    first -= 1;
+  }
+  return { first, last: lastTextIndex };
+}
 
+/** What the work line says about the rows it folds: whether they only reasoned, and their edits. */
+function summarizeFoldedRows(
+  messages: DisplayedMessage[],
+  start: number,
+  end: number,
+  answer: RowRange
+): { onlyReasoned: boolean; editedFileCount: number } {
   let onlyReasoned = true;
   const editedFiles = new Set<string>();
   for (let index = start; index <= end; index++) {
     const message = messages[index];
-    if (isAnswer(index) || !isWorkBundleRow(message)) {
+    if (isInRange(answer, index) || !isWorkBundleRow(message)) {
       continue;
     }
     onlyReasoned &&= message.type === "reasoning";
     collectEditedFiles(editedFiles, message);
   }
+  return { onlyReasoned, editedFileCount: editedFiles.size };
+}
 
-  const base = {
+/** Whether a folded work row still shows under its closed work line. */
+function showsThroughFold(message: DisplayedMessage, index: number, scan: StretchScan): boolean {
+  return (
+    // A running call (an approval, or the thing the user is waiting on), or the row an
+    // interrupted turn stopped on.
+    needsUser(message) ||
+    // The latest step of a live stretch, unless the agent has since moved on to writing.
+    (scan.isLive && index === scan.lastWorkIndex && index > scan.lastTextIndex)
+  );
+}
+
+function assignWorkBundle(
+  infos: Array<WorkBundleInfo | undefined>,
+  messages: DisplayedMessage[],
+  start: number,
+  end: number,
+  isTurnActive: boolean
+): void {
+  const scan = scanStretch(messages, start, end, isTurnActive);
+  // A reply with no work behind it needs no work line.
+  if (scan.lastWorkIndex === -1) {
+    return;
+  }
+
+  // A finished stretch that worked on after its last narration is two stretches: the one that
+  // narration closes, and the work after it. Each half is assigned on its own (the first now ends
+  // on its narration and the second has none, so neither splits again).
+  if (!scan.isLive && workedOnAfterNarration(messages, scan.lastTextIndex, end)) {
+    assignWorkBundle(infos, messages, start, scan.lastTextIndex, isTurnActive);
+    assignWorkBundle(infos, messages, scan.lastTextIndex + 1, end, isTurnActive);
+    return;
+  }
+
+  const answer = findAnswerRange(messages, start, scan.lastTextIndex);
+  const base = describeStretch(messages, start, end, scan, answer);
+  // Every row of a stretch is an agent row (computeWorkBundleInfos only builds such stretches).
+  for (let index = start; index <= end; index++) {
+    infos[index] = isInRange(answer, index)
+      ? { ...base, role: "answer", visibleWhenFolded: true }
+      : {
+          ...base,
+          role: "work",
+          visibleWhenFolded: showsThroughFold(messages[index], index, scan),
+        };
+  }
+}
+
+/** What every row of a stretch shares: the facts its work line states. */
+function describeStretch(
+  messages: DisplayedMessage[],
+  start: number,
+  end: number,
+  scan: StretchScan,
+  answer: RowRange
+): Omit<WorkBundleInfo, "role" | "visibleWhenFolded"> {
+  const folded = summarizeFoldedRows(messages, start, end, answer);
+  const timing = measureStretch(messages, start, end);
+  return {
     key: `work:${messages[start].id}`,
     headIndex: start,
-    state: isLive ? "live" : "settled",
-    kind: onlyReasoned ? "thought" : "work",
-    editedFileCount: editedFiles.size,
-    startedAtMs,
-    durationMs:
-      !isLive && startedAtMs !== undefined && endedAtMs !== undefined && endedAtMs > startedAtMs
-        ? endedAtMs - startedAtMs
-        : undefined,
-  } satisfies Partial<WorkBundleInfo>;
-
-  for (let index = start; index <= end; index++) {
-    const message = messages[index];
-    if (!isWorkBundleRow(message)) {
-      continue;
-    }
-    if (isAnswer(index)) {
-      infos[index] = { ...base, role: "answer", visibleWhenFolded: true };
-      continue;
-    }
-    infos[index] = {
-      ...base,
-      role: "work",
-      visibleWhenFolded:
-        // A running call (an approval, or the thing the user is waiting on), or the row an
-        // interrupted turn stopped on.
-        needsUser(message) ||
-        // The latest step, unless the agent has since moved on to writing.
-        (isLive && index === lastWorkIndex && index > lastTextIndex),
-    };
-  }
+    state: scan.isLive ? "live" : "settled",
+    kind: folded.onlyReasoned ? "thought" : "work",
+    editedFileCount: folded.editedFileCount,
+    startedAtMs: timing.startedAtMs,
+    // A live stretch has no duration yet: its line runs a clock from startedAtMs.
+    durationMs: scan.isLive ? undefined : timing.durationMs,
+  };
 }
 
 /**
@@ -459,17 +547,22 @@ export function computeWindowRowIndices(
   if (workBundleInfos === undefined) return undefined;
   const indices: number[] = [];
   for (let index = 0; index < workBundleInfos.length; index++) {
-    const info = workBundleInfos[index];
-    const mounts =
-      info === undefined ||
-      info.state === "live" ||
-      info.role === "answer" ||
-      info.visibleWhenFolded ||
-      info.headIndex === index ||
-      workBundleInfos[index + 1]?.key !== info.key;
-    if (mounts) indices.push(index);
+    if (countsInWindow(workBundleInfos, index)) indices.push(index);
   }
   return indices.length === workBundleInfos.length ? undefined : indices;
+}
+
+/** Whether the mount window counts the row at `index` (the rules of computeWindowRowIndices). */
+function countsInWindow(
+  workBundleInfos: ReadonlyArray<WorkBundleInfo | undefined>,
+  index: number
+): boolean {
+  const info = workBundleInfos[index];
+  if (info === undefined || info.state === "live") return true;
+  const showsWhenFolded = info.role === "answer" || info.visibleWhenFolded;
+  const isFirstOfStretch = info.headIndex === index;
+  const isLastOfStretch = workBundleInfos[index + 1]?.key !== info.key;
+  return showsWhenFolded || isFirstOfStretch || isLastOfStretch;
 }
 
 /** The rows a mount window counts, with its indices translated to and from the transcript's. */
@@ -583,11 +676,14 @@ function isRoutineToolMessage(
   if (nestedCalls.some((call) => !isRoutineToolCall(call.toolName, call.input, call.output))) {
     return false;
   }
-  const result = unwrapJsonResult(message.result);
-  return !(
-    isPlainObject(result) &&
-    Array.isArray(result.attachments) &&
-    result.attachments.length > 0
+  return !carriesAttachments(message.result);
+}
+
+/** Whether a tool result carries attachments (screenshots, files) for the user to see. */
+function carriesAttachments(rawResult: unknown): boolean {
+  const result = unwrapJsonResult(rawResult);
+  return (
+    isPlainObject(result) && Array.isArray(result.attachments) && result.attachments.length > 0
   );
 }
 
@@ -862,33 +958,23 @@ function isActiveOperationalMessage(message: OperationalBundleMemberMessage): bo
  * rows are folded in silently; a reasoning-only bundle reads "Thought".
  */
 function formatTitle(messages: OperationalBundleMemberMessage[]): string {
-  const counts = new Map<Exclude<OperationalBundleCategory, "reasoning">, number>();
-  for (const message of messages) {
-    const category = getOperationalBundleCategory(message);
-    if (category === "reasoning") continue;
-    counts.set(category, (counts.get(category) ?? 0) + 1);
-  }
-  if (counts.size === 0) {
+  const entries = countToolCategories(messages);
+  if (entries.length === 0) {
     return "Thought";
   }
 
-  const phrase = (category: Exclude<OperationalBundleCategory, "reasoning">, count: number) => {
-    const copy = OPERATIONAL_BUNDLE_CATEGORY_COPY[category];
-    return `${count.toLocaleString()} ${count === 1 ? copy.noun : copy.nounPlural}`;
-  };
-  const entries = Array.from(counts.entries());
   if (
     entries.length > 1 &&
     entries.every(([category]) => OPERATIONAL_BUNDLE_CATEGORY_COPY[category].explores)
   ) {
-    return `Explored ${entries.map(([category, count]) => phrase(category, count)).join(", ")}`;
+    return `Explored ${entries.map(([category, count]) => formatCategoryCount(category, count)).join(", ")}`;
   }
 
   // Merge categories that share a verb ("Ran 2 commands and 1 script") so the line stays short.
   const clauses = new Map<string, string[]>();
   for (const [category, count] of entries) {
     const verb = OPERATIONAL_BUNDLE_CATEGORY_COPY[category].verb;
-    clauses.set(verb, [...(clauses.get(verb) ?? []), phrase(category, count)]);
+    clauses.set(verb, [...(clauses.get(verb) ?? []), formatCategoryCount(category, count)]);
   }
   return Array.from(clauses.entries())
     .map(
@@ -896,6 +982,27 @@ function formatTitle(messages: OperationalBundleMemberMessage[]): string {
         `${index === 0 ? verb : verb.toLowerCase()} ${phrases.join(" and ")}`
     )
     .join(", ");
+}
+
+type ToolBundleCategory = Exclude<OperationalBundleCategory, "reasoning">;
+
+/** How many calls of each kind a run made, in order of first appearance. Reasoning is not counted. */
+function countToolCategories(
+  messages: OperationalBundleMemberMessage[]
+): Array<[ToolBundleCategory, number]> {
+  const counts = new Map<ToolBundleCategory, number>();
+  for (const message of messages) {
+    const category = getOperationalBundleCategory(message);
+    if (category === "reasoning") continue;
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+  return Array.from(counts.entries());
+}
+
+/** "3 files", "1 command". */
+function formatCategoryCount(category: ToolBundleCategory, count: number): string {
+  const copy = OPERATIONAL_BUNDLE_CATEGORY_COPY[category];
+  return `${count.toLocaleString()} ${count === 1 ? copy.noun : copy.nounPlural}`;
 }
 
 /** A collapsed bundle hides each card's status, so failures surface in the summary itself. */
@@ -906,45 +1013,36 @@ function formatFailures(messages: OperationalBundleMemberMessage[]): string {
   return failedCount > 0 ? `${failedCount.toLocaleString()} failed` : "";
 }
 
+/**
+ * The summary category of each tool that is known by name. Tools not listed (and not a file
+ * read or edit) count as a plain "tool".
+ */
+const TOOL_CATEGORY_BY_NAME = new Map<string, ToolBundleCategory>([
+  ["bash", "shell"],
+  ["web_search", "search"],
+  // server:GOOGLE_SEARCH_WEB is Google's native search grounding (Gemini 3+); one call can
+  // carry several queries, but it is still one search operation for bundle copy purposes.
+  ["server:GOOGLE_SEARCH_WEB", "search"],
+  ["web_fetch", "fetch"],
+  ["agent_skill_read", "skill"],
+  ["agent_skill_read_file", "skill"],
+  ["ask_user_question", "question"],
+  ["task", "task"],
+  ["task_await", "wait"],
+  ["code_execution", "code"],
+]);
+
 function getOperationalBundleCategory(
   message: OperationalBundleMemberMessage
 ): OperationalBundleCategory {
   if (message.type === "reasoning") {
     return "reasoning";
   }
-
   if (FILE_READ_TOOL_NAMES.has(message.toolName)) {
     return "read";
   }
   if (FILE_EDIT_TOOL_NAMES.has(message.toolName)) {
     return "edit";
   }
-  if (message.toolName === "bash") {
-    return "shell";
-  }
-  // server:GOOGLE_SEARCH_WEB is Google's native search grounding (Gemini 3+); one call can
-  // carry several queries, but it is still one search operation for bundle copy purposes.
-  if (message.toolName === "web_search" || message.toolName === "server:GOOGLE_SEARCH_WEB") {
-    return "search";
-  }
-  if (message.toolName === "web_fetch") {
-    return "fetch";
-  }
-  if (message.toolName === "agent_skill_read" || message.toolName === "agent_skill_read_file") {
-    return "skill";
-  }
-  if (message.toolName === "ask_user_question") {
-    return "question";
-  }
-  if (message.toolName === "task") {
-    return "task";
-  }
-  if (message.toolName === "task_await") {
-    return "wait";
-  }
-  if (message.toolName === "code_execution") {
-    return "code";
-  }
-
-  return "tool";
+  return TOOL_CATEGORY_BY_NAME.get(message.toolName) ?? "tool";
 }
