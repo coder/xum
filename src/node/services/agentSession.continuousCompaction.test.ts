@@ -1793,6 +1793,61 @@ describe("AgentSession continuous compaction wiring", () => {
     }
   );
 
+  test("a summary on a google-typed Coder instance replays only that route's thought signatures", async () => {
+    const { h, args } = await summarySetup();
+    const requests: LanguageModelV3CallOptions[] = [];
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+      },
+    });
+    const coderConfig = {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      discoveredProviders: [{ name: "agents-google", type: "google" as const }],
+      canonicalRoutes: { google: "agents-google" },
+    };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({ coder: coderConfig });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        ...pinnedSummaryModel(sdkModel, "google:gemini-4-carbon"),
+        optionsRouteProvider: "coder" as const,
+        optionsProvidersConfig: { coder: coderConfig },
+      })
+    );
+    const toolCall: MuxMessage = {
+      id: "assistant-tool",
+      role: "assistant",
+      metadata: {},
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "ls" },
+          output: "README.md",
+          providerOptions: {
+            coderGoogle: { thoughtSignature: "sig-coder" },
+            google: { thoughtSignature: "sig-native" },
+          },
+        },
+      ],
+    };
+    await summarizeContinuousCompaction({
+      ...args,
+      head: [...args.head, toolCall],
+      compactOptions: { ...args.compactOptions, model: "google:gemini-4-carbon" },
+    });
+    const sentOptions = requests[0].prompt
+      .flatMap((message) => (message.role === "assistant" ? message.content : []))
+      .filter((part) => part.type === "tool-call")
+      .map((part) => part.providerOptions);
+    expect(sentOptions).toEqual([{ coderGoogle: { thoughtSignature: "sig-coder" } }]);
+  });
+
   test("a Sonnet 5.5 'off' summary after a higher-effort turn prepares messages at low too", async () => {
     // #5086: the effort pin turns "off" into low adaptive here; the summary must then
     // prepare messages at "low" (keeping signed reasoning), not strip them as for
