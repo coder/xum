@@ -214,10 +214,16 @@ describe("sameForcedArchiveLoss", () => {
       true
     );
     expect(
-      sameForcedArchiveLoss(withCheckout, loss({ deletedCheckout: { ...checkout, path: "/src/repo/renamed" } }))
+      sameForcedArchiveLoss(
+        withCheckout,
+        loss({ deletedCheckout: { ...checkout, path: "/src/repo/renamed" } })
+      )
     ).toBe(false);
     expect(
-      sameForcedArchiveLoss(withCheckout, loss({ deletedCheckout: { ...checkout, branch: "renamed" } }))
+      sameForcedArchiveLoss(
+        withCheckout,
+        loss({ deletedCheckout: { ...checkout, branch: "renamed" } })
+      )
     ).toBe(false);
     expect(sameForcedArchiveLoss(withCheckout, loss({}))).toBe(false);
   });
