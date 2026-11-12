@@ -158,107 +158,68 @@ describe("work bundles (compact density)", () => {
   function work(messages: DisplayedMessage[], isTurnActive = false) {
     return computeWorkBundleInfos(messages, { isTurnActive });
   }
+  const lines = (infos: Array<WorkBundleInfo | undefined>) => infos.map((info) => info?.key);
 
-  test("folds everything but the reply behind one line", () => {
+  test("keeps what the agent wrote in view and folds the steps between into one line each", () => {
     const infos = work([
       user("prompt"),
       reasoning({ id: "think", ...TURN }),
-      assistant("narration", TURN),
-      tool({ id: "read", ...TURN }),
-      tool({ id: "edit", toolName: "file_edit_replace_string", ...TURN }),
-      assistant("reply", TURN),
-    ]);
-
-    expect(infos[0]).toBeUndefined();
-    for (const index of [1, 2, 3, 4]) {
-      expect(infos[index]).toMatchObject({
-        key: "work:think",
-        headIndex: 1,
-        role: "work",
-        visibleWhenFolded: false,
-        state: "settled",
-        kind: "work",
-      });
-    }
-    expect(infos[5]).toMatchObject({
-      key: "work:think",
-      role: "answer",
-      visibleWhenFolded: true,
-    });
-  });
-
-  test("keeps the reply in view when bookkeeping follows it", () => {
-    const infos = work([
-      tool({ id: "read", ...TURN }),
+      assistant("update-1", TURN),
+      tool({ id: "read-a", ...TURN }),
+      tool({ id: "read-b", ...TURN }),
+      tool({ id: "tests", toolName: "bash", ...TURN }),
+      assistant("update-2", TURN),
+      tool({ id: "edit", toolName: "file_edit_insert", status: "failed", ...TURN }),
       assistant("reply", TURN),
       tool({ id: "todo", toolName: "todo_write", ...TURN }),
     ]);
 
-    expect(infos[1]).toMatchObject({ role: "answer" });
-    expect(infos[2]).toMatchObject({
-      key: "work:read",
-      role: "work",
-      visibleWhenFolded: false,
-    });
-  });
-
-  test("keeps one line, and the last narration in view, when the turn worked on after it", () => {
-    // Interrupted while running the tests. The work after "Now running the tests." is behind the
-    // same line as the work before it: one turn, one line. The narration is the last thing the
-    // agent said, so it stays in view.
-    const infos = work([
-      user("prompt"),
-      tool({ id: "read", ...TURN }),
-      assistant("now-running-the-tests", TURN),
-      tool({ id: "tests", toolName: "bash", status: "interrupted", ...TURN }),
-      tool({ id: "todo", toolName: "todo_write", ...TURN }),
+    // Every update and the reply are plain rows. Each run of steps between them is a stretch.
+    expect(lines(infos)).toEqual([
+      undefined,
+      "work:think",
+      undefined,
+      "work:read-a",
+      "work:read-a",
+      "work:read-a",
+      undefined,
+      "work:edit",
+      undefined,
+      "work:todo",
     ]);
-
-    expect(infos.slice(1).map((info) => info?.key)).toEqual(Array<string>(4).fill("work:read"));
-    expect(infos.slice(1).map((info) => info?.role)).toEqual(["work", "answer", "work", "work"]);
-    expect(infos[3]).toMatchObject({ visibleWhenFolded: false });
-
-    // While the turn runs, the same line names the running call.
-    const live = work(
-      [
-        user("prompt"),
-        tool({ id: "read", ...TURN }),
-        assistant("now-running-the-tests", TURN),
-        tool({ id: "tests", toolName: "bash", status: "executing", ...TURN }),
-      ],
-      true
-    );
-    expect(live[3]).toMatchObject({
-      key: "work:read",
-      state: "live",
-      liveStep: "Running a command",
-    });
+    expect(infos[5]).toMatchObject({ headIndex: 3, state: "settled", visibleWhenFolded: false });
+    // The line says what its steps did, and that one of them failed.
+    expect(infos.map((info) => info?.summary).filter((summary) => summary !== undefined)).toEqual([
+      "Thought",
+      "Read 2 files, ran 1 command",
+      "Read 2 files, ran 1 command",
+      "Read 2 files, ran 1 command",
+      "Edited 1 file · 1 failed",
+      "Updated the todo list",
+    ]);
   });
 
-  test("merges the messages of one turn until one of them replies", () => {
-    // Interrupted mid-work, then continued: two assistant messages, one piece of work.
-    const infos = work([
+  test("folds a machine prompt with the steps around it, across the messages of a turn", () => {
+    // A sub-agent finished mid-work: the wake-up is a step like the calls on either side of it.
+    const midWork = work([
       user("prompt"),
       tool({ id: "read-a", historyId: "history-a" }),
-      assistant("narration-a", { historyId: "history-a" }),
-      tool({ id: "tests-a", toolName: "bash", status: "interrupted", historyId: "history-a" }),
+      wake("wake"),
       tool({ id: "read-b", historyId: "history-b" }),
-      assistant("reply-b", { historyId: "history-b" }),
+      assistant("reply", { historyId: "history-b" }),
     ]);
-
-    expect(infos.slice(1).map((info) => info?.key)).toEqual(Array<string>(5).fill("work:read-a"));
-    // The earlier narration is not the reply: it folds with the work.
-    expect(infos.slice(1).map((info) => info?.role)).toEqual([
-      "work",
-      "work",
-      "work",
-      "work",
-      "answer",
+    expect(lines(midWork)).toEqual([
+      undefined,
+      "work:read-a",
+      "work:read-a",
+      "work:read-a",
+      undefined,
     ]);
-  });
+    // The prompt itself is not something the agent did.
+    expect(midWork[1]?.summary).toBe("Read 2 files");
 
-  test("folds a machine prompt with the work it starts, after the reply before it", () => {
-    const infos = work([
+    // After something the agent wrote, the wake-up heads the stretch it starts.
+    const afterReply = work([
       user("prompt"),
       tool({ id: "read-a", historyId: "history-a" }),
       assistant("reply-a", { historyId: "history-a" }),
@@ -266,102 +227,27 @@ describe("work bundles (compact density)", () => {
       tool({ id: "read-b", historyId: "history-b" }),
       assistant("reply-b", { historyId: "history-b" }),
     ]);
-
-    expect(infos[2]).toMatchObject({ key: "work:read-a", role: "answer" });
-    // The wake-up heads the next stretch: opening that line shows what woke the agent.
-    expect(infos[3]).toMatchObject({
-      key: "work:wake",
-      headIndex: 3,
-      role: "work",
-      visibleWhenFolded: false,
-    });
-    expect(infos[4]).toMatchObject({ key: "work:wake", role: "work" });
-    expect(infos[5]).toMatchObject({ key: "work:wake", role: "answer" });
-
-    // A prompt the user typed is never folded, whatever it says.
-    const typed = { ...wake("typed"), isSynthetic: false };
-    const withTyped = work([tool({ id: "read", ...TURN }), typed, tool({ id: "next", ...TURN })]);
-    expect(withTyped[1]).toBeUndefined();
-    expect(withTyped[2]).toMatchObject({ key: "work:next" });
-  });
-
-  test("keeps a nudge and the bookkeeping it asked for behind the reply's line", () => {
-    const messages = [
-      user("prompt"),
-      tool({ id: "read-a", historyId: "history-a" }),
-      assistant("reply-a", { historyId: "history-a" }),
-      wake("nudge"),
-      tool({ id: "todo", toolName: "todo_write", historyId: "history-b" }),
-    ];
-
-    // Nothing after the reply said or did anything: no second line.
-    const settled = work(messages);
-    expect(settled.slice(1).map((info) => info?.key)).toEqual(Array<string>(4).fill("work:read-a"));
-    expect(settled[2]).toMatchObject({ role: "answer" });
-    expect(settled[4]).toMatchObject({ role: "work", visibleWhenFolded: false });
-
-    // While the turn runs the agent is acting on the nudge: that is its own, live, stretch,
-    // and the finished line above does not appear to restart.
-    const live = work(messages, true);
-    expect(live[1]).toMatchObject({ key: "work:read-a", state: "settled" });
-    expect(live[3]).toMatchObject({ key: "work:nudge", state: "live" });
-    expect(live[4]).toMatchObject({ key: "work:nudge", liveStep: "Using todo_write" });
+    expect(lines(afterReply)).toEqual([
+      undefined,
+      "work:read-a",
+      undefined,
+      "work:wake",
+      "work:wake",
+      undefined,
+    ]);
   });
 
   test("leaves a machine prompt the agent has not acted on as its own row", () => {
     expect(work([user("prompt"), wake("wake")])).toEqual([undefined, undefined]);
-    // With only a reply after it there is still no work to fold.
-    const replied = work([user("prompt"), wake("wake"), assistant("reply", TURN)]);
-    expect(replied).toEqual([undefined, undefined, undefined]);
-  });
-
-  test("counts the files the folded work edited, once each and only when the edit landed", () => {
-    const edit = (id: string, path: string, overrides: Partial<ReturnType<typeof tool>> = {}) =>
-      tool({ id, toolName: "file_edit_replace_string", args: { path }, ...TURN, ...overrides });
-    const infos = work([
-      edit("edit-1", "src/a.ts"),
-      edit("edit-2", "src/a.ts"),
-      edit("edit-3", "src/b.ts", { toolName: "file_edit_insert" }),
-      edit("edit-failed", "src/c.ts", { status: "failed" }),
-      edit("edit-refused", "src/d.ts", { result: { success: false, error: "no match" } }),
-      // A script's edits count too.
-      tool({
-        id: "script",
-        toolName: "code_execution",
-        ...TURN,
-        nestedCalls: [
-          {
-            toolCallId: "nested-edit",
-            toolName: "file_edit_insert",
-            input: { path: "src/e.ts" },
-            output: { success: true },
-            state: "output-available",
-          },
-        ],
-      }),
-      tool({ id: "read", args: { path: "src/f.ts" }, ...TURN }),
-      assistant("reply", TURN),
+    // With only a reply after it there is still nothing to fold.
+    expect(work([user("prompt"), wake("wake"), assistant("reply", TURN)])).toEqual([
+      undefined,
+      undefined,
+      undefined,
     ]);
-
-    expect(infos[0]?.editedFileCount).toBe(3);
-    expect(
-      work([tool({ id: "read", ...TURN }), assistant("reply", TURN)])[0]?.editedFileCount
-    ).toBe(0);
-  });
-
-  test("gives a reply with no work behind it no line, and a turn that only reasoned its own name", () => {
-    expect(work([user("prompt"), assistant("reply", TURN)])).toEqual([undefined, undefined]);
-
-    const thought = work([reasoning({ id: "think", ...TURN }), assistant("reply", TURN)]);
-    expect(thought[0]).toMatchObject({ role: "work", kind: "thought" });
-
-    // Narration that folds is work, not thought.
-    const narrated = work([
-      assistant("narration", TURN),
-      reasoning({ id: "think", ...TURN }),
-      assistant("reply", TURN),
-    ]);
-    expect(narrated[0]).toMatchObject({ role: "work", kind: "work" });
+    // Once the agent takes a step, the prompt folds with it.
+    const acted = work([user("prompt"), wake("wake"), reasoning({ id: "think", ...TURN })]);
+    expect(lines(acted)).toEqual([undefined, "work:wake", "work:wake"]);
   });
 
   test("never folds a question, a plan or an error, and starts a new stretch after one", () => {
@@ -374,16 +260,15 @@ describe("work bundles (compact density)", () => {
       streamError("error", TURN.historyId),
     ]);
 
-    expect(infos[0]).toMatchObject({ key: "work:read-a", role: "work" });
-    expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toMatchObject({
-      key: "work:read-b",
-      headIndex: 2,
-      role: "work",
-    });
-    expect(infos[3]).toMatchObject({ key: "work:read-b", role: "answer" });
-    expect(infos[4]).toBeUndefined();
-    expect(infos[5]).toBeUndefined();
+    expect(lines(infos)).toEqual([
+      "work:read-a",
+      undefined,
+      "work:read-b",
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    expect(infos[2]).toMatchObject({ headIndex: 2 });
   });
 
   test("never folds a tool row that carries an MCP App view, its own or a nested call's", () => {
@@ -413,28 +298,11 @@ describe("work bundles (compact density)", () => {
       assistant("reply", TURN),
     ]);
 
-    expect(infos[0]).toMatchObject({ key: "work:read-a", role: "work" });
-    expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toMatchObject({ key: "work:read-b", role: "work" });
-    expect(infos[3]).toBeUndefined();
-    // The reply after the last view has no work behind it, so it needs no line.
-    expect(infos[4]).toBeUndefined();
+    expect(lines(infos)).toEqual(["work:read-a", undefined, "work:read-b", undefined, undefined]);
   });
 
-  test("gives a second message its own stretch and reply when no prompt separates them", () => {
-    const infos = work([
-      tool({ id: "read-a", historyId: "history-a" }),
-      assistant("reply-a", { historyId: "history-a" }),
-      tool({ id: "read-b", historyId: "history-b" }),
-      assistant("reply-b", { historyId: "history-b" }),
-    ]);
-
-    expect(infos[1]).toMatchObject({ key: "work:read-a", role: "answer" });
-    expect(infos[3]).toMatchObject({ key: "work:read-b", role: "answer" });
-  });
-
-  test("names a live turn's latest step on its line and mounts no row for it", () => {
-    const narration = assistant("narration", TURN);
+  test("names a live stretch's latest step on its line and mounts no row for it", () => {
+    const update = assistant("update", TURN);
     const first = tool({ id: "read-1", args: { path: "src/auth/session.ts" }, ...TURN });
     const latest = tool({
       id: "tests",
@@ -444,16 +312,19 @@ describe("work bundles (compact density)", () => {
       ...TURN,
     });
 
-    // Nothing shows under the line but the narration: a step that rendered in under it was gone
-    // again when the next one started.
-    const working = work([user("prompt"), narration, first, latest], true);
-    expect(working[1]).toMatchObject({ state: "live", role: "answer" });
-    expect(working.slice(2).map((info) => info?.visibleWhenFolded)).toEqual([false, false]);
-    expect(working[2]).toMatchObject({ state: "live", liveStep: "Running the unit tests" });
+    // Nothing shows under the line: a step that rendered in under it was gone again when the
+    // next one started.
+    const working = work([user("prompt"), update, first, latest], true);
+    expect(working[1]).toBeUndefined();
+    expect(working.slice(2)).toEqual([
+      expect.objectContaining({ state: "live", visibleWhenFolded: false }),
+      expect.objectContaining({ state: "live", visibleWhenFolded: false }),
+    ]);
+    expect(working[2]?.summary).toBe("Running the unit tests");
 
-    // The line follows the turn step by step.
+    // The line follows the stretch step by step.
     const stepOf = (...steps: DisplayedMessage[]) =>
-      work([user("prompt"), ...steps], true)[1]?.liveStep;
+      work([user("prompt"), ...steps], true)[1]?.summary;
     expect(stepOf(first)).toBe("Reading session.ts");
     expect(stepOf(first, reasoning({ isStreaming: true, ...TURN }))).toBe("Thinking");
     expect(
@@ -486,32 +357,21 @@ describe("work bundles (compact density)", () => {
     });
     expect(stepOf(script)).toBe("Searching the web");
     expect(stepOf(tool({ toolName: "code_execution", ...TURN }))).toBe("Running a script");
+    // A prompt the machine has just handed the agent: no step of its own to name yet.
+    expect(stepOf(first, wake("wake"))).toBe("Working");
 
-    // A turn that has only reasoned already reads "Thinking": its line needs no step.
-    expect(
-      work([user("prompt"), reasoning({ isStreaming: true, ...TURN })], true)[1]
-    ).toMatchObject({
-      kind: "thought",
-      liveStep: undefined,
-    });
-
-    // Once the agent writes, the narration is the latest thing and the line names no step.
+    // Once the agent writes, the stretch is done: its line says what it did.
     const writing = work(
-      [
-        user("prompt"),
-        narration,
-        first,
-        latest,
-        assistant("reply", { ...TURN, isStreaming: true }),
-      ],
+      [user("prompt"), first, latest, assistant("reply", { ...TURN, isStreaming: true })],
       true
     );
-    expect(writing[1]).toMatchObject({ role: "work", visibleWhenFolded: false });
-    expect(writing[4]).toMatchObject({ state: "live", role: "answer", liveStep: undefined });
+    expect(writing[1]).toMatchObject({ state: "settled", summary: "Read 1 file, ran 1 command" });
+    expect(writing[3]).toBeUndefined();
 
-    // The same rows are settled once the turn ends, and an earlier turn is never live.
-    const settled = work([user("prompt"), narration, first, tool({ id: "done", ...TURN })], false);
-    expect(settled[3]).toMatchObject({ state: "settled", liveStep: undefined });
+    // The same steps are settled once the turn ends, and an earlier turn is never live.
+    expect(work([user("prompt"), first, tool({ id: "done", ...TURN })], false)[2]).toMatchObject({
+      state: "settled",
+    });
     expect(work([first, assistant("reply", TURN), user("next")], true)[0]).toMatchObject({
       state: "settled",
     });
@@ -544,11 +404,11 @@ describe("work bundles (compact density)", () => {
     // A running call keeps its stretch live on a host that does not report the turn.
     expect(work(messages, false)[0]).toMatchObject({
       state: "live",
-      liveStep: "Running a command",
+      summary: "Running a command",
     });
   });
 
-  // The row the transcript ends on when its turn was interrupted carries the divider that
+  // The row the transcript ends on when its turn was interrupted carries the control that
   // continues the turn. Further up, an interrupted row carries nothing and folds.
   test("shows the row an interrupted turn stopped on through the fold while it is the tail", () => {
     const stoppedOnCall = work([
@@ -566,52 +426,20 @@ describe("work bundles (compact density)", () => {
     expect(stoppedOnCall[1]).toMatchObject({ state: "settled", visibleWhenFolded: false });
     expect(stoppedOnCall[2]).toMatchObject({ state: "settled", visibleWhenFolded: true });
 
-    const stoppedWhileThinking = work([
-      user("prompt"),
-      reasoning({ id: "think", isPartial: true, isLastPartOfMessage: true, ...TURN }),
-    ]);
-    expect(stoppedWhileThinking[1]).toMatchObject({ kind: "thought", visibleWhenFolded: true });
-
-    const wentOn = work([
-      user("prompt"),
-      reasoning({ id: "think", isPartial: true, isLastPartOfMessage: true, ...TURN }),
-      user("next-prompt"),
-    ]);
-    expect(wentOn[1]).toMatchObject({ kind: "thought", visibleWhenFolded: false });
-  });
-
-  test("times a stretch from the prompt to its latest timestamp, or not at all", () => {
-    const prompt = user("prompt", 1_000);
-    const timed = work([
-      prompt,
-      tool({ id: "read", timestamp: 5_000, ...TURN }),
-      assistant("reply", { ...TURN, timestamp: 135_000 }),
-      // A row without its own timestamp carries its message's start: it must not end the clock.
-      tool({ id: "todo", toolName: "todo_write", timestamp: 5_000, ...TURN }),
-    ]);
-    expect(timed[1]).toMatchObject({ startedAtMs: 1_000, durationMs: 134_000 });
-
-    // A machine prompt can start the clock (the wake-up that began the work) and never ends
-    // it: a report is shown where the agent was, which can be before older rows.
-    const woken = work([
-      prompt,
-      assistant("reply-a", { historyId: "history-a", timestamp: 2_000 }),
-      wake("wake", 60_000),
-      tool({ id: "read", timestamp: 61_000, ...TURN }),
-      wake("late-report", 900_000),
-      assistant("reply-b", { ...TURN, timestamp: 70_000 }),
-    ]);
-    expect(woken[2]).toMatchObject({ key: "work:wake", startedAtMs: 60_000, durationMs: 10_000 });
-
-    const untimed = work([user("prompt"), tool({ id: "read", ...TURN }), assistant("reply", TURN)]);
-    expect(untimed[1]?.durationMs).toBeUndefined();
-
-    // A live stretch has a start for the running clock and no duration yet.
-    const live = work([prompt, tool({ id: "read", timestamp: 5_000, ...TURN })], true);
-    expect(live[1]).toMatchObject({ startedAtMs: 1_000 });
-    expect(live[1]?.durationMs).toBeUndefined();
+    const stoppedThought = reasoning({
+      id: "think",
+      isPartial: true,
+      isLastPartOfMessage: true,
+      ...TURN,
+    });
+    expect(work([user("prompt"), stoppedThought])[1]).toMatchObject({ visibleWhenFolded: true });
+    // The conversation went on: the stopped row needs nobody.
+    expect(work([user("prompt"), stoppedThought, user("next-prompt")])[1]).toMatchObject({
+      visibleWhenFolded: false,
+    });
   });
 });
+
 describe("mount window rows (compact density)", () => {
   const A = { historyId: "history-a" };
   const B = { historyId: "history-b" };
@@ -633,34 +461,36 @@ describe("mount window rows (compact density)", () => {
     expect(rows.toWindowIndex(1)).toBe(1);
   });
 
-  test("leaves out the steps folded behind a finished turn's work line", () => {
+  test("leaves out the steps folded behind a finished stretch's work line", () => {
     const messages = [
       user("prompt-1"),
       tool({ id: "read-1", ...A }),
       tool({ id: "read-2", ...A }),
       tool({ id: "read-3", ...A }),
+      tool({ id: "read-4", ...A }),
       assistant("reply-1", A),
       user("prompt-2"),
-      tool({ id: "read-4", ...B }),
       tool({ id: "read-5", ...B }),
       tool({ id: "read-6", ...B }),
+      tool({ id: "read-7", ...B }),
     ];
     const { indices, rows } = windowRows(messages);
 
-    // The first row of a stretch carries the work line, and the reply shows. The second
-    // stretch has no reply: its last row counts, so the transcript's newest row always does.
-    expect(indices).toEqual([0, 1, 4, 5, 6, 8]);
+    // The first row of a stretch carries the work line, and its last row is where the window
+    // may end (the transcript's newest row is always counted). What the agent wrote counts.
+    expect(indices).toEqual([0, 1, 4, 5, 6, 7, 9]);
     expect(rows.rows.map((row) => row.id)).toEqual([
       "prompt-1",
       "read-1",
+      "read-4",
       "reply-1",
       "prompt-2",
-      "read-4",
-      "read-6",
+      "read-5",
+      "read-7",
     ]);
   });
 
-  test("counts every row of the live turn, and a settled row that still needs the user", () => {
+  test("counts every row of the live stretch, and a settled row that still needs the user", () => {
     const live = [
       user("prompt"),
       tool({ id: "read-1", ...A }),
@@ -684,7 +514,7 @@ describe("mount window rows (compact density)", () => {
         ...A,
       }),
     ];
-    // "tests" shows through the fold (it holds the interrupted divider); the reads are folded.
+    // "tests" shows through the fold (it holds the control that continues the turn).
     expect(windowRows(stopped).indices).toEqual([0, 1, 4]);
   });
 
@@ -698,12 +528,12 @@ describe("mount window rows (compact density)", () => {
       user("prompt-2"),
     ];
     const { rows } = windowRows(messages);
-    // Window rows: prompt-1, read-1 (the work line), reply-1, prompt-2.
-    expect([0, 1, 2, 3].map(rows.toTranscriptIndex)).toEqual([0, 1, 4, 5]);
+    // Window rows: prompt-1, read-1 (the work line), read-3, reply-1, prompt-2.
+    expect([0, 1, 2, 3, 4].map(rows.toTranscriptIndex)).toEqual([0, 1, 3, 4, 5]);
     // One past the last window row is one past the last transcript row.
-    expect(rows.toTranscriptIndex(4)).toBe(messages.length);
+    expect(rows.toTranscriptIndex(5)).toBe(messages.length);
     // A folded step is reached through the row its work line renders at.
-    expect([0, 1, 2, 3, 4, 5].map(rows.toWindowIndex)).toEqual([0, 1, 1, 1, 2, 3]);
+    expect([0, 1, 2, 3, 4, 5].map(rows.toWindowIndex)).toEqual([0, 1, 1, 2, 3, 4]);
   });
 });
 
@@ -821,56 +651,6 @@ describe("routine tool runs", () => {
   function routine(messages: DisplayedMessage[], isTurnActive = false) {
     return computeOperationalBundleInfos(messages, { isTurnActive });
   }
-
-  // Each work line opens alone. A run across two of them would put its summary row behind the
-  // first line and leave the second with members that nothing visible can open. The projection
-  // only ends a stretch after a reply, which also ends a run, so the lines are given by hand:
-  // the rule is what keeps the two groupings paired if that ever changes.
-  test("stops a run where compact density's work line changes", () => {
-    const messages = [
-      tool({ id: "read-a1", historyId: "history-a" }),
-      tool({ id: "read-a2", historyId: "history-a" }),
-      tool({ id: "read-b1", historyId: "history-b" }),
-      tool({ id: "read-b2", historyId: "history-b" }),
-      assistant("reply", { historyId: "history-b" }),
-    ];
-    const line = (key: string, headIndex: number): WorkBundleInfo => ({
-      key,
-      headIndex,
-      role: "work",
-      visibleWhenFolded: false,
-      state: "settled",
-      kind: "work",
-      editedFileCount: 0,
-    });
-    const workBundleInfos = [line("a", 0), line("a", 0), line("b", 2), line("b", 2), undefined];
-    const infos = computeOperationalBundleInfos(messages, { isTurnActive: false, workBundleInfos });
-
-    expect(infos.slice(0, 4).map((info) => [info?.key, info?.position])).toEqual([
-      ["routine:read-a1", "head"],
-      ["routine:read-a1", "member"],
-      ["routine:read-b1", "head"],
-      ["routine:read-b1", "member"],
-    ]);
-
-    // Detailed density has no work lines, and the four reads are one run.
-    expect(routine(messages).map((info) => info?.key)).toEqual([
-      "routine:read-a1",
-      "routine:read-a1",
-      "routine:read-a1",
-      "routine:read-a1",
-      undefined,
-    ]);
-
-    // One read on each side of the boundary is no run on either side: both stay plain rows.
-    const lone = [messages[0], messages[2], messages[4]];
-    expect(
-      computeOperationalBundleInfos(lone, {
-        isTurnActive: false,
-        workBundleInfos: [line("a", 0), line("b", 1), undefined],
-      })
-    ).toEqual([undefined, undefined, undefined]);
-  });
 
   // A parallel step: a command waiting for sandbox approval, another routine call, then an
   // edit. The edit makes the run no longer the tail, but the approval card lives in the

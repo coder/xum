@@ -1,5 +1,4 @@
 import React from "react";
-import { formatElapsed } from "@/common/utils/formatDuration";
 import { cn } from "@/common/lib/utils";
 import {
   ExpandIcon,
@@ -8,61 +7,13 @@ import {
 } from "@/browser/features/Tools/Shared/ToolPrimitives";
 import type { WorkBundleInfo } from "@/browser/utils/messages/transcriptRenderProjection";
 
-function useActiveNowMs(isActive: boolean): number {
-  const [nowMs, setNowMs] = React.useState(() => Date.now());
-
-  React.useEffect(() => {
-    if (!isActive) {
-      return;
-    }
-
-    setNowMs(Date.now());
-    const intervalId = window.setInterval(() => setNowMs(Date.now()), 1_000);
-    return () => window.clearInterval(intervalId);
-  }, [isActive]);
-
-  return nowMs;
-}
-
-/** "Worked" or "Thought", in the present while the stretch is live. */
-function workVerb(item: WorkBundleInfo): string {
-  const isLive = item.state === "live";
-  if (item.kind === "thought") {
-    return isLive ? "Thinking" : "Thought";
-  }
-  return isLive ? "Working" : "Worked";
-}
-
-/** "Worked for 2m 14s", or the verb alone when the time is unknown or too short to read. */
-function formatWorked(item: WorkBundleInfo, liveDurationMs: number | undefined): string {
-  const isLive = item.state === "live";
-  const verb = workVerb(item);
-  const durationMs = isLive ? liveDurationMs : item.durationMs;
-  // Under a second there is nothing worth reading: "Worked" alone says it.
-  return durationMs === undefined || (!isLive && durationMs < 1000)
-    ? verb
-    : `${verb} for ${formatElapsed(durationMs)}`;
-}
-
-/** What the line says after the time, if anything. */
-function formatWorkDetail(item: WorkBundleInfo): string | undefined {
-  // A live turn says what it is doing right now. The text changes in place: no row mounts
-  // under the line for a step and unmounts for the next one.
-  if (item.state === "live") {
-    return item.liveStep;
-  }
-  // How long says little about a turn; that it changed files is what the user must not miss.
-  if (item.editedFileCount === 0) {
-    return undefined;
-  }
-  return `edited ${item.editedFileCount} ${item.editedFileCount === 1 ? "file" : "files"}`;
-}
-
-function formatWorkLine(item: WorkBundleInfo, liveDurationMs: number | undefined): string {
-  const worked = formatWorked(item, liveDurationMs);
-  const detail = formatWorkDetail(item);
-  return detail === undefined ? worked : `${worked} · ${detail}`;
-}
+/**
+ * An opened line stays at the top of the transcript while its steps are on screen, so it can be
+ * closed from anywhere in them. Without that, closing a long stretch meant scrolling back up to
+ * its line. The line's block bounds how far it sticks (see TranscriptBundleRows), and it has the
+ * transcript's surface so the steps do not show through it.
+ */
+const OPEN_LINE_CLASS = "bg-surface-primary sticky top-0 z-20 -my-1 py-1";
 
 interface WorkBundleMessageProps {
   item: WorkBundleInfo;
@@ -71,25 +22,14 @@ interface WorkBundleMessageProps {
 }
 
 /**
- * The one line a turn's work folds into at compact density: "Worked for 2m 14s · edited 2 files",
- * or "Working for 42s · Running the unit tests" while the turn runs.
- * The label starts where the reply's text starts and the chevron follows it, the way Codex writes
- * a finished turn. A leading chevron indented every label past the reply and put a column of
- * chevrons down the page.
+ * The one line a stretch of steps folds into at compact density: "Read 3 files, ran 2 commands",
+ * or "Running the unit tests" while the stretch is live. The label starts where the agent's text
+ * starts and the chevron follows it, the way Codex and Claude Code write a folded group. A
+ * leading chevron indented every label past the text and put a column of chevrons down the page.
  */
 export function WorkBundleMessage(props: WorkBundleMessageProps): React.ReactElement {
-  const isLive = props.item.state === "live";
-  const nowMs = useActiveNowMs(isLive && props.item.startedAtMs !== undefined);
-  const liveDurationMs =
-    isLive && props.item.startedAtMs !== undefined
-      ? Math.max(0, nowMs - props.item.startedAtMs)
-      : undefined;
-
   return (
-    // The line belongs to what follows it: it sits close to the reply below and further from the
-    // prompt above. A message block has a wide top margin of its own, so the one right after the
-    // line gets a narrow one.
-    <div className="mt-5 mb-0.5 px-1 [&+*>[data-message-block]]:mt-0.5">
+    <div className={cn("px-1", props.expanded && OPEN_LINE_CLASS)}>
       <button
         type="button"
         data-testid="work-bundle"
@@ -101,12 +41,9 @@ export function WorkBundleMessage(props: WorkBundleMessageProps): React.ReactEle
         aria-expanded={props.expanded}
         onClick={props.onToggle}
       >
-        <span className="counter-nums min-w-0 truncate">
-          {formatWorkLine(props.item, liveDurationMs)}
-        </span>
+        <span className="min-w-0 truncate">{props.item.summary}</span>
         <ExpandIcon expanded={props.expanded} />
-        {/* The running clock already says the turn is live; dots stand in only without one. */}
-        {isLive && liveDurationMs === undefined && <LoadingDots aria-hidden="true" />}
+        {props.item.state === "live" && <LoadingDots aria-hidden="true" />}
       </button>
     </div>
   );

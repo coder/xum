@@ -34,37 +34,27 @@ export interface OperationalBundleInfo {
 }
 
 /**
- * One stretch of agent work between two things the user reads: their prompt, a question or plan
- * that stops for them, and the reply. Compact density shows the stretch as one line ("Worked for
- * 2m 14s") above the reply, the way Codex folds a finished turn.
+ * One stretch of the agent's steps between two things the user reads: their prompt, something
+ * the agent wrote, a question or plan that stops for them. Compact density shows the stretch as
+ * one line that says what it did ("Read 3 files, ran 2 commands").
  */
 export interface WorkBundleInfo {
-  /** Derived from the stretch's first row, so it holds while a live turn grows. */
+  /** Derived from the stretch's first row, so it holds while a live stretch grows. */
   key: string;
   /** First row of the stretch; the work line renders above it. */
   headIndex: number;
-  /** "work" rows fold behind the work line. "answer" rows are the reply and always show. */
-  role: "work" | "answer";
   /**
-   * A work row that shows through the fold because the user must act on it: a call that waits
+   * A row that shows under the closed line because the user must act on it: a call that waits
    * for their approval, or the row an interrupted turn stopped on.
    */
   visibleWhenFolded: boolean;
   state: "live" | "settled";
   /**
-   * What a live stretch is doing right now ("Running the unit tests"). Its line says so in
-   * place, so no row has to mount under the line and unmount when the next step starts.
+   * The line's text. Settled, what the steps did ("Read 3 files, ran 2 commands · 1 failed").
+   * Live, what the latest step is doing ("Running the unit tests"): the text changes in place,
+   * so no row has to mount under the line and unmount when the next step starts.
    */
-  liveStep?: string;
-  /** A stretch that only reasoned reads "Thought for 4s" rather than "Worked for 4s". */
-  kind: "work" | "thought";
-  /**
-   * Files the folded work changed with the edit tools. The line says so ("edited 2 files"),
-   * because a change to the user's files is the one thing a fold must not keep quiet about.
-   */
-  editedFileCount: number;
-  startedAtMs?: number;
-  durationMs?: number;
+  summary: string;
 }
 
 interface ComputeBundleInfosOptions {
@@ -91,6 +81,7 @@ type OperationalBundleCategory =
   | "shell"
   | "skill"
   | "task"
+  | "todo"
   | "tool"
   | "wait";
 
@@ -124,6 +115,8 @@ const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
   task: { verb: "Ran", noun: "agent task", nounPlural: "agent tasks", explores: false },
   // A task_await inside a mixed run, worded like the all-wait row ("Checked task status 2 times").
   wait: { verb: "Checked task status", noun: "time", nounPlural: "times", explores: false },
+  // The agent ticks its list off after most replies, so this is often a line of its own.
+  todo: { verb: "Updated", noun: "the todo list", nounPlural: "the todo list", explores: false },
   tool: { verb: "Used", noun: "tool", nounPlural: "tools", explores: false },
 };
 
@@ -199,27 +192,20 @@ function showsAppView(message: DisplayedMessage & { type: "tool" }): boolean {
   return nestedCalls.some((call) => call.mcpServer?.app != null);
 }
 
-type WorkBundleRow = DisplayedMessage & {
-  type: "assistant" | "reasoning" | "tool";
-};
-
-function isWorkBundleRow(message: DisplayedMessage | undefined): message is WorkBundleRow {
+/**
+ * A step of the agent's work, which compact density folds: reasoning, a tool call, or a prompt
+ * the machine wrote mid-work (see isMachineRow). What the agent writes is never a step: it
+ * stays in view. Neither is a question, a plan or an app view, which are there for the user.
+ */
+function isStepRow(message: DisplayedMessage | undefined): message is DisplayedMessage {
   switch (message?.type) {
     case "reasoning":
       return true;
     case "tool":
       return !STOP_TOOL_NAMES.has(message.toolName) && !showsAppView(message);
-    case "assistant":
-      // Compaction summaries and peer messages are not this turn's narration: they stay put.
-      return !message.isCompacted && message.agentPeerMessage === undefined;
     default:
-      return false;
+      return isMachineRow(message);
   }
-}
-
-/** A row a work line can fold: a step of the agent, or a prompt the machine wrote mid-work. */
-function isFoldableRow(message: DisplayedMessage | undefined): message is DisplayedMessage {
-  return isWorkBundleRow(message) || isMachineRow(message);
 }
 
 function isRunningRow(message: DisplayedMessage): boolean {
@@ -246,76 +232,20 @@ function needsUser(message: DisplayedMessage, isTranscriptTail: boolean): boolea
   return isTranscriptTail && shouldShowInterruptedBarrier(message);
 }
 
-function getMessageTimestamp(message: DisplayedMessage | undefined): number | undefined {
-  return message !== undefined && "timestamp" in message && typeof message.timestamp === "number"
-    ? message.timestamp
-    : undefined;
-}
-
 /**
- * Calls that record progress and do no work. They often follow the reply (the agent ticks off
- * its todo list last), and the narration before them is still the reply.
- */
-const BOOKKEEPING_TOOL_NAMES = new Set<string>(["notify", "timeline_event", "todo_write"]);
-
-/** Whether a row after some narration means the agent went back to work after writing it. */
-function isWorkAfterNarration(message: DisplayedMessage): boolean {
-  return message.type === "tool" && !BOOKKEEPING_TOOL_NAMES.has(message.toolName);
-}
-
-/** Records the file a successful edit call changed. A call with no readable path counts alone. */
-function collectEditedFile(
-  editedFiles: Set<string>,
-  call: { id: string; toolName: string; args: unknown; result: unknown; failed: boolean }
-): void {
-  if (!FILE_EDIT_TOOL_NAMES.has(call.toolName) || call.failed) {
-    return;
-  }
-  const result = unwrapJsonResult(call.result);
-  if (isPlainObject(result) && result.success === false) {
-    return;
-  }
-  const path = isPlainObject(call.args) ? call.args.path : undefined;
-  editedFiles.add(typeof path === "string" ? path : `call:${call.id}`);
-}
-
-/** Records the files a work row edited: its own edit, or the edits of a script's nested calls. */
-function collectEditedFiles(editedFiles: Set<string>, message: DisplayedMessage): void {
-  if (message.type !== "tool") {
-    return;
-  }
-  collectEditedFile(editedFiles, {
-    id: message.id,
-    toolName: message.toolName,
-    args: message.args,
-    result: message.result,
-    failed: message.status !== "completed",
-  });
-  for (const call of Array.isArray(message.nestedCalls) ? message.nestedCalls : []) {
-    collectEditedFile(editedFiles, {
-      id: call.toolCallId,
-      toolName: call.toolName,
-      args: call.input,
-      result: call.output,
-      failed: call.failed === true || call.state !== "output-available",
-    });
-  }
-}
-
-/**
- * Compact density. The agent's rows between two things the user reads (their prompt, a question
- * or plan that stops for them, an app view, an error) are one stretch of work: its last
- * narration is the reply and stays in view, and every other row folds behind one line.
+ * Compact density. Everything the agent writes stays in view as regular text, the way Claude
+ * Code and Codex show a turn: its status updates while it works, then its reply. The steps
+ * between two things the user reads (their prompt, an update, a question or plan, an app view,
+ * an error) are one stretch, folded behind one line that says what they did.
  *
- * A stretch is not one assistant message. A turn that was interrupted and continued, that hit
- * an error and retried, or that was woken by a finished sub-agent is several messages, with
- * prompts the machine wrote between them (see isMachineRow), and it is still one piece of work
- * with one line. Only a reply ends a stretch early: the agent answered, and what follows (a
- * wake-up and the work it starts) is new work with its own line and its own reply.
+ * An earlier design folded a whole turn behind one line ("Worked for 2m 14s") and showed only
+ * its last narration. Closed, that said too little about a long turn. Opened, it put the whole
+ * log on the page, and the line that closes it was a long scroll away. The stretch between two
+ * updates is short, so it opens and closes in place.
  *
- * The last narration shows even when the stretch went back to work after it (it was
- * interrupted, or it failed): that is the last thing the agent said, and hiding it could hide an
- * answer that a trailing call happened to follow.
+ * Prompts the machine writes mid-work (a sub-agent's report, a wake-up, a nudge) fold with the
+ * steps around them. A stretch that holds only such prompts gets no line: the agent has not
+ * acted on them, and they stay rows.
  *
  * A call that left a background process running folds like any other step, although the routine
  * fold below keeps its row (see isRoutineToolCall). That is deliberate. The row cannot tell
@@ -323,10 +253,10 @@ function collectEditedFiles(editedFiles: Set<string>, message: DisplayedMessage)
  * this density removes. The composer's activity line (BackgroundProcessesBanner) lists the
  * processes that are running, with their output and terminate controls, whatever is folded here.
  *
- * A live stretch names its latest step on its line ("Working for 42s · Running the unit tests")
- * and mounts no row for it. Showing each step as a row under the line made the transcript flash:
- * every call rendered in, and was gone when the next one started. Only a row the user must act
- * on shows through the fold (see showsThroughFold).
+ * A live stretch names its latest step on its line ("Running the unit tests") and mounts no row
+ * for it. Showing each step as a row under the line made the transcript flash: every call
+ * rendered in, and was gone when the next one started. Only a row the user must act on shows
+ * through the fold (see showsThroughFold).
  */
 export function computeWorkBundleInfos(
   messages: DisplayedMessage[],
@@ -336,223 +266,18 @@ export function computeWorkBundleInfos(
   let index = 0;
 
   while (index < messages.length) {
-    if (!isFoldableRow(messages[index])) {
+    if (!isStepRow(messages[index])) {
       index += 1;
       continue;
     }
-    const runStart = index;
-    while (index < messages.length && isFoldableRow(messages[index])) {
+    const start = index;
+    while (index < messages.length && isStepRow(messages[index])) {
       index += 1;
     }
-    const runEnd = index - 1;
-    const isLiveTail = options.isTurnActive && runEnd === messages.length - 1;
-    const starts = findStretchStarts(messages, runStart, runEnd, isLiveTail);
-    starts.forEach((start, position) => {
-      const end = (starts[position + 1] ?? runEnd + 1) - 1;
-      assignWorkBundle(infos, messages, start, end, options);
-    });
+    assignWorkBundle(infos, messages, start, index - 1, options);
   }
 
   return infos;
-}
-
-/** Narration, or a call that did real work: what makes a message more than bookkeeping. */
-function isSubstantiveRow(message: DisplayedMessage): boolean {
-  return message.type === "assistant" || isWorkAfterNarration(message);
-}
-
-/** Last row of the unit that starts at `start`: one assistant message, or one machine prompt. */
-function findUnitEnd(messages: DisplayedMessage[], start: number, runEnd: number): number {
-  const first = messages[start];
-  if (!isWorkBundleRow(first)) {
-    return start;
-  }
-  let end = start;
-  while (end < runEnd) {
-    const next = messages[end + 1];
-    if (!isWorkBundleRow(next) || next.historyId !== first.historyId) {
-      break;
-    }
-    end += 1;
-  }
-  return end;
-}
-
-function findLastSubstantiveRow(
-  messages: DisplayedMessage[],
-  start: number,
-  end: number
-): DisplayedMessage | undefined {
-  for (let index = end; index >= start; index--) {
-    if (isSubstantiveRow(messages[index])) {
-      return messages[index];
-    }
-  }
-  return undefined;
-}
-
-/**
- * Where the stretches of a run of foldable rows start. The run is one stretch, cut after each
- * reply that more work follows: the new stretch starts right after the reply, so it takes the
- * machine prompts that woke the agent with it.
- *
- * Rows after the last reply that hold no narration and no real work (a nudge and the todo
- * update it asked for) stay with that reply's stretch, as bookkeeping behind its line. While
- * the turn runs they open a stretch instead: the agent is about to act on them, and its line
- * should not appear to restart the work above.
- */
-function findStretchStarts(
-  messages: DisplayedMessage[],
-  runStart: number,
-  runEnd: number,
-  isLiveTail: boolean
-): number[] {
-  const starts = [runStart];
-  // First row after the reply that closed the stretch being built; undefined while it is open.
-  let afterReply: number | undefined;
-  for (let unitStart = runStart; unitStart <= runEnd; ) {
-    const unitEnd = findUnitEnd(messages, unitStart, runEnd);
-    const last = findLastSubstantiveRow(messages, unitStart, unitEnd);
-    if (last !== undefined) {
-      if (afterReply !== undefined) {
-        starts.push(afterReply);
-      }
-      afterReply = last.type === "assistant" ? unitEnd + 1 : undefined;
-    }
-    unitStart = unitEnd + 1;
-  }
-  if (afterReply !== undefined && afterReply <= runEnd && isLiveTail) {
-    starts.push(afterReply);
-  }
-  return starts;
-}
-
-/** What one pass over a stretch finds: where its work and its narration end, and whether it runs. */
-interface StretchScan {
-  /**
-   * Last row that is not narration (reasoning, a tool call, a machine prompt). -1 when the
-   * stretch holds no step of the agent's: narration alone needs no line, and neither does a
-   * machine prompt the agent has not acted on.
-   */
-  lastWorkIndex: number;
-  /** Last narration row; -1 when the stretch has none. */
-  lastTextIndex: number;
-  /**
-   * The agent is still in this stretch: it is the transcript's tail, and the turn is running. A
-   * row that is itself still running also counts, for hosts that do not report the turn (and so
-   * a stale partial call does not look finished).
-   */
-  isLive: boolean;
-}
-
-function scanStretch(
-  messages: DisplayedMessage[],
-  start: number,
-  end: number,
-  isTurnActive: boolean
-): StretchScan {
-  let lastWorkIndex = -1;
-  let lastTextIndex = -1;
-  let hasAgentStep = false;
-  let hasRunningRow = false;
-  for (let index = start; index <= end; index++) {
-    const message = messages[index];
-    if (message.type === "assistant") {
-      lastTextIndex = index;
-    } else {
-      lastWorkIndex = index;
-      hasAgentStep ||= message.type !== "user";
-    }
-    hasRunningRow ||= isRunningRow(message);
-  }
-  const isLive = end === messages.length - 1 && (isTurnActive || hasRunningRow);
-  return { lastWorkIndex: hasAgentStep ? lastWorkIndex : -1, lastTextIndex, isLive };
-}
-
-/**
- * When a stretch started and how long it took. It starts at the prompt before it, or else at its
- * first row with a timestamp. It ends at the latest timestamp of the agent's own rows, not at
- * its last row's: a row without its own carries its message's start. A machine prompt does not
- * end it: a sub-agent's report is shown where the agent was when the sub-agent finished, which
- * can be before rows that are older than the report.
- */
-function measureStretch(
-  messages: DisplayedMessage[],
-  start: number,
-  end: number
-): { startedAtMs: number | undefined; durationMs: number | undefined } {
-  const prompt = messages[start - 1];
-  let startedAtMs = prompt?.type === "user" ? getMessageTimestamp(prompt) : undefined;
-  let endedAtMs = Number.NEGATIVE_INFINITY;
-  for (let index = start; index <= end; index++) {
-    const timestamp = getMessageTimestamp(messages[index]);
-    if (timestamp === undefined) {
-      continue;
-    }
-    startedAtMs ??= timestamp;
-    if (messages[index].type !== "user") {
-      endedAtMs = Math.max(endedAtMs, timestamp);
-    }
-  }
-  // No start, or no row with a timestamp after it (endedAtMs is still -Infinity): no duration.
-  const elapsedMs = startedAtMs === undefined ? 0 : endedAtMs - startedAtMs;
-  return { startedAtMs, durationMs: elapsedMs > 0 ? elapsedMs : undefined };
-}
-
-/** Rows `first` to `last`; empty when `first` is above `last`. */
-interface RowRange {
-  first: number;
-  last: number;
-}
-
-const isInRange = (range: RowRange, index: number) => index >= range.first && index <= range.last;
-
-/**
- * The reply of a stretch: its last narration, with any narration directly before it. Bookkeeping
- * that follows it (a todo update, a notification) folds like the rest, so it never hides a reply.
- * The range is empty when the stretch has no narration.
- */
-function findAnswerRange(
-  messages: DisplayedMessage[],
-  start: number,
-  lastTextIndex: number
-): RowRange {
-  if (lastTextIndex === -1) {
-    return { first: 0, last: -1 };
-  }
-  let first = lastTextIndex;
-  while (first > start && messages[first - 1].type === "assistant") {
-    first -= 1;
-  }
-  return { first, last: lastTextIndex };
-}
-
-/** What the work line says about the rows it folds: whether they only reasoned, and their edits. */
-function summarizeFoldedRows(
-  messages: DisplayedMessage[],
-  start: number,
-  end: number,
-  answer: RowRange
-): { onlyReasoned: boolean; editedFileCount: number } {
-  let reasoningRows = 0;
-  let otherRows = 0;
-  const editedFiles = new Set<string>();
-  for (let index = start; index <= end; index++) {
-    if (isInRange(answer, index)) {
-      continue;
-    }
-    const message = messages[index];
-    if (message.type === "reasoning") {
-      reasoningRows += 1;
-    } else {
-      otherRows += 1;
-    }
-    collectEditedFiles(editedFiles, message);
-  }
-  return {
-    onlyReasoned: reasoningRows > 0 && otherRows === 0,
-    editedFileCount: editedFiles.size,
-  };
 }
 
 /** Whether a call, or a call nested in it, waits for the user's approval. */
@@ -571,7 +296,7 @@ function awaitsApproval(
 }
 
 /**
- * Whether a folded work row still shows under its closed work line: only when the user must act
+ * Whether a folded step still shows under its closed work line: only when the user must act
  * on it. That is a call that waits for their approval (the card and its shortcuts are in the
  * row), and the row the transcript ends on when its turn was interrupted (it carries the control
  * that continues the turn). A call that is merely running does not show: the line names it.
@@ -595,23 +320,40 @@ function assignWorkBundle(
   end: number,
   options: ComputeWorkBundleInfosOptions
 ): void {
-  const scan = scanStretch(messages, start, end, options.isTurnActive);
-  // A reply with no work behind it needs no work line.
-  if (scan.lastWorkIndex === -1) {
+  const steps: OperationalBundleMemberMessage[] = [];
+  for (let index = start; index <= end; index++) {
+    const message = messages[index];
+    if (message.type === "reasoning" || message.type === "tool") {
+      steps.push(message);
+    }
+  }
+  // Machine prompts the agent has not acted on: nothing was done, so there is nothing to fold.
+  if (steps.length === 0) {
     return;
   }
 
-  const answer = findAnswerRange(messages, start, scan.lastTextIndex);
-  const base = describeStretch(messages, start, end, scan, answer);
+  // The agent is still in this stretch: it is the transcript's tail, and the turn is running. A
+  // step that is itself still running also counts, for hosts that do not report the turn (and
+  // so a stale partial call does not look finished).
+  const isLive = end === messages.length - 1 && (options.isTurnActive || steps.some(isRunningRow));
+  const base = {
+    key: `work:${messages[start].id}`,
+    headIndex: start,
+    state: isLive ? "live" : "settled",
+    summary: isLive ? describeLiveStep(messages[end]) : describeSteps(steps),
+  } as const;
   for (let index = start; index <= end; index++) {
-    infos[index] = isInRange(answer, index)
-      ? { ...base, role: "answer", visibleWhenFolded: true }
-      : {
-          ...base,
-          role: "work",
-          visibleWhenFolded: showsThroughFold(messages, index, options.approvalToolCallIds),
-        };
+    infos[index] = {
+      ...base,
+      visibleWhenFolded: showsThroughFold(messages, index, options.approvalToolCallIds),
+    };
   }
+}
+
+/** What a finished stretch did, in the words a run of routine calls uses in detailed density. */
+function describeSteps(steps: OperationalBundleMemberMessage[]): string {
+  const summary = summarizeOperationalBundle(steps);
+  return summary.details === "" ? summary.title : `${summary.title} · ${summary.details}`;
 }
 
 type LiveStepDescriber = (toolName: string, args: Record<string, unknown>) => string;
@@ -629,7 +371,7 @@ function describeFileStep(verb: string, fallback: string): LiveStepDescriber {
   };
 }
 
-/** What a live turn's line says a call of each kind is doing. */
+/** What a live stretch's line says a call of each kind is doing. */
 const LIVE_STEP_DESCRIBERS: Record<ToolBundleCategory, LiveStepDescriber> = {
   read: describeFileStep("Reading", "Reading a file"),
   edit: describeFileStep("Editing", "Editing a file"),
@@ -647,6 +389,7 @@ const LIVE_STEP_DESCRIBERS: Record<ToolBundleCategory, LiveStepDescriber> = {
   question: () => "Asking a question",
   task: () => "Starting a sub-agent",
   wait: () => "Waiting for sub-agents",
+  todo: () => "Updating the todo list",
   tool: (toolName) => `Using ${toolName}`,
 };
 
@@ -657,49 +400,20 @@ function describeCall(toolName: string, args: unknown): string {
 
 /**
  * What the latest step of a live stretch is doing, for its line. A script is described by the
- * call it is making. Undefined when the agent has moved on to writing, and for a machine prompt
- * the agent has not acted on yet: the line then says "Working" alone.
+ * call it is making. A machine prompt the agent has just been handed says "Working" alone.
  */
-function describeLiveStep(messages: DisplayedMessage[], scan: StretchScan): string | undefined {
-  if (scan.lastWorkIndex <= scan.lastTextIndex) {
-    return undefined;
-  }
-  const message = messages[scan.lastWorkIndex];
+function describeLiveStep(message: DisplayedMessage): string {
   if (message.type === "reasoning") {
     return "Thinking";
   }
   if (message.type !== "tool") {
-    return undefined;
+    return "Working";
   }
   const nestedCalls = Array.isArray(message.nestedCalls) ? message.nestedCalls : [];
   const latestNested = nestedCalls[nestedCalls.length - 1];
   return latestNested === undefined
     ? describeCall(message.toolName, message.args)
     : describeCall(latestNested.toolName, latestNested.input);
-}
-
-/** What every row of a stretch shares: the facts its work line states. */
-function describeStretch(
-  messages: DisplayedMessage[],
-  start: number,
-  end: number,
-  scan: StretchScan,
-  answer: RowRange
-): Omit<WorkBundleInfo, "role" | "visibleWhenFolded"> {
-  const folded = summarizeFoldedRows(messages, start, end, answer);
-  const timing = measureStretch(messages, start, end);
-  return {
-    key: `work:${messages[start].id}`,
-    headIndex: start,
-    state: scan.isLive ? "live" : "settled",
-    kind: folded.onlyReasoned ? "thought" : "work",
-    // A stretch that only reasoned already reads "Thinking for 4s".
-    liveStep: scan.isLive && !folded.onlyReasoned ? describeLiveStep(messages, scan) : undefined,
-    editedFileCount: folded.editedFileCount,
-    startedAtMs: timing.startedAtMs,
-    // A live stretch has no duration yet: its line runs a clock from startedAtMs.
-    durationMs: scan.isLive ? undefined : timing.durationMs,
-  };
 }
 
 /**
@@ -738,10 +452,9 @@ function countsInWindow(
 ): boolean {
   const info = workBundleInfos[index];
   if (info === undefined || info.state === "live") return true;
-  const showsWhenFolded = info.role === "answer" || info.visibleWhenFolded;
   const isFirstOfStretch = info.headIndex === index;
   const isLastOfStretch = workBundleInfos[index + 1]?.key !== info.key;
-  return showsWhenFolded || isFirstOfStretch || isLastOfStretch;
+  return info.visibleWhenFolded || isFirstOfStretch || isLastOfStretch;
 }
 
 /** The rows a mount window counts, with its indices translated to and from the transcript's. */
@@ -870,20 +583,13 @@ function carriesAttachments(rawResult: unknown): boolean {
  * Runs of two or more routine tool calls (reads, searches, shell commands, code execution, task
  * polls) collapse into one summary row, the way Claude Code, Codex and Cursor fold exploration
  * into "Explored 3 files" lines. Rows the user must see (edits, questions, plans, todos,
- * attachments) stay standalone. This is the grouping inside a turn at either density.
+ * attachments) stay standalone. This is detailed density's grouping. Compact density folds every
+ * step between two things the agent wrote (see computeWorkBundleInfos), so it has no use for it.
  */
 export function computeOperationalBundleInfos(
   messages: DisplayedMessage[],
-  options: ComputeBundleInfosOptions & {
-    /**
-     * Compact density's work bundles, indexed like `messages`. A run stops where the work line
-     * changes: each line opens on its own, so a run that spanned two of them would leave its
-     * summary row behind one line and its members, with no way to open them, behind the other.
-     */
-    workBundleInfos?: ReadonlyArray<WorkBundleInfo | undefined>;
-  }
+  options: ComputeBundleInfosOptions
 ): Array<OperationalBundleInfo | undefined> {
-  const workBundleInfos = options.workBundleInfos;
   const transcriptTail = messages[messages.length - 1];
   const infos = new Array<OperationalBundleInfo | undefined>(messages.length);
   // Found once per projection (not per run) so live-tail detection stays linear in the transcript.
@@ -907,9 +613,6 @@ export function computeOperationalBundleInfos(
     let toolCount = 0;
     for (let cursor = index; cursor < messages.length; cursor++) {
       const candidate = messages[cursor];
-      if (workBundleInfos?.[cursor]?.key !== workBundleInfos?.[headIndex]?.key) {
-        break;
-      }
       if (isRoutineToolMessage(candidate)) {
         lastToolIndex = cursor;
         toolCount += 1;
@@ -1183,6 +886,10 @@ function countToolCategories(
 /** "3 files", "1 command". */
 function formatCategoryCount(category: ToolBundleCategory, count: number): string {
   const copy = OPERATIONAL_BUNDLE_CATEGORY_COPY[category];
+  // Every update rewrites the one list: how many there were says nothing.
+  if (category === "todo") {
+    return copy.noun;
+  }
   return `${count.toLocaleString()} ${count === 1 ? copy.noun : copy.nounPlural}`;
 }
 
@@ -1210,6 +917,7 @@ const TOOL_CATEGORY_BY_NAME = new Map<string, ToolBundleCategory>([
   ["ask_user_question", "question"],
   ["task", "task"],
   ["task_await", "wait"],
+  ["todo_write", "todo"],
   ["code_execution", "code"],
 ]);
 

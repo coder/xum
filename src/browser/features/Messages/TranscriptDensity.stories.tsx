@@ -148,7 +148,10 @@ function setupSessionStory(density: TranscriptDensity, extra: ChatMuxMessage[] =
   });
 }
 
-/** Compact (the default): each turn is the prompt, one line for the work, and the reply. */
+/**
+ * Compact (the default): what the agent wrote stays in view, and the steps between two of its
+ * updates fold behind one line that says what they did.
+ */
 export const CompactTurns: AppStory = {
   parameters: { pixel: { matrix: PIXEL_DUAL_THEME } },
   render: () => <AppWithMocks setup={() => setupSessionStory("hyper")} />,
@@ -156,16 +159,17 @@ export const CompactTurns: AppStory = {
     const canvas = within(canvasElement);
     const workLine = await canvas.findByRole(
       "button",
-      { name: "Worked for 2m 14s · edited 2 files" },
+      { name: "Read 2 files, ran 1 command" },
       { timeout: 15_000 }
     );
     await expect(workLine).toHaveAttribute("aria-expanded", "false");
-    // A turn that only reasoned says so, and the work behind either line is out of sight.
-    await canvas.findByRole("button", { name: "Thought for 9s" });
-    await expect(canvas.queryByText("make typecheck")).toBeNull();
-    await expect(canvas.queryByText(/Adding it back/)).toBeNull();
-    // The reply shows although a todo update came after it.
+    // The updates read as regular text between the lines, and the reply after them.
+    await canvas.findByText(/Adding it back/);
     await canvas.findByText(/Tests and typecheck pass/);
+    // A line says when a step failed, and the steps themselves are out of sight.
+    await canvas.findByRole("button", { name: "Edited 1 file, ran 1 command · 1 failed" });
+    await expect(canvas.queryByText("src/auth/cache.ts")).toBeNull();
+    await expect(canvas.queryByText("make typecheck")).toBeNull();
   },
 };
 
@@ -176,7 +180,7 @@ export const CompactTurnsPhone: AppStory = {
   parameters: { pixel: { matrix: { viewports: ["phone"] } } },
 };
 
-/** Opening a work line shows that turn as detailed density does: narration, folded runs, edits. */
+/** Opening a work line lists its steps in place, on a rail between the two updates. */
 export const CompactTurnOpened: AppStory = {
   // Pixel executes this play function for the visual snapshot, while the
   // app-level UI test covers expansion behavior without Storybook's manager-page timing.
@@ -186,14 +190,14 @@ export const CompactTurnOpened: AppStory = {
     const canvas = within(canvasElement);
     const workLine = await canvas.findByRole(
       "button",
-      { name: "Worked for 2m 14s · edited 2 files" },
+      { name: "Read 2 files, ran 1 command" },
       { timeout: 15_000 }
     );
     await userEvent.click(workLine);
     await waitFor(() => expect(workLine).toHaveAttribute("aria-expanded", "true"), {
       timeout: 15_000,
     });
-    await canvas.findByText(/Adding it back/);
+    await canvas.findByText("src/auth/cache.ts");
     // Density snapshot, not a focus one: headless Chromium treats scripted focus as :focus-visible.
     workLine.blur();
   },
@@ -201,8 +205,8 @@ export const CompactTurnOpened: AppStory = {
 
 /**
  * What compact density never folds, and what a live turn shows: an answered question and a plan
- * stay in the conversation, and the turn in progress shows its latest narration under a line
- * that names the step it is on. No step mounts as a row under that line.
+ * stay in the conversation, and the turn in progress shows its updates with a line under the
+ * latest that names the step it is on. No step mounts as a row under that line.
  */
 export const CompactStopsAndLiveTurn: AppStory = {
   render: () => (
@@ -287,15 +291,13 @@ export const CompactStopsAndLiveTurn: AppStory = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     // The live line names the running step in place.
-    await canvas.findByRole(
-      "button",
-      { name: /^Working for .+ · Running the test suite$/ },
-      { timeout: 15_000 }
-    );
-    // Under it: the latest narration only. The running call is not a row that comes and goes.
+    await canvas.findByRole("button", { name: "Running the test suite" }, { timeout: 15_000 });
+    // The turn's updates are in view. The running call is not a row that comes and goes, and
+    // the steps before it are behind their own line.
+    await canvas.findByText("Adding the job first.");
     await canvas.findByText("Registering it and running the tests.");
+    await canvas.findByRole("button", { name: "Edited 1 file, read 1 file" });
     await expect(canvas.queryByText("make test")).toBeNull();
-    await expect(canvas.queryByText("Adding the job first.")).toBeNull();
     await expect(canvas.queryByText("src/jobs/expireSessions.ts")).toBeNull();
     // Stops stay in the conversation.
     await canvas.findByText("Here is the plan.");
@@ -307,8 +309,8 @@ const REVIEW_REPORT_TITLE = "Token check reviewed";
 
 /**
  * Prompts the machine writes in the middle of the agent's work (a sub-agent's report, the
- * wake-up that follows it) are steps of that work: they fold behind the line of the work they
- * start, and opened they sit on the left with the other steps, not in user bubbles on the right.
+ * wake-up that follows it) are steps of that work: they fold with the steps around them, and
+ * opened they sit on the left with those steps, not in user bubbles on the right.
  * A turn the user stopped earlier carries no divider: the conversation went on.
  */
 export const CompactMachineSteps: AppStory = {
@@ -393,8 +395,8 @@ export const CompactMachineSteps: AppStory = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByText("Both reviews agree: the module is sound.", {}, { timeout: 15_000 });
-    // One line for the work the wake-up started, after the reply before it. Closed, the
-    // reports and the wake-up are behind the lines.
+    // One line for each run of steps between two things the agent wrote. Closed, the reports
+    // and the wake-up are behind the lines.
     const lines = canvas.getAllByTestId("work-bundle");
     await expect(lines).toHaveLength(3);
     await expect(canvas.queryByText(REVIEW_REPORT_TITLE)).toBeNull();
@@ -421,10 +423,12 @@ export const CompactMachineSteps: AppStory = {
 
 const LONG_SESSION_TURNS = 6;
 const LONG_SESSION_STEPS_PER_TURN = 30;
+// An update before every third step: two steps, nine runs of three, and the last step.
+const LONG_SESSION_LINES_PER_TURN = 11;
 
 /**
  * A long session: every turn is dozens of steps, so the transcript is hundreds of rows while it
- * reads as six short exchanges.
+ * reads as six exchanges with their updates.
  */
 function createLongSession(): ChatMuxMessage[] {
   const start = STABLE_TIMESTAMP - 6 * 3_600_000;
@@ -470,7 +474,7 @@ function createLongSession(): ChatMuxMessage[] {
 
 /**
  * A long session in compact density. Nothing is cut out of it: every earlier turn still shows
- * its prompt, its work line and its reply.
+ * its prompt, its updates and its reply.
  */
 export const CompactLongSession: AppStory = {
   render: () => (
@@ -497,9 +501,10 @@ export const CompactLongSession: AppStory = {
     const latestReply = await canvas.findByText(new RegExp(`^Part ${LONG_SESSION_TURNS} is done`));
     await expect(canvas.queryByText(/hidden for performance/i)).toBeNull();
     await expect(canvas.queryByRole("button", { name: /load older/i })).toBeNull();
+    await canvas.findByText("Step 3 of part 1: checking the next module.");
     await waitFor(() =>
-      expect(canvas.getAllByRole("button", { name: /^Worked for /u })).toHaveLength(
-        LONG_SESSION_TURNS
+      expect(canvas.getAllByTestId("work-bundle")).toHaveLength(
+        LONG_SESSION_TURNS * LONG_SESSION_LINES_PER_TURN
       )
     );
 
@@ -513,6 +518,84 @@ export const CompactLongSession: AppStory = {
       await expect(metaOpacity(latestReply)).toBe("1");
       await expect(metaOpacity(oldestReply)).toBe("0");
     }
+  },
+};
+
+const LONG_STRETCH_STEPS = 40;
+
+/**
+ * A stretch with no update in it is as long as its steps. Opened, its line stays at the top of
+ * the transcript while the steps scroll under it, so it can be closed from anywhere in them:
+ * before, closing it meant scrolling all the way back up to the line.
+ */
+export const CompactLongStretchOpened: AppStory = {
+  // The Pixel snapshot budget is spent: the play function is the contract.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        const start = STABLE_TIMESTAMP - 600_000;
+        return setupSimpleChatStory({
+          workspaceId: "ws-density-long-stretch",
+          userPreferences: { appearance: { transcriptDensity: "hyper" } },
+          messages: [
+            createUserMessage("stretch-user", "Audit every module for the old session API", {
+              historySequence: 1,
+              timestamp: start,
+            }),
+            createAssistantMessage("stretch-assistant", "Reading the modules.", {
+              historySequence: 2,
+              timestamp: start + 2_000,
+              toolCalls: [
+                ...Array.from({ length: LONG_STRETCH_STEPS }, (_, step) =>
+                  createFileReadTool(`stretch-read-${step}`, `src/module${step}.ts`, "export {};")
+                ),
+                text("None of them uses the old API.", start + 120_000),
+              ],
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const line = await canvas.findByRole(
+      "button",
+      { name: `Read ${LONG_STRETCH_STEPS} files` },
+      { timeout: 15_000 }
+    );
+    await userEvent.click(line);
+    const steps = await canvas.findByTestId("work-bundle-steps");
+    const scrollport = canvasElement.querySelector('[role="log"]')?.parentElement;
+    if (!(scrollport instanceof HTMLElement)) throw new Error("No transcript scrollport");
+    if (steps.getBoundingClientRect().height <= scrollport.clientHeight) {
+      throw new Error("The opened steps fit on screen: the story no longer tests a long stretch");
+    }
+
+    // Scroll into the middle of the steps: the line's own place is far above the screen.
+    const middle = within(steps).getByText(`src/module${LONG_STRETCH_STEPS / 2}.ts`);
+    middle.scrollIntoView({ block: "center" });
+    await waitFor(() => {
+      const top = scrollport.getBoundingClientRect().top;
+      const lineBox = line.getBoundingClientRect();
+      if (steps.getBoundingClientRect().top >= top) {
+        throw new Error("The transcript did not scroll into the steps");
+      }
+      if (lineBox.top < top || lineBox.top > top + 24) {
+        throw new Error(`The opened line is ${lineBox.top - top}px from the top of the transcript`);
+      }
+      // Nothing covers it: the pointer reaches the line, not a step scrolled under it.
+      const hit = document.elementFromPoint(lineBox.left + 4, lineBox.top + lineBox.height / 2);
+      if (hit === null || !line.contains(hit)) {
+        throw new Error("The opened line is covered by the steps under it");
+      }
+    });
+
+    await userEvent.click(line);
+    await waitFor(() => expect(canvas.queryByTestId("work-bundle-steps")).toBeNull());
+    await canvas.findByText("None of them uses the old API.");
   },
 };
 

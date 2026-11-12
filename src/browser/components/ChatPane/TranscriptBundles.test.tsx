@@ -156,43 +156,107 @@ describe("TranscriptBundleRows", () => {
     );
   }
 
-  test("a finished turn is one work line and the reply until the line is opened", () => {
-    const messages = [say("narration"), read("read-1"), read("read-2"), say("reply")];
+  test("what the agent wrote stays in view, and the steps between open in place", () => {
+    const messages = [say("update"), read("read-1"), read("read-2"), say("reply"), read("read-3")];
     const view = render(<Transcript messages={messages} isTurnActive={false} />);
 
-    expect(shownRows(view.container)).toEqual(["reply"]);
+    expect(shownRows(view.container)).toEqual(["update", "reply"]);
+    const [first, second] = view.getAllByTestId("work-bundle");
+    expect(first.textContent).toContain("Read 2 files");
+
+    fireEvent.click(first);
+
+    // The opened steps are listed one by one on a rail, between the two texts. Compact density
+    // has no second fold inside an opened line.
+    expect(shownRows(view.container)).toEqual(["update", "read-1", "read-2", "reply"]);
     expect(view.queryByTestId("operational-bundle")).toBeNull();
-
-    fireEvent.click(view.getByTestId("work-bundle"));
-
-    // Opened, the turn reads as detailed density does: narration, the folded run, the reply.
-    expect(shownRows(view.container)).toEqual(["narration", "reply"]);
-    expect(view.getByTestId("operational-bundle").textContent).toContain("Read 2 files");
-    // The steps hang off one rail, and the reply stands outside it.
     const steps = view.getByTestId("work-bundle-steps");
-    expect(shownRows(steps)).toEqual(["narration"]);
-    expect(steps.contains(view.getByTestId("operational-bundle"))).toBe(true);
+    expect(shownRows(steps)).toEqual(["read-1", "read-2"]);
+    // The other line is its own block and stays closed.
+    expect(second.getAttribute("aria-expanded")).toBe("false");
+    // The line and its steps share one block, which bounds where the opened line sticks.
+    const block = first.closest('[data-testid="work-bundle-block"]');
+    expect(block?.contains(steps)).toBe(true);
+    expect(block?.contains(second)).toBe(false);
+
+    fireEvent.click(view.getAllByTestId("work-bundle")[0]);
+    expect(shownRows(view.container)).toEqual(["update", "reply"]);
   });
 
-  test("a live turn mounts no step under its closed line, which names the step instead", () => {
-    const messages = [say("narration"), read("read-1"), read("read-2", "executing")];
+  test("a range that starts below a closed line mounts nothing for that stretch", () => {
+    const messages = [read("read-1"), read("read-2"), say("reply")];
+    function Tail() {
+      const bundles = useTranscriptBundles({
+        workspaceId: "ws",
+        messages,
+        transcriptDensity: "hyper",
+        isTurnActive: false,
+      });
+      return (
+        <TranscriptBundleRows
+          workspaceId="ws"
+          messages={messages.slice(1)}
+          indexOffset={1}
+          bundles={bundles}
+          renderMessageAtIndex={(message, _index, options) => (
+            <div key={options.key} data-row={message.id} />
+          )}
+        />
+      );
+    }
+    const view = render(<Tail />);
+
+    expect(shownRows(view.container)).toEqual(["reply"]);
+    expect(view.queryByTestId("work-bundle-block")).toBeNull();
+  });
+
+  test("a live stretch mounts no step under its closed line, which names the step instead", () => {
+    const messages = [say("update"), read("read-1"), read("read-2", "executing")];
     const view = render(<Transcript messages={messages} isTurnActive />);
 
-    expect(shownRows(view.container)).toEqual(["narration"]);
-    expect(view.queryByTestId("operational-bundle")).toBeNull();
+    expect(shownRows(view.container)).toEqual(["update"]);
     const line = view.getByTestId("work-bundle");
     expect(line.getAttribute("aria-expanded")).toBe("false");
     expect(line.textContent).toContain("Reading a file");
   });
 
-  test("a call that waits for approval shows on its own, without the run it belongs to", () => {
-    const messages = [say("narration"), read("read-1"), read("read-2", "executing")];
+  test("a call that waits for approval shows under its closed line", () => {
+    const messages = [say("update"), read("read-1"), read("read-2", "executing")];
     const view = render(
       <Transcript messages={messages} isTurnActive approvalToolCallIds={new Set(["read-2"])} />
     );
 
-    expect(shownRows(view.container)).toEqual(["narration", "read-2"]);
-    expect(view.queryByTestId("operational-bundle")).toBeNull();
+    expect(shownRows(view.container)).toEqual(["update", "read-2"]);
     expect(view.getByTestId("work-bundle").getAttribute("aria-expanded")).toBe("false");
+    expect(view.queryByTestId("work-bundle-steps")).toBeNull();
+  });
+
+  test("detailed density folds runs of routine calls and has no work lines", () => {
+    const messages = [say("update"), read("read-1"), read("read-2"), say("reply")];
+    function Detailed() {
+      const bundles = useTranscriptBundles({
+        workspaceId: "ws",
+        messages,
+        transcriptDensity: "normal",
+        isTurnActive: false,
+      });
+      return (
+        <TranscriptBundleRows
+          workspaceId="ws"
+          messages={messages}
+          indexOffset={0}
+          bundles={bundles}
+          renderMessageAtIndex={(message, _index, options) => (
+            <div key={options.key} data-row={message.id} />
+          )}
+        />
+      );
+    }
+    const view = render(<Detailed />);
+
+    expect(view.queryByTestId("work-bundle")).toBeNull();
+    expect(shownRows(view.container)).toEqual(["update", "reply"]);
+    fireEvent.click(view.getByTestId("operational-bundle"));
+    expect(shownRows(view.container)).toEqual(["update", "read-1", "read-2", "reply"]);
   });
 });
