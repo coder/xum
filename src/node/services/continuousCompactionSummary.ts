@@ -18,6 +18,7 @@ import {
   buildProviderOptions,
   buildRequestHeaders,
   isAnthropic1MEffectivelyEnabled,
+  resolveRequestProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import {
   assistantThinkingLevels,
@@ -210,6 +211,12 @@ export async function summarizeContinuousCompaction(args: {
         providerOptions,
       }),
       workspaceId: args.workspaceId,
+      toolCallReplayNamespace: resolveRequestProviderOptionsNamespaceKey(
+        created.data.wireProviderName,
+        created.data.optionsModelString,
+        created.data.optionsProvidersConfig,
+        created.data.optionsRouteProvider
+      ),
     });
     messages.push({
       role: "user",

@@ -5378,7 +5378,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     expect(result.success).toBe(true);
     expect(harness.startStreamCalls[0]?.providerOptions).toEqual({
-      openai: { parallelToolCalls: true, reasoningEffort: "medium" },
+      coderGoogle: {
+        extra_body: {
+          google: { thinking_config: { include_thoughts: true, thinking_level: "medium" } },
+        },
+      },
     });
   });
 
