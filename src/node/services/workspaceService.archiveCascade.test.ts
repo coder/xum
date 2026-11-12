@@ -374,7 +374,7 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
 
     assert(forced.success, "the lifecycle archive returns a result");
     expect(forced.data.status).toBe("archived");
-    expect(forced.data.note).toContain(checkouts.get(rootId)!);
+    expect(forced.data.note).toContain(checkouts.get(rootId));
     expect(forced.data.note).toContain(childId);
     expect(forced.data.note).toContain(grandchildId);
     for (const id of allIds) {

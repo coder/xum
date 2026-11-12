@@ -241,7 +241,7 @@ export const ForcedArchiveReport: Story = {
       ],
     },
   },
-  play: async ({ canvasElement }) => {
+  play: ({ canvasElement }) => {
     const text = canvasElement.textContent ?? "";
     for (const expected of ["Untracked files deleted", "scratch/notes.md", "debug.log"]) {
       if (!text.includes(expected)) {
