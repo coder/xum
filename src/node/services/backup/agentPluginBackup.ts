@@ -2,7 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
 import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
-import type { BackupContents } from "@/common/config/schemas/settingsBackup";
+import { UNSAFE_URL_CHARACTERS, type BackupContents } from "@/common/config/schemas/settingsBackup";
 import {
   BackupPluginEntrySchema,
   MAX_BACKUP_PLUGIN_ENTRIES,
@@ -14,8 +14,13 @@ import {
   type BackupPluginStatus,
 } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
-import { pointsAtThisMachine } from "@/common/utils/agentPluginSource";
+import {
+  hasEscapedUnreservedCharacter,
+  httpsFormOfSshUrl,
+  pointsAtThisMachine,
+} from "@/common/utils/agentPluginSource";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
+import { isInstallerSourceUrl } from "@/node/services/agentPlugins/sourceInput";
 import {
   acquirePluginMutationLock,
   MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
@@ -35,6 +40,7 @@ import {
   assertManagedTreeWithinLimits,
   BACKUP_MANIFEST_FILE,
   isFilesystemError,
+  jsonValueHidesSecret,
   lstatIfExists,
   MAX_BACKUP_FILE_BYTES,
   resolveContainedPath,
@@ -107,19 +113,36 @@ interface InstallSnapshot {
   generated: GeneratedFrom | undefined;
 }
 
+/** The way out each side of a backup has when it cannot read the plugins: the flag skips the read. */
+const LOCK_WAIT_FAILURE = {
+  backup: {
+    reading: "the installed plugins for the backup",
+    wayOut: 'Turning off "Agent plugins" backs up without the plugin list.',
+  },
+  restore: {
+    reading: "the installed plugins to compare with the backup's list",
+    wayOut: 'Turning off "Agent plugins" restores without the plugin list.',
+  },
+} as const;
+
 /**
  * The plugin lock install, update and uninstall hold, taken for the reads only. A timeout is a
- * failed push, named like the other local reads: the holder is a process on this machine, not the
- * backup repository.
+ * failed push, preview or restore, named like the other local reads: the holder is a process on
+ * this machine, not the backup repository.
  */
-async function acquireSnapshotLock(muxRoot: string, timeoutMs: number) {
+async function acquireSnapshotLock(
+  muxRoot: string,
+  timeoutMs: number,
+  side: keyof typeof LOCK_WAIT_FAILURE
+) {
   try {
     return await acquirePluginMutationLock(muxRoot, { timeoutMs });
   } catch (error) {
     if (!(error instanceof CrossProcessLockTimeoutError)) throw error;
+    const { reading, wayOut } = LOCK_WAIT_FAILURE[side];
     throw new BackupServiceError(
       "IO_ERROR",
-      `Xum could not read the installed plugins for the backup. ${error.message} ${AGENT_PLUGINS_OFF_HINT}`
+      `Xum could not read ${reading}. ${error.message} ${wayOut}`
     );
   }
 }
@@ -131,14 +154,15 @@ async function acquireSnapshotLock(muxRoot: string, timeoutMs: number) {
  * plugin whose uninstall has begun. The lock is held for the reads and no longer, never across
  * git or network work. The installer clones under it, so the wait is bounded by the installer's own
  * timeout (`MUTATION_LOCK_ACQUIRE_TIMEOUT_MS`). Lock order: a push holds the backup locks (the
- * repository's and the local payload's) and then takes this one. Nothing that holds this lock
- * takes a backup lock, so the two cannot wait on each other.
+ * repository's and the local payload's) and then takes this one, and so do a preview and a restore
+ * (`planPluginRows`). Nothing that holds this lock takes a backup lock, so the two cannot wait on
+ * each other.
  */
 async function readInstallSnapshot(
   muxRoot: string,
   lockTimeoutMs: number
 ): Promise<InstallSnapshot[]> {
-  const release = await acquireSnapshotLock(muxRoot, lockTimeoutMs);
+  const release = await acquireSnapshotLock(muxRoot, lockTimeoutMs, "backup");
   try {
     const installs = await readInstallsToList(muxRoot);
     return await Promise.all(
@@ -153,47 +177,96 @@ async function readInstallSnapshot(
 }
 
 /**
- * The portable entry of one install, or null for a plugin the backup leaves out on purpose (logged
- * by name, and listed in the docs). An install the list cannot hold throws instead.
+ * A row of the list that the install review can open. The common schema holds the rules it can
+ * check without node (the folder, the ref, the URL's characters and whether it is on this
+ * machine). The URL must also be one the installer's own source parser takes as written
+ * (`isInstallerSourceUrl`): `ext::payload` reads as an scp host to the schema, and the preview
+ * then refuses it. Export and restore read the list through this schema, so both agree with
+ * the installer.
  */
-function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | null {
-  // Another machine cannot use a path or a loopback host on this one, and the list would publish it
-  // (the home folder names the user). The plugin is logged by name only, so its absence from the
-  // backup is explained.
-  if (pointsAtThisMachine(install.source.url)) {
-    log.info("Leaving a plugin out of the settings backup: its source is on this machine", {
-      plugin: install.name,
-    });
-    return null;
+const InstallablePluginEntrySchema = BackupPluginEntrySchema.refine(
+  (entry) => isInstallerSourceUrl(entry.source.url),
+  { path: ["source", "url"], message: "The installer does not read this as a repository URL" }
+);
+
+/**
+ * Why a plugin that works here stays out of the list, or undefined when its source can go in.
+ * Another machine cannot use a path or a loopback host on this one, and the list would publish it
+ * (the home folder names the user). The installer also takes an scp-style source with a space in
+ * its path (`gitbox:srv/my repos/r.git`), which the list refuses: whitespace, control and format
+ * characters let a URL read differently from the one git gets. A URL that escapes a letter, a
+ * digit or one of `- . _ ~` stays out too: the publish-time secret scan reads the list as
+ * written, so `%67hp_...` would hide a token (a `%20` has no other spelling and stays). Failing
+ * the push for these would block every backup for a plugin that installs and updates fine.
+ */
+function sourceLeftOutReason(url: string): string | undefined {
+  if (pointsAtThisMachine(url)) return "its source is on this machine";
+  if (UNSAFE_URL_CHARACTERS.test(url)) {
+    return "its source URL has whitespace, a control character or a format character (a bidi mark, a zero-width space) that a backup does not carry";
   }
+  if (hasEscapedUnreservedCharacter(url)) {
+    return "its source URL spells a letter, a digit or one of - . _ ~ as a percent escape, which would hide a token from the secret scan";
+  }
+  return undefined;
+}
+
+/**
+ * The paths of the fields a list entry fails on, never their values: the log names the plugin and
+ * the field, and a URL or a ref can carry what the user does not want in a log.
+ */
+function refusedFields(error: z.ZodError): string {
+  return [...new Set(error.issues.map((issue) => issue.path.join(".")))].join(", ");
+}
+
+/** A plugin left out of the list (logged by its name only) or the entry that goes in. */
+type Listing = { entry: BackupPluginEntry } | { leftOut: string };
+
+/**
+ * What the list does with one install. Anything the installer takes and the list cannot hold is
+ * left out, never a failed push: a ref such as `refs/team`, a URL over 2048 characters, a subfolder
+ * over 1024, more than 512 imported skills. One such plugin would otherwise block every settings
+ * backup that has "Agent plugins" on. A plugin that was listed before and is left out now still
+ * asks for the user's approval, as any removal from the list does (`pluginRemovalOf`).
+ */
+function listingOf({ install, generated }: InstallSnapshot): Listing {
+  const urlReason = sourceLeftOutReason(install.source.url);
+  if (urlReason !== undefined) return { leftOut: urlReason };
   // The registry records the repository a marketplace entry resolved to, and the plugin.json keeps
   // only the entry's name. An entry that points at another repository cannot be rebuilt from this
   // row, and telling it from an entry in the marketplace's own repository needs a registry field.
   // The marker is read for this exclusion alone. A plugin's repository can author its own marker,
   // so it can only remove a plugin from the backup, never choose how a restore installs it.
   if (generated?.kind === "claude-marketplace") {
-    log.info(
-      "Leaving a plugin out of the settings backup: Xum generated it from a Claude Code marketplace entry",
-      { plugin: install.name }
-    );
-    return null;
+    return { leftOut: "Xum generated it from a Claude Code marketplace entry" };
   }
   // Only the fields the schema names: consent, install times and auto-update stay local.
-  const parsed = BackupPluginEntrySchema.safeParse({
+  const parsed = InstallablePluginEntrySchema.safeParse({
     name: install.name,
     source: install.source,
     lockedSha: install.lockedSha,
     importedComponents: install.importedComponents,
   });
   if (!parsed.success) {
-    // A row the restore side would refuse. Leaving it out would drop the plugin from the backup
-    // without a word, so the push fails, like it does for a registry this build cannot read whole.
-    throw new BackupServiceError(
-      "IO_ERROR",
-      `The installed plugin "${install.name}" cannot be listed in the backup: ${formatZodIssues(parsed.error.issues.slice(0, 2))}. ${AGENT_PLUGINS_OFF_HINT}`
-    );
+    return { leftOut: `the backup list cannot hold its ${refusedFields(parsed.error)}` };
   }
-  return parsed.data;
+  // Every string of the entry (the URL, the ref, the folder, the names), as itself and decoded: not
+  // the JSON text it is written as, where `\n` or `\t` before a token takes away its word boundary.
+  if (jsonValueHidesSecret(parsed.data)) {
+    return {
+      leftOut: "its list entry hides a token behind percent escapes or a control character",
+    };
+  }
+  return { entry: parsed.data };
+}
+
+/** The portable entry of one install, or null for a plugin the list leaves out (see `listingOf`). */
+function entryOf(snapshot: InstallSnapshot): BackupPluginEntry | null {
+  const listing = listingOf(snapshot);
+  if ("entry" in listing) return listing.entry;
+  log.info(`Leaving a plugin out of the settings backup: ${listing.leftOut}`, {
+    plugin: snapshot.install.name,
+  });
+  return null;
 }
 
 /**
@@ -227,16 +300,27 @@ function folderIdentity(subpath: string | undefined): string {
 
 /**
  * The same repository URL as written, and the same folder, wherever the commit or ref of either
- * one points. Another spelling of one repository (`.git`, ssh against https, a host's case) is
- * another source here: a rule that merged spellings could also merge two repositories, and that
- * would count a different repository's plugin as kept with no approval. A spelling difference
- * asks for approval on a push and reads "Name in use" on a restore, which is the safe direction.
+ * one points. Another spelling of one repository (`.git`, a host's case) is another source here: a
+ * rule that merged spellings could also merge two repositories, and that would count a different
+ * repository's plugin as kept with no approval. A spelling difference asks for approval on a push
+ * and reads "Name in use" on a restore, which is the safe direction.
+ *
+ * The one exception is the https form of an ssh source (`httpsFormOfSshUrl`), compared as the
+ * exact URL it gives. A review previews a listed ssh source at that address and installs it from
+ * there, so the install is the listed plugin, not a plugin that replaces it: asking to remove
+ * it on the next push would be wrong, and the machine that installed it over ssh would be asked in
+ * turn. Two ssh spellings are still two sources (ports can name different servers), and so is an
+ * https URL that is not exactly that form.
  */
 function isSameSource(
   a: Pick<BackupPluginEntry["source"], "url" | "subpath">,
   b: Pick<BackupPluginEntry["source"], "url" | "subpath">
 ): boolean {
-  return a.url === b.url && folderIdentity(a.subpath) === folderIdentity(b.subpath);
+  return isSameRepository(a.url, b.url) && folderIdentity(a.subpath) === folderIdentity(b.subpath);
+}
+
+function isSameRepository(a: string, b: string): boolean {
+  return a === b || httpsFormOfSshUrl(a) === b || httpsFormOfSshUrl(b) === a;
 }
 
 /**
@@ -269,8 +353,15 @@ function pluginRemovalOf(
   const unreadable = prior.warnings.length > 0;
   if (!wholeList && !unreadable && names.length === 0) return undefined;
   names.sort();
-  // JSON, not a delimiter: a name is repository-controlled text.
-  const approval = sha256(Buffer.from(JSON.stringify({ names, wholeList, unreadable }), "utf-8"));
+  // JSON, not a delimiter: a name is repository-controlled text. The digest of the list file as
+  // stored binds the approval to the exact list on screen: an entry this build cannot read has no
+  // name to compare, so another machine could change it without changing the names or the flags.
+  // With no file to hash (it is missing, a symlink or too large) the reason it was not read does
+  // the same. A string and an array cannot be told apart by accident in the JSON.
+  const list = prior.digest ?? prior.warnings;
+  const approval = sha256(
+    Buffer.from(JSON.stringify({ names, wholeList, unreadable, list }), "utf-8")
+  );
   return { names, wholeList, unreadable, approval };
 }
 
@@ -312,14 +403,14 @@ function pluginBackupExists(sourceDir: string): Promise<boolean> {
   return sidecarExists(sourceDir, PLUGIN_BACKUP_DIR);
 }
 
-async function readManifestText(sourceDir: string): Promise<string> {
+async function readManifestBytes(sourceDir: string): Promise<Buffer> {
   // The walk refuses a symlink at the sidecar folder or the manifest, which git can store.
   const manifestPath = await resolveContainedPath(sourceDir, PLUGIN_BACKUP_MANIFEST_PATH);
   const stat = await lstatIfExists(manifestPath);
   if (stat === null || !stat.isFile() || stat.size > MAX_BACKUP_FILE_BYTES) {
     throw new Error("Backup plugin list is missing, not a file, or too large");
   }
-  return await fs.readFile(manifestPath, "utf-8");
+  return await fs.readFile(manifestPath);
 }
 
 /** The version and the rows of the list file. Each row is read on its own (`readPluginRows`). */
@@ -338,6 +429,8 @@ const MAX_PLUGIN_LIST_WARNINGS = 10;
 export interface PluginListRead {
   plugins: BackupPluginEntry[];
   warnings: string[];
+  /** sha256 of the list file's bytes as stored: absent when the file could not be read. */
+  digest?: string;
 }
 
 function unreadableList(reason: string): PluginListRead {
@@ -362,7 +455,7 @@ function readPluginRows(rows: readonly unknown[]): PluginListRead {
   const problems: string[] = [];
   const names = new Set<string>();
   for (const [index, row] of rows.slice(0, MAX_BACKUP_PLUGIN_ENTRIES).entries()) {
-    const parsed = BackupPluginEntrySchema.safeParse(row);
+    const parsed = InstallablePluginEntrySchema.safeParse(row);
     if (!parsed.success) {
       problems.push(
         `Left out ${rowLabel(row, index)}: ${formatZodIssues(parsed.error.issues.slice(0, 2))}`
@@ -406,14 +499,14 @@ function parsePluginList(text: string): PluginListRead {
  */
 async function readPluginBackup(sourceDir: string): Promise<PluginListRead> {
   if (!(await pluginBackupExists(sourceDir))) return { plugins: [], warnings: [] };
-  let text: string;
+  let bytes: Buffer;
   try {
-    text = await readManifestText(sourceDir);
+    bytes = await readManifestBytes(sourceDir);
   } catch (error) {
     if (isFilesystemError(error)) throw error;
     return unreadableList(getErrorMessage(error));
   }
-  return parsePluginList(text);
+  return { ...parsePluginList(bytes.toString("utf-8")), digest: sha256(bytes) };
 }
 
 async function hasPluginFolder(muxRoot: string, name: string): Promise<boolean> {
@@ -444,19 +537,30 @@ async function statusOf(
   return folder ? "installed" : "folderMissing";
 }
 
+/**
+ * Each listed plugin against this machine's installs. The registry and the folders are read under
+ * the plugin lock (`readInstallSnapshot`): an uninstall that lands between the two reads would
+ * report a plugin that is gone as `folderMissing`, which a reinstall is withheld for.
+ */
 async function planPluginRows(
   muxRoot: string,
-  listed: readonly BackupPluginEntry[]
+  listed: readonly BackupPluginEntry[],
+  lockTimeoutMs: number
 ): Promise<BackupPluginRow[]> {
   // No rows, nothing to compare: a backup without a list never reads this machine's registry.
   if (listed.length === 0) return [];
-  const local = await readManagedInstalls(muxRoot);
-  return await Promise.all(
-    listed.map(async (plugin) => ({
-      ...plugin,
-      status: await statusOf(muxRoot, plugin, local.get(plugin.name)),
-    }))
-  );
+  const release = await acquireSnapshotLock(muxRoot, lockTimeoutMs, "restore");
+  try {
+    const local = await readManagedInstalls(muxRoot);
+    return await Promise.all(
+      listed.map(async (plugin) => ({
+        ...plugin,
+        status: await statusOf(muxRoot, plugin, local.get(plugin.name)),
+      }))
+    );
+  } finally {
+    await release();
+  }
 }
 
 /**
@@ -484,10 +588,16 @@ export async function readPluginRestore(options: {
   muxRoot: string;
   sourceDir: string;
   contents: BackupContents;
+  /** How long to wait for a plugin install, update or uninstall in progress. */
+  lockTimeoutMs?: number;
 }): Promise<BackupPluginReport> {
   const { skipped, list } = await readPluginSidecar(options.sourceDir, options.contents);
   return {
-    rows: await planPluginRows(options.muxRoot, list.plugins),
+    rows: await planPluginRows(
+      options.muxRoot,
+      list.plugins,
+      options.lockTimeoutMs ?? MUTATION_LOCK_ACQUIRE_TIMEOUT_MS
+    ),
     skipped,
     warnings: list.warnings,
   };

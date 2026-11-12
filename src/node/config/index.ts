@@ -48,6 +48,11 @@ import {
   type AgentResourceLimits,
 } from "@/common/config/schemas/agentResourceLimits";
 import {
+  patchAgentSandbox,
+  salvageAgentSandbox,
+  type AgentSandboxPatch,
+} from "@/common/config/schemas/agentSandbox";
+import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfigInput,
@@ -70,6 +75,12 @@ import {
   RUNTIME_ENABLEMENT_IDS,
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
+import {
+  nearestSupportedIsolation,
+  resolveDefaultIsolation,
+  runtimeIdFromIsolation,
+  type IsolationChoice,
+} from "@/common/types/isolation";
 import { SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import {
   DEFAULT_RUNTIME_CONFIG,
@@ -140,6 +151,10 @@ import {
   withProjectRegistrationFileLock,
 } from "@/node/config/projectRegistrationLock";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  isSameSshDirectory,
+  normalizeTrustedSshDirectories,
+} from "@/common/utils/sshDirectoryTrust";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig };
@@ -699,7 +714,9 @@ function fallbackSeedGapKeys(key: string, entry: unknown): string[] {
   const scopedKey = sanitizeFallbackModelString(key);
   if (!scopedKey.startsWith("coder:")) return [scopedKey];
   const keptAtRuntime = normalizeModelFallbacks({ [key]: entry }) !== undefined;
-  return keptAtRuntime ? [scopedKey] : [scopedKey, normalizeToCanonical(key).trim()];
+  // scopedKey, not key: normalizeToCanonical does not trim, so a raw key with a
+  // leading space would keep its " coder" prefix and miss the direct key.
+  return keptAtRuntime ? [scopedKey] : [scopedKey, normalizeToCanonical(scopedKey)];
 }
 
 /**
@@ -1018,6 +1035,66 @@ function setProjectAgentResourceLimits(project: ProjectConfig, value: unknown): 
   else delete project.agentResourceLimits;
 }
 
+/**
+ * `defaultIsolation` is canonical; `defaultRuntime` is the flat runtime id older builds read.
+ * Resolving both from either field is the migration for legacy configs (only `defaultRuntime`),
+ * and deriving the legacy mirror from the resolved pair keeps downgrades working. A pair with no
+ * backend yet (e.g. ssh × docker) mirrors its nearest supported runtime so old builds still get a
+ * usable default. Returns no fields when neither is set, so callers delete both.
+ */
+function resolvePersistedDefaultIsolation(record: {
+  defaultIsolation?: unknown;
+  defaultRuntime?: unknown;
+}): { defaultIsolation: IsolationChoice; defaultRuntime: RuntimeEnablementId | undefined } | null {
+  const defaultIsolation = resolveDefaultIsolation(
+    record.defaultIsolation,
+    normalizeRuntimeEnablementId(record.defaultRuntime)
+  );
+  if (!defaultIsolation) {
+    return null;
+  }
+  const defaultRuntime =
+    runtimeIdFromIsolation(nearestSupportedIsolation(defaultIsolation)) ?? undefined;
+  return { defaultIsolation, defaultRuntime };
+}
+
+/** Write the canonical isolation default and its legacy mirror onto `target`, or delete both. */
+function applyPersistedDefaultIsolation(
+  target: { defaultIsolation?: IsolationChoice; defaultRuntime?: RuntimeEnablementId },
+  resolved: ReturnType<typeof resolvePersistedDefaultIsolation>
+): void {
+  if (resolved) {
+    target.defaultIsolation = resolved.defaultIsolation;
+  } else {
+    delete target.defaultIsolation;
+  }
+  if (resolved?.defaultRuntime) {
+    target.defaultRuntime = resolved.defaultRuntime;
+  } else {
+    delete target.defaultRuntime;
+  }
+}
+
+/**
+ * The isolation default fields of `record` as config.json stores them: only the keys that
+ * resolve, so a missing default writes neither key.
+ */
+function persistedDefaultIsolationFields(record: {
+  defaultIsolation?: unknown;
+  defaultRuntime?: unknown;
+}): { defaultIsolation?: IsolationChoice; defaultRuntime?: RuntimeEnablementId } {
+  const fields: { defaultIsolation?: IsolationChoice; defaultRuntime?: RuntimeEnablementId } = {};
+  applyPersistedDefaultIsolation(fields, resolvePersistedDefaultIsolation(record));
+  return fields;
+}
+
+/** Store the valid sandbox fields in `value` on the project, or remove its override. */
+function setProjectAgentSandbox(project: ProjectConfig, value: unknown): void {
+  const salvaged = salvageAgentSandbox(value);
+  if (salvaged) project.agentSandbox = salvaged;
+  else delete project.agentSandbox;
+}
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -1027,15 +1104,17 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
 
   const record = projectConfig as ProjectConfig & {
     runtimeEnablement?: unknown;
+    defaultIsolation?: unknown;
     defaultRuntime?: unknown;
     runtimeOverridesEnabled?: unknown;
     projectKind?: unknown;
     customInstructions?: unknown;
     codeWorkspaceSyncPath?: unknown;
     icon?: unknown;
+    trustedSshDirectories?: unknown;
   };
   const runtimeEnablement = normalizeRuntimeEnablementOverrides(record.runtimeEnablement);
-  const defaultRuntime = normalizeRuntimeEnablementId(record.defaultRuntime);
+  const defaultIsolation = resolvePersistedDefaultIsolation(record);
   const runtimeOverridesEnabled = record.runtimeOverridesEnabled === true ? true : undefined;
 
   const next = { ...record };
@@ -1052,11 +1131,9 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     delete next.runtimeOverridesEnabled;
   }
 
-  if (defaultRuntime) {
-    next.defaultRuntime = defaultRuntime;
-  } else {
-    delete next.defaultRuntime;
-  }
+  // Runs on both load and save: load migrates legacy defaultRuntime-only projects (so the
+  // projects list carries defaultIsolation), save rewrites the legacy mirror for older builds.
+  applyPersistedDefaultIsolation(next, defaultIsolation);
 
   const workspaces = Array.isArray(record.workspaces) ? record.workspaces : [];
   next.workspaces = workspaces.map((workspace) =>
@@ -1086,6 +1163,15 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
 
   // Hand-editable too: an out-of-range limit is dropped instead of failing projects.list.
   setProjectAgentResourceLimits(next, record.agentResourceLimits);
+  setProjectAgentSandbox(next, record.agentSandbox);
+
+  // Self-healing: malformed or duplicate SSH directory trust entries are dropped, never fatal.
+  const trustedSshDirectories = normalizeTrustedSshDirectories(record.trustedSshDirectories);
+  if (trustedSshDirectories) {
+    next.trustedSshDirectories = trustedSshDirectories;
+  } else {
+    delete next.trustedSshDirectories;
+  }
 
   // Legacy named workflow schedules are intentionally dropped while workflow
   // scheduling is disabled during the explicit script_path migration.
@@ -1152,6 +1238,17 @@ function mergeProjectAliases(group: StoredProjectEntry[]): {
     merged.trusted = true;
   } else if (group.some(({ config }) => config.trusted !== undefined)) {
     merged.trusted = false;
+  }
+  // Like project trust: an SSH directory stays trusted only when every alias trusted it.
+  const trustedSshDirectories = merged.trustedSshDirectories?.filter((directory) =>
+    group.every(({ config }) =>
+      (config.trustedSshDirectories ?? []).some((entry) => isSameSshDirectory(entry, directory))
+    )
+  );
+  if (trustedSshDirectories && trustedSshDirectories.length > 0) {
+    merged.trustedSshDirectories = trustedSshDirectories;
+  } else {
+    delete merged.trustedSshDirectories;
   }
   return { config: merged, conflictingIds: [...conflictingIds] };
 }
@@ -3202,7 +3299,8 @@ export class Config {
     const updateChannel = parseUpdateChannel(parsed.updateChannel);
 
     const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
-    const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
+    // Migrates legacy configs that only stored the flat defaultRuntime.
+    const { defaultIsolation, defaultRuntime } = persistedDefaultIsolationFields(parsed);
 
     const userPreferences = dropRemovedWorkspaceNotifications(
       normalizeUserPreferences(parsed.userPreferences),
@@ -3235,6 +3333,7 @@ export class Config {
       ),
       agentResourceLimits: normalizeAgentResourceLimits(parsed.agentResourceLimits),
       agentResourceLimitsEnabled: parseOptionalBoolean(parsed.agentResourceLimitsEnabled),
+      agentSandbox: salvageAgentSandbox(parsed.agentSandbox),
       goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
       evaluationDefaults: normalizeEvaluationDefaults(parsed.evaluationDefaults),
       routePriority,
@@ -3253,6 +3352,7 @@ export class Config {
       stopCoderWorkspaceOnArchive,
       terminalDefaultShell: parseOptionalNonEmptyString(parsed.terminalDefaultShell),
       updateChannel,
+      defaultIsolation,
       defaultRuntime,
       runtimeEnablement,
       // Validated here rather than trusted: a hand-edited or older-build value that fails the
@@ -3401,6 +3501,7 @@ export class Config {
       // Undefined (no limit set, or the limits are off) leaves the key out of the JSON.
       data.agentResourceLimits = normalizeAgentResourceLimits(config.agentResourceLimits);
       data.agentResourceLimitsEnabled = parseOptionalBoolean(config.agentResourceLimitsEnabled);
+      data.agentSandbox = salvageAgentSandbox(config.agentSandbox);
 
       if (config.goalDefaults) {
         data.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
@@ -3566,10 +3667,8 @@ export class Config {
         data.runtimeEnablement = runtimeEnablement;
       }
 
-      const defaultRuntime = normalizeRuntimeEnablementId(config.defaultRuntime);
-      if (defaultRuntime !== undefined) {
-        data.defaultRuntime = defaultRuntime;
-      }
+      // Write the canonical pair plus the legacy flat mirror so older builds keep the default.
+      Object.assign(data, persistedDefaultIsolationFields(config));
 
       if (config.settingsBackup) {
         data.settingsBackup = config.settingsBackup;
@@ -3795,7 +3894,7 @@ export class Config {
         config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR,
       worktreeArchiveBehavior: config.worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
       runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
-      defaultRuntime: config.defaultRuntime ?? null,
+      defaultIsolation: persistedDefaultIsolationFields(config).defaultIsolation ?? null,
       agentAiDefaults: config.agentAiDefaults ?? {},
       chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
       llmDebugLogs: config.llmDebugLogs === true,
@@ -3938,6 +4037,28 @@ export class Config {
     });
   }
 
+  /** Saves fields of the global sandbox setting over the latest saved value (AgentSandboxPatch). */
+  async updateAgentSandbox(patch: AgentSandboxPatch): Promise<void> {
+    await this.editConfig((config) => {
+      const next = patchAgentSandbox(config.agentSandbox, patch);
+      if (next) config.agentSandbox = next;
+      else delete config.agentSandbox;
+      return config;
+    });
+  }
+
+  /** Saves fields of one project's sandbox override; a removed field follows the global one. */
+  async updateProjectAgentSandbox(projectPath: string, patch: AgentSandboxPatch): Promise<void> {
+    await this.editConfig((config) => {
+      const project = config.projects.get(projectPath);
+      if (!project) {
+        throw new Error(`Project not found: ${projectPath}`);
+      }
+      setProjectAgentSandbox(project, patchAgentSandbox(project.agentSandbox, patch));
+      return config;
+    });
+  }
+
   async updateGoalDefaults(
     goalDefaults: Parameters<typeof normalizeGoalDefaults>[0]
   ): Promise<void> {
@@ -4031,19 +4152,20 @@ export class Config {
 
   async updateRuntimeEnablement(input: {
     runtimeEnablement?: Partial<Record<RuntimeEnablementId, boolean>> | null;
-    defaultRuntime?: RuntimeEnablementId | null;
+    /** null clears the default; undefined leaves it unchanged. */
+    defaultIsolation?: IsolationChoice | null;
     runtimeOverridesEnabled?: boolean | null;
     projectPath?: string | null;
   }): Promise<void> {
     await this.editConfig((config) => {
       const shouldUpdateRuntimeEnablement = input.runtimeEnablement !== undefined;
-      const shouldUpdateDefaultRuntime = input.defaultRuntime !== undefined;
+      const shouldUpdateDefaultIsolation = input.defaultIsolation !== undefined;
       const shouldUpdateOverridesEnabled = input.runtimeOverridesEnabled !== undefined;
       const projectPath = input.projectPath?.trim();
 
       if (
         !shouldUpdateRuntimeEnablement &&
-        !shouldUpdateDefaultRuntime &&
+        !shouldUpdateDefaultIsolation &&
         !shouldUpdateOverridesEnabled
       ) {
         return config;
@@ -4053,7 +4175,11 @@ export class Config {
         input.runtimeEnablement == null
           ? undefined
           : normalizeRuntimeEnablementOverrides(input.runtimeEnablement);
-      const defaultRuntime = input.defaultRuntime ?? undefined;
+      // Resolve through the same helper as load/save so the in-memory legacy mirror matches the
+      // new pair (a stale defaultRuntime must not survive, or clearing would resurrect it).
+      const defaultIsolation = resolvePersistedDefaultIsolation({
+        defaultIsolation: input.defaultIsolation ?? undefined,
+      });
       const runtimeOverridesEnabled = input.runtimeOverridesEnabled === true ? true : undefined;
 
       if (projectPath) {
@@ -4068,9 +4194,8 @@ export class Config {
           if (runtimeEnablement) nextProject.runtimeEnablement = runtimeEnablement;
           else delete nextProject.runtimeEnablement;
         }
-        if (shouldUpdateDefaultRuntime) {
-          if (defaultRuntime) nextProject.defaultRuntime = defaultRuntime;
-          else delete nextProject.defaultRuntime;
+        if (shouldUpdateDefaultIsolation) {
+          applyPersistedDefaultIsolation(nextProject, defaultIsolation);
         }
         if (shouldUpdateOverridesEnabled) {
           if (runtimeOverridesEnabled) nextProject.runtimeOverridesEnabled = true;
@@ -4085,8 +4210,8 @@ export class Config {
       if (shouldUpdateRuntimeEnablement) {
         next.runtimeEnablement = runtimeEnablement;
       }
-      if (shouldUpdateDefaultRuntime) {
-        next.defaultRuntime = defaultRuntime;
+      if (shouldUpdateDefaultIsolation) {
+        applyPersistedDefaultIsolation(next, defaultIsolation);
       }
       return next;
     });
@@ -5317,9 +5442,18 @@ export class Config {
 
             // The messaging tag lives only in config (legacy metadata.json predates it), so
             // overlay the validated config value or a tag write would publish stale metadata.
+            // The same holds for the consent, dispatch mode and goal defaults: read from the row
+            // as the current-format branch does, so a stray file value never reaches this build.
             workspaceMetadata.push({
               ...this.addPathsToMetadata(metadata, workspace.path),
               messagingTag: getValidMessagingTag(workspace.messagingTag),
+              unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+                workspace.unrelatedWorkspaceConsent
+              ),
+              agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+                workspace.agentMessageDispatchMode
+              ),
+              goalDefaults: workspace.goalDefaults,
             });
             metadataFound = true;
           }

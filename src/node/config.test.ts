@@ -5074,14 +5074,14 @@ describe("Config", () => {
       });
       await config.updateRuntimeEnablement({
         runtimeEnablement: { local: true, worktree: false },
-        defaultRuntime: "worktree",
+        defaultIsolation: { project: "local", workspace: "worktree" },
       });
 
       const saved = config.loadConfigOrDefault();
       expect(saved.defaultModel).toBe("openai:gpt-5.6-sol");
       expect(saved.hiddenModels).toEqual(["anthropic:claude-sonnet-4-5"]);
       expect(saved.runtimeEnablement).toEqual({ worktree: false });
-      expect(saved.defaultRuntime).toBe("worktree");
+      expect(saved.defaultIsolation).toEqual({ project: "local", workspace: "worktree" });
     });
 
     it("rejects invalid route overrides before saving", async () => {
@@ -5097,6 +5097,157 @@ describe("Config", () => {
       }
       expect((thrown as Error).message).toBe("invalid route");
       expect(config.loadConfigOrDefault().routePriority).toBeUndefined();
+    });
+  });
+
+  describe("default isolation migration", () => {
+    function writeRawConfig(raw: Record<string, unknown>): void {
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(raw));
+    }
+
+    function readRawConfig(): {
+      defaultIsolation?: unknown;
+      defaultRuntime?: unknown;
+      projects: Array<[string, { defaultIsolation?: unknown; defaultRuntime?: unknown }]>;
+    } {
+      return JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as ReturnType<
+        typeof readRawConfig
+      >;
+    }
+
+    it("loads a legacy-only defaultRuntime as an isolation pair, globally and per project", () => {
+      writeRawConfig({
+        defaultRuntime: "ssh",
+        projects: [["/repo", { workspaces: [], defaultRuntime: "ssh" }]],
+      });
+
+      const fresh = new Config(tempDir);
+      const loaded = fresh.loadConfigOrDefault();
+      expect(loaded.defaultIsolation).toEqual({ project: "ssh", workspace: "worktree" });
+      expect(loaded.projects.get("/repo")?.defaultIsolation).toEqual({
+        project: "ssh",
+        workspace: "worktree",
+      });
+      expect(fresh.getClientConfig().defaultIsolation).toEqual({
+        project: "ssh",
+        workspace: "worktree",
+      });
+    });
+
+    it("falls back to the legacy defaultRuntime when defaultIsolation is malformed", () => {
+      writeRawConfig({
+        defaultIsolation: { project: "mars", workspace: "worktree" },
+        defaultRuntime: "docker",
+        projects: [["/repo", { workspaces: [], defaultIsolation: "ssh", defaultRuntime: "coder" }]],
+      });
+
+      const loaded = new Config(tempDir).loadConfigOrDefault();
+      expect(loaded.defaultIsolation).toEqual({ project: "local", workspace: "docker" });
+      expect(loaded.projects.get("/repo")?.defaultIsolation).toEqual({
+        project: "coder",
+        workspace: "worktree",
+      });
+    });
+
+    it("prefers a valid defaultIsolation over a disagreeing legacy defaultRuntime", () => {
+      writeRawConfig({
+        defaultIsolation: { project: "local", workspace: "none" },
+        defaultRuntime: "ssh",
+        projects: [],
+      });
+
+      expect(new Config(tempDir).getClientConfig().defaultIsolation).toEqual({
+        project: "local",
+        workspace: "none",
+      });
+    });
+
+    it("saves defaultIsolation with its legacy defaultRuntime mirror", async () => {
+      writeRawConfig({ projects: [["/repo", { workspaces: [] }]] });
+      const fresh = new Config(tempDir);
+
+      await fresh.updateRuntimeEnablement({
+        defaultIsolation: { project: "local", workspace: "devcontainer" },
+      });
+      await fresh.updateRuntimeEnablement({
+        projectPath: "/repo",
+        defaultIsolation: { project: "coder", workspace: "worktree" },
+      });
+
+      const raw = readRawConfig();
+      expect(raw.defaultIsolation).toEqual({ project: "local", workspace: "devcontainer" });
+      expect(raw.defaultRuntime).toBe("devcontainer");
+      const project = raw.projects.find(([projectPath]) => projectPath === "/repo")?.[1];
+      expect(project?.defaultIsolation).toEqual({ project: "coder", workspace: "worktree" });
+      expect(project?.defaultRuntime).toBe("coder");
+    });
+
+    it("mirrors an unsupported pair as its nearest supported legacy runtime", async () => {
+      writeRawConfig({ projects: [["/repo", { workspaces: [] }]] });
+      const fresh = new Config(tempDir);
+
+      await fresh.updateRuntimeEnablement({
+        defaultIsolation: { project: "ssh", workspace: "docker" },
+      });
+      await fresh.updateRuntimeEnablement({
+        projectPath: "/repo",
+        defaultIsolation: { project: "coder", workspace: "none" },
+      });
+
+      const raw = readRawConfig();
+      // The pair itself is kept so the UI can show what the user picked.
+      expect(raw.defaultIsolation).toEqual({ project: "ssh", workspace: "docker" });
+      expect(raw.defaultRuntime).toBe("ssh");
+      const project = raw.projects.find(([projectPath]) => projectPath === "/repo")?.[1];
+      expect(project?.defaultIsolation).toEqual({ project: "coder", workspace: "none" });
+      expect(project?.defaultRuntime).toBe("coder");
+    });
+
+    it("rewrites a legacy-only config with both fields on the next save", async () => {
+      writeRawConfig({
+        defaultRuntime: "local",
+        projects: [["/repo", { workspaces: [], defaultRuntime: "docker" }]],
+      });
+      const fresh = new Config(tempDir);
+
+      await fresh.editConfig((cfg) => cfg);
+
+      const raw = readRawConfig();
+      expect(raw.defaultIsolation).toEqual({ project: "local", workspace: "none" });
+      expect(raw.defaultRuntime).toBe("local");
+      const project = raw.projects.find(([projectPath]) => projectPath === "/repo")?.[1];
+      expect(project?.defaultIsolation).toEqual({ project: "local", workspace: "docker" });
+      expect(project?.defaultRuntime).toBe("docker");
+    });
+
+    it("clearing removes both defaultIsolation and the legacy defaultRuntime", async () => {
+      writeRawConfig({
+        defaultIsolation: { project: "ssh", workspace: "worktree" },
+        defaultRuntime: "ssh",
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [],
+              defaultIsolation: { project: "local", workspace: "docker" },
+              defaultRuntime: "docker",
+            },
+          ],
+        ],
+      });
+      const fresh = new Config(tempDir);
+
+      await fresh.updateRuntimeEnablement({ defaultIsolation: null });
+      await fresh.updateRuntimeEnablement({ projectPath: "/repo", defaultIsolation: null });
+
+      const raw = readRawConfig();
+      expect(raw.defaultIsolation).toBeUndefined();
+      expect(raw.defaultRuntime).toBeUndefined();
+      const project = raw.projects.find(([projectPath]) => projectPath === "/repo")?.[1];
+      expect(project).toBeDefined();
+      expect(project?.defaultIsolation).toBeUndefined();
+      expect(project?.defaultRuntime).toBeUndefined();
+      expect(new Config(tempDir).getClientConfig().defaultIsolation).toBeNull();
     });
   });
 
@@ -5630,7 +5781,7 @@ describe("Config", () => {
       });
     });
 
-    it("does not activate a fallback through a Coder-scoped tombstone", () => {
+    it("does not activate a fallback through a Coder-scoped tombstone", async () => {
       // Read-time sanitizing drops this empty, disabled entry, and a default-typed
       // Coder selection then resolves through the direct key. Seeding the direct
       // default here would turn on a fallback the user disabled.
@@ -5651,11 +5802,45 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks?.[FABLE]).toBeUndefined();
       expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
+      // After the migration write-back, the direct default must not reach disk either.
+      await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
-        modelFallbacks?: unknown;
+        modelFallbacks?: Record<string, unknown>;
+        migrations?: { defaultModelFallbacksSeededFable52?: unknown };
       };
-      expect(raw.modelFallbacks).toEqual({ [coderKey]: tombstone });
+      expect(raw.modelFallbacks?.[FABLE]).toBeUndefined();
+      expect(raw.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
     });
+
+    it.each<[string, string, unknown, { models: string[] } | undefined]>([
+      ["a Coder tombstone", " coder:anthropic", { enabled: false, models: [] }, undefined],
+      [
+        "an OpenRouter chain",
+        " openrouter:anthropic",
+        { models: ["openai:gpt-5.5"] },
+        { models: ["openai:gpt-5.5"] },
+      ],
+    ])(
+      "treats %s under a key with a leading space like the trimmed key",
+      (_label, prefix, entry, expectedDirect) => {
+        // Hand-edited keys can carry stray whitespace. The seed must read them the
+        // way persistence does (trimmed), or it seeds a default that either wins
+        // over the user's chain or activates a fallback the user disabled.
+        fs.writeFileSync(
+          configFilePath(),
+          JSON.stringify({
+            projects: [],
+            migrations: {
+              defaultModelFallbacksSeeded: true,
+              defaultModelFallbacksSeededFable51: true,
+            },
+            modelFallbacks: { [`${prefix}/${KNOWN_MODELS.FABLE.providerModelId}`]: entry },
+          })
+        );
+
+        expect(config.loadConfigOrDefault().modelFallbacks?.[FABLE]).toEqual(expectedDirect);
+      }
+    );
 
     it("respects a hand-edited tombstone whose chain sanitizes away", () => {
       fs.writeFileSync(
@@ -6672,6 +6857,70 @@ describe("Config", () => {
       const [metadata] = await config.getAllWorkspaceMetadata();
       expect(metadata).toMatchObject({ id: "legacy-tag", messagingTag: "research" });
     });
+
+    // A padded consent value is invalid (getValidUnrelatedWorkspaceConsent): it reads as off.
+    it.each([
+      ["a valid", "row-consent", "row-consent"],
+      ["an invalid", " row-consent ", undefined],
+    ] as const)(
+      "publishes the config row's consent (%s), dispatch mode and goal defaults for an id-less legacy workspace",
+      async (_kind, rowConsent, expectedConsent) => {
+        // No Xum build wrote these to metadata.json, and the current-format branch reads them from
+        // the row, validated. A stray file value must not reach the first build either: its consent
+        // would let unrelated workspaces message this one.
+        const projectPath = path.join(tempDir, "repo");
+        const rowGoalDefaults = {
+          defaultBudgetCents: 500,
+          defaultTurnCap: null,
+          alwaysRequireExplicitBudget: null,
+        };
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: [
+              {
+                path: projectPath,
+                unrelatedWorkspaceConsent: rowConsent,
+                // Invalid: the row's value is validated, never served raw.
+                agentMessageDispatchMode: "bogus" as never,
+                goalDefaults: rowGoalDefaults,
+              },
+            ],
+          });
+          return cfg;
+        });
+        const sessionDir = path.join(config.sessionsDir, "repo");
+        fs.mkdirSync(sessionDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(sessionDir, "metadata.json"),
+          JSON.stringify({
+            id: "legacy-consent",
+            name: "legacy-consent",
+            unrelatedWorkspaceConsent: "file-consent",
+            agentMessageDispatchMode: "turn-end",
+            goalDefaults: {
+              defaultBudgetCents: 9,
+              defaultTurnCap: 9,
+              alwaysRequireExplicitBudget: true,
+            },
+          })
+        );
+        const fields = (metadata: WorkspaceMetadata | undefined) => ({
+          unrelatedWorkspaceConsent: metadata?.unrelatedWorkspaceConsent,
+          agentMessageDispatchMode: metadata?.agentMessageDispatchMode,
+          goalDefaults: metadata?.goalDefaults,
+        });
+        const first = fields((await config.getAllWorkspaceMetadata())[0]);
+        // The queued migration write lands before this no-op edit.
+        await config.editConfig((cfg) => cfg);
+        const restarted = fields((await new Config(tempDir).getAllWorkspaceMetadata())[0]);
+        const expected = {
+          unrelatedWorkspaceConsent: expectedConsent,
+          agentMessageDispatchMode: undefined,
+          goalDefaults: rowGoalDefaults,
+        };
+        expect([first, restarted]).toEqual([expected, expected]);
+      }
+    );
 
     it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
       const projectPath = path.join(tempDir, "project");

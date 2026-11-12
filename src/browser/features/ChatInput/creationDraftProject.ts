@@ -7,19 +7,88 @@ import {
   type ParsedRuntime,
   type RuntimeEnablement,
 } from "@/common/types/runtime";
+import {
+  DEFAULT_ISOLATION,
+  isolationEquals,
+  nearestSupportedIsolation,
+  resolveEnabledIsolation,
+  type IsolationChoice,
+} from "@/common/types/isolation";
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
+
+/** Whether the project's Settings → Runtimes overrides replace the global runtime settings. */
+function hasProjectRuntimeOverrides(project: ProjectConfig | undefined): project is ProjectConfig {
+  return (
+    project?.runtimeOverridesEnabled === true ||
+    Boolean(project?.runtimeEnablement) ||
+    project?.defaultIsolation !== undefined
+  );
+}
 
 /** The runtimes a project's creation offers: its Settings → Runtimes overrides, else the global ones. */
 export function projectRuntimeEnablement(
   project: ProjectConfig | undefined,
   global: RuntimeEnablement
 ): RuntimeEnablement {
-  if (!project) return global;
-  const hasOverrides =
-    project.runtimeOverridesEnabled === true ||
-    Boolean(project.runtimeEnablement) ||
-    project.defaultRuntime !== undefined;
-  return hasOverrides ? normalizeRuntimeEnablement(project.runtimeEnablement) : global;
+  return hasProjectRuntimeOverrides(project)
+    ? normalizeRuntimeEnablement(project.runtimeEnablement)
+    : global;
+}
+
+/**
+ * The isolation a new workspace in the project starts with: its Settings default (the project's
+ * override, else the global one), resolved against the isolations the project's Settings enable.
+ * This is the rule Settings → Runtimes shows, so the draft starts on the same pair instead of on a
+ * disabled one that the creation controls would then replace with a Local fallback.
+ */
+export function projectDefaultIsolation(
+  project: ProjectConfig | undefined,
+  globalDefault: IsolationChoice | null | undefined,
+  globalEnablement: RuntimeEnablement
+): IsolationChoice {
+  const configured =
+    (hasProjectRuntimeOverrides(project) ? project.defaultIsolation : undefined) ??
+    globalDefault ??
+    DEFAULT_ISOLATION;
+  return (
+    resolveEnabledIsolation(configured, projectRuntimeEnablement(project, globalEnablement)) ??
+    nearestSupportedIsolation(configured)
+  );
+}
+
+/** Whether `choice` is what new workspaces in the project already start with. */
+export function isProjectDefaultIsolation(
+  project: ProjectConfig | undefined,
+  globalDefault: IsolationChoice | null | undefined,
+  globalEnablement: RuntimeEnablement,
+  choice: IsolationChoice
+): boolean {
+  return isolationEquals(projectDefaultIsolation(project, globalDefault, globalEnablement), choice);
+}
+
+/**
+ * The config.updateRuntimeEnablement payload that makes `choice` the project's default, as the
+ * creation page's "Set as default" saves it. A project default is a Settings → Runtimes project
+ * override; a project without overrides inherits the global enabled isolations, so they are copied
+ * in: turning the override on to save a default must not re-enable what Settings turned off.
+ */
+export function projectDefaultIsolationUpdate(
+  projectPath: string,
+  project: ProjectConfig | undefined,
+  choice: IsolationChoice,
+  globalEnablement: RuntimeEnablement
+): {
+  projectPath: string;
+  defaultIsolation: IsolationChoice;
+  runtimeOverridesEnabled: true;
+  runtimeEnablement?: RuntimeEnablement;
+} {
+  return {
+    projectPath,
+    defaultIsolation: choice,
+    runtimeOverridesEnabled: true,
+    ...(hasProjectRuntimeOverrides(project) ? {} : { runtimeEnablement: { ...globalEnablement } }),
+  };
 }
 
 /** A project agent exists only in its project; built-in and global agents exist everywhere. */

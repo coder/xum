@@ -2180,6 +2180,28 @@ describe("xumEnv environment variables", () => {
       expect(result.output).toContain("CUSTOM:from-secrets");
     }
   });
+
+  it("keeps Xum's scratch dir when a secret has its name", async () => {
+    using tempDir = new TestTempDir("test-mux-env-scratch");
+    const config = createTestToolConfig(process.cwd());
+    config.runtimeTempDir = tempDir.path;
+    config.xumEnv = { XUM_SCRATCH_DIR: "/xum/scratch", MUX_SCRATCH_DIR: "/xum/scratch" };
+    // The macOS sandbox opens $XUM_SCRATCH_DIR for writes, so this would open a home folder.
+    config.secrets = { XUM_SCRATCH_DIR: "/Users/me", MUX_SCRATCH_DIR: "/Users/me" };
+    const tool = createBashTool(config);
+
+    const result = (await tool.execute!(
+      {
+        script: 'echo "SCRATCH:$XUM_SCRATCH_DIR|$MUX_SCRATCH_DIR"',
+        timeout_secs: 5,
+        run_in_background: false,
+        display_name: "test",
+      },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(result).toMatchObject({ success: true, output: "SCRATCH:/xum/scratch|/xum/scratch" });
+  });
 });
 
 describe("SSH runtime redundant cd detection", () => {

@@ -8,6 +8,7 @@ import {
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { linkSync, writeFileSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { Config } from "@/node/config";
@@ -96,6 +97,71 @@ function projectMemoryRoot(fixture: MemoryFixture): string {
     "project",
     projectMemoryDirName(FIXTURE_PROJECT_PATH)
   );
+}
+
+/** The notes that `writeFillerNotes` wrote, which `listIndexEntriesOverFiller` answers without a read. */
+const fillerNotes = new Set<string>();
+
+/**
+ * Brings a store towards its file cap with `count` notes named `<prefix>0000.md`, `<prefix>0001.md`, ...
+ * (`dir` must exist). Each is a hard link to the first, which holds `content`. The service lists, counts
+ * and deletes the notes by path, so it sees `count` files. A link costs a directory entry, and a written
+ * note costs a data write too: on a virtiofs host a thousand writes took 2 s and a thousand links 0.3 s.
+ * The loop is synchronous, so no event-loop hop waits on a loaded host between two files.
+ */
+function writeFillerNotes(
+  dir: string,
+  count: number,
+  options: { prefix?: string; content?: string } = {}
+): void {
+  expect(count).toBeGreaterThan(0);
+  const noteName = (i: number) =>
+    path.join(dir, `${options.prefix ?? "o"}${String(i).padStart(4, "0")}.md`);
+  writeFileSync(noteName(0), options.content ?? "o");
+  fillerNotes.add(noteName(0));
+  for (let i = 1; i < count; i++) {
+    linkSync(noteName(0), noteName(i));
+    fillerNotes.add(noteName(i));
+  }
+}
+
+/**
+ * `service.listIndexEntries(ctx)` over a store that holds filler notes (`writeFillerNotes`). The index
+ * reads a prefix of every note it lists, one note after the other (an `open`, a `read` and a `close`), so
+ * a listing of a full store is about three thousand awaited filesystem calls, and each one waits for a
+ * thread. At a load average of 40 a listing took 3 s and a test that lists three times took 13 s, and at
+ * 60 that test took 40 s. A filler note has no description, so this answers its `open` with an empty file
+ * and the listing is the same. Every other path reaches the filesystem, and the spy is gone when the
+ * listing returns. The adoption pass that a listing can run reads legacy notes through `open` too, so
+ * where the legacy store holds filler notes (the bounded-listing test), the spy answers those reads as
+ * well. That test asserts the content of `a.md` only, and `a.md` is no filler note.
+ */
+async function listIndexEntriesOverFiller(
+  service: MemoryService,
+  ctx: MemoryScopeContext
+): Promise<Awaited<ReturnType<MemoryService["listIndexEntries"]>>> {
+  const realOpen = fsPromises.open.bind(fsPromises) as (...args: unknown[]) => unknown;
+  const emptyFile = {
+    read: () => Promise.resolve({ bytesRead: 0 }),
+    close: () => Promise.resolve(),
+  } as unknown as fsPromises.FileHandle;
+  let answered = 0;
+  const open = spyOn(fsPromises, "open").mockImplementation(((
+    file: Parameters<typeof fsPromises.open>[0],
+    ...rest: unknown[]
+  ) => {
+    if (typeof file !== "string" || !fillerNotes.has(file)) return realOpen(file, ...rest);
+    answered++;
+    return Promise.resolve(emptyFile);
+  }) as unknown as typeof fsPromises.open);
+  try {
+    const entries = await service.listIndexEntries(ctx);
+    // The shortcut must have been taken, or the test is as slow as before.
+    expect(answered).toBeGreaterThan(0);
+    return entries;
+  } finally {
+    open.mockRestore();
+  }
 }
 
 describe("MemoryService", () => {
@@ -439,6 +505,135 @@ describe("MemoryService", () => {
       const physical = path.join(fixture.xumHome, "memory", "global", "s.md");
       expect(await fsPromises.readFile(physical, "utf-8")).toBe("dup\nother\ndup\nmore");
     });
+
+    // The refusal is what a model reads to choose a longer old_str, so its count, line numbers,
+    // order and wording are pinned for each shape a match list can take. A file with a single match
+    // never reaches this text: it is replaced, which "replaces a unique occurrence" covers.
+    const AMBIGUOUS_PATH = "/memories/global/s.md";
+    const ambiguousError = (count: number, lines: string) =>
+      `No replacement was performed: old_str matches ${count} locations (lines ${lines}) in ${AMBIGUOUS_PATH}. Provide a longer, unique old_str.`;
+    // "1, 2, ..., count" from `first`.
+    const lineList = (count: number, first = 1) =>
+      Array.from({ length: count }, (_, i) => first + i).join(", ");
+
+    // Refuses the edit through both write paths on a fresh file: strReplace, and validateMutation
+    // (staging-time validation), which share the computation and so must say the same thing.
+    const refuseAmbiguous = async (content: string, oldStr: string) => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, AMBIGUOUS_PATH, content, "agent");
+      const refused = await fixture.service.strReplace(
+        fixture.ctx,
+        AMBIGUOUS_PATH,
+        oldStr,
+        "x",
+        "agent"
+      );
+      const validated = await fixture.service.validateMutation(fixture.ctx, {
+        command: "str_replace",
+        path: AMBIGUOUS_PATH,
+        old_str: oldStr,
+        new_str: "x",
+      });
+      const physical = path.join(fixture.xumHome, "memory", "global", "s.md");
+      return { refused, validated, onDisk: await fsPromises.readFile(physical, "utf-8") };
+    };
+
+    it.each([
+      ["matches on separate lines", "dup\nother\ndup\nmore", "dup", ambiguousError(2, "1, 3")],
+      ["several matches on one line", "ab ab ab\nzz\nab", "ab", ambiguousError(4, "1, 3")],
+      [
+        "matches spread over many lines",
+        Array.from({ length: 24 }, (_, i) => (i % 3 === 0 ? "hit here" : `line ${i + 1}`)).join(
+          "\n"
+        ),
+        "hit",
+        ambiguousError(8, "1, 4, 7, 10, 13, 16, 19, 22"),
+      ],
+      ["matches that overlap on one line", "aaaa", "aa", ambiguousError(3, "1")],
+      ["matches that overlap across a newline", "a\na\na", "a\na", ambiguousError(2, "1, 2")],
+      ["an old_str that starts with a newline", "x\ny\nx\ny", "\ny", ambiguousError(2, "1, 3")],
+      ["blank lines before the matches", "\n\nfoo\n\nfoo\n", "foo", ambiguousError(2, "3, 5")],
+      ["CRLF line endings", "dup\r\nother\r\ndup\r\nmore\r\n", "dup", ambiguousError(2, "1, 3")],
+      ["a CRLF in old_str", "a\r\nb\r\na\r\nb", "a\r\nb", ambiguousError(2, "1, 3")],
+      [
+        "a last match with no trailing newline",
+        "foo\nbar\nbaz foo",
+        "foo",
+        ambiguousError(2, "1, 3"),
+      ],
+      ["a last line that is the match", "foo\nfoo", "foo", ambiguousError(2, "1, 2")],
+      [
+        "an old_str that overlaps itself on one line",
+        "a".repeat(12),
+        "a".repeat(8),
+        ambiguousError(5, "1"),
+      ],
+      [
+        "an old_str that overlaps itself across lines",
+        "ab\n".repeat(6),
+        "ab\n".repeat(3),
+        ambiguousError(4, "1, 2, 3, 4"),
+      ],
+      ["matches on a line after the first match's", "ab\nab ab", "ab", ambiguousError(3, "1, 2")],
+      ["matches that all sit on a later line", "x\nab ab ab\nzz", "ab", ambiguousError(3, "2")],
+      ["an old_str that is a run of newlines", "x\n\n\n", "\n", ambiguousError(3, "1, 2, 3")],
+      // The line list stops at 20 lines (MEMORY_STR_REPLACE_ERROR_MAX_LINES): 20 are named in
+      // full, and past that the first 20 are named and the rest are counted.
+      [
+        "as many matching lines as the cap lists",
+        "a\n".repeat(20),
+        "a",
+        ambiguousError(20, lineList(20)),
+      ],
+      [
+        "one more matching line than the cap lists",
+        "a\n".repeat(21),
+        "a",
+        ambiguousError(21, `${lineList(20)}, and 1 more`),
+      ],
+      [
+        "ten more matching lines than the cap lists",
+        "a\n".repeat(30),
+        "a",
+        ambiguousError(30, `${lineList(20)}, and 10 more`),
+      ],
+      [
+        "matching lines that start after some others",
+        "x\n".repeat(5) + "a\n".repeat(25),
+        "a",
+        ambiguousError(25, `${lineList(20, 6)}, and 5 more`),
+      ],
+      [
+        "more matches than the cap on a few lines",
+        `${"a ".repeat(30)}\na`,
+        "a",
+        ambiguousError(31, "1, 2"),
+      ],
+      ["text outside ASCII", "\u{1F642} x\n\u{1F642} x", "x", ambiguousError(2, "1, 2")],
+    ])("names the matching lines for %s", async (_label, content, oldStr, expected) => {
+      const { refused, validated, onDisk } = await refuseAmbiguous(content, oldStr);
+
+      expect(refused).toEqual({ success: false, error: expected });
+      expect(validated).toEqual({ ok: false, error: expected });
+      expect(onDisk).toBe(content);
+    });
+
+    // 100 KiB of newlines with old_str "\n" matches on every line. The error listed every line
+    // number and came to about 708 KB, all of it sent back to the model.
+    it("keeps the refusal of a file of newlines to a few hundred bytes", async () => {
+      const content = "\n".repeat(MEMORY_MAX_FILE_BYTES);
+      const expected = ambiguousError(
+        MEMORY_MAX_FILE_BYTES,
+        `${lineList(20)}, and ${MEMORY_MAX_FILE_BYTES - 20} more`
+      );
+
+      const { refused, validated, onDisk } = await refuseAmbiguous(content, "\n");
+
+      expect(refused).toEqual({ success: false, error: expected });
+      expect(validated).toEqual({ ok: false, error: expected });
+      expect(Buffer.byteLength(expected)).toBeLessThan(300);
+      expect(onDisk).toBe(content);
+    });
   });
 
   describe("insert", () => {
@@ -590,6 +785,48 @@ describe("MemoryService", () => {
         expect(edited.success).toBe(true);
         expect(await fsPromises.readFile(physical(fixture, name), "utf-8")).toContain("more notes");
       }
+    });
+
+    it("refuses an edit that writes a value behind a marker, and passes one that quotes a marker with punctuation", async () => {
+      // `password=[redacted]SEKRIT` is no redaction shape of its own (the key pattern skips a value
+      // that starts with the marker), so the guard reads what goes on behind the marker.
+      using fixture = await createFixture();
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/notes.md",
+        "# deploy\npassword=[redacted]\n",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const edit = (oldText: string, newText: string) =>
+        fixture.service.strReplace(
+          fixture.ctx,
+          "/memories/global/notes.md",
+          oldText,
+          newText,
+          "agent",
+          undefined,
+          undefined,
+          GUARDED
+        );
+
+      const refused = [
+        await edit("password=[redacted]", "password=[redacted]SEKRIT"),
+        await edit("password=[redacted]", "password=[redacted]秘密"),
+        await edit("# deploy", "# deploy\n?sig=[redacted]SEKRIT"),
+      ];
+      const quoted = await edit(
+        "# deploy",
+        "# deploy: `API_KEY=[redacted]`, then password=[redacted]。"
+      );
+
+      expect(refused.map((result) => result.success)).toEqual([false, false, false]);
+      expect(quoted.success).toBe(true);
+      expect(await fsPromises.readFile(physical(fixture, "notes.md"), "utf-8")).toBe(
+        "# deploy: `API_KEY=[redacted]`, then password=[redacted]。\npassword=[redacted]\n"
+      );
     });
 
     it("refuses an edit that assembles a new key in a file that already held a credential", async () => {
@@ -1871,18 +2108,14 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(legacyRoot, { recursive: true });
       // Owner two below the cap; child brings five (one identical to an owner
       // file, which needs no slot).
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 2 }, (_, i) =>
-          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
-        )
-      );
+      writeFillerNotes(ownerRoot, MEMORY_MAX_FILES_PER_SCOPE - 2);
       await fsPromises.writeFile(path.join(ownerRoot, "shared.md"), "same");
       for (const name of ["a.md", "b.md", "c.md", "d.md"]) {
         await fsPromises.writeFile(path.join(legacyRoot, name), `child ${name}`);
       }
       await fsPromises.writeFile(path.join(legacyRoot, "shared.md"), "same");
 
-      const listed = await fixture.service.listIndexEntries(fixture.ctx);
+      const listed = await listIndexEntriesOverFiller(fixture.service, fixture.ctx);
       const workspaceFiles = listed.filter((e) => e.scope === "workspace").map((e) => e.relPath);
       // Exactly at the cap, never above: one slot was already taken by
       // shared.md's owner copy, so only one of the four new notes fit.
@@ -1908,7 +2141,7 @@ describe("MemoryService", () => {
       );
       await fixture.service.deletePath({ ...fixture.ctx }, "/memories/workspace/o0000.md", "agent");
       await fixture.service.deletePath({ ...fixture.ctx }, "/memories/workspace/o0001.md", "agent");
-      const relisted = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+      const relisted = (await listIndexEntriesOverFiller(fixture.service, { ...fixture.ctx }))
         .filter((e) => e.scope === "workspace")
         .map((e) => e.relPath);
       expect(passes).not.toHaveBeenCalled();
@@ -1919,7 +2152,7 @@ describe("MemoryService", () => {
       // A changed legacy store (a note written on the downgraded build)
       // re-runs the pass, which then uses the freed capacity.
       await fsPromises.writeFile(path.join(legacyRoot, "e.md"), "child e.md");
-      const rewalked = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+      const rewalked = (await listIndexEntriesOverFiller(fixture.service, { ...fixture.ctx }))
         .filter((e) => e.scope === "workspace")
         .map((e) => e.relPath);
       expect(passes).toHaveBeenCalledTimes(1);
@@ -1929,7 +2162,10 @@ describe("MemoryService", () => {
         "b.md",
         "c.md",
       ]);
-    });
+      // What is left (the fixture, a thousand links, three listings with no per-note reads) still scales
+      // with the host's load: it took 1.8 s at a load average of 45 and 3.7 s at 80, so the default 5 s
+      // leaves little room. The tests next to it that fill a store allow 30 s or more as well.
+    }, 30_000);
 
     it("adopts addressable dot-entry notes and refuses the handover over unrepresentable ones", async () => {
       using fixture = await createFixture("ws-child");
@@ -3740,13 +3976,9 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(ownerRoot, { recursive: true });
       await fsPromises.mkdir(legacyRoot, { recursive: true });
       // The adopted note takes the owner store's last slot.
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 1 }, (_, i) =>
-          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
-        )
-      );
+      writeFillerNotes(ownerRoot, MEMORY_MAX_FILES_PER_SCOPE - 1);
       await fsPromises.writeFile(path.join(legacyRoot, "old.md"), "note");
-      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      await listIndexEntriesOverFiller(fixture.service, { ...fixture.ctx });
       expect(await fsPromises.readFile(path.join(ownerRoot, "old.md"), "utf-8")).toBe("note");
       const passes = spyOn(
         fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
@@ -3757,7 +3989,7 @@ describe("MemoryService", () => {
       // "full" (and then memoized) while the old copy still held the slot.
       await new Promise((resolve) => setTimeout(resolve, 5));
       await fsPromises.rename(path.join(legacyRoot, "old.md"), path.join(legacyRoot, "new.md"));
-      const files = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+      const files = (await listIndexEntriesOverFiller(fixture.service, { ...fixture.ctx }))
         .filter((e) => e.scope === "workspace")
         .map((e) => e.relPath);
       expect(passes).toHaveBeenCalledTimes(1);
@@ -3767,7 +3999,7 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(path.join(ownerRoot, "new.md"), "utf-8")).toBe("note");
       // Strict removal agrees the handover is complete.
       await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
-    });
+    }, 30_000);
 
     it("writes tombstones the previous build reads as unsettled, so a reappearing source is re-adopted there too", async () => {
       using fixture = await createFixture("ws-child");
@@ -4291,17 +4523,12 @@ describe("MemoryService", () => {
       // (a permanent, memoized skip) — cheap, and the fingerprint is what
       // decides whether a.md's later edit is seen.
       await fsPromises.mkdir(ownerRoot, { recursive: true });
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 1 }, (_, i) =>
-          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
-        )
-      );
+      writeFillerNotes(ownerRoot, MEMORY_MAX_FILES_PER_SCOPE - 1);
       await fsPromises.mkdir(path.join(legacyRoot, "a"), { recursive: true });
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 1 }, (_, i) =>
-          fsPromises.writeFile(path.join(legacyRoot, "a", `${String(i).padStart(4, "0")}.md`), "x")
-        )
-      );
+      writeFillerNotes(path.join(legacyRoot, "a"), MEMORY_MAX_FILES_PER_SCOPE + 1, {
+        prefix: "",
+        content: "x",
+      });
       await fsPromises.writeFile(path.join(legacyRoot, "a.md"), "v1");
       const realReaddir = fsPromises.readdir.bind(fsPromises);
       const untyped = spyOn(fsPromises, "readdir").mockImplementation((async (
@@ -4333,11 +4560,11 @@ describe("MemoryService", () => {
           },
           "readOrQuarantineAdoptionManifest"
         );
-        await fixture.service.listIndexEntries({ ...fixture.ctx });
+        await listIndexEntriesOverFiller(fixture.service, { ...fixture.ctx });
         expect(await fsPromises.readFile(path.join(ownerRoot, "a.md"), "utf-8")).toBe("v1");
         await new Promise((resolve) => setTimeout(resolve, 5));
         await fsPromises.writeFile(path.join(legacyRoot, "a.md"), "v2 (downgrade)");
-        await fixture.service.listIndexEntries({ ...fixture.ctx });
+        await listIndexEntriesOverFiller(fixture.service, { ...fixture.ctx });
         expect(passes).toHaveBeenCalledTimes(2);
         expect(await fsPromises.readFile(path.join(ownerRoot, "a.md"), "utf-8")).toBe(
           "v2 (downgrade)"
@@ -4345,7 +4572,11 @@ describe("MemoryService", () => {
       } finally {
         untyped.mockRestore();
       }
-    }, 30_000);
+      // The legacy directory must hold more entries than the cap, and each is untyped. The first listing
+      // made about 4,000 lstat and 6,000 realpath calls, and nothing can skip them as the filler reads are
+      // skipped. The cap is a constant of the service, so the directory cannot be smaller. The test took
+      // 8 s at a load average of 45 and 45 s at 75, so it keeps a wide allowance.
+    }, 120_000);
 
     it("quarantines a malformed sibling manifest during a reliance check, but waits on an unreadable one", async () => {
       using fixture = await createFixture("ws-child");
@@ -4418,13 +4649,9 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(ownerRoot, { recursive: true });
       await fsPromises.mkdir(childRoot, { recursive: true });
       // The child's adoption takes the owner store's last slot.
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 1 }, (_, i) =>
-          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
-        )
-      );
+      writeFillerNotes(ownerRoot, MEMORY_MAX_FILES_PER_SCOPE - 1);
       await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
-      await fixture.service.listIndexEntries(childCtx);
+      await listIndexEntriesOverFiller(fixture.service, childCtx);
       const sharedCopy = path.join(ownerRoot, "shared.md");
       const sharedKey = memoryLogicalKey("workspace", "shared.md", {
         projectPath: "",
@@ -4461,7 +4688,7 @@ describe("MemoryService", () => {
       // as not yet placed (a non-forced removal waits; a forced one loses
       // nothing — the bytes are the shared copy's).
       for (const id of ["ws-grandchild", "ws-cousin"]) {
-        await fixture.service.listIndexEntries({ ...fixture.ctx, workspaceId: id });
+        await listIndexEntriesOverFiller(fixture.service, { ...fixture.ctx, workspaceId: id });
         expect(await pathExists(ownCopyOf(id))).toBe(false);
         expect(await recordOf(id)).toEqual({
           content: sha256Hex("same note"),
@@ -4478,13 +4705,19 @@ describe("MemoryService", () => {
       // The creator deletes its note: the copy two receipts stand on stays.
       await new Promise((resolve) => setTimeout(resolve, 5));
       await fsPromises.rm(path.join(childRoot, "shared.md"));
-      await fixture.service.listIndexEntries(childCtx);
+      await listIndexEntriesOverFiller(fixture.service, childCtx);
       expect(await fsPromises.readFile(sharedCopy, "utf-8")).toBe("same note");
       // One slot frees up: the next descendant to look migrates into it,
       // the other still waits.
       await fsPromises.rm(path.join(ownerRoot, "o0000.md"));
-      await fixture.service.listIndexEntries({ ...fixture.ctx, workspaceId: "ws-grandchild" });
-      await fixture.service.listIndexEntries({ ...fixture.ctx, workspaceId: "ws-cousin" });
+      await listIndexEntriesOverFiller(fixture.service, {
+        ...fixture.ctx,
+        workspaceId: "ws-grandchild",
+      });
+      await listIndexEntriesOverFiller(fixture.service, {
+        ...fixture.ctx,
+        workspaceId: "ws-cousin",
+      });
       expect(await fsPromises.readFile(ownCopyOf("ws-grandchild"), "utf-8")).toBe("same note");
       expect(await recordOf("ws-grandchild")).toMatchObject({
         target: "imported/ws-grandchild/shared.md",
@@ -4493,15 +4726,18 @@ describe("MemoryService", () => {
       });
       expect(await pathExists(ownCopyOf("ws-cousin"))).toBe(false);
       expect(await mdFiles()).toBe(MEMORY_MAX_FILES_PER_SCOPE);
-      await fixture.service.listIndexEntries(childCtx);
+      await listIndexEntriesOverFiller(fixture.service, childCtx);
       expect(await fsPromises.readFile(sharedCopy, "utf-8")).toBe("same note");
       // A second slot: the last receipt migrates, nobody relies on the
       // creator's copy any more, and its deletion runs the normal removal,
       // metadata included. The store never exceeded the cap.
       await fsPromises.rm(path.join(ownerRoot, "o0001.md"));
-      await fixture.service.listIndexEntries({ ...fixture.ctx, workspaceId: "ws-cousin" });
+      await listIndexEntriesOverFiller(fixture.service, {
+        ...fixture.ctx,
+        workspaceId: "ws-cousin",
+      });
       expect(await fsPromises.readFile(ownCopyOf("ws-cousin"), "utf-8")).toBe("same note");
-      await fixture.service.listIndexEntries(childCtx);
+      await listIndexEntriesOverFiller(fixture.service, childCtx);
       expect(await pathExists(sharedCopy)).toBe(false);
       expect((await fixture.metaService.getPinnedKeys()).has(sharedKey)).toBe(false);
       expect(await mdFiles()).toBe(MEMORY_MAX_FILES_PER_SCOPE - 1);
@@ -5271,13 +5507,9 @@ describe("MemoryService", () => {
       // force thousands of per-file reads on stream startup.
       const memoryDir = projectMemoryRoot(fixture);
       await fsPromises.mkdir(memoryDir, { recursive: true });
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 25 }, (_, i) =>
-          fsPromises.writeFile(path.join(memoryDir, `f${String(i).padStart(4, "0")}.md`), "x")
-        )
-      );
+      writeFillerNotes(memoryDir, MEMORY_MAX_FILES_PER_SCOPE + 25, { prefix: "f", content: "x" });
 
-      const entries = await fixture.service.listIndexEntries(fixture.ctx);
+      const entries = await listIndexEntriesOverFiller(fixture.service, fixture.ctx);
       const project = entries.filter((e) => e.scope === "project");
       expect(project).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
       // Deterministic subset: the lexicographically-first files are kept.
@@ -5285,7 +5517,7 @@ describe("MemoryService", () => {
       expect(project[project.length - 1]?.relPath).toBe(
         `f${String(MEMORY_MAX_FILES_PER_SCOPE - 1).padStart(4, "0")}.md`
       );
-    });
+    }, 30_000);
 
     it("keeps global lexicographic order when the cap truncates nested trees", async () => {
       using fixture = await createFixture();
@@ -5295,17 +5527,16 @@ describe("MemoryService", () => {
       const memoryDir = projectMemoryRoot(fixture);
       await fsPromises.mkdir(path.join(memoryDir, "a"), { recursive: true });
       await fsPromises.writeFile(path.join(memoryDir, "a.md"), "root file");
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 5 }, (_, i) =>
-          fsPromises.writeFile(path.join(memoryDir, "a", `f${String(i).padStart(4, "0")}.md`), "x")
-        )
-      );
+      writeFillerNotes(path.join(memoryDir, "a"), MEMORY_MAX_FILES_PER_SCOPE + 5, {
+        prefix: "f",
+        content: "x",
+      });
 
-      const entries = await fixture.service.listIndexEntries(fixture.ctx);
+      const entries = await listIndexEntriesOverFiller(fixture.service, fixture.ctx);
       const project = entries.filter((e) => e.scope === "project");
       expect(project).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
       expect(project[0]?.relPath).toBe("a.md");
-    });
+    }, 30_000);
 
     it("reads only a bounded prefix per file when extracting descriptions", async () => {
       using fixture = await createFixture();
@@ -5958,6 +6189,47 @@ describe("MemoryService refinement journal", () => {
       expect([renamed.success, deleted.success]).toEqual([true, true]);
 
       expect(await readRefinementEvents(sessionDirOf(fixture))).toHaveLength(2);
+    });
+
+    // A note that quotes a marker puts punctuation behind it. That is no value, so the guard reads
+    // no credential in it and the row of its cleanup keeps its pre-image, as it does on main. A value
+    // behind the marker is one: that row is dropped.
+    it("journals a guarded delete of a note that quotes a marker with punctuation behind it, and none of one with a value", async () => {
+      using fixture = await createFixture();
+      const notes = [
+        ["full-stop.md", "The CI password=[redacted]."],
+        ["code-span.md", "Deploy reads `API_KEY=[redacted]` from the vault."],
+        ["ideographic.md", "密码 password=[redacted]。"],
+        ["value.md", "password=[redacted]SEKRIT"],
+        ["cjk-value.md", "password=[redacted]秘密"],
+      ];
+      for (const [name, text] of notes) {
+        await fixture.service.create(fixture.ctx, `/memories/global/${name}`, `${text}\n`, "agent");
+      }
+      for (const [name] of notes) {
+        const deleted = await fixture.service.deletePath(
+          fixture.ctx,
+          `/memories/global/${name}`,
+          "agent",
+          undefined,
+          undefined,
+          undefined,
+          GUARDED
+        );
+        expect(deleted.success).toBe(true);
+      }
+
+      const events = await readRefinementEvents(sessionDirOf(fixture));
+      const rows = events.map((event) => {
+        const action = MemoryRefinementActionSchema.parse(event.data.action);
+        return `${action.op} ${action.path}`;
+      });
+      expect(rows).toEqual([
+        ...notes.map(([name]) => `create /memories/global/${name}`),
+        "delete /memories/global/full-stop.md",
+        "delete /memories/global/code-span.md",
+        "delete /memories/global/ideographic.md",
+      ]);
     });
   });
 

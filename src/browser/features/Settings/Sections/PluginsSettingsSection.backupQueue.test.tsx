@@ -171,8 +171,8 @@ test("previews the pinned commit of the first backed-up plugin and installs it t
   });
 });
 
-test("keeps tracking the backup's branch when the user fixed the URL and the preview resolved the pinned commit", async () => {
-  const { view, installSpy } = renderWithBackup(
+test("previews an ssh source at its https address and installs it from there, tracking the backup's branch", async () => {
+  const { view, installSpy, previewSpy } = renderWithBackup(
     [
       backedUp("alpha", {
         source: {
@@ -186,6 +186,12 @@ test("keeps tracking the backup's branch when the user fixed the URL and the pre
     { alpha: previewOf("alpha") }
   );
   await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  // Git never sees the ssh address: the preview is of the https one, at the pinned commit.
+  expect(previewSpy).toHaveBeenCalledTimes(1);
+  expect(previewSpy.mock.calls[0]?.[0]).toMatchObject({
+    input: "https://github.com/example/alpha.git",
+    ref: PINNED,
+  });
 
   await clickButton(view, /^Install$/);
 
@@ -193,6 +199,44 @@ test("keeps tracking the backup's branch when the user fixed the URL and the pre
   expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
     source: { url: "https://github.com/example/alpha.git", ref: "main", refType: "branch" },
     expectedSha: PINNED,
+  });
+});
+
+test.each([
+  ["an http URL", "http://host.example/gone.git"],
+  ["a git URL", "git://host.example/gone.git"],
+  ["an ssh URL with no path", "ssh://git@host.example"],
+  // Not plain: WHATWG reads github.com, while git and libcurl connect to attacker.example.
+  [
+    "an https URL with a backslash before a user part",
+    "https://github.com\\@attacker.example/gone.git",
+  ],
+  ["an https URL on this machine", "https://127.0.0.1/example/gone.git"],
+  ["an ssh URL whose https form is on this machine", "git@127.0.0.1:example/gone.git"],
+])("does not preview %s, says why, and moves on when it is skipped", async (_label, url) => {
+  const { view, previewSpy } = renderWithBackup(
+    [
+      backedUp("gone", { source: { type: "git", url, ref: "main", refType: "branch" } }),
+      backedUp("beta"),
+    ],
+    { beta: previewOf("beta"), gone: previewOf("gone") }
+  );
+
+  await waitFor(() =>
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain(
+      "comes from a source that is not https"
+    )
+  );
+  expect(header(view)).toContain("From backup: 1 of 2");
+  // Nothing is fetched for it, and the form does not offer its address to a click on Preview.
+  expect(previewSpy).not.toHaveBeenCalled();
+  expect(view.container.querySelector<HTMLInputElement>("#plugin-source")?.value).toBe("");
+
+  await clickButton(view, /^Skip$/);
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  expect(previewSpy).toHaveBeenCalledTimes(1);
+  expect(previewSpy.mock.calls[0]?.[0]).toMatchObject({
+    input: "https://github.com/example/beta.git",
   });
 });
 
@@ -460,41 +504,66 @@ test("the ordinary add flow installs the source its own preview resolved", async
   await waitFor(() => expect(header(view)).toContain("Plugin installed."));
 });
 
+/** The API context in one state: a section mounted with `connecting` gets its client later. */
+function apiState(
+  api: ReturnType<typeof previewingClient>["api"],
+  state: "connecting" | "connected"
+): UseAPIResult {
+  return state === "connecting"
+    ? {
+        status: "connecting",
+        api: null,
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }
+    : {
+        status: "connected",
+        api,
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      };
+}
+
+const sectionWith = (
+  api: ReturnType<typeof previewingClient>["api"],
+  state: "connecting" | "connected"
+) => (
+  <APIContext.Provider value={apiState(api, state)}>
+    <TooltipProvider>
+      <PluginsSettingsSection />
+    </TooltipProvider>
+  </APIContext.Provider>
+);
+
 test("previews the first plugin once, when the API arrives after the panel mounted", async () => {
   const { api, previewSpy } = previewingClient({ alpha: previewOf("alpha") });
-  const apiState = (state: "connecting" | "connected"): UseAPIResult =>
-    state === "connecting"
-      ? {
-          status: "connecting",
-          api: null,
-          error: null,
-          authenticate: () => undefined,
-          retry: () => undefined,
-        }
-      : {
-          status: "connected",
-          api,
-          error: null,
-          authenticate: () => undefined,
-          retry: () => undefined,
-        };
-  const tree = (state: "connecting" | "connected") => (
-    <APIContext.Provider value={apiState(state)}>
-      <TooltipProvider>
-        <PluginsSettingsSection />
-      </TooltipProvider>
-    </APIContext.Provider>
-  );
   publishPluginsSectionIntent({ type: "install-from-backup", entries: [backedUp("alpha")] });
 
-  const view = render(tree("connecting"));
+  const view = render(sectionWith(api, "connecting"));
   await waitFor(() => expect(header(view)).toContain("From backup: 1 of 1"));
   expect(previewSpy).not.toHaveBeenCalled();
-  view.rerender(tree("connected"));
+  view.rerender(sectionWith(api, "connected"));
 
   await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
   expect(previewSpy).toHaveBeenCalledTimes(1);
   expect(previewSpy.mock.calls[0]?.[0]).toMatchObject({ ref: PINNED });
+});
+
+test("a reconnect previews again without the failure of the client that dropped", async () => {
+  const dropped = previewingClient({});
+  const reconnected = previewingClient({ alpha: previewOf("alpha") });
+  publishPluginsSectionIntent({ type: "install-from-backup", entries: [backedUp("alpha")] });
+  const view = render(sectionWith(dropped.api, "connected"));
+  await waitFor(() =>
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain("Could not fetch")
+  );
+
+  view.rerender(sectionWith(reconnected.api, "connected"));
+
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  expect(view.container.querySelector('[role="alert"]')).toBeNull();
 });
 
 test("under StrictMode, the result of the discarded first mount is not shown", async () => {

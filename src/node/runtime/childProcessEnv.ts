@@ -15,6 +15,22 @@ const CHILD_ENV_KEYS_TO_STRIP = [
   "CHROME_DESKTOP",
 ] as const;
 
+// A sandboxed command can reach the API on loopback. Without the token it cannot answer a card.
+const SANDBOXED_CHILD_ENV_KEYS_TO_STRIP = [
+  ...CHILD_ENV_KEYS_TO_STRIP,
+  "XUM_SERVER_AUTH_TOKEN",
+  "MUX_SERVER_AUTH_TOKEN",
+] as const;
+
+/** The env of a sandboxed agent command: Xum's child env minus the server auth token. */
+export function stripSandboxedChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const stripped: NodeJS.ProcessEnv = { ...env };
+  for (const key of SANDBOXED_CHILD_ENV_KEYS_TO_STRIP) {
+    delete stripped[key];
+  }
+  return stripped;
+}
+
 function normalizePathEntry(entry: string): string {
   const resolved = path.resolve(entry);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
@@ -192,4 +208,24 @@ export function mergeChildEnv(
 /** The host environment a child starts from, per ExecOptions.hostEnv (#6509). */
 export function hostChildEnv(mode: "inherit" | "minimal" | undefined): NodeJS.ProcessEnv {
   return mode === "minimal" ? pickMinimalChildEnv(process.env) : process.env;
+}
+
+const DEFAULT_EXEC_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/**
+ * The env of a local command whose caller passes `callerEnv` (the host env per `hostEnv` under
+ * it, sanitized), and the PATH the command starts with. The file tools take the same PATH for
+ * their sandbox policy as bash does.
+ */
+export function localExecEnv(
+  callerEnv: NodeJS.ProcessEnv,
+  hostEnv?: "inherit" | "minimal"
+): { env: NodeJS.ProcessEnv; path: string } {
+  const env = sanitizeXumChildEnv(mergeChildEnv(hostChildEnv(hostEnv), callerEnv), {
+    ...process.env,
+    ...callerEnv,
+  });
+  const callerSetPath = callerEnv.PATH !== undefined && callerEnv.PATH.length > 0;
+  const execPath = (callerSetPath ? env.PATH : (env.PATH ?? env.Path)) ?? DEFAULT_EXEC_PATH;
+  return { env, path: execPath };
 }

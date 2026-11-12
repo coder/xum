@@ -7,13 +7,20 @@
  */
 
 import "../dom";
-import { fireEvent, waitFor } from "@testing-library/react";
+import { waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, openProjectCreationView } from "../helpers";
+import {
+  checkedCreationIsolation,
+  cleanupView,
+  findCreationIsolationOption,
+  openCreationEnvironment,
+  openProjectCreationView,
+  selectCreationIsolation,
+} from "../helpers";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { expandProjects } from "@/browser/stories/helpers/uiState";
 import type { ProjectConfig } from "@/node/config";
@@ -23,41 +30,6 @@ const describeIntegration = shouldRunIntegrationTests() ? describe : describe.sk
 /** Helper to create a project config for a path with no workspaces */
 function projectWithNoWorkspaces(path: string): [string, ProjectConfig] {
   return [path, { workspaces: [] }];
-}
-
-function getWorkspaceTypeTrigger(container: HTMLElement): HTMLButtonElement | null {
-  const group = container.querySelector('[data-component="RuntimeTypeGroup"]');
-  if (!group) {
-    return null;
-  }
-
-  return group.querySelector('button[aria-label="Workspace type"]');
-}
-
-function findRuntimeOption(label: string): HTMLElement | null {
-  const options = Array.from(document.querySelectorAll<HTMLElement>('[role="option"]'));
-  return options.find((option) => option.textContent?.includes(label)) ?? null;
-}
-
-async function selectRuntime(container: HTMLElement, label: string): Promise<void> {
-  const trigger = getWorkspaceTypeTrigger(container);
-  if (!trigger) {
-    throw new Error("Workspace type trigger not found");
-  }
-
-  fireEvent.click(trigger);
-  const option = await waitFor(
-    () => {
-      const candidate = findRuntimeOption(label);
-      if (!candidate) {
-        throw new Error(`Runtime option '${label}' not found`);
-      }
-      return candidate;
-    },
-    { timeout: 2_000 }
-  );
-
-  fireEvent.click(option);
 }
 
 describeIntegration("Docker runtime selection (UI)", () => {
@@ -89,14 +61,12 @@ describeIntegration("Docker runtime selection (UI)", () => {
         { timeout: 5_000 }
       );
 
-      await selectRuntime(view.container, "Docker");
+      await selectCreationIsolation(view.container, "Workspace isolation", "Docker");
 
       // Verify Docker runtime becomes active in the workspace-type trigger.
       await waitFor(
         () => {
-          const trigger = getWorkspaceTypeTrigger(view.container);
-          if (!trigger) throw new Error("Workspace type trigger not found");
-          if (!trigger.textContent?.includes("Docker")) {
+          if (!checkedCreationIsolation("Workspace isolation").startsWith("Docker")) {
             throw new Error("Docker runtime not selected");
           }
         },
@@ -106,9 +76,7 @@ describeIntegration("Docker runtime selection (UI)", () => {
       // Docker image input should appear
       const imageInput = await waitFor(
         () => {
-          const input = view.container.querySelector<HTMLInputElement>(
-            'input[placeholder="node:20"]'
-          );
+          const input = document.querySelector<HTMLInputElement>('input[placeholder="node:20"]');
           if (!input) {
             throw new Error("Docker image input not found");
           }
@@ -118,7 +86,7 @@ describeIntegration("Docker runtime selection (UI)", () => {
       );
 
       // SSH host input should NOT be visible
-      const hostInput = view.container.querySelector('input[placeholder="user@host"]');
+      const hostInput = document.querySelector('input[placeholder="user@host"]');
       expect(hostInput).toBeNull();
 
       const user = userEvent.setup({ document: view.container.ownerDocument });
@@ -127,17 +95,17 @@ describeIntegration("Docker runtime selection (UI)", () => {
       expect(imageInput.value).toBe("node:20");
 
       // Switching to SSH should hide Docker image input and show host input
-      await selectRuntime(view.container, "SSH");
+      await selectCreationIsolation(view.container, "Project isolation", "SSH");
 
       await waitFor(
         () => {
-          const input = view.container.querySelector('input[placeholder="user@host"]');
+          const input = document.querySelector('input[placeholder="user@host"]');
           if (!input) throw new Error("SSH host input not found");
         },
         { timeout: 2_000 }
       );
 
-      const imageInputAfter = view.container.querySelector('input[placeholder="node:20"]');
+      const imageInputAfter = document.querySelector('input[placeholder="node:20"]');
       expect(imageInputAfter).toBeNull();
     } finally {
       await cleanupView(view, cleanupDom);
@@ -185,22 +153,22 @@ describeIntegration("Docker runtime selection (UI)", () => {
       // Local should be forced when repo is not a git repository.
       await waitFor(
         () => {
-          const trigger = getWorkspaceTypeTrigger(view.container);
-          if (!trigger) throw new Error("Workspace type trigger not found");
-          if (!trigger.textContent?.includes("Local")) {
-            throw new Error("Local runtime not selected for non-git repo");
+          // Without isolation the chip names the shared directory instead of "None".
+          const summary = view.container.querySelector(
+            '[data-component="WorkspaceIsolationSummary"]'
+          );
+          if (!summary?.textContent?.includes("Project directory")) {
+            throw new Error("No workspace isolation not selected for non-git repo");
           }
         },
         { timeout: 2_000 }
       );
 
-      const trigger = getWorkspaceTypeTrigger(view.container);
-      expect(trigger).toBeTruthy();
-      fireEvent.click(trigger!);
+      await openCreationEnvironment(view.container);
 
       const dockerOption = await waitFor(
         () => {
-          const option = findRuntimeOption("Docker");
+          const option = findCreationIsolationOption("Workspace isolation", "Docker");
           if (!option) {
             throw new Error("Docker option not found");
           }

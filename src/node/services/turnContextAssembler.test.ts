@@ -552,6 +552,81 @@ describe("assemblePromptPayload", () => {
     expect(afterPartial).toContain("[CONTINUE]");
   });
 
+  type AssembleOverrides = Partial<Parameters<typeof assemblePromptPayload>[0]>;
+  test.each([
+    {
+      route: "a google-typed Coder instance",
+      overrides: {
+        modelString: "google:gemini-4-carbon",
+        providerForMessages: "openai",
+        routeProvider: "coder",
+        providersConfig: {
+          coder: {
+            apiKeySet: false,
+            isEnabled: true,
+            isConfigured: true,
+            discoveredProviders: [{ name: "agents-google", type: "google" }],
+            canonicalRoutes: { google: "agents-google" },
+          },
+        },
+      } satisfies AssembleOverrides,
+      sent: { coderGoogle: { thoughtSignature: "sig-coder" } },
+    },
+    {
+      route: "the native Gemini API",
+      overrides: {
+        modelString: "google:gemini-4-carbon",
+        providerForMessages: "google",
+      } satisfies AssembleOverrides,
+      sent: { google: { thoughtSignature: "sig-native" } },
+    },
+    {
+      route: "Vertex AI",
+      overrides: {
+        modelString: "google-vertex:gemini-2.5-pro",
+        providerForMessages: "google-vertex",
+      } satisfies AssembleOverrides,
+      sent: { googleVertex: { thoughtSignature: "sig-vertex" } },
+    },
+    {
+      route: "Anthropic",
+      overrides: {
+        modelString: "anthropic:claude-opus-5-5",
+        providerForMessages: "anthropic",
+      } satisfies AssembleOverrides,
+      sent: undefined,
+    },
+  ])("replays tool-call thought signatures for $route", async ({ overrides, sent }) => {
+    const signedToolPart = (toolCallId: string) => ({
+      type: "dynamic-tool" as const,
+      toolCallId,
+      toolName: "first",
+      state: "output-available" as const,
+      input: {},
+      output: { ok: true },
+      providerOptions: {
+        coderGoogle: { thoughtSignature: "sig-coder" },
+        google: { thoughtSignature: "sig-native" },
+        googleVertex: { thoughtSignature: "sig-vertex" },
+      },
+    });
+    const history = [
+      createMuxMessage("user", "user", "list files"),
+      createMuxMessage("call", "assistant", "", undefined, [
+        signedToolPart("call-1"),
+        signedToolPart("call-2"),
+      ]),
+    ];
+    const payload = await assemble({ history, ...overrides });
+    const sentOptions = payload.messages
+      .flatMap((message) =>
+        message.role === "assistant" && Array.isArray(message.content) ? message.content : []
+      )
+      .filter((part) => part.type === "tool-call")
+      .map((part) => part.providerOptions as unknown);
+    expect(sentOptions).toEqual([sent, sent]);
+  });
+
   test("replays tool_catalog_search results as tool references only for deferred tools", async () => {
     const history = [
       createMuxMessage("user", "user", "find it"),

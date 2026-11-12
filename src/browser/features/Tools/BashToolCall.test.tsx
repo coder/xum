@@ -47,7 +47,69 @@ function renderExpanded(result: unknown) {
   return view;
 }
 
+function renderCollapsed(result: BashToolResult) {
+  return render(
+    <TooltipProvider>
+      <BackgroundBashProvider workspaceId="ws-test">
+        <BashToolCall
+          workspaceId="ws-test"
+          toolCallId="call-sandboxed"
+          args={{
+            script: "make install",
+            run_in_background: false,
+            timeout_secs: 30,
+            display_name: "Install",
+          }}
+          result={result}
+          status="failed"
+        />
+      </BackgroundBashProvider>
+    </TooltipProvider>
+  );
+}
+
+function sandboxedResult(sandboxDenials?: string[]): BashToolResult {
+  return {
+    success: false,
+    error: "Command exited with code 1",
+    output: "",
+    exitCode: 1,
+    wall_duration_ms: 5,
+    ...(sandboxDenials ? { sandboxDenials } : {}),
+  };
+}
+
 describe("BashToolCall", () => {
+  test("a sandbox denial shows the badge and a line naming what was blocked, even collapsed", () => {
+    const lines = [
+      ["write /Users/me/.zshrc", "/Users/me/.zshrc"],
+      ["read /Users/me/.ssh/id_rsa", "/Users/me/.ssh/id_rsa"],
+      ["network paste.example.net", "paste.example.net"],
+      ["mach-lookup com.apple.foo", "mach-lookup com.apple.foo"],
+    ].map(([denial, target]) => {
+      const view = renderCollapsed(sandboxedResult([denial, "write /tmp/other"]));
+      expect(view.getByText("Sandbox")).toBeDefined();
+      const line = view.getByText(
+        (_, element) =>
+          element?.textContent?.includes(target) === true && element.childElementCount === 0
+      );
+      // The first denial is named; the others are counted, not listed.
+      expect(line.textContent).toContain("1 more");
+      expect(line.textContent).not.toContain("/tmp/other");
+      cleanup();
+      return line.textContent?.replace(target, "<target>");
+    });
+    // Each kind explains itself in its own words.
+    expect(new Set(lines).size).toBe(lines.length);
+  });
+
+  test("a command the sandbox did not block shows no badge", () => {
+    for (const denials of [undefined, []]) {
+      expect(renderCollapsed(sandboxedResult(denials)).queryByText("Sandbox")).toBeNull();
+      cleanup();
+    }
+  });
+
   test("shows why a hook blocked the call: { error } without success (#6044)", () => {
     const view = renderExpanded({ error: "Blocked by hook: rm is not allowed here" });
     expect(view.getByText("Error")).toBeDefined();

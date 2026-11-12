@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   hasUrlCredentials,
+  isValidBackupBranch,
   SettingsBackupInputSchema,
   SettingsBackupSchema,
   UNSAFE_URL_CHARACTERS,
@@ -9,7 +10,12 @@ import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
 } from "@/common/config/schemas/agentPluginInstalls";
-import { pointsAtThisMachine } from "@/common/utils/agentPluginSource";
+import {
+  hasEscapedUnreservedCharacter,
+  isAbbreviatedCommitSha,
+  isNormalizedAgentPluginSubpath,
+  pointsAtThisMachine,
+} from "@/common/utils/agentPluginSource";
 import { ResultSchema } from "./result";
 
 /**
@@ -97,6 +103,51 @@ const BackupPluginUrlSchema = z
   })
   .refine((url) => !hasUrlCredentials(url), {
     message: "A repository URL must not carry a credential",
+  })
+  // The publish-time secret scan reads the list as written: a token spelled with escapes would
+  // pass it. The export leaves such a plugin out with the same predicate (agentPluginBackup.ts).
+  .refine((url) => !hasEscapedUnreservedCharacter(url), {
+    message: "A repository URL must not escape a letter, a digit or one of - . _ ~",
+  });
+
+/**
+ * The branch or tag a plugin tracks, which the install review writes back into the installed
+ * source. The installer has no syntax rule of its own for a ref: it takes any text, refuses an
+ * abbreviated commit id (`resolveRemoteRef`), and asks git for `refs/heads/<ref>` and
+ * `refs/tags/<ref>`, so a remote can hold (and Xum installs from) a branch `HEAD`, `refs/team` or
+ * `-x`. The list takes the same refs. It refuses only what a remote can never hold, a name that
+ * `git check-ref-format` refuses (`a..b`, `x.lock`, `main~1`: the install review would persist it,
+ * and every later update check of the plugin would fail), and a ref with whitespace, a control
+ * character or a format character such as a bidi mark, which the card shows and which can make
+ * one ref read as another. The export leaves such a plugin out and logs it (agentPluginBackup.ts).
+ */
+const BackupPluginRefSchema = z
+  .string()
+  .min(1)
+  .max(256)
+  // The `x/` folder takes the rules of a branch name that do not apply to a ref (`HEAD`, a leading
+  // `refs/` or `-`) out of the check: the rest are the rules of any ref name, in `refs/heads/<ref>`.
+  .refine((ref) => isValidBackupBranch(`x/${ref}`), {
+    message: "A plugin ref must be a name git can hold",
+  })
+  .refine((ref) => !UNSAFE_URL_CHARACTERS.test(ref), {
+    message: "A plugin ref must not contain whitespace, control or format characters",
+  })
+  .refine((ref) => !isAbbreviatedCommitSha(ref), {
+    message: "A plugin ref must not be an abbreviated commit id",
+  });
+
+/**
+ * The folder of a monorepo plugin, in the form the installer takes (`normalizeAgentPluginSubpath`).
+ * A row with another form (`/a`, `../a`, `a//b`, `.git`) would be offered for review and then
+ * refused by the preview, and a registry row in that form would back up into a list nobody can use.
+ */
+const BackupPluginSubpathSchema = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine(isNormalizedAgentPluginSubpath, {
+    message: "A plugin subpath must be a folder path inside the repository, like path/to/plugin",
   });
 
 /**
@@ -112,8 +163,8 @@ export const BackupPluginEntrySchema = z.object({
   name: AgentPluginInstallEntrySchema.shape.name,
   source: AgentPluginGitSourceSchema.extend({
     url: BackupPluginUrlSchema,
-    ref: z.string().min(1).max(256),
-    subpath: z.string().min(1).max(1024).optional(),
+    ref: BackupPluginRefSchema,
+    subpath: BackupPluginSubpathSchema.optional(),
   }),
   /** Full commit id: a restore previews this exact commit, whatever `source.ref` tracks now. */
   lockedSha: z.string().regex(FULL_COMMIT_SHA_PATTERN, { message: "Not a full commit id" }),

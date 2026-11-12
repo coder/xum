@@ -362,7 +362,8 @@ function resolvedAgentResultFor(
       },
       agentDiscoveryRuntime: new LocalRuntime(metadata.projectPath),
       agentDiscoveryPath: metadata.projectPath,
-      isSubagentWorkspace: false,
+      // As resolveAgentForStream decides it.
+      isSubagentWorkspace: Boolean(metadata.parentWorkspaceId),
       agentInheritanceChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentAiSettingsChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentIsPlanLike: false,
@@ -2250,6 +2251,34 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(goalIds).toEqual(["goal-dispatched", undefined]);
   });
 
+  // The sub-agent denial of ask_user_question lives in the agent policy, not the caller's.
+  it.each([
+    { kind: "root", parentWorkspaceId: undefined, expected: false },
+    { kind: "sub-agent", parentWorkspaceId: "parent-workspace", expected: true },
+  ])(
+    "refuses sandbox approval cards at once only in a sub-agent ($kind)",
+    async ({ kind, parentWorkspaceId, expected }) => {
+      using xumHome = new DisposableTempDir(`ai-service-no-interactive-user-${kind}`);
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = `workspace-no-interactive-user-${kind}`;
+      const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, {
+        ...(parentWorkspaceId != null ? { parentWorkspaceId } : {}),
+      });
+      const harness = createHarness(xumHome.path, metadata);
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+
+      expect(result.success).toBe(true);
+      expect(harness.getToolsForModelSpy.mock.calls.at(-1)?.[1]?.noInteractiveUser).toBe(expected);
+    }
+  );
+
   // Sub-agents own goals, but a turn TaskService drove (here: a recovery re-drive) carries its
   // provenance into the goal tool context and must not set one.
   it("keeps set_goal disabled on a child workspace's automatic task turns", async () => {
@@ -2517,6 +2546,120 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+
+  /**
+   * Runs `body` with Anthropic Fast mode on the route (Coder workspaces export a gateway
+   * ANTHROPIC_BASE_URL, which takes it off) and the JSON bodies of the requests to the provider.
+   * Only serialized requests are inspected: no provider is ever contacted.
+   */
+  async function withCapturedAnthropicBodies(
+    body: (bodies: Array<{ speed?: string }>) => Promise<void>
+  ): Promise<void> {
+    const hostBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_BASE_URL;
+    const bodies: Array<{ speed?: string }> = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
+        bodies.push(JSON.parse(init.body) as { speed?: string });
+        return Promise.resolve(new Response("{}", { status: 400 }));
+      }, globalThis.fetch)
+    );
+    try {
+      await body(bodies);
+    } finally {
+      fetchSpy.mockRestore();
+      if (hostBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = hostBaseUrl;
+    }
+  }
+
+  const sendOnce = (model: LanguageModel) =>
+    generateText({ model, prompt: "continue", maxRetries: 0 }).catch(() => undefined);
+
+  // Anthropic limits Fast mode to some models (Opus 5 needs a waitlist) and rejects `speed: "fast"`
+  // elsewhere, so a refusal fallback must not inherit the refused model's Fast pick.
+  it.each([
+    { pick: "the chat's Fast pick", chatTier: "priority" as const, providerSpeed: undefined },
+    { pick: "the provider's Fast preference", chatTier: undefined, providerSpeed: "fast" as const },
+  ])("a refusal fallback never sends Anthropic Fast mode ($pick)", async (c) => {
+    using xumHome = new DisposableTempDir("ai-service-fallback-no-fast");
+    const sourceModel = KNOWN_MODELS.FABLE.id;
+    const fallbackModel = "anthropic:claude-opus-5";
+    await writeMainConfig(xumHome.path, {
+      modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+    });
+    const metadata = createLocalWorkspaceMetadata("fallback-no-fast", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      anthropic: {
+        apiKey: "test-key",
+        ...(c.providerSpeed != null ? { speed: c.providerSpeed } : {}),
+      },
+    });
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    await withCapturedAnthropicBodies(async (bodies) => {
+      const holder: NonNullable<StreamMessageOptions["activeTurnThinkingOverride"]> = {};
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: sourceModel,
+        thinkingLevel: "off",
+        ...(c.chatTier != null
+          ? { muxProviderOptions: { openai: { serviceTier: c.chatTier } } }
+          : {}),
+        activeTurnThinkingOverride: holder,
+      });
+      expect(result.success).toBe(true);
+      const primary = harness.startStreamCalls[0];
+      const fallback = await primary.modelFallback!.prepare(fallbackModel);
+      if (!fallback.success) throw new Error("Expected prepared fallback");
+      // Control: the refused model itself still runs in Fast mode.
+      await sendOnce(primary.model);
+      expect(bodies.at(-1)?.speed).toBe("fast");
+      await sendOnce(fallback.data.model);
+      expect(bodies.at(-1)).not.toHaveProperty("speed");
+      // A Fast pick made mid-turn does not reach the fallback either.
+      holder.serviceTier = "priority";
+      await sendOnce(fallback.data.model);
+      expect(bodies.at(-1)).not.toHaveProperty("speed");
+      expect(bodies).toHaveLength(3);
+    });
+  });
+
+  // The Auto-routing tier fallback is not a refusal fallback: the composer's model is the one the
+  // user picked, so it keeps the chat's Fast pick.
+  it("an Auto-routing tier fallback keeps the chat's Anthropic Fast pick", async () => {
+    using xumHome = new DisposableTempDir("ai-service-auto-fallback-keeps-fast");
+    const composerModel = KNOWN_MODELS.FABLE.id;
+    const tierModel = "no-such-provider:tier-model";
+    const metadata = createLocalWorkspaceMetadata("auto-fallback-fast", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      anthropic: { apiKey: "test-key" },
+    });
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    await withCapturedAnthropicBodies(async (bodies) => {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: tierModel,
+        thinkingLevel: "off",
+        muxProviderOptions: { openai: { serviceTier: "priority" } },
+        autoModelRouting: {
+          requestedFallbackModel: composerModel,
+          tierId: "hard",
+          model: tierModel,
+          status: "routed",
+        },
+      });
+      expect(result.success).toBe(true);
+      // The tier model cannot be built, so the turn runs on the composer's model.
+      expect(harness.startStreamCalls[0].modelString).toBe(composerModel);
+      await sendOnce(harness.startStreamCalls[0].model);
+      expect(bodies.at(-1)?.speed).toBe("fast");
+    });
   });
 
   it.each([false, true])("pins assembly across attempts (budget=%s)", async (tokenBudget) => {
@@ -5235,7 +5378,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     expect(result.success).toBe(true);
     expect(harness.startStreamCalls[0]?.providerOptions).toEqual({
-      openai: { parallelToolCalls: true, reasoningEffort: "medium" },
+      coderGoogle: {
+        extra_body: {
+          google: { thinking_config: { include_thoughts: true, thinking_level: "medium" } },
+        },
+      },
     });
   });
 

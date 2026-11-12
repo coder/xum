@@ -143,6 +143,89 @@ describe("renderToolValue", () => {
     }
   );
 
+  // The redaction scans a window of the cap and a lookahead past it. The end of the window can cut a
+  // key, and what is left is too short to match, so it shows as it is. Redaction shortens the text
+  // (a long value becomes one marker), so a cut of the redacted window at the cap reached that end.
+  // The cut is at the cap in the value's own characters: nothing from past it is shown.
+  describe("a window that redaction shortens past its lookahead", () => {
+    const KEY_CUT = "sk-QBNDZ8P3"; // 8 characters of a key that needs 12 to match: the window ends here
+    const KEY_REST = "R6V4H2J5 and the rest of the text";
+    const LONG_TAIL = " lorem".repeat(6_000);
+    const shapes: Array<[string, string]> = [
+      ["a long redacted value", `password="${"A".repeat(600)}"`],
+      [
+        "ten long signed-URL values",
+        Array.from({ length: 10 }, () => `?sig=${"A".repeat(100)}`).join(" "),
+      ],
+      // Main writes a `]` behind each marker, which gives back 16 of the 512 characters that the
+      // value takes out. A redaction that does not write it takes this shape over the edge.
+      [
+        "a long value and signed-URL markers",
+        `password="${"A".repeat(520)}" ${"?sig=[redacted] ".repeat(16)}`,
+      ],
+    ];
+    const textOf = (prefix: string, cap: number): string => {
+      const filler = cap + 512 - prefix.length - 2 - KEY_CUT.length;
+      expect(filler).toBeGreaterThanOrEqual(0);
+      return `${prefix} ${"z".repeat(filler)} ${KEY_CUT}${KEY_REST}${LONG_TAIL}`;
+    };
+
+    it.each(
+      shapes.flatMap(([label, prefix]) =>
+        [1_000, 2_000].map((cap) => [label, cap, prefix] as const)
+      )
+    )(
+      "shows no part of a key that the end of the window cut, behind %s, at a cap of %d",
+      (_label, cap, prefix) => {
+        const text = textOf(prefix, cap);
+
+        const rendered = renderToolValue(text, cap);
+
+        expect(rendered).not.toContain("sk-QBND");
+        // Only the first `cap` characters of the value are shown, redacted.
+        expect(rendered).toStartWith(`${redactSecretLike(text.slice(0, cap))} [truncated `);
+      }
+    );
+
+    it("reads no more than the window of a value that redaction empties", () => {
+      const cap = 2_000;
+      const text = `password=${"z".repeat(1_000_000)} ${KEY_CUT}${KEY_REST}`;
+
+      let rendered = "";
+      const scanned = regexInputLengths(() => {
+        rendered = renderToolValue(text, cap);
+      });
+
+      expect(rendered).toStartWith("password=[redacted] [truncated ");
+      expect(Math.max(...scanned)).toBeLessThanOrEqual(cap + 512);
+    });
+  });
+
+  // The JWT pattern needs both dots, so a JWT whose first parts run past the window is not matched.
+  // What lies inside the cap is cut off at the JWT's start.
+  describe("a JWT that the window ends inside", () => {
+    const jwt = `eyJ${"Q".repeat(40)}.eyJ${"W".repeat(1_200)}.${"X".repeat(86)}`; // made up
+
+    it.each([2_000, 128_000])("shows no part of it, at a cap of %d", (cap) => {
+      const text = `${"z".repeat(cap - 100)} ${jwt} tail`;
+
+      const rendered = renderToolValue(text, cap);
+
+      expect(rendered).not.toMatch(/eyJ|QQQQ|WWWW/);
+      expect(rendered).toStartWith(`${"z".repeat(cap - 100)}  [truncated `);
+    });
+  });
+
+  // A value that fits the window is complete: a JWT-like run that ends it is no JWT, so what of it
+  // lies inside the cap is shown.
+  it("shows a JWT-like run that ends a complete value up to the cap", () => {
+    const text = `${"z".repeat(1_980)} eyJ${"A".repeat(30)}`;
+
+    expect(renderToolValue(text, 2_000)).toBe(
+      `${text.slice(0, 2_000)} [truncated ${text.length - 2_000} more chars for memory harvest]`
+    );
+  });
+
   it("says how much was cut when the whole value fit, and at least how much when it did not", () => {
     expect(renderToolValue("x".repeat(2_100), 2_000)).toBe(
       `${"x".repeat(2_000)} [truncated 100 more chars for memory harvest]`

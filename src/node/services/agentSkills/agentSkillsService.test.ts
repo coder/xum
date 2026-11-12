@@ -20,6 +20,7 @@ import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { AgentSandboxPathError } from "@/node/services/agentSandbox/fileToolSandbox";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   discoverAgentSkills,
@@ -418,6 +419,36 @@ describe("agentSkillsService", () => {
     const bar = skills.find((s) => s.name === "bar");
     expect(bar).toBeDefined();
     expect(bar!.scope).toBe("global");
+  });
+
+  // Codex review: a command can link a project SKILL.md to a file that its sandbox hides.
+  test("a project skill that the sandbox gate refuses yields to the global skill", async () => {
+    using project = new DisposableTempDir("agent-skills-sandbox-project");
+    using global = new DisposableTempDir("agent-skills-sandbox-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+    await writeSkill(global.path, "foo", "from global");
+    await writeSkill(projectSkillsRoot, "foo", "from project");
+    const hidden = path.join(projectSkillsRoot, "foo", "SKILL.md");
+    const gated: string[] = [];
+    const options = {
+      roots: { projectRoot: projectSkillsRoot, globalRoot: global.path },
+      runtimeFactory,
+      sandboxGate: (resolvedPath: string, access: "read" | "write") => {
+        gated.push(resolvedPath);
+        return resolvedPath === hidden
+          ? Promise.reject(new AgentSandboxPathError(resolvedPath, access))
+          : Promise.resolve();
+      },
+    };
+    const runtime = new LocalRuntime(project.path);
+
+    const { skills } = await discoverAgentSkills(runtime, project.path, options);
+    const read = await readAgentSkill(runtime, project.path, SkillNameSchema.parse("foo"), options);
+
+    expect(skills.find((skill) => skill.name === "foo")).toMatchObject({ scope: "global" });
+    expect(read.package.frontmatter.description).toBe("from global");
+    expect(gated).toContain(hidden);
+    expect(gated.every((gatedPath) => gatedPath.startsWith(project.path))).toBe(true);
   });
 
   test("subprojects inherit ancestor skills with nearest-directory precedence", async () => {
@@ -1177,6 +1208,39 @@ describe("agentSkillsService", () => {
     });
     expect(resolved.package.scope).toBe("project");
     expect(resolved.package.frontmatter.name).toBe("poteto-mode");
+  });
+
+  test("a skill with a description and when_to_use over the cap loads with both cut", async () => {
+    using project = new DisposableTempDir("agent-skills-long-text");
+    using global = new DisposableTempDir("agent-skills-long-text-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+    const longText = (length: number) =>
+      Array.from({ length }, (_, index) => String.fromCharCode(97 + (index % 26))).join("");
+    const description = longText(1069);
+    const whenToUse = longText(1100);
+    await fs.mkdir(path.join(projectSkillsRoot, "long-text"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectSkillsRoot, "long-text", "SKILL.md"),
+      `---\nname: long-text\ndescription: ${description}\nwhen_to_use: ${whenToUse}\n---\nBody\n`,
+      "utf-8"
+    );
+
+    const roots = { projectRoot: projectSkillsRoot, globalRoot: global.path };
+    const runtime = new LocalRuntime(project.path);
+    const result = await discoverAgentSkills(runtime, project.path, { roots, runtimeFactory });
+
+    expect(result.invalidSkills).toEqual([]);
+    const skill = result.skills.find((candidate) => candidate.name === "long-text");
+    expect(skill?.description).toHaveLength(1024);
+    expect(description.startsWith(skill?.description ?? "")).toBe(true);
+    expect(skill?.whenToUse).toHaveLength(1024);
+    expect(whenToUse.startsWith(skill?.whenToUse ?? "")).toBe(true);
+
+    const resolved = await readAgentSkill(runtime, project.path, "long-text", {
+      roots,
+      runtimeFactory,
+    });
+    expect(skill?.description).toBe(resolved.package.frontmatter.description);
   });
 
   test("discoverAgentSkills reports invalid paths globs and keeps valid path-scoped skills", async () => {

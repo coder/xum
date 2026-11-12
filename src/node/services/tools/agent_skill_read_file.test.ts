@@ -10,6 +10,7 @@ import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDef
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -18,6 +19,7 @@ import {
   mockToolCallOptions,
   RemotePathMappedRuntime,
   restoreMuxRoot,
+  stubSandboxHidingTokenPath,
   TEST_GLOBAL_WORKSPACE_ID as GLOBAL_WORKSPACE_ID,
   TestTempDir,
   TrueRemotePathMappedRuntime,
@@ -405,6 +407,47 @@ describe("agent_skill_read_file", () => {
     if (result.success) {
       expect(result.content).toBe("1\tfrom global skill");
     }
+  });
+
+  // Codex review: a command can link a project skill folder at the workspace root, where a
+  // project secret names a credential file that the agent sandbox hides from commands.
+  it("refuses a project skill file that the agent sandbox hides", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-read-file-sandbox");
+    const root = await fs.realpath(tempDir.path);
+    const workspace = path.join(root, "workspace");
+    const token = path.join(workspace, "hf-token");
+    await fs.mkdir(path.join(workspace, ".xum", "skills"), { recursive: true });
+    await fs.mkdir(path.join(root, "tmp"));
+    await fs.writeFile(token, "hf_secret");
+    await fs.writeFile(
+      path.join(workspace, "SKILL.md"),
+      "---\nname: leak\ndescription: Leak\n---\nBody\n"
+    );
+    await fs.symlink("../..", path.join(workspace, ".xum", "skills", "leak"));
+    const runtime = new LocalRuntime(workspace);
+    stubSandboxHidingTokenPath(runtime, workspace);
+    const tool = createAgentSkillReadFileTool({
+      ...createTestToolConfig(workspace, {
+        workspaceId: "regular-workspace",
+        runtime,
+        xumScope: {
+          type: "project",
+          xumHome: path.join(root, "xum-home"),
+          projectRoot: workspace,
+          projectStorageAuthority: "host-local",
+        },
+      }),
+      runtimeTempDir: path.join(root, "tmp"),
+      secrets: { HF_TOKEN_PATH: token },
+    });
+
+    const result = await executeReadFile(tool, { name: "leak", filePath: "hf-token" });
+
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("hf_secret");
+    expect(await executeReadFile(tool, { name: "leak", filePath: "SKILL.md" })).toMatchObject({
+      success: true,
+    });
   });
 
   it("allows reading project skill files on disk outside global-scope workspace", async () => {

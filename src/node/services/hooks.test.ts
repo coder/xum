@@ -323,6 +323,37 @@ describe("hooks", () => {
   });
 
   describe("runPostHook", () => {
+    // The agent sandbox keeps the stream's temp folder, in the home folder, closed.
+    test("opens the payload files it names for the hook's sandbox", async () => {
+      const hookDir = path.join(tempDir, ".xum");
+      const hookPath = path.join(hookDir, "tool_post");
+      await fs.mkdir(hookDir, { recursive: true });
+      await fs.writeFile(hookPath, "#!/bin/bash\nexit 0");
+      await fs.chmod(hookPath, 0o755);
+      const exec = spyOn(runtime, "exec");
+
+      await runPostHook(
+        runtime,
+        hookPath,
+        {
+          tool: "test_tool",
+          toolInput: JSON.stringify({ text: "x".repeat(10_000) }),
+          workspaceId: "test-workspace",
+          projectDir: tempDir,
+          runtimeTempDir: tempDir,
+        },
+        { value: 42 }
+      );
+
+      const options = exec.mock.calls.find((call) => call[1].env?.XUM_TOOL_RESULT_PATH)?.[1];
+      const payloads = [
+        options?.env?.XUM_TOOL_INPUT_PATH,
+        options?.env?.XUM_TOOL_RESULT_PATH,
+      ].filter((payload): payload is string => payload !== undefined);
+      expect(payloads).toHaveLength(2);
+      expect(options?.sandboxReadPaths).toEqual(payloads);
+    });
+
     test("succeeds when hook exits 0", async () => {
       const hookDir = path.join(tempDir, ".mux");
       const hookPath = path.join(hookDir, "tool_post");

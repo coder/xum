@@ -346,14 +346,16 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash and Argon but not older Flash", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash, Argon and Carbon but not older Flash", () => {
     // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
     // request envelope and debug snapshots agree with what the Google adapter sends.
-    // Argon has no "off" either; unclamped, it would run at its medium default.
+    // Argon and Carbon have no "off" either; unclamped, they would run at their medium default.
     for (const model of [
       "google:gemini-3.8-flash",
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-4-argon",
+      "google:gemini-4-carbon",
+      "google-vertex:gemini-4-carbon-cyber-permissive",
     ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
@@ -542,8 +544,12 @@ describe("getThinkingPolicyForModel", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
   });
 
-  test("returns low/medium/high (no off) for Gemini 4 Argon, unlike the Gemini 3 Pro set", () => {
-    for (const model of ["google:gemini-4-argon", "openrouter:google/gemini-4-argon"]) {
+  test("returns low/medium/high (no off) for Gemini 4 Argon and Carbon, unlike the Gemini 3 Pro set", () => {
+    for (const model of [
+      "google:gemini-4-argon",
+      "openrouter:google/gemini-4-argon",
+      "google:gemini-4-carbon",
+    ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
       expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
@@ -903,13 +909,21 @@ describe("GLM 5.3 thinking policy", () => {
     expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", "off")).toBe("low");
   });
 
+  test("recognizes self-hosted GLM 5.3 ids with deployment tags in any case", () => {
+    for (const model of [
+      "omlx:GLM-5.3-Flash-oQ4e-mtp",
+      "lmstudio:mlx-community/GLM-5.3-Flash-MLX-4bit",
+      "ollama:glm-5.3-flash:q4_K_M",
+      "vllm:zai-org/GLM-5.3-FP8",
+    ]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "high", "max"]);
+    }
+  });
+
   test("does not apply the GLM 5.3 policy to named variants", () => {
-    expect(getThinkingPolicyForModel("zai:glm-5.3-flashx")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
+    for (const model of ["zai:glm-5.3-flashx", "omlx:GLM-5.3-FlashX-4bit", "omlx:GLM-5.3-Air"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
+    }
   });
 });
 

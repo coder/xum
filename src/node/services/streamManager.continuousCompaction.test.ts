@@ -1149,6 +1149,59 @@ describe("continuous prefix prepareStep and journal", () => {
     ]);
   });
 
+  it.each<{
+    route: string;
+    requestProviderOptions: ContinuousCompactionJournal["requestProviderOptions"];
+    sent: unknown;
+  }>([
+    {
+      route: "a google-typed Coder instance",
+      requestProviderOptions: { coderGoogle: { extra_body: { google: {} } } },
+      sent: { coderGoogle: { thoughtSignature: "sig-coder" } },
+    },
+    {
+      route: "the native Gemini API",
+      requestProviderOptions: { google: { thinkingConfig: { includeThoughts: true } } },
+      sent: { google: { thoughtSignature: "sig-native" } },
+    },
+    {
+      route: "Anthropic",
+      requestProviderOptions: { anthropic: { sendReasoning: true } },
+      sent: undefined,
+    },
+  ])(
+    "prefix replay keeps the tool-call thought signatures of $route",
+    async ({ requestProviderOptions, sent }) => {
+      const journal = journalFixture();
+      journal.requestProviderOptions = requestProviderOptions;
+      journal.prefixSourceRows = [
+        journal.boundary,
+        createMuxMessage("call", "assistant", "", undefined, [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call-1",
+            toolName: "bash",
+            state: "output-available",
+            input: { script: "ls" },
+            output: "README.md",
+            providerOptions: {
+              coderGoogle: { thoughtSignature: "sig-coder" },
+              google: { thoughtSignature: "sig-native" },
+            },
+          },
+        ]),
+        createMuxMessage("next", "user", "continue"),
+      ];
+      const sentOptions = (await rebuildContinuousPrefix(journal, workspaceId))
+        .flatMap((message) =>
+          message.role === "assistant" && Array.isArray(message.content) ? message.content : []
+        )
+        .filter((part) => part.type === "tool-call")
+        .map((part) => part.providerOptions as unknown);
+      expect(sentOptions).toEqual([sent]);
+    }
+  );
+
   it("a swapped prefix lists only deferred tools a retained search still loads (#5262)", async () => {
     const journal = journalFixture();
     journal.preparation.deferLoadingToolNames = ["jira_create_issue", "slack_send_message"];

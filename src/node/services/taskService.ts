@@ -115,7 +115,12 @@ import {
   type PendingTaskStartWaiter,
   type PendingTaskWaiter,
 } from "@/node/services/taskWaiters";
-import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceDirTrusted,
+  isWorkspaceProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import {
@@ -193,6 +198,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   isDockerRuntime,
   isLocalProjectRuntime,
+  isSshSharedProjectDirRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeConfig,
@@ -2642,8 +2648,15 @@ interface ChildStreamEndContext extends StreamEndAdmission {
 /** A child stream end's context plus what it read once its workspace turn was finalized. */
 interface ChildStreamEndState extends ChildStreamEndContext {
   readonly status: WorkspaceConfigEntry["taskStatus"];
-  /** The stream's final report; always null for a plan-like task. */
+  /**
+   * The stream's final report; null for a plan-like task, and for a reported row, which publishes
+   * none.
+   */
   readonly reportArgs: Awaited<ReturnType<TaskService["resolveFinalAgentReportArgs"]>>;
+  /**
+   * Whether the task is plan-like. Not read (false) where no reader needs the answer: a stream
+   * with neither a final response nor a propose_plan result, and a reported row's final response.
+   */
   readonly isPlanLike: boolean;
   readonly proposePlanResult: ReturnType<TaskService["findProposePlanSuccessInParts"]>;
 }
@@ -5298,7 +5311,12 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
     // #6426: one cached config load per call (not per candidate or per read).
-    const projectPluginsTrusted = isProjectTrusted(this.config, entry.projectPath);
+    // An SSH+None task runs in a host directory that also needs its own trust.
+    const projectPluginsTrusted = isWorkspaceProjectTrusted(this.config, {
+      kind: undefined,
+      projectPath: entry.projectPath,
+      runtimeConfig: entry.workspace.runtimeConfig,
+    });
 
     const workspacePath = coerceNonEmptyString(entry.workspace.path);
     const workspaceName = coerceNonEmptyString(entry.workspace.name) ?? entry.workspace.id;
@@ -8737,7 +8755,12 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     const secrets = await secretsToRecord(
-      this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+      secretsForWorkspace(
+        this.secretsStore,
+        this.config,
+        plan.parentMeta.projectPath,
+        plan.taskRuntimeConfig
+      )
     );
     // The sanitize and secrets awaits above leave a window in which the parent can cancel this
     // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
@@ -9675,8 +9698,7 @@ export class TaskService implements AgentTaskIntegration {
       parentMetadata: plan.parentMeta,
       allowCreateFallback: true,
       ...(preferredTrunkBranch != null ? { preferredTrunkBranch } : {}),
-      trusted:
-        this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
+      trusted: this.taskInitTrusted(plan),
       multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
         EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
       ),
@@ -9808,7 +9830,12 @@ export class TaskService implements AgentTaskIntegration {
     // mutate the live parent workspace — skip it entirely.
     if (!plan.useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+        secretsForWorkspace(
+          this.secretsStore,
+          this.config,
+          plan.parentMeta.projectPath,
+          plan.taskRuntimeConfig
+        )
       );
       this.registerTaskBackgroundInit(plan, checkout, secrets);
     }
@@ -9855,6 +9882,23 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /** Starts a launched task's init in its own checkout (callers skip a shared parent checkout). */
+  /**
+   * Whether a task's init may run repo-controlled code (.xum/init, git hooks). A task forked from
+   * an SSH+None parent shares the parent's host directory, which project trust alone does not
+   * cover, so this is project trust AND that directory's trust (isWorkspaceDirTrusted). For every
+   * other parent runtime the directory check is true.
+   */
+  private taskInitTrusted(plan: {
+    readonly configProjectPath: string;
+    readonly parentRuntimeConfig: RuntimeConfig;
+  }): boolean {
+    const projects = this.config.loadConfigOrDefault().projects;
+    return (
+      (projects.get(plan.configProjectPath)?.trusted ?? false) &&
+      isWorkspaceDirTrusted(projects, plan.configProjectPath, plan.parentRuntimeConfig)
+    );
+  }
+
   private registerTaskBackgroundInit(
     plan: TaskLaunchSource,
     checkout: Omit<TaskLaunchCheckout, "forkedRuntimeConfig">,
@@ -9879,9 +9923,7 @@ export class TaskService implements AgentTaskIntegration {
           env,
           abortSignal: initAbortController.signal,
           skipInitHook: plan.skipInitHook,
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
-            false,
+          trusted: this.taskInitTrusted(plan),
         },
         plan.taskId,
         workspaceUseLeasesFor(this.config)
@@ -10816,6 +10858,7 @@ export class TaskService implements AgentTaskIntegration {
         isWorkspaceProjectTrustedIn(cfg.projects, {
           kind: workspace.kind,
           projectPath: entry.projectPath,
+          runtimeConfig: workspace.runtimeConfig,
         })
       );
     } catch (error) {
@@ -18762,6 +18805,7 @@ export class TaskService implements AgentTaskIntegration {
           projectPluginsTrusted: isWorkspaceProjectTrustedIn(context.config.projects, {
             kind: parentEntry.workspace.kind,
             projectPath: parentEntry.projectPath,
+            runtimeConfig: context.parentRuntimeConfig,
           }),
           runtimeFactory: nodeRuntimeFactory,
         }
@@ -20347,13 +20391,26 @@ export class TaskService implements AgentTaskIntegration {
             acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
           })
         : null;
-    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+    const proposePlanResult = this.findProposePlanSuccessInParts(event.parts);
+    // The probe reads agent definitions from the user's home, which takes seconds on a host with
+    // many skills, and a send that arrives while the stream's decision waits is refused as stale.
+    // So the decision does not wait for it where its answer changes nothing: a stream with neither
+    // a final response nor a propose_plan result, and a reported row's final response. A reported
+    // row publishes no report, so the handler resolves its decision `nonreport` whatever the
+    // answer (the ledger can still turn that into `indeterminate`: see
+    // StreamEndLedger.resolveStreamEndDecision), and it does so before the cleanup of the
+    // reported task, as a plan-like task's final response always did.
+    // The answer still matters to a propose_plan result (the plan hand-off) and to a final
+    // response on any other row (a plan-like task's final response is no report).
+    const probeDecidesReport =
+      proposePlanResult != null || (finalAgentReportArgs != null && status !== "reported");
+    const isPlanLike = probeDecidesReport ? await this.isPlanLikeTaskWorkspace(entry) : false;
     const state: ChildStreamEndState = {
       ...ctx,
       status,
-      reportArgs: isPlanLike ? null : finalAgentReportArgs,
+      reportArgs: isPlanLike || status === "reported" ? null : finalAgentReportArgs,
       isPlanLike,
-      proposePlanResult: this.findProposePlanSuccessInParts(event.parts),
+      proposePlanResult,
     };
     this.decideNonreportBeforeContinuation(state);
     return this.settleInterruptedOrReportedChild(state);
@@ -24325,10 +24382,14 @@ export class TaskService implements AgentTaskIntegration {
 
 /**
  * Removal deletes no checkout for isolation "none" children (they share the parent's) or for
- * project-dir local runtimes (deleteWorkspace is a no-op there), so it cannot lose their files.
+ * project-dir runtimes, local or SSH+None (deleteWorkspace is a no-op there), so it cannot lose
+ * their files.
  */
 function subagentRemovalPreservesCheckout(ws: WorkspaceConfigEntry): boolean {
+  const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
   return (
-    ws.taskIsolation === "none" || isLocalProjectRuntime(ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG)
+    ws.taskIsolation === "none" ||
+    isLocalProjectRuntime(runtimeConfig) ||
+    isSshSharedProjectDirRuntime(runtimeConfig)
   );
 }

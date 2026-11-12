@@ -141,7 +141,7 @@ import {
 } from "@/browser/utils/chatEditing";
 
 import { type ThinkingLevel } from "@/common/types/thinking";
-import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
+import { normalizeRuntimeEnablement, parsedRuntimeNeedsTrunk } from "@/common/types/runtime";
 import {
   type AgentSkillReference,
   type MuxMessageMetadata,
@@ -165,7 +165,7 @@ import type {
   GoalInterventionPolicy,
   QueueDispatchMode,
 } from "./types";
-import { CreationControls } from "./CreationControls";
+import { CreationControls, type RuntimeFieldError } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
@@ -877,6 +877,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     beginWorkspaceCreation
   );
   const [hasAttemptedCreateSend, setHasAttemptedCreateSend] = useState(false);
+  // Counts the sends the runtime validation refused. The environment panel holds the required
+  // fields, so it reopens on each refusal, not only on the first: the error itself does not
+  // change between two refused sends.
+  const [refusedCreateSends, setRefusedCreateSends] = useState(0);
 
   // Creation-specific state (hook always called, but only used when variant === "creation")
   // This avoids conditional hook calls which violate React rules
@@ -962,8 +966,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? validateCreationRuntime(creationState.selectedRuntime, coderState.presets.length)
       : null;
 
-  const runtimeFieldError =
-    variant === "creation" && hasAttemptedCreateSend ? (creationRuntimeError?.mode ?? null) : null;
+  const runtimeFieldError: RuntimeFieldError | null =
+    variant === "creation" && hasAttemptedCreateSend && creationRuntimeError
+      ? creationRuntimeError.kind === "missingProjectDir"
+        ? "sshProjectDir"
+        : creationRuntimeError.mode
+      : null;
 
   const creationControlsProps =
     variant === "creation" && props.kind !== "scratch"
@@ -975,7 +983,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           selectedRuntime: creationState.selectedRuntime,
           coderConfigFallback: creationState.coderConfigFallback,
           sshHostFallback: creationState.sshHostFallback,
-          defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
           disabled: isSendInFlight,
           projectPath: creationParentProjectPath,
@@ -996,6 +1003,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           runtimeEnablement: creationRuntimeEnablement,
           coderInfo: coderState.coderInfo,
           runtimeFieldError,
+          runtimeFieldErrorAttempt: refusedCreateSends,
           // Pass coderProps when CLI is available/outdated, Coder is enabled, or still checking (so "Checking…" UI renders)
           coderProps:
             coderState.coderInfo === null ||
@@ -1027,13 +1035,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
   // #6033: the trunk branch stays empty until the branch list loads, and the backend refuses
-  // every runtime except local without one, so a creation send must wait for the list. A failed
-  // list keeps it closed too (#6055).
+  // every runtime that builds a checkout without one, so a creation send must wait for the list.
+  // A failed list keeps it closed too (#6055). Local and SSH+None need no trunk.
   const creationBranchesLoading =
     variant === "creation" &&
     props.kind !== "scratch" &&
     creationState.branchLoad !== "loaded" &&
-    creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
+    parsedRuntimeNeedsTrunk(creationState.selectedRuntime);
   const creationDraftNotSaved = variant === "creation" && draft.saveError !== null;
   // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
   useReportCreationSendBlocked(
@@ -2535,6 +2543,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           coderState.presets.length
         );
         if (runtimeError) {
+          setRefusedCreateSends((count) => count + 1);
           return;
         }
       }

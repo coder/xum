@@ -10,6 +10,7 @@ import assert from "node:assert";
 import { createHash, createPrivateKey } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { Effect } from "effect";
+import type { createOpenAI as CreateOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
   LanguageModelV4,
@@ -92,6 +93,7 @@ import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import {
+  CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
   coderAibridgeBaseUrl,
   coderGatewayWireProtocol,
   parseCoderGatewayProviders,
@@ -100,6 +102,10 @@ import {
 } from "@/common/constants/coderOAuth";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import {
+  mapEventStreamLines,
+  wrapFetchWithGeminiThoughts,
+} from "@/node/services/geminiThoughtsFetch";
 import {
   captureAndStripDevToolsHeader,
   recordPromptCacheWire,
@@ -385,12 +391,15 @@ function readChatServiceTier(
 /**
  * Anthropic `speed` for a model that supports Fast mode: pinned from the chat's pick (else the
  * provider preference), and like the OpenAI tier, a mid-turn pick applies to the next call.
+ * None when the caller opts out (refusal-fallback hops): see CreateModelOptions.
  */
 function resolveAnthropicFastMode(
   chatServiceTier: ServiceTier | undefined,
   providerSpeed: unknown,
-  getServiceTierOverride: GetServiceTierOverride | undefined
+  opts: Pick<CreateModelOptions, "getServiceTierOverride" | "withoutAnthropicFastMode"> | undefined
 ): { defaults: { speed?: "fast" }; liveOverrides?: () => { speed?: "fast" } } | undefined {
+  if (opts?.withoutAnthropicFastMode === true) return undefined;
+  const getServiceTierOverride = opts?.getServiceTierOverride;
   const pinned =
     chatServiceTier != null ? chatServiceTier === "priority" : providerSpeed === "fast";
   if (getServiceTierOverride == null) return pinned ? { defaults: { speed: "fast" } } : undefined;
@@ -529,37 +538,78 @@ function wrapFetchWithChatToolCallIndexes(baseFetch: typeof fetch): typeof fetch
       return changed ? `data: ${JSON.stringify(chunk)}` : line;
     };
 
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
-    let pending = "";
-    const body = response.body.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        transform(bytes, controller) {
-          pending += decoder.decode(bytes, { stream: true });
-          const lines = pending.split("\n");
-          pending = lines.pop() ?? "";
-          if (lines.length > 0) {
-            controller.enqueue(encoder.encode(`${lines.map(indexToolCalls).join("\n")}\n`));
-          }
-        },
-        flush(controller) {
-          pending += decoder.decode();
-          if (pending) {
-            controller.enqueue(encoder.encode(indexToolCalls(pending)));
-          }
-        },
-      })
-    );
-    const headers = new Headers(response.headers);
-    headers.delete("content-length");
-    return new Response(body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-    });
+    return mapEventStreamLines(response, response.body, indexToolCalls);
   };
 
   return Object.assign(indexedFetch, baseFetch) as typeof fetch;
+}
+
+/**
+ * Model for a Coder instance on an OpenAI wire other than google-typed ones.
+ * The gateway intercepts both /responses and /chat/completions: real OpenAI
+ * upstreams use Responses, compatible upstreams use Chat.
+ */
+function createCoderOpenAIWireModel(
+  createOpenAI: typeof CreateOpenAI,
+  options: {
+    wire: "openai-responses" | "openai-chat";
+    baseURL: string;
+    modelId: string;
+    fetch: typeof fetch;
+    serviceTierAvailable: boolean;
+    capabilityModel: string;
+  }
+): LanguageModelV4 {
+  const createCoderModel = (fetch: typeof globalThis.fetch) => {
+    const provider = createOpenAI({
+      apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+      baseURL: options.baseURL,
+      fetch,
+    });
+    return options.wire === "openai-responses"
+      ? provider.responses(options.modelId)
+      : provider.chat(options.modelId);
+  };
+  if (options.wire === "openai-responses") {
+    return createOpenAIModelWithPreservedOptions(createCoderModel, options.fetch, {
+      serviceTierAvailable: options.serviceTierAvailable,
+      wireModelId: options.modelId,
+    });
+  }
+  // Chat upstreams include Gemini's OpenAI compatibility layer behind
+  // openai-compat instances.
+  const coderModel = createOpenAIModelWithPreservedOptions(
+    createCoderModel,
+    wrapFetchWithChatToolCallIndexes(options.fetch),
+    { serviceTierAvailable: options.serviceTierAvailable, wireModelId: options.modelId }
+  );
+  return clampGpt6ChatCompletionsToolReasoning(
+    reportChatCompletionsServiceTier(coderModel),
+    options.capabilityModel
+  );
+}
+
+/**
+ * Request body for google-typed Coder instances. @ai-sdk/openai-compatible
+ * replays reasoning as reasoning_content on assistant messages; drop it, as
+ * @ai-sdk/openai (this route's previous client) did, because Gemini's
+ * compatibility layer takes thoughts back only as tool-call thought signatures,
+ * which stay.
+ */
+function toGeminiOpenAICompatBody(body: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(body.messages)) {
+    return body;
+  }
+  return {
+    ...body,
+    messages: body.messages.map((message: unknown) => {
+      if (!isPlainObject(message) || message.role !== "assistant") {
+        return message;
+      }
+      const { reasoning_content: _reasoning, ...rest } = message;
+      return rest;
+    }),
+  };
 }
 
 /** Set reasoning effort "none" on either OpenAI wire format's request body. */
@@ -1785,6 +1835,12 @@ interface CreateModelOptions {
   /** Chat-local override, sampled at the next model call without changing other chats or routing. */
   getServiceTierOverride?: () => ServiceTier | undefined;
   /**
+   * Never send Anthropic `speed: "fast"` (neither the chat's pick nor the provider preference).
+   * Refusal-fallback hops set it: the pick was made for the refused model, Fast mode is limited
+   * to some Anthropic models (Opus 5 needs a waitlist) and the API rejects it elsewhere.
+   */
+  withoutAnthropicFastMode?: boolean;
+  /**
    * The running agent's Anthropic prompt-cache TTL, sampled at each request on Anthropic wires.
    * It wins over the global and request-level TTLs; undefined keeps them.
    */
@@ -2180,11 +2236,7 @@ export class ProviderModelFactory {
             providersConfig: self.providerService.getConfig(providersConfig),
           });
         anthropicFastMode = anthropicFastModeSupported
-          ? resolveAnthropicFastMode(
-              chatServiceTier,
-              providersConfig.anthropic?.speed,
-              opts?.getServiceTierOverride
-            )
+          ? resolveAnthropicFastMode(chatServiceTier, providersConfig.anthropic?.speed, opts)
           : undefined;
 
         // OpenAI-specific: merge global store setting into muxProviderOptions.
@@ -3129,37 +3181,37 @@ export class ProviderModelFactory {
             return Ok(provider(originModelId));
           }
 
-          const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          const createCoderModel = (fetch: typeof coderFetch) => {
-            const provider = createOpenAI({
-              apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+          if (gatewayProvider.type === "google") {
+            // Gemini's OpenAI compatibility layer emits thoughts only for an
+            // extra_body thinking_config (see buildProviderOptions), inline in
+            // content. @ai-sdk/openai drops both the passthrough and reasoning;
+            // the compatible SDK forwards one and parses reasoning_content,
+            // which wrapFetchWithGeminiThoughts produces from the inline thoughts.
+            const provider = createOpenAICompatible({
+              name: CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
               baseURL: gatewayBaseUrl,
-              fetch,
+              fetch: wrapFetchWithGeminiThoughts(wrapFetchWithChatToolCallIndexes(coderFetch)),
+              // Match @ai-sdk/openai's chat requests: streamed usage and json_schema outputs.
+              includeUsage: true,
+              supportsStructuredOutputs: true,
+              transformRequestBody: toGeminiOpenAICompatBody,
             });
-            // The gateway intercepts both /responses and /chat/completions. Real
-            // OpenAI upstreams use Responses; compatible upstreams use Chat.
-            return wire === "openai-responses"
-              ? provider.responses(originModelId)
-              : provider.chat(originModelId);
-          };
-          // Chat upstreams include Gemini's OpenAI compatibility layer (google-type
-          // instances, or openai-compat ones fronting it).
-          const openAIFetch =
-            wire === "openai-chat" ? wrapFetchWithChatToolCallIndexes(coderFetch) : coderFetch;
-          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, openAIFetch, {
-            serviceTierAvailable,
-            wireModelId: originModelId,
-          });
-          // A Coder-scoped "Treat as" mapping (coder:compat/team-luna → openai:gpt-6-luna)
-          // is the only capability identity an openai-compat instance has; the raw
-          // originModelId would miss the clamp. Same resolution as buildProviderOptions.
+            return Ok(provider(originModelId));
+          }
+
+          const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
           return Ok(
-            wire === "openai-responses"
-              ? coderModel
-              : clampGpt6ChatCompletionsToolReasoning(
-                  reportChatCompletionsServiceTier(coderModel),
-                  resolveModelForMetadata(`coder:${modelId}`, providersConfig)
-                )
+            createCoderOpenAIWireModel(createOpenAI, {
+              wire,
+              baseURL: gatewayBaseUrl,
+              modelId: originModelId,
+              fetch: coderFetch,
+              serviceTierAvailable,
+              // A Coder-scoped "Treat as" mapping (coder:compat/team-luna → openai:gpt-6-luna)
+              // is the only capability identity an openai-compat instance has; the raw
+              // originModelId would miss the clamp. Same resolution as buildProviderOptions.
+              capabilityModel: resolveModelForMetadata(`coder:${modelId}`, providersConfig),
+            })
           );
         }
 

@@ -2,11 +2,12 @@ import React, { useState } from "react";
 import { ArrowLeft, Loader2, Store, XCircle } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { cn } from "@/common/lib/utils";
-import type {
-  AgentPluginInstallMethod,
-  AgentPluginMarketplaceBuild,
-  AgentPluginMarketplaceEntry,
-  AgentPluginMarketplaceListing,
+import {
+  AgentPluginMarketplaceBuildSchema,
+  type AgentPluginInstallMethod,
+  type AgentPluginMarketplaceBuild,
+  type AgentPluginMarketplaceEntry,
+  type AgentPluginMarketplaceListing,
 } from "@/common/orpc/schemas/agentPlugins";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { installMethodLabel } from "./PluginInstallMethods";
@@ -14,31 +15,51 @@ import { installMethodLabel } from "./PluginInstallMethods";
 type MarketplaceFile = AgentPluginMarketplaceBuild["file"];
 export type MarketplaceEntrySelector = Extract<AgentPluginInstallMethod, { entry: string }>;
 
+/** One row per marketplace file; the header joins the `name`s ("Cursor and Claude Code marketplaces"). */
 const MARKETPLACE_FILE: Record<
   MarketplaceFile,
-  { selector: MarketplaceEntrySelector["kind"]; build: string; marketplace: string }
+  { selector: MarketplaceEntrySelector["kind"]; build: string; name: string }
 > = {
   cursor: {
     selector: "cursor-marketplace",
     build: "Cursor build",
-    marketplace: "Cursor marketplace",
+    name: "Cursor",
   },
   claude: {
     selector: "claude-marketplace",
     build: "Claude build",
-    marketplace: "Claude Code marketplace",
+    name: "Claude Code",
+  },
+  agents: {
+    selector: "agents-marketplace",
+    build: "Agent Plugins build",
+    name: "Agent Plugins",
   },
 };
+
+/**
+ * The marketplace files a listing reads, in build order: "Cursor marketplace", "Cursor and Claude
+ * Code marketplaces", "Cursor, Claude Code and Agent Plugins marketplaces".
+ */
+function marketplaceFilesLabel(files: ReadonlySet<MarketplaceFile>): string {
+  const names = AgentPluginMarketplaceBuildSchema.shape.file.options
+    .filter((file) => files.has(file))
+    .map((file) => MARKETPLACE_FILE[file].name);
+  if (names.length === 0) return "Marketplace";
+  const last = names[names.length - 1];
+  if (names.length === 1) return `${last} marketplace`;
+  return `${names.slice(0, -1).join(", ")} and ${last} marketplaces`;
+}
 
 function pickable(entry: AgentPluginMarketplaceEntry): boolean {
   return entry.builds.some((build) => build.installable);
 }
 
 /**
- * The entries of a marketplace repository in the Add panel: the Cursor and Claude Code
- * marketplace files merged by name. The user picks ONE plugin per install and previews it with
- * the normal consent review. A name in both files has two builds, each with its own preview
- * action. Builds that Xum cannot install (npm, archive and command sources, or a malformed entry)
+ * The entries of a marketplace repository in the Add panel: the Cursor, Claude Code and Agent
+ * Plugins marketplace files merged by name. The user picks ONE plugin per install and previews it
+ * with the normal consent review. A name in several files has a build per file, each with its own
+ * preview action. Builds that Xum cannot install (npm, archive and command sources, or a malformed entry)
  * are listed, disabled, with the reason.
  */
 export const MarketplaceListing: React.FC<{
@@ -129,10 +150,7 @@ const MarketplaceHeader: React.FC<{ listing: AgentPluginMarketplaceListing }> = 
   const files = new Set(
     listing.entries.flatMap((entry) => entry.builds.map((build) => build.file))
   );
-  const filesLabel =
-    files.size === 2
-      ? "Cursor and Claude Code marketplaces"
-      : MARKETPLACE_FILE[files.has("cursor") ? "cursor" : "claude"].marketplace;
+  const filesLabel = marketplaceFilesLabel(files);
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-2">
@@ -264,13 +282,15 @@ const PreviewButton: React.FC<{
 }> = (props) => (
   <Button
     size="sm"
-    // An entry name has no length limit and may have no break point: let it wrap inside the
-    // card instead of widening the action row past a phone screen.
-    className="h-auto min-h-8 max-w-full py-1 text-left break-all whitespace-normal"
+    // An entry name has no length limit and may have no break point: the label wraps at its
+    // spaces and hyphens, and inside a word only when the word is longer than a line, so the
+    // action row never grows past a phone screen. The label is its own min-w-0 flex item: the
+    // button lays out as a flex row, and break-words alone would not let a long word shrink.
+    className="h-auto min-h-8 max-w-full py-1 text-left whitespace-normal"
     onClick={props.onClick}
     disabled={props.disabled}
   >
     {props.fetching && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-    {props.fetching ? "Fetching…" : props.label}
+    <span className="min-w-0 break-words">{props.fetching ? "Fetching…" : props.label}</span>
   </Button>
 );

@@ -80,7 +80,7 @@ const MODEL_DEFINITIONS = {
     provider: "anthropic",
     providerModelId: "claude-mythos-5-2",
     aliases: ["mythos"],
-    // Same tokenizer situation as Fable 5 (see FABLE above): reuse Opus 4.5 for
+    // Same tokenizer situation as FABLE above: reuse Opus 4.5 for
     // approximate counting; real usage can run ~1.0-1.3x higher.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
@@ -185,6 +185,15 @@ const MODEL_DEFINITIONS = {
     provider: "google",
     providerModelId: "gemini-4-argon",
     aliases: ["argon", "gemini-argon", "gemini-4"],
+    tokenizerOverride: "google/gemini-2.5-pro",
+  },
+  // Gemini 4 Carbon - GA on the paid Gemini API and Vertex AI on November 10, 2026
+  // (stable ID `gemini-4-carbon`; not on the free tier). `gemini-4` stays on Argon, which
+  // Google recommends for most work. See models-extra for limits and pricing.
+  GEMINI_4_CARBON: {
+    provider: "google",
+    providerModelId: "gemini-4-carbon",
+    aliases: ["carbon", "gemini-carbon"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
   // Grok 4.7 - xAI's frontier coding and knowledge-work model, released September 21,

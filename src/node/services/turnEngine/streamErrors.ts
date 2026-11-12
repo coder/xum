@@ -49,16 +49,43 @@ export class EmptyStreamOutputError extends Error {
 }
 
 /**
+ * What a refusal in a category with no recommended fallback tells the user. Anthropic gives such
+ * a category no fallback model and says "the refusal stands", so none of these suggests another
+ * model: the request is what must change. Each category has its own cause:
+ * Anthropic's refusals page says a reasoning_extraction refusal "usually" comes from wording
+ * that asks for the model's reasoning in its reply, and that the wording "can sit in a system
+ * prompt, a skill, or a tool description". A category without an entry gets the neutral text.
+ */
+const NO_FALLBACK_REFUSAL_TEXT: ReadonlyMap<string, string> = new Map([
+  [
+    "reasoning_extraction",
+    "Retrying the same request will not help. This refusal usually comes from wording that asks the model to write out its reasoning in its reply. Check the prompt, AGENTS.md and the system prompt, skills, and tool descriptions, and ask for a short explanation instead.",
+  ],
+]);
+const NEUTRAL_NO_FALLBACK_REFUSAL_TEXT =
+  "Retrying the same request will not help: the refusal stands, so change the request.";
+
+/**
  * Terminal provider refusal: the model declined to continue the turn. Unlike
  * EmptyStreamOutputError (a transport drop), retrying the same request will
  * likely refuse again, so this maps to the non-retryable "model_refusal" stream
  * error type.
  */
 export class ModelRefusalError extends Error {
-  constructor(model: string, finishReason: string, fallbackNote?: string) {
+  constructor(
+    model: string,
+    finishReason: string,
+    details: { fallbackNote?: string; noFallbackCategory?: string } = {}
+  ) {
+    const { fallbackNote, noFallbackCategory: category } = details;
+    let advice =
+      "Retrying the same request is unlikely to help; try rephrasing or a different model.";
+    if (category !== undefined) {
+      // mutation-equivalent: every NO_FALLBACK_REFUSAL_TEXT value is non-empty, so ?? and || agree
+      advice = NO_FALLBACK_REFUSAL_TEXT.get(category) ?? NEUTRAL_NO_FALLBACK_REFUSAL_TEXT;
+    }
     super(
-      `The model refused to continue (finishReason: ${finishReason}): ${model}. ` +
-        "Retrying the same request is unlikely to help; try rephrasing or a different model." +
+      `The model refused to continue (finishReason: ${finishReason}): ${model}. ${advice}` +
         (fallbackNote ? ` ${fallbackNote}` : "")
     );
     this.name = "ModelRefusalError";

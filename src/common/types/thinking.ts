@@ -400,10 +400,19 @@ export function grokSupportsNativeXhigh(modelString: string): boolean {
   return /^grok-4\.[67](?:$|-)/.test(withoutPrefix);
 }
 
-/** GLM 5.3 and GLM 5.3 Flash always reason with low, high, or max effort. */
+/**
+ * GLM 5.3 and GLM 5.3 Flash always reason with low, high, or max effort.
+ *
+ * Self-hosted deployments append quantization and format tags to the id
+ * (`GLM-5.3-Flash-oQ4e-mtp`, `glm-5.3-flash:q4_k_m`, `GLM-5.3-Flash-MLX-4bit`).
+ * Those tags carry a digit or name a packaging format, while Z.ai's named
+ * variants (FlashX, Air, Turbo) are plain words, so the variants stay unmatched.
+ */
 export function isGlm53Model(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^glm-5\.3(?:-flash)?(?:$|-(?:latest|\d))/.test(withoutPrefix);
+  return /^glm-5\.3(?:-flash)?(?:$|[-:](?:latest|gguf|mlx|awq|gptq|mtp|[a-z]*\d))/.test(
+    withoutPrefix
+  );
 }
 
 /**
@@ -486,8 +495,10 @@ export function anthropicSupportsBetweenToolsThinking(modelString: string): bool
  * relied on. The Fable 5.2 migration guide says Mythos 5.1 on Bedrock still accepts such a
  * request. `block_binding` goes out only on the direct Claude API and anthropic-typed Coder
  * instances, and a model that skips the check accepts it. The "off" history strip keys on the
- * anthropic wire instead, so on a Bedrock-typed Coder instance it also drops Mythos 5.1 history
- * thinking that Bedrock would accept: that costs reasoning context, never a failed request.
+ * anthropic wire instead, which Bedrock routes use too (direct or through a Bedrock-typed Coder
+ * instance). The thinking policy raises Mythos 5.1's "off" to "low", so that strip only runs
+ * for a caller that skips the policy, and it then costs reasoning context Bedrock would have
+ * accepted, never a failed request.
  * See https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */
 export function anthropicBindsThinkingToPrefix(modelString: string): boolean {

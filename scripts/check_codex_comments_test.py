@@ -1327,6 +1327,11 @@ else:
             # `false` is not "no nodes": only null and a missing connection are.
             "comments false": (lambda pr: pr["comments"].update(nodes=False), dict.fromkeys(all_runs, shape)),
             "threads false": (lambda pr: pr["reviewThreads"].update(nodes=False), dict.fromkeys(all_runs, shape)),
+            # Every reader selects `.isResolved == false`, so a value that is no boolean would count as resolved.
+            "thread isResolved string": (lambda pr: pr["reviewThreads"]["nodes"][0].update(isResolved="false"), dict.fromkeys(all_runs, shape)),
+            "thread isResolved null": (lambda pr: pr["reviewThreads"]["nodes"][0].update(isResolved=None), dict.fromkeys(all_runs, shape)),
+            "thread isResolved number": (lambda pr: pr["reviewThreads"]["nodes"][0].update(isResolved=0), dict.fromkeys(all_runs, shape)),
+            "thread isResolved missing": (lambda pr: pr["reviewThreads"]["nodes"][0].pop("isResolved"), dict.fromkeys(all_runs, shape)),
             "thread comments false": (lambda pr: pr["reviewThreads"]["nodes"][0].update(comments={"nodes": False}), dict.fromkeys(all_runs, shape)),
             "reactions false": (lambda pr: pr["reactions"].update(nodes=False), {"wait": shape}),
             "body false": (lambda pr: pr["comments"]["nodes"][0].update(body=False), dict.fromkeys(all_runs, shape)),
@@ -1376,6 +1381,8 @@ else:
             AFTER[:-1] + ",123Z",  # a comma is not a point
             AFTER[:-1] + "x123Z",
             AFTER[:-1] + ".123+00:00",  # an offset is not Z
+            AFTER[:-1],  # no Z
+            AFTER[:-1] + ".123",  # a fraction and no Z
             AFTER[:-1] + ".123Z\n",
             AFTER[:-1] + ".123Z\nPASSED checks=99 visual_ignored=0",
             "x" + AFTER,

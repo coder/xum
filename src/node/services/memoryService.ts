@@ -33,6 +33,7 @@ import {
   MEMORY_MAX_FILES_PER_SCOPE,
   MEMORY_SCOPES,
   SHARED_MEMORY_SCOPES,
+  MEMORY_STR_REPLACE_ERROR_MAX_LINES,
   MEMORY_VIEW_MAX_DEPTH,
   MEMORY_VIRTUAL_ROOT,
   type MemoryScope,
@@ -3860,22 +3861,23 @@ async function fingerprintPhysicalSubtree(store: MemoryStore, relPath: string): 
  * real write path enforces. Both throw MemoryCommandError with the exact
  * write-path messages.
  */
-function computeStrReplaceUpdate(
+export function computeStrReplaceUpdate(
   content: string,
   oldStr: string,
   newStr: string,
   virtualPath: string
 ): string {
-  const occurrences = countOccurrences(content, oldStr);
+  const offsets = findOccurrenceOffsets(content, oldStr);
+  const occurrences = offsets.length;
   if (occurrences === 0) {
     throw new MemoryCommandError(
       `No replacement was performed: old_str was not found in ${virtualPath}`
     );
   }
   if (occurrences > 1) {
-    const lines = findMatchingLines(content, oldStr);
+    const lines = lineNumbersOf(content, offsets);
     throw new MemoryCommandError(
-      `No replacement was performed: old_str matches ${occurrences} locations (lines ${lines.join(", ")}) in ${virtualPath}. Provide a longer, unique old_str.`
+      `No replacement was performed: old_str matches ${occurrences} locations (lines ${describeMatchingLines(lines)}) in ${virtualPath}. Provide a longer, unique old_str.`
     );
   }
   // A replacer function, not the string: `replace` would read `$&`, `$'`, `` $` `` and `$$` in
@@ -3993,25 +3995,87 @@ function assertWithinFileSizeCap(content: string, maxFileBytes?: number): void {
   }
 }
 
-function countOccurrences(content: string, needle: string): number {
-  let count = 0;
-  let index = content.indexOf(needle);
-  while (index !== -1) {
-    count += 1;
-    index = content.indexOf(needle, index + 1);
+const NEWLINE_CODE_UNIT = "\n".charCodeAt(0);
+
+/**
+ * Offsets of every occurrence of needle in content, ascending, with overlapping occurrences counted
+ * ("aa" in "aaa" occurs twice). Memory content and old_str are untrusted model input, so this is
+ * Knuth-Morris-Pratt over UTF-16 code units, linear in both lengths. A loop of
+ * `indexOf(needle, index + 1)` is not: each overlapping hit re-compares most of the needle, so a
+ * 50 KiB run of "a" searched in a 100 KiB file cost about 1.7 s per pass.
+ */
+export function findOccurrenceOffsets(content: string, needle: string): number[] {
+  const offsets: number[] = [];
+  // No occurrence fits, and the border table below would be as large as the needle.
+  if (needle.length > content.length) return offsets;
+  const borders = borderTable(needle);
+  let matched = 0;
+  // mutation-equivalent: i === content.length reads NaN, which matches no needle unit
+  for (let i = 0; i < content.length; i++) {
+    const unit = content.charCodeAt(i);
+    while (matched > 0 && unit !== needle.charCodeAt(matched)) matched = borders[matched - 1];
+    if (unit === needle.charCodeAt(matched)) matched += 1;
+    if (matched === needle.length) {
+      offsets.push(i - needle.length + 1);
+      // Fall back to the longest border: the next occurrence can start inside this one.
+      matched = borders[matched - 1];
+    }
   }
-  return count;
+  return offsets;
 }
 
-/** 1-based line numbers of lines where occurrences of needle start. */
-function findMatchingLines(content: string, needle: string): number[] {
-  const lines = new Set<number>();
-  let index = content.indexOf(needle);
-  while (index !== -1) {
-    lines.add(content.slice(0, index).split("\n").length);
-    index = content.indexOf(needle, index + 1);
+/** borders[i] is the length of the longest proper prefix of needle[0..i] that is also its suffix. */
+function borderTable(needle: string): Int32Array {
+  // Callers refuse an empty old_str: it would match at every offset.
+  if (needle.length === 0) throw new Error("needle must not be empty");
+  const borders = new Int32Array(needle.length);
+  let length = 0;
+  // mutation-equivalent: i === needle.length reads NaN, and a write past the Int32Array is ignored
+  for (let i = 1; i < needle.length; i++) {
+    const unit = needle.charCodeAt(i);
+    while (length > 0 && unit !== needle.charCodeAt(length)) length = borders[length - 1];
+    if (unit === needle.charCodeAt(length)) length += 1;
+    borders[i] = length;
   }
-  return [...lines];
+  return borders;
+}
+
+/**
+ * The line list of the ambiguity error: every matching line while there are at most
+ * MEMORY_STR_REPLACE_ERROR_MAX_LINES of them, so the text stays as it was for those inputs, and
+ * otherwise the first ones and how many more matching lines there are. The cap counts lines, not
+ * matches: the list is the part that grows, and many matches on a few lines still name them all.
+ */
+// dry-duplicate-ok: error text for the model that tests pin, unlike the About dialog's UI copy
+function describeMatchingLines(lines: readonly number[]): string {
+  const listed = lines.slice(0, MEMORY_STR_REPLACE_ERROR_MAX_LINES).join(", ");
+  const unlisted = lines.length - MEMORY_STR_REPLACE_ERROR_MAX_LINES;
+  return unlisted > 0 ? `${listed}, and ${unlisted} more` : listed;
+}
+
+/**
+ * 1-based line numbers, ascending and without repeats, of the lines where the offsets fall.
+ * `offsets` must be strictly ascending and inside content, as findOccurrenceOffsets returns them.
+ * One bounded pass over content: a newline is counted once, whatever the number of matches. Searching
+ * for the next newline per match instead rescans one long line once per match, and re-splitting the
+ * prefix before every match was quadratic: a failed str_replace on a 100 KB file with 51,200
+ * matches took seconds of CPU.
+ */
+export function lineNumbersOf(content: string, offsets: readonly number[]): number[] {
+  const lines: number[] = [];
+  let line = 1;
+  let next = 0;
+  // mutation-equivalent: position === content.length reads NaN, and no offset equals it
+  for (let position = 0; position < content.length; position++) {
+    if (position === offsets[next]) {
+      if (lines[lines.length - 1] !== line) lines.push(line);
+      next += 1;
+    }
+    // Counted after the offset check: a match that starts with a newline starts on the line that
+    // newline ends.
+    if (content.charCodeAt(position) === NEWLINE_CODE_UNIT) line += 1;
+  }
+  return lines;
 }
 
 /** Render a flat file list as an indented tree, capped at maxDepth levels. */

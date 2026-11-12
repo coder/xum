@@ -1,7 +1,7 @@
-import { useCallback, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { displayRepoUrl, pointsAtThisMachine } from "@/common/utils/agentPluginSource";
+import { displayRepoUrl, reviewUrlOf } from "@/common/utils/agentPluginSource";
 import type {
   BackupOperationError,
   BackupPluginEntry,
@@ -10,26 +10,23 @@ import type {
   BackupPluginRow,
   BackupPluginStatus,
 } from "@/common/orpc/schemas/backup";
+import { EMPTY_BACKUP_PLUGIN_REPORT } from "@/common/orpc/schemas/backup";
 import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
 /**
- * SECURITY: a review previews only a plain https URL: a host name or IPv4 address, an optional
- * port, and a path of unreserved characters, with no user, query, fragment, escape or backslash.
- * The list is repository-controlled. A preview of an ssh or scp source makes git sign in with the
- * user's SSH agent to whatever host the list names, before any consent to that plugin (a remote
- * marketplace may name only https sources for the same reason, assertMarketplaceMayName). And a
- * URL that other parsers read differently, such as `https://github.com\@attacker.example/x`
- * (WHATWG sees github.com, git and libcurl connect to attacker.example), would show the user one
- * host and fetch from another. An allowlist cannot be spelled around. The user adds any other
- * plugin by hand in Settings → Plugins.
+ * A missing plugin the review does not preview: its source is not https and has no https address
+ * (`reviewUrlOf` holds the rule and why). The user adds it by hand in Settings → Plugins.
  */
-const PLAIN_HTTPS_URL =
-  /^https:\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?::[0-9]{1,5})?\/[A-Za-z0-9._~/-]+$/;
-
 function isAddedByHand(row: BackupPluginRow): boolean {
+  return row.status === "missing" && reviewUrlOf(row.source.url) === undefined;
+}
+
+/** A missing plugin from an ssh source, which a review previews at the https address of its host. */
+function isPreviewedOverHttps(row: BackupPluginRow): boolean {
   return (
     row.status === "missing" &&
-    (!PLAIN_HTTPS_URL.test(row.source.url) || pointsAtThisMachine(row.source.url))
+    !row.source.url.startsWith("https://") &&
+    reviewUrlOf(row.source.url) !== undefined
   );
 }
 
@@ -38,6 +35,16 @@ function reviewablePlugins(report: BackupPluginReport): BackupPluginEntry[] {
   return report.rows
     .filter((row) => row.status === "missing" && !isAddedByHand(row))
     .map(({ status: _status, ...entry }) => entry);
+}
+
+/**
+ * The plugin list the form may act on. It describes the saved repository. While the form holds an
+ * unsaved change, the other backup actions refuse to run (requireSavedSettings in BackupSection),
+ * so the list is hidden and cannot queue a review of plugins from the repository the form no
+ * longer names. It returns if the change is undone, since it still describes the saved one.
+ */
+export function savedPluginReport(report: BackupPluginReport, dirty: boolean): BackupPluginReport {
+  return dirty ? EMPTY_BACKUP_PLUGIN_REPORT : report;
 }
 
 /**
@@ -83,7 +90,7 @@ function PluginRow(props: { plugin: BackupPluginRow }) {
         {displayRepoUrl(plugin.source.url)}
         {folder}
       </span>
-      <span className="text-muted block font-mono break-all">
+      <span className="text-muted block font-mono break-words">
         {plugin.source.ref} · {plugin.lockedSha.slice(0, 12)}
       </span>
     </li>
@@ -100,12 +107,6 @@ function PluginRow(props: { plugin: BackupPluginRow }) {
 export function usePluginRemovalPrompt(options: { busy: boolean; push: () => Promise<void> }) {
   const [removal, setRemoval] = useState<BackupPluginRemoval | null>(null);
   const approved = useRef<string | undefined>(undefined);
-  // A stable identity: the settings reload effect in BackupSection calls it and lists it as a
-  // dependency, which must not rerun the effect on every render.
-  const clear = useCallback(() => {
-    approved.current = undefined;
-    setRemoval(null);
-  }, []);
   return {
     removal,
     /** Shows what a refused push would remove; any other outcome leaves the card as it is. */
@@ -113,7 +114,11 @@ export function usePluginRemovalPrompt(options: { busy: boolean; push: () => Pro
       if (error.code === "PLUGIN_REMOVAL_APPROVAL_REQUIRED")
         setRemoval(error.pluginRemoval ?? null);
     },
-    clear,
+    /** A new function on every render: an effect that calls it reads it through a ref. */
+    clear: () => {
+      approved.current = undefined;
+      setRemoval(null);
+    },
     /** The digest the next push carries. */
     approvedDigest: () => approved.current,
     confirm: () => {
@@ -195,6 +200,29 @@ function PluginListWarnings(props: { warnings: readonly string[] }) {
   );
 }
 
+/** What a review does with a source that is not https, said once under the list. */
+function SourceNotes(props: { rows: readonly BackupPluginRow[] }) {
+  return (
+    <>
+      {props.rows.some(isPreviewedOverHttps) ? (
+        <p className="text-muted text-xs">
+          A review previews only https addresses. A plugin from an ssh source is previewed at the
+          https address of the same host and path, so git never signs in with your SSH keys to a
+          host this backup names.
+        </p>
+      ) : null}
+      {props.rows.some(isAddedByHand) ? (
+        <p className="text-muted text-xs">
+          A plugin marked “Add it yourself” has a source that a review does not preview: a non-https
+          source with no https address, such as http or git, or an https URL that is not plain (one
+          with a user, a query, an escape, or a host on this machine). To reinstall it, add its
+          repository yourself in Settings → Plugins.
+        </p>
+      ) : null}
+    </>
+  );
+}
+
 /**
  * The backup's plugin list after a preview or restore, with the one way forward: review each
  * missing plugin through the normal install preview. Also says so when a list was skipped.
@@ -237,13 +265,7 @@ export function BackupPluginsCard(props: {
           another repository or folder, or a folder Xum does not manage, under that name.
         </p>
       ) : null}
-      {plugins.some(isAddedByHand) ? (
-        <p className="text-muted text-xs">
-          A review previews only plain https URLs. A plugin marked “Add it yourself” has another
-          kind of source, such as ssh, where a preview would sign in with your SSH keys to the host
-          this backup names. To reinstall it, add its repository yourself in Settings → Plugins.
-        </p>
-      ) : null}
+      <SourceNotes rows={plugins} />
       {missing.length > 0 ? (
         <Button
           size="sm"
