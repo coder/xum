@@ -1869,8 +1869,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({
           branches: ["main", "develop", "feature/new-feature"],
           recommendedTrunk: "main",
+          defaultBranch: "main",
         });
       },
+      listSshConfigHosts: () => Promise.resolve({ hosts: ["devbox", "gpu-01"] }),
       runtimeAvailability: () =>
         Promise.resolve(
           customRuntimeAvailability ?? {

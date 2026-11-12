@@ -66,6 +66,21 @@ describe("windowFilterListItems", () => {
     expect(rows.map((item) => item.value)).toEqual(["b4", "b0", "b1"]);
   });
 
+  test("a selection pulled to the front leaves its group, so no caption lands above the lead rows", () => {
+    const grouped = [
+      { value: "main", label: "main" },
+      { value: "recent", label: "recent", section: "Recent" },
+      { value: "old-1", label: "old-1", section: "All branches" },
+      { value: "old-2", label: "old-2", section: "All branches" },
+    ];
+    const rows = windowFilterListItems(grouped, "old-2", 3);
+    expect(rows.map((item) => `${item.section ?? "-"}:${item.value}`)).toEqual([
+      "-:old-2",
+      "-:main",
+      "Recent:recent",
+    ]);
+  });
+
   test("leaves the order alone when the selection is already in the window or absent", () => {
     expect(windowFilterListItems(many, "b1", 3).map((item) => item.value)).toEqual([
       "b0",
