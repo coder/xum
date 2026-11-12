@@ -33,6 +33,8 @@ export async function readModelDownload(
   }
   if (received !== file.bytes) throw new Error(`Incomplete download: ${file.name}`);
   const blob = new Blob(chunks);
+  // Release the download chunks before allocating the full buffer for checksum verification.
+  chunks.length = 0;
   const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
   const hash = Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, "0")

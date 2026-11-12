@@ -31,8 +31,19 @@ function update(patch: Partial<LocalVoiceState>) {
   for (const listener of listeners) listener();
 }
 
+export function isRemoteVoiceCaptureBlocked(): boolean {
+  // Remote Electron windows have no preload bridge and deny microphone permission.
+  return (
+    typeof window !== "undefined" &&
+    typeof navigator !== "undefined" &&
+    navigator.userAgent.includes("Electron/") &&
+    window.api == null
+  );
+}
+
 export function supportsLocalVoice(): boolean {
   return (
+    !isRemoteVoiceCaptureBlocked() &&
     typeof Worker !== "undefined" &&
     typeof WebAssembly !== "undefined" &&
     typeof OfflineAudioContext !== "undefined" &&

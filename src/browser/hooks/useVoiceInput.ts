@@ -17,6 +17,7 @@ import type { APIClient } from "@/browser/contexts/API";
 import { trackVoiceTranscription } from "@/common/telemetry";
 import type { VoiceModelId } from "@/common/constants/localVoiceModels";
 import { transcribeVoiceRecording } from "@/browser/utils/voice/transcribeVoiceRecording";
+import { isRemoteVoiceCaptureBlocked } from "@/browser/stores/LocalVoiceStore";
 import { getErrorMessage } from "@/common/utils/errors";
 
 export type VoiceInputState = "idle" | "requesting" | "recording" | "transcribing";
@@ -81,7 +82,11 @@ function hasTouchDictation(): boolean {
 // before MediaRecorder/mediaDevices exist in the environment (notably under Bun's test
 // module caching), which would otherwise freeze stale negatives.
 function hasMediaRecorder(): boolean {
-  return typeof window !== "undefined" && typeof MediaRecorder !== "undefined";
+  return (
+    typeof window !== "undefined" &&
+    typeof MediaRecorder !== "undefined" &&
+    !isRemoteVoiceCaptureBlocked()
+  );
 }
 
 function hasGetUserMedia(): boolean {

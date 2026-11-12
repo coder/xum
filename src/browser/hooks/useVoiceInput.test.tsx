@@ -13,6 +13,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
 import type { VoiceModelId } from "@/common/constants/localVoiceModels";
 import { useVoiceInput } from "./useVoiceInput";
+import { supportsLocalVoice } from "@/browser/stores/LocalVoiceStore";
 import { createTestApiClient } from "@/browser/testUtils";
 
 let sampleByte = 128;
@@ -176,6 +177,60 @@ describe("useVoiceInput", () => {
     } else {
       Reflect.deleteProperty(globalThis.navigator, "mediaDevices");
     }
+  });
+
+  test("limits local model downloads to browsers and the main desktop window", () => {
+    const descriptors = ["OfflineAudioContext", "caches"].map(
+      (name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const
+    );
+    try {
+      Object.defineProperty(globalThis, "OfflineAudioContext", {
+        configurable: true,
+        value: AudioContextMock,
+      });
+      Object.defineProperty(globalThis, "caches", { configurable: true, value: {} });
+      Object.defineProperty(navigator, "locks", { configurable: true, value: {} });
+      expect(supportsLocalVoice()).toBe(true);
+      Object.defineProperty(navigator, "userAgent", {
+        configurable: true,
+        value: "Xum Electron/44.3.0",
+      });
+      expect(supportsLocalVoice()).toBe(false);
+      window.api = { platform: "linux", versions: { electron: "44.3.0" } };
+      expect(supportsLocalVoice()).toBe(true);
+    } finally {
+      for (const [name, descriptor] of descriptors) {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        else Reflect.deleteProperty(globalThis, name);
+      }
+    }
+  });
+
+  test("does not offer recording in Electron remote-server windows", () => {
+    Object.defineProperty(navigator, "userAgent", {
+      configurable: true,
+      value: "Xum Electron/44.3.0",
+    });
+    const { result } = renderVoiceInput();
+    expect(result.current.isSupported).toBe(false);
+    expect(result.current.shouldShowUI).toBe(false);
+    expect(result.current.requiresSecureContext).toBe(false);
+    act(() => result.current.start());
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(result.current.state).toBe("idle");
+  });
+
+  test("keeps recording available in the main Electron window", async () => {
+    Object.defineProperty(navigator, "userAgent", {
+      configurable: true,
+      value: "Xum Electron/44.3.0",
+    });
+    window.api = { platform: "linux", versions: { electron: "44.3.0" } };
+    const { result } = renderVoiceInput();
+    expect(result.current.isSupported).toBe(true);
+    act(() => result.current.start());
+    await waitFor(() => expect(result.current.state).toBe("recording"));
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
   });
 
   test("the first recording survives Strict Mode effect replay", async () => {
