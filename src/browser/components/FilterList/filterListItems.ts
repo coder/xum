@@ -8,6 +8,11 @@ export interface FilterListItem {
   badge?: string;
   /** Muted text at the row's right edge ("No project"). Not searched. */
   aside?: string;
+  /**
+   * The group this row belongs to ("Recent"). A caption is drawn above the first shown row of
+   * each group; the items arrive already ordered by group.
+   */
+  section?: string;
   /** Draws a separator above this row unless it is the first one shown. */
   divider?: boolean;
 }

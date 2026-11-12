@@ -28,6 +28,7 @@ import type {
 import type { BranchLoadStatus } from "./branchListLoad";
 import type { EnvironmentSummary, RuntimeFieldError } from "./creationEnvironmentSummary";
 import { environmentArrowTarget, environmentOpenFocusTarget } from "./environmentPanelKeys";
+import { branchPickerItems } from "./creationPickerGroups";
 import { useCreationShortcut } from "./useCreationShortcut";
 
 /** One option on an isolation axis, with its UI and why it cannot be picked (if it cannot). */
@@ -44,6 +45,10 @@ export interface EnvironmentBranchPicker {
   selected: string;
   /** The repository's default branch, tagged in the list; null when it is not known. */
   defaultBranch: string | null;
+  /** The branches committed to most recently, newest first: listed right under the default. */
+  recentBranches: string[];
+  /** Loads the list again after a failed load. */
+  onRetry: () => void;
   onSelect: (branch: string) => void;
 }
 
@@ -191,16 +196,24 @@ function BranchColumn(props: {
           <Skeleton className="h-3 w-2/5 rounded" />
         </div>
       ) : branch.load === "failed" ? (
-        <span className="text-error px-2.5 py-2 text-xs" role="status">
-          Could not load branches
-        </span>
+        <div className="flex items-center gap-2.5 px-2.5 pt-1.5 pb-2.5">
+          <span className="text-error min-w-0 flex-1 text-xs" role="status">
+            Could not load branches
+          </span>
+          {/* Before, the only way to try again was to leave the project and come back. */}
+          <Button
+            variant="outline"
+            size="xs"
+            className="text-foreground h-7 px-2.5 text-xs"
+            disabled={props.disabled}
+            onClick={branch.onRetry}
+          >
+            Retry
+          </Button>
+        </div>
       ) : (
         <FilterList
-          items={branch.options.map((name) => ({
-            value: name,
-            label: name,
-            badge: name === branch.defaultBranch ? "default" : undefined,
-          }))}
+          items={branchPickerItems(branch.options, branch.defaultBranch, branch.recentBranches)}
           selected={branch.selected}
           onSelect={branch.onSelect}
           label="Select source branch"

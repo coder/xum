@@ -12,7 +12,7 @@ import {
   isInsideGitRepository,
   stripTrailingSlashes,
 } from "@/node/utils/pathUtils";
-import { listLocalBranches, detectDefaultTrunkBranch } from "@/node/git";
+import { listLocalBranches, listRecentLocalBranches, detectDefaultTrunkBranch } from "@/node/git";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { Secret } from "@/common/types/secrets";
@@ -1819,7 +1819,10 @@ export class ProjectService {
       }
 
       const recommendedTrunk = await detectDefaultTrunkBranch(normalizedPath, branches);
-      return { branches, recommendedTrunk };
+      // Recency only orders the picker, so a failure here must not fail the list (the list is
+      // the creation page's send barrier).
+      const recentBranches = await listRecentLocalBranches(normalizedPath).catch(() => []);
+      return { branches, recommendedTrunk, recentBranches };
     } catch (error) {
       log.error("Failed to list branches:", error);
       throw error instanceof Error ? error : new Error(String(error));

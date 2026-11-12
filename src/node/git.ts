@@ -46,6 +46,38 @@ export async function listLocalBranches(
     .sort((a, b) => a.localeCompare(b));
 }
 
+/** How many branches a branch list names as recent. */
+export const RECENT_BRANCH_COUNT = 5;
+
+/**
+ * The local branches committed to most recently, newest first. A repository can hold hundreds of
+ * branches (one per agent workspace); the few a person touched last are the likely base branches.
+ */
+export async function listRecentLocalBranches(
+  projectPath: string,
+  count: number = RECENT_BRANCH_COUNT,
+  options?: ExecFileAsyncOptions
+): Promise<string[]> {
+  using proc = execFileAsync(
+    "git",
+    [
+      "-C",
+      projectPath,
+      "for-each-ref",
+      "--sort=-committerdate",
+      `--count=${count}`,
+      "--format=%(refname:short)",
+      "refs/heads",
+    ],
+    options
+  );
+  const { stdout } = await proc.result;
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
 export async function getCurrentBranch(
   projectPath: string,
   options?: ExecFileAsyncOptions

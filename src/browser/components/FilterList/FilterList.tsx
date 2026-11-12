@@ -215,6 +215,14 @@ export function FilterList(props: {
             {item.divider && index > 0 && (
               <div role="presentation" className="border-border-light -mx-1 my-1 border-t" />
             )}
+            {item.section !== undefined && item.section !== rows[index - 1]?.section && (
+              <div
+                role="presentation"
+                className="text-muted-light px-2.5 pt-2 pb-1 font-mono text-[10.5px] font-medium tracking-[0.06em] uppercase"
+              >
+                {item.section}
+              </div>
+            )}
             <FilterListRow
               id={optionId(index)}
               item={item}

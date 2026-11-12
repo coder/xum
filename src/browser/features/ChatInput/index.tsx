@@ -979,6 +979,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           branches: creationState.branches,
           branchLoad: creationState.branchLoad,
           defaultBranch: creationState.recommendedTrunk,
+          recentBranches: creationState.recentBranches,
+          onReloadBranches: creationState.reloadBranches,
           trunkBranch: creationState.trunkBranch,
           onTrunkBranchChange: creationState.setTrunkBranch,
           selectedRuntime: creationState.selectedRuntime,

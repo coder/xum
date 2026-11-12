@@ -135,6 +135,10 @@ interface CreationControlsProps {
   branchLoad: BranchLoadStatus;
   /** The repository's default branch, tagged "default" in the branch list. */
   defaultBranch?: string | null;
+  /** The branches committed to most recently, listed under the default. */
+  recentBranches?: string[];
+  /** Loads the branch list again after a failed load. */
+  onReloadBranches?: () => void;
   trunkBranch: string;
   onTrunkBranchChange: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -1040,6 +1044,8 @@ function CreationControlsContent(props: CreationControlsProps) {
                     options: branchOptions,
                     selected: props.trunkBranch,
                     defaultBranch: props.defaultBranch ?? null,
+                    recentBranches: props.recentBranches ?? [],
+                    onRetry: props.onReloadBranches ?? (() => undefined),
                     onSelect: props.onTrunkBranchChange,
                   }
                 : null
@@ -1150,6 +1156,8 @@ export function CreationControls(props: CreationControlsProps) {
       branches={props.branches}
       branchLoad={props.branchLoad}
       defaultBranch={props.defaultBranch}
+      recentBranches={props.recentBranches}
+      onReloadBranches={props.onReloadBranches}
       trunkBranch={props.trunkBranch}
       onTrunkBranchChange={props.onTrunkBranchChange}
       selectedRuntime={props.selectedRuntime}

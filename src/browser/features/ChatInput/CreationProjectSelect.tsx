@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ComponentProps } from "react";
 import { ChevronDown, Pencil, Plus } from "lucide-react";
 import { FilterList } from "@/browser/components/FilterList/FilterList";
 import type { FilterListItem } from "@/browser/components/FilterList/filterListItems";
@@ -11,9 +11,12 @@ import {
 import { KeyHint } from "@/browser/components/KeyHint/KeyHint";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
+import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import { useWorkspaceRecency } from "@/browser/stores/WorkspaceStore";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import type { ProjectConfig } from "@/common/types/project";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
+import { groupProjectsByRecency, PROJECT_SECTIONS } from "./creationPickerGroups";
 
 interface CreationProjectSelectProps {
   /** Current creation scope: SCRATCH_PROJECT_CONFIG_KEY or a project path. */
@@ -73,6 +76,40 @@ export function CreationProjectSelect(props: CreationProjectSelectProps) {
           aside: "No project",
           divider: true,
         },
+      ]}
+    />
+  );
+}
+
+/**
+ * The project list with the projects worked in last on top, under "Recent". With many projects
+ * the sidebar's order says nothing about which one is wanted next; the last few used usually
+ * are. Mounted only while the switcher is open, so the recency subscription costs nothing closed.
+ */
+function RecencyGroupedProjectList(props: ComponentProps<typeof FilterList>) {
+  const recency = useWorkspaceRecency();
+  const workspaces = useOptionalWorkspaceMetadata()?.workspaceMetadata;
+  const projects = props.items.filter((item) => item.value !== SCRATCH_PROJECT_CONFIG_KEY);
+  const others = props.items.filter((item) => item.value === SCRATCH_PROJECT_CONFIG_KEY);
+  const groups = groupProjectsByRecency(
+    projects.map((item) => item.value),
+    workspaces?.values() ?? [],
+    recency
+  );
+  const byPath = new Map(projects.map((item) => [item.value, item]));
+  const rows = (paths: string[], section: string | undefined) =>
+    paths.flatMap((path) => {
+      const item = byPath.get(path);
+      return item ? [{ ...item, section }] : [];
+    });
+  const grouped = groups.recent.length > 0;
+  return (
+    <FilterList
+      {...props}
+      items={[
+        ...rows(groups.recent, PROJECT_SECTIONS.recent),
+        ...rows(groups.rest, grouped ? PROJECT_SECTIONS.all : undefined),
+        ...others,
       ]}
     />
   );
@@ -146,7 +183,7 @@ function ProjectSwitcher(props: {
         aria-label="Select project"
         className="flex max-h-(--radix-popover-content-available-height) w-[min(21.25rem,calc(100vw-1rem))] flex-col rounded-[10px] p-0 shadow-xl"
       >
-        <FilterList
+        <RecencyGroupedProjectList
           items={props.items}
           selected={props.selected}
           onSelect={(scope) => {

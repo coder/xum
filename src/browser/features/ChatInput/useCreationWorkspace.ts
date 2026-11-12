@@ -182,6 +182,10 @@ interface UseCreationWorkspaceReturn {
   branchLoad: BranchLoadStatus;
   /** The repository's default branch as the backend recommends it; null until known. */
   recommendedTrunk: string | null;
+  /** The branches committed to most recently, newest first. */
+  recentBranches: string[];
+  /** Loads the branch list again, after a failed load. */
+  reloadBranches: () => void;
   trunkBranch: string;
   setTrunkBranch: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -341,6 +345,9 @@ export function useCreationWorkspace({
   const [branches, setBranches] = useState<string[]>([]);
   const [branchLoad, setBranchLoad] = useState<BranchLoadStatus>("loading");
   const [recommendedTrunk, setRecommendedTrunk] = useState<string | null>(null);
+  const [recentBranches, setRecentBranches] = useState<string[]>([]);
+  // Bumped by "Retry" after a failed branch list: the load effect runs again.
+  const [branchReloads, setBranchReloads] = useState(0);
   const [toast, setToast] = useState<Toast | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [trustPrompt, setTrustPrompt] = useState<{
@@ -396,6 +403,7 @@ export function useCreationWorkspace({
         if (outcome.status === "loaded") {
           setBranches(outcome.branches);
           setRecommendedTrunk(outcome.recommendedTrunk);
+          setRecentBranches(outcome.recentBranches ?? []);
         }
         setBranchLoad(outcome.status);
       }
@@ -413,7 +421,7 @@ export function useCreationWorkspace({
       mounted = false;
       cancelBranchLoad();
     };
-  }, [kind, projectPath, api]);
+  }, [kind, projectPath, api, branchReloads]);
 
   // Cleanup: resolve trust prompt on unmount so handleSend doesn't wedge
   useEffect(() => {
@@ -1061,6 +1069,8 @@ export function useCreationWorkspace({
     branches,
     branchLoad,
     recommendedTrunk,
+    recentBranches,
+    reloadBranches: () => setBranchReloads((count) => count + 1),
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,
     selectedRuntime: settings.selectedRuntime,

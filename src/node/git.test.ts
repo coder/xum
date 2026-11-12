@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "@jest/globals";
-import { listLocalBranches, cleanStaleLock } from "./git";
+import { listLocalBranches, listRecentLocalBranches, cleanStaleLock } from "./git";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs/promises";
@@ -32,6 +32,26 @@ describe("listLocalBranches", () => {
     } catch (error) {
       console.warn("Failed to cleanup temp git repo:", error);
     }
+  });
+
+  test("listRecentLocalBranches names the branches committed to last, newest first", async () => {
+    const suffix = Date.now().toString(36);
+    const commitOn = async (branch: string, date: string) => {
+      await execAsync(`git checkout -q -b ${branch}`, { cwd: tempGitRepo });
+      await execAsync(`git commit -q --allow-empty -m ${branch}`, {
+        cwd: tempGitRepo,
+        env: { ...process.env, GIT_COMMITTER_DATE: date, GIT_AUTHOR_DATE: date },
+      });
+    };
+    // Far in the future, so they outrank whatever else the repository holds.
+    await commitOn(`older-${suffix}`, "2090-01-01T00:00:00Z");
+    await commitOn(`newest-${suffix}`, "2092-01-01T00:00:00Z");
+    await commitOn(`middle-${suffix}`, "2091-01-01T00:00:00Z");
+
+    expect(await listRecentLocalBranches(tempGitRepo, 2)).toEqual([
+      `newest-${suffix}`,
+      `middle-${suffix}`,
+    ]);
   });
 
   test("listLocalBranches should return sorted branch names", async () => {
