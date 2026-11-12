@@ -23,7 +23,11 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { Loader2, Wand2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
-import { CreationEnvironmentPanel, type IsolationSelectOption } from "./CreationEnvironmentPanel";
+import {
+  CreationEnvironmentPanel,
+  type EnvironmentBranchPicker,
+  type IsolationSelectOption,
+} from "./CreationEnvironmentPanel";
 import {
   describeEnvironment,
   environmentUsesBaseBranch,
@@ -32,8 +36,14 @@ import {
   type RuntimeFieldError,
 } from "./creationEnvironmentSummary";
 import { CreationProjectSelect } from "./CreationProjectSelect";
-import { SetDefaultIsolationButton } from "./SetDefaultIsolationButton";
+import {
+  DefaultSaveError,
+  SetDefaultIsolationButton,
+  setDefaultShortcut,
+  useSetDefaultIsolation,
+} from "./SetDefaultIsolationButton";
 import { SshDirectoryTrustNotice } from "./SshDirectoryTrustNotice";
+import { SshHostSuggestions } from "./SshHostSuggestions";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { cn } from "@/common/lib/utils";
@@ -132,6 +142,12 @@ interface CreationControlsProps {
   branches: string[];
   /** Where the branch list stands; only a loaded empty list means a non-git repo (#6055). */
   branchLoad: BranchLoadStatus;
+  /** The repository's default branch, tagged "default" in the branch list. */
+  defaultBranch?: string | null;
+  /** The branches committed to most recently, listed under the default. */
+  recentBranches?: string[];
+  /** Loads the branch list again after a failed load. */
+  onReloadBranches?: () => void;
   trunkBranch: string;
   onTrunkBranchChange: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -441,24 +457,27 @@ function SshHostInput(props: {
   if (selectedRuntime.mode !== "ssh" || props.isCoderSelected || coderProps?.enabled) return null;
   // Also hide when Coder is still checking but has saved config (will enable after check)
   if (coderProps?.coderInfo === null && coderProps?.coderConfig) return null;
+  const setHost = (value: string) =>
+    props.onSelectedRuntimeChange({
+      mode: "ssh",
+      host: value,
+      workspaceIsolation: selectedRuntime.workspaceIsolation,
+      projectDir: selectedRuntime.projectDir,
+    });
   return (
-    <RuntimeConfigInput
-      id="ssh-host"
-      fieldSpec={RUNTIME_OPTION_FIELDS.ssh}
-      value={selectedRuntime.host}
-      onChange={(value) =>
-        props.onSelectedRuntimeChange({
-          mode: "ssh",
-          host: value,
-          workspaceIsolation: selectedRuntime.workspaceIsolation,
-          projectDir: selectedRuntime.projectDir,
-        })
-      }
-      disabled={props.disabled}
-      hasError={props.hasError}
-      stacked
-      inputClassName={PANEL_FIELD_INPUT_CLASSES}
-    />
+    <>
+      <RuntimeConfigInput
+        id="ssh-host"
+        fieldSpec={RUNTIME_OPTION_FIELDS.ssh}
+        value={selectedRuntime.host}
+        onChange={setHost}
+        disabled={props.disabled}
+        hasError={props.hasError}
+        stacked
+        inputClassName={PANEL_FIELD_INPUT_CLASSES}
+      />
+      <SshHostSuggestions typed={selectedRuntime.host} disabled={props.disabled} onPick={setHost} />
+    </>
   );
 }
 
@@ -697,6 +716,26 @@ function workspaceIsolationFields(input: {
   return null;
 }
 
+/** The base-branch column's data, with the optional list extras defaulted. */
+function branchPickerFor(
+  props: CreationControlsProps,
+  branchOptions: string[]
+): EnvironmentBranchPicker {
+  return {
+    load: props.branchLoad,
+    options: branchOptions,
+    selected: props.trunkBranch,
+    defaultBranch: props.defaultBranch ?? null,
+    recentBranches: props.recentBranches ?? [],
+    onRetry: props.onReloadBranches ?? noop,
+    onSelect: props.onTrunkBranchChange,
+  };
+}
+
+function noop(): void {
+  // Nothing to reload when the host gave no reload (stories, tests).
+}
+
 function CreationControlsContent(props: CreationControlsProps) {
   usePerfRenderMarker("chat-input.creation-controls");
   const { nameState, runtimeAvailabilityState } = props;
@@ -845,6 +884,12 @@ function CreationControlsContent(props: CreationControlsProps) {
     isNonGitRepo,
     fieldError,
   };
+  const defaultSaver = useSetDefaultIsolation({
+    projectPath: props.projectPath,
+    isolation: currentIsolation,
+    disabled: props.disabled,
+    rememberShownFields: () => onSelectedRuntimeChange(selectedRuntime),
+  });
   const selectIsolation = (choice: IsolationChoice) => {
     const runtime = runtimeForIsolationChoice(choice, {
       runtimeChoiceContext,
@@ -1026,24 +1071,17 @@ function CreationControlsContent(props: CreationControlsProps) {
             })}
             branch={
               environmentUsesBaseBranch(environmentInput)
-                ? {
-                    load: props.branchLoad,
-                    options: branchOptions,
-                    selected: props.trunkBranch,
-                    onSelect: props.onTrunkBranchChange,
-                  }
+                ? branchPickerFor(props, branchOptions)
                 : null
             }
             fieldError={fieldError}
             fieldErrorAttempt={props.runtimeFieldErrorAttempt ?? 0}
-          />
-          <SetDefaultIsolationButton
-            projectPath={props.projectPath}
-            isolation={currentIsolation}
-            disabled={props.disabled}
-            rememberShownFields={() => onSelectedRuntimeChange(selectedRuntime)}
+            footerAction={<SetDefaultIsolationButton saver={defaultSaver} />}
+            footerShortcut={setDefaultShortcut(defaultSaver)}
           />
         </div>
+
+        <DefaultSaveError saver={defaultSaver} />
 
         {/* The directory's trust stays on the page, under the chip, not inside the panel: its
             pending and error state must survive the panel closing, and the trust state stands
@@ -1132,6 +1170,9 @@ export function CreationControls(props: CreationControlsProps) {
     <CreationControlsContent
       branches={props.branches}
       branchLoad={props.branchLoad}
+      defaultBranch={props.defaultBranch}
+      recentBranches={props.recentBranches}
+      onReloadBranches={props.onReloadBranches}
       trunkBranch={props.trunkBranch}
       onTrunkBranchChange={props.onTrunkBranchChange}
       selectedRuntime={props.selectedRuntime}

@@ -4,6 +4,7 @@ import type { ParsedRuntime } from "@/common/types/runtime";
 import {
   describeEnvironment,
   summarizeEnvironment,
+  summarizeUnavailableReason,
   type EnvironmentSummaryInput,
 } from "./creationEnvironmentSummary";
 
@@ -97,5 +98,35 @@ describe("describeEnvironment", () => {
     expect(
       describeEnvironment(input({ mode: "worktree" }, WORKTREE, { branchLoad: "failed" }))
     ).toBe("New workspaces run on this machine, in a separate git worktree.");
+  });
+});
+
+describe("summarizeUnavailableReason", () => {
+  test.each([
+    [
+      "/opt/homebrew/bin/coder is not logged in. Try logging in using 'coder login <url>'.",
+      "CLI not logged in",
+    ],
+    ["/usr/bin/coder 2.1.0 is below minimum v2.20.0.", "CLI out of date"],
+    [
+      "Dev Container CLI not installed. Run: npm install -g @devcontainers/cli",
+      "CLI not installed",
+    ],
+    ["devcontainer CLI not found. Install from https://containers.dev/", "CLI not installed"],
+    ["Dev Containers require Docker; Docker daemon not running", "Docker not running"],
+    ["Docker (or Podman) is not running or not installed", "Docker not available"],
+    ["No devcontainer.json found", "No devcontainer.json"],
+    ["Something else failed. Try again later", "Something else failed"],
+    // An empty first clause falls back to the whole reason; a one-character clause does not.
+    [": no details", ": no details"],
+    ["X. More", "X"],
+  ])("shortens %p to a setup hint", (reason, summary) => {
+    expect(summarizeUnavailableReason(reason)).toEqual({ summary, needsSetup: true });
+  });
+
+  test("a reason no setup can change is kept whole, without a setup link", () => {
+    for (const reason of ["Not yet supported on SSH projects", "Requires git repository"]) {
+      expect(summarizeUnavailableReason(reason)).toEqual({ summary: reason, needsSetup: false });
+    }
   });
 });
