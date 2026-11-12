@@ -148,8 +148,9 @@ describe("artifact tool", () => {
 
   describe("layout audit", () => {
     // The tool passes no budget, so the audit uses its production 15 s. Three fake widths took
-    // longer than that on a host at load 40: these tests get a budget no host load exhausts, and
-    // the hang test sets a short one. Captured before spyOn, which replaces the export.
+    // longer than that on a host at load 40: these tests get 60 s, four times as long, so a slow
+    // host does not turn a clean audit into "not checked" (a host slower still could exhaust
+    // it), and the hang test sets a short one. Captured before spyOn, which replaces the export.
     const audit = checkArtifactLayoutModule.checkArtifactLayout;
     let budgetMs = 60_000;
     let auditSpy: ReturnType<typeof spyOn<typeof checkArtifactLayoutModule, "checkArtifactLayout">>;
