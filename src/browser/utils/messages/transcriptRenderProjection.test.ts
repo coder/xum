@@ -214,7 +214,7 @@ describe("work bundles (compact density)", () => {
       tool({ id: "todo", toolName: "todo_write", ...TURN }),
     ]);
 
-    expect(infos.slice(1).map((info) => info?.key)).toEqual(Array(4).fill("work:read"));
+    expect(infos.slice(1).map((info) => info?.key)).toEqual(Array<string>(4).fill("work:read"));
     expect(infos.slice(1).map((info) => info?.role)).toEqual(["work", "answer", "work", "work"]);
     expect(infos[3]).toMatchObject({ visibleWhenFolded: false });
 
@@ -246,7 +246,7 @@ describe("work bundles (compact density)", () => {
       assistant("reply-b", { historyId: "history-b" }),
     ]);
 
-    expect(infos.slice(1).map((info) => info?.key)).toEqual(Array(5).fill("work:read-a"));
+    expect(infos.slice(1).map((info) => info?.key)).toEqual(Array<string>(5).fill("work:read-a"));
     // The earlier narration is not the reply: it folds with the work.
     expect(infos.slice(1).map((info) => info?.role)).toEqual([
       "work",
@@ -296,7 +296,7 @@ describe("work bundles (compact density)", () => {
 
     // Nothing after the reply said or did anything: no second line.
     const settled = work(messages);
-    expect(settled.slice(1).map((info) => info?.key)).toEqual(Array(4).fill("work:read-a"));
+    expect(settled.slice(1).map((info) => info?.key)).toEqual(Array<string>(4).fill("work:read-a"));
     expect(settled[2]).toMatchObject({ role: "answer" });
     expect(settled[4]).toMatchObject({ role: "work", visibleWhenFolded: false });
 
@@ -539,7 +539,7 @@ describe("work bundles (compact density)", () => {
 
     // With nothing to approve, a running call is only named on the line.
     expect(work(messages, true).map((info) => info?.visibleWhenFolded)).toEqual(
-      Array(4).fill(false)
+      Array<boolean>(4).fill(false)
     );
     // A running call keeps its stretch live on a host that does not report the turn.
     expect(work(messages, false)[0]).toMatchObject({
