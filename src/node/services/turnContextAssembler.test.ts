@@ -552,6 +552,65 @@ describe("assemblePromptPayload", () => {
     expect(afterPartial).toContain("[CONTINUE]");
   });
 
+  test.each([
+    {
+      route: "a google-typed Coder instance",
+      overrides: {
+        modelString: "google:gemini-4-carbon",
+        providerForMessages: "openai",
+        routeProvider: "coder",
+        providersConfig: {
+          coder: {
+            apiKeySet: false,
+            isEnabled: true,
+            isConfigured: true,
+            discoveredProviders: [{ name: "agents-google", type: "google" }],
+            canonicalRoutes: { google: "agents-google" },
+          },
+        },
+      },
+      sent: { coderGoogle: { thoughtSignature: "sig-coder" } },
+    },
+    {
+      route: "the native Gemini API",
+      overrides: { modelString: "google:gemini-4-carbon", providerForMessages: "google" },
+      sent: { google: { thoughtSignature: "sig-native" } },
+    },
+    {
+      route: "Anthropic",
+      overrides: { modelString: "anthropic:claude-opus-5-5", providerForMessages: "anthropic" },
+      sent: undefined,
+    },
+  ])("replays tool-call thought signatures for $route", async ({ overrides, sent }) => {
+    const history = [
+      createMuxMessage("user", "user", "list files"),
+      createMuxMessage("call", "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "first",
+          state: "output-available",
+          input: {},
+          output: { ok: true },
+          providerOptions: {
+            coderGoogle: { thoughtSignature: "sig-coder" },
+            google: { thoughtSignature: "sig-native" },
+          },
+        },
+      ]),
+    ];
+    const payload = await assemble({
+      history,
+      ...(overrides as Partial<Parameters<typeof assemblePromptPayload>[0]>),
+    });
+    const toolCall = payload.messages
+      .flatMap((message) =>
+        message.role === "assistant" && Array.isArray(message.content) ? message.content : []
+      )
+      .find((part) => part.type === "tool-call");
+    expect(toolCall?.providerOptions as unknown).toEqual(sent);
+  });
+
   test("replays tool_catalog_search results as tool references only for deferred tools", async () => {
     const history = [
       createMuxMessage("user", "user", "find it"),

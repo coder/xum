@@ -46,6 +46,8 @@ import type { InstructionSources } from "@/common/types/instructions";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
+import { isValidProvider } from "@/common/constants/providers";
+import { resolveRequestProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import type { TaskSettings } from "@/common/types/tasks";
 import {
   isRuntimeReadFailure,
@@ -812,6 +814,14 @@ export async function assemblePromptPayload(
     deferLoadingToolNames: options.tools
       ? collectDeferLoadingToolNames(options.tools)
       : options.deferLoadingToolNames,
+    toolCallReplayNamespace: resolveRequestProviderOptionsNamespaceKey(
+      options.providerForMessages,
+      options.modelString,
+      options.providersConfig,
+      options.routeProvider != null && isValidProvider(options.routeProvider)
+        ? options.routeProvider
+        : undefined
+    ),
   });
   // Without a cached system row nothing is frozen (rowsSupported), so this is also the sent one.
   let system: Instructions | undefined = options.systemMessage;
