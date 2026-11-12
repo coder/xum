@@ -67,12 +67,24 @@ def receipt_head(body):
     return match.group(1).ljust(40, "0") if match else None
 
 
+def quoted(sha):
+    """What Codex prints after the label: one space, then the SHA in backticks."""
+    return f" `{sha}`"
+
+
+def labelled_receipt(*lines, created_at=AFTER):
+    """The clean code-review receipt with one `Reviewed commit` label per entry of `lines`, each
+    followed by that text as it is (see `quoted`)."""
+    body = FIXTURES["code_review_no_findings"]["body"]
+    labels = "\n\n".join(f"**Reviewed commit:**{line}" for line in lines)
+    named = REVIEWED_COMMIT.sub(lambda _: labels, body)
+    assert named.count("**Reviewed commit:**") == len(lines), lines
+    return comment(named, BOT, created_at)
+
+
 def code_receipt(sha, created_at=AFTER):
     """The clean code-review receipt Codex posts for a review request, naming `sha`."""
-    body = FIXTURES["code_review_no_findings"]["body"]
-    named = REVIEWED_COMMIT.sub(f"**Reviewed commit:** `{sha}`", body)
-    assert f"`{sha}`" in named, sha
-    return comment(named, BOT, created_at)
+    return labelled_receipt(quoted(sha), created_at=created_at)
 
 
 RUNNING_LABEL = "🔄 Running"
@@ -1563,6 +1575,31 @@ else:
             ("11 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f")], 1),
             ("20 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 10)], 1),
             ("40 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 30)], 1),
+            # Longer than a head: the head cannot start it, and it must not read as a prefix of the head.
+            ("41 characters, the head and one more", [request, code_receipt(PR_HEAD + "f")], 1),
+            # Codex prints lowercase hex, and the gate reads only that. A line in any other shape names
+            # no readable commit: it is rejected here, and it is not a receipt with no line.
+            ("upper case, 12 characters of the head", [request, code_receipt(PR_HEAD[:12].upper())], 1),
+            ("upper case, the whole head", [request, code_receipt(PR_HEAD.upper())], 1),
+            ("upper case, an earlier head", [request, code_receipt(EARLIER_HEAD[:10].upper())], 1),
+            ("a reviewed commit that is not hex", [request, code_receipt("zzzzzzzzzz")], 1),
+            ("an empty reviewed commit", [request, code_receipt("")], 1),
+            ("a reviewed commit without backticks", [request, labelled_receipt(f" {PR_HEAD[:10]}")], 1),
+            # Codex prints the label, one space, then the SHA in backticks. Any other gap, or text before
+            # the SHA, is no readable commit. Main skips such a label and lets a later one decide, and
+            # this script must not copy that.
+            ("no space before the backticks", [request, labelled_receipt(f"`{PR_HEAD[:10]}`")], 1),
+            ("two spaces before the backticks", [request, labelled_receipt(f"  `{PR_HEAD[:10]}`")], 1),
+            ("a tab before the backticks", [request, labelled_receipt(f"\t`{PR_HEAD[:10]}`")], 1),
+            ("text before the backticks", [request, labelled_receipt(f" see `{PR_HEAD[:10]}`")], 1),
+            # The first line decides: a later line cannot rescue an earlier one that fails, and cannot
+            # fail an earlier one that passes.
+            ("two lines: 41 characters, then the head", [request, labelled_receipt(quoted(PR_HEAD + "f"), quoted(PR_HEAD[:12]))], 1),
+            ("two lines: no hex, then the head", [request, labelled_receipt(quoted("zzzzzzzzzz"), quoted(PR_HEAD[:12]))], 1),
+            ("two lines: the head, then no hex", [request, labelled_receipt(quoted(PR_HEAD[:12]), quoted("zzzzzzzzzz"))], 0),
+            ("two lines: no space and the head, then an earlier head", [request, labelled_receipt(f"`{PR_HEAD[:12]}`", quoted(EARLIER_HEAD[:10]))], 1),
+            ("two lines: no space and an earlier head, then the head", [request, labelled_receipt(f"`{EARLIER_HEAD[:10]}`", quoted(PR_HEAD[:12]))], 1),
+            ("two lines: the head, then no space and an earlier head", [request, labelled_receipt(quoted(PR_HEAD[:12]), f"`{EARLIER_HEAD[:10]}`")], 0),
         ):
             with self.subTest(case=case):
                 result = self.assert_gate(expected, snapshot(comments, head=PR_HEAD), "wait_pr_codex.sh")
@@ -1588,6 +1625,22 @@ else:
                     data, "wait_pr_codex.sh", env_extra={"CODEX_GATE_REACTIONS_NODES": json.dumps(served)}
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_a_rejected_receipt_does_not_pass_a_usage_limit_or_an_open_thread(self):
+        # Such a receipt is no approval, so the usage-limit pass (needs no Codex response) and the
+        # open-thread failure (which prints "approved" only for a real approval) do not meet it.
+        request = comment("@codex review", "maintainer", REQUEST)
+        for name, receipt in (
+            ("an earlier head", code_receipt(EARLIER_HEAD[:10])),
+            ("a head with no space before the backticks", labelled_receipt(f"`{PR_HEAD[:10]}`")),
+        ):
+            for case, comments, threads in (
+                ("a usage-limit notice", [request, receipt, comment(USAGE_LIMIT_NOTICES[0])], []),
+                ("an open review thread", [request, receipt], [thread("[P1] Fix authorization")]),
+            ):
+                with self.subTest(receipt=name, case=case):
+                    result = self.assert_gate(1, snapshot(comments, threads, head=PR_HEAD), "wait_pr_codex.sh")
+                    self.assertNotIn("Codex approved", result.stdout)
 
 
 if __name__ == "__main__":
