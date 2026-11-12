@@ -6,6 +6,7 @@ import {
   LOCAL_VOICE_MODELS,
   LOCAL_VOICE_MODEL_IDS,
   LOCAL_VOICE_MAX_SECONDS,
+  type LocalVoiceModelId,
 } from "@/common/constants/localVoiceModels";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
@@ -13,7 +14,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { useState } from "react";
 
 export function VoiceSection() {
-  const { model, setModel, state } = useVoiceModel();
+  const { model, setModel, state, isAvailable } = useVoiceModel();
   const { setActiveSection } = useSettings();
   const [error, setError] = useState<string | null>(null);
   const supported = supportsLocalVoice();
@@ -57,88 +58,10 @@ export function VoiceSection() {
             localhost.
           </p>
         )}
-        {LOCAL_VOICE_MODEL_IDS.map((id) => {
-          const entry = LOCAL_VOICE_MODELS[id];
-          const ready = state.downloaded.includes(id);
-          const operation = state.operation?.id === id ? state.operation : null;
-          const total = entry.files.reduce((sum, file) => sum + file.bytes, 0);
-          return (
-            <div
-              key={id}
-              className="border-border-light flex min-w-0 flex-wrap items-center gap-3 rounded-md border p-3"
-            >
-              <label className="flex min-w-0 flex-1 basis-48 items-start gap-3">
-                <input
-                  type="radio"
-                  name="voice-model"
-                  value={id}
-                  checked={model === id}
-                  disabled={!supported || !ready || !!state.operation}
-                  onChange={() => setModel(id)}
-                  className="accent-accent mt-1"
-                />
-                <span className="min-w-0 text-sm">
-                  {entry.name}
-                  <span className="text-muted mt-1 block text-xs">
-                    {entry.languages} · {Math.round(total / 1_000_000)} MB
-                  </span>
-                  <a
-                    className="text-muted mt-1 block text-xs underline"
-                    href={`https://huggingface.co/${entry.repo}`}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    NVIDIA model · CC BY 4.0
-                  </a>
-                </span>
-              </label>
-              <div className="flex flex-wrap items-center gap-2">
-                {operation?.kind === "download" ? (
-                  <>
-                    <span role="status" className="text-muted counter-nums text-xs">
-                      {Math.floor((operation.bytes / total) * 100)}%
-                    </span>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() => localVoiceStore.cancelDownload()}
-                    >
-                      Cancel download
-                    </Button>
-                  </>
-                ) : ready ? (
-                  <>
-                    <span className="text-muted text-xs">
-                      {model === id ? "Selected" : "Downloaded"}
-                    </span>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      aria-label={`Remove ${entry.name}`}
-                      disabled={!!state.operation}
-                      onClick={() => run(localVoiceStore.remove(id))}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                      Remove
-                    </Button>
-                  </>
-                ) : (
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    disabled={!supported || state.loading || !!state.operation}
-                    aria-label={`Download ${entry.name}`}
-                    onClick={() => run(localVoiceStore.download(id))}
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                    Download
-                  </Button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-        {model !== "openai" && !state.loading && (!model || !state.downloaded.includes(model)) && (
+        {LOCAL_VOICE_MODEL_IDS.map((id) => (
+          <LocalVoiceModelCard key={id} id={id} onOperation={run} />
+        ))}
+        {model !== "openai" && !state.loading && !isAvailable && (
           <p role="status" className="text-warning text-xs">
             Download and select a local model, or select OpenAI to enable voice input.
           </p>
@@ -172,6 +95,99 @@ export function VoiceSection() {
           Open provider settings
         </Button>
       </fieldset>
+    </div>
+  );
+}
+
+interface LocalVoiceModelProps {
+  id: LocalVoiceModelId;
+  onOperation: (operation: Promise<void>) => void;
+}
+
+function LocalVoiceModelCard(props: LocalVoiceModelProps) {
+  const { model, setModel, state } = useVoiceModel();
+  const id = props.id;
+  const entry = LOCAL_VOICE_MODELS[id];
+  const ready = state.downloaded.includes(id);
+  const supported = supportsLocalVoice();
+  const total = entry.files.reduce((sum, file) => sum + file.bytes, 0);
+  return (
+    <div className="border-border-light flex min-w-0 flex-wrap items-center gap-3 rounded-md border p-3">
+      <label className="flex min-w-0 flex-1 basis-48 items-start gap-3">
+        <input
+          type="radio"
+          name="voice-model"
+          value={id}
+          checked={model === id}
+          disabled={!supported || !ready || !!state.operation}
+          onChange={() => setModel(id)}
+          className="accent-accent mt-1"
+        />
+        <span className="min-w-0 text-sm">
+          {entry.name}
+          <span className="text-muted mt-1 block text-xs">
+            {entry.languages} · {Math.round(total / 1_000_000)} MB
+          </span>
+          <a
+            className="text-muted mt-1 block text-xs underline"
+            href={`https://huggingface.co/${entry.repo}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            NVIDIA model · CC BY 4.0
+          </a>
+        </span>
+      </label>
+      <LocalVoiceModelActions id={id} onOperation={props.onOperation} />
+    </div>
+  );
+}
+
+function LocalVoiceModelActions(props: LocalVoiceModelProps) {
+  const { model, state } = useVoiceModel();
+  const id = props.id;
+  const entry = LOCAL_VOICE_MODELS[id];
+  const ready = state.downloaded.includes(id);
+  const supported = supportsLocalVoice();
+  const operation = state.operation;
+  const total = entry.files.reduce((sum, file) => sum + file.bytes, 0);
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {operation?.id === id && operation.kind === "download" ? (
+        <>
+          <span role="status" className="text-muted counter-nums text-xs">
+            {Math.floor((operation.bytes / total) * 100)}%
+          </span>
+          <Button variant="secondary" size="sm" onClick={() => localVoiceStore.cancelDownload()}>
+            Cancel download
+          </Button>
+        </>
+      ) : ready ? (
+        <>
+          <span className="text-muted text-xs">{model === id ? "Selected" : "Downloaded"}</span>
+          <Button
+            variant="secondary"
+            size="sm"
+            aria-label={`Remove ${entry.name}`}
+            disabled={!!state.operation}
+            onClick={() => props.onOperation(localVoiceStore.remove(id))}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Remove
+          </Button>
+        </>
+      ) : (
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={!supported || state.loading || !!state.operation}
+          aria-label={`Download ${entry.name}`}
+          onClick={() => props.onOperation(localVoiceStore.download(id))}
+        >
+          <Download className="h-3.5 w-3.5" />
+          Download
+        </Button>
+      )}
     </div>
   );
 }

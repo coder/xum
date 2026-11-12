@@ -691,11 +691,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Track transcription provider prerequisites from Settings → Providers.
   const [openAIKeySet, setOpenAIKeySet] = useState(false);
   const [openAIProviderEnabled, setOpenAIProviderEnabled] = useState(true);
-  const { model: voiceModel, state: localVoiceState } = useVoiceModel();
-  const isTranscriptionAvailable =
-    voiceModel === "openai"
-      ? openAIProviderEnabled && openAIKeySet
-      : voiceModel !== null && localVoiceState.downloaded.includes(voiceModel);
+  const { model: voiceModel, isAvailable: isTranscriptionAvailable } = useVoiceModel(
+    openAIProviderEnabled && openAIKeySet
+  );
 
   // Voice input - appends transcribed text to input
   const voiceInput = useVoiceInput({

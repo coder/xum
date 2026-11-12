@@ -52,9 +52,8 @@ export const RecordingOverlay: React.FC<RecordingOverlayProps> = (props) => {
   // For recording state, we use inline styles with the agent color
   // For other states (requesting/transcribing), use amber classes
   const containerClasses = cn(
-    "mb-1 flex w-full flex-col items-center justify-center gap-1 rounded-md border px-3 py-2 transition-all focus:outline-none",
-    isRecording ? "cursor-pointer" : "border-amber-500 bg-amber-500/10",
-    isRequesting ? "cursor-wait" : "cursor-pointer"
+    "mb-1 flex w-full flex-col items-center justify-center gap-1 rounded-md border px-3 py-2 transition-all focus:outline-none cursor-pointer disabled:cursor-wait",
+    !isRecording && "border-amber-500 bg-amber-500/10"
   );
 
   return (

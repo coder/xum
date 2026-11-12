@@ -6,7 +6,7 @@
  * Hidden on touch devices where native keyboard dictation is available.
  */
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, type MutableRefObject } from "react";
 import { matchesKeybind, KEYBINDS, isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
@@ -412,52 +412,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     };
   }, [releaseStream, stopMetering]);
 
-  // ---------------------------------------------------------------------------
-  // Recording keybinds (when useRecordingKeybinds is true)
-  // ---------------------------------------------------------------------------
-
-  // Track if space was held when recording started to prevent immediate send
-  const spaceHeldAtStartRef = useRef(false);
-
-  useEffect(() => {
-    if (!options.useRecordingKeybinds || (state !== "recording" && state !== "transcribing")) {
-      spaceHeldAtStartRef.current = false;
-      return;
-    }
-
-    // Use global key state instead of assuming - handles async mic access delay
-    spaceHeldAtStartRef.current = isSpaceHeldRef.current;
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (isDesktopViewportFocused(e.target)) return;
-      if (e.key === " ") spaceHeldAtStartRef.current = false;
-    };
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Global capture runs before noVNC can contain the guest's keyboard input.
-      if (isDesktopViewportFocused(e.target)) return;
-      if (state === "transcribing" && e.key !== "Escape") return;
-      if (e.key === " " && !spaceHeldAtStartRef.current) {
-        e.preventDefault();
-        stop({ send: true });
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        stopKeyboardPropagation(e);
-        cancel();
-      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_VOICE_INPUT)) {
-        e.preventDefault();
-        stop();
-      }
-    };
-
-    // Use capture phase to intercept before focused elements consume the event
-    window.addEventListener("keyup", handleKeyUp, true);
-    window.addEventListener("keydown", handleKeyDown, true);
-    return () => {
-      window.removeEventListener("keyup", handleKeyUp, true);
-      window.removeEventListener("keydown", handleKeyDown, true);
-    };
-  }, [options.useRecordingKeybinds, state, stop, cancel]);
+  useVoiceRecordingKeys(options.useRecordingKeybinds, state, isSpaceHeldRef, stop, cancel);
 
   // ---------------------------------------------------------------------------
   // Return
@@ -475,4 +430,64 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     cancel,
     toggle,
   };
+}
+
+function voiceKeyAction(
+  event: KeyboardEvent,
+  state: VoiceInputState,
+  spaceHeld: boolean
+): "cancel" | "send" | "stop" | null {
+  // Guest desktop shortcuts must not control the host recording.
+  if (isDesktopViewportFocused(event.target)) return null;
+  if (event.key === "Escape") return "cancel";
+  if (state === "transcribing") return null;
+  if (event.key === " " && !spaceHeld) return "send";
+  if (matchesKeybind(event, KEYBINDS.TOGGLE_VOICE_INPUT)) return "stop";
+  return null;
+}
+
+function useVoiceRecordingKeys(
+  enabled: boolean | undefined,
+  state: VoiceInputState,
+  isSpaceHeldRef: MutableRefObject<boolean>,
+  stop: (options?: { send?: boolean }) => void,
+  cancel: () => void
+) {
+  // Track if space was held when recording started to prevent immediate send
+  const spaceHeldAtStartRef = useRef(false);
+
+  useEffect(() => {
+    if (!enabled || (state !== "recording" && state !== "transcribing")) {
+      spaceHeldAtStartRef.current = false;
+      return;
+    }
+
+    // Use global key state instead of assuming - handles async mic access delay
+    spaceHeldAtStartRef.current = isSpaceHeldRef.current;
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
+      if (e.key === " ") spaceHeldAtStartRef.current = false;
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const action = voiceKeyAction(e, state, spaceHeldAtStartRef.current);
+      if (action === null) return;
+      e.preventDefault();
+      if (action === "cancel") {
+        stopKeyboardPropagation(e);
+        cancel();
+      } else {
+        stop({ send: action === "send" });
+      }
+    };
+
+    // Use capture phase to intercept before focused elements consume the event
+    window.addEventListener("keyup", handleKeyUp, true);
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      window.removeEventListener("keyup", handleKeyUp, true);
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [enabled, state, stop, cancel, isSpaceHeldRef]);
 }
