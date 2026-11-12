@@ -1181,7 +1181,9 @@ describe("text in an element with no box (display: contents)", () => {
   test("a paragraph in a collapsed panel is reported on the panel, unless it has no box", () => {
     const panel = (css: string, box: string) =>
       `<div id="panel" data-box="0 0 200 0" data-css="overflow-y: hidden"><p data-box="${box}" data-css="${css}" data-lines="0 0 180 20">Collapsed panel text</p></div>`;
-    expect(audit(panel("", "0 0 200 20"))).toEqual([finding("clipped-text", "div#panel", "vertical", 20)]);
+    expect(audit(panel("", "0 0 200 20"))).toEqual([
+      finding("clipped-text", "div#panel", "vertical", 20),
+    ]);
     expect(audit(panel("display: contents", ""))).toEqual([]);
   });
 
