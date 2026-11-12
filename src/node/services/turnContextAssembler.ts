@@ -764,6 +764,22 @@ function combineSectionPlans(plans: Array<[keyof SystemSectionRecords, VolatileS
   };
 }
 
+/** The providerOptions namespace this request's client reads (see messagePipeline). */
+function requestProviderOptionsNamespace(
+  options: Pick<
+    AssemblePromptPayloadOptions,
+    "providerForMessages" | "modelString" | "providersConfig" | "routeProvider"
+  >
+): string {
+  const routeProvider = options.routeProvider;
+  return resolveRequestProviderOptionsNamespaceKey(
+    options.providerForMessages,
+    options.modelString,
+    options.providersConfig,
+    routeProvider != null && isValidProvider(routeProvider) ? routeProvider : undefined
+  );
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -814,14 +830,7 @@ export async function assemblePromptPayload(
     deferLoadingToolNames: options.tools
       ? collectDeferLoadingToolNames(options.tools)
       : options.deferLoadingToolNames,
-    toolCallReplayNamespace: resolveRequestProviderOptionsNamespaceKey(
-      options.providerForMessages,
-      options.modelString,
-      options.providersConfig,
-      options.routeProvider != null && isValidProvider(options.routeProvider)
-        ? options.routeProvider
-        : undefined
-    ),
+    toolCallReplayNamespace: requestProviderOptionsNamespace(options),
   });
   // Without a cached system row nothing is frozen (rowsSupported), so this is also the sent one.
   let system: Instructions | undefined = options.systemMessage;
