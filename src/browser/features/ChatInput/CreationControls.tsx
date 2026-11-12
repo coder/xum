@@ -34,6 +34,7 @@ import {
 import { CreationProjectSelect } from "./CreationProjectSelect";
 import { SetDefaultIsolationButton, useSetDefaultIsolation } from "./SetDefaultIsolationButton";
 import { SshDirectoryTrustNotice } from "./SshDirectoryTrustNotice";
+import { SshHostSuggestions } from "./SshHostSuggestions";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
@@ -448,24 +449,27 @@ function SshHostInput(props: {
   if (selectedRuntime.mode !== "ssh" || props.isCoderSelected || coderProps?.enabled) return null;
   // Also hide when Coder is still checking but has saved config (will enable after check)
   if (coderProps?.coderInfo === null && coderProps?.coderConfig) return null;
+  const setHost = (value: string) =>
+    props.onSelectedRuntimeChange({
+      mode: "ssh",
+      host: value,
+      workspaceIsolation: selectedRuntime.workspaceIsolation,
+      projectDir: selectedRuntime.projectDir,
+    });
   return (
-    <RuntimeConfigInput
-      id="ssh-host"
-      fieldSpec={RUNTIME_OPTION_FIELDS.ssh}
-      value={selectedRuntime.host}
-      onChange={(value) =>
-        props.onSelectedRuntimeChange({
-          mode: "ssh",
-          host: value,
-          workspaceIsolation: selectedRuntime.workspaceIsolation,
-          projectDir: selectedRuntime.projectDir,
-        })
-      }
-      disabled={props.disabled}
-      hasError={props.hasError}
-      stacked
-      inputClassName={PANEL_FIELD_INPUT_CLASSES}
-    />
+    <>
+      <RuntimeConfigInput
+        id="ssh-host"
+        fieldSpec={RUNTIME_OPTION_FIELDS.ssh}
+        value={selectedRuntime.host}
+        onChange={setHost}
+        disabled={props.disabled}
+        hasError={props.hasError}
+        stacked
+        inputClassName={PANEL_FIELD_INPUT_CLASSES}
+      />
+      <SshHostSuggestions typed={selectedRuntime.host} disabled={props.disabled} onPick={setHost} />
+    </>
   );
 }
 

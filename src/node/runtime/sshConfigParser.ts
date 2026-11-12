@@ -267,6 +267,29 @@ async function loadSSHConfig(): Promise<SSHConfig | null> {
   }
 }
 
+/** The most host aliases a suggestion list is given. */
+const MAX_LISTED_HOSTS = 50;
+
+/**
+ * The host aliases `~/.ssh/config` names with a `Host` line, in file order: what a user would
+ * type after `ssh`. Patterns (`*`, `?`, `!`) are skipped, since they are rules, not hosts. Used
+ * to suggest hosts on the new-workspace page, so a missing or unreadable file is an empty list.
+ */
+export async function listSSHConfigHosts(): Promise<string[]> {
+  const config = await loadSSHConfig();
+  if (!config) return [];
+  const hosts = new Set<string>();
+  for (const line of config) {
+    if (!("param" in line) || line.param.toLowerCase() !== "host") continue;
+    const values: unknown[] = Array.isArray(line.value) ? line.value : [line.value];
+    for (const value of values) {
+      const alias = typeof value === "string" ? value : isParsedValueToken(value) ? value.val : "";
+      if (alias.length > 0 && !/[*?!]/.test(alias)) hosts.add(alias);
+    }
+  }
+  return [...hosts].slice(0, MAX_LISTED_HOSTS);
+}
+
 export async function resolveSSHConfig(host: string): Promise<ResolvedSSHConfig> {
   const { host: hostAlias, user: userOverride } = parseHostAndUser(host);
   const homeDir = getHomeDir();
