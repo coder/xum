@@ -1626,18 +1626,21 @@ else:
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
-    def test_a_receipt_for_an_earlier_head_does_not_pass_a_usage_limit_or_an_open_thread(self):
+    def test_a_rejected_receipt_does_not_pass_a_usage_limit_or_an_open_thread(self):
         # Such a receipt is no approval, so the usage-limit pass (needs no Codex response) and the
         # open-thread failure (which prints "approved" only for a real approval) do not meet it.
         request = comment("@codex review", "maintainer", REQUEST)
-        receipt = code_receipt(EARLIER_HEAD[:10])
-        for case, comments, threads in (
-            ("a usage-limit notice", [request, receipt, comment(USAGE_LIMIT_NOTICES[0])], []),
-            ("an open review thread", [request, receipt], [thread("[P1] Fix authorization")]),
+        for name, receipt in (
+            ("an earlier head", code_receipt(EARLIER_HEAD[:10])),
+            ("a head with no space before the backticks", labelled_receipt(f"`{PR_HEAD[:10]}`")),
         ):
-            with self.subTest(case=case):
-                result = self.assert_gate(1, snapshot(comments, threads, head=PR_HEAD), "wait_pr_codex.sh")
-                self.assertNotIn("Codex approved", result.stdout)
+            for case, comments, threads in (
+                ("a usage-limit notice", [request, receipt, comment(USAGE_LIMIT_NOTICES[0])], []),
+                ("an open review thread", [request, receipt], [thread("[P1] Fix authorization")]),
+            ):
+                with self.subTest(receipt=name, case=case):
+                    result = self.assert_gate(1, snapshot(comments, threads, head=PR_HEAD), "wait_pr_codex.sh")
+                    self.assertNotIn("Codex approved", result.stdout)
 
 
 if __name__ == "__main__":
