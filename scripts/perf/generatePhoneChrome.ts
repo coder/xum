@@ -78,7 +78,7 @@ function capture() {
     "input[type=file],.sr-only";
   // Ids, a11y and test hooks go: the copy is inert and must not duplicate live hooks.
   const DROP =
-    /^(id|role|tabindex|title|for|name|aria-(?!hidden).*|data-testid|data-message-id|data-tutorial|data-state|data-autofocus-state|data-loaded|autocomplete|spellcheck)$/;
+    /^(id|role|tabindex|title|for|name|aria-(?!hidden).*|data-testid|data-message-id|data-displayed-message-id|data-tutorial|data-state|data-autofocus-state|data-loaded|autocomplete|spellcheck)$/;
   const children = new Map<Element, Node[]>();
   const MODE_STYLE = /var\(--color-[\w-]*-mode\)/; // the selected agent's color, workspace state
   const one = (selector: string, scope: ParentNode = document) => {

@@ -21,6 +21,8 @@ import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditC
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { AskUserQuestionDock } from "./AskUserQuestionDock";
+import { shouldDiscardTimelineReveal } from "@/browser/utils/timelineReveal";
+import { ChatSearch } from "./ChatSearch";
 import { WaitingOnYouCard, WaitingOnYouProvider, WaitingOnYouSlot } from "./WaitingOnYou";
 import { useAcceptedAnswersVersion } from "@/browser/utils/messages/openAskUserQuestions";
 import {
@@ -300,6 +302,11 @@ function findTranscriptRevealElement(
   scrollContainer: HTMLElement,
   anchor: CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]
 ): HTMLElement | undefined {
+  if (anchor.displayedMessageId) {
+    return Array.from(
+      scrollContainer.querySelectorAll<HTMLElement>("[data-displayed-message-id]")
+    ).find((element) => element.dataset.displayedMessageId === anchor.displayedMessageId);
+  }
   if (anchor.toolCallId) {
     const toolElement = Array.from(
       scrollContainer.querySelectorAll<HTMLElement>("[data-tool-call-id]")
@@ -318,6 +325,9 @@ function findTimelineRevealMessageIndex(
   messages: readonly DisplayedMessage[],
   anchor: CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]
 ): number {
+  if (anchor.displayedMessageId) {
+    return messages.findIndex((message) => message.id === anchor.displayedMessageId);
+  }
   if (anchor.toolCallId) {
     const toolIndex = messages.findIndex(
       (message) => message.type === "tool" && message.toolCallId === anchor.toolCallId
@@ -861,7 +871,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
     // Like pendingScrollTarget: the tail being pinned again supersedes a reveal still waiting.
-    if (pendingTimelineReveal.workspaceId !== workspaceId || autoScroll) {
+    if (shouldDiscardTimelineReveal(pendingTimelineReveal, workspaceId, autoScroll)) {
       setPendingTimelineReveal(null);
       return;
     }
@@ -1651,7 +1661,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             never resizes when the composer grows or shrinks. */}
         <div
           className={cn(
-            "relative flex-1 overflow-hidden",
+            "relative flex min-h-0 flex-1 flex-col overflow-hidden",
             props.embedded !== true && "mobile-header-spacer"
           )}
         >
@@ -1663,6 +1673,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             view={props.agentInterfaceView}
             dockRef={composerDockRef}
             composerApiRef={chatInputAPI}
+          />
+          <ChatSearch
+            key={`search:${workspaceId}`}
+            workspaceId={workspaceId}
+            transcriptRef={contentRef}
+            enabled={!showStatusView}
           />
           <div
             ref={contentRef}
@@ -1700,7 +1716,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             // measures the content box, so the plan TOC sees the narrower gutters too.
             // `chat-reserved-inline-end-scrollport`: globals.css eases the padding with the
             // sidebar's width slide.
-            className="chat-reserved-inline-end-scrollport @container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto pt-[15px] pr-[calc(15px+var(--chat-reserved-inline-end,0px))] pl-[15px] leading-[1.5] break-words whitespace-pre-wrap"
+            className="chat-reserved-inline-end-scrollport @container/transcript flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto pt-[15px] pr-[calc(15px+var(--chat-reserved-inline-end,0px))] pl-[15px] leading-[1.5] break-words whitespace-pre-wrap"
           >
             <div
               // While locked, opt the whole transcript subtree out of scroll

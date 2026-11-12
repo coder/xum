@@ -308,6 +308,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
       <TranscriptMessageBoundary
         data-testid="chat-message"
         data-message-id={getMessageHistoryId(message)}
+        data-displayed-message-id={message.id}
         data-tool-call-id={message.type === "tool" ? message.toolCallId : undefined}
       >
         {quoteText === null ? (

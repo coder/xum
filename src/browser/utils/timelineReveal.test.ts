@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 import type { DisplayedMessage } from "@/common/types/message";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { revealTimelineTarget, type TimelineRevealStore } from "./timelineReveal";
+import {
+  revealTimelineTarget,
+  shouldDiscardTimelineReveal,
+  type TimelineRevealStore,
+} from "./timelineReveal";
 
 const workspaceId = "timeline-reveal-test";
 
@@ -42,6 +46,15 @@ function makeUserMessage(historyId: string): DisplayedMessage {
   };
 }
 
+describe("shouldDiscardTimelineReveal", () => {
+  it("keeps pending reveals only in the detached transcript that requested them", () => {
+    const reveal = { workspaceId, messageId: "pending" };
+    expect(shouldDiscardTimelineReveal(reveal, workspaceId, false)).toBe(false);
+    expect(shouldDiscardTimelineReveal(reveal, "another-workspace", false)).toBe(true);
+    expect(shouldDiscardTimelineReveal(reveal, workspaceId, true)).toBe(true);
+  });
+});
+
 describe("revealTimelineTarget", () => {
   let cleanupDom: (() => void) | null = null;
 
@@ -67,6 +80,7 @@ describe("revealTimelineTarget", () => {
         getTarget: () => ({ messageId: "prompt-1" }),
         workspaceStore: store,
         pinTarget,
+        isCancelled: () => false,
       });
       expect(result).toBe("revealed");
       expect(pinTarget).not.toHaveBeenCalled();
@@ -78,6 +92,70 @@ describe("revealTimelineTarget", () => {
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
     }
+  });
+
+  it("pins the matching row instead of revealing a loaded sibling from the same history message", async () => {
+    const store = createStore({ messages: [{ ...makeUserMessage("parts"), id: "parts-0" }] });
+    const target = { messageId: "parts", displayedMessageId: "parts-1" };
+    const pinTarget = mock(() => {
+      store.state.messages.push({ ...makeUserMessage("parts"), id: "parts-1" });
+    });
+    const events: Event[] = [];
+    const listener = (event: Event) => events.push(event);
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    try {
+      expect(
+        await revealTimelineTarget({
+          workspaceId,
+          getTarget: () => target,
+          workspaceStore: store,
+          pinTarget,
+        })
+      ).toBe("revealed");
+      expect(pinTarget).toHaveBeenCalledWith(workspaceId, target);
+      expect(events).toHaveLength(1);
+      expect((events[0] as CustomEvent).detail).toEqual({ workspaceId, ...target });
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    }
+  });
+
+  it("keeps cancellation available after dispatch while the target still mounts", async () => {
+    const store = createStore({ messages: [makeUserMessage("prompt-1")] });
+    let cancelled = false;
+    const events: Array<CustomEvent<{ workspaceId: string; isCancelled: () => boolean }>> = [];
+    const listener = (event: Event) =>
+      events.push(event as CustomEvent<{ workspaceId: string; isCancelled: () => boolean }>);
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    try {
+      await revealTimelineTarget({
+        workspaceId,
+        getTarget: () => ({ messageId: "prompt-1" }),
+        workspaceStore: store,
+        pinTarget: () => undefined,
+        isCancelled: () => cancelled,
+        cancelPendingReveal: true,
+      });
+      expect(shouldDiscardTimelineReveal(events[0].detail, workspaceId, false)).toBe(false);
+      cancelled = true;
+      expect(shouldDiscardTimelineReveal(events[0].detail, workspaceId, false)).toBe(true);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    }
+  });
+
+  it("does not load older pages for a loaded-history-only reveal", async () => {
+    const loadOlderHistory = mock(() => Promise.resolve("loaded" as const));
+    const store = createStore({ hasOlderHistory: true, loadOlderHistory });
+    const result = await revealTimelineTarget({
+      workspaceId,
+      getTarget: () => ({ messageId: "unrenderable" }),
+      workspaceStore: store,
+      pinTarget: () => undefined,
+      maxHistoryPages: 0,
+    });
+    expect(result).toBe("not-loaded");
+    expect(loadOlderHistory).not.toHaveBeenCalled();
   });
 
   it("pins a target that becomes renderable without loading history", async () => {

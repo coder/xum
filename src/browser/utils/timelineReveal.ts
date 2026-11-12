@@ -1,4 +1,8 @@
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import {
+  CUSTOM_EVENTS,
+  createCustomEvent,
+  type CustomEventPayloads,
+} from "@/common/constants/events";
 import type { HistoryLoadResult, WorkspaceState } from "@/browser/stores/WorkspaceStore";
 
 const DEFAULT_MAX_REVEAL_HISTORY_PAGES = 10;
@@ -19,6 +23,17 @@ export type TimelineRevealResult = "revealed" | "not-found" | "not-loaded" | "er
 export interface TimelineRevealTarget {
   messageId?: string;
   toolCallId?: string;
+  /** Narrow a history message to its matching displayed row. */
+  displayedMessageId?: string;
+}
+
+/** Discard pending reveals after navigation, search cancellation, or return to the transcript tail. */
+export function shouldDiscardTimelineReveal(
+  reveal: CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR],
+  workspaceId: string,
+  autoScroll: boolean
+): boolean {
+  return reveal.workspaceId !== workspaceId || autoScroll || reveal.isCancelled?.() === true;
 }
 
 function hasTimelineRevealTarget(target: TimelineRevealTarget): boolean {
@@ -29,6 +44,9 @@ function isRevealTargetLoaded(
   workspaceState: Pick<WorkspaceState, "messages">,
   target: TimelineRevealTarget
 ): boolean {
+  if (target.displayedMessageId) {
+    return workspaceState.messages.some((message) => message.id === target.displayedMessageId);
+  }
   if (target.toolCallId) {
     return workspaceState.messages.some(
       (message) => message.type === "tool" && message.toolCallId === target.toolCallId
@@ -42,24 +60,36 @@ function isRevealTargetLoaded(
     : false;
 }
 
-function dispatchTimelineReveal(workspaceId: string, target: TimelineRevealTarget): void {
-  window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, {
-      workspaceId,
-      ...target,
-    })
-  );
-}
-
-/** Loads, pins, and reveals a timeline target in the transcript. */
-export async function revealTimelineTarget(options: {
+interface TimelineRevealOptions {
   workspaceId: string;
   getTarget: () => TimelineRevealTarget;
   workspaceStore: TimelineRevealStore;
   pinTarget: (workspaceId: string, target: TimelineRevealTarget) => void;
   maxHistoryPages?: number;
   isCancelled?: () => boolean;
-}): Promise<TimelineRevealResult> {
+  /** Keep cancellation active after dispatch while the transcript mounts the target. */
+  cancelPendingReveal?: boolean;
+}
+
+function dispatchTimelineReveal(
+  options: TimelineRevealOptions,
+  target: TimelineRevealTarget
+): void {
+  // Other callers end their load operation after dispatch. Search also owns the pending scroll.
+  const isCancelled = options.cancelPendingReveal ? options.isCancelled : undefined;
+  window.dispatchEvent(
+    createCustomEvent(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, {
+      workspaceId: options.workspaceId,
+      ...target,
+      ...(isCancelled ? { isCancelled } : {}),
+    })
+  );
+}
+
+/** Loads, pins, and reveals a timeline target in the transcript. */
+export async function revealTimelineTarget(
+  options: TimelineRevealOptions
+): Promise<TimelineRevealResult> {
   const { workspaceId, getTarget, workspaceStore, pinTarget, isCancelled } = options;
   const maxHistoryPages = options.maxHistoryPages ?? DEFAULT_MAX_REVEAL_HISTORY_PAGES;
   const cancelled = () => isCancelled?.() === true;
@@ -73,7 +103,7 @@ export async function revealTimelineTarget(options: {
       if (cancelled()) {
         return "cancelled";
       }
-      dispatchTimelineReveal(workspaceId, target);
+      dispatchTimelineReveal(options, target);
       return "revealed";
     }
     if (cancelled()) {
@@ -87,7 +117,7 @@ export async function revealTimelineTarget(options: {
       if (cancelled()) {
         return "cancelled";
       }
-      dispatchTimelineReveal(workspaceId, target);
+      dispatchTimelineReveal(options, target);
       return "revealed";
     }
   }
@@ -122,7 +152,7 @@ export async function revealTimelineTarget(options: {
         if (cancelled()) {
           return "cancelled";
         }
-        dispatchTimelineReveal(workspaceId, target);
+        dispatchTimelineReveal(options, target);
         return "revealed";
       }
     }
