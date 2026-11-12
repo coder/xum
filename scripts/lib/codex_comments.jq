@@ -57,6 +57,30 @@ def codex_security_review_requested_for($bot; $head):
   any(.[]; .author.login != $bot and (.authorAssociation | IN("OWNER", "MEMBER", "COLLABORATOR"))
     and (.body | contains("@codex security review") and contains($head)));
 
+# Input: PR comment nodes. Output: whether an unminimized Codex board records a finished code
+# review of $head that found nothing. An approval that carries no commit of its own (a thumbs-up,
+# or a receipt without its Reviewed commit line) says nothing about which head it approves, so
+# wait_pr_codex.sh counts it only when this board names the current head.
+def codex_clean_code_review_board_for($bot; $head):
+  ([.[] | select(.author.login == $bot and .isMinimized == false)
+    | .body | select(startswith(codex_summary_marker))
+    | first(capture("<!-- codex-review-state:v1 (?<p>.*) -->").p | fromjson? | .code_review)
+    | select(.commit_sha == $head and .status == "completed" and .has_any_findings == false)]
+    | length > 0);
+
+# Input: one PR comment node. Output: the commit that its clean code-review receipt names in the
+# Reviewed commit line, or null when Codex left the line out or the node is no such receipt.
+def codex_receipt_commit:
+  first(.body | codex_without_help
+    | capture("\\n\\n\\*\\*Reviewed commit:\\*\\* `(?<commit>[0-9a-f]{7,40})`$").commit) // null;
+
+# Input: one approval comment node. Output: whether it approves $head. A receipt that names a
+# commit approves only a head that starts with it. A receipt that names none counts only beside a
+# clean board for $head ($clean_board, from codex_clean_code_review_board_for).
+def codex_approval_names_head($head; $clean_board):
+  codex_receipt_commit as $commit
+  | if $commit == null then $clean_board else ($head | startswith($commit)) end;
+
 # Input: review thread nodes. Output: the root comment IDs of resolved Codex
 # threads, the IDs that board advisory links use (#discussion_r<id>).
 def codex_resolved_discussions($bot):

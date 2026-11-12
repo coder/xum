@@ -13,7 +13,7 @@ unset GH_DEBUG DEBUG
 # counts with the explicit read: ./scripts/check_codex_comments.sh <pr_number>
 #
 # Exits:
-#   0 - Codex approved and the Codex comments gate counted no open review thread, or Codex
+#   0 - Codex approved the current head and the Codex comments gate counted no open review thread, or Codex
 #       reported a usage limit with no outstanding findings
 #   1 - Codex left comments to address, approved while a review thread is open (or while the
 #       gate could not read the threads), OR failed to review for another reason
@@ -418,6 +418,7 @@ CHECK_CODEX_STATUS_ONCE() {
   local approval_reaction_at
   local reactions_has_previous
   local all_thumbs_up_reactions
+  local clean_board_for_head
   local should_scan_full_reactions
   local now_epoch
   local codex_response_count_comments
@@ -498,6 +499,14 @@ CHECK_CODEX_STATUS_ONCE() {
     return 10
   fi
 
+  # An approval stands for the current head only. A push starts a new review, but the approval of an
+  # earlier head can still be newer than the last request, so a receipt counts when its Reviewed commit
+  # line names this head. A receipt without that line, and a thumbs-up, name no head: they count
+  # only beside a board that records a clean, finished code review of this head.
+  clean_board_for_head=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" '
+    include "codex_comments";
+    codex_clean_code_review_board_for($bot; $head)')
+
   # A fresh quota notice may pass the gate, but only after the full findings check below.
   rate_limit_comment=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '
     include "codex_comments";
@@ -505,7 +514,11 @@ CHECK_CODEX_STATUS_ONCE() {
     | sort_by(.createdAt) | last // empty | .body // empty')
 
   # Only the time leaves this jq: the approval comment's body is Codex text.
-  approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
+  approval_comment_at=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" --arg head "$pr_head" --argjson clean_board "$clean_board_for_head" '
+    include "codex_comments";
+    [.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))
+        and codex_approval_names_head($head; $clean_board)) | {createdAt}]
+    | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
   if [[ -n "$approval_comment_at" ]]; then
     approval_stands || return 1
@@ -517,6 +530,7 @@ CHECK_CODEX_STATUS_ONCE() {
   fi
 
   approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
+  [[ "$clean_board_for_head" == "true" ]] || approval_reaction_at=""
 
   if [[ -n "$approval_reaction_at" ]]; then
     approval_stands || return 1
@@ -579,6 +593,7 @@ CHECK_CODEX_STATUS_ONCE() {
     now_epoch=$(date +%s)
     record_full_reactions_scan "$request_at" "$now_epoch" || return 1
     approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
+    [[ "$clean_board_for_head" == "true" ]] || approval_reaction_at=""
 
     if [[ -n "$approval_reaction_at" ]]; then
       approval_stands || return 1
