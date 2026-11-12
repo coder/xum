@@ -79,6 +79,16 @@ export const LAYOUT_AUDIT_THRESHOLDS = {
   maxAuditedElements: 800,
   /** Candidates the overlap rule samples (after its own filters). */
   maxOcclusionCandidates: 200,
+  /**
+   * The overlap rule scrolls at most this many scrolling panels, and makes at most this many
+   * panel scrolls in all, to reach the text and controls they hide. A page past these bounds
+   * keeps its time budget: what it hides further down is not sampled. The Layout check section
+   * of docs/workspaces/artifacts.mdx names both numbers.
+   */
+  maxScrolledPanels: 8,
+  maxPanelScrolls: 32,
+  /** A scroll that reaches within this of where it was sent was not stopped by the content's end. */
+  scrollRoundingPx: 1,
   /** A document wider than the viewport by less than max(this, ratio of the width) is cosmetic. */
   pageOverflowMinPx: 24,
   pageOverflowMinViewportRatio: 0.05,

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Covered text below the first screen of an app shell that scrolls its content</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      /* The window cannot scroll: the content area does. */
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+      }
+      main {
+        height: 100%;
+        overflow-y: auto;
+        padding: 24px;
+      }
+      /* Taller than every audited viewport, so the section below it is reached only by scrolling. */
+      .spacer {
+        height: 2400px;
+      }
+      .stack {
+        position: relative;
+        width: min(620px, 100%);
+        padding: 18px;
+        border: 1px solid #aebbc4;
+      }
+      .stack p {
+        margin: 0;
+        padding: 18px;
+        font-size: 20px;
+        line-height: 1.3;
+      }
+      .cover {
+        position: absolute;
+        inset: 0;
+        background: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Order status</h1>
+      <div class="spacer"></div>
+      <section class="stack">
+        <p id="payment-failed">
+          Your payment failed. Update your billing details to keep your plan.
+        </p>
+        <div class="cover"></div>
+      </section>
+    </main>
+  </body>
+</html>

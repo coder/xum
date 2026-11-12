@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { LAYOUT_AUDIT_THRESHOLDS } from "@/common/constants/artifactLayoutAudit";
 import type { LayoutAuditPageFinding } from "@/common/types/artifactLayoutAudit";
 import { auditLayout } from "./audit";
 import {
@@ -914,6 +915,277 @@ describe("overlapping-text", () => {
       };
       expect(() => auditLayout(failing)).toThrow("boom");
       expect(fake.calls.filter((call) => call.startsWith("scrollTo")).at(-1)).toBe("scrollTo 0");
+    });
+  });
+  describe("content in a scrolling panel", () => {
+    const WHITE = "background-color: rgb(255, 255, 255)";
+    // A panel 200 px tall at y 100, with 900 px of content. `data-scroll-height` makes the fake
+    // scroll it. `extra` adds attributes (a first scroll position).
+    const PANEL = (content: string, extra = "") =>
+      `<div id="panel" data-box="0 100 300 200" data-css="overflow-y: auto" data-scroll-height="900" ${extra}>${content}</div>`;
+    // A paragraph at `top` (the panel shows y 100 to 300, so 400 is below it, 40 is above).
+    const TEXT = (top: number, id = "t") =>
+      `<p id="${id}" data-box="10 ${top} 200 20" data-lines="10 ${top} 200 20">Hello world text</p>`;
+    // An opaque block over the panel's box, a sibling of the panel: it does not scroll with it.
+    const COVER_OVER_PANEL = `<div id="cover" data-box="0 100 300 200" data-css="${WHITE}" data-z="1"></div>`;
+    const covered = [finding("overlapping-text", "p#t", "horizontal", 0)];
+    const panelScrolls = (calls: string[]) =>
+      calls.filter((call) => call.startsWith("scrollPanel"));
+    // `auditScrolling` has the fake page 3000 px tall; this one returns every scroll it made.
+    function run(
+      html: string,
+      prepare: (fake: FakeLayoutPage) => void = () => undefined,
+      scrollY = 0
+    ) {
+      using fake = createFakeLayoutPage(html, {
+        viewport: { width: 390, height: 844, scrollHeight: 3000, scrollY },
+      });
+      prepare(fake);
+      return { findings: auditLayout(fake.page), calls: fake.calls };
+    }
+
+    test("a cover over what a panel hides below its edge is reported, then the panel is put back", () => {
+      const { findings, calls } = run(
+        `<div id="stage">${PANEL(TEXT(400))}${COVER_OVER_PANEL}</div>`
+      );
+      expect(findings).toEqual(covered);
+      // The first point is at y 404: the panel scrolls 204 px to put it in the middle of its box.
+      expect(panelScrolls(calls)).toEqual(["scrollPanel #panel 204", "scrollPanel #panel 0"]);
+    });
+
+    test("overflow-y: scroll holds its content just as auto does", () => {
+      const html = `<div id="stage">${PANEL(TEXT(400))}${COVER_OVER_PANEL}</div>`;
+      expect(run(html.replace("overflow-y: auto", "overflow-y: scroll")).findings).toEqual(covered);
+    });
+
+    test("a panel with no box of its own (display: contents) holds nothing: its text is sampled where it is", () => {
+      const noBox = `<div id="panel" data-css="overflow-y: auto">${TEXT(150)}</div>`;
+      const { findings, calls } = run(`<div id="stage">${noBox}${COVER_OVER_PANEL}</div>`);
+      expect(findings).toEqual(covered);
+      expect(panelScrolls(calls)).toEqual([]);
+    });
+
+    test("a page loaded scrolled still gets its panel scrolled to the right place", () => {
+      // The boxes are client coordinates at scroll 500: the panel is at 600 in the document, and
+      // its text is 204 px below the middle of what it shows.
+      const html = `<div id="stage">${PANEL(TEXT(400))}${COVER_OVER_PANEL}</div>`;
+      const { findings, calls } = run(html, () => undefined, 500);
+      expect(findings).toEqual(covered);
+      expect(panelScrolls(calls)).toEqual(["scrollPanel #panel 204", "scrollPanel #panel 0"]);
+    });
+
+    test("content above the part a panel shows is reached too, and the panel goes back to where it was", () => {
+      // The panel loaded scrolled by 300 px: this text is above its box.
+      const html = `<div id="stage">${PANEL(TEXT(40), 'data-scroll="300"')}${COVER_OVER_PANEL}</div>`;
+      const { findings, calls } = run(html);
+      expect(findings).toEqual(covered);
+      expect(panelScrolls(calls)).toEqual(["scrollPanel #panel 144", "scrollPanel #panel 300"]);
+    });
+
+    test("nothing over the panel: the hidden text is free, and the panel is put back all the same", () => {
+      const { findings, calls } = run(`<div id="stage">${PANEL(TEXT(400))}</div>`);
+      expect(findings).toEqual([]);
+      expect(panelScrolls(calls).at(-1)).toBe("scrollPanel #panel 0");
+    });
+
+    test("text a panel shows is sampled where it is: no panel scroll", () => {
+      const { findings, calls } = run(
+        `<div id="stage">${PANEL(TEXT(150))}${COVER_OVER_PANEL}</div>`
+      );
+      expect(findings).toEqual(covered);
+      expect(panelScrolls(calls)).toEqual([]);
+    });
+
+    // The text that the panel hides is not where its rectangle says: a block that follows the
+    // panel sits there. A user who scrolls the panel sees the text, free.
+    test("a block after the panel does not cover text that is scrolled out of the panel", () => {
+      const after = `<div id="after" data-box="0 350 300 150" data-css="${WHITE}" data-z="1"></div>`;
+      const { findings } = run(`<div id="stage">${PANEL(TEXT(400))}${after}</div>`);
+      expect(findings).toEqual([]);
+    });
+
+    test("a panel that cannot scroll that far leaves the point unsampled, not sampled where it lies", () => {
+      // No scroll height: the panel scrolls nowhere, and the block that follows it sits at y 400.
+      const after = `<div id="after" data-box="0 350 300 150" data-css="${WHITE}" data-z="1"></div>`;
+      const stuck = `<div id="panel" data-box="0 100 300 200" data-css="overflow-y: auto">${TEXT(400)}</div>`;
+      const { findings, calls } = run(`<div id="stage">${stuck}${after}</div>`);
+      expect(findings).toEqual([]);
+      expect(panelScrolls(calls)).toEqual(["scrollPanel #panel 204", "scrollPanel #panel 0"]);
+    });
+
+    // The panel is 300 px wide; the text lies at x 310, under a block beside the panel. A panel
+    // that scrolls sideways could show it, and the audit scrolls panels only up and down.
+    test.each([
+      ["on the first screen", 100],
+      ["below the fold", 1500],
+    ])("text past the side of a panel (%s) is not sampled where it lies", (_where, top) => {
+      const side = `<p id="t" data-box="310 ${top + 50} 70 20" data-lines="310 ${top + 50} 70 20">Hello world text</p>`;
+      const box = `data-box="0 ${top} 300 200"`;
+      const panel = `<div id="panel" ${box} data-css="overflow-y: auto" data-scroll-height="900">${side}</div>`;
+      const cover = `<div data-box="300 ${top} 90 200" data-css="${WHITE}" data-z="1"></div>`;
+      const { findings, calls } = run(`<div id="stage">${panel}${cover}</div>`);
+      expect(findings).toEqual([]);
+      expect(panelScrolls(calls)).toEqual([]);
+    });
+
+    test("a panel scrolls even when the page cannot: its content is still there to reach", () => {
+      const { findings, calls } = run(
+        `<div id="stage">${PANEL(TEXT(400))}${COVER_OVER_PANEL}</div>`,
+        (fake) => fake.page.document.body.setAttribute("data-css", "overflow-y: hidden")
+      );
+      expect(findings).toEqual(covered);
+      expect(calls.filter((call) => call.startsWith("scrollTo"))).toEqual([]);
+    });
+
+    describe("a panel below the fold", () => {
+      // The panel is at y 1500, 600 px below the first screen of an 844 px viewport.
+      const LOW_PANEL = (content: string) =>
+        `<div id="panel" data-box="0 1500 300 200" data-css="overflow-y: auto" data-scroll-height="900">${content}</div>`;
+      const LOW_COVER = `<div id="cover" data-box="0 1500 300 200" data-css="${WHITE}" data-z="1"></div>`;
+
+      test("text that shows in it needs only the page scroll: the panel stays", () => {
+        const { findings, calls } = run(
+          `<div id="stage">${LOW_PANEL(TEXT(1550))}${LOW_COVER}</div>`
+        );
+        expect(findings).toEqual(covered);
+        expect(panelScrolls(calls)).toEqual([]);
+      });
+
+      test("is scrolled first, then the window shows it, and both go back (the panel first)", () => {
+        const html = `<div id="stage">${LOW_PANEL(TEXT(2000))}${LOW_COVER}</div>`;
+        const { findings, calls } = run(html);
+        expect(findings).toEqual(covered);
+        // The first point is at y 2004, 504 px under the middle of the panel's box (1600).
+        expect(calls.filter((call) => /^scroll(Panel|To)/.test(call))).toEqual([
+          "scrollPanel #panel 404",
+          "scrollTo 1178",
+          "scrollPanel #panel 0",
+          "scrollTo 0",
+        ]);
+      });
+    });
+
+    describe("a panel inside a panel", () => {
+      // The inner panel sits at y 800 in the content of the outer one, which shows y 100 to 400:
+      // the inner panel is out of sight until the outer one scrolls.
+      const INNER = (content: string, atY = 800) =>
+        `<div id="inner" data-box="0 ${atY} 300 200" data-css="overflow-y: auto" data-scroll-height="1500">${content}</div>`;
+      const OUTER = (content: string) =>
+        `<div id="outer" data-box="0 100 300 300" data-css="overflow-y: auto" data-scroll-height="2000">${content}</div>`;
+      const COVER_OVER_INNER = (atY = 800) =>
+        `<div id="cover" data-box="0 ${atY} 300 200" data-css="${WHITE}" data-z="1"></div>`;
+
+      test("the inner panel scrolls first, then the outer one brings it into view", () => {
+        const html = `<div id="stage">${OUTER(INNER(TEXT(1600)) + COVER_OVER_INNER())}</div>`;
+        const { findings, calls } = run(html);
+        expect(findings).toEqual(covered);
+        expect(panelScrolls(calls)).toEqual([
+          "scrollPanel #inner 704",
+          "scrollPanel #outer 650",
+          "scrollPanel #inner 0",
+          "scrollPanel #outer 0",
+        ]);
+      });
+
+      test("an outer panel that shows the inner one stays where it is", () => {
+        const html = `<div id="stage">${OUTER(INNER(TEXT(1000), 150) + COVER_OVER_INNER(150))}</div>`;
+        const { findings, calls } = run(html);
+        expect(findings).toEqual(covered);
+        expect(panelScrolls(calls)).toEqual(["scrollPanel #inner 754", "scrollPanel #inner 0"]);
+      });
+    });
+
+    describe("the work is bounded", () => {
+      const { maxScrolledPanels, maxPanelScrolls } = LAYOUT_AUDIT_THRESHOLDS;
+
+      test("a page scrolls only so many panels: the text in the others is not sampled", () => {
+        // Panels of 50 px at y 100, 200, ... each with its own text far below and its own cover.
+        const panels = Array.from({ length: maxScrolledPanels + 2 }, (_, i) => {
+          const top = 100 + i * 100;
+          const text = `<p id="t${i}" data-box="10 ${2000 + i * 30} 200 20" data-lines="10 ${2000 + i * 30} 200 20">Hello world text</p>`;
+          return `<div id="panel${i}" data-box="0 ${top} 300 50" data-css="overflow-y: auto" data-scroll-height="9000">${text}</div>
+            <div data-box="0 ${top} 300 50" data-css="${WHITE}" data-z="1"></div>`;
+        });
+        const { findings, calls } = run(`<div id="stage">${panels.join("")}</div>`);
+        expect(findings.map((f) => f.selector)).toEqual(
+          Array.from({ length: maxScrolledPanels }, (_, i) => `p#t${i}`)
+        );
+        // One scroll and one restore for each panel that was scrolled.
+        expect(panelScrolls(calls)).toHaveLength(2 * maxScrolledPanels);
+      });
+
+      test("a page makes only so many panel scrolls: the text further down is not sampled", () => {
+        // One panel of 100 px with 40 paragraphs 300 px apart: each needs a scroll of its own.
+        const rows = Array.from({ length: maxPanelScrolls + 8 }, (_, i) =>
+          TEXT(1000 + i * 300, `r${i}`)
+        );
+        const panel = `<div id="panel" data-box="0 100 300 100" data-css="overflow-y: auto" data-scroll-height="20000">${rows.join("")}</div>`;
+        const cover = `<div data-box="0 100 300 100" data-css="${WHITE}" data-z="1"></div>`;
+        const { findings, calls } = run(`<div id="stage">${panel}${cover}</div>`);
+        expect(findings).toHaveLength(maxPanelScrolls);
+        expect(panelScrolls(calls)).toHaveLength(maxPanelScrolls + 1);
+      });
+    });
+
+    // A list that draws only the rows that show can drop a row when its panel scrolls. The row has
+    // two lines: the first shows in the panel and is covered, the second is below its edge.
+    test("an element that left the page when its panel scrolled is unknown: not covered, not free", () => {
+      const row =
+        '<p id="t" data-box="10 150 200 280" data-lines="10 150 200 20; 10 400 200 20">Hello world text</p>';
+      using fake = createFakeLayoutPage(`<div id="stage">${PANEL(row)}${COVER_OVER_PANEL}</div>`, {
+        viewport: { width: 390, height: 844, scrollHeight: 3000 },
+      });
+      const text = fake.byId("t");
+      const dropping: LayoutPage = {
+        ...fake.page,
+        scrollElementTo: (el, top) => {
+          const reached = fake.page.scrollElementTo(el, top);
+          text.remove();
+          return reached;
+        },
+      };
+      // The second line's nine points are unknown. Counted as free they would pull the nine
+      // covered points of the first line under 90%.
+      expect(auditLayout(dropping)).toEqual(covered);
+    });
+
+    describe("every scroll is put back", () => {
+      const TWO = `<div id="stage">${PANEL(TEXT(400))}${COVER_OVER_PANEL}</div>`;
+
+      test("when a sample throws", () => {
+        using fake = createFakeLayoutPage(TWO, {
+          viewport: { width: 390, height: 844, scrollHeight: 3000 },
+        });
+        const failing: LayoutPage = {
+          ...fake.page,
+          elementAt: () => {
+            throw new Error("boom");
+          },
+        };
+        expect(() => auditLayout(failing)).toThrow("boom");
+        expect(panelScrolls(fake.calls).at(-1)).toBe("scrollPanel #panel 0");
+        expect(fake.calls.at(-1)).toBe("scrollTo 0");
+      });
+
+      test("when one of them cannot be put back, the others still are", () => {
+        const html = `<div id="stage">
+          <div id="a" data-box="0 100 300 50" data-css="overflow-y: auto" data-scroll-height="9000">${TEXT(2000, "ta")}</div>
+          <div id="b" data-box="0 200 300 50" data-css="overflow-y: auto" data-scroll-height="9000">${TEXT(2100, "tb")}</div>
+          <div data-box="0 100 300 150" data-css="${WHITE}" data-z="1"></div></div>`;
+        using fake = createFakeLayoutPage(html, {
+          viewport: { width: 390, height: 844, scrollHeight: 3000 },
+        });
+        const stuck: LayoutPage = {
+          ...fake.page,
+          scrollElementTo: (el, top) => {
+            if (el.id === "a" && top === 0) throw new Error("stuck");
+            return fake.page.scrollElementTo(el, top);
+          },
+        };
+        expect(() => auditLayout(stuck)).toThrow(AggregateError);
+        expect(fake.calls).toContain("scrollPanel #b 0");
+        expect(fake.calls.at(-1)).toBe("scrollTo 0");
+      });
     });
   });
 });

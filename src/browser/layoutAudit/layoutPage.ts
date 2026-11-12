@@ -71,6 +71,14 @@ export interface LayoutPage {
    * the page at that position afterwards.
    */
   scrollTo(top: number): number;
+  /** Where a scrolling box (`overflow: auto` or `scroll`) shows its content: its `scrollTop`. */
+  scrollTopOf(el: Element): number;
+  /**
+   * Scrolls the box `el` to `top` at once, whatever its `scroll-behavior`, and returns the
+   * position it reached: the end of its content limits it. `elementAt` reads the page at that
+   * position afterwards, as it does after `scrollTo`.
+   */
+  scrollElementTo(el: Element, top: number): number;
   /** Targets of running or pending animations. */
   animatedElements(): Element[];
   escapeIdent(value: string): string;

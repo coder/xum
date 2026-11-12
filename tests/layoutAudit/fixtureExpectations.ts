@@ -91,6 +91,17 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   // Two opaque panels meet over the text, 60% and 40% of the box: each is under the share that one
   // cover must hold, together they hide all of it.
   "cover-in-two-panels": everyWidth(found("overlapping-text", "p#totals")),
+  // The only text with something to cover sits below the visible part of a 120 px panel, which
+  // the page loads scrolled by 40 px. Only a scroll of the panel reaches it, and the audit puts
+  // the panel back where it found it.
+  "covered-in-scroll-panel": everyWidth(found("overlapping-text", "p#late-notice")),
+  // The same kind of panel with five rows, two of them in view. An opaque block fills the space
+  // below the panel, where the scrolled-out rows are laid out: they are not covered, only out of
+  // sight, and scrolling the panel shows them.
+  "scrolled-out-text-clean": CLEAN,
+  // The window cannot scroll (the root clips): the content area does, and the cover sits below its
+  // first screen. Only a scroll of that area reaches it.
+  "covered-in-app-shell-scroller": everyWidth(found("overlapping-text", "p#payment-failed")),
   "occlusion-exclusions-clean": CLEAN,
   "real-animated-entry": CLEAN,
   "real-carousel": CLEAN,
