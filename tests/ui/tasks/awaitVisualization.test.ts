@@ -104,6 +104,20 @@ describe("task_await executing visualization", () => {
       await setupWorkspaceView(view, createResult.metadata, workspaceId);
       await waitForWorkspaceChatToRender(view.container);
 
+      // Compact density names the running wait on the turn's work line; its row is behind it.
+      const workLine = await waitFor(
+        () => {
+          const node = view?.queryByTestId("work-bundle");
+          if (!node) {
+            throw new Error("The turn's work line has not rendered yet");
+          }
+          return node;
+        },
+        { timeout: 30_000 }
+      );
+      expect(workLine.textContent).toContain("Waiting for sub-agents");
+      workLine.click();
+
       const taskAwaitSummary = await waitFor(
         () => {
           const node = view?.queryByLabelText("Waiting for 2 tasks. Show task wait details");
