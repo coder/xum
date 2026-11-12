@@ -43,6 +43,20 @@ test("a read-only agent is flagged, and so is whether the mapped tools keep its 
   });
 });
 
+test("an agent whose description is over the cap is listed with it cut, as discovery loads it", async () => {
+  using dir = new DisposableTempDir("agent-files-long-description");
+  await fs.writeFile(
+    path.join(dir.path, "wordy.md"),
+    `---\nname: Wordy\ndescription: ${"w".repeat(2000)}\n---\nBody\n`,
+    "utf-8"
+  );
+
+  const agents = await listPluginAgentFiles(dir.path);
+
+  expect(agents.map((agent) => agent.file)).toEqual(["wordy.md"]);
+  expect((agents[0]?.frontmatter as { description?: string }).description).toBe("w".repeat(1024));
+});
+
 test("a file of exactly the size cap is listed, and one byte more is skipped", async () => {
   using dir = new DisposableTempDir("agent-files-size-cap");
   const head = "---\ndescription: d\n---\n";

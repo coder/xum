@@ -32,6 +32,16 @@ export function firstNonEmptyLine(text: string): string | undefined {
     .find((line) => line.length > 0);
 }
 
+/**
+ * `text` cut to at most `cap` UTF-16 units, the unit Zod's `.max()` counts. A cut that would end
+ * on the first half of a surrogate pair drops that half, so the text stays well formed.
+ */
+export function cutToCap(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  const cut = text.slice(0, cap);
+  return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+
 /** Format Zod validation issues into a semicolon-delimited summary string. */
 export function formatZodIssues(
   issues: ReadonlyArray<{ path: readonly PropertyKey[]; message: string }>

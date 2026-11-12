@@ -643,6 +643,38 @@ describe("agentDefinitionsService", () => {
     expect(pkg.frontmatter.name).toBe("Foo (project)");
   });
 
+  // Claude Code loads an agent whatever its description's length, so a long one is cut, not dropped.
+  test("a project agent with a description over the cap is listed and read with it cut", async () => {
+    using project = new DisposableTempDir("agent-defs-long-description");
+    using global = new DisposableTempDir("agent-defs-long-description-global");
+    const projectAgentsRoot = path.join(project.path, ".mux", "agents");
+    const description = Array.from({ length: 1500 }, (_, i) =>
+      String.fromCharCode(97 + (i % 26))
+    ).join("");
+    await fs.mkdir(projectAgentsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(projectAgentsRoot, "wordy.md"),
+      `---\nname: Wordy\ndescription: ${description}\nbase: exec\n---\nBody\n`,
+      "utf-8"
+    );
+
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: global.path };
+    const runtime = new LocalRuntime(project.path);
+
+    const listed = await discoverAgentDefinitions(runtime, project.path, { roots, runtimeFactory });
+    const wordy = listed.find((agent) => agent.id === "wordy");
+    expect(wordy?.description).toHaveLength(1024);
+    expect(description.startsWith(wordy?.description ?? "")).toBe(true);
+
+    const frontmatter = await resolveAgentFrontmatter(
+      runtime,
+      project.path,
+      AgentIdSchema.parse("wordy"),
+      { roots, runtimeFactory }
+    );
+    expect(frontmatter.description).toBe(wordy?.description);
+  });
+
   // A sandboxed command can replace a project agent file with a link to a file its sandbox hides,
   // and the definition goes into the prompt.
   test("skips a project agent that links to a file the agent sandbox hides", async () => {
@@ -1904,6 +1936,46 @@ base: a
       });
       expect(pkg.scope).toBe("project");
       expect(pkg.frontmatter.name).toBe("Helper (plugin)");
+    });
+
+    // The install review and discovery must cut alike: a review that dropped the agent, or kept the
+    // whole description, would leave a loadable agent unreviewed (not-reviewed) or unlisted.
+    test("a reviewed Claude Code plugin agent with a description over the cap loads with it cut", async () => {
+      using home = new DisposableTempDir("agent-defs-plugin-long-description");
+      const pluginsRoot = path.join(home.path, "plugins");
+      await writePluginWithAgent(pluginsRoot, "managed", "helper", "unused");
+      const pluginDir = path.join(pluginsRoot, "managed");
+      const description = "d".repeat(1500);
+      await fs.writeFile(
+        path.join(pluginDir, "agents", "helper.md"),
+        `---\nname: Helper\ndescription: ${description}\n---\nBody\n`,
+        "utf-8"
+      );
+      const consent = await reviewedComponentConsent({ pluginDir });
+      expect(Object.keys(consent.agents)).toEqual(["helper"]);
+      await fs.writeFile(
+        path.join(home.path, "plugins.json"),
+        JSON.stringify({
+          plugins: [
+            createTestPluginInstallEntry("managed", { skills: [], mcpServers: [] }, consent),
+          ],
+        })
+      );
+      const roots = {
+        projectRoots: [],
+        globalRoot: path.join(home.path, "agents"),
+        globalPluginRoots: [pluginsRoot],
+      };
+      const runtime = new LocalRuntime(home.path);
+
+      const listed = await discoverAgentDefinitions(runtime, home.path, { roots, runtimeFactory });
+      expect(listed.find((agent) => agent.id === "helper")?.description).toBe("d".repeat(1024));
+
+      const pkg = await readAgentDefinition(runtime, home.path, AgentIdSchema.parse("helper"), {
+        roots,
+        runtimeFactory,
+      });
+      expect(pkg.frontmatter.description).toBe("d".repeat(1024));
     });
 
     describe("plugin folder placeholder and spawn refusals (plugin install methods RFC, A2 and A4)", () => {

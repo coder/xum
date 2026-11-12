@@ -35,6 +35,105 @@ console.log(JSON.stringify(calls.map(([name, ...args]) => guards[name](...args))
   return JSON.parse(child.stdout.toString());
 }
 
+// The timing rows in this file compare CPU time, not wall-clock time. Wall-clock time also counts
+// the time other processes keep the CPU from this one, so a loaded host, or a second test run on
+// the same CPU, stretched a 66 ms scan past its 100 ms budget, and the mutation gate dropped the
+// whole file at its baseline. CPU time is the process's own, and it stayed within 7% when two runs
+// shared one CPU. A budget alone is not enough: the slowest linear scan takes about 90 ms, so a
+// budget low enough to catch a regression on the faster ones would fail it. Each row therefore
+// also runs its text at a half, a quarter and an eighth of its size, and checks how the cost per
+// character grows from each size to the next.
+//
+// A smaller text must keep the shape of the row. A slice of the text drops what the row ends with
+// (a quote after a backslash run, a trailing space that ends a run before the window's end, a dot
+// and the payload after it), so the cost of a regression that needs that ending shows at the full
+// size only and the growth check is blind to it. Every row therefore builds its text at each size
+// (`TextAt`, `repeated`), and no row is cut by a slice.
+//
+// One ratio against the first eighth does not work. Bun 1.4 runs a regex about 70 times cheaper
+// per character on a text shorter than some length (near 65,000 characters for the cookie rows,
+// near 35,000 for the escaped runs), so the eighth of a long text looks cheap and the whole text
+// 3 to 28 times costlier per character, with no quadratic scan involved: CI failed two rows on it
+// at 3.6 and 3.2. That jump sits at one size, so it hits one of the three doublings. A quadratic
+// scan hits all three, so the median of the three growths tells the two apart. The floor below
+// means a quadratic cost under about 13 ms at the full size passes unseen, and so does a cost that
+// grows at one doubling only, up to the ceiling.
+const SCAN_SIZE_DIVISORS = [8, 4, 2, 1];
+// Past this, a scan fails whatever its growth: the slowest linear scan takes about a third of it,
+// and the regressions this guards cost seconds.
+const SCAN_CPU_CEILING_MS = 300;
+// How much the cost per character grows when the text doubles: 1 for a linear scan (1.40 at most
+// over 780 measurements on Bun 1.4.3, 1.36 over 720 on Bun 1.3.14), 2 for a quadratic one.
+const SCAN_GROWTH_PER_DOUBLING_LIMIT = 1.6;
+// A cut that costs less than this is mostly timer and allocation noise. Bun 1.4 measured growths
+// up to 1.9 on linear scans with no floor, and up to 1.65 with a floor of 0.25.
+const SCAN_CPU_FLOOR_MS = 1;
+// Bun's default per-test timeout is 5 s of wall-clock time, and a row times CPU, so it must not be
+// the limit: a loaded host stretched the slowest rows to 4.8 s with four copies of this file on
+// one CPU. The ceiling and the growth limit are what fail a row.
+const SCAN_TEST_TIMEOUT_MS = 30_000;
+
+function cpuMilliseconds(run: () => void): number {
+  const before = process.cpuUsage();
+  run();
+  const used = process.cpuUsage(before);
+  return (used.user + used.system) / 1000;
+}
+
+/**
+ * The least CPU time of up to `runs` runs. One run can be slow for no fault of the scan: a 50 ms
+ * scan once measured 350 ms (the process's CPU time counts all its threads). So the runs stop
+ * early only when the first two are both past the ceiling, which a quadratic scan does every
+ * time, and a failing test does not repeat for long.
+ */
+function bestCpuMilliseconds(run: () => void, runs: number): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let attempt = 0; attempt < runs; attempt++) {
+    const cpuMs = cpuMilliseconds(run);
+    best = Math.min(best, cpuMs);
+    if (attempt >= 1 && best >= SCAN_CPU_CEILING_MS) break;
+  }
+  return best;
+}
+
+/** A row's text at a fraction of its full size (1 is the full text), in the row's own shape. */
+type TextAt = (fraction: number) => string;
+
+/** `head`, `count` repeats of `unit` and then `tail`, at a fraction of the repeats. */
+const repeated =
+  (unit: string, count: number, ends: { head?: string; tail?: string } = {}): TextAt =>
+  (fraction) =>
+    `${ends.head ?? ""}${unit.repeat(Math.round(count * fraction))}${ends.tail ?? ""}`;
+
+/** The CPU time of the whole text, and the median growth of the cost per character per doubling. */
+function measureScan(
+  scan: (text: string) => unknown,
+  textAt: TextAt
+): { fullMs: number; growth: number } {
+  const parts = SCAN_SIZE_DIVISORS.map((divisor) => textAt(1 / divisor));
+  const timesMs = parts.map((part, i) => {
+    scan(part);
+    return bestCpuMilliseconds(() => scan(part), SCAN_SIZE_DIVISORS[i] >= 4 ? 5 : 3);
+  });
+  // Each size is about twice the one before, and the cost per character grew by this much.
+  const growths = timesMs
+    .slice(1)
+    .map(
+      (next, i) =>
+        next / parts[i + 1].length / (Math.max(timesMs[i], SCAN_CPU_FLOOR_MS) / parts[i].length)
+    )
+    .sort((a, b) => a - b);
+  // Four sizes give three growths, so the middle one is the median.
+  return { fullMs: timesMs[timesMs.length - 1], growth: growths[Math.floor(growths.length / 2)] };
+}
+
+/** Fails when `scan` costs 300 ms or more on the text, or more than linear time as it grows. */
+function expectLinearScan(scan: (text: string) => unknown, textAt: TextAt): void {
+  const { fullMs, growth } = measureScan(scan, textAt);
+  expect(fullMs).toBeLessThan(SCAN_CPU_CEILING_MS);
+  expect(growth).toBeLessThan(SCAN_GROWTH_PER_DOUBLING_LIMIT);
+}
+
 describe("redactSecretLike", () => {
   const FAKE = {
     github: `gho_${"Q7w3".repeat(9)}`,
@@ -1797,17 +1896,22 @@ describe("redactSecretLike", () => {
       expect(addsSecretLike(nested, nested)).toBe(false);
     });
 
-    it("reads keys nested in one tail of 100 KiB in linear time", () => {
-      const text = `${"password=[redacted]".repeat(5_400)}x`;
-      expect(text.length).toBeGreaterThan(100_000);
-      containsSecretLike("warm up password=[redacted]x"); // keep a cold regex compile out of the timing
-      const started = performance.now();
-      const refused = containsSecretLike(text);
-      const added = addsSecretLike("", text);
-      // A rescan of the tail from each key takes seconds here. The budget is generous for a loaded host.
-      expect(performance.now() - started).toBeLessThan(1_000);
-      expect([refused, added]).toEqual([true, true]);
-    });
+    it(
+      "reads keys nested in one tail of 100 KiB in linear time",
+      () => {
+        const nested = repeated("password=[redacted]", 5_400, { tail: "x" });
+        const text = nested(1);
+        expect(text.length).toBeGreaterThan(100_000);
+        expect([containsSecretLike(text), addsSecretLike("", text)]).toEqual([true, true]);
+        containsSecretLike("warm up password=[redacted]x"); // keep a cold regex compile out of the timing
+        // A rescan of the tail from each key takes seconds here.
+        expectLinearScan((window) => {
+          containsSecretLike(window);
+          addsSecretLike("", window);
+        }, nested);
+      },
+      SCAN_TEST_TIMEOUT_MS
+    );
   });
 
   it("keeps the userinfo's host readable", () => {
@@ -1820,105 +1924,130 @@ describe("redactSecretLike", () => {
   // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
   // JWT segment rescan to the end of the text from every occurrence (seconds per input).
   it.each([
-    ["token", "token".repeat(20_000)],
-    ["secret-", "secret-".repeat(14_000)],
-    ["authorization", "authorization".repeat(7_700)],
-    ["credential_", "credential_".repeat(9_000)],
-    ["api_key", "api_key".repeat(14_000)],
-    ["a JWT header after a dash", "eyJ-".repeat(25_000)],
-    ["a bare bracket assignment", 'password"]'.repeat(10_000)],
-    ["URL schemes with a short userinfo", "://a:".repeat(25_000)],
-    ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
-    ["account_key", "account_key".repeat(9_000)],
-    ["SharedAccessKey", "SharedAccessKey".repeat(6_600)],
-    ["shared_access_key_", "shared_access_key_".repeat(5_600)],
-    ["SharedAccessKeyName", "SharedAccessKeyName".repeat(5_200)],
-    ["bearer", "bearer".repeat(16_000)],
-    ["a PGP key header", "-----BEGIN PGP PRIVATE KEY BLOCK-----".repeat(3_000)],
-    ["a quoted value of backslashes", `token:"${"\\".repeat(100_000)}`],
-    ["a quoted value of escaped quotes", `token:"${'\\"'.repeat(50_000)}`],
+    ["token", repeated("token", 20_000)],
+    ["secret-", repeated("secret-", 14_000)],
+    ["authorization", repeated("authorization", 7_700)],
+    ["credential_", repeated("credential_", 9_000)],
+    ["api_key", repeated("api_key", 14_000)],
+    ["a JWT header after a dash", repeated("eyJ-", 25_000)],
+    ["a bare bracket assignment", repeated('password"]', 10_000)],
+    ["URL schemes with a short userinfo", repeated("://a:", 25_000)],
+    ["a keyword followed by whitespace", repeated(" ", 100_000, { head: "token", tail: "x" })],
+    ["account_key", repeated("account_key", 9_000)],
+    ["SharedAccessKey", repeated("SharedAccessKey", 6_600)],
+    ["shared_access_key_", repeated("shared_access_key_", 5_600)],
+    ["SharedAccessKeyName", repeated("SharedAccessKeyName", 5_200)],
+    ["bearer", repeated("bearer", 16_000)],
+    ["a PGP key header", repeated("-----BEGIN PGP PRIVATE KEY BLOCK-----", 3_000)],
+    ["a quoted value of backslashes", repeated("\\", 100_000, { head: 'token:"' })],
+    ["a quoted value of escaped quotes", repeated('\\"', 50_000, { head: 'token:"' })],
+    ["a long backslash run and one letter", repeated("\\", 100_000, { tail: "x" })],
     [
       "an escaped quoted value of backslash runs",
-      String.raw`token:\"` + String.raw`\\\"`.repeat(25_000),
+      repeated(String.raw`\\\"`, 25_000, { head: String.raw`token:\"` }),
     ],
-    ["a quoted value that ends in a backslash run", `token:"a${"\\".repeat(100_000)}`],
-    ["many opening quotes", 'token:"a'.repeat(12_000)],
-    ["a key followed by a long backslash run", `token${"\\".repeat(100_000)}"`],
-    ["a value opened by a long backslash run", `token:${"\\".repeat(100_000)}"a`],
+    ["a quoted value that ends in a backslash run", repeated("\\", 100_000, { head: 'token:"a' })],
+    ["many opening quotes", repeated('token:"a', 12_000)],
+    [
+      "a key followed by a long backslash run",
+      repeated("\\", 100_000, { head: "token", tail: '"' }),
+    ],
+    [
+      "a value opened by a long backslash run",
+      repeated("\\", 100_000, { head: "token:", tail: '"a' }),
+    ],
     [
       "a deep value of one long backslash run",
-      `token:${"\\".repeat(31)}"a${"\\".repeat(100_000)}"`,
+      repeated("\\", 100_000, { head: `token:${"\\".repeat(31)}"a`, tail: '"' }),
     ],
     [
       "a deep value of runs as long as its opener",
-      `token:${"\\".repeat(31)}"${`${"\\".repeat(31)}x`.repeat(3_000)}`,
+      repeated(`${"\\".repeat(31)}x`, 3_000, { head: `token:${"\\".repeat(31)}"` }),
     ],
     [
       "a deep value of runs just short of a doubled close",
-      `token:${"\\".repeat(31)}"${`${"\\".repeat(62)}x`.repeat(1_500)}`,
+      repeated(`${"\\".repeat(62)}x`, 1_500, { head: `token:${"\\".repeat(31)}"` }),
     ],
-    ["many deep openers", `token:${"\\".repeat(31)}"a`.repeat(2_500)],
-    ["many deep keys", `token${"\\".repeat(31)}"`.repeat(2_800)],
-    ["a signature parameter with a long value", `?sig=${"a".repeat(100_000)}`],
-    ["signature parameters with no value", "?sig=&signature=".repeat(20_000)],
-    ["a signature name with no equals sign", "&X-Amz-Signature".repeat(20_000)],
-    ["stacked signature prefixes", "?&amp;sig=".repeat(20_000)],
-    ["a cookie name with no colon", "Cookie".repeat(20_000)],
-    ["a cookie name and gap with no colon", `Set-Cookie${" ".repeat(100_000)}x`],
-    ["cookie names with a colon and no value", "Cookie:".repeat(20_000)],
-    ["cookie headers on one line", "Set-Cookie: a=b; ".repeat(10_000)],
-    ["a cookie value of backslashes", `Cookie: ${"\\".repeat(100_000)}x`],
-    ["a cookie value of escaped quotes", `Cookie: "${'\\"'.repeat(50_000)}`],
-    ["a cookie key followed by a long backslash run", `cookie${"\\".repeat(100_000)}"x`],
-    ["many cookie keys with a long backslash run", `cookie${"\\".repeat(31)}"`.repeat(2_800)],
-    ["cookie array openers with no close", `Cookie:[`.repeat(25_000)],
-    ["cookie names after escaped line breaks", String.raw`\nCookie`.repeat(15_000)],
-    ["a cookie colon and a long gap with no value", `Cookie:${" ".repeat(100_000)}`],
-    ["cookie colons and a gap with no value, line after line", "Cookie: \n".repeat(15_000)],
+    ["many deep openers", repeated(`token:${"\\".repeat(31)}"a`, 2_500)],
+    ["many deep keys", repeated(`token${"\\".repeat(31)}"`, 2_800)],
+    ["a signature parameter with a long value", repeated("a", 100_000, { head: "?sig=" })],
+    ["signature parameters with no value", repeated("?sig=&signature=", 20_000)],
+    ["a signature name with no equals sign", repeated("&X-Amz-Signature", 20_000)],
+    ["stacked signature prefixes", repeated("?&amp;sig=", 20_000)],
+    ["a cookie name with no colon", repeated("Cookie", 20_000)],
+    [
+      "a cookie name and gap with no colon",
+      repeated(" ", 100_000, { head: "Set-Cookie", tail: "x" }),
+    ],
+    ["cookie names with a colon and no value", repeated("Cookie:", 20_000)],
+    ["cookie headers on one line", repeated("Set-Cookie: a=b; ", 10_000)],
+    ["a cookie value of backslashes", repeated("\\", 100_000, { head: "Cookie: ", tail: "x" })],
+    ["a cookie value of escaped quotes", repeated('\\"', 50_000, { head: 'Cookie: "' })],
+    [
+      "a cookie key followed by a long backslash run",
+      repeated("\\", 100_000, { head: "cookie", tail: '"x' }),
+    ],
+    ["many cookie keys with a long backslash run", repeated(`cookie${"\\".repeat(31)}"`, 2_800)],
+    ["cookie array openers with no close", repeated("Cookie:[", 25_000)],
+    ["cookie names after escaped line breaks", repeated(String.raw`\nCookie`, 15_000)],
+    ["a cookie colon and a long gap with no value", repeated(" ", 100_000, { head: "Cookie:" })],
+    ["cookie colons and a gap with no value, line after line", repeated("Cookie: \n", 15_000)],
     [
       "cookie names behind an indent that is no line start",
-      `${" ".repeat(16)}Cookie`.repeat(5_900),
+      repeated(`${" ".repeat(16)}Cookie`, 5_900),
     ],
-    ["cookie names behind an indent and a marker", `\n${" ".repeat(16)}> Cookie`.repeat(5_000)],
-    ["cookie values that open with a redacted marker", 'Cookie: "[redacted]\n'.repeat(7_000)],
+    ["cookie names behind an indent and a marker", repeated(`\n${" ".repeat(16)}> Cookie`, 5_000)],
+    ["cookie values that open with a redacted marker", repeated('Cookie: "[redacted]\n', 7_000)],
     [
       "cookie values that open with a long gap and a marker",
-      `Cookie:${" ".repeat(40)}[redacted]\n`.repeat(2_500),
+      repeated(`Cookie:${" ".repeat(40)}[redacted]\n`, 2_500),
     ],
-    ["cookie names behind quotes and commas", `,Cookie`.repeat(14_000)],
-    ["unclosed quoted cookie list items", 'Cookie:["'.repeat(14_000)],
-    ["quoted cookie keys each followed by a value", '"cookie":"a"'.repeat(10_000)],
+    ["cookie names behind quotes and commas", repeated(",Cookie", 14_000)],
+    ["unclosed quoted cookie list items", repeated('Cookie:["', 14_000)],
+    ["quoted cookie keys each followed by a value", repeated('"cookie":"a"', 10_000)],
     [
       "cookie names behind escaped breaks of long runs",
-      `\\n${"\\".repeat(31)}nCookie`.repeat(2_500),
+      repeated(`\\n${"\\".repeat(31)}nCookie`, 2_500),
     ],
-    ["nested cookie list openers", `${"Cookie: [".repeat(10_000)}]`],
-    ["a key and a run of markers", `token=${"[redacted]".repeat(5_000)}x`],
-    ["a key and markers each with a tail", `token=${"[redacted]x".repeat(5_000)}`],
-    ["keys that each hold a marker and a tail", "token=[redacted]x ".repeat(4_000)],
-    ["a key and a marker followed by brackets", `token=[redacted]${"]x".repeat(10_000)}`],
-    ["a signature and a run of markers", `?sig=${"[redacted]]".repeat(5_000)}x`],
-    ["keys and half markers", "token=[redacted".repeat(10_000)],
+    ["nested cookie list openers", repeated("Cookie: [", 10_000, { tail: "]" })],
+    ["a key and a run of markers", repeated("[redacted]", 5_000, { head: "token=", tail: "x" })],
+    ["a key and markers each with a tail", repeated("[redacted]x", 5_000, { head: "token=" })],
+    ["keys that each hold a marker and a tail", repeated("token=[redacted]x ", 4_000)],
+    [
+      "a key and a marker followed by brackets",
+      repeated("]x", 50_000, { head: "token=[redacted]" }),
+    ],
+    [
+      "a signature and a run of markers",
+      repeated("[redacted]]", 5_000, { head: "?sig=", tail: "x" }),
+    ],
+    ["keys and half markers", repeated("token=[redacted", 10_000)],
     [
       "a marker and a tail of 100 KiB of full-width punctuation",
-      `token=[redacted]${"。".repeat(100 * 1024)}秘`,
+      repeated("。", 100 * 1024, { head: "token=[redacted]", tail: "秘" }),
     ],
-    ["a marker and a tail of 50 Ki astral letters", `password=[redacted]${"𝒜".repeat(50 * 1024)}`],
-  ])("scans %s in linear time", (_label, text) => {
-    redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
-    // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
-    // and with the cookie rule a pass costs about half of it, so one budget for both flaked.
-    for (const scan of [redactSecretLike, containsSecretLike]) {
-      const started = performance.now();
-      scan(text);
-      expect(performance.now() - started).toBeLessThan(100);
-    }
-  });
+    [
+      "a marker and a tail of 50 Ki astral letters",
+      repeated("𝒜", 50 * 1024, { head: "password=[redacted]" }),
+    ],
+  ])(
+    "scans %s in linear time",
+    (_label, textAt) => {
+      redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
+      // Each scan gets its own checks: `containsSecretLike` is a second pass of the same redaction.
+      for (const scan of [redactSecretLike, containsSecretLike]) expectLinearScan(scan, textAt);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
 });
 
 describe("redactWithinCap", () => {
   const CAP = 100;
   const KEY = `ghp_${"a1B2".repeat(5)}`;
+
+  /** A scan that cuts a window `tail` characters before its end. */
+  const cutBefore = (tail: number) => (window: string) =>
+    redactWithinCap(window, window.length - tail, { cut: true });
 
   it("cuts text without a secret where redaction alone would, and reads the lookahead for none", () => {
     const text = "lorem ".repeat(300);
@@ -2088,32 +2217,51 @@ describe("redactWithinCap", () => {
   // JWT character comes before, so it reads the run once. Tried at every start it is quadratic:
   // with no anchor, with a `\b` anchor (a dash before each start passes it), or with an anchor
   // class that lacks the character before each start. That takes several seconds at these sizes,
-  // against well under 100 ms. The budget is generous because a loaded test host slows every row.
+  // against a few milliseconds. A row fails at 300 ms of CPU or when the cost per character grows
+  // with the window (see `measureScan`), so a loaded test host does not fail it.
   it.each([
-    ["JWT starts", `${"eyJ".repeat(30_000)} `],
-    ["JWT starts with a dash after each", `${"eyJ-".repeat(32_000)} `],
-    ["JWT starts with an underscore after each", `${"eyJ_".repeat(32_000)} `],
-  ])("cuts a window of %s that miss its end in linear time", (_label, text) => {
-    // Keep a cold regex compile out of the timing.
-    redactWithinCap("warm up eyJabc.def", 10, { cut: true });
-    const started = performance.now();
-    redactWithinCap(text, text.length - REDACTION_LOOKAHEAD_CHARS, { cut: true });
-    expect(performance.now() - started).toBeLessThan(1_500);
-  });
+    ["JWT starts", repeated("eyJ", 30_000, { tail: " " })],
+    ["JWT starts with a dash after each", repeated("eyJ-", 32_000, { tail: " " })],
+    ["JWT starts with an underscore after each", repeated("eyJ_", 32_000, { tail: " " })],
+  ])(
+    "cuts a window of %s that miss its end in linear time",
+    (_label, textAt) => {
+      // Keep a cold regex compile out of the timing.
+      redactWithinCap("warm up eyJabc.def", 10, { cut: true });
+      expectLinearScan(cutBefore(REDACTION_LOOKAHEAD_CHARS), textAt);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
 
   // The cut reads the redacted window once more. Its cost must not grow faster than the window: a
   // quadratic scan of these shapes takes seconds at this size.
+  //
+  // The third item is the cap at the full size: about 1,000 characters before the window's end
+  // (29,000 of about 30,000), and the cap stays that far from the end at every size of the window.
+  // The row of one long header and one long payload is four times as long as the others (60,000
+  // characters in each part, the cap at 119,000 of 120,006). A payload pattern that backtracks then
+  // costs seconds, and the 300 ms ceiling catches it on every run. At 15,000 characters in each
+  // part it cost 190 to 290 ms, and the growth check caught it in 18 of 20 runs only.
   it.each([
-    ["dots between JWT starts", "eyJ.".repeat(7_500)],
-    ["JWT starts with a dot after each", "eyJabc.".repeat(4_300)],
-    ["one long header and one long payload", `eyJ${"a".repeat(15_000)}.${"b".repeat(15_000)} x`],
-    ["many long parts", `eyJ${"a".repeat(1_000)}.`.repeat(30)],
-  ])("cuts the window of %s in linear time", (_label, text) => {
-    redactWithinCap("warm up eyJabc.def", 10, { cut: true }); // keep a cold regex compile out of the timing
-    const started = performance.now();
-    redactWithinCap(text, 29_000, { cut: true });
-    expect(performance.now() - started).toBeLessThan(100);
-  });
+    ["dots between JWT starts", repeated("eyJ.", 7_500), 29_000],
+    ["JWT starts with a dot after each", repeated("eyJabc.", 4_300), 29_000],
+    [
+      "one long header and one long payload",
+      (fraction: number) => {
+        const part = Math.round(60_000 * fraction);
+        return `eyJ${"a".repeat(part)}.${"b".repeat(part)} x`;
+      },
+      119_000,
+    ],
+    ["many long parts", repeated(`eyJ${"a".repeat(1_000)}.`, 30), 29_000],
+  ])(
+    "cuts the window of %s in linear time",
+    (_label, textAt, cap) => {
+      redactWithinCap("warm up eyJabc.def", 10, { cut: true }); // keep a cold regex compile out of the timing
+      expectLinearScan(cutBefore(textAt(1).length - cap), textAt);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
 });
 
 describe("containsSecretLike", () => {
