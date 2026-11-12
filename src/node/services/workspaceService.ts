@@ -11753,11 +11753,10 @@ export class WorkspaceService
     if (await this.hasRunningBackgroundBashProcesses(workspaceId)) {
       labels.push("running background bash processes");
     }
-    if (
-      hasInProcessWorkflowWork(workspaceId) ||
-      (await this.agentTaskIntegration?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId)) ===
-        true
-    ) {
+    const integration = this.agentTaskIntegration;
+    // mutation-equivalent: a cascade has sub-agents only when the task integration is set
+    const durable = await integration?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId);
+    if (hasInProcessWorkflowWork(workspaceId) || durable === true) {
       labels.push("a workflow run starting or running");
     }
     return labels;
@@ -11765,8 +11764,8 @@ export class WorkspaceService
 
   /**
    * The sink's refusals for a cascaded sub-agent that do not depend on a race: live activity
-   * (including workflow runs) that archiving would terminate, and a native terminal or external editor whose lifetime cannot be
-   * tracked while the archive removes the checkout.
+   * (including workflow runs) that archiving would terminate, and a native terminal or external
+   * editor whose lifetime cannot be tracked while the archive removes the checkout.
    */
   private async refuseBusyCascadeSubagent(
     descendant: WorkspaceRemovalDescendant,
