@@ -182,6 +182,147 @@ const HISTORY_REPLACEMENT_UNAVAILABLE_MESSAGE =
  */
 const latestPlanContentCache = new Map<string, { content: string; path: string }>();
 
+/** The strip above a plan's body: its title, and the mode the card is in. */
+function PlanTitleStrip(props: {
+  planTitle: string;
+  annotateMode: boolean;
+  isEphemeralPreview: boolean | undefined;
+}): JSX.Element {
+  return (
+    <ToolChrome className="plan-divider mb-3 flex items-center gap-2 border-b pb-2">
+      <ClipboardList aria-hidden="true" className="h-4 w-4" />
+      <div className="text-plan-mode font-mono text-[13px] font-semibold">{props.planTitle}</div>
+      {props.annotateMode && (
+        <div className="bg-accent/10 text-accent-text rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
+          Annotating
+        </div>
+      )}
+      {props.isEphemeralPreview && (
+        <div className="text-muted font-mono text-[10px] italic">preview only</div>
+      )}
+    </ToolChrome>
+  );
+}
+
+/** A plan's text as written (the "Show Text" view), with a copy button in its corner. */
+function RawPlanText(props: {
+  planContent: string;
+  copied: boolean;
+  onCopy: () => void;
+}): JSX.Element {
+  return (
+    <div className="relative">
+      <pre className="text-text bg-code-bg m-0 rounded-sm p-2 pb-8 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap">
+        {props.planContent}
+      </pre>
+      <div className="absolute right-2 bottom-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-6 px-2 text-[11px] [&_svg]:size-3.5"
+          onClick={props.onCopy}
+        >
+          {props.copied ? <ClipboardCheck /> : <Clipboard />}
+          {props.copied ? "Copied" : "Copy to clipboard"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** One primary plan action on a wide layout: a labelled button whose tooltip names the shortcut. */
+function PlanActionTextButton(props: { button: ButtonConfig }): JSX.Element {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-7 gap-1"
+          onClick={props.button.onClick}
+          disabled={props.button.disabled}
+        >
+          {props.button.icon}
+          <span className="leading-none">{props.button.label}</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent align="center">
+        {props.button.tooltip ?? props.button.label}
+        {/* Wide layout only, so the hint never shows on mobile widths. */}
+        {!props.button.disabled && ` (${formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION)})`}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * The plan's primary actions (Implement, Continue in Auto), right-aligned in the actions row:
+ * icons on a narrow screen, labelled buttons otherwise, and nothing when the plan has neither.
+ */
+function PlanPrimaryActions(props: {
+  implementButton: ButtonConfig | null;
+  autoButton: ButtonConfig | null;
+  isNarrowScreen: boolean;
+}): JSX.Element | null {
+  if (!(props.implementButton ?? props.autoButton)) {
+    return null;
+  }
+  if (props.isNarrowScreen) {
+    // Mobile: icon-only plan actions, right-aligned, white
+    return (
+      <div className="[&_button]:text-foreground ml-auto flex items-center gap-0.5">
+        {props.implementButton && <IconActionButton button={props.implementButton} />}
+        {props.autoButton && <IconActionButton button={props.autoButton} />}
+      </div>
+    );
+  }
+  return (
+    <div className="ml-auto flex items-center gap-1">
+      {props.implementButton && <PlanActionTextButton button={props.implementButton} />}
+      {props.autoButton && <PlanActionTextButton button={props.autoButton} />}
+    </div>
+  );
+}
+
+/** The tool-call row of a plan: the disclosure button (with the title while folded) and the status. */
+function PlanToolHeader(props: {
+  expanded: boolean;
+  onToggle: () => void;
+  planTitle: string;
+  status: ToolStatus;
+}): JSX.Element {
+  return (
+    <ToolHeader className="cursor-default">
+      {/* The disclosure is a real button. An earlier plan folds by itself, and its body is
+          not mounted while folded, so without a focusable control a keyboard user could not
+          read it again (Tab, then Enter or Space). It fills the row, so a click anywhere on
+          the header still toggles. */}
+      <button
+        type="button"
+        aria-expanded={props.expanded}
+        onClick={props.onToggle}
+        className={cn(
+          "flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-sm text-left",
+          "focus-visible:outline-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+        )}
+      >
+        <ExpandIcon expanded={props.expanded} />
+        {/* Set like the work lines around it (prose font): a plan is part of the conversation. */}
+        <ToolName className={FOLDED_ROW_TEXT_CLASS}>Plan</ToolName>
+        {/* A folded plan is its title: the card that carries the title is out of sight. */}
+        {!props.expanded && (
+          <span className={cn("text-text min-w-0 truncate", FOLDED_ROW_TEXT_CLASS)}>
+            {props.planTitle}
+          </span>
+        )}
+      </button>
+      <StatusIndicator status={props.status}>{getStatusDisplay(props.status)}</StatusIndicator>
+    </ToolHeader>
+  );
+}
+
 export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) => {
   const {
     args,
@@ -678,8 +819,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
   };
 
-  const statusDisplay = getStatusDisplay(status);
-
   // Build action buttons array (similar to AssistantMessage)
   const copyButton: ButtonConfig = {
     label: copied ? "Copied" : "Copy",
@@ -874,23 +1013,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       reviewActions={reviewActions}
     />
   ) : showRaw ? (
-    <div className="relative">
-      <pre className="text-text bg-code-bg m-0 rounded-sm p-2 pb-8 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap">
-        {planContent}
-      </pre>
-      <div className="absolute right-2 bottom-2">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="h-6 px-2 text-[11px] [&_svg]:size-3.5"
-          onClick={() => void copyToClipboard(planContent)}
-        >
-          {copied ? <ClipboardCheck /> : <Clipboard />}
-          {copied ? "Copied" : "Copy to clipboard"}
-        </Button>
-      </div>
-    </div>
+    <RawPlanText
+      planContent={planContent}
+      copied={copied}
+      onCopy={() => void copyToClipboard(planContent)}
+    />
   ) : (
     <MarkdownRenderer content={planContent} />
   );
@@ -929,18 +1056,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       {/* Header: title only. A plan whose body opens with that title as its heading already
           shows it one line below, so the strip is kept only when it says something more. */}
       {(!bodyOpensWithTitle || annotateMode || isEphemeralPreview === true) && (
-        <ToolChrome className="plan-divider mb-3 flex items-center gap-2 border-b pb-2">
-          <ClipboardList aria-hidden="true" className="h-4 w-4" />
-          <div className="text-plan-mode font-mono text-[13px] font-semibold">{planTitle}</div>
-          {annotateMode && (
-            <div className="bg-accent/10 text-accent-text rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
-              Annotating
-            </div>
-          )}
-          {isEphemeralPreview && (
-            <div className="text-muted font-mono text-[10px] italic">preview only</div>
-          )}
-        </ToolChrome>
+        <PlanTitleStrip
+          planTitle={planTitle}
+          annotateMode={annotateMode}
+          isEphemeralPreview={isEphemeralPreview}
+        />
       )}
 
       {/* Content */}
@@ -970,63 +1090,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           )}
         </div>
 
-        {/* Mobile: icon-only plan actions, right-aligned, white */}
-        {isNarrowScreen && (implementButton ?? autoButton) && (
-          <div className="[&_button]:text-foreground ml-auto flex items-center gap-0.5">
-            {implementButton && <IconActionButton button={implementButton} />}
-            {autoButton && <IconActionButton button={autoButton} />}
-          </div>
-        )}
-
-        {!isNarrowScreen && (implementButton ?? autoButton) && (
-          <div className="ml-auto flex items-center gap-1">
-            {implementButton && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 gap-1"
-                    onClick={implementButton.onClick}
-                    disabled={implementButton.disabled}
-                  >
-                    {implementButton.icon}
-                    <span className="leading-none">{implementButton.label}</span>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent align="center">
-                  {implementButton.tooltip ?? implementButton.label}
-                  {/* Wide layout only, so the hint never shows on mobile widths. */}
-                  {!implementButton.disabled &&
-                    ` (${formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION)})`}
-                </TooltipContent>
-              </Tooltip>
-            )}
-
-            {autoButton && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 gap-1"
-                    onClick={autoButton.onClick}
-                    disabled={autoButton.disabled}
-                  >
-                    {autoButton.icon}
-                    <span className="leading-none">{autoButton.label}</span>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent align="center">
-                  {autoButton.tooltip ?? autoButton.label}
-                  {!autoButton.disabled && ` (${formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION)})`}
-                </TooltipContent>
-              </Tooltip>
-            )}
-          </div>
-        )}
+        <PlanPrimaryActions
+          implementButton={implementButton}
+          autoButton={autoButton}
+          isNarrowScreen={isNarrowScreen}
+        />
       </ToolChrome>
 
       {planActionError && (implementButton ?? autoButton) && (
@@ -1067,32 +1135,12 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   return (
     <>
       <ToolContainer expanded={expanded}>
-        <ToolHeader className="cursor-default">
-          {/* The disclosure is a real button. An earlier plan folds by itself, and its body is
-              not mounted while folded, so without a focusable control a keyboard user could not
-              read it again (Tab, then Enter or Space). It fills the row, so a click anywhere on
-              the header still toggles. */}
-          <button
-            type="button"
-            aria-expanded={expanded}
-            onClick={toggleExpanded}
-            className={cn(
-              "flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-sm text-left",
-              "focus-visible:outline-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
-            )}
-          >
-            <ExpandIcon expanded={expanded} />
-            {/* Set like the work lines around it (prose font): a plan is part of the conversation. */}
-            <ToolName className={FOLDED_ROW_TEXT_CLASS}>Plan</ToolName>
-            {/* A folded plan is its title: the card that carries the title is out of sight. */}
-            {!expanded && (
-              <span className={cn("text-text min-w-0 truncate", FOLDED_ROW_TEXT_CLASS)}>
-                {planTitle}
-              </span>
-            )}
-          </button>
-          <StatusIndicator status={status}>{statusDisplay}</StatusIndicator>
-        </ToolHeader>
+        <PlanToolHeader
+          expanded={expanded}
+          onToggle={toggleExpanded}
+          planTitle={planTitle}
+          status={status}
+        />
 
         {expanded && <ToolDetails text={errorMessage ?? planContent}>{planLayout}</ToolDetails>}
 

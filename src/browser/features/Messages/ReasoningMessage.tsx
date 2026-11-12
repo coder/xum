@@ -52,6 +52,43 @@ function parseLeadingBoldSummary(
   };
 }
 
+/**
+ * The text of a thought's row: the live shimmer while it streams, then its first line (with a
+ * leading bold title kept bold), or a plain label when the thought has no content.
+ */
+function ReasoningSummaryText(props: {
+  isStreaming: boolean;
+  hasContent: boolean;
+  /** The thought's first line, as the row shows it. */
+  headerLine: string;
+  /** The row is open on a one-line thought: the line wraps instead of being cut. */
+  wraps: boolean;
+}): JSX.Element {
+  if (props.isStreaming) {
+    return (
+      <Shimmer className="thinking-shimmer" colorClass="var(--color-thinking-mode)">
+        Thinking…
+      </Shimmer>
+    );
+  }
+  if (!props.hasContent) {
+    return <>Thought</>;
+  }
+  const parsedLeadingBoldSummary = parseLeadingBoldSummary(props.headerLine);
+  return (
+    <span className={props.wraps ? "break-words" : "whitespace-nowrap"}>
+      {parsedLeadingBoldSummary ? (
+        <>
+          <strong>{parsedLeadingBoldSummary.boldText}</strong>
+          {parsedLeadingBoldSummary.trailingText}
+        </>
+      ) : (
+        props.headerLine
+      )}
+    </span>
+  );
+}
+
 export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
   message,
   className,
@@ -83,7 +120,6 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
   const isCollapsible = hasContent;
   const showsWrappedLine = isExpanded && isSingleLineTrace;
   const headerLine = showsWrappedLine ? summaryLineRaw : summaryLine;
-  const parsedLeadingBoldSummary = parseLeadingBoldSummary(headerLine);
   const showExpandedContent = isExpanded && !isSingleLineTrace;
   // Keep height uncontrolled while a streaming block is expanded so live markdown
   // growth (Shiki/Mermaid) can't be clipped by a stale measured height.
@@ -161,24 +197,12 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
       <span
         className={cn("block min-w-0", !showsWrappedLine && "truncate", REASONING_FONT_CLASSES)}
       >
-        {isStreaming ? (
-          <Shimmer className="thinking-shimmer" colorClass="var(--color-thinking-mode)">
-            Thinking…
-          </Shimmer>
-        ) : hasContent ? (
-          <span className={showsWrappedLine ? "break-words" : "whitespace-nowrap"}>
-            {parsedLeadingBoldSummary ? (
-              <>
-                <strong>{parsedLeadingBoldSummary.boldText}</strong>
-                {parsedLeadingBoldSummary.trailingText}
-              </>
-            ) : (
-              headerLine
-            )}
-          </span>
-        ) : (
-          "Thought"
-        )}
+        <ReasoningSummaryText
+          isStreaming={isStreaming}
+          hasContent={hasContent}
+          headerLine={headerLine}
+          wraps={showsWrappedLine}
+        />
       </span>
     </>
   );

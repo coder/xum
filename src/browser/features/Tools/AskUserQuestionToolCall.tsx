@@ -52,6 +52,8 @@ import {
   useToolExpansion,
   type ToolStatus,
 } from "@/browser/features/Tools/Shared/toolUtils";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import type { DisplayedMessage } from "@/common/types/message";
 import type {
   AskUserQuestionQuestion,
   AskUserQuestionToolArgs,
@@ -127,6 +129,27 @@ function summarizeQuestions(
     question: `${first.question}${more}`,
     answer: given.length > 0 ? given.join(" · ") : null,
   };
+}
+
+/**
+ * The send options a resumed stream uses: the workspace's stored ones, with the overrides of the
+ * last user message when that message asked for a compaction.
+ */
+function getResumeSendOptions(
+  workspaceId: string,
+  messages: readonly DisplayedMessage[] | undefined
+): SendMessageOptions {
+  const sendOptions = getSendOptionsFromStorage(workspaceId);
+  const lastUserMessage = [...(messages ?? [])]
+    .reverse()
+    .find(
+      (message): message is Extract<typeof message, { type: "user" }> => message.type === "user"
+    );
+
+  if (lastUserMessage?.compactionRequest) {
+    return applyCompactionOverrides(sendOptions, lastUserMessage.compactionRequest.parsed);
+  }
+  return sendOptions;
 }
 
 /**
@@ -514,20 +537,7 @@ export function AskUserQuestionToolCall(
 
         // If the stream was interrupted (e.g. app restart), explicitly resume using
         // the latest persisted send options for this workspace.
-        let sendOptions = getSendOptionsFromStorage(workspaceId);
-        const lastUserMessage = [...(workspaceState?.messages ?? [])]
-          .reverse()
-          .find(
-            (message): message is Extract<typeof message, { type: "user" }> =>
-              message.type === "user"
-          );
-
-        if (lastUserMessage?.compactionRequest) {
-          sendOptions = applyCompactionOverrides(
-            sendOptions,
-            lastUserMessage.compactionRequest.parsed
-          );
-        }
+        const sendOptions = getResumeSendOptions(workspaceId, workspaceState?.messages);
 
         const enableResult = await liveApi.workspace.setAutoRetryEnabled?.({
           workspaceId,
