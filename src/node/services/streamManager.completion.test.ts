@@ -91,6 +91,54 @@ describe("StreamManager - exact step indices", () => {
     // The trailing empty step start is not persisted.
     expect(committed?.metadata?.stepStartPartIndices).toEqual([0, 1]);
   });
+
+  test("persists Gemini tool-call thought signatures to chat.jsonl", async () => {
+    // A retry rebuilds the current turn from history, and Gemini rejects its
+    // function calls without their signatures.
+    const call = (toolCallId: string, providerMetadata?: unknown) => ({
+      type: "tool-call",
+      toolCallId,
+      toolName: "bash",
+      input: { script: "pwd" },
+      ...(providerMetadata != null ? { providerMetadata } : {}),
+    });
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: turnStreamTextForTests(() =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield call("coder", {
+              coderGoogle: { thoughtSignature: "sig-coder", extra: "dropped" },
+              openai: { itemId: "dropped" },
+            });
+            yield call("vertex", { vertex: { thoughtSignature: "sig-vertex" } });
+            yield call("plain");
+            for (const toolCallId of ["coder", "vertex", "plain"]) {
+              yield { type: "tool-result", toolCallId, toolName: "bash", output: "/tmp" };
+            }
+            yield { type: "finish", finishReason: "tool-calls" };
+          })()
+        )
+      ),
+    });
+    const workspaceId = "tool-call-signature-workspace";
+    const messageId = "tool-call-signature-message";
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence: 1 });
+
+    const restarted = new HistoryService(historyConfig);
+    const history = await restarted.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const committed = history.data.find((row) => row.id === messageId);
+    expect(
+      committed?.parts.map((part) =>
+        part.type === "dynamic-tool" ? [part.toolCallId, part.providerOptions] : part.type
+      )
+    ).toEqual([
+      ["coder", { coderGoogle: { thoughtSignature: "sig-coder" } }],
+      ["vertex", { googleVertex: { thoughtSignature: "sig-vertex" } }],
+      ["plain", undefined],
+    ]);
+  });
 });
 
 // #7499: StreamRetries.test.ts owns the retry reset; this checks the conditional delete it uses.

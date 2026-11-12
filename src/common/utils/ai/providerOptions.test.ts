@@ -10,6 +10,7 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { createOpenAICachedSystemMessage } from "./cacheStrategy";
 import { describe, test, expect, mock } from "bun:test";
 import * as RealLogModule from "@/node/services/log";
@@ -982,21 +983,25 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
     expect(options).toHaveProperty("anthropic");
   });
 
-  test("canonical model mapped onto a Coder instance builds that instance's wire options", () => {
-    // google-typed instances speak OpenAI chat, which ignores google.thinkingConfig.
+  describe("google-typed instances send Gemini thinking_config, not reasoning_effort", () => {
+    // Gemini's OpenAI compatibility layer emits thoughts only for an explicit
+    // include_thoughts and rejects reasoning_effort alongside thinking_config.
     const config: ProvidersConfigMap = {
       coder: {
         apiKeySet: false,
         isEnabled: true,
         isConfigured: true,
-        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        discoveredProviders: [
+          { name: "agents-google", type: "google" },
+          { name: "gemini-proxy", type: "openai-compat" },
+        ],
         canonicalRoutes: { google: "agents-google" },
       },
     };
-    const build = (modelString: string) =>
+    const build = (modelString: string, thinking: ThinkingLevel): Record<string, unknown> =>
       buildProviderOptions(
         modelString,
-        "high",
+        thinking,
         undefined,
         undefined,
         { openai: { wireFormat: "chatCompletions" } },
@@ -1005,8 +1010,49 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
         config,
         "coder"
       );
-    expect(build("google:gemini-3.8-flash")).toEqual(build("coder:agents-google/gemini-3.8-flash"));
-    expect(build("google:gemini-3.8-flash")).toMatchObject({ openai: { reasoningEffort: "high" } });
+    const thinkingConfig = (value: Record<string, unknown>): Record<string, unknown> => ({
+      coderGoogle: { extra_body: { google: { thinking_config: value } } },
+    });
+
+    const cases: Array<{ model: string; thinking: ThinkingLevel; expected: unknown }> = [
+      {
+        model: "gemini-4-carbon",
+        thinking: "high",
+        expected: thinkingConfig({ include_thoughts: true, thinking_level: "high" }),
+      },
+      {
+        model: "gemini-4-carbon",
+        thinking: "max",
+        expected: thinkingConfig({ include_thoughts: true, thinking_level: "high" }),
+      },
+      {
+        model: "gemini-2.5-pro",
+        thinking: "high",
+        expected: thinkingConfig({ include_thoughts: true, thinking_budget: 16384 }),
+      },
+      { model: "gemini-3-pro", thinking: "off", expected: { coderGoogle: {} } },
+      {
+        model: "gemini-3-flash",
+        thinking: "off",
+        expected: thinkingConfig({ thinking_level: "minimal" }),
+      },
+      {
+        model: "gemini-3.8-flash",
+        thinking: "off",
+        expected: thinkingConfig({ include_thoughts: true, thinking_level: "low" }),
+      },
+    ];
+    test.each(cases)("$model at $thinking", ({ model, thinking, expected }) => {
+      const canonical = build(`google:${model}`, thinking);
+      expect(canonical).toEqual(expected as Record<string, unknown>);
+      expect(build(`coder:agents-google/${model}`, thinking)).toEqual(canonical);
+    });
+
+    test("an openai-compat instance fronting Gemini keeps OpenAI options", () => {
+      expect(build("coder:gemini-proxy/gemini-4-carbon", "high")).toMatchObject({
+        openai: { reasoningEffort: "high" },
+      });
+    });
   });
 
   test("unknown instance names build no options", () => {
@@ -1616,9 +1662,9 @@ describe("buildProviderOptions - OpenAI", () => {
           },
           "coder"
         );
-        const openai = getOpenAIOptions(options);
-        expect(openai).toBeDefined();
-        expect(openai?.serviceTier).toBe(type === "google" ? undefined : "priority");
+        expect(getOpenAIOptions(options)?.serviceTier).toBe(
+          type === "google" ? undefined : "priority"
+        );
       }
     );
 

@@ -15,6 +15,7 @@ import {
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
 import { extractPreActivatedToolNames } from "@/common/utils/tools/toolCatalog";
+import { toolCallReplayNamespaceOf } from "@/node/utils/messages/toolCallReplayMetadata";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
 import { log } from "./log";
@@ -84,6 +85,8 @@ export async function rebuildContinuousPrefix(
     replayReceiptMessages: prepared.activeContextMessages,
     postCompactionAttachments: journal.postCompactionAttachments,
     deferLoadingToolNames: deferred,
+    // The journal keeps the request's options, not its route, so read the namespace off them.
+    toolCallReplayNamespace: toolCallReplayNamespaceOf(journal.requestProviderOptions),
   });
   const prefix = stripMessageCacheControl(messages);
   return [

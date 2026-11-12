@@ -4,6 +4,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { StreamErrorType } from "./errors";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FilePart, MuxToolPartSchema } from "@/common/orpc/schemas";
+import type { CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE } from "@/common/constants/coderOAuth";
 import type {
   ContextBoundaryKind,
   PersistedContextBoundaryKind,
@@ -1300,7 +1301,24 @@ export interface MuxMetadata {
 // Extended tool part type that supports interrupted tool calls (input-available state)
 // Standard AI SDK ToolUIPart only supports output-available (completed tools)
 // Uses discriminated union: output is required when state is "output-available", absent when "input-available"
-export type MuxToolPart = z.infer<typeof MuxToolPartSchema>;
+export type MuxToolPart = z.infer<typeof MuxToolPartSchema> & {
+  /**
+   * Gemini thought signatures for replay, keyed by the providerOptions
+   * namespace of the client that received them. Gemini rejects a current-turn
+   * function call replayed without its signature, so a rebuild from history
+   * (retry, resume) needs them. Like reasoning replay data, this is kept out of
+   * the wire schema; attachToolCallReplayMetadata sends it to the same
+   * namespace only.
+   */
+  providerOptions?: ToolCallReplayMetadata;
+};
+
+export type ToolCallReplayMetadata = Partial<
+  Record<
+    typeof CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE | "google" | "googleVertex",
+    { thoughtSignature: string }
+  >
+>;
 
 // Text part type
 export interface MuxTextPart {
