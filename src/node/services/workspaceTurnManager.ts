@@ -238,6 +238,11 @@ const LOSSY_SNAPSHOT_ARCHIVE_REFUSAL =
   "Ask the user to archive this workspace manually (the archive dialog lists the files and asks for confirmation). " +
   "If the user asked you to clean up, or the work is provably saved, archive again with force.";
 
+const CASCADE_LOSSY_REFUSAL_ADVICE =
+  "You must not delete the files yourself to get around it. " +
+  "Ask the user to archive this workspace manually (the archive dialog lists the sub-agents' files and asks for confirmation). " +
+  "If the user asked you to clean up, or the work is provably saved, archive again with force.";
+
 // A forced archive deletes only the files it listed: a different set at the sink means someone
 // wrote to the checkout since, so nothing was deleted for it.
 const FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL =
@@ -4770,7 +4775,7 @@ export class WorkspaceTurnManager {
   private lossySnapshotArchiveRefusal(
     resolved: ResolvedWorkspaceLifecycleTarget,
     paths: string[],
-    forced = false
+    error = LOSSY_SNAPSHOT_ARCHIVE_REFUSAL
   ): WorkspaceLifecycleResult {
     assert(paths.length > 0, "a lossy snapshot archive refusal must list the untracked paths");
     return {
@@ -4778,7 +4783,7 @@ export class WorkspaceTurnManager {
       action: "archive",
       ...this.lifecycleTargetFields(resolved),
       paths,
-      error: forced ? FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL,
+      error,
     };
   }
 
@@ -4800,13 +4805,11 @@ export class WorkspaceTurnManager {
         action: "archive",
         ...this.lifecycleTargetFields(resolved),
         paths: subagentPathLines(cascade.subagents),
-        error:
-          `Archiving this workspace also archives its sub-agents, and that would permanently delete the untracked files listed in paths from sub-agent(s) ${cascade.subagents
-            .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
-            .join(", ")}, because the snapshot archive behavior cannot preserve them. ` +
-          "You must not delete the files yourself to get around it. " +
-          "Ask the user to archive this workspace manually (the archive dialog lists the sub-agents' files and asks for confirmation). " +
-          "If the user asked you to clean up, or the work is provably saved, archive again with force.",
+        error: `Archiving this workspace also archives its sub-agents, and that would permanently delete the untracked files listed in paths from sub-agent(s) ${cascade.subagents
+          .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
+          .join(
+            ", "
+          )}, because the snapshot archive behavior cannot preserve them. ${CASCADE_LOSSY_REFUSAL_ADVICE}`,
       };
     }
     if (cascade.targetPaths.length > 0) {
@@ -4899,7 +4902,11 @@ export class WorkspaceTurnManager {
     );
     if (!result.success) return this.archiveErrorResult(resolved, result.error);
     if (result.data.kind === "confirm-lossy-untracked-files") {
-      return this.lossySnapshotArchiveRefusal(resolved, result.data.paths, forced);
+      return this.lossySnapshotArchiveRefusal(
+        resolved,
+        result.data.paths,
+        forced ? FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL
+      );
     }
     return {
       status: "archived",

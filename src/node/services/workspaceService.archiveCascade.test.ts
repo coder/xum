@@ -417,6 +417,24 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     expect(await exists(checkouts.get(grandchildId)!)).toBe(true);
   });
 
+  test("the cascade preflight does not list a sub-agent whose checkout the delete policy leaves alone", async () => {
+    await a.config.editConfig((config) => {
+      const row = [...config.projects.values()][0].workspaces.find((w) => w.id === childId)!;
+      // Not a managed worktree: the worktree archive hook skips it.
+      row.runtimeConfig = { type: "local" };
+      return config;
+    });
+
+    const allowed = await a.workspaceService.preflightArchiveCascade(rootId, "delete", {
+      allowCheckoutDeletion: true,
+    });
+
+    assert(allowed.success, "an allowed cascade preflight lists the checkouts");
+    expect(allowed.data.deletedCheckouts?.map((subagent) => subagent.workspaceId)).toEqual([
+      grandchildId,
+    ]);
+  });
+
   test("the cascade preflight lists the sub-agent checkouts the delete policy would delete only for a caller that allows it", async () => {
     const refused = await a.workspaceService.preflightArchiveCascade(rootId, "delete");
     const allowed = await a.workspaceService.preflightArchiveCascade(rootId, "delete", {

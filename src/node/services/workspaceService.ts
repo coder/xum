@@ -252,6 +252,7 @@ import {
 } from "@/node/runtime/devcontainerCli";
 import {
   archiveDeletesManagedWorktree,
+  archiveRemovesExternalAppEnvironment,
   isWorktreeRuntime,
 } from "@/node/runtime/worktreeLifecycleHooks";
 import {
@@ -1053,27 +1054,6 @@ function remoteBoxArchiveBehavior(
   coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior
 ): CoderWorkspaceArchiveBehavior {
   return isDedicatedCoderRuntime(metadata?.runtimeConfig) ? coderWorkspaceArchiveBehavior : "keep";
-}
-
-/**
- * Whether archiving removes what a live external editor or native terminal may still use: the
- * checkout (a snapshot capture, or the "delete" behavior) or a stopped or deleted dedicated
- * Coder workspace. Only a caller that does not forbid the "delete" behaviors reaches it under
- * them: a forced archive.
- */
-function archiveRemovesExternalAppEnvironment(args: {
-  needsSnapshotCapture: boolean;
-  remoteBoxBehavior: CoderWorkspaceArchiveBehavior;
-  worktreeArchiveBehavior: WorktreeArchiveBehavior;
-  metadata: WorkspaceMetadata | undefined;
-}): boolean {
-  return (
-    args.needsSnapshotCapture ||
-    args.remoteBoxBehavior !== "keep" ||
-    (args.worktreeArchiveBehavior === "delete" &&
-      args.metadata != null &&
-      archiveDeletesManagedWorktree(args.metadata, args.worktreeArchiveBehavior))
-  );
 }
 
 /**
