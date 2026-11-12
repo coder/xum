@@ -12,6 +12,7 @@ jest.mock("lottie-react", () => ({
 import { preloadTestModules } from "../../ipc/setup";
 import { generateBranchName } from "../../ipc/helpers";
 import { createAppHarness, ChatHarness } from "../harness";
+import { showEveryTranscriptStep } from "../helpers";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import { MOCK_TOOL_FLOW_PROMPTS } from "../../e2e/mockAiPrompts";
@@ -243,7 +244,10 @@ describe("Chat bottom layout stability", () => {
   }, 60_000);
 
   test("keeps the transcript pinned when the last bash tool call is expanded", async () => {
-    const app = await createAppHarness({ branchPrefix: "expand-bash-bottom" });
+    const app = await createAppHarness({
+      branchPrefix: "expand-bash-bottom",
+      beforeRenderEnvironment: showEveryTranscriptStep,
+    });
 
     try {
       await app.chat.send(MOCK_TOOL_FLOW_PROMPTS.LIST_DIRECTORY);

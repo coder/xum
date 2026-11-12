@@ -28,7 +28,7 @@ import { createMuxMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
 import { installDom } from "../dom";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, setupWorkspaceView, showEveryTranscriptStep } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 
 const BEST_OF_GROUP_ID = "best-of-ui-progress-group";
@@ -171,6 +171,7 @@ async function renderBestOfParentWorkspace(): Promise<{
   view: RenderedApp;
 }> {
   const env = await createTestEnvironment();
+  await showEveryTranscriptStep(env);
   env.services.aiService.enableMockMode();
 
   const repoPath = await createTempGitRepo();
@@ -271,6 +272,7 @@ async function renderCompletedBestOfParentWorkspace(params: {
   view: RenderedApp;
 }> {
   const env = await createTestEnvironment();
+  await showEveryTranscriptStep(env);
   env.services.aiService.enableMockMode();
 
   const repoPath = await createTempGitRepo();
@@ -355,6 +357,7 @@ async function renderPartiallySpawnedBestOfParentWorkspace(params: {
   view: RenderedApp;
 }> {
   const env = await createTestEnvironment();
+  await showEveryTranscriptStep(env);
   env.services.aiService.enableMockMode();
 
   const repoPath = await createTempGitRepo();
@@ -509,6 +512,7 @@ describe("Best-of parent task progress UI (mock AI router)", () => {
 
   test("does not rebind historical best-of cards to a later matching group", async () => {
     const env = await createTestEnvironment();
+    await showEveryTranscriptStep(env);
     env.services.aiService.enableMockMode();
 
     const repoPath = await createTempGitRepo();

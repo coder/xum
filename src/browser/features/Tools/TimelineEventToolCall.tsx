@@ -185,7 +185,7 @@ export const TimelineEventToolCall: React.FC<TimelineEventToolCallProps> = (prop
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="timeline_event" />
         <span className="text-secondary font-medium whitespace-nowrap">Timeline</span>
         <CategoryChip category={category} />

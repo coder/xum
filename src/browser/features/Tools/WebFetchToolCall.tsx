@@ -124,7 +124,7 @@ export const WebFetchToolCall: React.FC<WebFetchToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="web_fetch" />
         <div className="text-text flex max-w-96 min-w-0 items-center gap-1.5">
           <span className="font-monospace truncate">{domain}</span>

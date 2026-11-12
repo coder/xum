@@ -28,6 +28,8 @@ test(
     // the nudged turn reads README.md and completes the list.
     await sendMessage(screen, `Start the task ${Date.now()}`);
     await expect(screen.getByText(SCRIPTED_DONE_TEXT).last()).toBeVisible({ timeout: 60_000 });
+    // The nudge is a step of the work it starts: it is behind that work's line.
+    await screen.getByTestId("work-bundle").last().click();
     await expect(screen.getByText(NUDGE_ROW).last()).toBeVisible();
 
     const requests = readScriptedModelRequests(port).slice(before);

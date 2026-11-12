@@ -129,20 +129,26 @@ describe("NestedToolRenderer", () => {
     expect(queryByText(/—/)).toBeNull();
   });
 
-  test("full bash results keep the duration and exit-code badge", () => {
-    const { getByText } = render(
-      <Providers>
-        <NestedToolRenderer
-          toolName="bash"
-          input={{ script: "ls", display_name: "List", timeout_secs: 60 }}
-          output={{ success: true, output: "a", exitCode: 0, wall_duration_ms: 1500 }}
-          status="completed"
-        />
-      </Providers>
-    );
+  test("collapsed bash rows name the exit code only when it is non-zero", () => {
+    const renderBash = (exitCode: number) =>
+      render(
+        <Providers>
+          <NestedToolRenderer
+            toolName="bash"
+            input={{ script: "ls", display_name: "List", timeout_secs: 60 }}
+            output={{ success: exitCode === 0, output: "a", exitCode, wall_duration_ms: 1500 }}
+            status={exitCode === 0 ? "completed" : "failed"}
+          />
+        </Providers>
+      );
 
-    expect(getByText(/took 2s/)).toBeDefined();
-    expect(getByText("0")).toBeDefined();
+    const success = renderBash(0);
+    expect(success.queryByText(/took 2s/)).toBeNull();
+    expect(success.queryByText("0")).toBeNull();
+    success.unmount();
+
+    const failure = renderBash(2);
+    expect(failure.getByText("exit 2")).toBeDefined();
   });
 
   test("passes workspace identity to nested workflow components", async () => {

@@ -961,7 +961,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     }
   }
 
-  // Work bundles (hyper density) and operational bundles collapse rows as on desktop (#4979).
+  // Work bundles (compact density) and operational bundles collapse rows as on desktop (#4979).
   const [transcriptDensity] = useTranscriptDensity();
   const streamState = aggregatorRef.current
     ? getAggregatorStreamState(aggregatorRef.current)
@@ -1029,6 +1029,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   const transcriptRowDerivations = useTranscriptRowDerivations({
     workspaceId: selectedWorkspaceId ?? "",
     messages: renderedMessages,
+    workBundleInfos: transcriptBundles.workBundleInfos,
   });
   // Stable so the per-prompt navigation objects keep their identity across flushes. Every row is
   // mounted (no bounded reveal), so the target can be scrolled to directly; disabling auto-scroll
@@ -1190,7 +1191,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                             }}
                           />
                           {/* Transcript tail, after the rows, as in desktop ChatPane. */}
-                          {retryActionsAllowed && retryBarrier?.shouldMountRetryBarrier && streamState ? (
+                          {retryActionsAllowed &&
+                          retryBarrier?.shouldMountRetryBarrier &&
+                          streamState ? (
                             <RetryBarrierContent
                               workspaceId={selectedWorkspaceId}
                               visible={retryBarrier.showRetryBarrierUI}

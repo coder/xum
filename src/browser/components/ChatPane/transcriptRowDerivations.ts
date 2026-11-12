@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import type { UserMessageNavigation } from "@/browser/features/Messages/UserMessage";
+import { isMachineRow } from "@/browser/utils/messages/machineRows";
 import {
   computeBashOutputGroupInfos,
   type BashOutputGroupInfo,
@@ -28,8 +29,10 @@ export interface TranscriptRowDerivations {
 export function useTranscriptRowDerivations(params: {
   workspaceId: string;
   messages: DisplayedMessage[];
+  /** Compact density's work bundles (see useTranscriptBundles): row groups stop at their edges. */
+  workBundleInfos?: ReadonlyArray<{ readonly key: string } | undefined>;
 }): TranscriptRowDerivations {
-  const { workspaceId, messages } = params;
+  const { workspaceId, messages, workBundleInfos } = params;
 
   // Track which bash_output groups are expanded (keyed by first message ID). Expansion choices
   // belong to one workspace's transcript: the set is stored with its workspace and reads as empty
@@ -45,7 +48,10 @@ export function useTranscriptRowDerivations(params: {
   const taskReportLinking = useMemo(() => computeTaskReportLinking(messages), [messages]);
 
   // Precompute bash_output grouping once per message snapshot so row rendering stays O(n).
-  const bashOutputGroupInfos = useMemo(() => computeBashOutputGroupInfos(messages), [messages]);
+  const bashOutputGroupInfos = useMemo(
+    () => computeBashOutputGroupInfos(messages, workBundleInfos),
+    [messages, workBundleInfos]
+  );
 
   const updateBashGroups = (update: (groups: Set<string>) => void) => {
     setBashGroupExpansion((current) => {
@@ -114,14 +120,10 @@ export function useUserMessageNavigation(params: {
   return useMemo(() => {
     const userMessages: Array<Extract<DisplayedMessage, { type: "user" }>> = [];
     for (const message of messages) {
-      // Machine wakes and budget warnings should not interrupt navigation between human prompts.
-      if (
-        message.type === "user" &&
-        message.isPendingSend == null &&
-        message.bashMonitorWake == null &&
-        message.agentPeerMessageTrigger == null &&
-        message.contextBudgetWarning == null
-      ) {
+      // Prompts the machine wrote mid-work (wake-ups, nudges, sub-agent reports, budget
+      // warnings) should not interrupt navigation between human prompts. Compact density also
+      // folds them behind a work line, so a jump to one would land on a row that is not mounted.
+      if (message.type === "user" && message.isPendingSend == null && !isMachineRow(message)) {
         userMessages.push(message);
       }
     }

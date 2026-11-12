@@ -55,8 +55,9 @@ function renderAssistantWindow(overrides: Parameters<typeof createAssistantMessa
 function expectAssistantMeta(container: HTMLElement, visible: boolean) {
   const block = container.querySelector("[data-message-block]");
   expect(block).not.toBeNull();
+  // The block's own margins no longer depend on the row, so the row is the only thing that
+  // changes the transcript's spacing when it appears.
   expect(block?.querySelector("[data-message-meta]") !== null).toBe(visible);
-  expect(/\bmb-4\b/.test(block?.className ?? "")).toBe(visible);
 }
 
 describe("MessageWindow meta-row stability", () => {

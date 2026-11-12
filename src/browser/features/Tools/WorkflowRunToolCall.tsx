@@ -1900,7 +1900,7 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName={toolName} />
         <WorkflowKindBadge />
         {/* min-w-0 + truncate lets a long workflow name yield space instead of holding

@@ -59,7 +59,7 @@ export const MemoryToolCall: React.FC<MemoryToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="memory" />
         <span className="text-text font-medium">{args.command}</span>
         <span className="font-monospace text-secondary max-w-96 min-w-0 truncate">

@@ -1,4 +1,4 @@
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
@@ -55,6 +55,8 @@ describe("SubagentReportMessageContent", () => {
       </TooltipProvider>
     );
 
+    // Who wrote the report is part of the opened row.
+    fireEvent.click(view.getByRole("button", { name: "Show subagent report details" }));
     expect(view.getByText("thinking: max")).toBeTruthy();
   });
 });

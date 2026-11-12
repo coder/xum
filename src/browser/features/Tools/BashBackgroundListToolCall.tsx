@@ -50,7 +50,7 @@ export const BashBackgroundListToolCall: React.FC<BashBackgroundListToolCallProp
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="bash_background_list" />
         <span className="text-text-secondary">
           {result?.success

@@ -8691,6 +8691,39 @@ describe("WorkspaceStore", () => {
       expect(store.getLatestBashSandboxApprovalToolCallId(workspaceId)).toBe("call-new");
     });
 
+    // The transcript memoizes its folds on this set, and reads it through useSyncExternalStore.
+    it("lists the waiting calls as one set that changes only when the calls do", async () => {
+      const workspaceId = "sandbox-approval-workspace-ids";
+      expect(store.getBashSandboxApprovalToolCallIds(workspaceId).size).toBe(0);
+
+      let answer: () => void = () => undefined;
+      const answered = new Promise<void>((resolve) => {
+        answer = resolve;
+      });
+      mockChatScript([
+        caughtUpEvent(),
+        Promise.resolve(),
+        sandboxApprovalEvent(workspaceId, "call-a", true, 1),
+        sandboxApprovalEvent(workspaceId, "call-b", true, 2),
+        answered,
+        sandboxApprovalEvent(workspaceId, "call-a", false, 3),
+        sandboxApprovalEvent(workspaceId, "call-b", false, 4),
+      ]);
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const waiting = store.getBashSandboxApprovalToolCallIds(workspaceId);
+      expect([...waiting]).toEqual(["call-a", "call-b"]);
+      expect(store.getBashSandboxApprovalToolCallIds(workspaceId)).toBe(waiting);
+
+      answer();
+      await tick(10);
+      const none = store.getBashSandboxApprovalToolCallIds(workspaceId);
+      expect(none.size).toBe(0);
+      // Empty is one shared set, for every workspace.
+      expect(store.getBashSandboxApprovalToolCallIds("another-workspace")).toBe(none);
+    });
+
     // Every replay re-sends the calls still waiting (pending:true) before caught-up, so a
     // reconnect shows exactly those; a call answered while disconnected sends nothing.
     const approvalAfterReconnect = async (
@@ -9776,16 +9809,34 @@ describe("findRenderedRefineProposalHash", () => {
     expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
   });
 
-  it("ignores a proposal row hidden by the display cap until Load all reveals it (r68)", () => {
+  it("ignores a proposal row buried behind more chat than the display cap keeps (r68)", () => {
     // A staged proposal (e.g. from a foreign backend) buried behind enough
-    // later chat falls out of the rendered window: approving it would apply
-    // edits this user never saw, so the scan must not surface its hash from
-    // internal history.
+    // later chat is one this user may never have seen: approving it would
+    // apply unaudited edits, so the scan must not surface its hash.
     const aggregator = new StreamingMessageAggregator(CREATED_AT);
     aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(200, 2)], false);
     expect(findRenderedRefineProposalHash(aggregator)).toBeNull();
-    // "Load all" disables the cap: the proposal is now actually rendered.
+    // The desktop chat shows the whole transcript (no cap). Showing more of it must not
+    // widen what /refine apply accepts: the check keeps the cap's reach.
     aggregator.setShowAllMessages(true);
+    expect(findRenderedRefineProposalHash(aggregator)).toBeNull();
+  });
+
+  it("accepts a proposal within the cap's reach when the whole transcript shows", () => {
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.setShowAllMessages(true);
+    const later = Array.from({ length: 10 }, (_, i) =>
+      createMuxMessage(`later-${i}`, "assistant", `later ${i}`, {
+        timestamp: 300 + i,
+        historySequence: 300 + i,
+      })
+    );
+    const proposal = createMuxMessage("refine-1", "assistant", "Staged 2 edits", {
+      timestamp: 250,
+      historySequence: 250,
+      muxMetadata: { type: "refine-summary", stagedSetHash: HASH },
+    });
+    aggregator.loadHistoricalMessages([...assistantFiller(200, 1), proposal, ...later], false);
     expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
   });
 });

@@ -93,7 +93,7 @@ export const ComputerToolCall: React.FC<ComputerToolCallProps> = (props) => {
   return (
     <ToolContainer expanded={shouldShowDetails}>
       <ToolHeader onClick={() => hasDetails && toggleExpanded()}>
-        {hasDetails && <ExpandIcon expanded={shouldShowDetails}>▶</ExpandIcon>}
+        {hasDetails && <ExpandIcon expanded={shouldShowDetails} />}
         <ToolIcon toolName="computer" />
         <ToolName className="min-w-0 truncate">{summarizeComputerAction(props.args)}</ToolName>
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>

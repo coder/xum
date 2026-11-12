@@ -177,24 +177,27 @@ test.describe("tool and reasoning flows", () => {
     }
 
     const transcript = page.getByRole("log", { name: "Conversation transcript" });
-    const reasoningPreview = transcript
-      .getByText("Assessing quicksort mechanics and choosing example array...")
-      .first();
-    await expect(reasoningPreview).toBeVisible();
+    const reasoningPreview = transcript.getByText(
+      "Assessing quicksort mechanics and choosing example array..."
+    );
+    const reasoningBody = transcript.getByText(
+      "Plan: explain pivot selection, partitioning, recursion, base case."
+    );
 
-    // Thinking blocks are quiet by default (collapsed): the summary line shows with a
-    // trailing ellipsis and the multi-line body stays hidden until the user expands.
-    await expect(transcript.getByTestId("reasoning-ellipsis")).toHaveCount(1);
-    await expect(
-      transcript.getByText("Plan: explain pivot selection, partitioning, recursion, base case.")
-    ).toHaveCount(0);
-
-    // Expanding reveals the full reasoning body (and the choice sticks for future blocks).
-    await reasoningPreview.click();
-    await expect(transcript.getByTestId("reasoning-ellipsis")).toHaveCount(0);
-    await expect(
-      transcript.getByText("Plan: explain pivot selection, partitioning, recursion, base case.")
-    ).toBeVisible();
+    // The transcript is compact by default: a finished turn is its reply under one work line,
+    // and a turn that only reasoned says so. The thought itself is behind that line.
     await ui.chat.expectTranscriptContains("Quicksort works by picking a pivot");
+    const workLine = transcript.getByTestId("work-bundle").last();
+    await expect(workLine).toContainText("Thought");
+    await expect(reasoningPreview).toHaveCount(0);
+
+    // Opening the work line shows the thought as one quiet line: its body stays hidden.
+    await workLine.click();
+    await expect(reasoningPreview.first()).toBeVisible();
+    await expect(reasoningBody).toHaveCount(0);
+
+    // Opening the thought reveals its full body (and the choice sticks for future blocks).
+    await reasoningPreview.first().click();
+    await expect(reasoningBody).toBeVisible();
   });
 });

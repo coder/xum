@@ -14,7 +14,7 @@ import { createMuxMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { installDom } from "./dom";
 import { renderApp } from "./renderReviewPanel";
-import { cleanupView, setupWorkspaceView } from "./helpers";
+import { cleanupView, setupWorkspaceView, showEveryTranscriptStep } from "./helpers";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -131,6 +131,7 @@ describeIntegration("MCP tool call identity in chat", () => {
 
   test("shows frozen per-call identity and icons without changing expansion or plain rows", async () => {
     const env = await createTestEnvironment();
+    await showEveryTranscriptStep(env);
     const repoPath = await createTempGitRepo();
     await trustProject(env, repoPath);
     const getIcon = jest.spyOn(env.services.mcpServerManager, "getIcon");

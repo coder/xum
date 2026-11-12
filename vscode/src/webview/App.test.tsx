@@ -65,7 +65,13 @@ class TestBridge implements VscodeBridge {
   // Plays the host answering every call of `path` so far with `value`.
   async answer(path: string, value: unknown): Promise<void> {
     for (const call of this.orpcCalls(path)) {
-      await this.emit({ type: "orpcResponse", requestId: call.requestId, ok: true, kind: "value", value });
+      await this.emit({
+        type: "orpcResponse",
+        requestId: call.requestId,
+        ok: true,
+        kind: "value",
+        value,
+      });
     }
   }
 
@@ -154,6 +160,14 @@ async function emitBackgroundBashes(
   if (!call) throw new Error(`no background bash subscription for ${workspaceId}`);
   await bridge.emitOnStream(call, { processes, foregroundToolCallIds });
   await settle();
+}
+
+// Compact density (the default) folds a finished turn's rows behind its work line. Tests about
+// the rows themselves ask for the detailed transcript, as a user who wants every step does.
+async function showEveryStep(bridge: TestBridge): Promise<void> {
+  await bridge.answer("config.getConfig", {
+    userPreferences: { appearance: { transcriptDensity: "normal" } },
+  });
 }
 
 async function selectWorkspace(
@@ -476,6 +490,7 @@ describe("vscode webview workspace selection", () => {
         },
       },
     ]);
+    await showEveryStep(bridge);
 
     expect(view.container.textContent).toContain("echo webview");
     expect(view.container.textContent).toContain("provider exploded");
@@ -518,6 +533,11 @@ describe("vscode webview workspace selection", () => {
       args: { script: "make build", timeout_secs: 60, display_name: "Build" },
       tokens: 1,
       timestamp: 2,
+    });
+    // A running call is named on the turn's work line; its card is behind the line.
+    await act(async () => {
+      fireEvent.click(view.getByTestId("work-bundle"));
+      await Promise.resolve();
     });
     // Live output renders inside the expanded card.
     await act(async () => {
@@ -595,6 +615,7 @@ describe("vscode webview workspace selection", () => {
         { success: true, output: "kept", exitCode: 0, wall_duration_ms: 3 }
       ),
     ]);
+    await showEveryStep(bridge);
     const textarea = () => view.container.querySelector("textarea");
     expect(view.container.textContent).toContain("echo kept");
     expect(textarea()?.disabled).toBe(false);
@@ -765,7 +786,9 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
       bridge.emit({
         type: "workspaceActivity",
         workspaceId,
-        activity: { [workspaceId]: { activeBashMonitorCount, streaming: false, activeWorkflowRunIds: [] } },
+        activity: {
+          [workspaceId]: { activeBashMonitorCount, streaming: false, activeWorkflowRunIds: [] },
+        },
       });
 
     await activity(WORKSPACE.id, 1);
@@ -774,7 +797,11 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
 
     // A resubscribe to the same workspace keeps the count until the host sends a new one.
     await bridge.emit({ type: "chatReset", workspaceId: WORKSPACE.id });
-    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: { type: "caught-up" },
+    });
     expect(view.container.textContent).toContain(waiting);
 
     await activity(WORKSPACE.id, 0);
@@ -1020,7 +1047,13 @@ describe("vscode webview plan actions (#4942)", () => {
     }));
     await selectWorkspace(bridge, [
       ...filler,
-      toolMessage("m1", 501, "propose_plan", {}, { success: true, planPath: "/home/alice/plan.md" }),
+      toolMessage(
+        "m1",
+        501,
+        "propose_plan",
+        {},
+        { success: true, planPath: "/home/alice/plan.md" }
+      ),
     ]);
 
     expect(view.container.textContent).toContain("did not finish loading");
@@ -1088,6 +1121,8 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
         { success: true, output: "ok", exitCode: 0, wall_duration_ms: 5 }
       ),
     ]);
+    // The rows are behind the turn's work line at the default density, with or without config.
+    fireEvent.click(view.getByTestId("work-bundle"));
 
     // Default mode: the intent above the command.
     expect(view.getByText("List the repository files")).toBeDefined();
@@ -1112,7 +1147,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     expect(view.queryByText(script)).toBeNull();
   });
 
-  test("hyper transcript density collapses a finished turn's work into a work bundle (#4979)", async () => {
+  test("compact transcript density folds the steps between what the agent wrote (#4979)", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, [
@@ -1151,22 +1186,24 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
 
     const toggle = view.getByTestId("work-bundle");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.textContent).toContain("Ran 2 commands");
+    // The prompt, the update and the reply are in view; the steps are behind the line.
     expect(view.queryByText("Audit the auth module")).not.toBeNull();
+    expect(view.queryByText("I'll gather context first.")).not.toBeNull();
     expect(view.queryByText("Implemented the auth audit fix.")).not.toBeNull();
     expect(view.queryByText("make typecheck")).toBeNull();
-    expect(view.queryByText("I'll gather context first.")).toBeNull();
 
     await act(async () => {
       fireEvent.click(toggle);
       await Promise.resolve();
     });
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    expect(view.queryByText("I'll gather context first.")).not.toBeNull();
-    // Hyper density also groups the expanded bundle's tool rows, as on desktop.
-    expect(view.getByTestId("operational-bundle").textContent).toContain("2 shell commands");
+    // Opened, the steps are listed in place as on desktop, with no second fold.
+    expect(view.queryByText("make typecheck")).not.toBeNull();
+    expect(view.queryByTestId("operational-bundle")).toBeNull();
   });
 
-  test("consecutive task_await polls collapse into one operational bundle in the default density (#4979)", async () => {
+  test("consecutive task_await polls collapse into one operational bundle (#4979)", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(
@@ -1181,6 +1218,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
         )
       )
     );
+    await showEveryStep(bridge);
 
     const bundles = view.getAllByTestId("operational-bundle");
     expect(bundles).toHaveLength(1);
@@ -1521,7 +1559,12 @@ describe("vscode webview workspace AI settings", () => {
     const { bridge, view } = await selectWorkspaceWith(WORKSPACE);
     // A configured gateway provider lists its custom models under the gateway prefix.
     await bridge.answer("providers.getConfig", {
-      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true, models: ["openai/gpt-5"] },
+      openrouter: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: ["openai/gpt-5"],
+      },
     });
 
     try {
@@ -1631,7 +1674,11 @@ describe("vscode webview agent lookup", () => {
     const view = render(<App bridge={bridge} />);
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
-    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: { type: "caught-up" },
+    });
     await emitBackgroundBashes(bridge, WORKSPACE.id);
 
     const toggle = agentPicker(view);
@@ -1817,9 +1864,9 @@ describe("vscode webview explicit AI-setting persistence", () => {
       fireEvent.click(trigger);
       await Promise.resolve();
     });
-    const option = Array.from(
-      view.container.querySelectorAll<HTMLElement>('[role="option"]')
-    ).find((row) => row.getAttribute("aria-label") === label);
+    const option = Array.from(view.container.querySelectorAll<HTMLElement>('[role="option"]')).find(
+      (row) => row.getAttribute("aria-label") === label
+    );
     if (!option) throw new Error(`thinking option ${label} did not render`);
     await act(async () => {
       fireEvent.click(option);
@@ -1853,7 +1900,13 @@ describe("vscode webview explicit AI-setting persistence", () => {
     const sends = bridge.orpcCalls("workspace.sendMessage");
     const call = sends.at(index);
     if (!call) throw new Error("no sendMessage call to answer");
-    await bridge.emit({ type: "orpcResponse", requestId: call.requestId, ok: true, kind: "value", value });
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: call.requestId,
+      ok: true,
+      kind: "value",
+      value,
+    });
   }
 
   const OK = { success: true, data: {} };
@@ -2058,7 +2111,12 @@ describe("vscode webview explicit AI-setting persistence", () => {
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
     const call = bridge.orpcCalls("workspace.sendMessage")[0];
-    await bridge.emit({ type: "orpcResponse", requestId: call.requestId, ok: false, error: "network" });
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: call.requestId,
+      ok: false,
+      error: "network",
+    });
 
     await pickModel(view, "Opus 5.5");
     const next = await send(bridge, view);
@@ -2072,7 +2130,10 @@ describe("vscode webview explicit AI-setting persistence", () => {
     await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
-    await reply(bridge, { success: false, error: { type: "invalid_model_string", message: "bad model" } });
+    await reply(bridge, {
+      success: false,
+      error: { type: "invalid_model_string", message: "bad model" },
+    });
 
     const retry = await send(bridge, view);
     expect(retry).toMatchObject({
@@ -2146,7 +2207,11 @@ describe("vscode webview message rows", () => {
       historyMessage(
         "peer",
         "assistant",
-        formatAgentMessageEnvelope({ from: "ws-peer", relationship: "unrelated", message: "hello" }),
+        formatAgentMessageEnvelope({
+          from: "ws-peer",
+          relationship: "unrelated",
+          message: "hello",
+        }),
         {
           historySequence: 4,
           synthetic: true,
@@ -2248,7 +2313,9 @@ describe("vscode webview message rows", () => {
         await Promise.resolve();
       });
       // Compare IDs, not elements: a failing toEqual on DOM nodes can exhaust memory while diffing.
-      expect(scrolled.map((element) => element.getAttribute("data-message-id"))).toEqual(["second"]);
+      expect(scrolled.map((element) => element.getAttribute("data-message-id"))).toEqual([
+        "second",
+      ]);
     } finally {
       Element.prototype.scrollIntoView = originalScrollIntoView;
     }
@@ -2269,9 +2336,11 @@ describe("vscode webview message rows", () => {
         )
       )
     );
+    await showEveryStep(bridge);
 
     // A boolean, so a failure does not print the whole row element.
-    const middleRowRendered = () => view.container.querySelector('[data-message-id="out-2"]') !== null;
+    const middleRowRendered = () =>
+      view.container.querySelector('[data-message-id="out-2"]') !== null;
     expect(view.container.querySelector('[data-message-id="out-1"]')).not.toBeNull();
     expect(view.container.querySelector('[data-message-id="out-3"]')).not.toBeNull();
     expect(middleRowRendered()).toBe(false);
@@ -2325,6 +2394,7 @@ describe("vscode webview message rows", () => {
         }
       ),
     ]);
+    await showEveryStep(bridge);
 
     expect(view.queryByText(/bash · Watching PR 27330 until it is ready/)).not.toBeNull();
   });
@@ -2735,7 +2805,10 @@ describe("vscode webview sub-agent tasks strip (#5109)", () => {
     await selectWorkspace(bridge, [], parent);
     expect(strip(view)).toBeNull();
 
-    await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "running" })] });
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [parent, child({ taskStatus: "running" })],
+    });
     expect(chipName(view)).toBe("1 sub-agent, 1 active");
     await act(async () => {
       fireEvent.click(view.getByRole("button", { name: /1 sub-agent/ }));
@@ -2747,7 +2820,10 @@ describe("vscode webview sub-agent tasks strip (#5109)", () => {
     expect(bridge.sent.at(-1)).toEqual({ type: "selectWorkspace", workspaceId: "ws-child" });
 
     // The host re-posts the list when the task reports; an armed monitor keeps it active.
-    await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "reported" })] });
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [parent, child({ taskStatus: "reported" })],
+    });
     expect(chipName(view)).toBe("1 sub-agent");
     expect(strip(view)?.textContent).toContain("inactive");
     const activity = { [parent.id]: idle, "ws-child": { ...idle, activeBashMonitorCount: 1 } };
@@ -2882,7 +2958,11 @@ describe("vscode webview background processes strip (#5092)", () => {
   });
 
   test("Enter on a focused row opens its output (#5197)", async () => {
-    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-output", workspaceName: "bash-keys-output" };
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-keys-output",
+      workspaceName: "bash-keys-output",
+    };
     const { bridge, view, textarea } = await focusComposerWithProcesses(workspace);
     await press(textarea, FOCUS_STRIP);
     await press(stripRows(view)[0], { key: "Enter" });
@@ -2913,7 +2993,11 @@ describe("vscode webview background processes strip (#5092)", () => {
   });
 
   test("focus moves to a neighbor when the focused process exits on its own (#5197)", async () => {
-    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-exit", workspaceName: "bash-keys-exit" };
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-keys-exit",
+      workspaceName: "bash-keys-exit",
+    };
     const { bridge, view, textarea } = await focusComposerWithProcesses(workspace);
     await press(textarea, FOCUS_STRIP);
     await press(stripRows(view)[0], { key: "ArrowDown" });
@@ -2926,7 +3010,11 @@ describe("vscode webview background processes strip (#5092)", () => {
   });
 
   test("opened without a focus origin (command palette), Escape leaves focus on the strip toggle (#5197)", async () => {
-    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-palette", workspaceName: "bash-keys-palette" };
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-keys-palette",
+      workspaceName: "bash-keys-palette",
+    };
     const { view, textarea } = await focusComposerWithProcesses(workspace);
     textarea.blur();
     const request = createCustomEvent(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, {
@@ -2946,7 +3034,11 @@ describe("vscode webview background processes strip (#5092)", () => {
   });
 
   test("the shortcut is ignored inside the command palette or an inert pane (#5197)", async () => {
-    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-cmdk", workspaceName: "bash-keys-cmdk" };
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-keys-cmdk",
+      workspaceName: "bash-keys-cmdk",
+    };
     const { view } = await focusComposerWithProcesses(workspace);
     const palette = document.createElement("div");
     palette.setAttribute("cmdk-root", "");
@@ -2973,7 +3065,11 @@ describe("vscode webview background processes strip (#5092)", () => {
   });
 
   test("the shortcut is not consumed when there are no processes (#5197)", async () => {
-    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-idle", workspaceName: "bash-keys-idle" };
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-keys-idle",
+      workspaceName: "bash-keys-idle",
+    };
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, [], workspace);
@@ -3001,7 +3097,11 @@ describe("vscode webview background processes strip (#5092)", () => {
   };
 
   test("View output opens the shared output viewer, which reads the output through the bridge (#5196)", async () => {
-    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-output", workspaceName: "bash-output" };
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-output",
+      workspaceName: "bash-output",
+    };
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await openStripOutput(bridge, view, workspace);
@@ -3044,6 +3144,7 @@ describe("vscode webview background processes strip (#5092)", () => {
       ],
       workspace
     );
+    await showEveryStep(bridge);
     await settle();
 
     await click(view.getByRole("button", { name: "View output" }));
@@ -3054,7 +3155,11 @@ describe("vscode webview background processes strip (#5092)", () => {
   });
 
   test("a failed output read stops polling with the error shown, and reopening reads again (#5196)", async () => {
-    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-output-fail", workspaceName: "bash-output-fail" };
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-output-fail",
+      workspaceName: "bash-output-fail",
+    };
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await openStripOutput(bridge, view, workspace);
@@ -3096,9 +3201,11 @@ describe("vscode webview background processes strip (#5092)", () => {
     await click(view.getByRole("button", { name: "Close" }));
     await click(view.getByRole("button", { name: "View output" }));
     await settle();
-    expect(getOutputCalls(bridge).map((call) => call.input).slice(2)).toEqual([
-      { workspaceId: workspace.id, processId: "bash-1", tailBytes: 64_000 },
-    ]);
+    expect(
+      getOutputCalls(bridge)
+        .map((call) => call.input)
+        .slice(2)
+    ).toEqual([{ workspaceId: workspace.id, processId: "bash-1", tailBytes: 64_000 }]);
   });
 
   test("does not offer sending a running foreground bash to the background", async () => {
@@ -3131,6 +3238,11 @@ describe("vscode webview background processes strip (#5092)", () => {
     // bridge refuses sendToBackground (bashForegroundControls is unsupported in the webview).
     await emitBackgroundBashes(bridge, workspace.id, [], ["call-fg"]);
 
+    // A running call is named on the turn's work line; its card is behind the line.
+    await act(async () => {
+      fireEvent.click(view.getByTestId("work-bundle"));
+      await Promise.resolve();
+    });
     expect(view.container.textContent).toContain("make build");
     expect(view.queryByRole("button", { name: "Send to background" })).toBeNull();
   });
@@ -3169,74 +3281,77 @@ describe("vscode webview background processes strip (#5092)", () => {
   test.each([
     ["an already-shown", true],
     ["a late", false],
-  ])("switching servers shows neither the previous server's rows nor %s error over the new connection", async (_label, answerBeforeSwitch) => {
-    // Both servers expose a workspace with this ID.
-    const workspace: UiWorkspace = {
-      ...WORKSPACE,
-      id: "ws-bash-server",
-      workspaceName: "bash-server",
-    };
-    const bridge = new TestBridge();
-    // Snapshot the document after every commit, before passive effects run.
-    const commits: { rows: boolean; error: boolean }[] = [];
-    const onRender = () => {
-      const text = document.body.textContent ?? "";
-      commits.push({
-        // The live line's bash chip shows only a count, so look for the chip itself.
-        rows: document.body.querySelector('[data-activity-id="background-bashes"]') !== null,
-        error: text.includes("terminate refused"),
-      });
-    };
-    const view = render(
-      <Profiler id="app" onRender={onRender}>
-        <App bridge={bridge} />
-      </Profiler>
-    );
-    await selectWorkspace(bridge, [], workspace);
-    await settle();
-    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
-    await click(view.getByRole("button", { name: /1 background bash/ }));
-    expect(view.getByText("sleep 600")).toBeTruthy();
-    // Terminate on server A.
-    await click(view.getByRole("button", { name: "Terminate process" }));
-    await settle();
-    const answerTerminate = () =>
-      bridge.answer("workspace.backgroundBashes.terminate", {
-        success: false,
-        error: "terminate refused",
-      });
-    if (answerBeforeSwitch) {
-      await answerTerminate();
+  ])(
+    "switching servers shows neither the previous server's rows nor %s error over the new connection",
+    async (_label, answerBeforeSwitch) => {
+      // Both servers expose a workspace with this ID.
+      const workspace: UiWorkspace = {
+        ...WORKSPACE,
+        id: "ws-bash-server",
+        workspaceName: "bash-server",
+      };
+      const bridge = new TestBridge();
+      // Snapshot the document after every commit, before passive effects run.
+      const commits: { rows: boolean; error: boolean }[] = [];
+      const onRender = () => {
+        const text = document.body.textContent ?? "";
+        commits.push({
+          // The live line's bash chip shows only a count, so look for the chip itself.
+          rows: document.body.querySelector('[data-activity-id="background-bashes"]') !== null,
+          error: text.includes("terminate refused"),
+        });
+      };
+      const view = render(
+        <Profiler id="app" onRender={onRender}>
+          <App bridge={bridge} />
+        </Profiler>
+      );
+      await selectWorkspace(bridge, [], workspace);
       await settle();
-      expect(view.getByText(/terminate refused/)).toBeTruthy();
+      await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+      await click(view.getByRole("button", { name: /1 background bash/ }));
+      expect(view.getByText("sleep 600")).toBeTruthy();
+      // Terminate on server A.
+      await click(view.getByRole("button", { name: "Terminate process" }));
+      await settle();
+      const answerTerminate = () =>
+        bridge.answer("workspace.backgroundBashes.terminate", {
+          success: false,
+          error: "terminate refused",
+        });
+      if (answerBeforeSwitch) {
+        await answerTerminate();
+        await settle();
+        expect(view.getByText(/terminate refused/)).toBeTruthy();
+      }
+
+      commits.length = 0;
+      await bridge.emit({
+        type: "connectionStatus",
+        status: { mode: "api", baseUrl: "http://other" },
+      });
+      if (!answerBeforeSwitch) {
+        await answerTerminate();
+      }
+      await settle();
+
+      expect(commits.length).toBeGreaterThan(0);
+      expect(commits.filter((commit) => commit.rows)).toEqual([]);
+      // An already-shown error can remain in the commits of the synchronous store resets that
+      // precede the render showing the new connection; once gone it never comes back. A late error
+      // arrives after the first (error-free) commit, so it must never show.
+      const firstErrorFree = commits.findIndex((commit) => !commit.error);
+      expect(firstErrorFree).toBeGreaterThanOrEqual(0);
+      expect(commits.slice(firstErrorFree).filter((commit) => commit.error)).toEqual([]);
+      const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+      expect(subscriptions.length).toBeGreaterThan(1);
+
+      // Server B runs a process too: its strip starts collapsed, never with server A's expanded list.
+      await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+      expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
+      expect(view.queryByText("sleep 600")).toBeNull();
     }
-
-    commits.length = 0;
-    await bridge.emit({
-      type: "connectionStatus",
-      status: { mode: "api", baseUrl: "http://other" },
-    });
-    if (!answerBeforeSwitch) {
-      await answerTerminate();
-    }
-    await settle();
-
-    expect(commits.length).toBeGreaterThan(0);
-    expect(commits.filter((commit) => commit.rows)).toEqual([]);
-    // An already-shown error can remain in the commits of the synchronous store resets that
-    // precede the render showing the new connection; once gone it never comes back. A late error
-    // arrives after the first (error-free) commit, so it must never show.
-    const firstErrorFree = commits.findIndex((commit) => !commit.error);
-    expect(firstErrorFree).toBeGreaterThanOrEqual(0);
-    expect(commits.slice(firstErrorFree).filter((commit) => commit.error)).toEqual([]);
-    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
-    expect(subscriptions.length).toBeGreaterThan(1);
-
-    // Server B runs a process too: its strip starts collapsed, never with server A's expanded list.
-    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
-    expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
-    expect(view.queryByText("sleep 600")).toBeNull();
-  });
+  );
 
   test("does not show another workspace's processes after a switch", async () => {
     const bridge = new TestBridge();

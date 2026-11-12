@@ -32,6 +32,7 @@ import {
   isSessionTapeReplayRenderer,
 } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import {
+  MAX_DISPLAYED_MESSAGES,
   StreamingMessageAggregator,
   type LoadedSkill,
   type SkillLoadError,
@@ -530,6 +531,8 @@ export interface WorkflowToolLiveRunState {
 }
 
 /** A bash call that waits for the user to let it run once outside the sandbox. */
+const NO_TOOL_CALL_IDS: ReadonlySet<string> = new Set();
+
 export type BashSandboxApprovalView = Pick<
   BashSandboxApprovalEvent,
   "workspaceId" | "toolCallId" | "script" | "reason" | "timestamp"
@@ -563,6 +566,8 @@ interface WorkspaceChatTransientState {
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   /** Bash calls that wait for the user to let them run outside the sandbox, by toolCallId. */
   sandboxApprovals: Map<string, BashSandboxApprovalView>;
+  /** The last set getBashSandboxApprovalToolCallIds returned, reused while the calls are the same. */
+  sandboxApprovalToolCallIds?: { key: string; ids: ReadonlySet<string> };
   liveTaskIds: Map<string, string[]>;
   liveWorkflowRuns: Map<string, WorkflowToolLiveRunState>;
   autoRetryStatus: AutoRetryStatus | null;
@@ -2863,6 +2868,27 @@ export class WorkspaceStore {
 
   getBashSandboxApproval(workspaceId: string, toolCallId: string): BashSandboxApprovalView | null {
     return this.chatTransientState.get(workspaceId)?.sandboxApprovals.get(toolCallId) ?? null;
+  }
+
+  /**
+   * The tool calls of the workspace that wait for an approval. The transcript keeps their rows
+   * in view whatever it folds, because the approval card and its shortcuts are in the row.
+   * The same set object is returned while the calls are the same, so useSyncExternalStore gets
+   * a stable snapshot and the fold projection memoized on it does not rerun.
+   */
+  getBashSandboxApprovalToolCallIds(workspaceId: string): ReadonlySet<string> {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient === undefined || transient.sandboxApprovals.size === 0) {
+      return NO_TOOL_CALL_IDS;
+    }
+    const key = Array.from(transient.sandboxApprovals.keys()).join("\n");
+    if (transient.sandboxApprovalToolCallIds?.key !== key) {
+      transient.sandboxApprovalToolCallIds = {
+        key,
+        ids: new Set(transient.sandboxApprovals.keys()),
+      };
+    }
+    return transient.sandboxApprovalToolCallIds.ids;
   }
 
   /** The toolCallId of the newest approval the workspace waits for; the shortcuts answer it. */
@@ -5397,6 +5423,12 @@ export class WorkspaceStore {
     if (!this.aggregators.has(workspaceId)) {
       // Create new aggregator with required createdAt and workspaceId for localStorage persistence
       const aggregator = new StreamingMessageAggregator(createdAt, workspaceId, unarchivedAt);
+      // Nothing is cut out of the transcript here. The chat pane bounds what it mounts with a
+      // tail-first window (useBoundedTranscriptReveal), so the aggregator's row cap is not
+      // needed, and it did harm: it replaced older replies with "hidden for performance"
+      // markers, which in compact density (a turn is three rows) reached the first screen. The
+      // cap stays for the VS Code webview, which has no mount window.
+      aggregator.setShowAllMessages(true);
       // Wire up navigation callback for notification clicks
       if (this.navigateToWorkspaceCallback) {
         aggregator.onNavigateToWorkspace = this.navigateToWorkspaceCallback;
@@ -6245,6 +6277,15 @@ export function useBashSandboxApproval(
   return approval ? { approval, isLatest: latestToolCallId === approval.toolCallId } : null;
 }
 
+/** The tool calls of a workspace that wait for a sandbox approval (see the store method). */
+export function useBashSandboxApprovalToolCallIds(workspaceId: string): ReadonlySet<string> {
+  const store = getStoreInstance();
+  return useSyncExternalStore(
+    (listener) => store.subscribeKey(workspaceId, listener),
+    () => store.getBashSandboxApprovalToolCallIds(workspaceId)
+  );
+}
+
 /**
  * Hook to get UI-only taskId for a running task tool call.
  *
@@ -6314,54 +6355,47 @@ export function pinTimelineRevealTarget(
 }
 
 /**
- * Disable the displayed message cap for a workspace and trigger a re-render.
- * Used by HistoryHiddenMessage “Load all”.
- */
-export function showAllMessages(workspaceId: string): void {
-  assert(
-    typeof workspaceId === "string" && workspaceId.length > 0,
-    "showAllMessages requires workspaceId"
-  );
-
-  const store = getStoreInstance();
-  const aggregator = store.getAggregator(workspaceId);
-  if (aggregator) {
-    aggregator.setShowAllMessages(true);
-    store.bumpState(workspaceId);
-  }
-}
-
-/**
  * Newest staged /refine proposal hash RENDERED in this window (r64).
  * /refine apply must bind approval to the proposal THIS user saw: with
  * XUM_ALLOW_MULTIPLE_INSTANCES=1 the shared chat transcript can contain a
  * newer proposal from another backend that this renderer never displayed,
  * so the backend cannot infer the displayed proposal from the transcript
  * alone. Scans newest-first for a refine-summary row carrying a
- * stagedSetHash, restricted to rows the transcript actually RENDERS (r68):
- * the DOM display cap can hide a proposal row from internal history (e.g. a
- * window opened after a foreign backend staged it, with enough later chat
- * to push it past the cap), and approving a hidden proposal would apply
- * memory/skill edits the user never saw. A hidden newer proposal also
- * cannot be applied via an older visible hash — the backend re-hashes the
- * staged set and refuses the mismatch — so filtering here fails safe.
+ * stagedSetHash, restricted to the transcript's most recent rows (r68):
+ * a proposal buried behind enough later chat (e.g. a window opened after a
+ * foreign backend staged it) is one the user may never have seen, and
+ * approving it would apply memory/skill edits unaudited. A hidden newer
+ * proposal also cannot be applied via an older visible hash — the backend
+ * re-hashes the staged set and refuses the mismatch — so filtering here
+ * fails safe.
+ *
+ * "Most recent" is the aggregator's display cap, whether or not the cap
+ * is applied: the desktop chat shows the whole transcript (its pane bounds
+ * what it mounts), but this check keeps the cap's reach, so showing more
+ * of the transcript did not widen what /refine apply accepts. An older
+ * proposal is refused, and running /refine again stages a current one.
  */
 export function getDisplayedRefineProposalHash(workspaceId: string): string | null {
   const aggregator = getStoreInstance().getAggregator(workspaceId);
   return aggregator ? findRenderedRefineProposalHash(aggregator) : null;
 }
 
+/** History ids of the rows the display cap keeps in view: the newest MAX_DISPLAYED_MESSAGES. */
+function collectRecentHistoryIds(aggregator: StreamingMessageAggregator): Set<string> {
+  const recentHistoryIds = new Set<string>();
+  for (const displayed of aggregator.getDisplayedMessages().slice(-MAX_DISPLAYED_MESSAGES)) {
+    if ("historyId" in displayed) {
+      recentHistoryIds.add(displayed.historyId);
+    }
+  }
+  return recentHistoryIds;
+}
+
 /** Pure scan behind getDisplayedRefineProposalHash, exported for tests. */
 export function findRenderedRefineProposalHash(
   aggregator: StreamingMessageAggregator
 ): string | null {
-  // The rendered row set: display-capped unless "Load all" disabled the cap.
-  const renderedHistoryIds = new Set<string>();
-  for (const displayed of aggregator.getDisplayedMessages()) {
-    if ("historyId" in displayed) {
-      renderedHistoryIds.add(displayed.historyId);
-    }
-  }
+  const renderedHistoryIds = collectRecentHistoryIds(aggregator);
   const messages = aggregator.getAllMessages();
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];

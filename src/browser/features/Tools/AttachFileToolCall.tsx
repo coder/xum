@@ -74,7 +74,7 @@ export const AttachFileToolCall: React.FC<AttachFileToolCallProps> = (props) => 
   return (
     <ToolContainer expanded={shouldShowDetails}>
       <ToolHeader onClick={() => hasDetails && toggleExpanded()}>
-        {hasDetails && <ExpandIcon expanded={expanded}>▶</ExpandIcon>}
+        {hasDetails && <ExpandIcon expanded={expanded} />}
         <ToolIcon toolName={props.toolName} />
         <ToolName>{props.toolName}</ToolName>
         <StatusIndicator status={props.status ?? "pending"}>

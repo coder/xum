@@ -26,13 +26,10 @@ describe("InterruptedBarrier", () => {
     expect(onResume).toHaveBeenCalledTimes(1);
   });
 
-  test("a non-resumable divider renders no clickable control", () => {
-    const onResume = mock(() => undefined);
-    const view = render(<InterruptedBarrier resumable={false} onResume={onResume} />);
+  test("renders nothing where the turn cannot be continued", () => {
+    const view = render(<InterruptedBarrier resumable={false} onResume={() => undefined} />);
 
-    expect(view.queryByRole("button")).toBeNull();
-    expect(view.getByText("interrupted")).toBeTruthy();
-    expect(onResume).not.toHaveBeenCalled();
+    expect(view.container.childElementCount).toBe(0);
   });
 
   test("surfaces a resume failure so the action is not a silent no-op", () => {
@@ -42,11 +39,5 @@ describe("InterruptedBarrier", () => {
 
     expect(view.getByText("Couldn't continue:")).toBeTruthy();
     expect(view.getByText(/Runtime failed to start/)).toBeTruthy();
-  });
-
-  test("does not surface an error on a non-resumable divider", () => {
-    const view = render(<InterruptedBarrier resumable={false} error="ignored" />);
-
-    expect(view.queryByText("Couldn't continue:")).toBeNull();
   });
 });

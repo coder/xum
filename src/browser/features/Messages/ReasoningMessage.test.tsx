@@ -98,6 +98,18 @@ describe("ReasoningMessage", () => {
     expect(getByText(/Second line details/)).toBeDefined();
   });
 
+  // The disclosure is the only way to read a one-line thought that the row truncates, so it
+  // must be reachable from the keyboard: a real button, with its state announced.
+  test("a thought that can be opened is a button that announces its state", () => {
+    const view = render(<ReasoningMessage message={createReasoningMessage("One line thought")} />);
+
+    const disclosure = view.getByRole("button", { name: /One line thought/ });
+    expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(disclosure);
+    expect(disclosure.getAttribute("aria-expanded")).toBe("true");
+  });
+
   test("renders leading markdown-bold summary text as bold", () => {
     const message = createReasoningMessage("**Collecting context**\nSecond line details");
 
@@ -139,10 +151,9 @@ describe("ReasoningMessage", () => {
     });
     const view = render(<ReasoningMessage message={streamingMessage} />);
 
-    // The accessible activity label omits its own dots while the separate
-    // collapsed-content marker supplies the one visible ellipsis.
-    expect(view.container.querySelector(".shimmer-text-base")?.textContent).toBe("Thinking");
-    expect(view.getByTestId("reasoning-ellipsis").textContent).toBe("...");
+    // The activity label carries the one ellipsis; there is no second truncation marker.
+    expect(view.container.querySelector(".shimmer-text-base")?.textContent).toBe("Thinking…");
+    expect(view.queryByTestId("reasoning-ellipsis")).toBeNull();
     expect(view.container.querySelector(".shimmer-text-sweep")?.getAttribute("aria-hidden")).toBe(
       "true"
     );

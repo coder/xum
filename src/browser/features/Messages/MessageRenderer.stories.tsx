@@ -848,8 +848,9 @@ export const BashMonitorWakeMessages: AppStory = {
       const toggle = row.querySelector<HTMLElement>("button");
       if (!toggle) throw new Error("Monitor wake toggle not rendered");
       const toggleBounds = toggle.getBoundingClientRect();
-      if (Math.abs(rowBounds.right - toggleBounds.right) > 1) {
-        throw new Error("Monitor wake summary is not right-aligned");
+      // A wake-up is the machine's, not the user's: it sits on the left with the agent's steps.
+      if (Math.abs(rowBounds.left - toggleBounds.left) > 1) {
+        throw new Error("Monitor wake summary is not left-aligned with the agent's steps");
       }
     }
 

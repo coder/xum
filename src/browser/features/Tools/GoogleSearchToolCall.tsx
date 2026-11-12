@@ -148,11 +148,11 @@ export const GoogleSearchToolCall: React.FC<GoogleSearchToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="server:GOOGLE_SEARCH_WEB" />
         <ToolName className="shrink-0">Google Search</ToolName>
         <div className="text-text flex max-w-96 min-w-0 items-center gap-1.5">
-          <span className="font-monospace truncate">{queries[0] ?? "searching..."}</span>
+          <span className="font-monospace truncate">{queries[0] ?? "Searching…"}</span>
         </div>
         {queries.length > 1 && (
           <span className="text-secondary ml-2 text-[10px] whitespace-nowrap">

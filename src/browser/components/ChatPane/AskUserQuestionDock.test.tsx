@@ -399,7 +399,7 @@ describe("AskUserQuestionDock", () => {
   test("a question set that arrives after the user collapsed the form re-opens it", () => {
     messages = [ROW_A];
     const view = render(dock(workspaceId), { wrapper: Wrapper });
-    fireEvent.click(view.getByText("ask_user_question"));
+    fireEvent.click(view.getByText("Question"));
     expect(view.queryByText(STORAGE.question)).toBeNull();
 
     messages = [ROW_A, ROW_B];

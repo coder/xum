@@ -1,23 +1,24 @@
 import React from "react";
 import { cn } from "@/common/lib/utils";
 import type { DisplayedMessage } from "@/common/types/message";
-import { showAllMessages } from "@/browser/stores/WorkspaceStore";
 
+/**
+ * The marker for rows an aggregator's row cap left out. The desktop chat never caps (its mount
+ * window bounds the DOM instead), so only a host that caps its own aggregator renders this: the
+ * VS Code webview, which has no mount window.
+ */
 interface HistoryHiddenMessageProps {
   message: DisplayedMessage & { type: "history-hidden" };
-  workspaceId?: string;
   className?: string;
-  /** Overrides the WorkspaceStore "Load all" path for hosts with their own aggregator. */
+  /** "Load all": lifts the cap on the host's aggregator. */
   onShowAll?: () => void;
 }
 
 export const HistoryHiddenMessage: React.FC<HistoryHiddenMessageProps> = ({
   message,
-  workspaceId,
   className,
   onShowAll,
 }) => {
-  const handleShowAll = onShowAll ?? (workspaceId ? () => showAllMessages(workspaceId) : undefined);
   const omittedMessageDetails: string[] = [];
   if (message.omittedMessageCounts?.tool) {
     omittedMessageDetails.push(
@@ -61,11 +62,11 @@ export const HistoryHiddenMessage: React.FC<HistoryHiddenMessageProps> = ({
         />
       </svg>
       <span className="text-muted">Some messages are hidden for performance • {detailSummary}</span>
-      {handleShowAll && (
+      {onShowAll && (
         <button
           type="button"
           className="text-link hover:text-link-hover cursor-pointer border-none bg-transparent p-0 font-medium underline"
-          onClick={() => handleShowAll()}
+          onClick={() => onShowAll()}
         >
           Load all
         </button>

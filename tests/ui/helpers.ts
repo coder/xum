@@ -9,6 +9,7 @@ import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
+import type { APIClient } from "@/browser/contexts/API";
 
 /**
  * Open Settings from the titlebar button and scope queries to the Settings dialog. The page
@@ -563,6 +564,18 @@ export function waitForIdleGitStatus(
     },
     { timeout: timeoutMs }
   );
+}
+
+/**
+ * Compact density (the default) folds a finished turn's rows behind its work line. A test about
+ * the rows themselves asks for the detailed transcript first, as a user who wants every step does.
+ */
+export async function showEveryTranscriptStep(env: {
+  orpc: Pick<APIClient, "config">;
+}): Promise<void> {
+  await env.orpc.config.updateUserPreferences({
+    patches: [{ appearance: { transcriptDensity: "normal" } }],
+  });
 }
 
 export type CreationIsolationAxis = "Project isolation" | "Workspace isolation";

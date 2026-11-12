@@ -466,7 +466,7 @@ describe("AskUserQuestionToolCall", () => {
 
       const view = renderAsyncQuestion();
       // Answered questions follow the collapsed tool preference; expand to read the answers.
-      fireEvent.click(view.getByText("ask_user_question"));
+      fireEvent.click(view.getByText("Question"));
 
       expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
       expect(view.getByText("Second")).toBeTruthy();
@@ -536,7 +536,7 @@ describe("AskUserQuestionToolCall", () => {
       };
 
       const view = renderAsyncQuestion();
-      fireEvent.click(view.getByText("ask_user_question"));
+      fireEvent.click(view.getByText("Question"));
 
       expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
       expect(view.getByText(/no longer in the agent/)).toBeTruthy();
@@ -571,13 +571,13 @@ describe("AskUserQuestionToolCall", () => {
         );
 
       const earlier = renderRow("row-1");
-      fireEvent.click(earlier.getByText("ask_user_question"));
+      fireEvent.click(earlier.getByText("Question"));
       expect(earlier.getByText(/later question replaced/)).toBeTruthy();
       expect(earlier.queryByText("User answered")).toBeNull();
       earlier.unmount();
 
       const later = renderRow("row-2");
-      fireEvent.click(later.getByText("ask_user_question"));
+      fireEvent.click(later.getByText("Question"));
       expect(later.getByText("User answered")).toBeTruthy();
     });
 
@@ -658,7 +658,7 @@ describe("AskUserQuestionToolCall", () => {
       view.unmount();
       const remounted = renderAsyncQuestion("row-ask-async");
       // Closed, so it follows the collapsed tool preference: open it to read the answers.
-      fireEvent.click(remounted.getByText("ask_user_question"));
+      fireEvent.click(remounted.getByText("Question"));
       expect(remounted.getByText("User answered")).toBeTruthy();
       expect(remounted.queryByRole("button", { name: "Submit answers" })).toBeNull();
     });

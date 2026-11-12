@@ -6,6 +6,11 @@ import { normalizeReasoningMarkdown } from "./MarkdownStyles";
 import { cn } from "@/common/lib/utils";
 import { Shimmer } from "../AIElements/Shimmer";
 import { Lightbulb } from "lucide-react";
+import {
+  ExpandIcon,
+  FOLDED_ROW_TEXT_CLASS,
+  TOOL_RAIL_CLASS,
+} from "@/browser/features/Tools/Shared/ToolPrimitives";
 
 interface ReasoningMessageProps {
   message: DisplayedMessage & { type: "reasoning" };
@@ -18,7 +23,7 @@ interface ReasoningMessageProps {
   workspaceId?: string;
 }
 
-const REASONING_FONT_CLASSES = "font-primary text-[12px] leading-[18px]";
+const REASONING_FONT_CLASSES = FOLDED_ROW_TEXT_CLASS;
 const MAX_SUMMARY_CHARS = 240;
 
 function parseLeadingBoldSummary(
@@ -47,6 +52,43 @@ function parseLeadingBoldSummary(
   };
 }
 
+/**
+ * The text of a thought's row: the live shimmer while it streams, then its first line (with a
+ * leading bold title kept bold), or a plain label when the thought has no content.
+ */
+function ReasoningSummaryText(props: {
+  isStreaming: boolean;
+  hasContent: boolean;
+  /** The thought's first line, as the row shows it. */
+  headerLine: string;
+  /** The row is open on a one-line thought: the line wraps instead of being cut. */
+  wraps: boolean;
+}): JSX.Element {
+  if (props.isStreaming) {
+    return (
+      <Shimmer className="thinking-shimmer" colorClass="var(--color-thinking-mode)">
+        Thinking…
+      </Shimmer>
+    );
+  }
+  if (!props.hasContent) {
+    return <>Thought</>;
+  }
+  const parsedLeadingBoldSummary = parseLeadingBoldSummary(props.headerLine);
+  return (
+    <span className={props.wraps ? "break-words" : "whitespace-nowrap"}>
+      {parsedLeadingBoldSummary ? (
+        <>
+          <strong>{parsedLeadingBoldSummary.boldText}</strong>
+          {parsedLeadingBoldSummary.trailingText}
+        </>
+      ) : (
+        props.headerLine
+      )}
+    </span>
+  );
+}
+
 export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
   message,
   className,
@@ -66,17 +108,18 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
     summaryLineRaw.length > MAX_SUMMARY_CHARS
       ? `${summaryLineRaw.slice(0, MAX_SUMMARY_CHARS)}…`
       : summaryLineRaw;
-  const parsedLeadingBoldSummary = parseLeadingBoldSummary(summaryLine);
   const hasAdditionalLines = hasContent && /[\r\n]/.test(trimmedContent);
   // OpenAI models often emit terse, single-line traces; surface them inline instead of hiding behind the label.
   const isSingleLineTrace = !isStreaming && hasContent && !hasAdditionalLines;
-  // Collapsible whenever there's multi-line content — including while streaming, so
-  // the user can opt into watching the live trace. We deliberately no longer
-  // auto-collapse on stream completion: that mutated a present block (a visible
-  // height tear) and fought the sticky preference. A block keeps whatever expand
-  // state it mounted with until the user toggles it.
-  const isCollapsible = hasContent && hasAdditionalLines;
-  const showEllipsis = isCollapsible && !isExpanded;
+  // Collapsible whenever there is content, including while streaming, so the user can opt
+  // into watching the live trace. A one-line trace has no body to reveal, but its line can be
+  // longer than the row: opening it lets that line wrap, so no thought is unreadable.
+  // We deliberately no longer auto-collapse on stream completion: that mutated a present
+  // block (a visible height tear) and fought the sticky preference. A block keeps whatever
+  // expand state it mounted with until the user toggles it.
+  const isCollapsible = hasContent;
+  const showsWrappedLine = isExpanded && isSingleLineTrace;
+  const headerLine = showsWrappedLine ? summaryLineRaw : summaryLine;
   const showExpandedContent = isExpanded && !isSingleLineTrace;
   // Keep height uncontrolled while a streaming block is expanded so live markdown
   // growth (Shiki/Mermaid) can't be clipped by a stale measured height.
@@ -94,7 +137,7 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
   const renderContent = () => {
     // Empty streaming state
     if (isStreaming && !content) {
-      return <div className="text-thinking-mode opacity-60">Thinking...</div>;
+      return <div className="text-muted">Thinking…</div>;
     }
 
     if (!content) {
@@ -125,71 +168,66 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
     );
   };
 
-  return (
-    <div
-      className={cn(
-        "my-2 px-2 py-1 bg-[color-mix(in_srgb,var(--color-thinking-mode)_5%,transparent)] rounded relative",
-        className
+  // A quiet line, not a box: reasoning is the least important row in a settled transcript, so
+  // it gets the same muted one-line treatment as a folded summary row and no fill or accent
+  // colour. Only a live trace (the shimmer) carries the thinking colour.
+  const headerClassName = cn(
+    "text-muted flex min-w-0 gap-2 px-1 select-none",
+    showsWrappedLine ? "items-start" : "items-center",
+    isExpanded && !isSingleLineTrace && "mb-1.5"
+  );
+  const headerBody = (
+    <>
+      {/* The chevron column is kept (as a spacer) when there is nothing to open, so every
+          folded row's icon and text start on the same edges. The 3px offset centres the
+          12px icons on the first 18px line when the text wraps. */}
+      {isCollapsible ? (
+        <ExpandIcon expanded={isExpanded} className={cn(showsWrappedLine && "mt-[3px]")} />
+      ) : (
+        <span className="w-3 shrink-0" aria-hidden="true" />
       )}
-    >
-      <div
+      <Lightbulb
+        aria-hidden="true"
         className={cn(
-          "flex items-center justify-between gap-2 select-none",
-          isCollapsible && "cursor-pointer",
-          isExpanded && !isSingleLineTrace && "mb-1.5"
+          "size-3 shrink-0",
+          showsWrappedLine && "mt-[3px]",
+          isStreaming && "animate-pulse"
         )}
-        onClick={isCollapsible ? toggleExpanded : undefined}
+      />
+      <span
+        className={cn("block min-w-0", !showsWrappedLine && "truncate", REASONING_FONT_CLASSES)}
       >
-        <div
+        <ReasoningSummaryText
+          isStreaming={isStreaming}
+          hasContent={hasContent}
+          headerLine={headerLine}
+          wraps={showsWrappedLine}
+        />
+      </span>
+    </>
+  );
+
+  return (
+    <div className={cn("relative my-1.5", className)}>
+      {/* A thought that can be opened is a real button, so the disclosure works from the
+          keyboard (Tab, then Enter or Space) and announces its state, like the work line and the
+          Script row. It is the only way to read a one-line thought the row truncates. */}
+      {isCollapsible ? (
+        <button
+          type="button"
           className={cn(
-            "flex flex-1 items-center gap-1 min-w-0 text-xs opacity-80",
-            "text-thinking-mode"
+            headerClassName,
+            "hover:text-foreground w-full cursor-pointer rounded-sm text-left transition-colors",
+            "focus-visible:outline-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
           )}
+          aria-expanded={isExpanded}
+          onClick={toggleExpanded}
         >
-          <span className="text-xs">
-            <Lightbulb className={cn("size-3.5", isStreaming && "animate-pulse")} />
-          </span>
-          <div className="flex min-w-0 items-center gap-1 truncate">
-            {isStreaming ? (
-              <Shimmer className="thinking-shimmer" colorClass="var(--color-thinking-mode)">
-                {/* The collapsed-content ellipsis below already communicates truncation. */}
-                {showEllipsis ? "Thinking" : "Thinking..."}
-              </Shimmer>
-            ) : hasContent ? (
-              <span className={cn("truncate whitespace-nowrap text-text", REASONING_FONT_CLASSES)}>
-                {parsedLeadingBoldSummary ? (
-                  <>
-                    <strong>{parsedLeadingBoldSummary.boldText}</strong>
-                    {parsedLeadingBoldSummary.trailingText}
-                  </>
-                ) : (
-                  summaryLine
-                )}
-              </span>
-            ) : (
-              "Thought"
-            )}
-            {showEllipsis && (
-              <span
-                className="text-[11px] tracking-widest text-[color:var(--color-text)] opacity-70"
-                data-testid="reasoning-ellipsis"
-              >
-                ...
-              </span>
-            )}
-          </div>
-        </div>
-        {isCollapsible && (
-          <span
-            className={cn(
-              "text-thinking-mode opacity-60 transition-transform duration-200 ease-in-out text-xs",
-              isExpanded ? "rotate-90" : "rotate-0"
-            )}
-          >
-            ▸
-          </span>
-        )}
-      </div>
+          {headerBody}
+        </button>
+      ) : (
+        <div className={headerClassName}>{headerBody}</div>
+      )}
 
       {/* Always render the content container to prevent layout shifts. Keep an
           expanded streaming block's height uncontrolled so async markdown growth
@@ -199,6 +237,8 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
       <div
         className={cn(
           REASONING_FONT_CLASSES,
+          // The opened trace hangs off the same rail as any other opened row.
+          TOOL_RAIL_CLASS,
           "italic opacity-85 [&_p]:mt-0 [&_p]:mb-1 [&_p:last-child]:mb-0",
           !showStreamingExpanded && "overflow-hidden transition-opacity duration-200 ease-in-out"
         )}

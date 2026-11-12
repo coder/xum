@@ -281,7 +281,7 @@ type AgentStatus = z.infer<typeof AgentStatusSchema>;
  * We keep all user prompts and structural markers, while allowing older assistant
  * content to collapse behind history-hidden markers for faster initial paint.
  */
-const MAX_DISPLAYED_MESSAGES = 64;
+export const MAX_DISPLAYED_MESSAGES = 64;
 
 /**
  * Message types that are always preserved even in truncated history.

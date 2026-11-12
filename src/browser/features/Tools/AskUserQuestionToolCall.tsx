@@ -52,6 +52,8 @@ import {
   useToolExpansion,
   type ToolStatus,
 } from "@/browser/features/Tools/Shared/toolUtils";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import type { DisplayedMessage } from "@/common/types/message";
 import type {
   AskUserQuestionQuestion,
   AskUserQuestionToolArgs,
@@ -109,6 +111,45 @@ function isToolErrorResult(val: unknown): val is ToolErrorResult {
 
   const record = val as Record<string, unknown>;
   return record.success === false && typeof record.error === "string";
+}
+
+/** The row's one-line reading: the first question (and how many more), and the answers given. */
+function summarizeQuestions(
+  questions: readonly AskUserQuestionQuestion[] | undefined,
+  answers: Record<string, string> | undefined
+): { question: string; answer: string | null } | undefined {
+  // History replays can carry args without a questions array, or with malformed entries.
+  const first = questions?.[0];
+  if (typeof first?.question !== "string") {
+    return undefined;
+  }
+  const more = questions != null && questions.length > 1 ? ` (+${questions.length - 1} more)` : "";
+  const given = answers == null ? [] : Object.values(answers).filter((answer) => answer !== "");
+  return {
+    question: `${first.question}${more}`,
+    answer: given.length > 0 ? given.join(" · ") : null,
+  };
+}
+
+/**
+ * The send options a resumed stream uses: the workspace's stored ones, with the overrides of the
+ * last user message when that message asked for a compaction.
+ */
+function getResumeSendOptions(
+  workspaceId: string,
+  messages: readonly DisplayedMessage[] | undefined
+): SendMessageOptions {
+  const sendOptions = getSendOptionsFromStorage(workspaceId);
+  const lastUserMessage = [...(messages ?? [])]
+    .reverse()
+    .find(
+      (message): message is Extract<typeof message, { type: "user" }> => message.type === "user"
+    );
+
+  if (lastUserMessage?.compactionRequest) {
+    return applyCompactionOverrides(sendOptions, lastUserMessage.compactionRequest.parsed);
+  }
+  return sendOptions;
 }
 
 /**
@@ -206,7 +247,7 @@ function DockedQuestionStub(props: { status: ToolStatus }): JSX.Element {
       <ToolHeader className="cursor-default">
         <ToolIcon toolName="ask_user_question" />
         <div className="flex min-w-0 flex-1 flex-col">
-          <ToolName>ask_user_question</ToolName>
+          <ToolName>Question</ToolName>
           <div className="text-secondary text-[10px] leading-tight">
             Answer in the panel above the chat input.
           </div>
@@ -496,20 +537,7 @@ export function AskUserQuestionToolCall(
 
         // If the stream was interrupted (e.g. app restart), explicitly resume using
         // the latest persisted send options for this workspace.
-        let sendOptions = getSendOptionsFromStorage(workspaceId);
-        const lastUserMessage = [...(workspaceState?.messages ?? [])]
-          .reverse()
-          .find(
-            (message): message is Extract<typeof message, { type: "user" }> =>
-              message.type === "user"
-          );
-
-        if (lastUserMessage?.compactionRequest) {
-          sendOptions = applyCompactionOverrides(
-            sendOptions,
-            lastUserMessage.compactionRequest.parsed
-          );
-        }
+        const sendOptions = getResumeSendOptions(workspaceId, workspaceState?.messages);
 
         const enableResult = await liveApi.workspace.setAutoRetryEnabled?.({
           workspaceId,
@@ -593,6 +621,7 @@ export function AskUserQuestionToolCall(
         onToggle={toggleExpanded}
         hint={isAnswering ? answeringHints.header : null}
         status={props.status}
+        title={summarizeQuestions(props.args.questions, successResult?.answers)}
       />
 
       {expanded && (

@@ -1,7 +1,7 @@
 import { expect, userEvent, within } from "storybook/test";
 import { getAutoExpandPrefsKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { PhoneSubagentReportDecorator } from "./helpers/subagentReportStory";
 import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
@@ -91,29 +91,31 @@ export default {
 export const NestedTools: AppStory = {
   render: () => <AppWithMocks setup={setupNestedToolsStory} />,
   globals: { viewport: { value: "desktop", isRotated: false } },
-  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
+  // Geometry regression only: ConsecutiveRuns carries the code execution Pixel snapshots, which
+  // keeps the repo under its snapshot budget.
+  parameters: { pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     const toggle = await canvas.findByRole("button", { name: "Message to Reviewer" });
-    const frame = canvas.getByRole("group", { name: "Code Execution" });
-    const legend = frame.querySelector("legend")!;
-    const tools = frame.querySelector(":scope > div")!;
+    const frame = canvas.getByRole("group", { name: "Script" });
+    const header = frame.firstElementChild!;
+    const tools = within(frame).getByTestId("nested-tool-calls");
     await expect(tools.children).toHaveLength(3);
 
     const checkSpacing = async () => {
       const bounds = frame.getBoundingClientRect();
-      let previousBottom = legend.getBoundingClientRect().bottom;
+      let previousBottom = header.getBoundingClientRect().bottom;
       // Assert rendered geometry, not utility classes: every tool (including an
-      // unbordered file read) needs its own clearance from the shared border.
+      // unbordered file read) stays inside the card, below the header, without overlap.
       for (const card of tools.children) {
         const rect = card.getBoundingClientRect();
-        await expect(rect.left - bounds.left).toBeGreaterThanOrEqual(8);
-        await expect(bounds.right - rect.right).toBeGreaterThanOrEqual(8);
-        await expect(rect.top - previousBottom).toBeGreaterThanOrEqual(8);
+        await expect(rect.left).toBeGreaterThanOrEqual(bounds.left);
+        await expect(rect.right).toBeLessThanOrEqual(bounds.right);
+        await expect(rect.top).toBeGreaterThanOrEqual(previousBottom);
         await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
         previousBottom = rect.bottom;
       }
-      await expect(bounds.bottom - previousBottom).toBeGreaterThanOrEqual(8);
+      await expect(bounds.bottom).toBeGreaterThanOrEqual(previousBottom);
       await expect(frame.scrollWidth).toBeLessThanOrEqual(frame.clientWidth);
     };
 
@@ -133,11 +135,133 @@ export const NestedToolsPhone: AppStory = {
   globals: { viewport: { value: "mobile1", isRotated: false } },
   // Keep the narrow-container regression active in the desktop-sized test-runner too.
   decorators: [PhoneSubagentReportDecorator],
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async (context) => {
+    await NestedTools.play?.(context);
+    const frame = within(context.canvasElement).getByRole("group", { name: "Script" });
+    await expect(frame.getBoundingClientRect().width).toBeLessThan(390);
+  },
+};
+
+const SEQUENCE_WORKSPACE_ID = "ws-code-execution-sequence";
+
+function nestedRead(id: string, path: string) {
+  return {
+    toolCallId: id,
+    toolName: "file_read",
+    state: "output-available" as const,
+    input: { path },
+    output: { success: true, lines_read: 1, file_size: 24, content: "1\texport {};" },
+  };
+}
+
+function codeExecutionCall(
+  id: string,
+  code: string,
+  nestedCalls: Array<ReturnType<typeof nestedRead>>
+) {
+  return {
+    type: "dynamic-tool" as const,
+    toolCallId: id,
+    toolName: "code_execution",
+    state: "output-available" as const,
+    input: { code },
+    output: { success: true, result: "ok", toolCalls: [], consoleOutput: [] },
+    nestedCalls,
+  };
+}
+
+/** Back-to-back code executions, the way agents explore: several runs, then an answer. */
+function setupSequenceStory() {
+  collapseLeftSidebar();
+  collapseRightSidebar();
+  updatePersistedState(getAutoExpandPrefsKey(SEQUENCE_WORKSPACE_ID), {});
+  return setupSimpleChatStory({
+    workspaceId: SEQUENCE_WORKSPACE_ID,
+    workspaceName: "code-execution-sequence",
+    projectName: "mux",
+    messages: [
+      createAssistantMessage("sequence-tools", "", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP,
+        toolCalls: [
+          codeExecutionCall("run-1", "const files = xum.bash({ script: 'git ls-files' });", [
+            nestedRead("run-1-read", "package.json"),
+          ]),
+          codeExecutionCall(
+            "run-2",
+            "// Count the stories per feature\nconst counts = new Map();\nreturn counts.size;",
+            []
+          ),
+          codeExecutionCall(
+            "run-3",
+            "for (const p of paths) xum.file_read({ path: p });",
+            Array.from({ length: 7 }, (_, index) =>
+              nestedRead(`run-3-read-${index}`, `src/feature-${index}.ts`)
+            )
+          ),
+        ],
+      }),
+      createAssistantMessage("sequence-answer", "The feature folders are consistent.", {
+        historySequence: 2,
+        timestamp: STABLE_TIMESTAMP + 1000,
+      }),
+    ],
+  });
+}
+
+/**
+ * A settled run of scripts folds into one summary row (detailed density). Opening it shows each
+ * script as one line; opening a script shows its calls, and a long script shows only its latest
+ * calls until asked for the rest.
+ */
+export const ConsecutiveRuns: AppStory = {
+  render: () => <AppWithMocks setup={setupSequenceStory} />,
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const bundle = await canvas.findByRole("button", { name: /Ran 3 scripts/ });
+    await expect(bundle).toHaveAttribute("aria-expanded", "false");
+    await expect(canvas.queryAllByRole("group", { name: "Script" })).toHaveLength(0);
+
+    await userEvent.click(bundle);
+    const runs = await canvas.findAllByRole("group", { name: "Script" });
+    await expect(runs).toHaveLength(3);
+
+    // One level per click: opening the summary shows three one-line scripts, not their calls.
+    for (const run of runs) {
+      await expect(within(run).queryByTestId("nested-tool-calls")).toBeNull();
+    }
+    // A script that made no calls previews its first statement in the header.
+    await expect(runs[1]).toHaveTextContent("const counts = new Map();");
+
+    const longRun = within(runs[2]);
+    // The disclosure is a real button: it opens from the keyboard and reports its state.
+    const disclosure = longRun.getByRole("button", { name: /Script/, expanded: false });
+    disclosure.focus();
+    await userEvent.keyboard("{Enter}");
+    await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    await expect(longRun.getByTestId("nested-tool-calls").children).toHaveLength(4);
+    await userEvent.click(longRun.getByRole("button", { name: "Show 3 earlier calls" }));
+    await expect(longRun.getByTestId("nested-tool-calls").children).toHaveLength(7);
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+  },
+};
+
+export const ConsecutiveRunsPhone: AppStory = {
+  ...ConsecutiveRuns,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  decorators: [PhoneSubagentReportDecorator],
   parameters: { pixel: { matrix: { viewports: ["phone"] } } },
   play: async (context) => {
-    await expect(context.parameters.pixel).toMatchObject({ matrix: { viewports: ["phone"] } });
-    await NestedTools.play?.(context);
-    const frame = within(context.canvasElement).getByRole("group", { name: "Code Execution" });
-    await expect(frame.getBoundingClientRect().width).toBeLessThan(390);
+    await ConsecutiveRuns.play?.(context);
+    for (const run of within(context.canvasElement).getAllByRole("group", {
+      name: "Script",
+    })) {
+      await expect(run.scrollWidth).toBeLessThanOrEqual(run.clientWidth);
+    }
   },
 };

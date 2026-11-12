@@ -6,6 +6,7 @@ import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import {
   ErrorBox,
   ExpandIcon,
+  FOLDED_ROW_TEXT_CLASS,
   StatusIndicator,
   ToolHeader,
   ToolIcon,
@@ -46,13 +47,35 @@ export function AskUserQuestionHeader(props: {
   /** Shown under the tool name while the questions take answers. */
   hint: string | null;
   status: ToolStatus;
+  /** What was asked and, once answered, what the user chose: the row says it without opening. */
+  title?: { question: string; answer: string | null };
 }): JSX.Element {
   return (
     <ToolHeader onClick={props.onToggle}>
-      <ExpandIcon expanded={props.expanded}>▶</ExpandIcon>
+      <ExpandIcon expanded={props.expanded} />
       <ToolIcon toolName="ask_user_question" />
       <div className="flex min-w-0 flex-1 flex-col">
-        <ToolName>ask_user_question</ToolName>
+        {/* A question is part of the conversation, so its row is set like the work lines around
+            it (prose font), not like a tool row. */}
+        <div className={cn("flex min-w-0 items-baseline gap-2", FOLDED_ROW_TEXT_CLASS)}>
+          <ToolName>Question</ToolName>
+          {/* Folded only: the opened card shows the questions and answers itself. */}
+          {props.title != null && !props.expanded && (
+            <>
+              <span className="text-secondary min-w-0 truncate">{props.title.question}</span>
+              {props.title.answer != null && (
+                <>
+                  <span aria-hidden="true" className="text-muted -mx-0.5 shrink-0">
+                    ·
+                  </span>
+                  <span className="text-text max-w-[45%] shrink-0 truncate">
+                    {props.title.answer}
+                  </span>
+                </>
+              )}
+            </>
+          )}
+        </div>
         {props.hint != null && (
           <div className="text-secondary text-[10px] leading-tight">{props.hint}</div>
         )}
@@ -284,7 +307,9 @@ function QuestionBody(props: {
         </div>
       </div>
 
-      <div className="-mx-2 flex flex-col gap-0.5">
+      {/* The option rows' hover fill may bleed into the card's gutter, but no further: the
+          gutter is ToolContainer's 4px, and anything wider scrolls the dock sideways. */}
+      <div className="-mx-1 flex flex-col gap-0.5">
         {options.map((opt) => (
           <OptionRow
             key={opt.label}

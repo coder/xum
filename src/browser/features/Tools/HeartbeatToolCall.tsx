@@ -246,7 +246,7 @@ export const HeartbeatToolCall: React.FC<HeartbeatToolCallProps> = (props) => {
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="heartbeat" />
         <span className="text-secondary font-medium whitespace-nowrap">{verb}</span>
         {badge && <HeartbeatBadge tone={badge.tone} label={badge.label} />}

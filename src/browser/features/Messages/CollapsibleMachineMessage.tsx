@@ -18,7 +18,10 @@ interface CollapsibleMachineMessageProps {
   className?: string;
 }
 
-/** Compact transcript treatment for machine-authored prompts whose raw control text is secondary. */
+/**
+ * Compact transcript treatment for machine-authored prompts whose raw control text is secondary.
+ * It sits on the left, with the agent's steps: the right side is for what the user said.
+ */
 export function CollapsibleMachineMessage(props: CollapsibleMachineMessageProps): ReactElement {
   const [expanded, setExpanded] = useState(false);
   const markerAttributes = { [`data-${props.marker}`]: true };
@@ -26,7 +29,7 @@ export function CollapsibleMachineMessage(props: CollapsibleMachineMessageProps)
   return (
     <div
       {...markerAttributes}
-      className={cn("my-2 flex min-w-0 flex-col items-end", props.className)}
+      className={cn("my-2 -ml-1 flex min-w-0 flex-col items-start", props.className)}
       data-message-block
     >
       <button

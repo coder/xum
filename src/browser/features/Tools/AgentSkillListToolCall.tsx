@@ -235,7 +235,7 @@ export const AgentSkillListToolCall: React.FC<AgentSkillListToolCallProps> = (pr
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="agent_skill_list" />
         <span className="text-secondary font-medium whitespace-nowrap">{verb}</span>
         {view.kind === "skills" && (

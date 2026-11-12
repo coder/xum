@@ -14,6 +14,7 @@ import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import type { StreamStartEvent } from "@/common/types/stream";
 
 import { createAppHarness, type AppHarness } from "../harness";
+import { showEveryTranscriptStep } from "../helpers";
 
 interface ServiceContainerPrivates {
   backgroundProcessManager: BackgroundProcessManager;
@@ -201,7 +202,10 @@ describe("Send dispatch modes (mock AI router)", () => {
   }, 60_000);
 
   test("send after step waits for every tool call emitted in the current step", async () => {
-    const app = await createAppHarness({ branchPrefix: "queued-parallel-tool-step" });
+    const app = await createAppHarness({
+      branchPrefix: "queued-parallel-tool-step",
+      beforeRenderEnvironment: showEveryTranscriptStep,
+    });
 
     try {
       // The send waits for workspace init, so the stream can start more than 1 s after the
@@ -234,13 +238,23 @@ describe("Send dispatch modes (mock AI router)", () => {
       // The mock turn holds its tool calls until now, so the follow-up was queued mid-step.
       app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
 
-      await app.chat.expectTranscriptContains("parallel-step-a.txt");
-      await app.chat.expectTranscriptContains("parallel-step-b.txt");
       await app.chat.expectTranscriptContains(
         "Finished both sibling tool calls before continuing."
       );
       await app.chat.expectTranscriptContains(`Mock response: ${queuedText}`);
       await app.chat.expectStreamComplete();
+
+      // Detailed density folds the two settled reads into one summary row; open it to see both.
+      const readsSummary = await waitFor(() => {
+        const button = Array.from(app.view.container.querySelectorAll("button")).find((element) =>
+          element.textContent?.includes("Read 2 files")
+        );
+        if (!button) throw new Error("Expected the two reads to fold into one summary row");
+        return button;
+      });
+      fireEvent.click(readsSummary);
+      await app.chat.expectTranscriptContains("parallel-step-a.txt");
+      await app.chat.expectTranscriptContains("parallel-step-b.txt");
     } finally {
       await app.dispose();
     }

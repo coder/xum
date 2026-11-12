@@ -1124,7 +1124,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded} data-component="TaskToolCall">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <TaskIcon toolName="task" />
         <ToolName>task</ToolName>
         {kindBadge}
@@ -1497,9 +1497,10 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
             <ElapsedTimeDisplay startedAt={startedAt} isActive={true} separator="" prefix="" />
           </span>
         )}
-        <ExpandIcon expanded={expanded} className="text-muted group-hover:text-secondary shrink-0">
-          ▶
-        </ExpandIcon>
+        <ExpandIcon
+          expanded={expanded}
+          className="text-muted group-hover:text-secondary shrink-0"
+        />
       </ToolHeader>
 
       {/* Align collapsed details with the header text; expanded mode already lists per-task rows. */}
@@ -1694,7 +1695,7 @@ export const TaskListToolCall: React.FC<TaskListToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <TaskIcon toolName="task_list" />
         <ToolName>task_list</ToolName>
         <span className="text-muted text-[10px]">{tasks.length} task(s)</span>
@@ -1881,7 +1882,7 @@ export const TaskRetitleToolCall: React.FC<TaskRetitleToolCallProps> = (props) =
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <TaskIcon toolName="task_retitle" />
         <ToolName>task_retitle</ToolName>
         <span className="text-muted min-w-0 truncate text-[10px]">{props.args.title}</span>
@@ -1924,7 +1925,7 @@ export const TaskStopToolCall: React.FC<TaskStopToolCallProps> = (props) => {
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <TaskIcon toolName="task_stop" />
         <ToolName>task_stop</ToolName>
         <span className="text-interrupted text-[10px]">
@@ -2002,7 +2003,7 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <TaskIcon toolName="task_remove" />
         <ToolName>task_remove</ToolName>
         <span className="text-danger text-[10px]">
@@ -2061,7 +2062,7 @@ export const TaskTerminateToolCall: React.FC<TaskTerminateToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <TaskIcon toolName="task_terminate" />
         <ToolName>task_terminate</ToolName>
         <span className="text-interrupted text-[10px]">{summary}</span>

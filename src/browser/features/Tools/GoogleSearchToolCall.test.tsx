@@ -189,7 +189,7 @@ describe("GoogleSearchToolCall", () => {
   test("shows searching placeholder while executing without args or result", () => {
     const view = renderTool({ args: {}, status: "executing" });
 
-    expect(view.getByText("searching...")).toBeTruthy();
+    expect(view.getByText("Searching…")).toBeTruthy();
 
     expand(view);
     expect(view.getByText("Searching")).toBeTruthy();

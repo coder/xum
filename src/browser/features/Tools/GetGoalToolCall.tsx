@@ -38,7 +38,7 @@ export const GetGoalToolCall: React.FC<GetGoalToolCallProps> = ({ result, status
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="get_goal" />
         <span className="text-secondary font-medium whitespace-nowrap">Read goal</span>
         {goal && <GoalStatusBadge status={goal.status} />}

@@ -109,7 +109,7 @@ export const ToolSearchToolCall: React.FC<ToolSearchToolCallProps> = (props) => 
   return (
     <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="tool_catalog_search" />
         <span className="text-muted-foreground truncate italic">{props.args.query}</span>
         {view.kind === "matches" && (

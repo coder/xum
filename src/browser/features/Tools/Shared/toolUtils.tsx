@@ -1,5 +1,5 @@
 import React from "react";
-import { AlertTriangle, Check, CircleDot, EyeOff, X } from "lucide-react";
+import { AlertTriangle, CircleDot, EyeOff, X } from "lucide-react";
 import type { ToolErrorResult } from "@/common/types/tools";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
@@ -100,18 +100,18 @@ export function useAutoCollapsingToolExpansion(
 export function getStatusDisplay(status: ToolStatus): React.ReactNode {
   switch (status) {
     case "executing":
+      // Dots only: the motion already says "running", and the word repeated it.
       return (
         <>
-          <LoadingDots /> <span className="status-text">executing</span>
+          <LoadingDots aria-hidden="true" />
+          <span className="status-text sr-only">executing</span>
         </>
       );
     case "completed":
-      return (
-        <>
-          <Check aria-hidden="true" className="mr-1 inline-block h-3 w-3 align-[-2px]" />
-          <span className="status-text">completed</span>
-        </>
-      );
+      // Success is the default outcome, so it gets no visible badge (as in Claude Code, Codex and
+      // Cursor): only running, failed and otherwise unusual rows draw the eye. Screen readers
+      // still hear the status.
+      return <span className="status-text sr-only">completed</span>;
     case "failed":
       return (
         <>

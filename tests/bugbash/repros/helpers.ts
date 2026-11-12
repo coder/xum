@@ -94,6 +94,21 @@ export async function disableTutorials(app: { baseUrl: string | undefined }): Pr
 }
 
 /**
+ * Asks for the detailed transcript on the server before the page loads. Compact density (the
+ * default) folds a finished turn's steps behind its work line, so a test that reads a tool row
+ * asks for every step first, as a user who wants them does.
+ */
+export async function showEveryTranscriptStep(app: { baseUrl: string | undefined }): Promise<void> {
+  if (app.baseUrl === undefined) throw new Error("The bug-bash target declares no app URL");
+  const client: RouterClient<AppRouter> = createORPCClient(
+    new RPCLink({ origin: new URL(app.baseUrl).origin, url: "/orpc" })
+  );
+  await client.config.updateUserPreferences({
+    patches: [{ appearance: { transcriptDensity: "normal" } }],
+  });
+}
+
+/**
  * Clears the saved tutorial state (the opt-out and every finished tutorial) before the page loads,
  * so the creation tutorial shows again. A merge patch with null deletes the key (RFC 7386).
  */

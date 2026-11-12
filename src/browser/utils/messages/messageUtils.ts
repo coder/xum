@@ -276,6 +276,39 @@ function reuseEqualBashOutputGroupInfo(
   return info;
 }
 
+/** The work line a row sits behind, if any (compact density only). */
+function workLineKeyAt(
+  workBundleInfos: ReadonlyArray<{ readonly key: string } | undefined> | undefined,
+  index: number
+): string | undefined {
+  return workBundleInfos?.[index]?.key;
+}
+
+/**
+ * Last row of the run of bash_output polls of one process that starts at `start`. The run stops
+ * at a row behind another work line (see computeBashOutputGroupInfos).
+ */
+function findBashOutputGroupEnd(
+  messages: DisplayedMessage[],
+  start: number,
+  processId: string,
+  workBundleInfos: ReadonlyArray<{ readonly key: string } | undefined> | undefined
+): number {
+  const workLineKey = workLineKeyAt(workBundleInfos, start);
+  let groupEnd = start;
+  while (groupEnd < messages.length - 1) {
+    const nextMsg = messages[groupEnd + 1];
+    if (!isBashOutputTool(nextMsg) || nextMsg.args.process_id !== processId) {
+      break;
+    }
+    if (workLineKeyAt(workBundleInfos, groupEnd + 1) !== workLineKey) {
+      break;
+    }
+    groupEnd++;
+  }
+  return groupEnd;
+}
+
 /**
  * Precompute bash_output grouping metadata for all rows in one linear pass.
  *
@@ -283,7 +316,13 @@ function reuseEqualBashOutputGroupInfo(
  * scan per row turns long transcripts into O(n²) grouping work right on the critical path.
  */
 export function computeBashOutputGroupInfos(
-  messages: DisplayedMessage[]
+  messages: DisplayedMessage[],
+  /**
+   * Compact density's work bundles, indexed like `messages`. A group stops where the work line
+   * changes: its toggle sits with its first row, so a group that spanned two lines would hide
+   * the polls behind the second line with their toggle behind the first.
+   */
+  workBundleInfos?: ReadonlyArray<{ readonly key: string } | undefined>
 ): Array<BashOutputGroupInfo | undefined> {
   const groupInfos = new Array<BashOutputGroupInfo | undefined>(messages.length);
 
@@ -296,15 +335,7 @@ export function computeBashOutputGroupInfos(
     }
 
     const processId = msg.args.process_id;
-    let groupEnd = index;
-
-    while (groupEnd < messages.length - 1) {
-      const nextMsg = messages[groupEnd + 1];
-      if (!isBashOutputTool(nextMsg) || nextMsg.args.process_id !== processId) {
-        break;
-      }
-      groupEnd++;
-    }
+    const groupEnd = findBashOutputGroupEnd(messages, index, processId, workBundleInfos);
 
     const groupSize = groupEnd - index + 1;
     if (groupSize >= 3) {

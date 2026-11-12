@@ -389,6 +389,9 @@ Found the **message renderer** and its responsive story coverage.
         <MessageRenderer message={withMetadata} />
       </TooltipProvider>
     );
+    // Who wrote the report is part of the opened row.
+    expect(metadataView.queryByText("thinking: high")).toBeNull();
+    fireEvent.click(metadataView.getByRole("button", { name: "Show subagent report details" }));
     expect(metadataView.getByText("Opus 5")).toBeDefined();
     expect(metadataView.getByText("thinking: high")).toBeDefined();
     metadataView.unmount();
@@ -402,6 +405,7 @@ Found the **message renderer** and its responsive story coverage.
         <MessageRenderer message={withoutMetadata} />
       </TooltipProvider>
     );
+    fireEvent.click(plainView.getByRole("button", { name: "Show subagent report details" }));
     expect(plainView.queryByText(/thinking:/)).toBeNull();
   });
 

@@ -62,6 +62,7 @@ import { TRANSCRIPT_MAX_MOUNTED_ROWS } from "@/common/constants/ui";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
+  useBashSandboxApprovalToolCallIds,
   useWorkspaceAggregator,
   useWorkspaceState,
   useWorkspaceUsage,
@@ -121,11 +122,15 @@ import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import {
   buildEditingStateFromDisplayed,
-  canEditDisplayedUserMessage,
+  findLastEditablePrompt,
   normalizeQueuedMessage,
   type EditingMessageState,
 } from "@/browser/utils/chatEditing";
-import { estimateTranscriptRowWeight } from "@/browser/utils/messages/transcriptRenderProjection";
+import {
+  computeWindowRowIndices,
+  estimateTranscriptRowWeight,
+  selectTranscriptWindowRows,
+} from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { markChatSwitchMilestoneOnNextFrame } from "@/browser/utils/perf/chatSwitchTiming";
@@ -666,18 +671,23 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [workspaceId, latestMessageId, onOpenTerminal]
   );
 
-  const transcriptRowDerivations = useTranscriptRowDerivations({
-    workspaceId,
-    messages: deferredMessages,
-  });
-  const { bashOutputGroupInfos, expandedBashGroups, expandBashGroup } = transcriptRowDerivations;
-
+  const approvalToolCallIds = useBashSandboxApprovalToolCallIds(workspaceId);
   const transcriptBundles = useTranscriptBundles({
     workspaceId,
     messages: deferredMessages,
     transcriptDensity,
     isTurnActive: isStreamStarting || canInterrupt,
+    approvalToolCallIds,
   });
+
+  // After the bundles: bash_output poll groups stop at work-line boundaries.
+  const transcriptRowDerivations = useTranscriptRowDerivations({
+    workspaceId,
+    messages: deferredMessages,
+    workBundleInfos: transcriptBundles.workBundleInfos,
+  });
+  const { bashOutputGroupInfos, expandedBashGroups, expandBashGroup } = transcriptRowDerivations;
+
   const {
     workBundleInfos,
     operationalBundleInfos,
@@ -694,7 +704,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const bashOutputGroup = bashOutputGroupInfos[index];
     if (bashOutputGroup !== undefined && bashOutputGroup.position !== "first") return false;
     const workBundle = workBundleInfos?.[index];
-    if (workBundle !== undefined && workBundle.position !== "head") return false;
+    if (workBundle !== undefined && workBundle.headIndex !== index) return false;
     const operationalBundle = operationalBundleInfos?.[index];
     return operationalBundle === undefined || operationalBundle.position === "head";
   };
@@ -734,21 +744,28 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
   // it: it would otherwise mount the whole transcript in the one commit that replaces the
   // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
+  // The window budgets the rows that mount. In compact density the steps behind a closed work
+  // line mount nothing, so it is given the rows that do (computeWindowRowIndices), and its
+  // indices are translated back to the transcript's below.
+  const windowRows = showTranscriptHydrationPlaceholder
+    ? selectTranscriptWindowRows(EMPTY_TRANSCRIPT, undefined)
+    : selectTranscriptWindowRows(deferredMessages, computeWindowRowIndices(workBundleInfos));
   const {
-    fromIndex: revealFromIndex,
-    toIndex: revealToIndex,
+    fromIndex: windowFromIndex,
+    toIndex: windowToIndex,
     isDetached: isTranscriptDetached,
     isFullyRevealed,
     isRevealPaused,
     revealMore,
-    revealThrough,
+    revealThrough: revealThroughWindowRow,
     revealNewer,
     resetToLatest,
   } = useBoundedTranscriptReveal({
     workspaceId,
-    messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
-    isSafeCut: isSafeRevealCut,
-    rowWeight: (index) => estimateTranscriptRowWeight(deferredMessages[index]),
+    messages: windowRows.rows,
+    isSafeCut: (index) => isSafeRevealCut(windowRows.toTranscriptIndex(index)),
+    rowWeight: (index) =>
+      estimateTranscriptRowWeight(deferredMessages[windowRows.toTranscriptIndex(index)]),
     // Bounds renderer heap on long read-backs (#4961 F20): past the cap the newest rows unmount
     // ("detached") until Show newer or Jump to bottom brings them back.
     maxMountedRows: TRANSCRIPT_MAX_MOUNTED_ROWS,
@@ -761,6 +778,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   useLayoutEffect(() => {
     setTranscriptDetached(isTranscriptDetached);
   }, [isTranscriptDetached, setTranscriptDetached]);
+  const revealFromIndex = windowRows.toTranscriptIndex(windowFromIndex);
+  const revealToIndex = windowRows.toTranscriptIndex(windowToIndex);
   const revealedMessages = mountedSlice(deferredMessages, revealFromIndex, revealToIndex);
   // An accepted non-blocking answer closes its question without any transcript change.
   useAcceptedAnswersVersion();
@@ -897,7 +916,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // The automatic reveal may have paused above the target, so ask it to reach the target. A
     // target below a detached slice re-centers the slice on it.
     if (!isInSlice(targetIndex, revealFromIndex, revealToIndex)) {
-      revealThrough(targetIndex);
+      // A target folded behind a work line is mounted with the line it sits behind.
+      revealThroughWindowRow(windowRows.toWindowIndex(targetIndex));
       return;
     }
 
@@ -928,7 +948,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     operationalBundleInfos,
     pendingTimelineReveal,
     revealFromIndex,
-    revealThrough,
+    revealThroughWindowRow,
+    windowRows,
     revealToIndex,
     setOperationalBundleExpanded,
     setWorkBundleExpanded,
@@ -1022,14 +1043,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       setPendingScrollTarget(null);
       return;
     }
-    revealThrough(targetIndex);
+    revealThroughWindowRow(windowRows.toWindowIndex(targetIndex));
   }, [
     autoScroll,
     contentRef,
     deferredMessages,
     pendingScrollTarget,
     revealFromIndex,
-    revealThrough,
+    revealThroughWindowRow,
+    windowRows,
     revealToIndex,
     workspaceId,
   ]);
@@ -1232,13 +1254,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // Otherwise, edit last user message. `current.messages` may be a cached/provisional view
     // while the replay is still running, so ArrowUp must not enter edit mode until caught up.
     if (!isTranscriptMutationAllowed(workspaceId)) return;
-    const transformedMessages = mergeConsecutiveStreamErrors(current.messages);
-    const lastUserMessage = [...transformedMessages]
-      .reverse()
-      .find(
-        (msg): msg is Extract<DisplayedMessage, { type: "user" }> =>
-          msg.type === "user" && canEditDisplayedUserMessage(msg)
-      );
+    const lastUserMessage = findLastEditablePrompt(mergeConsecutiveStreamErrors(current.messages));
 
     if (!lastUserMessage) {
       return;

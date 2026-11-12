@@ -1,5 +1,5 @@
 import React, { useLayoutEffect, useRef, useState } from "react";
-import { FileText, Info, Layers } from "lucide-react";
+import { FileText, Info, Layers, X } from "lucide-react";
 import type { BashToolArgs, BashToolResult } from "@/common/types/tools";
 import { BASH_DEFAULT_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 import {
@@ -13,7 +13,6 @@ import {
   DetailContent,
   ToolIcon,
   ErrorBox,
-  ExitCodeBadge,
 } from "./Shared/ToolPrimitives";
 import {
   useToolExpansion,
@@ -79,6 +78,49 @@ function SandboxDenialFooter(props: { summary: string | null }) {
   return (
     <div className="text-warning mt-1 font-sans text-[11px] wrap-anywhere">{props.summary}</div>
   );
+}
+
+/** The timing in a bash row's header: the timeout, then the clock while it runs or how long it took. */
+function BashHeaderTiming(props: {
+  timeoutSecs: BashToolArgs["timeout_secs"];
+  result: BashToolResult | undefined;
+  isPending: boolean;
+  startedAt: number | undefined;
+}) {
+  return (
+    <span
+      className={cn(
+        "ml-2 text-[10px] tabular-nums whitespace-nowrap [@container(max-width:500px)]:hidden",
+        props.isPending ? "text-pending" : "text-text-secondary"
+      )}
+    >
+      timeout: {props.timeoutSecs ?? BASH_DEFAULT_TIMEOUT_SECS}s
+      {/* Kernel-mode nested reloads reconstruct partial results without
+          wall_duration_ms; skip it instead of rendering "took —". */}
+      {typeof props.result?.wall_duration_ms === "number" &&
+        ` • took ${formatDuration(props.result.wall_duration_ms)}`}
+      {!props.result && (
+        <ElapsedTimeDisplay startedAt={props.startedAt} isActive={props.isPending} />
+      )}
+    </span>
+  );
+}
+
+/**
+ * The text of a bash row's status slot. A failed command says why once, in the status slot:
+ * "exit 1" replaces the generic "failed" and the separate exit-code pill. A zero exit shows
+ * nothing at all. Kernel-mode nested reloads can lack exitCode, so check the type.
+ */
+function BashStatusLabel(props: { status: ToolStatus; result: BashToolResult | undefined }) {
+  if (props.status === "failed" && typeof props.result?.exitCode === "number") {
+    return (
+      <>
+        <X aria-hidden="true" className="mr-1 inline-block h-3 w-3 align-[-2px]" />
+        <span className="status-text">exit {props.result.exitCode}</span>
+      </>
+    );
+  }
+  return <>{getStatusDisplay(props.status)}</>;
 }
 
 export const BashToolCall: React.FC<BashToolCallProps> = ({
@@ -190,7 +232,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <ExpandIcon expanded={expanded} />
         <ToolIcon toolName="bash" />
         {bashCollapsedSummary.kind === "intent-command" ? (
           <span className="flex min-w-0 flex-1 flex-col leading-tight">
@@ -254,29 +296,20 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             {args.display_name}
           </span>
         )}
-        {!isBackground && !showsDurationInCollapsedSummary && (
-          // Normal mode: show timeout and duration
-          <span
-            className={cn(
-              "ml-2 text-[10px] tabular-nums whitespace-nowrap [@container(max-width:500px)]:hidden",
-              isPending ? "text-pending" : "text-text-secondary"
-            )}
-          >
-            timeout: {args.timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS}s
-            {/* Kernel-mode nested reloads reconstruct partial results without
-                wall_duration_ms/exitCode; skip those fields instead of
-                rendering "took —" and an empty exit-code pill. */}
-            {typeof result?.wall_duration_ms === "number" &&
-              ` • took ${formatDuration(result.wall_duration_ms)}`}
-            {!result && <ElapsedTimeDisplay startedAt={startedAt} isActive={isPending} />}
-          </span>
-        )}
-        {!isBackground && typeof result?.exitCode === "number" && (
-          <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />
+        {!isBackground && !showsDurationInCollapsedSummary && (!result || expanded) && (
+          // While running, show the budget and the clock. A finished command's timeout and
+          // duration are detail, not headline: the collapsed row keeps to the command itself
+          // (as Claude Code, Codex and Cursor do) and expanding the card brings them back.
+          <BashHeaderTiming
+            timeoutSecs={args.timeout_secs}
+            result={result}
+            isPending={isPending}
+            startedAt={startedAt}
+          />
         )}
         <SandboxDenialBadge summary={sandboxDenialSummary} />
         <StatusIndicator status={effectiveStatus}>
-          {getStatusDisplay(effectiveStatus)}
+          <BashStatusLabel status={effectiveStatus} result={result} />
         </StatusIndicator>
         {/* Show "Background" button when bash is executing and can be sent to background.
             Use invisible when executing but not yet confirmed as foreground to avoid layout flash. */}
@@ -292,7 +325,8 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
                 }}
                 disabled={!canSendToBackground}
                 className={cn(
-                  "ml-2 flex cursor-pointer items-center gap-1 rounded p-1 text-[10px] font-medium transition-colors",
+                  // The running dots sit by the command, so this action takes the right edge.
+                  "ml-auto flex cursor-pointer items-center gap-1 rounded p-1 text-[10px] font-medium transition-colors",
                   "bg-[var(--color-pending)]/20 text-[var(--color-pending)]",
                   "hover:bg-[var(--color-pending)]/30",
                   "disabled:pointer-events-none disabled:invisible"

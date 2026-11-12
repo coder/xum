@@ -670,6 +670,39 @@ describe("computeBashOutputGroupInfo", () => {
     }
   });
 
+  // Compact density opens each work line on its own. A group's toggle sits with its first row,
+  // so a group that spanned two lines would hide polls that no visible toggle could reveal.
+  it("stops a group where the work line changes", () => {
+    const messages: DisplayedMessage[] = [1, 2, 3, 4, 5, 6].map((n) =>
+      createBashOutputMessage(String(n), "proc", n)
+    );
+    const lineA = { key: "work:a" };
+    const lineB = { key: "work:b" };
+    const infos = computeBashOutputGroupInfos(messages, [lineA, lineA, lineA, lineB, lineB, lineB]);
+
+    expect(infos.map((info) => info?.groupKey)).toEqual(["1", "1", "1", "4", "4", "4"]);
+    expect(infos[2]).toMatchObject({ position: "last", totalCount: 3 });
+    expect(infos[3]).toMatchObject({ position: "first", totalCount: 3 });
+
+    // Too few polls on one side of the boundary to collapse: they stay plain rows.
+    const uneven = computeBashOutputGroupInfos(messages, [
+      lineA,
+      lineA,
+      lineA,
+      lineA,
+      lineB,
+      lineB,
+    ]);
+    expect(uneven.map((info) => info?.groupKey)).toEqual([
+      "1",
+      "1",
+      "1",
+      "1",
+      undefined,
+      undefined,
+    ]);
+  });
+
   // Rows are memoized on prop identity: older rows loaded above a group must not hand its
   // rows new (equal) info objects, or every mounted group row re-renders per page (#4961 F20).
   it("returns the same info objects when older rows are prepended", () => {
