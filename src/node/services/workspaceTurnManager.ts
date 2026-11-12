@@ -102,6 +102,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import {
   describeForcedArchiveLoss,
   describeForcedLossBeforeFailure,
+  FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL,
   forcedArchiveAcknowledgements,
   subagentPathLines,
   type ForcedArchiveLoss,
@@ -243,12 +244,6 @@ const CASCADE_LOSSY_REFUSAL_ADVICE =
   "You must not delete the files yourself to get around it. " +
   "Ask the user to archive this workspace manually (the archive dialog lists the sub-agents' files and asks for confirmation). " +
   "If the user asked you to clean up, or the work is provably saved, archive again with force.";
-
-// A forced archive deletes only the files it listed: a different set at the sink means someone
-// wrote to the checkout since, so nothing was deleted for it.
-const FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL =
-  "The untracked files changed after force listed them, so the archive deleted nothing for this workspace. " +
-  "The files now listed in paths would be deleted; archive again with force to delete them.";
 
 const DELETE_CODER_WORKSPACE_ARCHIVE_REFUSAL =
   'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop". If the user asked you to clean up, or the work is provably saved, archive again with force.';

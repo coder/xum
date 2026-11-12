@@ -12,6 +12,7 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { Ok, Err, type Result } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
+import { FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL } from "@/node/services/forcedArchiveLoss";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import { waitForCondition } from "@/node/services/testDispatchHelpers";
 import assert from "node:assert";
@@ -1347,10 +1348,12 @@ describe("WorkspaceTurnManager", () => {
       expect(data.note).toBeUndefined();
       expect(archive).toHaveBeenCalledTimes(2);
       expect(archive.mock.calls[1]?.[1]).toEqual(["scratch.txt"]);
-      // A changed set is not the plain "ask the user" refusal: the model must not read it as a
-      // refusal that force could never lift, nor the reverse.
-      expect(data.status === "error" ? data.error : plain.status).not.toBe(
-        plain.status === "error" ? plain.error : data.status
+      // The changed-set refusal is its own message, never the plain "ask the user" one.
+      expect(data.status === "error" ? data.error : undefined).toBe(
+        FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL
+      );
+      expect(plain.status === "error" ? plain.error : undefined).not.toBe(
+        FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL
       );
     });
 
@@ -1520,6 +1523,8 @@ describe("WorkspaceTurnManager", () => {
             subagents: [
               { workspaceId: "sub-done", title: "Done one", paths: ["notes.txt"] },
               { workspaceId: "sub-late", title: "Late one", paths: ["late.txt"] },
+              // Listed, but its row is gone: it must read as not archived, not throw.
+              { workspaceId: "sub-missing", title: "Gone one", paths: ["gone.txt"] },
             ],
           })
         )
@@ -1567,6 +1572,7 @@ describe("WorkspaceTurnManager", () => {
       // The archived sub-agent's file is reported. The one that never archived lost nothing.
       expect(result.note).toContain("sub-done: notes.txt");
       expect(result.note).not.toContain("late.txt");
+      expect(result.note).not.toContain("gone.txt");
     });
 
     test("a failed archive that is not forced adds no loss note", async () => {

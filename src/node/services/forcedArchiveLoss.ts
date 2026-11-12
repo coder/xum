@@ -21,6 +21,17 @@ export interface ForcedArchiveLoss {
   deletedCoderWorkspaceName?: string | undefined;
 }
 
+// The checkout and Coder deletions run after the archive is saved and are best effort.
+const BEST_EFFORT_DELETION = "A deletion that failed leaves the path or workspace in place.";
+
+/**
+ * A forced archive deletes only the files it listed: a different set at the sink means someone
+ * wrote to the checkout since, so nothing was deleted for it.
+ */
+export const FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL =
+  "The untracked files changed after force listed them, so the archive deleted nothing for this workspace. " +
+  "The files now listed in paths would be deleted; archive again with force to delete them.";
+
 /** A sub-agent's path, prefixed with its workspace ID: each path is relative to its checkout. */
 export function subagentPathLines(subagents: ArchiveCascadePreflight["subagents"]): string[] {
   return subagents.flatMap((subagent) =>
@@ -89,13 +100,10 @@ export function describeForcedArchiveLoss(loss: ForcedArchiveLoss): {
       `Force let the Coder "delete" archive policy delete the dedicated Coder workspace ${loss.deletedCoderWorkspaceName}; unarchive cannot recreate it.`
     );
   }
-  if (parts.length > 0) {
-    // The checkout and Coder deletions run after the archive is saved and are best effort.
-    parts.push("A deletion that failed leaves the path or workspace in place.");
-  }
+  const note = parts.length > 0 ? [...parts, BEST_EFFORT_DELETION].join(" ") : undefined;
   return {
     ...(paths.length > 0 ? { paths } : {}),
-    ...(parts.length > 0 ? { note: parts.join(" ") } : {}),
+    ...(note != null ? { note } : {}),
   };
 }
 
