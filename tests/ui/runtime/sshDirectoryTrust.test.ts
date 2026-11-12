@@ -27,7 +27,7 @@ type AppView = ReturnType<typeof renderApp>;
 
 /**
  * The host and directory inputs are in the environment panel, which is portaled to document.body;
- * the trust row and "Set as default" stay on the page. Both are under the document body. The
+ * the trust row stays on the page and "Set as default" is in the panel's footer. Both are under the document body. The
  * panel is modal, so a test closes it before it uses the page.
  */
 const page = (): HTMLElement => document.body;
@@ -69,7 +69,7 @@ async function openSshNoneForm(view: AppView, projectPath: string, dir: string) 
   if (!dirInput) throw new Error("Directory input not found");
   await user.clear(dirInput);
   await user.type(dirInput, dir);
-  // The panel is modal: close it so the tests can use the trust row and "Set as default".
+  // The panel is modal: close it so the tests can use the trust row on the page.
   await closeCreationEnvironment(view.container);
   return { user };
 }
@@ -196,6 +196,8 @@ describeIntegration("SSH+None directory trust (UI)", () => {
 
     try {
       const { user } = await openSshNoneForm(view, projectPath, "/srv/app");
+      // "Set as default" is in the panel's footer.
+      await openCreationEnvironment(view.container);
       await user.click(await findButtonEventually(page(), "Set as default"));
 
       await waitFor(() => {
@@ -217,8 +219,8 @@ describeIntegration("SSH+None directory trust (UI)", () => {
     const view = renderApp({ apiClient: client });
 
     try {
+      // The panel is closed here: the shortcut belongs to the page, not to the footer button.
       await openSshNoneForm(view, projectPath, "/srv/app");
-      await findButtonEventually(page(), "Set as default");
       const chord = new window.KeyboardEvent("keydown", {
         key: "D",
         code: "KeyD",
@@ -232,12 +234,10 @@ describeIntegration("SSH+None directory trust (UI)", () => {
       Object.defineProperty(chord, "getModifierState", { value: () => false });
       fireEvent(window, chord);
 
-      await waitFor(() => {
-        const state = page().querySelector('[data-component="IsolationDefaultState"]');
-        if (!state) throw new Error("Default state not shown");
+      await waitFor(async () => {
+        const saved = new Map(await client.projects.list()).get(projectPath);
+        expect(saved?.defaultIsolation).toEqual({ project: "ssh", workspace: "none" });
       });
-      const saved = new Map(await client.projects.list()).get(projectPath);
-      expect(saved?.defaultIsolation).toEqual({ project: "ssh", workspace: "none" });
     } finally {
       await cleanupView(view, cleanupDom);
     }

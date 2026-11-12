@@ -180,6 +180,8 @@ interface UseCreationWorkspaceReturn {
   branches: string[];
   /** Where listBranches stands: a failed list is not an empty (non-git) one (#6055). */
   branchLoad: BranchLoadStatus;
+  /** The repository's default branch as the backend recommends it; null until known. */
+  recommendedTrunk: string | null;
   trunkBranch: string;
   setTrunkBranch: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -1058,6 +1060,7 @@ export function useCreationWorkspace({
   return {
     branches,
     branchLoad,
+    recommendedTrunk,
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,
     selectedRuntime: settings.selectedRuntime,

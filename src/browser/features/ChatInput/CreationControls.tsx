@@ -32,10 +32,11 @@ import {
   type RuntimeFieldError,
 } from "./creationEnvironmentSummary";
 import { CreationProjectSelect } from "./CreationProjectSelect";
-import { SetDefaultIsolationButton } from "./SetDefaultIsolationButton";
+import { SetDefaultIsolationButton, useSetDefaultIsolation } from "./SetDefaultIsolationButton";
 import { SshDirectoryTrustNotice } from "./SshDirectoryTrustNotice";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
@@ -132,6 +133,8 @@ interface CreationControlsProps {
   branches: string[];
   /** Where the branch list stands; only a loaded empty list means a non-git repo (#6055). */
   branchLoad: BranchLoadStatus;
+  /** The repository's default branch, tagged "default" in the branch list. */
+  defaultBranch?: string | null;
   trunkBranch: string;
   onTrunkBranchChange: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -845,6 +848,12 @@ function CreationControlsContent(props: CreationControlsProps) {
     isNonGitRepo,
     fieldError,
   };
+  const defaultSaver = useSetDefaultIsolation({
+    projectPath: props.projectPath,
+    isolation: currentIsolation,
+    disabled: props.disabled,
+    rememberShownFields: () => onSelectedRuntimeChange(selectedRuntime),
+  });
   const selectIsolation = (choice: IsolationChoice) => {
     const runtime = runtimeForIsolationChoice(choice, {
       runtimeChoiceContext,
@@ -1030,20 +1039,28 @@ function CreationControlsContent(props: CreationControlsProps) {
                     load: props.branchLoad,
                     options: branchOptions,
                     selected: props.trunkBranch,
+                    defaultBranch: props.defaultBranch ?? null,
                     onSelect: props.onTrunkBranchChange,
                   }
                 : null
             }
             fieldError={fieldError}
             fieldErrorAttempt={props.runtimeFieldErrorAttempt ?? 0}
-          />
-          <SetDefaultIsolationButton
-            projectPath={props.projectPath}
-            isolation={currentIsolation}
-            disabled={props.disabled}
-            rememberShownFields={() => onSelectedRuntimeChange(selectedRuntime)}
+            footerAction={<SetDefaultIsolationButton saver={defaultSaver} />}
+            footerShortcut={
+              defaultSaver.canSave
+                ? { keybind: KEYBINDS.SET_DEFAULT_ISOLATION, run: () => void defaultSaver.save() }
+                : null
+            }
           />
         </div>
+
+        {/* A failed save from the shortcut has no open panel to report in. */}
+        {defaultSaver.error !== null && (
+          <span role="alert" className="text-error text-xs">
+            {defaultSaver.error}
+          </span>
+        )}
 
         {/* The directory's trust stays on the page, under the chip, not inside the panel: its
             pending and error state must survive the panel closing, and the trust state stands
@@ -1132,6 +1149,7 @@ export function CreationControls(props: CreationControlsProps) {
     <CreationControlsContent
       branches={props.branches}
       branchLoad={props.branchLoad}
+      defaultBranch={props.defaultBranch}
       trunkBranch={props.trunkBranch}
       onTrunkBranchChange={props.onTrunkBranchChange}
       selectedRuntime={props.selectedRuntime}

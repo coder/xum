@@ -269,7 +269,7 @@ export interface IsolationOptionUi {
 export const PROJECT_ISOLATION_UI = {
   local: {
     label: "Local",
-    description: "Run on this machine",
+    description: "This machine",
     docsPath: "/runtime",
     Icon: LocalMachineIcon,
     triggerClass:
@@ -278,7 +278,7 @@ export const PROJECT_ISOLATION_UI = {
   },
   ssh: {
     label: "SSH",
-    description: "Run on a remote host over SSH",
+    description: "A remote host",
     docsPath: RUNTIME_UI.ssh.docsPath,
     Icon: RUNTIME_UI.ssh.Icon,
     triggerClass:
@@ -300,7 +300,7 @@ export const PROJECT_ISOLATION_UI = {
 export const WORKSPACE_ISOLATION_UI = {
   none: {
     label: "None",
-    description: "Work directly in the project directory",
+    description: "Work in the project directory",
     docsPath: RUNTIME_UI.local.docsPath,
     Icon: RUNTIME_UI.local.Icon,
     triggerClass:
@@ -309,7 +309,7 @@ export const WORKSPACE_ISOLATION_UI = {
   },
   worktree: {
     label: "Worktree",
-    description: "Separate git worktree per workspace",
+    description: "A git worktree per workspace",
     docsPath: RUNTIME_UI.worktree.docsPath,
     Icon: RUNTIME_UI.worktree.Icon,
     triggerClass:
@@ -318,7 +318,7 @@ export const WORKSPACE_ISOLATION_UI = {
   },
   docker: {
     label: "Docker",
-    description: "Separate container per workspace",
+    description: "A container per workspace",
     docsPath: RUNTIME_UI.docker.docsPath,
     Icon: RUNTIME_UI.docker.Icon,
     triggerClass:
@@ -327,7 +327,7 @@ export const WORKSPACE_ISOLATION_UI = {
   },
   devcontainer: {
     label: "Dev container",
-    description: "Container built from the project's devcontainer.json",
+    description: "Built from the project's devcontainer.json",
     docsPath: RUNTIME_UI.devcontainer.docsPath,
     Icon: RUNTIME_UI.devcontainer.Icon,
     triggerClass:

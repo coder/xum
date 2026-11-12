@@ -4,6 +4,12 @@ export interface FilterListItem {
   label: string;
   /** Secondary text (a path, a hint). Searched along with the label. */
   detail?: string;
+  /** A small outlined tag after the label ("default" on the default branch). Not searched. */
+  badge?: string;
+  /** Muted text at the row's right edge ("No project"). Not searched. */
+  aside?: string;
+  /** Draws a separator above this row unless it is the first one shown. */
+  divider?: boolean;
 }
 
 /** Case-insensitive substring filter over label and detail; an empty query keeps every item. */
