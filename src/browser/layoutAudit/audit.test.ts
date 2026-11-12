@@ -748,6 +748,40 @@ describe("overlapping-text", () => {
       const wide = TEXT("10 10 40 440", "overflow-x: clip", LINES(22, 400));
       expect(audit(`<div id="stage">${wide}${COVER_FROM("60 0 600 600")}</div>`)).toEqual([]);
     });
+
+    // An overflow box clips the boxes that it contains: an absolutely positioned box is placed in
+    // its nearest positioned ancestor, so a clipper between the two does not cut it, and a fixed
+    // box is placed in the viewport, so no clipper does. The text sits at y 100, wholly outside the
+    // 50 x 20 clippers at the top, and the page paints it there.
+    describe("an absolutely positioned or fixed box", () => {
+      const CLIP = "overflow-x: hidden; overflow-y: hidden";
+      const PLACED = (position: string) =>
+        `<div data-box="10 100 200 20" data-css="position: ${position}"><p id="t" data-box="10 100 200 20" data-css="webkit-line-clamp: 2" data-lines="10 100 200 20">Hello world text</p>${COVER_FROM("0 90 300 60")}</div>`;
+      const CLIPPER = (css: string, inside: string) =>
+        `<div data-box="10 10 50 20" data-css="${css}">${inside}</div>`;
+      const PAGE = (inside: string) => `<div id="stage">${inside}</div>`;
+
+      test.each(["absolute", "fixed"])(
+        "%s: is not cut by a clipper that is no containing block for it",
+        (position) => {
+          expect(audit(PAGE(CLIPPER(CLIP, PLACED(position))))).toEqual(COVERED);
+        }
+      );
+
+      test("an absolute box is cut by a positioned clipper: that one is its containing block", () => {
+        expect(audit(PAGE(CLIPPER(`${CLIP}; position: relative`, PLACED("absolute"))))).toEqual([]);
+      });
+
+      test("an absolute box is cut by a positioned clipper further out, past one that does not cut it", () => {
+        const inner = CLIPPER(CLIP, PLACED("absolute"));
+        expect(audit(PAGE(CLIPPER(`${CLIP}; position: relative`, inner)))).toEqual([]);
+      });
+
+      test("a fixed box is cut by no clipper, a positioned one included", () => {
+        const inner = CLIPPER(CLIP, PLACED("fixed"));
+        expect(audit(PAGE(CLIPPER(`${CLIP}; position: relative`, inner)))).toEqual(COVERED);
+      });
+    });
   });
 
   test("positioned text overlaps on purpose, and motion makes the sample unreliable", () => {

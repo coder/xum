@@ -300,23 +300,43 @@ export function clippingBoundariesFor(page: LayoutPage, el: Element): ClippingBo
   );
 }
 
+// The element whose overflow can clip `node`: the one that `node`'s box is placed in. An absolutely
+// positioned box is placed in its nearest positioned ancestor (a clipper between them does not cut
+// it), a fixed box in the viewport (no element), any other box in its parent. A transform or a
+// similar property also makes a containing block: `LayoutStyle` has none of them, so a clipper
+// that is one only by that is read as no containing block and does not cut.
+function containingBlockOf(page: LayoutPage, node: Element): Element | null {
+  const position = page.style(node).position;
+  if (position === "fixed") return null;
+  let parent = node.parentElement;
+  while (position === "absolute" && parent && page.style(parent).position === "static") {
+    parent = parent.parentElement;
+  }
+  return parent;
+}
+
 /**
  * The part of `rect`, a rendered line or the box of `el`, that overflow leaves visible: `rect`
- * cut at the padding box of `el` and of each ancestor that clips (`overflow: hidden | clip`), on
- * the axes it clips. A line clamp or a short box still has line rectangles for the lines it cuts
- * away, so a rule that samples what a user sees reads them through this. Null when none is left.
+ * cut at the padding box of `el` and of each element that clips (`overflow: hidden | clip`) among
+ * the ones that contain it, on the axes it clips. A line clamp or a short box still has line
+ * rectangles for the lines it cuts away, so a rule that samples what a user sees reads them
+ * through this. Null when none is left.
  */
 export function visiblePart(page: LayoutPage, el: Element, rect: Box): Box | null {
-  const own = clippingBoundaryOf(page, el);
   let { left, top, right, bottom } = rect;
-  for (const { box, axes } of [...(own ? [own] : []), ...clippingBoundariesFor(page, el)]) {
-    if (axes.includes("horizontal")) {
-      left = Math.max(left, box.left);
-      right = Math.min(right, box.right);
+  for (
+    let node: Element | null = el;
+    node && !isRootElement(page, node);
+    node = containingBlockOf(page, node)
+  ) {
+    const clip = clippingBoundaryOf(page, node);
+    if (clip?.axes.includes("horizontal")) {
+      left = Math.max(left, clip.box.left);
+      right = Math.min(right, clip.box.right);
     }
-    if (axes.includes("vertical")) {
-      top = Math.max(top, box.top);
-      bottom = Math.min(bottom, box.bottom);
+    if (clip?.axes.includes("vertical")) {
+      top = Math.max(top, clip.box.top);
+      bottom = Math.min(bottom, clip.box.bottom);
     }
   }
   if (right <= left || bottom <= top) return null;

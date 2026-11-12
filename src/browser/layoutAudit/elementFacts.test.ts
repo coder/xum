@@ -62,9 +62,9 @@ describe("visiblePart", () => {
   const LINE = { left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 };
 
   /** `LINE` as the text of a <p> in a 50 x 10 box at 10, 5, with `css` on the box (a <div>). */
-  function visibleInBox(css: string, rect = LINE) {
+  function visibleInBox(css: string, rect = LINE, position = "static") {
     using fake = createFakeLayoutPage(
-      `<div data-box="10 5 50 10" data-css="${css}"><p data-box="0 0 100 20">text</p></div>`
+      `<div data-box="10 5 50 10" data-css="${css}"><p data-box="0 0 100 20" data-css="position: ${position}">text</p></div>`
     );
     const paragraph = fake.page.document.querySelector("p");
     if (paragraph === null) throw new Error("no <p>");
@@ -92,6 +92,16 @@ describe("visiblePart", () => {
   test("cuts at the padding box: a border is not room for text", () => {
     const bordered = "overflow-x: hidden; border-left-width: 4px; border-right-width: 6px";
     expect(visibleInBox(bordered)).toEqual({ ...LINE, left: 14, right: 54, width: 40 });
+  });
+
+  test("skips a clipper that its text's box is not placed in", () => {
+    const hidden = "overflow-x: hidden; overflow-y: hidden";
+    expect(visibleInBox(hidden, LINE, "absolute")).toEqual(LINE);
+    expect(visibleInBox(hidden, LINE, "fixed")).toEqual(LINE);
+    // The box is placed in the nearest positioned ancestor: this clipper is one, so it cuts.
+    const cut = { ...LINE, left: 10, top: 5, right: 60, bottom: 15, width: 50, height: 10 };
+    expect(visibleInBox(`${hidden}; position: relative`, LINE, "absolute")).toEqual(cut);
+    expect(visibleInBox(hidden, LINE, "relative")).toEqual(cut);
   });
 
   test("returns null when nothing is left, a rectangle that only touches the box included", () => {
