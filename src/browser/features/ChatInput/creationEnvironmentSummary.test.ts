@@ -117,6 +117,9 @@ describe("summarizeUnavailableReason", () => {
     ["Docker (or Podman) is not running or not installed", "Docker not available"],
     ["No devcontainer.json found", "No devcontainer.json"],
     ["Something else failed. Try again later", "Something else failed"],
+    // An empty first clause falls back to the whole reason; a one-character clause does not.
+    [": no details", ": no details"],
+    ["X. More", "X"],
   ])("shortens %p to a setup hint", (reason, summary) => {
     expect(summarizeUnavailableReason(reason)).toEqual({ summary, needsSetup: true });
   });
