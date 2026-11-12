@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { selectorFor, textTruncation } from "./elementFacts";
+import { selectorFor, textFragments, textTruncation } from "./elementFacts";
 import { createFakeLayoutPage } from "./fakeLayoutPage.testHarness";
 
 /** The selectors of every element matching `query`, in document order. */
@@ -55,5 +55,46 @@ describe("textTruncation", () => {
     expect(truncationOf("webkit-line-clamp: 2")).toBe("line-clamp");
     expect(truncationOf("text-overflow: ellipsis; webkit-line-clamp: 2")).toBe("line-clamp");
     expect(truncationOf("webkit-line-clamp: none")).toBe("none");
+  });
+});
+
+describe("textFragments", () => {
+  const SHOWN_LINE = "0 0 100 20";
+  // A paragraph with its own line and `inner` after it. A Range measures hidden text too, so the
+  // fake gives every span lines: what comes back is what the filter let through.
+  function paragraphLines(inner: string): number[] {
+    using fake = createFakeLayoutPage(`<p data-lines="${SHOWN_LINE}">Visible ${inner}</p>`);
+    const paragraph = fake.page.document.querySelector("p");
+    if (paragraph === null) throw new Error("no <p>");
+    return textFragments(fake.page, paragraph).map((box) => box.width);
+  }
+  const span = (css: string, attributes = "") =>
+    `<span data-css="${css}" ${attributes} data-lines="0 0 500 20">words</span>`;
+
+  test("a text boundary reads the text of what it holds, in document order", () => {
+    expect(paragraphLines(span(""))).toEqual([100, 500]);
+    expect(paragraphLines(`${span("")}${span("")}`)).toEqual([100, 500, 500]);
+  });
+
+  test.each([
+    ["visibility: hidden", span("visibility: hidden")],
+    ["opacity 0", span("opacity: 0")],
+    ["content-visibility: hidden", span("content-visibility: hidden")],
+    [
+      "inside a hidden element",
+      `<i data-css="visibility: hidden"><b data-lines="0 0 500 20">words</b></i>`,
+    ],
+    ["of a diagram", span("", 'class="mermaid"')],
+    [
+      "screen-reader-only",
+      span("position: absolute; white-space: nowrap; overflow-x: hidden", 'data-box="0 0 1 1"'),
+    ],
+  ])("text that is %s is not read", (_name, inner) => {
+    expect(paragraphLines(inner)).toEqual([100]);
+  });
+
+  test("a descendant that switches visibility back on is read", () => {
+    const inner = `<i data-css="visibility: hidden">${span("visibility: visible")}</i>`;
+    expect(paragraphLines(inner)).toEqual([100, 500]);
   });
 });

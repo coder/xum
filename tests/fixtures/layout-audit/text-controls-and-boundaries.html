@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Text controls, ARIA widgets and text boundaries</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      .field {
+        position: relative;
+        margin-top: 18px;
+        padding: 8px;
+      }
+      textarea {
+        display: block;
+        width: 220px;
+        height: 60px;
+        font-size: 16px;
+      }
+      .cover {
+        position: absolute;
+        inset: 0;
+        background: #fff;
+      }
+      /* A menu row narrower than its item: the item is a button with role menuitem. */
+      .menu {
+        width: 160px;
+        overflow: hidden;
+      }
+      .menu button {
+        width: 240px;
+        white-space: nowrap;
+      }
+      /* A card that clips a paragraph. The paragraph has no box of its own: its text is laid out in
+         the card, and it is one long word. */
+      .card {
+        width: 200px;
+        overflow: hidden;
+        font-size: 18px;
+      }
+      .card p {
+        display: contents;
+      }
+      /* A box that clips its paragraph. The long line after the words is hidden, so it is no clip. */
+      .note {
+        width: 200px;
+        overflow: hidden;
+        font-size: 18px;
+      }
+      .tooltip {
+        visibility: hidden;
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Settings</h1>
+      <!-- A textarea that holds text is drawn from a shadow tree: its text has no line to sample. -->
+      <section class="field">
+        <label><textarea id="notes">Initial value</textarea></label>
+        <div class="cover"></div>
+      </section>
+      <div class="menu" id="menu">
+        <button role="menuitem">Export the whole workspace</button>
+      </div>
+      <div class="card" id="card">
+        <p>Supercalifragilisticexpialidocious_and_more_letters_without_a_break</p>
+      </div>
+      <div class="note" id="note">
+        <p>
+          Short words <span class="tooltip">a hidden line that is much wider than the box</span>
+        </p>
+      </div>
+    </main>
+  </body>
+</html>

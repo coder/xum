@@ -374,8 +374,46 @@ describe("clipped-control", () => {
     expect(audit(link)).toHaveLength(1);
     const aria = IN_BAR('<div role="button" data-box="150 5 100 30">Buy</div>');
     expect(audit(aria)).toHaveLength(1);
-    const otherRole = IN_BAR('<button role="menuitem" data-box="150 5 100 30">Buy</button>');
-    expect(audit(otherRole)).toEqual([]);
+  });
+
+  // A native control stays one under any role, and a role on another element needs to be a
+  // widget role that one element fills by itself.
+  const CONTROL_FILLED: Array<[string, string]> = [
+    ["a button with role menuitem", '<button role="menuitem" data-box="150 5 100 30">Buy</button>'],
+    [
+      "a button with a role that is no widget",
+      '<button role="presentation" data-box="150 5 100 30">Buy</button>',
+    ],
+    ["a link with role tab", '<a href="#x" role="tab" data-box="150 5 100 30">Buy</a>'],
+    ["an input with role searchbox", '<input role="searchbox" data-box="150 5 100 30">'],
+    ...[
+      "menuitem",
+      "menuitemcheckbox",
+      "menuitemradio",
+      "option",
+      "tab",
+      "slider",
+      "spinbutton",
+      "searchbox",
+      "treeitem",
+      "combobox",
+      "TextBox",
+    ].map((role): [string, string] => [
+      `a div with role ${role}`,
+      `<div role="${role}" data-box="150 5 100 30">Buy</div>`,
+    ]),
+  ];
+
+  test.each(CONTROL_FILLED)("%s is a control", (_name, control) => {
+    expect(audit(IN_BAR(control))).toEqual([
+      finding("clipped-control", "div#bar", "horizontal", 50),
+    ]);
+  });
+
+  test("a container role is no control: its items are", () => {
+    for (const role of ["menu", "tablist", "listbox", "grid", "tree", "toolbar", "group"]) {
+      expect(audit(IN_BAR(`<div role="${role}" data-box="150 5 100 30">Buy</div>`))).toEqual([]);
+    }
   });
 
   test("a rounded or masked clipping ancestor is cutting on purpose", () => {
@@ -761,11 +799,21 @@ describe("overlapping-text", () => {
       expect(audit(inLabel('class="mermaid"'))).toEqual([]);
     });
 
-    test("a control that has text is still left to the paragraph around it", () => {
-      // Its text is in the item's lines, and a short one is no candidate there: only a control
-      // with no text at all is sampled by its box inside a paragraph.
+    // The item's lines are no stand-in for the control: they hold its text only when it has any
+    // (a short one is no candidate there), and say nothing of a covered control that has none.
+    test("a control that has text lines is sampled by them, inside a paragraph too", () => {
       const html = `<div id="stage"><li data-box="0 0 300 40"><textarea id="f" ${BOXED} data-lines="10 10 200 30">Go</textarea></li>${COVER()}</div>`;
-      expect(audit(html)).toEqual([]);
+      expect(audit(html)).toEqual([finding("overlapping-text", "textarea#f", "horizontal", 0)]);
+      const aria = `<div id="stage"><li data-box="0 0 300 40"><div role="checkbox" id="f" ${BOXED} data-lines="10 10 200 30">Go</div></li>${COVER()}</div>`;
+      expect(audit(aria)).toEqual([finding("overlapping-text", "div#f", "horizontal", 0)]);
+    });
+
+    test("a textarea that holds text has no text line, so it is sampled by its box", () => {
+      // A browser draws the value from a shadow tree: a Range over the text the textarea holds has
+      // no rectangle, so the control is sampled like an input.
+      const html = `<div id="stage"><label data-box="0 0 300 40">Notes <textarea id="f" ${BOXED}>Initial value</textarea></label>${COVER()}</div>`;
+      expect(audit(html)).toEqual([finding("overlapping-text", "textarea#f", "horizontal", 0)]);
+      expect(audit(html.replace(COVER(), ""))).toEqual([]);
     });
 
     test("an element that is no control, and a hidden or disabled control, are not sampled", () => {
@@ -848,6 +896,94 @@ describe("overlapping-text", () => {
       expect(() => auditLayout(failing)).toThrow("boom");
       expect(fake.calls.filter((call) => call.startsWith("scrollTo")).at(-1)).toBe("scrollTo 0");
     });
+  });
+});
+
+describe("text a text boundary holds that is not shown", () => {
+  // A Range still measures the text of a hidden or transparent element: the fake gives the span
+  // its lines too. Only what the user sees is evidence.
+  const HOLDING = (spanCss: string, lines: string, paragraphCss = "") =>
+    `<p id="p" data-box="0 0 300 20" data-css="${paragraphCss}" data-lines="0 0 100 20">Visible <span data-css="${spanCss}" data-lines="${lines}">words nobody sees</span></p>`;
+  const SHOWN = "visibility: visible";
+
+  test.each([["visibility: hidden"], ["opacity: 0"], ["content-visibility: hidden"]])(
+    "a span with %s does not clip its paragraph",
+    (css) => {
+      const clipping = "overflow-x: hidden";
+      expect(audit(HOLDING(SHOWN, "0 0 900 20", clipping))).toEqual([
+        finding("clipped-text", "p#p", "horizontal", 600),
+      ]);
+      expect(audit(HOLDING(css, "0 0 900 20", clipping))).toEqual([]);
+    }
+  );
+
+  test("a hidden span past the edge neither widens the page nor loses the paragraph's left edge", () => {
+    const wide = { viewport: { width: 390, height: 844, scrollWidth: 900 } };
+    expect(audit(HOLDING(SHOWN, "0 0 900 20"), wide)).toEqual([
+      finding("page-horizontal-overflow", "html", "horizontal", 510),
+    ]);
+    expect(audit(HOLDING("visibility: hidden", "0 0 900 20"), wide)).toEqual([]);
+    expect(audit(HOLDING(SHOWN, "-200 0 100 20"))).toEqual([
+      finding("viewport-unreachable-content", "p#p", "horizontal", 200),
+    ]);
+    expect(audit(HOLDING("visibility: hidden", "-200 0 100 20"))).toEqual([]);
+  });
+
+  test("a hidden span does not dilute the cover over the text that is shown", () => {
+    // Half of the lines Range measures sit under no cover: 9 of 18 points is no near-total cover.
+    const html = (spanCss: string) =>
+      `<div id="stage"><p id="t" data-box="10 10 400 20" data-lines="10 10 200 20">Hello <span data-css="${spanCss}" data-lines="250 10 100 20">world text</span></p>
+        <div data-box="0 0 220 60" data-css="background-color: rgb(255, 255, 255)" data-z="1"></div></div>`;
+    expect(audit(html("visibility: hidden"))).toEqual([
+      finding("overlapping-text", "p#t", "horizontal", 0),
+    ]);
+    expect(audit(html(SHOWN))).toEqual([]);
+  });
+});
+
+describe("text in an element with no box (display: contents)", () => {
+  // `display: contents` takes the element's box away (the fake's empty `data-box`). Its text still
+  // paints, in lines of its parent's, so the lines are what is judged.
+  const CONTENTS = (lines: string, css = "") =>
+    `<p id="p" data-css="display: contents; ${css}" data-lines="${lines}">Paragraph text that paints</p>`;
+  const wide = { viewport: { width: 390, height: 844, scrollWidth: 642 } };
+
+  test("text past the right edge is evidence of page overflow", () => {
+    expect(audit(CONTENTS("0 0 642 20"), wide)).toEqual([
+      finding("page-horizontal-overflow", "html", "horizontal", 252),
+    ]);
+  });
+
+  test("text past the left edge is reported on the element", () => {
+    expect(audit(CONTENTS("-80 0 100 20"))).toEqual([
+      finding("viewport-unreachable-content", "p#p", "horizontal", 80),
+    ]);
+  });
+
+  test("a clipping ancestor cuts it, and its own overflow, which has no box to clip, does not", () => {
+    const lines = "0 0 180 20; 0 24 150 20";
+    const card = `<div id="card" data-box="0 0 200 22" data-css="overflow-y: hidden">${CONTENTS(lines)}</div>`;
+    expect(audit(card)).toEqual([finding("clipped-text", "div#card", "vertical", 22)]);
+    expect(audit(CONTENTS(lines, "overflow-y: hidden"))).toEqual([]);
+  });
+
+  test("an opaque sibling over it is reported", () => {
+    const covered = `<div id="stage">${CONTENTS("10 10 200 20")}
+      <div data-box="0 0 300 60" data-css="background-color: rgb(255, 255, 255)" data-z="1"></div></div>`;
+    expect(audit(covered)).toEqual([finding("overlapping-text", "p#p", "horizontal", 0)]);
+  });
+
+  test("it is hidden as any element is: by its visibility or by an ancestor", () => {
+    expect(audit(CONTENTS("-80 0 100 20", "visibility: hidden"))).toEqual([]);
+    const inside = (css: string) => `<div data-css="${css}">${CONTENTS("-80 0 100 20")}</div>`;
+    expect(audit(inside("display: none"))).toEqual([]);
+    expect(audit(inside("opacity: 0"))).toEqual([]);
+    expect(audit(inside("content-visibility: hidden"))).toEqual([]);
+  });
+
+  test("any other element with no area holds text nobody sees: a collapsed panel is no finding", () => {
+    const collapsed = `<div data-box="0 0 200 0" data-css="overflow-y: hidden"><p data-box="0 0 200 0" data-lines="0 0 180 20; 0 24 150 20">Collapsed text</p></div>`;
+    expect(audit(collapsed)).toEqual([]);
   });
 });
 

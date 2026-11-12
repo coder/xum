@@ -85,6 +85,16 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   // An ellipsis does not excuse lines lost below a short box. A one-line ellipsis and a line
   // clamp are the author's cut.
   "ellipsis-clipped-lines": everyWidth(found("clipped-text", "p#lost-lines")),
+  // Four misses of the element facts. A textarea that holds text, covered inside its label: a browser
+  // gives that text no line, so the control is sampled by its box. A button with role menuitem
+  // wider than its clipping row is a control. A paragraph with `display: contents` has no box, and
+  // its one long word is cut by the card around it. The long line that is hidden inside the clipping
+  // note does not clip it.
+  "text-controls-and-boundaries": everyWidth(
+    found("clipped-control", "div#menu"),
+    found("clipped-text", "div#card"),
+    found("overlapping-text", "textarea#notes")
+  ),
   "occlusion-exclusions-clean": CLEAN,
   "real-animated-entry": CLEAN,
   "real-carousel": CLEAN,
