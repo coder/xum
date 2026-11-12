@@ -23,6 +23,7 @@ import type { IsolationOptionUi } from "@/browser/utils/runtimeUi";
 import {
   formatKeybind,
   formatKeybindForAria,
+  isAltGraphPressed,
   KEYBINDS,
   matchesKeybind,
   type Keybind,
@@ -443,7 +444,12 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
   );
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (props.footerShortcut && matchesKeybind(event, props.footerShortcut.keybind)) {
+    // AltGr input reports Ctrl+Alt: it is text, not the chord (the page's listener skips it too).
+    if (
+      props.footerShortcut &&
+      !isAltGraphPressed(event) &&
+      matchesKeybind(event, props.footerShortcut.keybind)
+    ) {
       event.preventDefault();
       props.footerShortcut.run();
       return;

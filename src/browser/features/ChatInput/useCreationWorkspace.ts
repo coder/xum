@@ -184,6 +184,8 @@ interface UseCreationWorkspaceReturn {
   recommendedTrunk: string | null;
   /** The branches committed to most recently, newest first. */
   recentBranches: string[];
+  /** The repository's default branch (not the checked-out one); null when unknown. */
+  defaultBranch: string | null;
   /** Loads the branch list again, after a failed load. */
   reloadBranches: () => void;
   trunkBranch: string;
@@ -346,6 +348,7 @@ export function useCreationWorkspace({
   const [branchLoad, setBranchLoad] = useState<BranchLoadStatus>("loading");
   const [recommendedTrunk, setRecommendedTrunk] = useState<string | null>(null);
   const [recentBranches, setRecentBranches] = useState<string[]>([]);
+  const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
   // Bumped by "Retry" after a failed branch list: the load effect runs again.
   const [branchReloads, setBranchReloads] = useState(0);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -404,6 +407,7 @@ export function useCreationWorkspace({
           setBranches(outcome.branches);
           setRecommendedTrunk(outcome.recommendedTrunk);
           setRecentBranches(outcome.recentBranches ?? []);
+          setDefaultBranch(outcome.defaultBranch ?? null);
         }
         setBranchLoad(outcome.status);
       }
@@ -1070,6 +1074,7 @@ export function useCreationWorkspace({
     branchLoad,
     recommendedTrunk,
     recentBranches,
+    defaultBranch,
     reloadBranches: () => setBranchReloads((count) => count + 1),
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,

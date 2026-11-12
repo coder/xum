@@ -49,8 +49,13 @@ export function SetDefaultIsolationButton(props: { saver: DefaultIsolationSaver 
 
   return (
     <span className="inline-flex min-w-0 shrink-0 items-center gap-2">
-      {/* In the panel as plain text; the page shows the alert, where it outlives the panel. */}
-      {saver.error !== null && <span className="text-error min-w-0 text-xs">{saver.error}</span>}
+      {/* An alert here too: the panel is modal, so the page's copy of this error is hidden from
+          assistive technology while the panel is open. */}
+      {saver.error !== null && (
+        <span role="alert" className="text-error min-w-0 text-xs">
+          {saver.error}
+        </span>
+      )}
       <Button
         variant="outline"
         size="xs"

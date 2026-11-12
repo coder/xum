@@ -1,5 +1,10 @@
 import { describe, test, expect, beforeAll, afterAll } from "@jest/globals";
-import { listLocalBranches, listRecentLocalBranches, cleanStaleLock } from "./git";
+import {
+  listLocalBranches,
+  listRecentLocalBranches,
+  detectRepositoryDefaultBranch,
+  cleanStaleLock,
+} from "./git";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs/promises";
@@ -52,6 +57,29 @@ describe("listLocalBranches", () => {
       `newest-${suffix}`,
       `middle-${suffix}`,
     ]);
+  });
+
+  test("detectRepositoryDefaultBranch prefers origin's HEAD, then a conventional name, never the checkout", async () => {
+    const branches = await listLocalBranches(tempGitRepo);
+    const trunk = branches.find((name) => name === "main" || name === "master");
+    // No origin: a conventional trunk name, even while another branch is checked out.
+    await execAsync(`git checkout -q -b not-default-${Date.now().toString(36)}`, {
+      cwd: tempGitRepo,
+    });
+    expect(await detectRepositoryDefaultBranch(tempGitRepo, branches)).toBe(trunk ?? null);
+    expect(await detectRepositoryDefaultBranch(tempGitRepo, ["topic"])).toBeNull();
+
+    // origin's HEAD wins when a local branch has its name.
+    await execAsync(`git branch -f release-line`, { cwd: tempGitRepo });
+    await execAsync(`git update-ref refs/remotes/origin/release-line HEAD`, { cwd: tempGitRepo });
+    await execAsync(`git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/release-line`, {
+      cwd: tempGitRepo,
+    });
+    expect(await detectRepositoryDefaultBranch(tempGitRepo, [...branches, "release-line"])).toBe(
+      "release-line"
+    );
+    // ...and is ignored when no local branch does.
+    expect(await detectRepositoryDefaultBranch(tempGitRepo, branches)).toBe(trunk ?? null);
   });
 
   test("listLocalBranches should return sorted branch names", async () => {
