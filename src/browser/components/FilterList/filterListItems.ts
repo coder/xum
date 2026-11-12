@@ -67,5 +67,7 @@ export function windowFilterListItems<T extends FilterListItem>(
   const selectedItem = matches.find((item) => item.value === selected);
   if (selectedItem === undefined || rows.includes(selectedItem)) return rows;
   // Lead with the selection so it is the active row; the last windowed row makes room for it.
-  return [selectedItem, ...rows.slice(0, Math.max(0, max - 1))];
+  // Moved out of its place, it also leaves its group: under its group's caption it would put
+  // that caption above the ungrouped rows that follow it (the default branch).
+  return [{ ...selectedItem, section: undefined }, ...rows.slice(0, Math.max(0, max - 1))];
 }
