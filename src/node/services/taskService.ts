@@ -468,13 +468,16 @@ interface InactiveTaskRemoval {
   readonly entry: { projectPath: string; workspace: WorkspaceConfigEntry };
   readonly target: { taskId: string; workspaceId: string; displayName?: string };
   readonly options: SubagentRemovalOptions | undefined;
-  /** Set under the "force" policy when the removal deletes unsaved work: reported on success. */
+  /** Set under the "force" policy when the removal deletes unsaved work: reported on the result. */
   readonly forcedDeletion?: ForcedSubagentDeletion;
 }
 
-/** What a forced removal deleted, read under the locks right before the removal. */
+/** What a forced removal deletes, read under the locks right before the removal. */
 interface ForcedSubagentDeletion {
-  deletedWork: string;
+  /** The lost work, as a phrase that completes "Deleted ...". */
+  lostWork: string;
+  /** The checkout and the branch, as sentences. */
+  where: string;
   paths: string[];
 }
 
@@ -497,49 +500,56 @@ function reportInactiveTaskRemoval(
     removal.options?.onRemovalWarnings?.(result.warnings);
   return Ok(
     result.success
-      ? describeRemoved(removal, result.warnings)
-      : { status: "error", action: "remove", ...removal.target, error: result.error }
+      ? {
+          status: "removed",
+          action: "remove",
+          ...removal.target,
+          ...forcedDeletionFields(removal.forcedDeletion, true, result.warnings),
+        }
+      : {
+          status: "error",
+          action: "remove",
+          ...removal.target,
+          error: result.error,
+          // The checkout may already be gone when the removal fails after deleting it.
+          ...forcedDeletionFields(removal.forcedDeletion, false),
+        }
   );
 }
 
 /**
- * The removed result. A forced removal adds what it deleted, and says so when the runtime left
- * part of the checkout behind (forced removal succeeds then, with warnings): the deleted-work
- * report must not claim a deletion that did not happen.
+ * The deleted-work fields of a forced removal's result, or none when it found no unsaved work. The
+ * report must not claim a deletion that did not happen: a failed removal says "may have deleted"
+ * (it can fail after the checkout was deleted), and a removal the runtime only partly completed
+ * (forced removal succeeds then, with warnings) names what remains.
  */
-function describeRemoved(
-  removal: InactiveTaskRemoval,
+function forcedDeletionFields(
+  forced: ForcedSubagentDeletion | undefined,
+  removed: boolean,
   warnings: readonly WorkspaceRemoveWarning[] = []
-): WorkspaceLifecycleResult {
-  const forced = removal.forcedDeletion;
+): { deletedWork?: string; paths?: string[] } {
+  if (forced == null) return {};
+  const lead = removed
+    ? `Deleted ${forced.lostWork}.`
+    : `The removal failed, and it may have deleted ${forced.lostWork}.`;
+  const leftovers =
+    warnings.length > 0
+      ? [
+          `Removal did not delete everything, so some of this work may remain: ${warnings.map((warning) => warning.description).join(" ")}`,
+        ]
+      : [];
   return {
-    status: "removed",
-    action: "remove",
-    ...removal.target,
-    ...(forced != null
-      ? {
-          deletedWork: qualifyDeletedWork(forced.deletedWork, warnings),
-          ...(forced.paths.length > 0 ? { paths: forced.paths } : {}),
-        }
-      : {}),
+    deletedWork: [lead, forced.where, ...leftovers].join(" "),
+    ...(forced.paths.length > 0 ? { paths: forced.paths } : {}),
   };
-}
-
-function qualifyDeletedWork(
-  deletedWork: string,
-  warnings: readonly WorkspaceRemoveWarning[]
-): string {
-  if (warnings.length === 0) return deletedWork;
-  const leftovers = warnings.map((warning) => warning.description).join(" ");
-  return `${deletedWork} Removal did not delete everything, so some of this work may remain: ${leftovers}`;
 }
 
 /** What removing a sub-agent's checkout deletes: one finding, worded for the refusal and the report. */
 interface UnpreservedSubagentWorkDescription {
   /** Before the removal: what it would delete, or that this could not be verified. */
   summary: string;
-  /** After a forced removal: the same finding in the past tense. */
-  deletedSummary: string;
+  /** The same finding as a phrase that completes "Deleted ...", for a forced removal's report. */
+  lostWork: string;
   paths: string[];
 }
 
@@ -575,7 +585,7 @@ function describeForcedDeletion(
     ...(checkoutPath != null ? [`Checkout: ${checkoutPath}.`] : []),
     ...(branch != null ? [`Branch: ${branch}.`] : []),
   ];
-  return { deletedWork: [lost.deletedSummary, ...where].join(" "), paths: lost.paths };
+  return { lostWork: lost.lostWork, where: where.join(" "), paths: lost.paths };
 }
 
 interface TaskParentAiMeta {
@@ -17161,7 +17171,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!check.success) {
       return {
         summary: `Cannot verify that removing this sub-agent keeps its work (${check.error}).`,
-        deletedSummary: `Its checkout could not be checked (${check.error}), so any unsaved work in it was deleted.`,
+        lostWork: `any unsaved work in its checkout, which could not be checked (${check.error})`,
         paths: [],
       };
     }
@@ -17188,7 +17198,7 @@ export class TaskService implements AgentTaskIntegration {
     const lostWork = lost.join(" and ");
     return {
       summary: `Removing this sub-agent would permanently delete ${lostWork}.`,
-      deletedSummary: `Deleted ${lostWork}.`,
+      lostWork,
       paths: work.paths,
     };
   }

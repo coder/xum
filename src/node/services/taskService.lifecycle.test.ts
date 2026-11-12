@@ -6,7 +6,7 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { Config } from "@/node/config";
+import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { upsertSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -523,6 +523,117 @@ describe("TaskService", () => {
     expect(partial.data.deletedWork).toContain(completeReport);
     expect(partial.data.deletedWork).toContain(leftover);
     expect(partial.data.paths).toEqual(["notes.txt"]);
+  });
+
+  test("a forced removal that fails reports what it may have deleted, and a clean one reports nothing", async () => {
+    const parentWorkspaceId = "parent-remove-forced-failed";
+    const childTaskId = "child-remove-forced-failed";
+    const { childPath, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+    // The removal can fail after it deleted the checkout (the row's config write fails last), and
+    // a retry then finds no unsaved work to report: the failure itself must carry the report.
+    remove.mockImplementation(() => Promise.resolve(Err("Failed to remove workspace: disk full")));
+
+    const failed = await removeAsModel(childTaskId, "force");
+    assert(failed.success && failed.data.status === "error", "a failed removal is an error");
+    expect(failed.data.error).toContain("disk full");
+    expect(failed.data.deletedWork).toContain("may have deleted");
+    expect(failed.data.deletedWork).toContain(childPath);
+    expect(failed.data.paths).toEqual(["notes.txt"]);
+
+    // Without unsaved work there is nothing to report, even when the removal fails.
+    await fsPromises.rm(path.join(childPath, "notes.txt"));
+    const cleanFailure = await removeAsModel(childTaskId, "force");
+    assert(cleanFailure.success && cleanFailure.data.status === "error", "still an error");
+    expect(cleanFailure.data.deletedWork).toBeUndefined();
+    expect(cleanFailure.data.paths).toBeUndefined();
+  });
+
+  // The force policy skips only the unsaved-work refusal. The checks below are about the child
+  // being busy or not the caller's, so each must still stop a removal that force would complete.
+  test("the force policy keeps the refusals for scope, descendants, an active child and a pending patch", async () => {
+    const parentWorkspaceId = "parent-remove-forced-guards";
+    const childTaskId = "child-remove-forced-guards";
+    const { config, projectPath, childPath, remove, removeAsModel } =
+      await createChildCheckoutHarness(parentWorkspaceId, childTaskId);
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+    const editRows = (edit: (rows: WorkspaceConfigEntry[]) => WorkspaceConfigEntry[]) =>
+      config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project != null, "the test project exists");
+        project.workspaces = edit(project.workspaces);
+        return cfg;
+      });
+    const setChildStatus = (taskStatus: "running" | "reported") =>
+      editRows((rows) =>
+        rows.map((row) => (row.id === childTaskId ? { ...row, taskStatus } : row))
+      );
+    const forcedRemoval = async (taskId: string) => {
+      const result = await removeAsModel(taskId, "force");
+      assert(result.success, "a refused removal still returns a result");
+      return result.data;
+    };
+
+    // Out of scope: another tree's child.
+    await editRows((rows) => [
+      ...rows,
+      projectWorkspace(projectPath, "other", "other-root"),
+      projectWorkspace(projectPath, "foreign", "foreign", {
+        parentWorkspaceId: "other-root",
+        taskStatus: "reported",
+      }),
+    ]);
+    expect((await forcedRemoval("foreign")).status).toBe("invalid_scope");
+
+    // A descendant remains.
+    await editRows((rows) => [
+      ...rows,
+      projectWorkspace(projectPath, "grandchild", "grandchild", {
+        parentWorkspaceId: childTaskId,
+        taskStatus: "reported",
+      }),
+    ]);
+    const withDescendant = await forcedRemoval(childTaskId);
+    assert(withDescendant.status === "error", "descendants refuse");
+    expect(withDescendant.descendantTaskIds).toEqual(["grandchild"]);
+    await editRows((rows) => rows.filter((row) => row.id !== "grandchild"));
+
+    // The child is still running.
+    await setChildStatus("running");
+    expect((await forcedRemoval(childTaskId)).status).toBe("active");
+    await setChildStatus("reported");
+
+    // Its patch artifact is still being written.
+    await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
+      workspaceId: parentWorkspaceId,
+      workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
+      childTaskId,
+      updater: () => ({
+        childTaskId,
+        parentWorkspaceId,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+        status: "pending",
+        projectArtifacts: [
+          { projectPath, projectName: "repo", storageKey: "repo", status: "pending" },
+        ],
+        readyProjectCount: 0,
+        failedProjectCount: 0,
+        skippedProjectCount: 0,
+        totalCommitCount: 0,
+      }),
+    });
+    const pending = await forcedRemoval(childTaskId);
+    assert(pending.status === "error", "a pending patch artifact refuses");
+    expect(pending.error).toContain("patch artifact");
+
+    expect(remove).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
+    await fsPromises.access(path.join(childPath, "notes.txt"));
   });
 
   test("the user can preview and then confirm removing a sub-agent the model must not remove (#5106)", async () => {

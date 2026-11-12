@@ -72,6 +72,8 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
                 ? { descendantTaskIds: data.descendantTaskIds }
                 : {}),
               ...(data.paths != null ? { paths: data.paths } : {}),
+              // A forced removal that failed part-way reports what it may have deleted.
+              deletedWork: data.deletedWork,
               error: data.error ?? "Task removal failed.",
             });
             break;

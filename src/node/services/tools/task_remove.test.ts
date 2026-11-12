@@ -116,6 +116,32 @@ describe("task_remove tool", () => {
     }
   });
 
+  it("returns what a forced removal may have deleted when the removal fails", async () => {
+    using tempDir = new TestTempDir("test-task-remove-force-failed");
+    const failed = {
+      status: "error",
+      taskId: "child",
+      workspaceId: "child",
+      paths: ["notes.txt"],
+      deletedWork: "The removal failed, and it may have deleted 1 commit(s). Branch: child.",
+      error: "Failed to remove workspace: disk full",
+    };
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [{ taskId: "child", depth: 1 }]),
+      removeInactiveDescendantAgentTask: mock(() =>
+        Promise.resolve(Ok({ ...failed, action: "remove" }))
+      ),
+    } as unknown as TaskService;
+    const tool = createTaskRemoveTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "root" }),
+      taskService,
+    });
+
+    expect(
+      await Promise.resolve(tool.execute!({ task_ids: ["child"], force: true }, toolOptions))
+    ).toEqual({ results: [failed] });
+  });
+
   it("surfaces active and scope outcomes without removing", async () => {
     using tempDir = new TestTempDir("test-task-remove-outcomes");
     const removeOwnedTaskWorkspace = mock(
