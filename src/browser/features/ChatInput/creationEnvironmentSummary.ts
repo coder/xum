@@ -131,3 +131,30 @@ export function describeEnvironment(input: EnvironmentSummaryInput): string {
   const from = branch.kind === "selected" ? `, branched from ${branch.name}` : "";
   return `New workspaces run ${where}, ${isolation}${from}.`;
 }
+
+/**
+ * An unavailable option's reason, cut down to fit one line of its row. The reasons come from the
+ * runtime checks and from CLIs, so they can run to three lines ("/opt/homebrew/bin/coder is not
+ * logged in. Try logging in using ..."); the row shows the short form and keeps the whole reason
+ * for the tooltip and for screen readers.
+ *
+ * `needsSetup` is false for a reason no setup can change (an unsupported pair, a project that is
+ * not a git repository): those rows get no "Set up" link.
+ */
+export function summarizeUnavailableReason(reason: string): {
+  summary: string;
+  needsSetup: boolean;
+} {
+  if (/^Not yet supported|^Requires git repository/i.test(reason)) {
+    return { summary: reason, needsSetup: false };
+  }
+  if (/not logged in|coder login/i.test(reason)) {
+    return { summary: "Coder CLI not logged in", needsSetup: true };
+  }
+  if (/is below minimum/i.test(reason)) {
+    return { summary: "Coder CLI is out of date", needsSetup: true };
+  }
+  // The first clause: up to a sentence end, a "Run: ..." hint or a semicolon.
+  const firstClause = /^(.*?)(?:[.;:](?:\s|$)|$)/.exec(reason.trim())?.[1] ?? reason;
+  return { summary: firstClause.length > 0 ? firstClause : reason, needsSetup: true };
+}

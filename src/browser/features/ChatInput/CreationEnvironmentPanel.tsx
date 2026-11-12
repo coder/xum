@@ -26,7 +26,11 @@ import type {
   WorkspaceIsolation,
 } from "@/common/types/isolation";
 import type { BranchLoadStatus } from "./branchListLoad";
-import type { EnvironmentSummary, RuntimeFieldError } from "./creationEnvironmentSummary";
+import {
+  summarizeUnavailableReason,
+  type EnvironmentSummary,
+  type RuntimeFieldError,
+} from "./creationEnvironmentSummary";
 import { environmentArrowTarget, environmentOpenFocusTarget } from "./environmentPanelKeys";
 import { branchPickerItems } from "./creationPickerGroups";
 import { useCreationShortcut } from "./useCreationShortcut";
@@ -108,62 +112,87 @@ function OptionColumn<T extends string>(props: {
           const checked = option.value === props.value;
           const unavailable = option.disabledReason !== null;
           const rowDisabled = props.disabled || unavailable;
+          const why = unavailable ? summarizeUnavailableReason(option.disabledReason ?? "") : null;
           return (
             <div key={option.value} className="flex flex-col">
-              <button
-                type="button"
-                role="radio"
-                aria-checked={checked}
-                // aria-disabled as well: assistive tech and tests read it on a native-disabled row.
-                aria-disabled={rowDisabled}
-                disabled={rowDisabled}
-                // Re-picking the selected row is a no-op, as with the select this replaced: the
-                // pick rebuilds the runtime and would drop what the row's fields hold (for
-                // example Docker's credential sharing).
-                onClick={() => {
-                  if (!checked) props.onChange(option.value);
-                }}
-                className={cn(
-                  "focus-visible:ring-accent flex w-full gap-2.5 rounded-md px-2.5 py-[7px] text-left outline-none focus-visible:ring-1 [@media(pointer:coarse)]:min-h-12",
-                  // A reason can wrap to several lines; the icon then stays with the name.
-                  unavailable ? "items-start" : "items-center",
-                  checked ? "bg-hover" : "hover:bg-hover/60",
-                  props.disabled && "opacity-50"
-                )}
-              >
-                {/* Decorative: the runtime icons carry their own labels ("Local Runtime" on None's
-                    icon), which would otherwise become part of the row's accessible name. */}
-                <span
-                  aria-hidden
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={checked}
+                  // aria-disabled as well: assistive tech and tests read it on a native-disabled row.
+                  aria-disabled={rowDisabled}
+                  disabled={rowDisabled}
+                  // Re-picking the selected row is a no-op, as with the select this replaced: the
+                  // pick rebuilds the runtime and would drop what the row's fields hold (for
+                  // example Docker's credential sharing).
+                  onClick={() => {
+                    if (!checked) props.onChange(option.value);
+                  }}
                   className={cn(
-                    "flex shrink-0",
-                    unavailable ? "text-muted-light mt-[3px]" : option.ui.iconClass
+                    "focus-visible:ring-accent flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-2.5 py-[7px] text-left outline-none focus-visible:ring-1 [@media(pointer:coarse)]:min-h-12",
+                    checked ? "bg-hover" : "hover:bg-hover/60",
+                    props.disabled && "opacity-50"
                   )}
                 >
-                  <Icon size={14} />
-                </span>
-                <span className="flex min-w-0 flex-1 flex-col gap-px">
+                  {/* Decorative: the runtime icons carry their own labels ("Local Runtime" on None's
+                    icon), which would otherwise become part of the row's accessible name. */}
                   <span
+                    aria-hidden
                     className={cn(
-                      "text-[13px] font-medium",
-                      unavailable ? "text-muted" : "text-foreground"
+                      "flex shrink-0",
+                      unavailable ? "text-muted-light" : option.ui.iconClass
                     )}
                   >
-                    {option.ui.label}
+                    <Icon size={14} />
                   </span>
-                  {/* One line under the name: what the option is, or why it cannot be picked.
-                      The reason replaces the description (both made the row three paragraphs)
-                      and is shown whole, wrapped: the old select cut it off after two lines. */}
-                  {unavailable ? (
-                    <span className="text-warning-text/85 text-xs leading-snug break-words">
-                      {option.disabledReason}
+                  <span className="flex min-w-0 flex-1 flex-col gap-px">
+                    <span
+                      className={cn(
+                        "text-[13px] font-medium",
+                        unavailable ? "text-muted" : "text-foreground"
+                      )}
+                    >
+                      {option.ui.label}
                     </span>
-                  ) : (
-                    <span className="text-muted text-xs leading-snug">{option.ui.description}</span>
-                  )}
-                </span>
-                {checked && <Check aria-hidden className="text-foreground size-3.5 shrink-0" />}
-              </button>
+                    {/* One line under the name: what the option is, or why it cannot be picked. An
+                      unavailable row is as tall as any other: it shows the reason's short form
+                      (a CLI's own message ran to three lines and pushed the options apart) and
+                      keeps the whole reason for screen readers and the "Set up" tooltip. */}
+                    {why !== null ? (
+                      <>
+                        <span
+                          aria-hidden
+                          className="text-warning-text/85 truncate text-xs leading-snug"
+                        >
+                          {why.summary}
+                        </span>
+                        <span className="sr-only">{option.disabledReason}</span>
+                      </>
+                    ) : (
+                      <span className="text-muted text-xs leading-snug">
+                        {option.ui.description}
+                      </span>
+                    )}
+                  </span>
+                  {checked && <Check aria-hidden className="text-foreground size-3.5 shrink-0" />}
+                </button>
+                {why?.needsSetup && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <DocsLink
+                        path={option.ui.docsPath}
+                        className="border-border-medium bg-hover text-foreground hover:text-foreground mr-1.5 shrink-0 rounded-md border px-2 py-1 text-xs font-medium"
+                      >
+                        Set up
+                      </DocsLink>
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-72 break-words">
+                      {option.disabledReason}
+                    </TooltipContent>
+                  </Tooltip>
+                )}
+              </div>
               {checked && props.fields != null && (
                 <div className="flex flex-col gap-2 pt-1 pr-1.5 pb-2 pl-[2.125rem]">
                   {props.fields}
