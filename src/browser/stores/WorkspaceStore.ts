@@ -55,7 +55,7 @@ import {
 } from "@/browser/stores/subscriptionTransport";
 import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useCallback, useContext, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { LiveBashOutputSourceContext } from "@/browser/stores/liveBashOutputSource";
 import {
   isCaughtUpMessage,
@@ -530,6 +530,8 @@ export interface WorkflowToolLiveRunState {
 }
 
 /** A bash call that waits for the user to let it run once outside the sandbox. */
+const NO_TOOL_CALL_IDS: ReadonlySet<string> = new Set();
+
 export type BashSandboxApprovalView = Pick<
   BashSandboxApprovalEvent,
   "workspaceId" | "toolCallId" | "script" | "reason" | "timestamp"
@@ -563,6 +565,8 @@ interface WorkspaceChatTransientState {
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   /** Bash calls that wait for the user to let them run outside the sandbox, by toolCallId. */
   sandboxApprovals: Map<string, BashSandboxApprovalView>;
+  /** The last set getBashSandboxApprovalToolCallIds returned, reused while the calls are the same. */
+  sandboxApprovalToolCallIds?: { key: string; ids: ReadonlySet<string> };
   liveTaskIds: Map<string, string[]>;
   liveWorkflowRuns: Map<string, WorkflowToolLiveRunState>;
   autoRetryStatus: AutoRetryStatus | null;
@@ -2866,12 +2870,24 @@ export class WorkspaceStore {
   }
 
   /**
-   * The tool calls of the workspace that wait for an approval, joined by newlines. A string, so
-   * useSyncExternalStore gets a snapshot that is stable while the set of calls is.
+   * The tool calls of the workspace that wait for an approval. The transcript keeps their rows
+   * in view whatever it folds, because the approval card and its shortcuts are in the row.
+   * The same set object is returned while the calls are the same, so useSyncExternalStore gets
+   * a stable snapshot and the fold projection memoized on it does not rerun.
    */
-  getBashSandboxApprovalToolCallIdsKey(workspaceId: string): string {
-    const approvals = this.chatTransientState.get(workspaceId)?.sandboxApprovals;
-    return approvals === undefined ? "" : Array.from(approvals.keys()).join("\n");
+  getBashSandboxApprovalToolCallIds(workspaceId: string): ReadonlySet<string> {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient === undefined || transient.sandboxApprovals.size === 0) {
+      return NO_TOOL_CALL_IDS;
+    }
+    const key = Array.from(transient.sandboxApprovals.keys()).join("\n");
+    if (transient.sandboxApprovalToolCallIds?.key !== key) {
+      transient.sandboxApprovalToolCallIds = {
+        key,
+        ids: new Set(transient.sandboxApprovals.keys()),
+      };
+    }
+    return transient.sandboxApprovalToolCallIds.ids;
   }
 
   /** The toolCallId of the newest approval the workspace waits for; the shortcuts answer it. */
@@ -6260,23 +6276,13 @@ export function useBashSandboxApproval(
   return approval ? { approval, isLatest: latestToolCallId === approval.toolCallId } : null;
 }
 
-const NO_TOOL_CALL_IDS: ReadonlySet<string> = new Set();
-
-/**
- * The tool calls of a workspace that wait for a sandbox approval. The transcript keeps their
- * rows in view whatever it folds, because the approval card and its shortcuts are in the row.
- */
-export function useBashSandboxApprovalToolCallIds(
-  workspaceId: string | undefined
-): ReadonlySet<string> {
+/** The tool calls of a workspace that wait for a sandbox approval (see the store method). */
+export function useBashSandboxApprovalToolCallIds(workspaceId: string): ReadonlySet<string> {
   const store = getStoreInstance();
-  const subscribe = (listener: () => void) =>
-    workspaceId ? store.subscribeKey(workspaceId, listener) : () => undefined;
-  const key = useSyncExternalStore(subscribe, () =>
-    workspaceId ? store.getBashSandboxApprovalToolCallIdsKey(workspaceId) : ""
+  return useSyncExternalStore(
+    (listener) => store.subscribeKey(workspaceId, listener),
+    () => store.getBashSandboxApprovalToolCallIds(workspaceId)
   );
-  // One set per key: the transcript's fold projection is memoized on it.
-  return useMemo(() => (key === "" ? NO_TOOL_CALL_IDS : new Set(key.split("\n"))), [key]);
 }
 
 /**

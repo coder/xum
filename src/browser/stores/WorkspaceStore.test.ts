@@ -8691,6 +8691,39 @@ describe("WorkspaceStore", () => {
       expect(store.getLatestBashSandboxApprovalToolCallId(workspaceId)).toBe("call-new");
     });
 
+    // The transcript memoizes its folds on this set, and reads it through useSyncExternalStore.
+    it("lists the waiting calls as one set that changes only when the calls do", async () => {
+      const workspaceId = "sandbox-approval-workspace-ids";
+      expect(store.getBashSandboxApprovalToolCallIds(workspaceId).size).toBe(0);
+
+      let answer: () => void = () => undefined;
+      const answered = new Promise<void>((resolve) => {
+        answer = resolve;
+      });
+      mockChatScript([
+        caughtUpEvent(),
+        Promise.resolve(),
+        sandboxApprovalEvent(workspaceId, "call-a", true, 1),
+        sandboxApprovalEvent(workspaceId, "call-b", true, 2),
+        answered,
+        sandboxApprovalEvent(workspaceId, "call-a", false, 3),
+        sandboxApprovalEvent(workspaceId, "call-b", false, 4),
+      ]);
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const waiting = store.getBashSandboxApprovalToolCallIds(workspaceId);
+      expect([...waiting]).toEqual(["call-a", "call-b"]);
+      expect(store.getBashSandboxApprovalToolCallIds(workspaceId)).toBe(waiting);
+
+      answer();
+      await tick(10);
+      const none = store.getBashSandboxApprovalToolCallIds(workspaceId);
+      expect(none.size).toBe(0);
+      // Empty is one shared set, for every workspace.
+      expect(store.getBashSandboxApprovalToolCallIds("another-workspace")).toBe(none);
+    });
+
     // Every replay re-sends the calls still waiting (pending:true) before caught-up, so a
     // reconnect shows exactly those; a call answered while disconnected sends nothing.
     const approvalAfterReconnect = async (
