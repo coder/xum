@@ -12,6 +12,7 @@ import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
 import {
   cleanupView,
+  closeCreationEnvironment,
   openCreationEnvironment,
   openProjectCreationView,
   selectCreationIsolation,
@@ -26,7 +27,8 @@ type AppView = ReturnType<typeof renderApp>;
 
 /**
  * The host and directory inputs are in the environment panel, which is portaled to document.body;
- * the trust row and "Set as default" stay on the page. Both are under the document body.
+ * the trust row and "Set as default" stay on the page. Both are under the document body. The
+ * panel is modal, so a test closes it before it uses the page.
  */
 const page = (): HTMLElement => document.body;
 
@@ -67,7 +69,9 @@ async function openSshNoneForm(view: AppView, projectPath: string, dir: string) 
   if (!dirInput) throw new Error("Directory input not found");
   await user.clear(dirInput);
   await user.type(dirInput, dir);
-  return { user, dirInput };
+  // The panel is modal: close it so the tests can use the trust row and "Set as default".
+  await closeCreationEnvironment(view.container);
+  return { user };
 }
 
 function trustedProject(projectPath: string): Map<string, ProjectConfig> {

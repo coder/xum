@@ -19,6 +19,7 @@ import { renderApp } from "../renderReviewPanel";
 import {
   addProjectViaUI,
   cleanupView,
+  closeCreationEnvironment,
   selectCreationIsolation,
   setupTestDom,
   waitForOpenDraftId,
@@ -375,6 +376,8 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches();
     try {
       await selectCreationIsolation(view.container, "Workspace isolation", "None");
+      // The panel is modal: close it before going back to the composer.
+      await closeCreationEnvironment(view.container);
       await chat.typeWithoutSending("hello on the local runtime");
       await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
         timeout: 10_000,
@@ -422,6 +425,8 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
         timeout: 10_000,
       });
       await selectCreationIsolation(view.container, "Project isolation", "Coder");
+      // The panel is modal: close it before going back to the composer.
+      await closeCreationEnvironment(view.container);
       await waitFor(() => expect(presets).toHaveBeenCalled(), { timeout: 10_000 });
       // The composer reports from an effect, and the page renders the banner after it.
       await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {

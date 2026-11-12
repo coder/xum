@@ -591,6 +591,25 @@ export async function openCreationEnvironment(container: HTMLElement): Promise<v
   });
 }
 
+/**
+ * Closes the environment panel if it is open. The panel is modal, so the page behind it takes no
+ * pointer input until it closes: do this before a test goes back to the composer or the page.
+ */
+export async function closeCreationEnvironment(container: HTMLElement): Promise<void> {
+  const chip = container.querySelector<HTMLButtonElement>('[data-testid="creation-environment"]');
+  if (chip?.getAttribute("aria-expanded") !== "true") return;
+  const done = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')
+  ).find((button) => button.textContent?.trim() === "Done");
+  if (!done) throw new Error("Environment panel has no Done button");
+  fireEvent.click(done);
+  await waitFor(() => {
+    if (chip.getAttribute("aria-expanded") === "true") {
+      throw new Error("Environment panel did not close");
+    }
+  });
+}
+
 /** An option row of the open environment panel, by the label it starts with. */
 export function findCreationIsolationOption(
   axis: CreationIsolationAxis,

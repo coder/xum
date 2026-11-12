@@ -312,13 +312,15 @@ export const SshWithoutIsolation: Story = {
     const setDefault = canvas.getByRole("button", { name: "Set as default" });
     await expect(setDefault.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
 
+    // The project is trusted but this host directory is not: its own trust is offered, on the
+    // page (checked before the panel opens: the panel is modal and hides the page from queries).
+    await expect(canvas.getByRole("button", { name: "Trust directory" })).toBeVisible();
+
     await openEnvironmentPanel(storyRoot);
     await expect(await body.findByLabelText("Project directory on host")).toHaveValue(
       "~/src/my-app"
     );
     await expect(body.getByLabelText("Host")).toHaveValue("devbox.internal");
-    // The project is trusted but this host directory is not: its own trust is offered.
-    await expect(body.getByRole("button", { name: "Trust directory" })).toBeVisible();
 
     const dockerOption = await body.findByRole("radio", { name: /^Docker/i });
     await expect(dockerOption).toHaveAttribute("aria-disabled", "true");

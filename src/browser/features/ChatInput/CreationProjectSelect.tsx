@@ -1,7 +1,12 @@
 import { useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { FilterList } from "@/browser/components/FilterList/FilterList";
-import { Popover, PopoverContent, PopoverTrigger } from "@/browser/components/Popover/Popover";
+import {
+  MODAL_POPOVER_CONTENT_PROPS,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/browser/components/Popover/Popover";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import type { ProjectConfig } from "@/common/types/project";
@@ -79,14 +84,15 @@ function ProjectSwitcher(props: {
   // is cleared, not masked, so the list does not reopen by itself when the lock lifts.
   if (props.disabled && open) setOpen(false);
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover modal open={open} onOpenChange={setOpen}>
       <Tooltip>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <button
               type="button"
               aria-label="Select project"
-              aria-haspopup="listbox"
+              // The popup is the popover (a dialog) that holds the filter and its list.
+              aria-haspopup="dialog"
               data-testid="project-selector"
               disabled={props.disabled}
               className="text-foreground hover:bg-toggle-bg/70 focus-visible:ring-accent flex h-7 max-w-[280px] shrink-0 items-center gap-1 rounded-md text-lg font-semibold outline-none focus-visible:ring-1 disabled:cursor-not-allowed disabled:opacity-50"
@@ -101,7 +107,9 @@ function ProjectSwitcher(props: {
       {/* Fits the space Radix has on the side it opens: on a short phone (keyboard up) the list
           opens above the heading and must end below the top safe-area band, not under it. */}
       <PopoverContent
+        {...MODAL_POPOVER_CONTENT_PROPS}
         align="start"
+        aria-label="Select project"
         className="flex max-h-(--radix-popover-content-available-height) w-[min(22rem,calc(100vw-1rem))] flex-col p-0"
       >
         <FilterList

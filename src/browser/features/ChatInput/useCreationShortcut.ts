@@ -1,10 +1,21 @@
 import { useEffect, useRef } from "react";
 import {
   isAltGraphPressed,
+  isCommandPaletteTarget,
   isDialogOpen,
   matchesKeybind,
   type Keybind,
 } from "@/browser/utils/ui/keybinds";
+
+/**
+ * Whether a creation-page chord may act on this event. Not on AltGr input: the chords are
+ * Ctrl+Alt+Shift, AltGr reports as Ctrl+Alt, and Shift+AltGr types a character on some layouts.
+ * Not behind a modal dialog, and not from the command palette, which isDialogOpen() does not see:
+ * the actions move focus, and focus must not leave the open palette.
+ */
+function creationShortcutMayAct(event: KeyboardEvent): boolean {
+  return !isAltGraphPressed(event) && !isDialogOpen() && !isCommandPaletteTarget(event.target);
+}
 
 /**
  * Runs a creation-page action on its keybind while enabled, outside open dialogs. Shared by the
@@ -22,9 +33,7 @@ export function useCreationShortcut(
   useEffect(() => {
     if (!enabled) return;
     const handler = (event: KeyboardEvent) => {
-      // The page's shortcuts are Ctrl+Alt+Shift chords, and AltGr reports as Ctrl+Alt: Shift+AltGr
-      // types a character on some layouts, so that input stays text.
-      if (isAltGraphPressed(event) || !matchesKeybind(event, keybind) || isDialogOpen()) return;
+      if (!matchesKeybind(event, keybind) || !creationShortcutMayAct(event)) return;
       event.preventDefault();
       if (!event.repeat) void actionRef.current();
     };

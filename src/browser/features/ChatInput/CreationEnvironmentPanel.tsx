@@ -3,7 +3,12 @@ import { AlertTriangle, Check, ChevronDown, GitBranch } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { FilterList } from "@/browser/components/FilterList/FilterList";
-import { Popover, PopoverContent, PopoverTrigger } from "@/browser/components/Popover/Popover";
+import {
+  MODAL_POPOVER_CONTENT_PROPS,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/browser/components/Popover/Popover";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import type { IsolationOptionUi } from "@/browser/utils/runtimeUi";
@@ -311,14 +316,14 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
   };
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover modal open={open} onOpenChange={setOpen}>
       <Tooltip>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <button
               type="button"
               data-testid="creation-environment"
-              // The tutorial's "Branch From" step points here. On the chip, not on its branch
+              // The tutorial's base-branch step points here. On the chip, not on its branch
               // segment: the segment is hidden for runtimes with no base branch, and a step with
               // no target shows only its backdrop.
               data-tutorial="trunk-branch"
@@ -345,6 +350,7 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
         </TooltipContent>
       </Tooltip>
       <PopoverContent
+        {...MODAL_POPOVER_CONTENT_PROPS}
         ref={contentRef}
         align="start"
         aria-label="Environment"
