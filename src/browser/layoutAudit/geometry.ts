@@ -70,9 +70,17 @@ export interface TextOverflow {
 /**
  * The cut the author asked for. An ellipsis marks where a line ends, so it speaks for the
  * horizontal axis only: it never authorizes lines lost below a short box. A line clamp drops
- * whole lines on purpose, so it speaks for both.
+ * whole lines on purpose, so it speaks for the vertical axis only: it never authorizes a word
+ * cut sideways (a browser paints an ellipsis only on the clamp's last line, and only when more
+ * text follows). A box with both has both.
  */
-export type TextTruncation = "none" | "ellipsis" | "line-clamp";
+export type TextTruncation = "none" | "ellipsis" | "line-clamp" | "ellipsis-and-line-clamp";
+
+const hasEllipsis = (truncation: TextTruncation) =>
+  truncation === "ellipsis" || truncation === "ellipsis-and-line-clamp";
+
+const hasLineClamp = (truncation: TextTruncation) =>
+  truncation === "line-clamp" || truncation === "ellipsis-and-line-clamp";
 
 export interface TextOverflowInput {
   /** Rendered line rectangles of the element's text. */
@@ -88,7 +96,7 @@ export interface TextOverflowInput {
 // ink, masks, transforms and offscreen carousel content, so they are never sufficient.
 function severeHorizontal(fragment: Box, input: TextOverflowInput): TextOverflow | null {
   const horizontal = axisOverflow(fragment, input.box, "horizontal");
-  if (horizontal === null || !isClipping(input.overflowX) || input.truncation !== "none") {
+  if (horizontal === null || !isClipping(input.overflowX) || hasEllipsis(input.truncation)) {
     return null;
   }
   const severe =
@@ -103,7 +111,7 @@ function severeVertical(fragment: Box, input: TextOverflowInput): TextOverflow |
   const vertical = axisOverflow(fragment, input.box, "vertical");
   if (vertical === null) return null;
   if (!isClipping(input.overflowY) && input.overflowY !== "visible") return null;
-  if (input.truncation === "line-clamp") return null;
+  if (hasLineClamp(input.truncation)) return null;
   const severe = vertical.overflowPx > THRESHOLDS.textEpsilonPx && vertical.centerOutside;
   return severe ? { axis: "vertical", overflowPx: vertical.overflowPx } : null;
 }

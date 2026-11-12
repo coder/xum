@@ -49,11 +49,13 @@ describe("textTruncation", () => {
     return textTruncation(fake.page.style(paragraph));
   }
 
-  test("names the cut the author asked for, and a line clamp wins over an ellipsis", () => {
+  test("names each cut the author asked for, an ellipsis and a line clamp together too", () => {
     expect(truncationOf("")).toBe("none");
     expect(truncationOf("text-overflow: ellipsis")).toBe("ellipsis");
     expect(truncationOf("webkit-line-clamp: 2")).toBe("line-clamp");
-    expect(truncationOf("text-overflow: ellipsis; webkit-line-clamp: 2")).toBe("line-clamp");
+    expect(truncationOf("text-overflow: ellipsis; webkit-line-clamp: 2")).toBe(
+      "ellipsis-and-line-clamp"
+    );
     expect(truncationOf("webkit-line-clamp: none")).toBe("none");
   });
 });

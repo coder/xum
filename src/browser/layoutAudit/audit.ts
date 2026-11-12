@@ -11,9 +11,11 @@ import {
   isInsideHorizontalScroller,
   isNearAnimation,
   isNestedInTextBoundary,
+  isReplacedContent,
   isRequiredControl,
   isRootElement,
   isVisible,
+  isVisibleTextHolder,
   nestedClippingBoundaries,
   paddingBox,
   rootVerticalScrollLocked,
@@ -91,7 +93,9 @@ function isJudgeable(pass: AuditPass, el: Element, byOwnBox = false): boolean {
 }
 
 function isVisibleText(pass: AuditPass, el: Element): boolean {
-  return isJudgeable(pass, el) && auditedText(pass.page, el) !== "" && isVisible(pass.page, el);
+  return (
+    isJudgeable(pass, el) && auditedText(pass.page, el) !== "" && isVisibleTextHolder(pass.page, el)
+  );
 }
 
 /** Absolute, fixed or sticky text stays put on purpose; a positioned control is still checked. */
@@ -121,15 +125,22 @@ function textEscapesRightEdge(pass: AuditPass, el: Element): boolean {
   );
 }
 
-/** Real content, not a scroll dimension, past the right edge: the evidence for page overflow. */
+/**
+ * Real content, not a scroll dimension, past the right edge: the evidence for page overflow. A
+ * control and a replaced element (an image, a video) are judged by their box, as nothing else
+ * says where they end. Text is judged by its lines.
+ */
 function elementEscapesRightEdge(pass: AuditPass, el: Element): boolean {
-  const control = isRequiredControl(el);
-  const scrolled = control
+  const replaced = isReplacedContent(el);
+  const byBox = replaced || isRequiredControl(el);
+  const scrolled = byBox
     ? hasHorizontalScrollerAncestor(pass.page, el)
     : isInsideHorizontalScroller(pass.page, el);
-  if (scrolled || !isJudgeable(pass, el)) return false;
-  if (!isVisible(pass.page, el) || isPositionedNonControl(pass, el)) return false;
-  if (!control) return textEscapesRightEdge(pass, el);
+  // An image in a link or a table cell is no text for the paragraph around it to judge.
+  if (scrolled || !isJudgeable(pass, el, replaced)) return false;
+  const visible = byBox ? isVisible(pass.page, el) : isVisibleTextHolder(pass.page, el);
+  if (!visible || isPositionedNonControl(pass, el)) return false;
+  if (!byBox) return textEscapesRightEdge(pass, el);
   const rect = pass.page.box(el);
   return viewportEscape(pass, rect, THRESHOLDS.controlMinOutsidePx)?.side === "end";
 }
@@ -181,10 +192,13 @@ function clippedControlCheck(pass: AuditPass, el: Element, rect: Box): void {
   });
 }
 
-function leftEdgeControlCheck(pass: AuditPass, el: Element, rect: Box): void {
+// A control past the right edge widens the page, and page-horizontal-overflow reports that. A
+// fixed control does not widen it, and no scroll brings it back, so its right edge is checked
+// here like its left.
+function viewportEdgeControlCheck(pass: AuditPass, el: Element, rect: Box): void {
   if (hasHorizontalScrollerAncestor(pass.page, el)) return;
   const escape = viewportEscape(pass, rect, THRESHOLDS.controlMinOutsidePx);
-  if (escape?.side !== "start") return;
+  if (escape === null || (escape.side === "end" && !isFixed(pass, el))) return;
   report(pass, {
     rule: "viewport-unreachable-control",
     selector: selectorFor(pass.page, el),
@@ -193,11 +207,15 @@ function leftEdgeControlCheck(pass: AuditPass, el: Element, rect: Box): void {
   });
 }
 
-// A fixed or sticky control, or any control when the root cannot scroll and no scroller on screen
-// holds it, must fit the viewport; otherwise it must fit the scrollable page.
+function isFixed(pass: AuditPass, el: Element): boolean {
+  return pass.page.style(el).position === "fixed";
+}
+
+// A fixed control, or any control when the root cannot scroll and no scroller on screen holds it,
+// must fit the viewport; otherwise it must fit the scrollable page. A sticky control is not
+// pinned: it sits in the flow until the user scrolls to it, so one below the fold is reachable.
 function isPinnedToViewport(pass: AuditPass, el: Element): boolean {
-  const position = pass.page.style(el).position;
-  if (position === "fixed" || position === "sticky") return true;
+  if (isFixed(pass, el)) return true;
   const { page, metrics } = pass;
   return (
     rootVerticalScrollLocked(page) &&
@@ -241,7 +259,7 @@ function controlChecks(pass: AuditPass, el: Element): void {
   if (!isVisible(page, el)) return;
   const rect = page.box(el);
   clippedControlCheck(pass, el, rect);
-  leftEdgeControlCheck(pass, el, rect);
+  viewportEdgeControlCheck(pass, el, rect);
   verticalControlCheck(pass, el, rect);
 }
 
@@ -303,13 +321,17 @@ function strongestTextClip(pass: AuditPass, el: Element): TextClip | null {
   const style = pass.page.style(el);
   const fragments = textFragments(pass.page, el);
   const truncation = textTruncation(style);
-  const own = classifySevereTextOverflow({
-    fragments,
-    box: paddingBox(pass.page, el),
-    overflowX: style.overflowX,
-    overflowY: style.overflowY,
-    truncation,
-  });
+  // A `display: contents` element has no box, so its `overflow` cannot cut its own text.
+  const own =
+    style.display === "contents"
+      ? null
+      : classifySevereTextOverflow({
+          fragments,
+          box: paddingBox(pass.page, el),
+          overflowX: style.overflowX,
+          overflowY: style.overflowY,
+          truncation,
+        });
   let clip: TextClip | null = own && { root: el, ...own };
   // A nested clipper's own ellipsis or line clamp is the author's cut of the text it holds, so it
   // is read from that clipper (`<span class="truncate">` in a paragraph is common).
@@ -526,7 +548,7 @@ function isOcclusionCandidate(pass: AuditPass, el: Element): boolean {
   return (
     sampled &&
     isJudgeable(pass, el, isFacelessControl(pass.page, el)) &&
-    isVisible(pass.page, el) &&
+    isVisibleTextHolder(pass.page, el) &&
     pass.page.style(el).position === "static"
   );
 }
