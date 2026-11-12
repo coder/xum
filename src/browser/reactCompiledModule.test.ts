@@ -9,11 +9,16 @@ import { loadReactCompiledModule } from "../../tests/ui/reactCompiledModule";
 // rejection: a later file then saw that TypeError, with no cause, instead of its own rejection
 // (brotliResponseGuard.test.ts, once WorkspaceShell.test.tsx ran before it in the shard).
 test("compiling a module through React Compiler leaves the stack trace hooks as they were", () => {
-  const before = { prepare: Error.prepareStackTrace, limit: Error.stackTraceLimit };
+  const hooks = () => ({
+    prepare: Object.getOwnPropertyDescriptor(Error, "prepareStackTrace")?.value as unknown,
+    limit: Object.getOwnPropertyDescriptor(Error, "stackTraceLimit")?.value as unknown,
+  });
+  const before = hooks();
 
   loadReactCompiledModule(path.join(import.meta.dir, "../constants/layout.ts"));
 
   expect(() => Error.captureStackTrace({})).not.toThrow();
-  expect(Error.prepareStackTrace).toBe(before.prepare);
-  expect(Error.stackTraceLimit).toBe(before.limit);
+  const after = hooks();
+  expect(after.prepare).toBe(before.prepare);
+  expect(after.limit).toBe(before.limit);
 });
