@@ -1,5 +1,6 @@
 import type { DisplayedMessage } from "@/common/types/message";
 import {
+  classifyLayoutTurnEndNudgePrompt,
   classifyStatusPageTurnEndNudgePrompt,
   classifyTodoTurnEndNudgePrompt,
 } from "@/common/utils/machineTurnPrompts";
@@ -18,6 +19,7 @@ function isMachineAuthoredPrompt(content: string): boolean {
     getBackgroundWorkWakeSummary(content) !== null ||
     classifyTodoTurnEndNudgePrompt(content) !== null ||
     classifyStatusPageTurnEndNudgePrompt(content) !== null ||
+    classifyLayoutTurnEndNudgePrompt(content) !== null ||
     parseSubagentReportEnvelope(content) !== null ||
     parseSubagentFailureEnvelope(content) !== null
   );
