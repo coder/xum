@@ -61,6 +61,46 @@ function parseFileContent(content: string): {
   return { lineNumbers, actualContent, actualBytes };
 }
 
+/** The summary line of an opened read: the path, the requested range and how much was read. */
+function FileReadSummary(props: {
+  filePath: string;
+  args: FileReadToolArgs;
+  result: FileReadToolResult | undefined;
+  parsedContent: ReturnType<typeof parseFileContent> | null;
+}) {
+  return (
+    <div className="bg-code-bg flex flex-wrap gap-4 rounded px-2 py-1.5 text-[11px] leading-[1.4]">
+      <div className="flex gap-1.5">
+        <span className="text-secondary font-medium">Path:</span>
+        <span className="text-text font-monospace break-all">{props.filePath}</span>
+      </div>
+      {props.args.offset != null && (
+        <div className="flex gap-1.5">
+          <span className="text-secondary font-medium">Offset:</span>
+          <span className="text-text font-monospace break-all">line {props.args.offset}</span>
+        </div>
+      )}
+      {props.args.limit != null && (
+        <div className="flex gap-1.5">
+          <span className="text-secondary font-medium">Limit:</span>
+          <span className="text-text font-monospace break-all">{props.args.limit} lines</span>
+        </div>
+      )}
+      {/* History replays can carry results without a numeric file_size. */}
+      {props.result?.success && props.parsedContent && (
+        <div className="flex gap-1.5">
+          <span className="text-secondary font-medium">Read:</span>
+          <span className="text-text font-monospace">
+            {formatBytes(props.parsedContent.actualBytes)}
+            {Number.isFinite(props.result.file_size) &&
+              ` of ${formatBytes(props.result.file_size)}`}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export const FileReadToolCall: React.FC<FileReadToolCallProps> = ({
   args,
   result,
@@ -91,34 +131,12 @@ export const FileReadToolCall: React.FC<FileReadToolCallProps> = ({
       {expanded && (
         <ToolDetails>
           <DetailSection>
-            <div className="bg-code-bg flex flex-wrap gap-4 rounded px-2 py-1.5 text-[11px] leading-[1.4]">
-              <div className="flex gap-1.5">
-                <span className="text-secondary font-medium">Path:</span>
-                <span className="text-text font-monospace break-all">{filePath}</span>
-              </div>
-              {args.offset != null && (
-                <div className="flex gap-1.5">
-                  <span className="text-secondary font-medium">Offset:</span>
-                  <span className="text-text font-monospace break-all">line {args.offset}</span>
-                </div>
-              )}
-              {args.limit != null && (
-                <div className="flex gap-1.5">
-                  <span className="text-secondary font-medium">Limit:</span>
-                  <span className="text-text font-monospace break-all">{args.limit} lines</span>
-                </div>
-              )}
-              {/* History replays can carry results without a numeric file_size. */}
-              {result?.success && parsedContent && (
-                <div className="flex gap-1.5">
-                  <span className="text-secondary font-medium">Read:</span>
-                  <span className="text-text font-monospace">
-                    {formatBytes(parsedContent.actualBytes)}
-                    {Number.isFinite(result.file_size) && ` of ${formatBytes(result.file_size)}`}
-                  </span>
-                </div>
-              )}
-            </div>
+            <FileReadSummary
+              filePath={filePath}
+              args={args}
+              result={result}
+              parsedContent={parsedContent}
+            />
           </DetailSection>
 
           {result && (

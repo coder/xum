@@ -80,6 +80,49 @@ function SandboxDenialFooter(props: { summary: string | null }) {
   );
 }
 
+/** The timing in a bash row's header: the timeout, then the clock while it runs or how long it took. */
+function BashHeaderTiming(props: {
+  timeoutSecs: BashToolArgs["timeout_secs"];
+  result: BashToolResult | undefined;
+  isPending: boolean;
+  startedAt: number | undefined;
+}) {
+  return (
+    <span
+      className={cn(
+        "ml-2 text-[10px] tabular-nums whitespace-nowrap [@container(max-width:500px)]:hidden",
+        props.isPending ? "text-pending" : "text-text-secondary"
+      )}
+    >
+      timeout: {props.timeoutSecs ?? BASH_DEFAULT_TIMEOUT_SECS}s
+      {/* Kernel-mode nested reloads reconstruct partial results without
+          wall_duration_ms; skip it instead of rendering "took —". */}
+      {typeof props.result?.wall_duration_ms === "number" &&
+        ` • took ${formatDuration(props.result.wall_duration_ms)}`}
+      {!props.result && (
+        <ElapsedTimeDisplay startedAt={props.startedAt} isActive={props.isPending} />
+      )}
+    </span>
+  );
+}
+
+/**
+ * The text of a bash row's status slot. A failed command says why once, in the status slot:
+ * "exit 1" replaces the generic "failed" and the separate exit-code pill. A zero exit shows
+ * nothing at all. Kernel-mode nested reloads can lack exitCode, so check the type.
+ */
+function BashStatusLabel(props: { status: ToolStatus; result: BashToolResult | undefined }) {
+  if (props.status === "failed" && typeof props.result?.exitCode === "number") {
+    return (
+      <>
+        <X aria-hidden="true" className="mr-1 inline-block h-3 w-3 align-[-2px]" />
+        <span className="status-text">exit {props.result.exitCode}</span>
+      </>
+    );
+  }
+  return <>{getStatusDisplay(props.status)}</>;
+}
+
 export const BashToolCall: React.FC<BashToolCallProps> = ({
   workspaceId,
   toolCallId,
@@ -257,33 +300,16 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           // While running, show the budget and the clock. A finished command's timeout and
           // duration are detail, not headline: the collapsed row keeps to the command itself
           // (as Claude Code, Codex and Cursor do) and expanding the card brings them back.
-          <span
-            className={cn(
-              "ml-2 text-[10px] tabular-nums whitespace-nowrap [@container(max-width:500px)]:hidden",
-              isPending ? "text-pending" : "text-text-secondary"
-            )}
-          >
-            timeout: {args.timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS}s
-            {/* Kernel-mode nested reloads reconstruct partial results without
-                wall_duration_ms; skip it instead of rendering "took —". */}
-            {typeof result?.wall_duration_ms === "number" &&
-              ` • took ${formatDuration(result.wall_duration_ms)}`}
-            {!result && <ElapsedTimeDisplay startedAt={startedAt} isActive={isPending} />}
-          </span>
+          <BashHeaderTiming
+            timeoutSecs={args.timeout_secs}
+            result={result}
+            isPending={isPending}
+            startedAt={startedAt}
+          />
         )}
         <SandboxDenialBadge summary={sandboxDenialSummary} />
         <StatusIndicator status={effectiveStatus}>
-          {/* A failed command says why once, in the status slot: "exit 1" replaces the generic
-              "failed" and the separate exit-code pill. A zero exit shows nothing at all.
-              Kernel-mode nested reloads can lack exitCode, so check the type. */}
-          {effectiveStatus === "failed" && typeof result?.exitCode === "number" ? (
-            <>
-              <X aria-hidden="true" className="mr-1 inline-block h-3 w-3 align-[-2px]" />
-              <span className="status-text">exit {result.exitCode}</span>
-            </>
-          ) : (
-            getStatusDisplay(effectiveStatus)
-          )}
+          <BashStatusLabel status={effectiveStatus} result={result} />
         </StatusIndicator>
         {/* Show "Background" button when bash is executing and can be sent to background.
             Use invisible when executing but not yet confirmed as foreground to avoid layout flash. */}

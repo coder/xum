@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState } from "react";
 import {
   CodeIcon,
   TerminalIcon,
@@ -86,6 +86,167 @@ const ViewToggle: React.FC<ViewToggleProps> = ({
   </Tooltip>
 );
 
+/** Format result for display: null when the script failed or returned nothing. */
+function formatScriptResult(result: CodeExecutionResult | undefined): string | null {
+  if (!result?.success || result.result === undefined) return null;
+  return typeof result.result === "string" ? result.result : JSON.stringify(result.result, null, 2);
+}
+
+/** The "result" view of a script: its return value or error once it settled, else its state. */
+function ScriptResultView(props: {
+  result: CodeExecutionResult | undefined;
+  isComplete: boolean;
+  isInterrupted: boolean;
+  isBackgrounded: boolean;
+}) {
+  if (props.isComplete && props.result) {
+    if (!props.result.success) {
+      return <ErrorBox className="break-words whitespace-pre-wrap">{props.result.error}</ErrorBox>;
+    }
+    const formattedResult = formatScriptResult(props.result);
+    return formattedResult ? (
+      <DetailContent className="p-2">{formattedResult}</DetailContent>
+    ) : (
+      <div className="text-muted italic">No return value</div>
+    );
+  }
+  if (props.isInterrupted) return <div className="text-interrupted italic">Interrupted</div>;
+  if (props.isBackgrounded) return <div className="text-muted italic">Backgrounded</div>;
+  return <div className="text-muted italic">Running…</div>;
+}
+
+/**
+ * Carrier attachments from nested tool results, split by kind: images
+ * render inline via ToolResultImages, media the gallery refuses (PDF, SVG)
+ * gets download cards, and display-only files get preview/download cards.
+ * Self-healing: history replays hand this renderer unvalidated results, so
+ * a non-array attachments value or malformed members must be filtered out
+ * rather than allowed to throw and brick the workspace.
+ */
+function splitCarrierAttachments(result: CodeExecutionResult | undefined) {
+  const attachmentParts: unknown[] = Array.isArray(result?.attachments) ? result.attachments : [];
+  const mediaAttachments = attachmentParts.filter(isMediaPart);
+  const displayAttachments = attachmentParts.filter(isDisplayOnlyFilePart);
+  const attachmentsResult =
+    mediaAttachments.length > 0 ? { type: "content" as const, value: mediaAttachments } : null;
+  const downloadOnlyMedia = mediaAttachments
+    .filter((media) => sanitizeImageData(media.mediaType, media.data) === null)
+    .map((media) => ({
+      type: "media" as const,
+      data: media.data,
+      mediaType: media.mediaType,
+      // Untrusted optional metadata (r24/r25): only well-formed filenames
+      // reach the download card.
+      ...(typeof media.filename === "string" && media.filename.length > 0
+        ? { filename: media.filename }
+        : {}),
+    }));
+  const hasAttachments =
+    attachmentsResult !== null || downloadOnlyMedia.length > 0 || displayAttachments.length > 0;
+  return { attachmentsResult, downloadOnlyMedia, displayAttachments, hasAttachments };
+}
+
+/**
+ * The cards for a script's carrier attachments. Attachments carried out of nested tool results
+ * (attach_file): the nested result only holds a stub, so previews render from the carrier.
+ */
+function CarrierAttachmentCards(props: {
+  attachments: ReturnType<typeof splitCarrierAttachments>;
+}) {
+  const { attachmentsResult, downloadOnlyMedia, displayAttachments } = props.attachments;
+  return (
+    <>
+      {attachmentsResult && <ToolResultImages result={attachmentsResult} />}
+      {downloadOnlyMedia.length > 0 && (
+        <div className="space-y-2">
+          {downloadOnlyMedia.map((media, index) => (
+            <MediaAttachmentDownloadCard
+              key={`${media.filename ?? media.mediaType}-${index}`}
+              media={media}
+            />
+          ))}
+        </div>
+      )}
+      {displayAttachments.length > 0 && (
+        <div className="space-y-2">
+          {displayAttachments.map((file, index) => (
+            <DisplayOnlyFile key={`${file.filename ?? file.mediaType}-${index}`} file={file} />
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** The "Result" view toggle: its icon and colour say how the script ended. */
+function ResultViewToggle(props: {
+  active: boolean;
+  onClick: () => void;
+  isInterrupted: boolean;
+  isBackgrounded: boolean;
+  hasFailed: boolean;
+}) {
+  return (
+    <ViewToggle
+      active={props.active}
+      onClick={props.onClick}
+      tooltip="Result"
+      variant={props.isInterrupted ? "warning" : props.hasFailed ? "error" : "default"}
+    >
+      {props.isInterrupted ? (
+        <AlertTriangleIcon className="h-3.5 w-3.5" />
+      ) : props.isBackgrounded ? (
+        <CirclePauseIcon className="h-3.5 w-3.5" />
+      ) : props.hasFailed ? (
+        <XCircleIcon className="h-3.5 w-3.5" />
+      ) : (
+        <CheckCircleIcon className="h-3.5 w-3.5" />
+      )}
+    </ViewToggle>
+  );
+}
+
+/** The calls a script made: the latest ones, under a button that shows or hides the earlier ones. */
+function ScriptNestedCalls(props: {
+  calls: NestedToolCall[];
+  showAllCalls: boolean;
+  onToggleShowAllCalls: () => void;
+  parentInterrupted: boolean;
+  workspaceId?: string;
+  toolCallTimestamp?: number;
+}) {
+  // Long runs show only their latest calls by default; earlier ones are one click away.
+  const { visible: visibleCalls, hiddenCount: hiddenCallCount } = selectVisibleNestedCalls(
+    props.calls,
+    props.showAllCalls
+  );
+  const canCollapseCalls = selectVisibleNestedCalls(props.calls, false).hiddenCount > 0;
+  return (
+    <>
+      {canCollapseCalls && (
+        <button
+          type="button"
+          className="text-muted hover:text-foreground self-start px-1 text-left transition-colors"
+          aria-expanded={props.showAllCalls}
+          onClick={props.onToggleShowAllCalls}
+        >
+          {props.showAllCalls
+            ? "Hide earlier calls"
+            : `Show ${hiddenCallCount.toLocaleString()} earlier ${
+                hiddenCallCount === 1 ? "call" : "calls"
+              }`}
+        </button>
+      )}
+      <NestedToolsContainer
+        calls={visibleCalls}
+        parentInterrupted={props.parentInterrupted}
+        workspaceId={props.workspaceId}
+        toolCallTimestamp={props.toolCallTimestamp}
+      />
+    </>
+  );
+}
+
 /**
  * A script (code execution) is a tool row like any other (Claude Code / Codex / Cursor style):
  * one header line behind the shared chevron, and the calls it made on the rail beneath it.
@@ -120,39 +281,7 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   const viewOptions = { isComplete, hasToolCalls, noToolCallsDefaultView } as const;
   const effectiveViewMode = resolveCodeExecutionViewMode(viewMode, viewOptions);
 
-  // Format result for display
-  const formattedResult = useMemo(() => {
-    if (!result?.success || result.result === undefined) return null;
-    return typeof result.result === "string"
-      ? result.result
-      : JSON.stringify(result.result, null, 2);
-  }, [result]);
-
-  // Carrier attachments from nested tool results, split by kind: images
-  // render inline via ToolResultImages, media the gallery refuses (PDF, SVG)
-  // gets download cards, and display-only files get preview/download cards.
-  // Self-healing: history replays hand this renderer unvalidated results, so
-  // a non-array attachments value or malformed members must be filtered out
-  // rather than allowed to throw and brick the workspace.
-  const attachmentParts: unknown[] = Array.isArray(result?.attachments) ? result.attachments : [];
-  const mediaAttachments = attachmentParts.filter(isMediaPart);
-  const displayAttachments = attachmentParts.filter(isDisplayOnlyFilePart);
-  const attachmentsResult =
-    mediaAttachments.length > 0 ? { type: "content" as const, value: mediaAttachments } : null;
-  const downloadOnlyMedia = mediaAttachments
-    .filter((media) => sanitizeImageData(media.mediaType, media.data) === null)
-    .map((media) => ({
-      type: "media" as const,
-      data: media.data,
-      mediaType: media.mediaType,
-      // Untrusted optional metadata (r24/r25): only well-formed filenames
-      // reach the download card.
-      ...(typeof media.filename === "string" && media.filename.length > 0
-        ? { filename: media.filename }
-        : {}),
-    }));
-  const hasAttachments =
-    attachmentsResult !== null || downloadOnlyMedia.length > 0 || displayAttachments.length > 0;
+  const attachments = splitCarrierAttachments(result);
 
   // A settled script that only made routine calls is one line, like the summary row it may sit
   // under. It opens by default only when there is something to watch or review: it is still
@@ -162,7 +291,7 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
     isRoutineToolCall(call.toolName, call.input, call.output)
   );
   const expandedByDefault =
-    isRunning || hasFailed || isInterrupted || !madeOnlyRoutineCalls || hasAttachments;
+    isRunning || hasFailed || isInterrupted || !madeOnlyRoutineCalls || attachments.hasAttachments;
   const expanded = userExpanded ?? expandedByDefault;
 
   const toggleView = (mode: CodeExecutionViewMode) => {
@@ -180,13 +309,6 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
       resolveCodeExecutionViewMode(prev, viewOptions) === mode ? defaultView : mode
     );
   };
-
-  // Long runs show only their latest calls by default; earlier ones are one click away.
-  const { visible: visibleCalls, hiddenCount: hiddenCallCount } = selectVisibleNestedCalls(
-    toolCalls,
-    showAllCalls
-  );
-  const canCollapseCalls = selectVisibleNestedCalls(toolCalls, false).hiddenCount > 0;
 
   const pinViewToggles = hasFailed || isInterrupted || (expanded && viewMode !== "tools");
   const codePreview = hasToolCalls ? "" : getCodePreviewLine(args.code);
@@ -235,22 +357,13 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
           )}
         >
           {!isRunning && (
-            <ViewToggle
+            <ResultViewToggle
               active={expanded && effectiveViewMode === "result"}
               onClick={() => toggleView("result")}
-              tooltip="Result"
-              variant={isInterrupted ? "warning" : hasFailed ? "error" : "default"}
-            >
-              {isInterrupted ? (
-                <AlertTriangleIcon className="h-3.5 w-3.5" />
-              ) : isBackgrounded ? (
-                <CirclePauseIcon className="h-3.5 w-3.5" />
-              ) : hasFailed ? (
-                <XCircleIcon className="h-3.5 w-3.5" />
-              ) : (
-                <CheckCircleIcon className="h-3.5 w-3.5" />
-              )}
-            </ViewToggle>
+              isInterrupted={isInterrupted}
+              isBackgrounded={isBackgrounded}
+              hasFailed={hasFailed}
+            />
           )}
           <ViewToggle
             active={expanded && effectiveViewMode === "code"}
@@ -272,28 +385,16 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
       {expanded && (
         <div className={cn(TOOL_RAIL_CLASS, "flex min-w-0 flex-col gap-1.5 py-0.5")}>
           {effectiveViewMode === "tools" && hasToolCalls && (
-            <>
-              {canCollapseCalls && (
-                <button
-                  type="button"
-                  className="text-muted hover:text-foreground self-start px-1 text-left transition-colors"
-                  aria-expanded={showAllCalls}
-                  onClick={() => setShowAllCalls((prev) => !prev)}
-                >
-                  {showAllCalls
-                    ? "Hide earlier calls"
-                    : `Show ${hiddenCallCount.toLocaleString()} earlier ${
-                        hiddenCallCount === 1 ? "call" : "calls"
-                      }`}
-                </button>
-              )}
-              <NestedToolsContainer
-                calls={visibleCalls}
-                parentInterrupted={isInterrupted}
-                workspaceId={workspaceId}
-                toolCallTimestamp={toolCallTimestamp}
-              />
-            </>
+            // The show-all choice is held here, not in the block, so that it outlives closing
+            // the script or visiting another view.
+            <ScriptNestedCalls
+              calls={toolCalls}
+              showAllCalls={showAllCalls}
+              onToggleShowAllCalls={() => setShowAllCalls((prev) => !prev)}
+              parentInterrupted={isInterrupted}
+              workspaceId={workspaceId}
+              toolCallTimestamp={toolCallTimestamp}
+            />
           )}
 
           {effectiveViewMode === "code" && (
@@ -312,45 +413,16 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
             </div>
           )}
 
-          {effectiveViewMode === "result" &&
-            (isComplete && result ? (
-              result.success ? (
-                formattedResult ? (
-                  <DetailContent className="p-2">{formattedResult}</DetailContent>
-                ) : (
-                  <div className="text-muted italic">No return value</div>
-                )
-              ) : (
-                <ErrorBox className="break-words whitespace-pre-wrap">{result.error}</ErrorBox>
-              )
-            ) : isInterrupted ? (
-              <div className="text-interrupted italic">Interrupted</div>
-            ) : isBackgrounded ? (
-              <div className="text-muted italic">Backgrounded</div>
-            ) : (
-              <div className="text-muted italic">Running…</div>
-            ))}
+          {effectiveViewMode === "result" && (
+            <ScriptResultView
+              result={result}
+              isComplete={isComplete}
+              isInterrupted={isInterrupted}
+              isBackgrounded={isBackgrounded}
+            />
+          )}
 
-          {/* Attachments carried out of nested tool results (attach_file): the
-          nested result only holds a stub, so previews render from the carrier. */}
-          {attachmentsResult && <ToolResultImages result={attachmentsResult} />}
-          {downloadOnlyMedia.length > 0 && (
-            <div className="space-y-2">
-              {downloadOnlyMedia.map((media, index) => (
-                <MediaAttachmentDownloadCard
-                  key={`${media.filename ?? media.mediaType}-${index}`}
-                  media={media}
-                />
-              ))}
-            </div>
-          )}
-          {displayAttachments.length > 0 && (
-            <div className="space-y-2">
-              {displayAttachments.map((file, index) => (
-                <DisplayOnlyFile key={`${file.filename ?? file.mediaType}-${index}`} file={file} />
-              ))}
-            </div>
-          )}
+          <CarrierAttachmentCards attachments={attachments} />
         </div>
       )}
     </div>
