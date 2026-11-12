@@ -1,4 +1,14 @@
 import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "bun:test";
 
@@ -71,32 +81,80 @@ test.each(["succeeds", "throws"] as const)(
 );
 
 // tests/ui/reactCompiledModule.ts is the one place that runs Babel and puts the hooks back, so
-// any other file that imports @babel/core runs Babel without that. The earlier cases cannot
+// any other file that mentions @babel/core may run Babel without that. The cases above cannot
 // see such a file once any transform or the source-map-support hook came first in the process.
-// scripts/check_react_compiler_coverage.ts is allowed: only its Makefile target runs it, in its
-// own process, never inside a test process.
-const MAY_IMPORT_BABEL_CORE = new Set([
+// The match is a plain substring, so a quoted import, a template literal and a subpath all count,
+// and so does a comment: name the package elsewhere in other words. Allowed files: the helper,
+// this file (it names the package to look for), and scripts/check_react_compiler_coverage.ts,
+// because only its Makefile target runs it, in its own process, never inside a test process.
+const MAY_NAME_BABEL_CORE = new Set([
   "tests/ui/reactCompiledModule.ts",
+  "src/browser/reactCompiledModule.test.ts",
   "scripts/check_react_compiler_coverage.ts",
 ]);
-const BABEL_CORE_SPECIFIER = /["']@babel\/core(?:\/[^"']*)?["']/;
 const SCANNED_ROOTS = ["src", "tests", "scripts", "vscode/src"];
+const SOURCE_FILE = /\.(?:[cm]?[jt]s|[jt]sx)$/;
 
-test("no file except the React Compiler helper imports @babel/core", async () => {
+// Reads the files on disk, not `git ls-files`: some jobs test without a git checkout. Vendored
+// code is skipped without being walked: `make check-docs-links` leaves scripts/mintlify/node_modules
+// (jiti alone has 35,000 files, and jiti bundles its own Babel), and dot folders hold tool output.
+function sourceFilesUnder(repoRoot: string, dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(path.join(repoRoot, dir), { withFileTypes: true })) {
+    const relative = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) {
+      if (entry.name !== "node_modules" && !entry.name.startsWith(".")) {
+        files.push(...sourceFilesUnder(repoRoot, relative));
+      }
+    } else if (entry.isFile() && SOURCE_FILE.test(entry.name)) {
+      files.push(relative);
+    }
+  }
+  return files;
+}
+
+function scanForBabelCore(repoRoot: string): { scanned: Set<string>; mentions: string[] } {
   const scanned = new Set<string>();
-  const importers: string[] = [];
+  const mentions: string[] = [];
   for (const root of SCANNED_ROOTS) {
-    // One glob per root: a glob with a `/` inside its braces matches nothing in Bun.
-    const files = new Bun.Glob(`${root}/**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}`);
-    for await (const file of files.scan({ cwd: REPO_ROOT })) {
+    if (!existsSync(path.join(repoRoot, root))) continue;
+    for (const file of sourceFilesUnder(repoRoot, root)) {
       scanned.add(file);
-      if (MAY_IMPORT_BABEL_CORE.has(file)) continue;
-      if (BABEL_CORE_SPECIFIER.test(await Bun.file(path.join(REPO_ROOT, file)).text())) {
-        importers.push(file);
+      if (readFileSync(path.join(repoRoot, file), "utf8").includes("@babel/core")) {
+        mentions.push(file);
       }
     }
   }
+  return { scanned, mentions: mentions.sort() };
+}
+
+test("no source file on disk except the React Compiler helper names @babel/core", () => {
+  const { scanned, mentions } = scanForBabelCore(REPO_ROOT);
   // A scan that finds nothing would pass for the wrong reason: it must see the allowed files.
-  for (const allowed of MAY_IMPORT_BABEL_CORE) expect(scanned.has(allowed)).toBe(true);
-  expect(importers.sort()).toEqual([]);
+  for (const allowed of MAY_NAME_BABEL_CORE) expect(scanned.has(allowed)).toBe(true);
+  expect(mentions.filter((file) => !MAY_NAME_BABEL_CORE.has(file))).toEqual([]);
 }, 30_000);
+
+test("the scan skips node_modules and dot folders and finds a mention anywhere else", () => {
+  const fixture = mkdtempSync(path.join(tmpdir(), "babel-core-scan-"));
+  try {
+    const write = (file: string, text: string) => {
+      mkdirSync(path.dirname(path.join(fixture, file)), { recursive: true });
+      writeFileSync(path.join(fixture, file), text);
+    };
+    write("src/found.ts", "export const a = `@babel/core`;");
+    write("scripts/deep/er/found.mjs", "import 'x'; // @babel/core/lib/errors");
+    write("tests/clean.ts", "export const b = 1;");
+    write("scripts/mintlify/node_modules/jiti/dist/babel.js", 'require("@babel/core");');
+    write("src/node_modules/dep/index.ts", 'import "@babel/core";');
+    write("tests/.e2e/output.ts", 'import "@babel/core";');
+    write("src/readme.md", "@babel/core");
+
+    expect(scanForBabelCore(fixture).mentions).toEqual([
+      "scripts/deep/er/found.mjs",
+      "src/found.ts",
+    ]);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
