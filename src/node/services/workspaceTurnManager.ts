@@ -4900,12 +4900,22 @@ export class WorkspaceTurnManager {
           : {}),
       }
     );
+    return this.archiveSinkResult(resolved, result, forcedLoss);
+  }
+
+  private archiveSinkResult(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    result: Awaited<ReturnType<WorkspaceHost["archiveWhileTaskTreeLocked"]>>,
+    forcedLoss: ForcedArchiveLoss | undefined
+  ): WorkspaceLifecycleResult {
     if (!result.success) return this.archiveErrorResult(resolved, result.error);
     if (result.data.kind === "confirm-lossy-untracked-files") {
       return this.lossySnapshotArchiveRefusal(
         resolved,
         result.data.paths,
-        forced ? FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL
+        forcedLoss != null
+          ? FORCED_ARCHIVE_UNTRACKED_CHANGED_REFUSAL
+          : LOSSY_SNAPSHOT_ARCHIVE_REFUSAL
       );
     }
     return {
