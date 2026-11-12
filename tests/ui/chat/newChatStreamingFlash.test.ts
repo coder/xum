@@ -46,9 +46,12 @@ interface CreationHarness {
 async function waitForSourceBranch(view: RenderedApp): Promise<void> {
   await waitFor(
     () => {
-      const trigger = view.container.querySelector('[aria-label="Select source branch"]');
-      const selected = trigger?.textContent?.trim();
-      if (!selected || selected === "Select source branch") {
+      // The environment chip shows the base branch once one is selected.
+      if (
+        !view.container.querySelector(
+          '[data-component="BranchSelector"][data-branch-load="selected"]'
+        )
+      ) {
         throw new Error("Source branch not selected yet");
       }
     },

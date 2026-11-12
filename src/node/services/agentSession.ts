@@ -1097,6 +1097,16 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     workspaceId: string,
     input: { messageId: string; parts: readonly CompletedMessagePart[] }
   ): Promise<string | null>;
+  /** The layout nudge for HTML artifacts that are due for an audit, or null. Absent: never. */
+  layoutTurnEndNudge?(
+    workspaceId: string,
+    input: {
+      /** The ended turn's assistant message: a turn that cannot publish gets no nudge. */
+      messageId: string;
+      /** A user Stop (or a shutdown) ends the audit: no nudge is returned. */
+      abortSignal: AbortSignal;
+    }
+  ): Promise<string | null>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
     runtime: Runtime,
@@ -10791,12 +10801,12 @@ export class AgentSession {
    * (Codex `decision: "block"`) queues its prompt as a new synthetic user row. Each hook continues
    * a user turn up to its own limit (runTurnStopHooks), and all of them together at most
    * MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN times. Xum's own nudges (needsTodoTurnEndNudge,
-   * statusPageTurnEndNudge) ride the same continuation and gates. Sub-agent turns skip the
-   * hooks: TaskService owns their stream end (Codex has SubagentStop for them). A delegated
-   * workspace turn (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager
-   * settles its handle from this stream end, and can remove a disposable workspace, while a slow
-   * hook still runs, so a continuation would arrive after the caller already got the turn as
-   * finished.
+   * statusPageTurnEndNudge, layoutTurnEndNudge) ride the same continuation and gates. Sub-agent
+   * turns skip the hooks: TaskService owns their stream end (Codex has SubagentStop for them). A
+   * delegated workspace turn (`workspace-turn-task`) skips them for the same reason:
+   * WorkspaceTurnManager settles its handle from this stream end, and can remove a disposable
+   * workspace, while a slow hook still runs, so a continuation would arrive after the caller
+   * already got the turn as finished.
    */
   private async runTurnStopHooks(
     payload: StreamEndEvent,
@@ -10940,7 +10950,10 @@ export class AgentSession {
     // A Stop that landed after the stream ended and before this point had nothing to abort. No
     // await sits between storing the controller and this check, so no Stop falls between them.
     if (this.stoppedSince(provenance.admissionStopEpoch)) hooksAbort.abort();
+    // A shutdown or dispose ends the hooks too: their processes must not delay teardown.
+    const abortSignal = AbortSignal.any([hooksAbort.signal, this.closingSignal]);
     let hookOutcome: TurnStopHookOutcome;
+    let nudges: string[];
     try {
       hookOutcome = (await this.aiService.runTurnStopHooks?.(this.workspaceId, {
         messageId: payload.messageId,
@@ -10948,24 +10961,29 @@ export class AgentSession {
         model: stopHookModel(payload, provenance),
         turnContinuations: this.stopHookContinuations,
         hookContinuations: this.stopHookCountsByKey,
-        // A shutdown or dispose ends the hooks too: their processes must not delay teardown.
-        abortSignal: AbortSignal.any([hooksAbort.signal, this.closingSignal]),
+        abortSignal,
       })) ?? { kind: "none" };
+      // Still under the Stop abort: the layout audit of the nudges runs a browser for seconds.
+      nudges = await this.readTurnEndNudges(hookOutcome, options, payload, provenance, abortSignal);
     } finally {
       if (this.turnStopHooksAbort === hooksAbort) this.turnStopHooksAbort = undefined;
     }
     return mergeTurnStopContinuation({
       hookReasons: hookOutcome.kind === "continue" ? hookOutcome.reasons : [],
-      nudges: await this.readTurnEndNudges(hookOutcome, options, payload, provenance),
+      nudges,
     });
   }
 
-  /** Xum's turn-end nudges for the continuation, TODO first (see readTurnStopContinuation). */
+  /**
+   * Xum's turn-end nudges for the continuation: TODO, then the status page, then layout (see
+   * readTurnStopContinuation). `abortSignal` is the turn.stop hooks' (a user Stop or a shutdown).
+   */
   private async readTurnEndNudges(
     hookOutcome: TurnStopHookOutcome,
     options: SendMessageOptions | undefined,
     payload: StreamEndEvent,
-    provenance: StopContinuationProvenance
+    provenance: StopContinuationProvenance,
+    abortSignal: AbortSignal
   ): Promise<string[]> {
     if (
       hookOutcome.kind === "halted" ||
@@ -10989,7 +11007,28 @@ export class AgentSession {
       parts: payload.parts,
     });
     if (statusPageNudge != null) nudges.push(statusPageNudge);
+    const layoutNudge = await this.readLayoutNudge(provenance, payload.messageId, abortSignal);
+    if (layoutNudge != null) nudges.push(layoutNudge);
     return nudges;
+  }
+
+  /**
+   * The layout nudge (see AgentSessionAIService.layoutTurnEndNudge). A machine turn can change a
+   * page as well as a user turn, so it is not limited to user-started turns. The audit runs a
+   * browser for seconds, so it is skipped when the turn's continuation would be dropped anyway
+   * (runTurnStopHooks).
+   */
+  private async readLayoutNudge(
+    provenance: StopContinuationProvenance,
+    messageId: string,
+    abortSignal: AbortSignal
+  ): Promise<string | null> {
+    if (provenance.externallyOwnedTurn) return null;
+    const nudge = await this.aiService.layoutTurnEndNudge?.(this.workspaceId, {
+      messageId,
+      abortSignal,
+    });
+    return nudge ?? null;
   }
 
   /** Records whether the sent message whose stream starts now began a user turn. */

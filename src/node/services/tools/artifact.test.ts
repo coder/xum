@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -8,6 +8,12 @@ import { getToolsForModel } from "@/common/utils/tools/tools";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import * as artifactsOperationsModule from "@/node/services/artifactsOperations";
 import { getArtifactId, readArtifactRecord } from "@/node/services/artifactRecordStore";
+import * as checkArtifactLayoutModule from "@/node/services/layoutAudit/checkArtifactLayout";
+import {
+  installFakeAgentBrowser,
+  type FakeAgentBrowser,
+  type FakeAgentBrowserScript,
+} from "@/node/services/layoutAudit/fakeAgentBrowser.testHarness";
 import { createArtifactTool } from "./artifact";
 import { createArtifactListTool } from "./artifact_list";
 import { createArtifactReadTool } from "./artifact_read";
@@ -20,16 +26,24 @@ const options: ToolExecutionOptions<unknown> = {
   context: undefined,
 };
 
+// Publishing HTML runs the layout audit through a shell (a fake agent-browser here).
+setDefaultTimeout(60_000);
+
 describe("artifact tool", () => {
   let tempDir: string;
   let scratchDir: string;
   let sessionDir: string;
+
+  let fakeBrowser: FakeAgentBrowser;
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "artifact-tool-"));
     scratchDir = path.join(tempDir, "scratch");
     sessionDir = path.join(tempDir, "session");
     await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
+    // Every HTML publish in this block audits its layout. The trusted project's tool_env puts
+    // the fake first on PATH, so no test here can reach a real agent-browser.
+    fakeBrowser = await installFakeAgentBrowser(tempDir, {});
   });
 
   afterEach(async () => {
@@ -38,6 +52,7 @@ describe("artifact tool", () => {
 
   const configFor = (runtimeMode = "worktree", runtime = new LocalRuntime(tempDir)) => ({
     ...createTestToolConfig(tempDir, { sessionsDir: sessionDir, runtime }),
+    trusted: true,
     xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: runtimeMode },
     experiments: { artifacts: true },
     artifactShelfRoot: path.join(tempDir, "shelf"),
@@ -64,7 +79,7 @@ describe("artifact tool", () => {
     const file = path.join(scratchDir, "artifacts", "chart.html");
     await fs.writeFile(file, "<p>1</p>");
     const first = await run({ path: "chart.html", title: "interactive chart", pin: "project" });
-    expect(first).toEqual({
+    expect(first).toMatchObject({
       success: true,
       path: "chart.html",
       bytes: 8,
@@ -75,7 +90,7 @@ describe("artifact tool", () => {
     await fs.writeFile(file, "<p>two</p>");
     // Absolute path inside the artifacts dir; no title → file name; omitted pin keeps "project".
     const second = await run({ path: file });
-    expect(second).toEqual({
+    expect(second).toMatchObject({
       success: true,
       path: "chart.html",
       bytes: 10,
@@ -129,6 +144,159 @@ describe("artifact tool", () => {
       { path: "a.md", title: "Alpha" },
       { path: "b.md", title: undefined },
     ]);
+  });
+
+  describe("layout audit", () => {
+    // The tool passes no budget, so the audit uses its production 15 s. Three fake widths took
+    // longer than that on a host at load 40: these tests get a budget no host load exhausts, and
+    // the hang test sets a short one. Captured before spyOn, which replaces the export.
+    const audit = checkArtifactLayoutModule.checkArtifactLayout;
+    let budgetMs = 60_000;
+    let auditSpy: ReturnType<typeof spyOn<typeof checkArtifactLayoutModule, "checkArtifactLayout">>;
+    beforeEach(() => {
+      budgetMs = 60_000;
+      auditSpy = spyOn(checkArtifactLayoutModule, "checkArtifactLayout").mockImplementation(
+        (input) => audit({ ...input, budgetMs })
+      );
+    });
+    afterEach(() => auditSpy.mockRestore());
+
+    const publish = (file: string, html = "<p>hello</p>") =>
+      fs.writeFile(path.join(scratchDir, "artifacts", file), html).then(() => run({ path: file }));
+
+    /** The result as the model and the chat history see it. */
+    const serialized = (result: ArtifactToolResult): Record<string, unknown> =>
+      JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
+
+    /** The widths the layout lists as not checked; none when it is missing or checked. */
+    const notCheckedOf = (result: ArtifactToolResult) =>
+      result.success && result.layout?.checked === false ? result.layout.notChecked : [];
+
+    const evalCalls = async () =>
+      (await fakeBrowser.calls()).filter((argv) => argv.includes("eval")).length;
+
+    const withFake = async (script: FakeAgentBrowserScript) => {
+      fakeBrowser = await installFakeAgentBrowser(tempDir, script);
+    };
+
+    test("an HTML publish reports its layout and still succeeds", async () => {
+      await withFake({
+        eval: {
+          1440: {
+            kind: "pass",
+            findings: [{ rule: "clipped-text", selector: "h1", axis: "horizontal", overflowPx: 9 }],
+          },
+        },
+      });
+      const result = await publish("page.html");
+      expect(result).toMatchObject({
+        success: true,
+        kind: "html",
+        layout: {
+          checked: true,
+          issues: [{ rule: "clipped-text", selector: "h1", viewport: 1440 }],
+        },
+      });
+      expect(await evalCalls()).toBe(3);
+    });
+
+    test("a clean HTML page is checked and lists nothing", async () => {
+      expect(await publish("page.html")).toMatchObject({
+        success: true,
+        layout: { checked: true, issues: [] },
+      });
+    });
+
+    test("a missing agent-browser is not checked, never clean, and the publish succeeds", async () => {
+      await withFake({ missing: true });
+      const result = await publish("page.html");
+      expect(result).toMatchObject({
+        success: true,
+        path: "page.html",
+        layout: { checked: false, issues: [] },
+      });
+      expect(JSON.stringify(result)).toContain("no-agent-browser");
+      expect(await fakeBrowser.calls()).toEqual([]);
+    });
+
+    test("a hang gives up within the test budget: not checked, publish succeeds", async () => {
+      await withFake({ eval: { 390: { kind: "hang" } } });
+      budgetMs = 6_000;
+      const result = await publish("page.html");
+      expect(result).toMatchObject({ success: true, layout: { checked: false } });
+      expect(notCheckedOf(result)).toContainEqual({ viewport: 390, reason: "timeout" });
+      expect(auditSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test("a crashed audit script is not checked and the publish succeeds", async () => {
+      await withFake({ eval: { 390: { kind: "throw", message: "boom" } } });
+      const result = await publish("page.html");
+      expect(result).toMatchObject({ success: true, layout: { checked: false } });
+      expect(notCheckedOf(result)).toContainEqual({ viewport: 390, reason: "script-failed" });
+    });
+
+    test("a re-publish marks an issue it showed before as persistent", async () => {
+      await withFake({
+        eval: {
+          390: {
+            kind: "pass",
+            findings: [{ rule: "clipped-text", selector: "h1", axis: "horizontal", overflowPx: 9 }],
+          },
+        },
+      });
+      const first = await publish("page.html");
+      const second = await publish("page.html", "<p>edited</p>");
+      expect(first).toMatchObject({ layout: { issues: [{ selector: "h1" }] } });
+      expect(first).not.toMatchObject({ layout: { issues: [{ persistent: true }] } });
+      expect(second).toMatchObject({ layout: { issues: [{ selector: "h1", persistent: true }] } });
+    });
+
+    test("other kinds have no layout and never start a browser", async () => {
+      for (const file of ["notes.md", "data.json", "figure.svg"]) {
+        const result = await publish(file, "x");
+        expect(result).toMatchObject({ success: true });
+        expect(serialized(result)).not.toHaveProperty("layout");
+      }
+      expect(await fakeBrowser.calls()).toEqual([]);
+    });
+
+    test("a kind override decides only with an html name: page.htm is audited, page.txt and an html file shown as markdown are not", async () => {
+      await fs.writeFile(path.join(scratchDir, "artifacts", "page.htm"), "<p>x</p>");
+      expect(await run({ path: "page.htm", kind: "html" })).toMatchObject({
+        layout: { checked: true },
+      });
+      // The browser would load page.txt as plain text: no layout rather than a false clean.
+      await fs.writeFile(path.join(scratchDir, "artifacts", "page.txt"), "<p>x</p>");
+      const asText = await run({ path: "page.txt", kind: "html" });
+      expect(asText).toMatchObject({ success: true, kind: "html" });
+      expect(serialized(asText)).not.toHaveProperty("layout");
+      await fs.writeFile(path.join(scratchDir, "artifacts", "doc.html"), "<p>x</p>");
+      const asMarkdown = await run({ path: "doc.html", kind: "markdown" });
+      expect(serialized(asMarkdown)).not.toHaveProperty("layout");
+    });
+
+    test("a failed publish has no layout and starts no browser", async () => {
+      for (const failed of [
+        await run({ path: "missing.html" }),
+        await run({ path: "../escape.html" }),
+      ]) {
+        expect(failed).toMatchObject({ success: false });
+        expect(serialized(failed)).not.toHaveProperty("layout");
+      }
+      expect(await fakeBrowser.calls()).toEqual([]);
+    });
+
+    test("a refused pin has no layout and starts no browser", async () => {
+      await fs.writeFile(path.join(scratchDir, "artifacts", "page.html"), "<p>x</p>");
+      const config = { ...configFor(), artifactShelfRoot: undefined };
+      const result = (await createArtifactTool(config).execute!(
+        { path: "page.html", pin: "global" },
+        options
+      )) as ArtifactToolResult;
+      expect(result).toMatchObject({ success: false });
+      expect(serialized(result)).not.toHaveProperty("layout");
+      expect(await fakeBrowser.calls()).toEqual([]);
+    });
   });
 });
 

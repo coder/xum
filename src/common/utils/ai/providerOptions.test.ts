@@ -6,9 +6,11 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { createOpenAICachedSystemMessage } from "./cacheStrategy";
 import { describe, test, expect, mock } from "bun:test";
 import * as RealLogModule from "@/node/services/log";
@@ -981,21 +983,25 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
     expect(options).toHaveProperty("anthropic");
   });
 
-  test("canonical model mapped onto a Coder instance builds that instance's wire options", () => {
-    // google-typed instances speak OpenAI chat, which ignores google.thinkingConfig.
+  describe("google-typed instances send Gemini thinking_config, not reasoning_effort", () => {
+    // Gemini's OpenAI compatibility layer emits thoughts only for an explicit
+    // include_thoughts and rejects reasoning_effort alongside thinking_config.
     const config: ProvidersConfigMap = {
       coder: {
         apiKeySet: false,
         isEnabled: true,
         isConfigured: true,
-        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        discoveredProviders: [
+          { name: "agents-google", type: "google" },
+          { name: "gemini-proxy", type: "openai-compat" },
+        ],
         canonicalRoutes: { google: "agents-google" },
       },
     };
-    const build = (modelString: string) =>
+    const build = (modelString: string, thinking: ThinkingLevel): Record<string, unknown> =>
       buildProviderOptions(
         modelString,
-        "high",
+        thinking,
         undefined,
         undefined,
         { openai: { wireFormat: "chatCompletions" } },
@@ -1004,8 +1010,49 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
         config,
         "coder"
       );
-    expect(build("google:gemini-3.8-flash")).toEqual(build("coder:agents-google/gemini-3.8-flash"));
-    expect(build("google:gemini-3.8-flash")).toMatchObject({ openai: { reasoningEffort: "high" } });
+    const thinkingConfig = (value: Record<string, unknown>): Record<string, unknown> => ({
+      coderGoogle: { extra_body: { google: { thinking_config: value } } },
+    });
+
+    const cases: Array<{ model: string; thinking: ThinkingLevel; expected: unknown }> = [
+      {
+        model: "gemini-4-carbon",
+        thinking: "high",
+        expected: thinkingConfig({ include_thoughts: true, thinking_level: "high" }),
+      },
+      {
+        model: "gemini-4-carbon",
+        thinking: "max",
+        expected: thinkingConfig({ include_thoughts: true, thinking_level: "high" }),
+      },
+      {
+        model: "gemini-2.5-pro",
+        thinking: "high",
+        expected: thinkingConfig({ include_thoughts: true, thinking_budget: 16384 }),
+      },
+      { model: "gemini-3-pro", thinking: "off", expected: { coderGoogle: {} } },
+      {
+        model: "gemini-3-flash",
+        thinking: "off",
+        expected: thinkingConfig({ thinking_level: "minimal" }),
+      },
+      {
+        model: "gemini-3.8-flash",
+        thinking: "off",
+        expected: thinkingConfig({ include_thoughts: true, thinking_level: "low" }),
+      },
+    ];
+    test.each(cases)("$model at $thinking", ({ model, thinking, expected }) => {
+      const canonical = build(`google:${model}`, thinking);
+      expect(canonical).toEqual(expected as Record<string, unknown>);
+      expect(build(`coder:agents-google/${model}`, thinking)).toEqual(canonical);
+    });
+
+    test("an openai-compat instance fronting Gemini keeps OpenAI options", () => {
+      expect(build("coder:gemini-proxy/gemini-4-carbon", "high")).toMatchObject({
+        openai: { reasoningEffort: "high" },
+      });
+    });
   });
 
   test("unknown instance names build no options", () => {
@@ -1615,9 +1662,9 @@ describe("buildProviderOptions - OpenAI", () => {
           },
           "coder"
         );
-        const openai = getOpenAIOptions(options);
-        expect(openai).toBeDefined();
-        expect(openai?.serviceTier).toBe(type === "google" ? undefined : "priority");
+        expect(getOpenAIOptions(options)?.serviceTier).toBe(
+          type === "google" ? undefined : "priority"
+        );
       }
     );
 
@@ -3284,6 +3331,102 @@ describe("buildProviderOptions - Z.ai", () => {
 
   test("does not apply forced GLM 5.3 options to other Z.ai models", () => {
     expect(buildProviderOptions("zai:glm-4.7-flash", "high")).toEqual({});
+  });
+});
+
+describe("buildProviderOptions - GLM 5.3 on custom OpenAI-compatible providers", () => {
+  const openaiCompatibleConfig = (
+    name: string,
+    models?: Array<{ id: string; mappedToModel?: string }>
+  ): ProvidersConfigMap => ({
+    [name]: {
+      apiKeySet: true,
+      isEnabled: true,
+      isConfigured: true,
+      isCustom: true,
+      providerType: "openai-compatible",
+      ...(models && { models }),
+    },
+  });
+
+  /** The reasoning_effort the real OpenAI-compatible SDK puts on the wire for one request. */
+  async function wireReasoningEffort(
+    providerName: string,
+    modelId: string,
+    thinking: Parameters<typeof buildProviderOptions>[1],
+    providersConfig = openaiCompatibleConfig(providerName)
+  ): Promise<unknown> {
+    let body: Record<string, unknown> | undefined;
+    const captureFetch: typeof fetch = Object.assign(
+      (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== "string") throw new Error("Expected a JSON request body");
+        body = JSON.parse(init.body) as Record<string, unknown>;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: "chat_test",
+              object: "chat.completion",
+              created: 0,
+              model: modelId,
+              choices: [
+                { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+              ],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    const providerOptions = buildProviderOptions(
+      `${providerName}:${modelId}`,
+      thinking,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      providersConfig
+    ) as Parameters<typeof generateText>[0]["providerOptions"];
+    await generateText({
+      model: createOpenAICompatible({
+        name: providerName,
+        baseURL: "http://127.0.0.1:1/v1",
+        fetch: captureFetch,
+      })(modelId),
+      prompt: "Return ok.",
+      providerOptions,
+      maxRetries: 0,
+    });
+    expect(body).toBeDefined();
+    return body?.reasoning_effort;
+  }
+
+  test("sends the GLM template's effort strings for every level", async () => {
+    for (const [level, effort] of [
+      ["off", "low"],
+      ["low", "low"],
+      ["medium", "low"],
+      ["high", "high"],
+      ["xhigh", "high"],
+      ["max", "max"],
+    ] as const) {
+      expect(await wireReasoningEffort("omlx", "GLM-5.3-Flash-oQ4e-mtp", level)).toBe(effort);
+    }
+    expect(await wireReasoningEffort("local-glm", "glm-5.3-flash", "high")).toBe("high");
+  });
+
+  test("recognizes GLM 5.3 behind a mappedToModel alias", async () => {
+    const config = openaiCompatibleConfig("omlx", [
+      { id: "house-model", mappedToModel: "zai:glm-5.3-flash" },
+    ]);
+    expect(await wireReasoningEffort("omlx", "house-model", "max", config)).toBe("max");
+  });
+
+  test("sends no reasoning_effort to models it does not recognize as GLM 5.3", async () => {
+    expect(await wireReasoningEffort("omlx", "Qwen3.8-Flash-Next-oQ4e-mtp", "max")).toBeUndefined();
+    expect(await wireReasoningEffort("omlx", "glm-5.3-flashx", "high")).toBeUndefined();
   });
 });
 

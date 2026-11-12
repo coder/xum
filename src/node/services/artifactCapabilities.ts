@@ -24,25 +24,38 @@ export const AGENT_BROWSER_PROBE_TIMEOUT_SECONDS = 5;
 /** Same variable name the bash tool uses to hand the tool_env path to its prelude. */
 const PROBE_TOOL_ENV_PATH_ENV = "XUM_INTERNAL_TOOL_ENV_PATH";
 /** Exit code for "tool_env failed to source": not an answer, so never cached. */
-const TOOL_ENV_FAILED_EXIT = 3;
+export const TOOL_ENV_FAILED_EXIT = 3;
+
+/**
+ * Shell text that sources `.xum/tool_env` like the bash tool does, plus the `pathEnv` that hands
+ * it the file's path. Shared by the probe and the publish-time layout audit, so both find
+ * agent-browser wherever tool_env puts it. The caller decides whether the project is trusted: no
+ * path (null) means no prelude. A failing tool_env ends the script with TOOL_ENV_FAILED_EXIT.
+ */
+export function toolEnvPrelude(toolEnvPath: string | null | undefined): {
+  prelude: string;
+  pathEnv: Record<string, string> | undefined;
+} {
+  if (!toolEnvPath) return { prelude: "", pathEnv: undefined };
+  return {
+    prelude: `. "$${PROBE_TOOL_ENV_PATH_ENV}" >/dev/null 2>&1 </dev/null || exit ${TOOL_ENV_FAILED_EXIT}\n`,
+    pathEnv: { [PROBE_TOOL_ENV_PATH_ENV]: toolEnvPath },
+  };
+}
 
 /** true/false from the exit code; null when the probe could not run or timed out. */
 export async function probeAgentBrowser(
   runtime: Runtime,
   options: { cwd?: string; toolEnvPath?: string | null } = {}
 ): Promise<boolean | null> {
-  const prelude = options.toolEnvPath
-    ? `. "$${PROBE_TOOL_ENV_PATH_ENV}" >/dev/null 2>&1 </dev/null || exit ${TOOL_ENV_FAILED_EXIT}\n`
-    : "";
+  const { prelude, pathEnv } = toolEnvPrelude(options.toolEnvPath);
   try {
     const result = await execBuffered(
       runtime,
       `${prelude}command -v agent-browser >/dev/null 2>&1`,
       {
         cwd: options.cwd ?? "/",
-        pathEnv: options.toolEnvPath
-          ? { [PROBE_TOOL_ENV_PATH_ENV]: options.toolEnvPath }
-          : undefined,
+        pathEnv,
         timeout: AGENT_BROWSER_PROBE_TIMEOUT_SECONDS,
         maxOutputBytes: 4096,
       }

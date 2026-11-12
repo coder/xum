@@ -8,7 +8,7 @@ import type { ExecOptions, ExecStream, FileStat, Runtime } from "@/node/runtime/
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
-import { copyPlanFileAcrossRuntimes, movePlanFile, readPlanFile } from "./helpers";
+import { copyPlanFileAcrossRuntimes, execBuffered, movePlanFile, readPlanFile } from "./helpers";
 import type { PlanFileLocation } from "./planLocation";
 import { drainFifoReaders } from "../../../../tests/ipc/fifoRelease";
 
@@ -173,6 +173,46 @@ function createMockRuntime(state: MockRuntimeState): Runtime {
     isTransportFailureExit: (exitCode: number) => exitCode === 255,
   } as unknown as Runtime;
 }
+
+describe("execBuffered when the command stops reading its stdin", () => {
+  // A command that exits early closes its end of the pipe: the write of its input then fails.
+  function runtimeWhoseStdinFails(code: string): Runtime {
+    const stream: ExecStream = {
+      ...createExecStream("partial output", "", 7),
+      stdin: new WritableStream<Uint8Array>({
+        write: () => Promise.reject(Object.assign(new Error(`${code}: write failed`), { code })),
+      }),
+    };
+    return { exec: () => Promise.resolve(stream) } as unknown as Runtime;
+  }
+
+  it("fails by default, so a command that needs all of its input cannot pass on a part of it", async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      execBuffered(runtimeWhoseStdinFails("EPIPE"), "cat > file", { cwd: "/", stdin: "input" })
+    ).rejects.toThrow("EPIPE");
+  });
+
+  it("returns the exit code and the output when the caller allows unread stdin", async () => {
+    const result = await execBuffered(runtimeWhoseStdinFails("EPIPE"), "exit 7", {
+      cwd: "/",
+      stdin: "input",
+      stdinMayGoUnread: true,
+    });
+    expect(result).toMatchObject({ exitCode: 7, stdout: "partial output" });
+  });
+
+  it("still fails on a write error that is not a closed pipe", async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      execBuffered(runtimeWhoseStdinFails("EIO"), "exit 7", {
+        cwd: "/",
+        stdin: "input",
+        stdinMayGoUnread: true,
+      })
+    ).rejects.toThrow("EIO");
+  });
+});
 
 describe("copyPlanFileAcrossRuntimes", () => {
   const sourceWorkspaceName = "source-workspace";

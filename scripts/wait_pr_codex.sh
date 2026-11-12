@@ -8,6 +8,18 @@ unset GH_DEBUG DEBUG
 #
 # Usage: ./scripts/wait_pr_codex.sh <pr_number> [--once]
 #
+# Approval is an approval comment or a thumbs-up reaction after the latest request, while the
+# Codex comments gate counts no open review thread. The only head this script binds is the one that
+# a receipt names: its `Reviewed commit` must start the PR head (at least 10 characters), because a
+# receipt for an earlier head outlasts a push. The first `Reviewed commit` label decides. Right
+# after the label must come exactly one space, then a lowercase hex SHA in backticks (Codex's
+# format, and the one the gate reads). A label with anything else there names no commit, and the
+# receipt is rejected. A thumbs-up, and a receipt with no `Reviewed commit` label,
+# name no head. This script does not read the summary board for them, so one that outlasts a push
+# stays an approval here, and so does one on a PR that has no summary board at all. The board
+# (head, still running, findings) is the gate's: `wait_pr_ready.sh` and the CI `Codex Comments`
+# check run it after this script.
+#
 # Output carries fixed text, counts, timestamps and GitHub IDs only. Codex comment bodies quote
 # PR code, so an approval prints the comment's time instead of its body, and findings print
 # counts with the explicit read: ./scripts/check_codex_comments.sh <pr_number>
@@ -504,8 +516,22 @@ CHECK_CODEX_STATUS_ONCE() {
     [.[] | select(.createdAt > $request_at and .isMinimized != true and codex_usage_limit($bot))]
     | sort_by(.createdAt) | last // empty | .body // empty')
 
-  # Only the time leaves this jq: the approval comment's body is Codex text.
-  approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
+  # Only the time leaves this jq: the approval comment's body is Codex text. A receipt with a
+  # `Reviewed commit` label names a commit. The first such label decides: right after it must come
+  # exactly one space and then a lowercase hex SHA in backticks (Codex's format, the one the gate
+  # reads) of at least 10 characters that starts the PR head. A shorter SHA, or a label with no SHA
+  # there (no space or two, text before the backticks, uppercase, non-hex, empty, unquoted), is
+  # rejected, and not mistaken for a receipt with no label. Keep the one space exact: with the
+  # space optional, a no-space label that names the head approved even when a later label named an
+  # earlier head, which main refuses. A receipt with no label names no head and stays as it was.
+  approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" --arg head "$pr_head" '
+    [.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex)))
+      | select(((.body | capture("[*][*]Reviewed commit:[*][*](?<line>[^\n]*)")?) // null) as $label
+          | if $label == null then true
+            else (($label.line | capture("^ `(?<sha>[0-9a-f]+)`")?) // null) as $named
+              | $named != null and ($named.sha | length) >= 10 and ($head | startswith($named.sha))
+            end)
+      | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
   if [[ -n "$approval_comment_at" ]]; then
     approval_stands || return 1

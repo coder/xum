@@ -877,6 +877,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     beginWorkspaceCreation
   );
   const [hasAttemptedCreateSend, setHasAttemptedCreateSend] = useState(false);
+  // Counts the sends the runtime validation refused. The environment panel holds the required
+  // fields, so it reopens on each refusal, not only on the first: the error itself does not
+  // change between two refused sends.
+  const [refusedCreateSends, setRefusedCreateSends] = useState(0);
 
   // Creation-specific state (hook always called, but only used when variant === "creation")
   // This avoids conditional hook calls which violate React rules
@@ -999,6 +1003,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           runtimeEnablement: creationRuntimeEnablement,
           coderInfo: coderState.coderInfo,
           runtimeFieldError,
+          runtimeFieldErrorAttempt: refusedCreateSends,
           // Pass coderProps when CLI is available/outdated, Coder is enabled, or still checking (so "Checking…" UI renders)
           coderProps:
             coderState.coderInfo === null ||
@@ -2538,6 +2543,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           coderState.presets.length
         );
         if (runtimeError) {
+          setRefusedCreateSends((count) => count + 1);
           return;
         }
       }
