@@ -156,7 +156,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit test-storybook-paint-fixtures storybook-budget
-.PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
+.PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome test-layout-audit-browser
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -431,6 +431,10 @@ BUILTIN_AGENTS_GENERATED := src/node/services/agentDefinitions/builtInAgentConte
 BUILTIN_SKILLS_GENERATED := src/node/services/agentSkills/builtInSkillContent.generated.ts
 WORKFLOW_RUNTIME_SOURCES_GENERATED := src/node/services/workflows/workflowRuntimeSources.generated.ts
 WORKFLOW_RUNTIME_SOURCES := $(shell find src/node/workflowRuntime -type f -name '*.js' 2>/dev/null)
+# The HTML artifact layout audit's page script: src/browser/layoutAudit bundled by esbuild (the
+# tests and test harnesses stay out), with the shared constants and types it imports.
+LAYOUT_AUDIT_SCRIPT_GENERATED := src/node/services/layoutAudit/layoutAuditPageScript.generated.ts
+LAYOUT_AUDIT_SOURCES := $(shell find src/browser/layoutAudit -type f \( -name '*.ts' -o -name '*.txt' \) ! -name '*.test.ts' ! -name '*.testHarness.ts' 2>/dev/null) src/common/constants/artifactLayoutAudit.ts src/common/types/artifactLayoutAudit.ts
 
 $(BUILTIN_AGENTS_GENERATED): src/node/builtinAgents/*.md scripts/generate-builtin-agents.sh
 	@./scripts/generate-builtin-agents.sh
@@ -441,9 +445,12 @@ $(BUILTIN_SKILLS_GENERATED): $(BUILTIN_SKILL_SOURCES) $(DOCS_SOURCES) scripts/ge
 $(WORKFLOW_RUNTIME_SOURCES_GENERATED): $(WORKFLOW_RUNTIME_SOURCES) scripts/gen_workflow_runtime_sources.ts
 	@bun scripts/gen_workflow_runtime_sources.ts
 
+$(LAYOUT_AUDIT_SCRIPT_GENERATED): $(LAYOUT_AUDIT_SOURCES) scripts/gen_layout_audit_script.ts
+	@bun scripts/gen_layout_audit_script.ts
+
 # models.json is bundled but not in $(TS_SOURCES); without this prerequisite a
 # catalog-only refresh would leave a stale main bundle (#3727).
-dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) src/common/utils/tokens/models.json $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) src/common/utils/tokens/models.json $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED)
 	@echo "Building main process..."
 	@NODE_ENV=production $(TSGO) -p tsconfig.main.json
 	@NODE_ENV=production bun x tsc-alias -p tsconfig.main.json
@@ -698,10 +705,10 @@ check-test-seam-comments: node_modules/.installed ## Fail when production code g
 	@bun test ./scripts/check-test-seam-comments.test.ts
 	@bun scripts/check-test-seam-comments.ts
 
-check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
+check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
 
-LINT_PREREQS := node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+LINT_PREREQS := node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED)
 # Type-aware ESLint lints vscode/src, whose types (@types/vscode) come from the extension's own
 # install. Without it, `make -j static-check-full` races typecheck's install and every vscode
 # type reads as `error`.
@@ -750,14 +757,14 @@ pin-actions: ## Pin GitHub Actions to SHA hashes (requires GH_TOKEN or gh CLI)
 	./scripts/pin-actions.sh .github/workflows/*.yml .github/actions/*/action.yml
 
 ifeq ($(OS),Windows_NT)
-typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run TypeScript type checking (uses tsgo for 10x speedup)
+typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED) ## Run TypeScript type checking (uses tsgo for 10x speedup)
 	@# On Windows, use npm run because bun x doesn't correctly pass arguments
 	@npm x concurrently -g \
 		"$(TSGO) --noEmit" \
 		"$(TSGO) --noEmit -p tsconfig.main.json" \
 		"$(TSGO) --noEmit -p tsconfig.tooling.json"
 else
-typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED)
 	@bun x concurrently -g \
 		"$(TSGO) --noEmit" \
 		"$(TSGO) --noEmit -p tsconfig.main.json" \
@@ -1069,6 +1076,12 @@ generate-phone-chrome: build-main build-renderer build-static ## Capture the pho
 check-phone-chrome: node_modules/.installed ## Fail when the built live phone workspace page (run `make build` first) drifted from the checked-in skeleton
 	@bun scripts/perf/generatePhoneChrome.ts --check $(PHONE_CHROME_ARGS)
 
+# The shipped layout audit script, run in Chromium over the lavish-axi fixture pages (CI runs it
+# in Test / Phone chrome, which already sets up Playwright). LAYOUT_AUDIT_BROWSER_ARGS: --print
+# (only print the table), --chrome <executable>.
+test-layout-audit-browser: node_modules/.installed ## Run the shipped layout audit in Chromium over tests/fixtures/layout-audit at 390, 1440 and 768 px
+	@bun tests/layoutAudit/runFixtureAudit.ts $(LAYOUT_AUDIT_BROWSER_ARGS)
+
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Harbor and its Daytona SDK come from the harbor group in pyproject.toml; bump them there.
 	@# Harbor removed --task-name, so keep smoke-test task filtering on the current dataset filter flag.
@@ -1106,7 +1119,7 @@ clean: ## Clean build artifacts
 ## Startup Performance Checks
 # Walks the static import graph of the startup entry points (no build needed).
 # The analyzer's fixture tests run first so a broken guard cannot pass vacuously.
-check-startup-imports: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Check that heavy packages stay off the eager startup import path
+check-startup-imports: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED) ## Check that heavy packages stay off the eager startup import path
 	@bun test ./scripts/check-startup-imports.test.ts
 	@bun scripts/check-startup-imports.ts
 

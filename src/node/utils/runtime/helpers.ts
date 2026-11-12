@@ -7,6 +7,7 @@ import {
 } from "@/node/runtime/Runtime";
 import { streamToString, streamToStringCapped } from "@/node/runtime/streamUtils";
 import { PlatformPaths } from "@/node/utils/paths.main";
+import { isIgnorableStreamError } from "@/node/utils/streamErrors";
 // Type-only: planLocation imports remoteProjectLayout, which imports getProjectName from here.
 import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 
@@ -46,6 +47,13 @@ export async function execBuffered(
   options: ExecOptions & {
     stdin?: string;
     /**
+     * A script can exit before it has read all of `stdin` (an early `exit`). The write then fails
+     * with EPIPE, at a moment that depends on the input's size and the Bun version. When set, that
+     * is not an error: the exit code says what happened. Never set it for a command whose result
+     * depends on all of its input, such as a file write.
+     */
+    stdinMayGoUnread?: boolean;
+    /**
      * When set, stdout and stderr are each capped at this many raw bytes while
      * reading (excess is drained and discarded), bounding memory on commands
      * with unbounded output. Pair with `timeout` to also bound duration.
@@ -63,7 +71,7 @@ export async function execBuffered(
       await writer.close();
     } catch (err) {
       writer.releaseLock();
-      throw err;
+      if (!(options.stdinMayGoUnread && isIgnorableStreamError(err))) throw err;
     }
   } else {
     // Close stdin immediately if no input

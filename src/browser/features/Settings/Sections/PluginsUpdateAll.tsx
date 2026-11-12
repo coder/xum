@@ -17,12 +17,21 @@ import {
 
 type Reviews = readonly AgentPluginUpdateReview[];
 
-/** The open review is the first; the rest wait behind it. */
-export function useUpdateReviewQueue(initial: Reviews) {
+/**
+ * The open review is the first waiting one whose plugin has a managed card: the review panel
+ * renders under that card, so a review for any other plugin (uninstalled from another client,
+ * or only unmanaged) stays queued and must not hide the reviews behind it.
+ */
+export function useUpdateReviewQueue(
+  initial: Reviews,
+  items: readonly AgentPluginListItem[] | null
+) {
   const [reviews, setReviews] = useState(initial);
+  const hasManagedCard = (review: AgentPluginUpdateReview) =>
+    items?.some((item) => item.managed && item.name === review.name);
   return {
     // mutation-equivalent: a review is an object, so ?? and || agree
-    open: reviews[0] ?? null,
+    open: reviews.find(hasManagedCard) ?? null,
     waiting: reviews,
     show: (shown: Reviews) => setReviews(shown),
     // By identity, not position: a palette run can replace the queue while a confirm is in

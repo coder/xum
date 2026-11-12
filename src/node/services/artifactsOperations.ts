@@ -9,7 +9,11 @@
 import * as path from "path";
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type { ArtifactCapabilities, ArtifactListing } from "@/common/orpc/schemas/artifacts";
+import type {
+  ArtifactCapabilities,
+  ArtifactEntry,
+  ArtifactListing,
+} from "@/common/orpc/schemas/artifacts";
 import type { ArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -200,28 +204,33 @@ export async function listArtifacts(
   }
   const records = await listPublishedArtifacts(context, input.workspaceId);
   const publishedPaths = records.map((record) => record.path);
+  try {
+    const listing = await listArtifactsAtLocation(location, abortSignal);
+    const entries = withPublishedKinds(listing.entries, records);
+    return { success: true, data: { available: true, ...listing, entries, publishedPaths } };
+  } catch (error) {
+    // Only a runtime can be unreachable: a host dir that fails to list is not that.
+    if (location.kind === "runtime") return unreachableError(error);
+    throw error;
+  }
+}
+
+/**
+ * The files of an available artifacts location, newest first, each with the kind its extension
+ * gives (a publish record can override it: withPublishedKinds). The tab and the turn-end layout
+ * audit both list through this. Runtime failures throw.
+ */
+export async function listArtifactsAtLocation(
+  location: AvailableArtifactsLocation,
+  abortSignal?: AbortSignal
+): Promise<{ dir: string; entries: ArtifactEntry[]; truncated: boolean }> {
   if (location.kind === "runtime") {
-    try {
-      const listing = await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal);
-      const entries = withPublishedKinds(listing.entries, records);
-      return { success: true, data: { available: true, ...listing, entries, publishedPaths } };
-    } catch (error) {
-      return unreachableError(error);
-    }
+    return listArtifactsOnRuntime(location.runtime, location.dir, abortSignal);
   }
   const { entries, truncated } = await listArtifactsInDir(location.dir, {
     requireDescriptorPaths: location.containerWritable,
   });
-  return {
-    success: true,
-    data: {
-      available: true,
-      dir: location.dir,
-      entries: withPublishedKinds(entries, records),
-      truncated,
-      publishedPaths,
-    },
-  };
+  return { dir: location.dir, entries, truncated };
 }
 
 /**
