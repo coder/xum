@@ -360,16 +360,26 @@ describe("transcribeLocally", () => {
     }
   });
 
-  test("rejects excessive duration before cache access and permits the duration limit", async () => {
+  test.each([-1, 0, 1])("preserves audio at the PCM limit with %i extra samples", async (extra) => {
     const env = setup();
-    env.decoded.duration = LOCAL_VOICE_MAX_SECONDS + 1;
-    await rejects(env.start().result, /Local recordings must be shorter/);
-    expect(env.open).not.toHaveBeenCalled();
-    expect(env.createUrl).not.toHaveBeenCalled();
-    expect(env.createWorkerBoundary).not.toHaveBeenCalled();
+    const maxSamples = LOCAL_VOICE_MAX_SECONDS * LOCAL_VOICE_SAMPLE_RATE;
+    const retainedSamples = Math.min(maxSamples, maxSamples + extra);
+    const channel = new Float32Array(maxSamples + extra).fill(0.5);
+    channel[retainedSamples - 1] = 0.25;
+    env.decoded.length = channel.length;
+    env.decoded.duration = channel.length / LOCAL_VOICE_SAMPLE_RATE;
+    env.decoded.numberOfChannels = 1;
+    env.decoded.getChannelData = () => channel;
+    env.worker.postMessage.mockImplementation((request) => {
+      expect(request.type).toBe("transcribe");
+      if (request.type !== "transcribe") throw new Error("Expected an audio request");
+      expect(request.samples).toHaveLength(retainedSamples);
+      expect(request.samples[0]).toBe(0.5);
+      expect(request.samples[retainedSamples - 1]).toBe(0.25);
+      env.respond();
+    });
+    expect(await env.start().result).toBe("recognized speech");
     env.expectReleased();
-    env.decoded.duration = LOCAL_VOICE_MAX_SECONDS;
-    await env.expectRetrySucceeds();
   });
 
   test.each([0, 1, 2])(

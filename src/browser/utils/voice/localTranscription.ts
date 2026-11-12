@@ -23,12 +23,10 @@ export async function transcribeLocally(
     try {
       const context = new OfflineAudioContext(1, 1, LOCAL_VOICE_SAMPLE_RATE);
       const decoded = await context.decodeAudioData(await audio.arrayBuffer());
-      if (decoded.duration > LOCAL_VOICE_MAX_SECONDS) {
-        throw new Error(
-          `Local recordings must be shorter than ${LOCAL_VOICE_MAX_SECONDS} seconds.`
-        );
-      }
-      const samples = new Float32Array(decoded.length);
+      // Capture timers can run late. Keep the recording and bound inference to the duration limit.
+      const samples = new Float32Array(
+        Math.min(decoded.length, LOCAL_VOICE_MAX_SECONDS * LOCAL_VOICE_SAMPLE_RATE)
+      );
       for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
         const data = decoded.getChannelData(channel);
         for (let i = 0; i < samples.length; i++) samples[i] += data[i] / decoded.numberOfChannels;

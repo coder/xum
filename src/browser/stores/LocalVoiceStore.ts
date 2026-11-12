@@ -41,9 +41,27 @@ export function isRemoteVoiceCaptureBlocked(): boolean {
   );
 }
 
+/**
+ * Detect touch devices where native keyboard dictation is typically available.
+ * This includes phones, tablets (iPad), and touch-enabled laptops in tablet mode.
+ * We hide our voice UI on these devices to avoid redundancy with system dictation.
+ */
+export function hasTouchDictation(): boolean {
+  if (typeof window === "undefined" || typeof navigator === "undefined") return false;
+
+  const maxTouchPoints =
+    typeof navigator.maxTouchPoints === "number" ? navigator.maxTouchPoints : 0;
+  const hasTouch = "ontouchstart" in window || maxTouchPoints > 0;
+
+  // Touch-only check: most touch devices have native dictation.
+  // Screen size does not determine whether a device has native dictation.
+  return hasTouch;
+}
+
 export function supportsLocalVoice(): boolean {
   return (
     !isRemoteVoiceCaptureBlocked() &&
+    !hasTouchDictation() &&
     typeof Worker !== "undefined" &&
     typeof WebAssembly !== "undefined" &&
     typeof OfflineAudioContext !== "undefined" &&

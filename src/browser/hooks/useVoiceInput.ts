@@ -15,9 +15,13 @@ import {
 } from "@/browser/utils/voice/silenceGate";
 import type { APIClient } from "@/browser/contexts/API";
 import { trackVoiceTranscription } from "@/common/telemetry";
-import type { VoiceModelId } from "@/common/constants/localVoiceModels";
+import {
+  isLocalVoiceModelId,
+  LOCAL_VOICE_MAX_SECONDS,
+  type VoiceModelId,
+} from "@/common/constants/localVoiceModels";
 import { transcribeVoiceRecording } from "@/browser/utils/voice/transcribeVoiceRecording";
-import { isRemoteVoiceCaptureBlocked } from "@/browser/stores/LocalVoiceStore";
+import { hasTouchDictation, isRemoteVoiceCaptureBlocked } from "@/browser/stores/LocalVoiceStore";
 import { getErrorMessage } from "@/common/utils/errors";
 
 export type VoiceInputState = "idle" | "requesting" | "recording" | "transcribing";
@@ -61,23 +65,6 @@ export interface UseVoiceInputResult {
 // Platform Detection
 // =============================================================================
 
-/**
- * Detect touch devices where native keyboard dictation is typically available.
- * This includes phones, tablets (iPad), and touch-enabled laptops in tablet mode.
- * We hide our voice UI on these devices to avoid redundancy with system dictation.
- */
-function hasTouchDictation(): boolean {
-  if (typeof window === "undefined" || typeof navigator === "undefined") return false;
-
-  const maxTouchPoints =
-    typeof navigator.maxTouchPoints === "number" ? navigator.maxTouchPoints : 0;
-  const hasTouch = "ontouchstart" in window || maxTouchPoints > 0;
-
-  // Touch-only check: most touch devices have native dictation.
-  // We don't check screen size because iPads are large but still have dictation.
-  return hasTouch;
-}
-
 // Capability checks run at call time, not module load: this module can be evaluated
 // before MediaRecorder/mediaDevices exist in the environment (notably under Bun's test
 // module caching), which would otherwise freeze stale negatives.
@@ -113,6 +100,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
   const recordingModelRef = useRef<VoiceModelId | null>("openai");
   const transcriptionControllerRef = useRef<AbortController | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const recordingDeadlineRef = useRef<number | undefined>(undefined);
   const meterIntervalRef = useRef<number | null>(null);
   const rmsFramesRef = useRef<number[]>([]);
 
@@ -220,6 +208,8 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
   // ---------------------------------------------------------------------------
 
   const releaseStream = useCallback(() => {
+    window.clearTimeout(recordingDeadlineRef.current);
+    recordingDeadlineRef.current = undefined;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
   }, []);
@@ -272,6 +262,21 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     },
     [stopMetering]
   );
+
+  // ---------------------------------------------------------------------------
+  // Stop Recording (triggers transcription)
+  // ---------------------------------------------------------------------------
+
+  const stop = useCallback((options?: { send?: boolean }) => {
+    window.clearTimeout(recordingDeadlineRef.current);
+    if (options?.send) shouldSendRef.current = true;
+
+    if (recorderRef.current?.state !== "inactive") {
+      recorderRef.current?.stop();
+      recorderRef.current = null;
+      setMediaRecorder(null);
+    }
+  }, []);
 
   // ---------------------------------------------------------------------------
   // Start Recording
@@ -352,6 +357,10 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
       startMetering(stream);
       recorder.start();
       recordingStartTimeRef.current = Date.now();
+      if (isLocalVoiceModelId(recordingModelRef.current)) {
+        // Stop local capture at its processing limit without discarding the completed recording.
+        recordingDeadlineRef.current = window.setTimeout(stop, LOCAL_VOICE_MAX_SECONDS * 1000);
+      }
       setState("recording");
     } catch (err) {
       stopMetering();
@@ -367,21 +376,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
       );
       setState("idle");
     }
-  }, [state, transcribe, releaseStream, startMetering, stopMetering]);
-
-  // ---------------------------------------------------------------------------
-  // Stop Recording (triggers transcription)
-  // ---------------------------------------------------------------------------
-
-  const stop = useCallback((options?: { send?: boolean }) => {
-    if (options?.send) shouldSendRef.current = true;
-
-    if (recorderRef.current?.state !== "inactive") {
-      recorderRef.current?.stop();
-      recorderRef.current = null;
-      setMediaRecorder(null);
-    }
-  }, []);
+  }, [state, transcribe, releaseStream, startMetering, stopMetering, stop]);
 
   // ---------------------------------------------------------------------------
   // Cancel Recording (discard audio, no transcription)

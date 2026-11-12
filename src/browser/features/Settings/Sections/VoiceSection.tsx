@@ -56,7 +56,7 @@ export function VoiceSection() {
           <p role="status" className="text-warning text-xs">
             Local models require a browser with WebAssembly, storage, and workers. Use HTTPS or
             localhost. Desktop remote-server windows cannot access the microphone. Open the server
-            in a browser instead.
+            in a browser instead. Touch devices use keyboard dictation instead of local models.
           </p>
         )}
         {LOCAL_VOICE_MODEL_IDS.map((id) => (
