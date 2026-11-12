@@ -57,6 +57,8 @@ export async function downloadVoiceModel(
 ): Promise<void> {
   const name = voiceModelCacheName(id);
   await navigator.locks.request(name, { signal }, async () => {
+    // Another window can finish the download while this request waits for the lock.
+    if (await isVoiceModelDownloaded(id)) return;
     await caches.delete(name);
     const cache = await caches.open(name);
     let completedBytes = 0;
