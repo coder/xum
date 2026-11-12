@@ -248,7 +248,7 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
     expect(result.warnings).toEqual([
       {
         kind: "leftover",
-        description: `${checkouts.get(childId)} could not be deleted (teardown failed) and may still exist; remove it manually.`,
+        description: `${checkouts.get(childId)!} could not be deleted (teardown failed) and may still exist; remove it manually.`,
       },
     ]);
     expect(findWorkspaceInConfig(a.config, childId)).toBeUndefined();
