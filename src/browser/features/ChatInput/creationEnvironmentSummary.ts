@@ -132,6 +132,15 @@ export function describeEnvironment(input: EnvironmentSummaryInput): string {
   return `New workspaces run ${where}, ${isolation}${from}.`;
 }
 
+const SHORT_FORMS: Array<[RegExp, string]> = [
+  [/not logged in|coder login/i, "CLI not logged in"],
+  [/is below minimum/i, "CLI out of date"],
+  [/CLI not (?:installed|found)/i, "CLI not installed"],
+  [/Docker daemon not running/i, "Docker not running"],
+  [/^Docker .*not running or not installed/i, "Docker not available"],
+  [/^No devcontainer\.json/i, "No devcontainer.json"],
+];
+
 /**
  * An unavailable option's reason, cut down to fit one line of its row. The reasons come from the
  * runtime checks and from CLIs, so they can run to three lines ("/opt/homebrew/bin/coder is not
@@ -148,11 +157,11 @@ export function summarizeUnavailableReason(reason: string): {
   if (/^Not yet supported|^Requires git repository/i.test(reason)) {
     return { summary: reason, needsSetup: false };
   }
-  if (/not logged in|coder login/i.test(reason)) {
-    return { summary: "Coder CLI not logged in", needsSetup: true };
-  }
-  if (/is below minimum/i.test(reason)) {
-    return { summary: "Coder CLI is out of date", needsSetup: true };
+  // The row's name already says which runtime ("Coder", "Dev container"), so the short forms
+  // leave it out: next to "Set up", the longer forms were cut off.
+  const shortForm = SHORT_FORMS.find(([pattern]) => pattern.test(reason));
+  if (shortForm) {
+    return { summary: shortForm[1], needsSetup: true };
   }
   // The first clause: up to a sentence end, a "Run: ..." hint or a semicolon.
   const firstClause = /^(.*?)(?:[.;:](?:\s|$)|$)/.exec(reason.trim())?.[1] ?? reason;

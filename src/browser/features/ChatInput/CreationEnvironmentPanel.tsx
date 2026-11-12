@@ -95,7 +95,10 @@ interface CreationEnvironmentPanelProps {
 const COLUMN_TITLE_CLASSES =
   "text-muted-light font-mono text-[10.5px] font-medium tracking-[0.06em] uppercase";
 const COLUMN_CLASSES = "flex min-w-0 flex-col p-1.5";
-const COLUMN_HEADER_CLASSES = "flex items-center justify-between px-2.5 pt-2 pb-1";
+// On a touch screen the docs link gets the 44px touch minimum (globals.css), which made a caption
+// with the link twice as tall as one without; one fixed caption height keeps the gaps even.
+const COLUMN_HEADER_CLASSES =
+  "flex items-center justify-between px-2.5 pt-2 pb-1 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:py-0";
 
 /** One isolation axis as a radio group; the selected row shows the inputs it needs below it. */
 function OptionColumn<T extends string>(props: {
@@ -179,7 +182,7 @@ function OptionColumn<T extends string>(props: {
                         <span className="sr-only">{option.disabledReason}</span>
                       </>
                     ) : (
-                      <span className="text-muted text-xs leading-snug">
+                      <span className="text-muted truncate text-xs leading-snug">
                         {option.ui.description}
                       </span>
                     )}

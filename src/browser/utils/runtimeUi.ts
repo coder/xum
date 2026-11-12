@@ -327,7 +327,7 @@ export const WORKSPACE_ISOLATION_UI = {
   },
   devcontainer: {
     label: "Dev container",
-    description: "Built from the project's devcontainer.json",
+    description: "Built from devcontainer.json",
     docsPath: RUNTIME_UI.devcontainer.docsPath,
     Icon: RUNTIME_UI.devcontainer.Icon,
     triggerClass:

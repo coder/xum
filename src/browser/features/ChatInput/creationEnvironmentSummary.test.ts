@@ -105,18 +105,18 @@ describe("summarizeUnavailableReason", () => {
   test.each([
     [
       "/opt/homebrew/bin/coder is not logged in. Try logging in using 'coder login <url>'.",
-      "Coder CLI not logged in",
+      "CLI not logged in",
     ],
-    ["/usr/bin/coder 2.1.0 is below minimum v2.20.0.", "Coder CLI is out of date"],
+    ["/usr/bin/coder 2.1.0 is below minimum v2.20.0.", "CLI out of date"],
     [
       "Dev Container CLI not installed. Run: npm install -g @devcontainers/cli",
-      "Dev Container CLI not installed",
+      "CLI not installed",
     ],
-    ["Dev Containers require Docker; Docker daemon not running", "Dev Containers require Docker"],
-    [
-      "Docker (or Podman) is not running or not installed",
-      "Docker (or Podman) is not running or not installed",
-    ],
+    ["devcontainer CLI not found. Install from https://containers.dev/", "CLI not installed"],
+    ["Dev Containers require Docker; Docker daemon not running", "Docker not running"],
+    ["Docker (or Podman) is not running or not installed", "Docker not available"],
+    ["No devcontainer.json found", "No devcontainer.json"],
+    ["Something else failed. Try again later", "Something else failed"],
   ])("shortens %p to a setup hint", (reason, summary) => {
     expect(summarizeUnavailableReason(reason)).toEqual({ summary, needsSetup: true });
   });
