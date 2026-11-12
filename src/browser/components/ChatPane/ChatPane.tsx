@@ -58,7 +58,7 @@ import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
 import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
-import { TRANSCRIPT_MAX_MOUNTED_ROWS } from "@/common/constants/ui";
+import { TRANSCRIPT_MAX_MOUNTED_ROWS, TRANSCRIPT_WORKSPACE_ATTRIBUTE } from "@/common/constants/ui";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
@@ -1730,6 +1730,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               // sentinel below — native anchoring then pins the bottom on append.
               style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}
               role="log"
+              // Names the workspace these rows belong to (see TRANSCRIPT_WORKSPACE_ATTRIBUTE).
+              {...{ [TRANSCRIPT_WORKSPACE_ATTRIBUTE]: workspaceId }}
               // Live only once the historical reveal has settled: chunks of replayed history
               // mounting during a stream would otherwise be announced as fresh output.
               aria-live={canInterrupt && revealSettled ? "polite" : "off"}

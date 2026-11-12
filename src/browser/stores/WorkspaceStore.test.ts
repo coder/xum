@@ -9838,12 +9838,32 @@ describe("findRenderedRefineProposalHash", () => {
     expect(findRenderedRefineProposalHash(aggregator, MOUNTED)).toBe(HASH);
   });
 
-  it("reads the mounted rows from the page", () => {
+  // Another pane can hold a row with the same message id: a side chat copies its parent's
+  // transcript, and stays mounted while its sidebar is hidden.
+  it("reads the mounted rows of the workspace's own transcript, and only one that is laid out", () => {
     const page = new GlobalWindow().document;
-    page.body.innerHTML =
-      '<div data-message-id="refine-1"></div><div data-message-id="filler-0"></div><div></div>';
-    const mounted = getMountedTranscriptHistoryIds(page as unknown as Document);
-    expect([...mounted]).toEqual(["refine-1", "filler-0"]);
+    page.body.innerHTML = `
+      <div data-transcript-workspace-id="ws-main" data-shown="true">
+        <div data-message-id="filler-0"></div>
+        <div></div>
+      </div>
+      <div data-transcript-workspace-id="ws-side" data-shown="true">
+        <div data-message-id="refine-1"></div>
+      </div>
+      <div data-transcript-workspace-id="ws-main" data-shown="false">
+        <div data-message-id="refine-1"></div>
+      </div>
+      <div data-message-id="refine-1"></div>`;
+    const isShown = (transcript: Element) => transcript.getAttribute("data-shown") === "true";
+    const mounted = (workspaceId: string) => [
+      ...getMountedTranscriptHistoryIds(page as unknown as Document, workspaceId, isShown),
+    ];
+
+    // The proposal row is in the side chat, in a hidden copy of this transcript and outside any
+    // transcript: none of those is this chat's page.
+    expect(mounted("ws-main")).toEqual(["filler-0"]);
+    expect(mounted("ws-side")).toEqual(["refine-1"]);
+    expect(mounted("ws-other")).toEqual([]);
   });
 });
 

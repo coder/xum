@@ -193,5 +193,13 @@ export const TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS = 2_000;
  * (~340 rows of heavy replies, many short steps) must still reveal fully.
  */
 export const TRANSCRIPT_REVEAL_AUTO_MAX_ROWS = 500;
+/**
+ * Attribute on a chat pane's transcript element: the workspace whose rows it holds. A check
+ * that asks "did this user see that row" (/refine apply) reads the rows of the invoking
+ * workspace's transcript only, since another pane can hold a row with the same message id
+ * (a side chat copies its parent's transcript).
+ */
+export const TRANSCRIPT_WORKSPACE_ATTRIBUTE = "data-transcript-workspace-id";
+
 /** Mounted-row cap of the two-sided transcript slice (#4961 F20): ~118 KB heap per row. */
 export const TRANSCRIPT_MAX_MOUNTED_ROWS = 1_200;

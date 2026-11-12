@@ -55,6 +55,7 @@ import {
 } from "@/browser/stores/subscriptionTransport";
 import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { TRANSCRIPT_WORKSPACE_ATTRIBUTE } from "@/common/constants/ui";
 import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { LiveBashOutputSourceContext } from "@/browser/stores/liveBashOutputSource";
 import {
@@ -6367,27 +6368,50 @@ export function pinTimelineRevealTarget(
  * VS Code webview), the chat pane's mount window (a proposal with enough
  * later chat after it is above the window until the user loads older rows),
  * and a fold (compact density's work line). So the check is the page
- * itself: the row must be mounted. A hidden newer proposal also cannot be
+ * itself: the row must be mounted in this workspace's own transcript, and
+ * that transcript must be laid out (see getMountedTranscriptHistoryIds).
+ * A hidden newer proposal also cannot be
  * applied via an older visible hash — the backend re-hashes the staged set
  * and refuses the mismatch — so filtering here fails safe.
  */
 export function getDisplayedRefineProposalHash(workspaceId: string): string | null {
   const aggregator = getStoreInstance().getAggregator(workspaceId);
   return aggregator
-    ? findRenderedRefineProposalHash(aggregator, getMountedTranscriptHistoryIds(document))
+    ? findRenderedRefineProposalHash(
+        aggregator,
+        getMountedTranscriptHistoryIds(document, workspaceId)
+      )
     : null;
 }
 
+/** Whether an element takes part in layout: false under `display: none`, as a hidden pane is. */
+function hasLayoutBox(element: Element): boolean {
+  return element.getClientRects().length > 0;
+}
+
 /**
- * History ids of the transcript rows mounted under `root`: MessageRenderer tags every row it
- * mounts with its message's id (data-message-id).
+ * History ids of the rows mounted in the transcripts of `workspaceId` under `root`: a chat pane
+ * names its transcript's workspace (TRANSCRIPT_WORKSPACE_ATTRIBUTE), and MessageRenderer tags
+ * every row it mounts with its message's id (data-message-id).
+ *
+ * Only that workspace's transcripts count, and only ones that are laid out. Another pane can
+ * hold a row with the same id (a side chat copies its parent's transcript, and stays mounted
+ * while its sidebar is hidden), and such a row is not one the user saw in this chat.
  */
-export function getMountedTranscriptHistoryIds(root: ParentNode): Set<string> {
+export function getMountedTranscriptHistoryIds(
+  root: ParentNode,
+  workspaceId: string,
+  isLaidOut: (transcript: Element) => boolean = hasLayoutBox
+): Set<string> {
   const historyIds = new Set<string>();
-  for (const row of root.querySelectorAll("[data-message-id]")) {
-    const historyId = row.getAttribute("data-message-id");
-    if (historyId !== null) {
-      historyIds.add(historyId);
+  for (const transcript of root.querySelectorAll(`[${TRANSCRIPT_WORKSPACE_ATTRIBUTE}]`)) {
+    if (transcript.getAttribute(TRANSCRIPT_WORKSPACE_ATTRIBUTE) !== workspaceId) continue;
+    if (!isLaidOut(transcript)) continue;
+    for (const row of transcript.querySelectorAll("[data-message-id]")) {
+      const historyId = row.getAttribute("data-message-id");
+      if (historyId !== null) {
+        historyIds.add(historyId);
+      }
     }
   }
   return historyIds;
