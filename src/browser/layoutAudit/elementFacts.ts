@@ -341,6 +341,57 @@ export function clippingBoundariesFor(page: LayoutPage, el: Element): ClippingBo
   );
 }
 
+// The element whose overflow can clip `node`: the one that `node`'s box is placed in. An absolutely
+// positioned box is placed in its nearest positioned ancestor (a clipper between them does not cut
+// it), a fixed box in the viewport (no element), any other box in its parent. A transform or a
+// similar property also makes a containing block: `LayoutStyle` has none of them, so a clipper
+// that is one only by that is read as no containing block and does not cut.
+function containingBlockOf(page: LayoutPage, node: Element): Element | null {
+  const position = page.style(node).position;
+  if (position === "fixed") return null;
+  let parent = node.parentElement;
+  while (position === "absolute" && parent && page.style(parent).position === "static") {
+    parent = parent.parentElement;
+  }
+  return parent;
+}
+
+type Edges = Pick<Box, "left" | "top" | "right" | "bottom">;
+
+// `rect` cut at a clipping box, on the axes that it clips.
+function cutAt(rect: Edges, { box, axes }: ClippingBoundary): Edges {
+  const across = axes.includes("horizontal");
+  const down = axes.includes("vertical");
+  return {
+    left: across ? Math.max(rect.left, box.left) : rect.left,
+    right: across ? Math.min(rect.right, box.right) : rect.right,
+    top: down ? Math.max(rect.top, box.top) : rect.top,
+    bottom: down ? Math.min(rect.bottom, box.bottom) : rect.bottom,
+  };
+}
+
+/**
+ * The part of `rect`, a rendered line or the box of `el`, that overflow leaves visible: `rect`
+ * cut at the padding box of `el` and of each element that clips (`overflow: hidden | clip`) among
+ * the ones that contain it, on the axes it clips. A line clamp or a short box still has line
+ * rectangles for the lines it cuts away, so a rule that samples what a user sees reads them
+ * through this. Null when none is left.
+ */
+export function visiblePart(page: LayoutPage, el: Element, rect: Box): Box | null {
+  let cut: Edges = rect;
+  for (
+    let node: Element | null = el;
+    node && !isRootElement(page, node);
+    node = containingBlockOf(page, node)
+  ) {
+    const clip = clippingBoundaryOf(page, node);
+    if (clip) cut = cutAt(cut, clip);
+  }
+  const { left, top, right, bottom } = cut;
+  if (right <= left || bottom <= top) return null;
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
+
 /** A clipping element inside a text boundary, and the rendered lines of the text it holds. */
 export interface NestedClip {
   boundary: ClippingBoundary;

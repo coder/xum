@@ -6,6 +6,7 @@ import {
   selectorFor,
   textFragments,
   textTruncation,
+  visiblePart,
 } from "./elementFacts";
 import { createFakeLayoutPage } from "./fakeLayoutPage.testHarness";
 
@@ -204,5 +205,73 @@ describe("nestedClippingBoundaries", () => {
     expect(
       nested(`<div><span id="s" ${CLIPPER} data-lines="0 0 200 20">long</span></div>`, "div")
     ).toEqual([]);
+  });
+});
+
+describe("visiblePart", () => {
+  const LINE = { left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 };
+
+  /** `LINE` as the text of a <p> in a 50 x 10 box at 10, 5, with `css` on the box (a <div>). */
+  function visibleInBox(css: string, rect = LINE, position = "static") {
+    using fake = createFakeLayoutPage(
+      `<div data-box="10 5 50 10" data-css="${css}"><p data-box="0 0 100 20" data-css="position: ${position}">text</p></div>`
+    );
+    const paragraph = fake.page.document.querySelector("p");
+    if (paragraph === null) throw new Error("no <p>");
+    return visiblePart(fake.page, paragraph, rect);
+  }
+
+  test("cuts a rectangle at the box of an ancestor that clips, on the axes it clips", () => {
+    expect(visibleInBox("overflow-x: hidden; overflow-y: hidden")).toEqual({
+      left: 10,
+      top: 5,
+      right: 60,
+      bottom: 15,
+      width: 50,
+      height: 10,
+    });
+    expect(visibleInBox("overflow-x: clip")).toEqual({ ...LINE, left: 10, right: 60, width: 50 });
+    expect(visibleInBox("overflow-y: hidden")).toEqual({ ...LINE, top: 5, bottom: 15, height: 10 });
+  });
+
+  test("leaves a rectangle whole when no box clips it: a scroller shows it by scrolling", () => {
+    expect(visibleInBox("")).toEqual(LINE);
+    expect(visibleInBox("overflow-y: auto")).toEqual(LINE);
+  });
+
+  test("cuts at the padding box: a border is not room for text", () => {
+    const bordered = "overflow-x: hidden; border-left-width: 4px; border-right-width: 6px";
+    expect(visibleInBox(bordered)).toEqual({ ...LINE, left: 14, right: 54, width: 40 });
+  });
+
+  test("skips a clipper that its text's box is not placed in", () => {
+    const hidden = "overflow-x: hidden; overflow-y: hidden";
+    expect(visibleInBox(hidden, LINE, "absolute")).toEqual(LINE);
+    expect(visibleInBox(hidden, LINE, "fixed")).toEqual(LINE);
+    // The box is placed in the nearest positioned ancestor: this clipper is one, so it cuts.
+    const cut = { ...LINE, left: 10, top: 5, right: 60, bottom: 15, width: 50, height: 10 };
+    expect(visibleInBox(`${hidden}; position: relative`, LINE, "absolute")).toEqual(cut);
+    expect(visibleInBox(hidden, LINE, "relative")).toEqual(cut);
+  });
+
+  test("returns null when nothing is left, a rectangle that only touches the box included", () => {
+    const hidden = "overflow-x: hidden; overflow-y: hidden";
+    expect(visibleInBox(hidden, { ...LINE, left: 60, right: 160 })).toBeNull();
+    expect(visibleInBox(hidden, { ...LINE, top: 15, bottom: 35 })).toBeNull();
+    expect(visibleInBox(hidden, { ...LINE, left: 59, right: 160 })).not.toBeNull();
+  });
+
+  test("an element's own clipping box cuts its text too", () => {
+    using fake = createFakeLayoutPage(
+      '<p data-box="10 5 50 10" data-css="overflow-x: hidden">text</p>'
+    );
+    const paragraph = fake.page.document.querySelector("p");
+    if (paragraph === null) throw new Error("no <p>");
+    expect(visiblePart(fake.page, paragraph, LINE)).toEqual({
+      ...LINE,
+      left: 10,
+      right: 60,
+      width: 50,
+    });
   });
 });

@@ -721,6 +721,18 @@ describe("overlapping-text", () => {
     expect(audit(STAGE(COVER()))).toEqual(COVERED);
   });
 
+  test("covers add up: two panels that together hide the text are a cover, one of them alone is not", () => {
+    // Text samples at x 50, 110 and 170: the left panel holds the first two columns, the right
+    // panel the third. Each is under the 90% on its own.
+    const left = COVER().replace("0 0 300 60", "0 0 160 60");
+    const right = COVER()
+      .replace('id="cover"', 'id="cover-right"')
+      .replace("0 0 300 60", "160 0 140 60");
+    expect(audit(STAGE(left + right))).toEqual(COVERED);
+    expect(audit(STAGE(left))).toEqual([]);
+    expect(audit(STAGE(right))).toEqual([]);
+  });
+
   test("an ancestor around the text is not a cover", () => {
     const html = `<div id="stage"><div id="cover" data-box="0 0 300 60" data-z="1"
       data-css="background-color: rgb(255, 255, 255)"><p id="t" data-box="10 10 200 20"
@@ -744,6 +756,79 @@ describe("overlapping-text", () => {
   test("text of 8 characters is long enough to read, 7 is not", () => {
     expect(audit(STAGE(COVER(), "12345678"))).toEqual(COVERED);
     expect(audit(STAGE(COVER(), "1234567"))).toEqual([]);
+  });
+
+  // A line clamp or a short `overflow: hidden` box cuts lines away, but `Range.getClientRects()`
+  // still reports a rectangle for each. Two lines show and twenty do not; an opaque block starts
+  // right under the two, so the twenty clipped lines (91% of the sample points) sit under it.
+  describe("lines that a box clips away", () => {
+    const LINES = (count: number, width = 200) =>
+      Array.from({ length: count }, (_, i) => `10 ${10 + i * 20} ${width} 20`).join("; ");
+    // The clamp keeps the clipped-text rule quiet: this is about what the overlap rule samples.
+    const TEXT = (box: string, css: string, lines: string) =>
+      `<p id="t" data-box="${box}" data-css="${css}; webkit-line-clamp: 2" data-lines="${lines}">Hello world text</p>`;
+    const COVER_FROM = (box: string) =>
+      `<div id="cover" data-box="${box}" data-css="background-color: rgb(255, 255, 255)" data-z="1"></div>`;
+    const BELOW_TWO_LINES = COVER_FROM("0 50 300 500");
+
+    test.each(["hidden", "clip"])("are not sampled when the text's own box clips (%s)", (value) => {
+      const text = TEXT("10 10 200 40", `overflow-x: ${value}; overflow-y: ${value}`, LINES(22));
+      expect(audit(`<div id="stage">${text}${BELOW_TWO_LINES}</div>`)).toEqual([]);
+    });
+
+    test("are not sampled when an ancestor does the clipping", () => {
+      const text = TEXT("10 10 200 440", "overflow-y: visible", LINES(22));
+      const clipper = `<div data-box="10 10 200 40" data-css="overflow-y: hidden">${text}</div>`;
+      expect(audit(`<div id="stage">${clipper}${BELOW_TWO_LINES}</div>`)).toEqual([]);
+    });
+
+    test("the lines that show are still sampled: a cover over them is reported", () => {
+      const text = TEXT("10 10 200 40", "overflow-y: hidden", LINES(22));
+      expect(audit(`<div id="stage">${text}${COVER_FROM("0 0 300 500")}</div>`)).toEqual(COVERED);
+    });
+
+    test("only the axes that the box clips cut a line", () => {
+      // Clipped across only: the lines below the box are not cut, so all of them are sampled.
+      const across = TEXT("10 10 200 40", "overflow-x: clip", LINES(22));
+      expect(audit(`<div id="stage">${across}${BELOW_TWO_LINES}</div>`)).toEqual(COVERED);
+      // Clipped across, with lines 400 wide in a box 40 wide: the cover starts past the box.
+      const wide = TEXT("10 10 40 440", "overflow-x: clip", LINES(22, 400));
+      expect(audit(`<div id="stage">${wide}${COVER_FROM("60 0 600 600")}</div>`)).toEqual([]);
+    });
+
+    // An overflow box clips the boxes that it contains: an absolutely positioned box is placed in
+    // its nearest positioned ancestor, so a clipper between the two does not cut it, and a fixed
+    // box is placed in the viewport, so no clipper does. The text sits at y 100, wholly outside the
+    // 50 x 20 clippers at the top, and the page paints it there.
+    describe("an absolutely positioned or fixed box", () => {
+      const CLIP = "overflow-x: hidden; overflow-y: hidden";
+      const PLACED = (position: string) =>
+        `<div data-box="10 100 200 20" data-css="position: ${position}"><p id="t" data-box="10 100 200 20" data-css="webkit-line-clamp: 2" data-lines="10 100 200 20">Hello world text</p>${COVER_FROM("0 90 300 60")}</div>`;
+      const CLIPPER = (css: string, inside: string) =>
+        `<div data-box="10 10 50 20" data-css="${css}">${inside}</div>`;
+      const PAGE = (inside: string) => `<div id="stage">${inside}</div>`;
+
+      test.each(["absolute", "fixed"])(
+        "%s: is not cut by a clipper that is no containing block for it",
+        (position) => {
+          expect(audit(PAGE(CLIPPER(CLIP, PLACED(position))))).toEqual(COVERED);
+        }
+      );
+
+      test("an absolute box is cut by a positioned clipper: that one is its containing block", () => {
+        expect(audit(PAGE(CLIPPER(`${CLIP}; position: relative`, PLACED("absolute"))))).toEqual([]);
+      });
+
+      test("an absolute box is cut by a positioned clipper further out, past one that does not cut it", () => {
+        const inner = CLIPPER(CLIP, PLACED("absolute"));
+        expect(audit(PAGE(CLIPPER(`${CLIP}; position: relative`, inner)))).toEqual([]);
+      });
+
+      test("a fixed box is cut by no clipper, a positioned one included", () => {
+        const inner = CLIPPER(CLIP, PLACED("fixed"));
+        expect(audit(PAGE(CLIPPER(`${CLIP}; position: relative`, inner)))).toEqual(COVERED);
+      });
+    });
   });
 
   test("positioned text overlaps on purpose, and motion makes the sample unreliable", () => {
@@ -832,7 +917,7 @@ describe("overlapping-text", () => {
     });
   });
 
-  describe("text below the screen", () => {
+  describe("text above and below the screen", () => {
     // A paragraph at `top` and an opaque sibling over it. The page is 3000 px tall.
     const AT = (top: number, id = "t") =>
       `<div id="stage-${id}"><p id="${id}" data-box="10 ${top} 200 20" data-lines="10 ${top} 200 20">Hello world text</p>
@@ -873,6 +958,22 @@ describe("overlapping-text", () => {
       });
       expect(findings).toHaveLength(1);
       expect(scrolls).toEqual(["scrollTo 1282", "scrollTo 500"]);
+    });
+
+    test("text above the scroll position the page loaded at is sampled too, and the scroll is put back", () => {
+      // The page loaded at scroll 1000 (an autofocus, a restored position): this text is at 700
+      // in the document, 300 above the top of the screen.
+      const { findings, scrolls } = auditScrolling(AT(-300), {
+        viewport: { width: 390, height: 844, scrollY: 1000 },
+      });
+      expect(findings).toEqual([finding("overlapping-text", "p#t", "horizontal", 0)]);
+      expect(scrolls).toEqual(["scrollTo 282", "scrollTo 1000"]);
+    });
+
+    test("text above the top of the page cannot be scrolled to, so it is not scrolled for", () => {
+      const { findings, scrolls } = auditScrolling(AT(-300));
+      expect(findings).toEqual([]);
+      expect(scrolls).toEqual([]);
     });
 
     test("text at the end of the page, where the scroll stops short of the middle, is still sampled", () => {
