@@ -1,6 +1,6 @@
 import { useState, type ComponentProps, type ReactNode, useEffect, useMemo } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
@@ -214,6 +214,12 @@ export const CoderAvailable: Story = {
     await openEnvironmentPanel(storyRoot);
     await within(document.body).findByRole("radio", { name: /^Coder/i }, { timeout: 10000 });
     await userEvent.keyboard("{Escape}");
+
+    // Closing returns focus to the chip without opening its tooltip, which would cover the
+    // project heading above it.
+    const chip = within(storyRoot).getByTestId("creation-environment");
+    await waitFor(() => expect(chip).toHaveFocus());
+    await expect(within(document.body).queryByRole("tooltip")).toBeNull();
   },
 };
 

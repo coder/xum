@@ -318,7 +318,11 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
   return (
     <Popover modal open={open} onOpenChange={setOpen}>
       <Tooltip>
-        <TooltipTrigger asChild>
+        {/* Hover only. Radix also opens a tooltip on focus, and closing the panel returns focus to
+            the chip: the tooltip then sat on top of the project heading, which could not be
+            clicked, and on a phone it showed the keyboard shortcut. Cancelling the focus event
+            keeps the focus return and skips the tooltip. */}
+        <TooltipTrigger asChild onFocus={(event) => event.preventDefault()}>
           <PopoverTrigger asChild>
             <button
               type="button"
@@ -344,7 +348,6 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
             </button>
           </PopoverTrigger>
         </TooltipTrigger>
-        {/* Hover only, so phones never show the shortcut. */}
         <TooltipContent align="start" className="max-w-72">
           {props.description} ({formatKeybind(KEYBINDS.OPEN_CREATION_ENVIRONMENT)})
         </TooltipContent>
@@ -353,6 +356,9 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
         {...MODAL_POPOVER_CONTENT_PROPS}
         ref={contentRef}
         align="start"
+        // Keeps the same gap to both screen edges on a phone, where the panel is as wide as the
+        // viewport allows and would otherwise start at the chip and end flush with the edge.
+        collisionPadding={8}
         aria-label="Environment"
         aria-describedby={descriptionId}
         // Wide enough for three columns on desktop; on a phone it spans the viewport and the
