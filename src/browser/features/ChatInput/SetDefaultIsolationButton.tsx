@@ -1,19 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { Check, Loader2, Pin } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAppConfig } from "@/browser/stores/AppConfigStore";
-import {
-  formatKeybind,
-  formatKeybindForAria,
-  isDialogOpen,
-  KEYBINDS,
-  matchesKeybind,
-} from "@/browser/utils/ui/keybinds";
+import { formatKeybind, formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { IsolationChoice } from "@/common/types/isolation";
 import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 import { getErrorMessage } from "@/common/utils/errors";
+import { useCreationShortcut } from "./useCreationShortcut";
 import { isProjectDefaultIsolation, projectDefaultIsolationUpdate } from "./creationDraftProject";
 
 interface SetDefaultIsolationProps {
@@ -34,7 +29,11 @@ interface SetDefaultIsolationProps {
 export function SetDefaultIsolationButton(props: SetDefaultIsolationProps) {
   const saver = useSetDefaultIsolation(props);
   // Every operation has a shortcut (AGENTS.md); it works only while the button would.
-  useShortcut(!saver.isDefault && !props.disabled, saver.save);
+  useCreationShortcut(
+    !saver.isDefault && !props.disabled,
+    KEYBINDS.SET_DEFAULT_ISOLATION,
+    saver.save
+  );
 
   if (saver.isDefault) {
     return (
@@ -110,22 +109,4 @@ function useSetDefaultIsolation(props: SetDefaultIsolationProps) {
     error,
     save,
   };
-}
-
-/** Runs the Set as default action on its keybind while enabled, outside open dialogs. */
-function useShortcut(enabled: boolean, action: () => Promise<void>) {
-  // Read the latest action through a ref, so the listener subscribes once per enabled state
-  // instead of on every render.
-  const actionRef = useRef(action);
-  actionRef.current = action;
-  useEffect(() => {
-    if (!enabled) return;
-    const handler = (event: KeyboardEvent) => {
-      if (!matchesKeybind(event, KEYBINDS.SET_DEFAULT_ISOLATION) || isDialogOpen()) return;
-      event.preventDefault();
-      if (!event.repeat) void actionRef.current();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [enabled]);
 }

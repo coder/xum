@@ -10766,7 +10766,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "## Choosing a Runtime",
       "",
-      "Pick both when creating a workspace: _Run on_ selects the project isolation and _with_ selects the workspace isolation. Set the defaults, and turn options on or off, in **Settings → Runtimes**, globally or per project.",
+      "Pick both when creating a workspace: the environment chip under the workspace name opens a panel where _Run on_ selects the project isolation and _Isolation_ selects the workspace isolation. Set the defaults, and turn options on or off, in **Settings → Runtimes**, globally or per project.",
       "",
       "Configs written by older versions (a single default runtime) are migrated automatically, and the old field is still written so you can downgrade.",
       "",

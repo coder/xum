@@ -1,6 +1,6 @@
 import { useState, type ComponentProps, type ReactNode, useEffect, useMemo } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
@@ -193,13 +193,14 @@ export default meta;
 
 type Story = StoryObj<typeof meta>;
 
-async function openIsolationMenu(
-  storyRoot: HTMLElement,
-  axis: "Project isolation" | "Workspace isolation"
-): Promise<void> {
-  const canvas = within(storyRoot);
-  const trigger = await canvas.findByLabelText(axis, {}, { timeout: 10000 });
-  await userEvent.click(trigger);
+/**
+ * Opens the environment panel from its chip. The panel is portaled, so its rows and fields are
+ * queried on document.body.
+ */
+async function openEnvironmentPanel(storyRoot: HTMLElement): Promise<void> {
+  const chip = await within(storyRoot).findByTestId("creation-environment", {}, { timeout: 10000 });
+  if (chip.getAttribute("aria-expanded") !== "true") await userEvent.click(chip);
+  await within(document.body).findByRole("radiogroup", { name: "Project isolation" });
 }
 
 /** Coder option is visible and selectable when Coder CLI is available. */
@@ -210,9 +211,15 @@ export const CoderAvailable: Story = {
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openIsolationMenu(storyRoot, "Project isolation");
-    await within(document.body).findByRole("option", { name: /^Coder/i }, { timeout: 10000 });
+    await openEnvironmentPanel(storyRoot);
+    await within(document.body).findByRole("radio", { name: /^Coder/i }, { timeout: 10000 });
     await userEvent.keyboard("{Escape}");
+
+    // Closing returns focus to the chip without opening its tooltip, which would cover the
+    // project heading above it.
+    const chip = within(storyRoot).getByTestId("creation-environment");
+    await waitFor(() => expect(chip).toHaveFocus());
+    await expect(within(document.body).queryByRole("tooltip")).toBeNull();
   },
 };
 
@@ -226,24 +233,27 @@ export const CoderNotAvailable: Story = {
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openIsolationMenu(storyRoot, "Project isolation");
-    await within(document.body).findByRole("option", { name: /^SSH/i }, { timeout: 10000 });
-    await expect(within(document.body).queryByRole("option", { name: /^Coder/i })).toBeNull();
+    await openEnvironmentPanel(storyRoot);
+    await within(document.body).findByRole("radio", { name: /^SSH/i }, { timeout: 10000 });
+    await expect(within(document.body).queryByRole("radio", { name: /^Coder/i })).toBeNull();
     await userEvent.keyboard("{Escape}");
   },
 };
 
 /** Coder option remains visible but disabled when CLI version is outdated. */
 export const CoderOutdated: Story = {
+  // Closed, the chip looks the same as CoderAvailable's; the play checks the disabled row. This
+  // keeps the Pixel snapshot budget level now that EnvironmentPanelOpen snapshots the open panel.
+  parameters: { pixel: PIXEL_DISABLED },
   args: {
     coderInfo: mockCoderInfoOutdated,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openIsolationMenu(storyRoot, "Project isolation");
+    await openEnvironmentPanel(storyRoot);
     const coderOption = await within(document.body).findByRole(
-      "option",
+      "radio",
       { name: /^Coder/i },
       { timeout: 10000 }
     );
@@ -263,9 +273,9 @@ export const DevcontainerUnavailable: Story = {
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openIsolationMenu(storyRoot, "Workspace isolation");
+    await openEnvironmentPanel(storyRoot);
 
-    const devcontainerOption = await within(document.body).findByRole("option", {
+    const devcontainerOption = await within(document.body).findByRole("radio", {
       name: /^Dev container/i,
     });
 
@@ -279,8 +289,8 @@ export const DevcontainerUnavailable: Story = {
  * SSH backend yet, so they stay listed but disabled with the reason.
  */
 export const SshWithoutIsolation: Story = {
-  // The selects share a row and the host and directory inputs wrap below them on phones, so this
-  // story is the phone snapshot of the creation controls.
+  // On a phone the environment panel spans the viewport and its columns stack, so this story is
+  // the phone snapshot of the creation controls, with the panel left open.
   globals: { viewport: { value: "mobile1", isRotated: false } },
   parameters: { pixel: { matrix: { viewports: ["phone"] } } },
   args: {
@@ -296,34 +306,50 @@ export const SshWithoutIsolation: Story = {
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
     const canvas = within(storyRoot);
+    const body = within(document.body);
 
-    await expect(
-      await canvas.findByLabelText("Project directory on host", {}, { timeout: 10000 })
-    ).toHaveValue("~/src/my-app");
-    // The project is trusted but this host directory is not: its own trust is offered.
+    // Narrow-layout contract: the chip and "Set as default" stay inside the phone-width frame.
+    const frame = canvas.getByTestId("isolation-picker-frame").getBoundingClientRect();
+    const chip = await canvas.findByTestId("creation-environment", {}, { timeout: 10000 });
+    await expect(chip.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
+    // Closed, the chip names the host and the shared directory, not "SSH" and "None".
+    await expect(chip).toHaveTextContent("devbox.internal");
+    await expect(chip).toHaveTextContent("~/src/my-app");
+    const setDefault = canvas.getByRole("button", { name: "Set as default" });
+    await expect(setDefault.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
+
+    // The project is trusted but this host directory is not: its own trust is offered, on the
+    // page (checked before the panel opens: the panel is modal and hides the page from queries).
     await expect(canvas.getByRole("button", { name: "Trust directory" })).toBeVisible();
 
-    // Narrow-layout contract: every control stays inside the phone-width frame.
-    const frame = canvas.getByTestId("isolation-picker-frame").getBoundingClientRect();
-    for (const label of [
-      "Project isolation",
-      "Workspace isolation",
-      "Host",
-      "Project directory on host",
-    ]) {
-      const box = canvas.getByLabelText(label).getBoundingClientRect();
-      await expect(box.right).toBeLessThanOrEqual(frame.right + 1);
-    }
-    for (const name of ["Trust directory", "Set as default"]) {
-      const button = canvas.getByRole("button", { name });
-      await expect(button.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
-    }
+    await openEnvironmentPanel(storyRoot);
+    await expect(await body.findByLabelText("Project directory on host")).toHaveValue(
+      "~/src/my-app"
+    );
+    await expect(body.getByLabelText("Host")).toHaveValue("devbox.internal");
 
-    await openIsolationMenu(storyRoot, "Workspace isolation");
-    const dockerOption = await within(document.body).findByRole("option", { name: /^Docker/i });
+    const dockerOption = await body.findByRole("radio", { name: /^Docker/i });
     await expect(dockerOption).toHaveAttribute("aria-disabled", "true");
     await expect(dockerOption).toHaveTextContent("Not yet supported on SSH projects");
-    await userEvent.keyboard("{Escape}");
+  },
+};
+
+/**
+ * The environment panel open on the default selection: where it runs, the isolation and the base
+ * branch side by side, with the branch list filtered.
+ */
+export const EnvironmentPanelOpen: Story = {
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const body = within(document.body);
+
+    await openEnvironmentPanel(storyRoot);
+    const filter = await body.findByRole("combobox", { name: "Select source branch" });
+    await userEvent.type(filter, "dev");
+    // Filtering narrows the list to the match and keeps the selection.
+    await expect(body.getByRole("option", { name: "develop" })).toBeVisible();
+    await expect(body.queryByRole("option", { name: "main" })).toBeNull();
+    await expect(within(storyRoot).getByTestId("creation-environment")).toHaveTextContent("main");
   },
 };
 
@@ -333,12 +359,14 @@ export const DevcontainerSingleConfig: Story = {
     <DevcontainerCreationControlsStory runtimeAvailabilityState={DEVCONTAINER_SINGLE_CONFIG} />
   ),
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
+    const body = within(document.body);
 
-    const configSelect = await canvas.findByRole("combobox", { name: "Dev container config" });
+    // The config sits under the Dev container row of the environment panel.
+    await openEnvironmentPanel(canvasElement);
+    const configSelect = await body.findByRole("combobox", { name: "Dev container config" });
     await expect(configSelect).toBeEnabled();
     await expect(
-      canvas.findByText("Default (.devcontainer/devcontainer.json)")
+      body.findByText("Default (.devcontainer/devcontainer.json)")
     ).resolves.toBeInTheDocument();
   },
 };
@@ -349,8 +377,9 @@ export const DevcontainerMultiConfig: Story = {
     <DevcontainerCreationControlsStory runtimeAvailabilityState={DEVCONTAINER_MULTI_CONFIG} />
   ),
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
+    const canvas = within(document.body);
 
+    await openEnvironmentPanel(canvasElement);
     const configSelect = await canvas.findByRole("combobox", { name: "Dev container config" });
     await userEvent.click(configSelect);
 
