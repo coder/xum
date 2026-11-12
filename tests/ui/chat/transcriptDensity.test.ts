@@ -83,7 +83,7 @@ async function withCompactTranscript(
 }
 
 describe("Compact transcript density", () => {
-  test("a finished turn is its prompt, one work line and the reply, with the steps one click away", async () => {
+  test("a turn shows what the agent wrote, with the steps between one click away", async () => {
     await withCompactTranscript(
       "ws-density",
       [
@@ -113,33 +113,35 @@ describe("Compact transcript density", () => {
       async (view) => {
         const workLine = await findButton(view.container, "work-bundle");
         expect(workLine.getAttribute("aria-expanded")).toBe("false");
+        // The update and the reply are regular text, and one line stands for the steps between.
         expectTextOrder(
           view.container,
           "Audit the auth module",
-          "Worked",
-          "Implemented the auth audit fix."
-        );
-        expect(view.container.textContent).not.toContain("I'll gather context first.");
-        expect(view.container.textContent).not.toContain("make typecheck");
-        expect(queryButtons(view.container, "operational-bundle")).toHaveLength(0);
-
-        fireEvent.click(workLine);
-
-        // Opened, the turn reads as detailed density does: narration, then the folded run.
-        const run = await findButton(view.container, "operational-bundle");
-        expect(run.getAttribute("aria-expanded")).toBe("false");
-        expect(run.textContent).toContain("Read 1 file");
-        expectTextOrder(
-          view.container,
           "I'll gather context first.",
           "Read 1 file",
           "Implemented the auth audit fix."
         );
+        expect(queryButtons(view.container, "work-bundle")).toHaveLength(1);
         expect(view.container.textContent).not.toContain("make typecheck");
 
-        fireEvent.click(run);
+        fireEvent.click(workLine);
+
+        // Opened, the steps are listed in place, with no second fold to open.
         await waitFor(() => {
           expect(view.container.textContent).toContain("make typecheck");
+        });
+        expect(queryButtons(view.container, "operational-bundle")).toHaveLength(0);
+        expectTextOrder(
+          view.container,
+          "I'll gather context first.",
+          "src/auth.ts",
+          "make typecheck",
+          "Implemented the auth audit fix."
+        );
+
+        fireEvent.click(workLine);
+        await waitFor(() => {
+          expect(view.container.textContent).not.toContain("make typecheck");
         });
       }
     );

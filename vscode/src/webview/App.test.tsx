@@ -1147,7 +1147,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     expect(view.queryByText(script)).toBeNull();
   });
 
-  test("compact transcript density folds a finished turn's work behind a work line (#4979)", async () => {
+  test("compact transcript density folds the steps between what the agent wrote (#4979)", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, [
@@ -1186,19 +1186,21 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
 
     const toggle = view.getByTestId("work-bundle");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.textContent).toContain("Ran 2 commands");
+    // The prompt, the update and the reply are in view; the steps are behind the line.
     expect(view.queryByText("Audit the auth module")).not.toBeNull();
+    expect(view.queryByText("I'll gather context first.")).not.toBeNull();
     expect(view.queryByText("Implemented the auth audit fix.")).not.toBeNull();
     expect(view.queryByText("make typecheck")).toBeNull();
-    expect(view.queryByText("I'll gather context first.")).toBeNull();
 
     await act(async () => {
       fireEvent.click(toggle);
       await Promise.resolve();
     });
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    expect(view.queryByText("I'll gather context first.")).not.toBeNull();
-    // Opened, the turn groups its tool rows as on desktop.
-    expect(view.getByTestId("operational-bundle").textContent).toContain("Ran 2 commands");
+    // Opened, the steps are listed in place as on desktop, with no second fold.
+    expect(view.queryByText("make typecheck")).not.toBeNull();
+    expect(view.queryByTestId("operational-bundle")).toBeNull();
   });
 
   test("consecutive task_await polls collapse into one operational bundle (#4979)", async () => {

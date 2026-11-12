@@ -313,6 +313,11 @@ function showsThroughFold(
   );
 }
 
+/** A step the agent took itself, as opposed to a prompt the machine handed it. */
+function isAgentStep(message: DisplayedMessage): message is OperationalBundleMemberMessage {
+  return message.type === "reasoning" || message.type === "tool";
+}
+
 function assignWorkBundle(
   infos: Array<WorkBundleInfo | undefined>,
   messages: DisplayedMessage[],
@@ -320,13 +325,7 @@ function assignWorkBundle(
   end: number,
   options: ComputeWorkBundleInfosOptions
 ): void {
-  const steps: OperationalBundleMemberMessage[] = [];
-  for (let index = start; index <= end; index++) {
-    const message = messages[index];
-    if (message.type === "reasoning" || message.type === "tool") {
-      steps.push(message);
-    }
-  }
+  const steps = messages.slice(start, end + 1).filter(isAgentStep);
   // Machine prompts the agent has not acted on: nothing was done, so there is nothing to fold.
   if (steps.length === 0) {
     return;

@@ -13,7 +13,12 @@ import type { WorkBundleInfo } from "@/browser/utils/messages/transcriptRenderPr
  * its line. The line's block bounds how far it sticks (see TranscriptBundleRows), and it has the
  * transcript's surface so the steps do not show through it.
  */
-const OPEN_LINE_CLASS = "bg-surface-primary sticky top-0 z-20 -my-1 py-1";
+const OPEN_LINE_CLASS = cn(
+  "bg-surface-primary sticky top-0 z-20 -my-1 py-1",
+  // The transcript has padding above its first row, and steps scroll through it. The line's
+  // surface reaches up over that strip, so no step shows above the pinned line.
+  "before:bg-surface-primary before:absolute before:inset-x-0 before:bottom-full before:h-4"
+);
 
 interface WorkBundleMessageProps {
   item: WorkBundleInfo;

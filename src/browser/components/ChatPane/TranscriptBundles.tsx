@@ -149,6 +149,24 @@ function WorkBlock(props: {
   );
 }
 
+// Open bundle members hang off the shared rail under the summary line's chevron, like the
+// calls under a script header. `flow-root` keeps each row's 8px margins inside its rail
+// segment, so the rail is one unbroken line. Neighbouring segments' negative margins collapse
+// to one, so `-my-3` overlaps them by 12px: the 4px left between rows is the gap the calls
+// under a script have, giving every opened list the same pitch.
+const RUN_MEMBER_CLASS = `${TOOL_RAIL_CLASS} flow-root -my-3`;
+
+/** Whether a run of routine calls shows its members: a failed run always does. */
+function isRunExpanded(
+  operationalBundle: OperationalBundleInfo,
+  overrides: ReadonlyMap<string, boolean>
+): boolean {
+  return (
+    operationalBundle.summary.tone !== undefined ||
+    (overrides.get(operationalBundle.key) ?? operationalBundle.defaultExpanded)
+  );
+}
+
 /** A row outside any work line: on its own, or as the head or a member of a run of routine calls. */
 function renderRunRow(args: {
   message: DisplayedMessage;
@@ -157,40 +175,34 @@ function renderRunRow(args: {
   bundles: TranscriptBundles;
   renderMessageAtIndex: RenderTranscriptMessageAtIndex;
 }): React.ReactNode {
-  const { operationalBundleInfos, operationalBundleExpansionOverrides } = args.bundles;
-  const operationalBundle = operationalBundleInfos[args.index];
-  const isExpanded =
-    operationalBundle !== undefined &&
-    (operationalBundle.summary.tone !== undefined ||
-      (operationalBundleExpansionOverrides.get(operationalBundle.key) ??
-        operationalBundle.defaultExpanded));
-  if (operationalBundle?.position === "member" && !isExpanded) {
-    return null;
+  const renderMessage = (className?: string) =>
+    args.renderMessageAtIndex(args.message, args.index, {
+      key: `${args.rowKey}:message`,
+      className,
+    });
+  const operationalBundle = args.bundles.operationalBundleInfos[args.index];
+  if (operationalBundle === undefined) {
+    return <React.Fragment key={args.rowKey}>{renderMessage()}</React.Fragment>;
   }
 
-  const isHead = operationalBundle?.position === "head";
+  const isExpanded = isRunExpanded(
+    operationalBundle,
+    args.bundles.operationalBundleExpansionOverrides
+  );
+  const member = isExpanded ? renderMessage(RUN_MEMBER_CLASS) : null;
+  if (operationalBundle.position === "member") {
+    return <React.Fragment key={args.rowKey}>{member}</React.Fragment>;
+  }
   return (
     <React.Fragment key={args.rowKey}>
-      {isHead && (
-        <OperationalBundleMessage
-          item={operationalBundle}
-          expanded={isExpanded}
-          onToggle={() =>
-            args.bundles.setOperationalBundleExpanded(operationalBundle.key, !isExpanded)
-          }
-        />
-      )}
-      {(!isHead || isExpanded) &&
-        args.renderMessageAtIndex(args.message, args.index, {
-          key: `${args.rowKey}:message`,
-          // Open bundle members hang off the shared rail under the summary line's chevron,
-          // like the calls under a script header.
-          // `flow-root` keeps each row's 8px margins inside its rail segment, so the rail is
-          // one unbroken line. Neighbouring segments' negative margins collapse to one, so
-          // `-my-3` overlaps them by 12px: the 4px left between rows is the gap the calls
-          // under a script have, giving every opened list the same pitch.
-          className: operationalBundle ? `${TOOL_RAIL_CLASS} flow-root -my-3` : undefined,
-        })}
+      <OperationalBundleMessage
+        item={operationalBundle}
+        expanded={isExpanded}
+        onToggle={() =>
+          args.bundles.setOperationalBundleExpanded(operationalBundle.key, !isExpanded)
+        }
+      />
+      {member}
     </React.Fragment>
   );
 }
