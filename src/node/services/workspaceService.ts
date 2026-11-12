@@ -642,6 +642,42 @@ export function nameRestartBlockerWorkspaces(
 }
 
 /**
+ * The warnings of a forced removal whose runtime failed to delete the checkout: the row is removed
+ * anyway, so the failure must reach the caller, or a caller would report the checkout as deleted
+ * (task_remove force does). A container left behind still holds this workspace's plan (#5143): the
+ * plan step cannot reach it once the worktree is gone. Forced paths that skip the Force Delete
+ * dialog (bulk delete, cancel-creation, shift-click) never saw the non-forced error that names it.
+ * A failure that names no leftover can still leave the checkout itself, so that is named.
+ */
+function forcedDeleteFailureWarnings(params: {
+  workspaceId: string;
+  deleteResult: { error?: string; leftoverPaths?: string[] };
+  checkoutPath: string;
+  planContainer: string | undefined;
+}): WorkspaceRemoveWarning[] {
+  const { deleteResult } = params;
+  if (!deleteResult.leftoverPaths?.length) {
+    return [
+      {
+        kind: "leftover",
+        description: `${params.checkoutPath} could not be deleted (${deleteResult.error ?? "unknown error"}) and may still exist; remove it manually.`,
+      },
+    ];
+  }
+  log.warn("Forced removal left these behind; a container may still hold the plan", {
+    workspaceId: params.workspaceId,
+    leftovers: deleteResult.leftoverPaths,
+  });
+  return deleteResult.leftoverPaths.map((leftover) => ({
+    kind: "leftover",
+    description:
+      leftover === params.planContainer
+        ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
+        : `${leftover} was left behind; remove it manually.`,
+  }));
+}
+
+/**
  * Another registered workspace whose plan path is `metadata`'s: plans key on the project
  * basename, so a same-named workspace in another project with that basename, on the same plan
  * storage, shares the path, and the plan there may be its live one. Removal and history clears
@@ -7952,6 +7988,14 @@ export class WorkspaceService
             log.error(
               `Failed to fully delete multi-project workspace from disk, but force=true. Removing from config. Errors: ${deleteErrors.join("; ")}`
             );
+            // The row goes away with the checkouts possibly still on disk: return that as a warning
+            // too, so a caller never reports the workspace as deleted (task_remove force).
+            removalWarnings = [
+              {
+                kind: "leftover",
+                description: `Part of this workspace could not be deleted (${deleteErrors.join("; ")}) and may still exist; remove it manually.`,
+              },
+            ];
           }
         } else if (metadata.kind === "scratch") {
           if (
@@ -8045,27 +8089,14 @@ export class WorkspaceService
             log.error(
               `Failed to delete workspace from disk, but force=true. Removing from config. Error: ${deleteResult.error}`
             );
-            // A container left behind still holds this workspace's plan (#5143): the plan step
-            // below cannot reach it once the worktree is gone. Name it for the user's logs, and
-            // return it as a warning: forced paths that skip the Force Delete dialog (bulk delete,
-            // cancel-creation, shift-click) never saw the non-forced error that names it.
-            if (deleteResult.leftoverPaths?.length) {
-              log.warn("Forced removal left these behind; a container may still hold the plan", {
-                workspaceId,
-                leftovers: deleteResult.leftoverPaths,
-              });
-              const planContainer =
-                runtime instanceof DevcontainerRuntime
-                  ? containerLabel(runtime.getWorkspacePath(projectPath, metadata.name))
-                  : undefined;
-              removalWarnings = deleteResult.leftoverPaths.map((leftover) => ({
-                kind: "leftover",
-                description:
-                  leftover === planContainer
-                    ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
-                    : `${leftover} was left behind; remove it manually.`,
-              }));
-            }
+            const checkoutPath = runtime.getWorkspacePath(projectPath, metadata.name);
+            removalWarnings = forcedDeleteFailureWarnings({
+              workspaceId,
+              deleteResult,
+              checkoutPath,
+              planContainer:
+                runtime instanceof DevcontainerRuntime ? containerLabel(checkoutPath) : undefined,
+            });
           }
 
           // Note: Coder workspace deletion is handled by CoderSSHRuntime.deleteWorkspace()

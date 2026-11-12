@@ -1,5 +1,14 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  spyOn,
+  beforeEach,
+  afterEach,
+  setDefaultTimeout,
+} from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "child_process";
 import {
@@ -39,6 +48,11 @@ import {
 } from "@/node/services/taskService.shared.testHarness";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { LossyWorkPolicy } from "@/node/services/taskService";
+
+// The real-git removal tests run several git commands each, which at bun's 5 s default times out
+// on a loaded host. A timed-out test keeps running while afterEach deletes its root, and that
+// breaks the next tests ("missing ancestor lineage").
+setDefaultTimeout(30_000);
 
 describe("TaskService", () => {
   let rootDir: string;
