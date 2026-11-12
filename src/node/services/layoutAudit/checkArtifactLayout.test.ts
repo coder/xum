@@ -22,6 +22,7 @@ import {
 } from "./fakeAgentBrowser.testHarness";
 import {
   LAYOUT_MEMORY_MAX_PATHS,
+  layoutAuditLastStartedAtMs,
   layoutAuditPathsInFlight,
   startLayoutAudit,
 } from "./layoutFingerprints";
@@ -273,6 +274,55 @@ describe("checkArtifactLayout", () => {
     // The agent never saw that report, so the same finding is still new on the next publish.
     await install({ eval: { 390: { kind: "pass", findings: [card] } } });
     expect((await check())?.issues[0]).not.toHaveProperty("persistent");
+  });
+
+  test("an audit that does not remember reads what the agent was shown and adds nothing to it", async () => {
+    // The turn-end audit has shown the agent nothing yet: only a publish result does.
+    await install({ eval: { 390: { kind: "pass", findings: [card] } } });
+    const atTurnEnd = () => check({ remember: false });
+    expect((await atTurnEnd())?.issues[0]).not.toHaveProperty("persistent");
+    // The publish still reads the finding as new, and its result is what commits it.
+    expect((await check())?.issues[0]).not.toHaveProperty("persistent");
+    expect((await atTurnEnd())?.issues[0]).toHaveProperty("persistent", true);
+  }, 180_000);
+
+  describe("the start time of the last audit that ran to its end", () => {
+    const startedAt = () => layoutAuditLastStartedAtMs(sessionDir, "chart.html");
+
+    test("is set by a complete check, whether or not it remembers", async () => {
+      await install();
+      const before = Date.now();
+      await check({ remember: false });
+      const recorded = startedAt();
+      expect(recorded).toBeGreaterThanOrEqual(before);
+      expect(recorded).toBeLessThanOrEqual(Date.now());
+    });
+
+    test("is set by a check in which no width completed", async () => {
+      await install({ missing: true });
+      await check();
+      expect(startedAt()).toBeDefined();
+    });
+
+    test("is not set by a cancelled check", async () => {
+      await install();
+      await check({ abortSignal: AbortSignal.abort() });
+      expect(startedAt()).toBeUndefined();
+    });
+
+    test("is not set by a check that found an issue it does not show, until a publish shows it", async () => {
+      // The continuation that tells the agent can lose to newer input or a Stop: the page must
+      // stay due for the next turn end, changed or not.
+      await install({ eval: { 390: { kind: "pass", findings: [card] } } });
+      await check({ remember: false });
+      expect(startedAt()).toBeUndefined();
+      await check();
+      const shownAt = startedAt();
+      expect(shownAt).toBeDefined();
+      // The agent was shown the issue: a turn-end audit that finds only that one settles the page.
+      await check({ remember: false });
+      expect(startedAt()).toBeGreaterThan(shownAt ?? Infinity);
+    }, 180_000);
   });
 
   test("overlapping publishes of one path run at once, and the one that started first does not overwrite the newer memory", async () => {

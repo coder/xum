@@ -3121,6 +3121,7 @@ export const TOOL_DEFINITIONS = {
       "HTML is sandboxed (its CSP blocks network, not guaranteed): never put secrets in it. Inline JS/CSS or use relative files; scripts may load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com, cdn.tailwindcss.com if the user allows. " +
       "HTML may call window.xum.send(text, data?) from a click handler (sent at once; the user did not review the text; arrives as an <artifact_interaction> message) and window.xum.setState(obj) (shown here). " +
       "Publishing HTML with the artifact tool checks its layout in agent-browser (when installed) at phone, tablet and desktop widths and lists clipped or overflowing text and unreachable or covered controls in the result's `layout`: fix those and publish again. " +
+      "A published page edited after its last check (else after its last publish) is checked again when a main-chat turn ends, three pages at most (not a sub-agent or Plan mode turn). " +
       "A screenshot via file:// and attach_file is an optional visual check (unsandboxed there: CDN content can differ).",
     schema: z
       .object({
@@ -3149,7 +3150,8 @@ export const TOOL_DEFINITIONS = {
     description:
       "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ in the user's Artifacts tab, shown as a chat card. " +
       "The tab shows the file as it is now, so edit it in place; publish again to show a new card or to change its title, kind or pin. " +
-      "For HTML the result's `layout` lists layout issues found in agent-browser; `checked: false` means a width was not checked, never that the page is clean.",
+      "For HTML the result's `layout` lists layout issues found in agent-browser; `checked: false` means a width was not checked, never that the page is clean. " +
+      "Xum also checks a published HTML page edited after its last check (else after its last publish) when a main-chat turn ends, three pages at most (not a sub-agent or Plan mode turn), and asks you to publish it again if that finds an issue you were not shown.",
     schema: z
       .object({
         path: z.string().describe("Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),

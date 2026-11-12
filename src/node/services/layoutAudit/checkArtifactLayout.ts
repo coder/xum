@@ -9,7 +9,7 @@ import { getToolEnvPath } from "@/node/services/hooks";
 import { runLayoutPasses } from "@/node/services/layoutAudit/agentBrowserLayoutRun";
 import { LAYOUT_AUDIT_PAGE_SCRIPT } from "@/node/services/layoutAudit/layoutAuditPageScript.generated";
 import { startLayoutAudit } from "@/node/services/layoutAudit/layoutFingerprints";
-import { buildLayoutReport } from "@/node/services/layoutAudit/layoutReport";
+import { buildLayoutReport, hasNewLayoutIssue } from "@/node/services/layoutAudit/layoutReport";
 import { failedOutcomes, type ViewportOutcome } from "@/node/services/layoutAudit/viewportOutcome";
 import { log } from "@/node/services/log";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -30,6 +30,12 @@ export interface ArtifactLayoutInput {
   /** Host session dir: with `relPath` it names the artifact the fix-loop memory is kept for. */
   sessionDir: string;
   abortSignal?: AbortSignal;
+  /**
+   * Whether this audit commits the issues it found to the fix-loop memory. Default true: a
+   * publish result is what shows the agent its issues. The turn-end audit shows nothing yet, so
+   * it passes false and only reads the memory.
+   */
+  remember?: boolean;
   /** Time for the whole audit, run and close, from when it starts. Production leaves it unset. */
   budgetMs?: number;
 }
@@ -124,7 +130,8 @@ export function isAuditableHtml(kind: string, relPath: string): boolean {
  * Never throws and never fails the publish: whatever goes wrong becomes `checked: false`, which
  * the agent must not read as "clean". Findings of the same path are compared with the last
  * complete check of it, so the agent can tell a new issue from one it already saw and could not
- * fix. The audit only reports. Nothing here wakes or re-prompts the agent.
+ * fix. The audit only reports: the turn-end audit (turnEndLayoutAudit.ts) is what tells the
+ * agent about issues in a page that nothing published.
  *
  * Overlapping publishes of one path run at the same time, each with its own budget from its own
  * start. The memory commit is the only thing that is ordered: by start, not by finish. Every
@@ -142,10 +149,16 @@ export async function checkArtifactLayout(
     // call's report was probably never delivered, so it leaves the memory alone. So does a
     // check in which no width completed: it learned nothing, and committing it would still
     // push another path out of the bounded memory.
+    const cancelled = input.abortSignal?.aborted === true;
+    const shown = input.remember !== false;
     return turn.finish(
       (previous) => buildLayoutReport(outcomes, previous),
-      input.abortSignal?.aborted !== true &&
-        outcomes.some((outcome) => outcome.status === "complete")
+      shown && !cancelled && outcomes.some((outcome) => outcome.status === "complete"),
+      // The page stays due for the turn-end audit when this audit was cancelled (it never
+      // looked at the page the way a finished one does), and when it found an issue that it
+      // does not show the agent: the continuation that tells the agent can lose to newer input
+      // or a Stop, and then only a later turn end can tell it.
+      (report) => cancelled || (!shown && hasNewLayoutIssue(report))
     );
   } catch (error) {
     log.debug("layout audit report failed", { error });
