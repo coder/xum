@@ -3,7 +3,9 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { runLocalVoiceWorker, transcribeLocally } from "./localTranscription";
 import type { LocalVoiceRequest, LocalVoiceResponse } from "@/browser/workers/localVoiceWorker";
 import {
+  LOCAL_VOICE_INFERENCE_LOCK,
   LOCAL_VOICE_MAX_SECONDS,
+  LOCAL_VOICE_MODEL_IDS,
   LOCAL_VOICE_MODELS,
   LOCAL_VOICE_SAMPLE_RATE,
   voiceModelCacheName,
@@ -19,6 +21,41 @@ function createWorker() {
     terminate: mock(() => undefined),
   };
   return { worker, boundary: worker as unknown as Worker };
+}
+
+function createLocks() {
+  const tails = new Map<string, Promise<void>>();
+  const held = new Set<string>();
+  const request = mock(
+    async <T>(name: string, options: LockOptions, callback: () => Promise<T>) => {
+      options.signal?.throwIfAborted();
+      const previous = tails.get(name) ?? Promise.resolve();
+      const released = Promise.withResolvers<void>();
+      // A cancelled waiter must not let later requests bypass the current lock holder.
+      tails.set(
+        name,
+        previous.then(() => released.promise)
+      );
+      const aborted = Promise.withResolvers<never>();
+      const onAbort = () => aborted.reject(options.signal?.reason);
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        await Promise.race([previous, aborted.promise]);
+        options.signal?.throwIfAborted();
+        options.signal?.removeEventListener("abort", onAbort);
+        held.add(name);
+        try {
+          return await callback();
+        } finally {
+          held.delete(name);
+        }
+      } finally {
+        options.signal?.removeEventListener("abort", onAbort);
+        released.resolve();
+      }
+    }
+  );
+  return { request, held };
 }
 
 describe("transcribeLocally", () => {
@@ -56,17 +93,15 @@ describe("transcribeLocally", () => {
       return { decodeAudioData: decode };
     });
     const entries = new Map(
-      LOCAL_VOICE_MODELS[id].files.map((file) => [
-        voiceModelFileUrl(id, file),
-        new Response(`cached ${file.name}`),
-      ])
+      LOCAL_VOICE_MODEL_IDS.flatMap((modelId) =>
+        LOCAL_VOICE_MODELS[modelId].files.map(
+          (file) => [voiceModelFileUrl(modelId, file), new Response(`cached ${file.name}`)] as const
+        )
+      )
     );
     const match = mock((url: string) => Promise.resolve(entries.get(url)?.clone()));
     const open = mock((_name: string) => Promise.resolve({ match }));
-    const lock = mock((_name: string, options: LockOptions, callback: () => Promise<void>) => {
-      options.signal?.throwIfAborted();
-      return callback();
-    });
+    const { request: lock, held } = createLocks();
     const { worker, boundary } = createWorker();
     const posted = Promise.withResolvers<void>();
     worker.postMessage.mockImplementation(() => posted.resolve());
@@ -89,9 +124,9 @@ describe("transcribeLocally", () => {
     const controllers: AbortController[] = [];
     const pending: Array<Promise<string>> = [];
 
-    function start(controller = new AbortController()) {
+    function start(controller = new AbortController(), recording = audio, modelId = id) {
       controllers.push(controller);
-      const result = transcribeLocally(id, audio, controller.signal);
+      const result = transcribeLocally(modelId, recording, controller.signal);
       pending.push(result);
       return { controller, result };
     }
@@ -122,6 +157,7 @@ describe("transcribeLocally", () => {
     };
 
     function expectReleased() {
+      expect(held.size).toBe(0);
       expect(revokeUrl.mock.calls.map(([url]) => url)).toEqual(createdUrls());
       expect(worker.terminate).toHaveBeenCalledTimes(createWorkerBoundary.mock.calls.length);
       expect(worker.onmessage).toBeNull();
@@ -148,6 +184,7 @@ describe("transcribeLocally", () => {
       entries,
       open,
       lock,
+      held,
       match,
       createUrl,
       revokeUrl,
@@ -194,6 +231,12 @@ describe("transcribeLocally", () => {
       }
       expect(transfer).toEqual([request.samples.buffer]);
       expect(transfer[0]).toBe(request.samples.buffer);
+      expect(env.lock).toHaveBeenNthCalledWith(
+        1,
+        LOCAL_VOICE_INFERENCE_LOCK,
+        { signal: controller.signal },
+        expect.any(Function)
+      );
       expect(env.lock).toHaveBeenCalledWith(
         voiceModelCacheName(id),
         { signal: controller.signal },
@@ -223,20 +266,98 @@ describe("transcribeLocally", () => {
     }
   );
 
-  test("rejects concurrent calls without releasing the active transcription", async () => {
+  test.each(["success", "error", "abort"] as const)(
+    "serializes recordings across models after %s and releases resources before the next decode",
+    async (outcome) => {
+      const env = setup();
+      const first = env.start();
+      await env.posted;
+      const nextPosted = Promise.withResolvers<void>();
+      env.worker.postMessage.mockImplementationOnce(() => nextPosted.resolve());
+      const secondAudio = new Blob([new Uint8Array([4, 5, 6])]);
+      const second = env.start(new AbortController(), secondAudio, "parakeet-v2");
+      expect(env.decode).toHaveBeenCalledTimes(1);
+      expect(env.open).toHaveBeenCalledTimes(1);
+      expect(env.createWorkerBoundary).toHaveBeenCalledTimes(1);
+      expect(env.revokeUrl).not.toHaveBeenCalled();
+      expect(env.worker.terminate).not.toHaveBeenCalled();
+      expect(env.held.has(LOCAL_VOICE_INFERENCE_LOCK)).toBe(true);
+      env.decode.mockImplementationOnce(() => {
+        expect(env.worker.terminate).toHaveBeenCalledTimes(1);
+        expect(env.revokeUrl).toHaveBeenCalledTimes(3);
+        return Promise.resolve(env.decoded);
+      });
+      if (outcome === "success") {
+        env.respond({ text: "first recording" });
+        expect(await first.result).toBe("first recording");
+      } else {
+        if (outcome === "error") env.respond({ error: "Not enough memory" });
+        else first.controller.abort();
+        await rejects(
+          first.result,
+          outcome === "error" ? /Not enough memory/ : /stopped or timed out/
+        );
+      }
+      await nextPosted.promise;
+      expect(env.decode).toHaveBeenLastCalledWith(await secondAudio.arrayBuffer());
+      expect(env.open).toHaveBeenLastCalledWith(voiceModelCacheName("parakeet-v2"));
+      expect(env.createWorkerBoundary).toHaveBeenCalledTimes(2);
+      env.respond({ text: "second recording" });
+      expect(await second.result).toBe("second recording");
+      env.expectReleased();
+    }
+  );
+
+  test("queued cancellation leaves the active recording and the next waiter intact", async () => {
     const env = setup();
-    const { result } = env.start();
+    const first = env.start();
     await env.posted;
-    await rejects(env.start().result, /Another local transcription/);
-    await rejects(env.start().result, /Another local transcription/);
+    const cancelled = env.start();
+    const nextPosted = Promise.withResolvers<void>();
+    env.worker.postMessage.mockImplementationOnce(() => nextPosted.resolve());
+    const last = env.start();
+    cancelled.controller.abort();
+    await rejects(cancelled.result, { name: "AbortError" });
     expect(env.decode).toHaveBeenCalledTimes(1);
+    expect(env.open).toHaveBeenCalledTimes(1);
     expect(env.createWorkerBoundary).toHaveBeenCalledTimes(1);
     expect(env.revokeUrl).not.toHaveBeenCalled();
     expect(env.worker.terminate).not.toHaveBeenCalled();
-    env.respond();
-    expect(await result).toBe("recognized speech");
+    expect(env.held.has(LOCAL_VOICE_INFERENCE_LOCK)).toBe(true);
+    env.respond({ text: "first recording" });
+    expect(await first.result).toBe("first recording");
+    await nextPosted.promise;
+    env.respond({ text: "last recording" });
+    expect(await last.result).toBe("last recording");
+    expect(env.decode).toHaveBeenCalledTimes(2);
+    expect(env.createWorkerBoundary).toHaveBeenCalledTimes(2);
     env.expectReleased();
-    await env.expectRetrySucceeds();
+  });
+
+  test("waits for another window's inference lock before decoding or loading a model", async () => {
+    const env = setup();
+    const acquired = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const otherWindow = env.lock(LOCAL_VOICE_INFERENCE_LOCK, {}, () => {
+      acquired.resolve();
+      return release.promise;
+    });
+    await acquired.promise;
+    env.worker.postMessage.mockImplementation(() => env.respond());
+    try {
+      const { result } = env.start();
+      expect(env.createContext).not.toHaveBeenCalled();
+      expect(env.decode).not.toHaveBeenCalled();
+      expect(env.open).not.toHaveBeenCalled();
+      expect(env.createWorkerBoundary).not.toHaveBeenCalled();
+      expect(env.lock).toHaveBeenCalledTimes(2);
+      release.resolve();
+      expect(await result).toBe("recognized speech");
+      env.expectReleased();
+    } finally {
+      release.resolve();
+      await otherWindow;
+    }
   });
 
   test("rejects excessive duration before cache access and permits the duration limit", async () => {
@@ -281,6 +402,8 @@ describe("transcribeLocally", () => {
     const controller = new AbortController();
     controller.abort();
     await rejects(env.start(controller).result, { name: "AbortError" });
+    expect(env.createContext).not.toHaveBeenCalled();
+    expect(env.decode).not.toHaveBeenCalled();
     expect(env.open).not.toHaveBeenCalled();
     expect(env.createWorkerBoundary).not.toHaveBeenCalled();
     env.expectReleased();

@@ -1,3 +1,4 @@
+export const LOCAL_VOICE_INFERENCE_LOCK = "xum-voice-inference";
 export const LOCAL_VOICE_SAMPLE_RATE = 16_000;
 export const LOCAL_VOICE_MAX_SECONDS = 120;
 export const LOCAL_VOICE_TIMEOUT_MS = 5 * 60_000;

@@ -1,4 +1,5 @@
 import {
+  LOCAL_VOICE_INFERENCE_LOCK,
   LOCAL_VOICE_MODELS,
   LOCAL_VOICE_MAX_SECONDS,
   LOCAL_VOICE_SAMPLE_RATE,
@@ -9,53 +10,54 @@ import {
 } from "@/common/constants/localVoiceModels";
 import type { LocalVoiceRequest, LocalVoiceResponse } from "@/browser/workers/localVoiceWorker";
 
-let transcribing = false;
-
 /** Local mode never uploads audio or falls back to a cloud provider. */
 export async function transcribeLocally(
   id: LocalVoiceModelId,
   audio: Blob,
   signal: AbortSignal
 ): Promise<string> {
-  if (transcribing) throw new Error("Another local transcription is in progress.");
-  transcribing = true;
-  const urls: string[] = [];
-  try {
-    const context = new OfflineAudioContext(1, 1, LOCAL_VOICE_SAMPLE_RATE);
-    const decoded = await context.decodeAudioData(await audio.arrayBuffer());
-    if (decoded.duration > LOCAL_VOICE_MAX_SECONDS) {
-      throw new Error(`Local recordings must be shorter than ${LOCAL_VOICE_MAX_SECONDS} seconds.`);
-    }
-    const samples = new Float32Array(decoded.length);
-    for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
-      const data = decoded.getChannelData(channel);
-      for (let i = 0; i < samples.length; i++) samples[i] += data[i] / decoded.numberOfChannels;
-    }
-    // Read only verified cache entries. Missing files require an explicit download in Settings.
-    await navigator.locks.request(voiceModelCacheName(id), { signal }, async () => {
-      const cache = await caches.open(voiceModelCacheName(id));
-      for (const file of LOCAL_VOICE_MODELS[id].files) {
-        const response = await cache.match(voiceModelFileUrl(id, file));
-        if (!response)
-          throw new Error("Download the local model in Settings → Voice before recording.");
-        urls.push(URL.createObjectURL(await response.blob()));
+  // Queue completed recordings across windows instead of discarding them during another transcription.
+  // Hold the inference lock through decoding, model access, and worker cleanup.
+  return navigator.locks.request(LOCAL_VOICE_INFERENCE_LOCK, { signal }, async () => {
+    const urls: string[] = [];
+    try {
+      const context = new OfflineAudioContext(1, 1, LOCAL_VOICE_SAMPLE_RATE);
+      const decoded = await context.decodeAudioData(await audio.arrayBuffer());
+      if (decoded.duration > LOCAL_VOICE_MAX_SECONDS) {
+        throw new Error(
+          `Local recordings must be shorter than ${LOCAL_VOICE_MAX_SECONDS} seconds.`
+        );
       }
-    });
-    signal.throwIfAborted();
-    return await callVoiceWorker(
-      {
-        type: "transcribe",
-        samples,
-        encoderUrl: urls[0],
-        decoderUrl: urls[1],
-        tokenizerUrl: urls[2],
-      },
-      signal
-    );
-  } finally {
-    for (const url of urls) URL.revokeObjectURL(url);
-    transcribing = false;
-  }
+      const samples = new Float32Array(decoded.length);
+      for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
+        const data = decoded.getChannelData(channel);
+        for (let i = 0; i < samples.length; i++) samples[i] += data[i] / decoded.numberOfChannels;
+      }
+      // Read only verified cache entries. Missing files require an explicit download in Settings.
+      await navigator.locks.request(voiceModelCacheName(id), { signal }, async () => {
+        const cache = await caches.open(voiceModelCacheName(id));
+        for (const file of LOCAL_VOICE_MODELS[id].files) {
+          const response = await cache.match(voiceModelFileUrl(id, file));
+          if (!response)
+            throw new Error("Download the local model in Settings → Voice before recording.");
+          urls.push(URL.createObjectURL(await response.blob()));
+        }
+      });
+      signal.throwIfAborted();
+      return await callVoiceWorker(
+        {
+          type: "transcribe",
+          samples,
+          encoderUrl: urls[0],
+          decoderUrl: urls[1],
+          tokenizerUrl: urls[2],
+        },
+        signal
+      );
+    } finally {
+      for (const url of urls) URL.revokeObjectURL(url);
+    }
+  });
 }
 
 export async function prepareLocalVoiceRuntime(signal: AbortSignal): Promise<void> {
