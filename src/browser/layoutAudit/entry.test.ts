@@ -8,6 +8,7 @@ describe("auditWindow", () => {
     expect(await auditWindow(fake.win)).toEqual({
       complete: true,
       viewportWidth: 390,
+      viewportHeight: 844,
       href: "about:blank",
       findings: [],
     });
@@ -34,20 +35,23 @@ describe("auditWindow", () => {
     expect(await auditWindow(fake.win)).toEqual({
       complete: false,
       viewportWidth: 390,
+      viewportHeight: 844,
       href: "about:blank",
       findings: [],
     });
   });
 
-  test("a crash while measuring does too, and an unreadable width reads as 0", async () => {
+  test("a crash while measuring does too, and an unreadable size reads as 0", async () => {
     using fake = createFakeBrowserWindow({ width: 390, bodyHtml: "<p>hello world</p>" });
     fake.win.getComputedStyle = () => {
       throw new Error("style broke");
     };
     Object.defineProperty(fake.win, "innerWidth", { value: 0, configurable: true });
+    Object.defineProperty(fake.win, "innerHeight", { value: 0, configurable: true });
     expect(await auditWindow(fake.win)).toEqual({
       complete: false,
       viewportWidth: 0,
+      viewportHeight: 0,
       href: "about:blank",
       findings: [],
     });

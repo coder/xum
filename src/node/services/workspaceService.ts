@@ -10447,7 +10447,8 @@ export class WorkspaceService
 
   /**
    * Model-only view of getWorkspaceNamingCandidates for "small model" callers
-   * whose runtime ignores thinking (AI sidebar status). Public so
+   * that pick their own thinking level (AI sidebar status runs with thinking
+   * off). Public so
    * AgentStatusService can share the precedence.
    */
   public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {

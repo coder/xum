@@ -29,22 +29,23 @@ describe("runLayoutAudit", () => {
       "domQuiet",
       "measure", // sample C, taken only because the DOM was quiet
       "documentComplete",
-      "measure", // the viewport width of the result
+      "measure", // the viewport size of the result
     ]);
   });
 
   test("takes no third sample when the DOM never went quiet", async () => {
     using fake = createFakeLayoutPage("<p>hello</p>", { ...PHONE, settle: { domQuiet: false } });
     await runLayoutAudit(fake.page, fake.signals);
-    expect(fake.calls.filter((call) => call === "measure")).toHaveLength(3); // A, B, width
+    expect(fake.calls.filter((call) => call === "measure")).toHaveLength(3); // A, B, size
     expect(fake.calls.indexOf("domQuiet")).toBeGreaterThan(fake.calls.lastIndexOf("sleep"));
   });
 
-  test("reports the viewport width the page has at the end", async () => {
+  test("reports the viewport size the page has at the end", async () => {
     using fake = createFakeLayoutPage("<p>hello</p>", { viewport: { width: 768, height: 1024 } });
     expect(await runLayoutAudit(fake.page, fake.signals)).toEqual({
       complete: true,
       viewportWidth: 768,
+      viewportHeight: 1024,
       findings: [],
     });
   });
@@ -74,13 +75,23 @@ describe("runLayoutAudit", () => {
     using fake = createFakeLayoutPage("<p>hello</p>", PHONE);
     const result = await runLayoutAudit(fake.page, signalsThatAdd(fake, "pause"));
     // Samples: A without it, B and C with it. Stable = B and C.
-    expect(result).toEqual({ complete: true, viewportWidth: 390, findings: [FINDING] });
+    expect(result).toEqual({
+      complete: true,
+      viewportWidth: 390,
+      viewportHeight: 844,
+      findings: [FINDING],
+    });
   });
 
   test("it is not reported when the DOM never went quiet, because sample A did not see it", async () => {
     using fake = createFakeLayoutPage("<p>hello</p>", { ...PHONE, settle: { domQuiet: false } });
     const result = await runLayoutAudit(fake.page, signalsThatAdd(fake, "pause"));
-    expect(result).toEqual({ complete: false, viewportWidth: 390, findings: [] });
+    expect(result).toEqual({
+      complete: false,
+      viewportWidth: 390,
+      viewportHeight: 844,
+      findings: [],
+    });
   });
 
   test("a finding that appears only after the DOM went quiet is not stable", async () => {
@@ -92,7 +103,12 @@ describe("runLayoutAudit", () => {
   test("a finding present in both samples of an unquiet page is kept, but the pass is incomplete", async () => {
     using fake = createFakeLayoutPage(OFF_LEFT("late"), { ...PHONE, settle: { domQuiet: false } });
     const result = await runLayoutAudit(fake.page, fake.signals);
-    expect(result).toEqual({ complete: false, viewportWidth: 390, findings: [FINDING] });
+    expect(result).toEqual({
+      complete: false,
+      viewportWidth: 390,
+      viewportHeight: 844,
+      findings: [FINDING],
+    });
   });
 
   test.each([
