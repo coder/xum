@@ -738,6 +738,34 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Gemini 4 Hydrogen - GA on the free and paid Gemini API tiers (November 2026).
+  // Stable `gemini-4-hydrogen` model ID; input, thinking, and output share one
+  // 1,048,576-token window. Like Argon and Carbon, a synchronous request caps output
+  // at 65,536 tokens (a larger max_output_tokens opts into long decode, which Xum
+  // does not drive). Paid pricing is flat (no expiry dates, unlike Carbon's intro
+  // rates): $1.50/M input, $7.50/M output including thinking tokens, $0.075/M
+  // implicitly cached input. No >200K tier. Hydrogen's migration guide drops
+  // temperature/top_p/top_k, and the server ignores custom values rather than
+  // rejecting them (no 400, unlike Carbon), so forwarding overrides would still
+  // silently do nothing. Source: Gemini API model, pricing, and migration docs,
+  // 2026-11-13.
+  "gemini-4-hydrogen": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.0000015, // $1.50 per million input tokens
+    output_cost_per_token: 0.0000075, // $7.50 per million output tokens, including thinking tokens
+    cache_read_input_token_cost: 0.000000075, // $0.075 per million cached input tokens
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Gemini 3.8 Flash - GA on September 2, 2026. Stable `gemini-3.8-flash` model ID with
   // 1M context, 64K max output (DeepMind model card). Like 3.7 Flash, we encode the
   // introductory rates Google actually bills through December 31, 2026 ($0.75/M input,

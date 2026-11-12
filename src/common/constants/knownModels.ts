@@ -196,6 +196,16 @@ const MODEL_DEFINITIONS = {
     aliases: ["carbon", "gemini-carbon"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
+  // Gemini 4 Hydrogen - GA on the free and paid Gemini API tiers in November 2026
+  // (stable ID `gemini-4-hydrogen`; default thinking high, native xhigh). `gemini-4`
+  // stays on Argon, which Google recommends for most work. See models-extra for limits
+  // and pricing.
+  GEMINI_4_HYDROGEN: {
+    provider: "google",
+    providerModelId: "gemini-4-hydrogen",
+    aliases: ["hydrogen", "gemini-hydrogen"],
+    tokenizerOverride: "google/gemini-2.5-pro",
+  },
   // Grok 4.7 - xAI's frontier coding and knowledge-work model, released September 21,
   // 2026. Supersedes Grok 4.6 at identical pricing and specs ($2/M in, $6/M out, 500K
   // context, native xhigh); Grok 4.6 remains usable as the custom model string
