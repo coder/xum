@@ -25,27 +25,52 @@ export interface ButtonConfig {
  * A message's actions and time are there when the pointer or the keyboard is on the message, and
  * out of sight otherwise: repeated under every prompt and every reply they were the loudest
  * thing in a quiet transcript. Only the latest reply keeps its row in view, since that is the
- * one the user acts on. A quiet row keeps its place in the layout, so nothing moves when it
- * shows. Touch has no hover: there every row is always shown.
+ * one the user acts on. A hidden row takes no clicks. Touch has no hover: there every row is
+ * always shown.
  */
-const QUIET_META_ROW_CLASS =
-  "opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100";
+const QUIET_META_ROW_CLASS = cn(
+  "pointer-events-none opacity-0 transition-opacity",
+  "group-hover/message:pointer-events-auto group-hover/message:opacity-100",
+  "focus-within:pointer-events-auto focus-within:opacity-100",
+  "[@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100"
+);
 
 /**
- * A prompt's row sits under its bubble, at the bubble's right edge, like a reply's row sits
- * under the reply. Beside the bubble (to its left, where it was for a while to save the line)
- * it read as a stray label in the middle of the page, far from the message it belongs to.
- *
- * The row is in the flow, so it never floats over the row below: when one prompt follows
- * another, that row is the next prompt's bubble, which would take the clicks meant for Edit.
- * A hidden row still takes its line, so the block gives part of it back with a negative margin:
- * the prompt stays near the work it started. The margin is no larger than the smallest top
- * margin a transcript row has, so the row never overlaps what follows. On touch the row is
- * always shown and keeps its full line.
+ * Where a hover device puts the row of a prompt or a step: floating, so a hidden row reserves
+ * no line. A reserved line under every prompt pushed the prompt away from the work it started,
+ * further than it sat from the turn before, and one under every step broke the pitch of the
+ * steps around it.
+ *  - "under": below the bubble, at its right edge, like a reply's row sits under the reply.
+ *    (Beside the bubble, to its left, it read as a stray label in the middle of the page.)
+ *  - "beside": at the right end of a step's one line.
+ * The row has the transcript's surface, so it covers what it floats over while it shows, and
+ * its block rises above the rows around it then (see FLOATING_BLOCK_CLASS): when one prompt
+ * follows another, the row would otherwise sit under the next prompt's bubble, which would
+ * take the clicks meant for Edit. On touch the row is always shown, so it keeps its own line.
  */
+const FLOATING_META_ROW_CLASS = cn(
+  "[@media(hover:hover)]:absolute [@media(hover:hover)]:right-0 [@media(hover:hover)]:mt-0",
+  "[@media(hover:hover)]:w-max [@media(hover:hover)]:max-w-[90cqw] [@media(hover:hover)]:rounded-sm",
+  "[@media(hover:hover)]:bg-surface-primary"
+);
+const FLOATING_META_ROW_PLACEMENT_CLASS: Record<MetaRowPlacement, string | undefined> = {
+  "in-flow": undefined,
+  under: cn(FLOATING_META_ROW_CLASS, "[@media(hover:hover)]:top-full [@media(hover:hover)]:pt-0.5"),
+  beside: cn(FLOATING_META_ROW_CLASS, "[@media(hover:hover)]:top-0 [@media(hover:hover)]:pl-2"),
+};
+const FLOATING_BLOCK_CLASS = "hover:z-10 focus-within:z-10";
+
+type MetaRowPlacement = "in-flow" | "under" | "beside";
+const META_ROW_PLACEMENT: Record<NonNullable<MessageWindowProps["variant"]>, MetaRowPlacement> = {
+  assistant: "in-flow",
+  user: "under",
+  step: "beside",
+};
+
+/** A prompt: its bubble at the right, and on touch its row on a line of its own below. */
 const USER_BLOCK_CLASS = cn(
-  "ml-auto w-fit max-w-full flex-col items-end gap-y-0.5 -mb-2",
-  "[@media(hover:none)]:items-stretch [@media(hover:none)]:gap-y-2 [@media(hover:none)]:mb-1"
+  "ml-auto w-fit max-w-full flex-col items-end",
+  "[@media(hover:none)]:items-stretch [@media(hover:none)]:gap-y-2"
 );
 
 interface MessageWindowProps {
@@ -103,6 +128,7 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
       className={cn(
         "group/message mt-4 mb-1 flex relative isolate",
         variant === "user" && USER_BLOCK_CLASS,
+        variant !== "assistant" && FLOATING_BLOCK_CLASS,
         variant !== "user" && "flex-col w-full text-foreground",
         // A step keeps the pitch of the tool rows it sits among.
         variant === "step" && "my-2",
@@ -136,7 +162,7 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
       </div>
       {showMetaRow && (
         <MessageMetaRow
-          variant={variant === "user" ? "user" : "assistant"}
+          placement={META_ROW_PLACEMENT[variant]}
           quiet={isQuietMetaRow}
           buttons={buttons}
           jsonToggle={
@@ -164,7 +190,8 @@ function useIsLatestRow(messageId: string): boolean {
 }
 
 interface MessageMetaRowProps {
-  variant: "assistant" | "user";
+  /** In the flow under the message, or floating on hover devices (see FLOATING_META_ROW_CLASS). */
+  placement: MetaRowPlacement;
   /** Out of sight until the pointer or the keyboard is on the message (see QUIET_META_ROW_CLASS). */
   quiet: boolean;
   buttons: ButtonConfig[];
@@ -182,8 +209,9 @@ const MessageMetaRow: React.FC<MessageMetaRowProps> = (props) => {
     <div
       className={cn(
         "text-muted flex flex-wrap items-center justify-between gap-3 text-[11px]",
-        // A prompt's block spaces its row itself (see USER_BLOCK_CLASS).
-        props.variant === "user" ? "ml-auto" : "mt-1",
+        // A prompt's block spaces its row itself on touch (see USER_BLOCK_CLASS).
+        props.placement === "under" ? "ml-auto" : "mt-1",
+        FLOATING_META_ROW_PLACEMENT_CLASS[props.placement],
         props.quiet && QUIET_META_ROW_CLASS
       )}
       data-message-meta

@@ -77,6 +77,7 @@ export function SubagentReportMessageContent(
         )}
       >
         <Bot aria-hidden="true" className="size-3.5 shrink-0" />
+        <span className="shrink-0 font-medium">Sub-agent</span>
         <span className="text-foreground min-w-0 truncate">{props.report.title}</span>
         <span
           className={cn(

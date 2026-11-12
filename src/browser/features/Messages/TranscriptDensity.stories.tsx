@@ -3,7 +3,11 @@ import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, PIXEL_DUAL_THEME } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar } from "@/browser/stories/helpers/uiState";
-import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
+import {
+  createAssistantMessage,
+  createSubagentReportMessage,
+  createUserMessage,
+} from "@/browser/stories/mocks/messages";
 import {
   createBashTool,
   createFileEditTool,
@@ -17,6 +21,7 @@ import {
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
 import type { TranscriptDensity } from "@/common/constants/storage";
 import type { ChatMuxMessage } from "@/common/orpc/types";
+import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import { PhoneSubagentReportDecorator } from "@/browser/stories/helpers/subagentReportStory";
 
 const meta = { ...appMeta, title: "App/Chat/Transcript Density" };
@@ -195,9 +200,9 @@ export const CompactTurnOpened: AppStory = {
 };
 
 /**
- * What compact density never folds, and what a live turn shows through its work line:
- * an answered question and a plan stay in the conversation, and the turn in progress shows its
- * latest narration and the call that is running, not the steps before them.
+ * What compact density never folds, and what a live turn shows: an answered question and a plan
+ * stay in the conversation, and the turn in progress shows its latest narration under a line
+ * that names the step it is on. No step mounts as a row under that line.
  */
 export const CompactStopsAndLiveTurn: AppStory = {
   render: () => (
@@ -270,6 +275,7 @@ export const CompactStopsAndLiveTurn: AppStory = {
                 createPendingTool("live-test-1", "bash", {
                   script: "make test",
                   timeout_secs: 120,
+                  model_intent: "Running the test suite",
                 }),
               ],
             }),
@@ -280,19 +286,136 @@ export const CompactStopsAndLiveTurn: AppStory = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
+    // The live line names the running step in place.
     await canvas.findByRole(
       "button",
-      { name: /^Working for .+ · edited 2 files$/ },
+      { name: /^Working for .+ · Running the test suite$/ },
       { timeout: 15_000 }
     );
-    // Through the live fold: the latest narration and the running call, not the steps before.
+    // Under it: the latest narration only. The running call is not a row that comes and goes.
     await canvas.findByText("Registering it and running the tests.");
-    await canvas.findByText("make test");
+    await expect(canvas.queryByText("make test")).toBeNull();
     await expect(canvas.queryByText("Adding the job first.")).toBeNull();
     await expect(canvas.queryByText("src/jobs/expireSessions.ts")).toBeNull();
     // Stops stay in the conversation.
     await canvas.findByText("Here is the plan.");
     await canvas.findByText("Session cleanup job");
+  },
+};
+
+const REVIEW_REPORT_TITLE = "Token check reviewed";
+
+/**
+ * Prompts the machine writes in the middle of the agent's work (a sub-agent's report, the
+ * wake-up that follows it) are steps of that work: they fold behind the line of the work they
+ * start, and opened they sit on the left with the other steps, not in user bubbles on the right.
+ * A turn the user stopped earlier carries no divider: the conversation went on.
+ */
+export const CompactMachineSteps: AppStory = {
+  // The Pixel snapshot budget is spent: the play function is the contract.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        const at = (seconds: number) => STABLE_TIMESTAMP - 600_000 + seconds * 1000;
+        return setupSimpleChatStory({
+          workspaceId: "ws-density-machine-steps",
+          userPreferences: { appearance: { transcriptDensity: "hyper" } },
+          messages: [
+            createUserMessage("steps-user-0", "Review the auth module", {
+              historySequence: 1,
+              timestamp: at(0),
+            }),
+            // Stopped by the user, who then asked again.
+            createAssistantMessage("steps-assistant-0", "Starting with the session store.", {
+              historySequence: 2,
+              timestamp: at(2),
+              partial: true,
+              toolCalls: [
+                createFileReadTool("steps-read-0", "src/auth/store.ts", "export const store = {};"),
+              ],
+            }),
+            createUserMessage("steps-user-1", "Use two sub-agents for it", {
+              historySequence: 3,
+              timestamp: at(20),
+            }),
+            createAssistantMessage("steps-assistant-1", "", {
+              historySequence: 4,
+              timestamp: at(22),
+              toolCalls: [
+                createFileReadTool(
+                  "steps-read-1",
+                  "src/auth/session.ts",
+                  "export function verify() {}"
+                ),
+                text("Two sub-agents are reviewing it. I will report when they finish.", at(30)),
+              ],
+            }),
+            createSubagentReportMessage("steps-report-1", {
+              historySequence: 5,
+              timestamp: at(150),
+              taskId: "task-review-1",
+              agentType: "explore",
+              title: REVIEW_REPORT_TITLE,
+              reportMarkdown: "The token check compares in constant time.",
+            }),
+            createSubagentReportMessage("steps-report-2", {
+              historySequence: 6,
+              timestamp: at(151),
+              taskId: "task-review-2",
+              agentType: "explore",
+              title: "Expiry handling reviewed",
+              reportMarkdown: "Expired sessions are rejected before the store is read.",
+            }),
+            createUserMessage(
+              "steps-wake-1",
+              `${BACKGROUND_WORK_WAKE_OPENINGS.subagentsCompleted} Read the reports and continue.`,
+              { historySequence: 7, timestamp: at(152), synthetic: true }
+            ),
+            createAssistantMessage("steps-assistant-2", "", {
+              historySequence: 8,
+              timestamp: at(154),
+              toolCalls: [
+                createFileReadTool(
+                  "steps-read-2",
+                  "src/auth/expiry.ts",
+                  "export const ttl = 3600;"
+                ),
+                text("Both reviews agree: the module is sound.", at(170)),
+              ],
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Both reviews agree: the module is sound.", {}, { timeout: 15_000 });
+    // One line for the work the wake-up started, after the reply before it. Closed, the
+    // reports and the wake-up are behind the lines.
+    const lines = canvas.getAllByTestId("work-bundle");
+    await expect(lines).toHaveLength(3);
+    await expect(canvas.queryByText(REVIEW_REPORT_TITLE)).toBeNull();
+    await expect(canvasElement.querySelector("[data-background-work-wake]")).toBeNull();
+    // The stopped turn further up has no divider and no control.
+    await expect(canvas.queryByText(/^interrupted$/i)).toBeNull();
+
+    // The transcript shows a report where the agent was when the sub-agent finished: with the
+    // work before the reply. The wake-up heads the work it started.
+    await userEvent.click(lines[1]);
+    await userEvent.click(lines[2]);
+    const [reportSteps, wakeSteps] = await canvas.findAllByTestId("work-bundle-steps");
+    await within(reportSteps).findByText(REVIEW_REPORT_TITLE);
+    await expect(wakeSteps.querySelector("[data-background-work-wake]")).not.toBeNull();
+    // A report is a step on the agent's side: its row starts at the left edge of the steps.
+    const report = within(reportSteps)
+      .getByText(REVIEW_REPORT_TITLE)
+      .closest("[data-message-block]");
+    if (!(report instanceof HTMLElement)) throw new Error("The report row is not a message block");
+    const offset = report.getBoundingClientRect().left - reportSteps.getBoundingClientRect().left;
+    if (offset > 24) throw new Error(`The report row sits ${offset}px in: it reads as a prompt`);
   },
 };
 

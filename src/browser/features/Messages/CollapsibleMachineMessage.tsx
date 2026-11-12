@@ -28,7 +28,7 @@ export function CollapsibleMachineMessage(props: CollapsibleMachineMessageProps)
   return (
     <div
       {...markerAttributes}
-      className={cn("my-2 flex min-w-0 flex-col items-start", props.className)}
+      className={cn("my-2 -ml-1 flex min-w-0 flex-col items-start", props.className)}
       data-message-block
     >
       <button

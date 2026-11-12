@@ -471,8 +471,10 @@ function scanStretch(
 
 /**
  * When a stretch started and how long it took. It starts at the prompt before it, or else at its
- * first row with a timestamp. It ends at its latest timestamp, not its last row's: a row without
- * its own carries its message's start.
+ * first row with a timestamp. It ends at the latest timestamp of the agent's own rows, not at
+ * its last row's: a row without its own carries its message's start. A machine prompt does not
+ * end it: a sub-agent's report is shown where the agent was when the sub-agent finished, which
+ * can be before rows that are older than the report.
  */
 function measureStretch(
   messages: DisplayedMessage[],
@@ -488,7 +490,9 @@ function measureStretch(
       continue;
     }
     startedAtMs ??= timestamp;
-    endedAtMs = Math.max(endedAtMs, timestamp);
+    if (messages[index].type !== "user") {
+      endedAtMs = Math.max(endedAtMs, timestamp);
+    }
   }
   // No start, or no row with a timestamp after it (endedAtMs is still -Infinity): no duration.
   const elapsedMs = startedAtMs === undefined ? 0 : endedAtMs - startedAtMs;

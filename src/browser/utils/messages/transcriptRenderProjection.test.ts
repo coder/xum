@@ -70,9 +70,9 @@ function user(id: string, timestamp?: number): DisplayedMessage & { type: "user"
 }
 
 /** A prompt the machine wrote mid-turn: the wake-up for finished sub-agents. */
-function wake(id: string): DisplayedMessage {
+function wake(id: string, timestamp?: number): DisplayedMessage {
   return {
-    ...user(id),
+    ...user(id, timestamp),
     content: `${BACKGROUND_WORK_WAKE_OPENINGS.subagentsCompleted} Read the reports.`,
     isSynthetic: true,
   };
@@ -590,6 +590,18 @@ describe("work bundles (compact density)", () => {
       tool({ id: "todo", toolName: "todo_write", timestamp: 5_000, ...TURN }),
     ]);
     expect(timed[1]).toMatchObject({ startedAtMs: 1_000, durationMs: 134_000 });
+
+    // A machine prompt can start the clock (the wake-up that began the work) and never ends
+    // it: a report is shown where the agent was, which can be before older rows.
+    const woken = work([
+      prompt,
+      assistant("reply-a", { historyId: "history-a", timestamp: 2_000 }),
+      wake("wake", 60_000),
+      tool({ id: "read", timestamp: 61_000, ...TURN }),
+      wake("late-report", 900_000),
+      assistant("reply-b", { ...TURN, timestamp: 70_000 }),
+    ]);
+    expect(woken[2]).toMatchObject({ key: "work:wake", startedAtMs: 60_000, durationMs: 10_000 });
 
     const untimed = work([user("prompt"), tool({ id: "read", ...TURN }), assistant("reply", TURN)]);
     expect(untimed[1]?.durationMs).toBeUndefined();
