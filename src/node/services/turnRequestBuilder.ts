@@ -152,6 +152,7 @@ import {
   buildProviderOptions,
   buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
+  resolveRequestProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -1223,6 +1224,19 @@ export class TurnRequestBuilder {
     { messageId: string; turn: AgentInterfaceStatusPageTurn }
   >();
 
+  /**
+   * Each workspace's latest prepared turn whose agent can call the artifact tool and is not
+   * plan-like, for the turn-end layout nudge (turnCanRepublishArtifacts). The nudge asks for a
+   * publish, and its continuation keeps the turn's agent, tool policy and request assembly: a turn
+   * without the tool could not follow it. `toolSent` is whether the tools of the turn's latest
+   * attempt still held `artifact` after assembly (followArtifactToolAfterAssembly). One entry per
+   * workspace: the next prepare replaces or drops it.
+   */
+  private readonly artifactPublishTurns = new Map<
+    string,
+    { messageId: string; toolSent: boolean }
+  >();
+
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
   /** Turn timings, record timestamps and retry delays share the stream's HostClock. */
@@ -1235,6 +1249,13 @@ export class TurnRequestBuilder {
   forgetWorkspace(workspaceId: string): void {
     this.toolCatalogOverviews.delete(workspaceId);
     this.agentInterfaceTurns.delete(workspaceId);
+    this.artifactPublishTurns.delete(workspaceId);
+  }
+
+  /** Whether the turn whose assistant message is `messageId` could publish an artifact. */
+  turnCanRepublishArtifacts(workspaceId: string, messageId: string): boolean {
+    const entry = this.artifactPublishTurns.get(workspaceId);
+    return entry?.messageId === messageId && entry.toolSent;
   }
 
   /**
@@ -1249,6 +1270,39 @@ export class TurnRequestBuilder {
     if (entry?.messageId !== messageId) return undefined;
     this.agentInterfaceTurns.delete(workspaceId);
     return entry.turn;
+  }
+
+  private recordArtifactPublishTurn(
+    workspaceId: string,
+    messageId: string,
+    agent: { planLike: boolean; toolPolicy: ToolPolicy | undefined }
+  ): void {
+    // A plan-like agent (a custom one included) may edit only its plan file, as for the status
+    // page nudge (recordAgentInterfaceTurn).
+    // Not sent until an attempt's assembled tools hold the tool (followArtifactToolAfterAssembly).
+    if (!agent.planLike && applyToolPolicyToNames(["artifact"], agent.toolPolicy).length > 0) {
+      this.artifactPublishTurns.set(workspaceId, { messageId, toolSent: false });
+    } else {
+      this.artifactPublishTurns.delete(workspaceId);
+    }
+  }
+
+  /**
+   * The policy allows the tool, but request.assemble middleware, XUM_DISABLE_AGENT_TOOLS or
+   * capability grants can still remove it from the request. Each attempt (a model fallback reruns
+   * assembly) sets the record from the tools it sends. With Programmatic Tool Calling the tool is
+   * bridged into code_execution (`xum.artifact`), built from the same policy-filtered tools that
+   * request hooks never see, so code_execution carries it.
+   */
+  private followArtifactToolAfterAssembly(
+    workspaceId: string,
+    messageId: string,
+    attempt: { tools: Record<string, Tool>; ptcEnabled: boolean }
+  ): void {
+    const entry = this.artifactPublishTurns.get(workspaceId);
+    if (entry?.messageId !== messageId) return;
+    entry.toolSent =
+      attempt.tools.artifact !== undefined || ptcRanForTools(attempt.ptcEnabled, attempt.tools);
   }
 
   private recordAgentInterfaceTurn(
@@ -1454,8 +1508,10 @@ export class TurnRequestBuilder {
       overridesIdentity.modelString,
       options.effectiveModelString
     );
-    const namespaceKey = resolveProviderOptionsNamespaceKey(
+    const namespaceKey = resolveRequestProviderOptionsNamespaceKey(
       options.wireProviderName,
+      options.optionsModelString,
+      options.providersConfigSnapshot,
       options.routeProvider
     );
     const extrasWireCompatible =
@@ -3079,6 +3135,10 @@ export class TurnRequestBuilder {
       // The same rule the prompt follows, so the nudge asks for what the prompt told the agent.
       statusPageAgent: statusUpdateUsable(statusPageAgentActive, effectiveToolPolicy),
     });
+    this.recordArtifactPublishTurn(workspaceId, assistantMessageId, {
+      planLike: agentIsPlanLike,
+      toolPolicy: effectiveToolPolicy,
+    });
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
@@ -3515,6 +3575,10 @@ export class TurnRequestBuilder {
             ? {}
             : applyCapabilityGrants(attemptTools, capabilityGrants);
         }
+        this.followArtifactToolAfterAssembly(workspaceId, assistantMessageId, {
+          tools: attemptTools,
+          ptcEnabled,
+        });
 
         // The window section goes last, resolved from the rows being sent, so start() can
         // re-render it without rerunning assembly middleware or tool construction.

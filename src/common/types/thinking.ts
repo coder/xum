@@ -400,10 +400,19 @@ export function grokSupportsNativeXhigh(modelString: string): boolean {
   return /^grok-4\.[67](?:$|-)/.test(withoutPrefix);
 }
 
-/** GLM 5.3 and GLM 5.3 Flash always reason with low, high, or max effort. */
+/**
+ * GLM 5.3 and GLM 5.3 Flash always reason with low, high, or max effort.
+ *
+ * Self-hosted deployments append quantization and format tags to the id
+ * (`GLM-5.3-Flash-oQ4e-mtp`, `glm-5.3-flash:q4_k_m`, `GLM-5.3-Flash-MLX-4bit`).
+ * Those tags carry a digit or name a packaging format, while Z.ai's named
+ * variants (FlashX, Air, Turbo) are plain words, so the variants stay unmatched.
+ */
 export function isGlm53Model(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^glm-5\.3(?:-flash)?(?:$|-(?:latest|\d))/.test(withoutPrefix);
+  return /^glm-5\.3(?:-flash)?(?:$|[-:](?:latest|gguf|mlx|awq|gptq|mtp|[a-z]*\d))/.test(
+    withoutPrefix
+  );
 }
 
 /**

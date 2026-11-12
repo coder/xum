@@ -127,6 +127,14 @@ export function coderGatewayWireProtocol(type: string, modelId?: string): CoderG
   }
 }
 
+/**
+ * google-typed instances speak openai-chat through @ai-sdk/openai-compatible,
+ * whose provider name is also its providerOptions namespace. Keys under it
+ * that are not SDK options are copied into the request body verbatim (Gemini's
+ * `extra_body`), so it must not be a namespace other providers read.
+ */
+export const CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE = "coderGoogle";
+
 /** Parse a persisted (hand-editable) gateway provider list, dropping malformed entries. */
 export function parseCoderGatewayProviders(value: unknown): CoderGatewayProvider[] {
   if (!Array.isArray(value)) {

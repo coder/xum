@@ -8,8 +8,12 @@ import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
 import { pageToolTextForResult, type ToolTextPage } from "@/common/utils/tools/pageToolText";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
-import { fetchSkillContent, type FetchedSkillContent } from "./skillsCatalogFetch";
+import type { ParsedSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  fetchSkillContent,
+  parseCatalogSkill,
+  type FetchedSkillContent,
+} from "./skillsCatalogFetch";
 
 interface SkillsCatalogReadToolArgs {
   owner: string;
@@ -21,7 +25,7 @@ interface SkillsCatalogReadToolArgs {
 
 interface PinnedSkill {
   fetched: FetchedSkillContent;
-  parsed: ReturnType<typeof parseSkillMarkdown>;
+  parsed: ParsedSkillMarkdown;
   /** Short content hash: the paging sequence's id, passed back as `snapshot`. */
   snapshot: string;
   pinnedAt: number;
@@ -63,11 +67,7 @@ function pinSkill(key: string, pinned: PinnedSkill): void {
 
 async function fetchAndParseSkill(owner: string, repo: string, skillId: string, now: number) {
   const fetched = await fetchSkillContent(owner, repo, skillId);
-  const parsed = parseSkillMarkdown({
-    content: fetched.content,
-    byteSize: Buffer.byteLength(fetched.content, "utf-8"),
-    // Don't pass directoryName — catalog skills may have mismatched directory/frontmatter names.
-  });
+  const parsed = parseCatalogSkill(fetched.content, Buffer.byteLength(fetched.content, "utf-8"));
   return { fetched, parsed, snapshot: contentSnapshot(fetched.content), pinnedAt: now };
 }
 

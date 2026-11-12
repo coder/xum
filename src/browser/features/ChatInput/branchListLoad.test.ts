@@ -5,6 +5,14 @@ import { startBranchListLoad, type BranchListLoadOutcome } from "./branchListLoa
 
 const LIST: BranchListResult = { branches: ["main", "dev"], recommendedTrunk: "main" };
 
+// A list from a backend that names no default or recent branches loads with those filled in.
+const LOADED: BranchListLoadOutcome = {
+  status: "loaded",
+  ...LIST,
+  defaultBranch: null,
+  recentBranches: [],
+};
+
 /** A list whose settlement the test controls. */
 function heldList() {
   let resolve!: (result: BranchListResult) => void;
@@ -40,7 +48,7 @@ describe("startBranchListLoad", () => {
     list.resolve(LIST);
     await flush();
     advance(2_000);
-    expect(outcomes).toEqual([{ status: "loaded", ...LIST }]);
+    expect(outcomes).toEqual([LOADED]);
   });
 
   test("reports failed when the list rejects", async () => {
@@ -62,7 +70,7 @@ describe("startBranchListLoad", () => {
     expect(outcomes).toEqual([{ status: "failed" }]);
     list.resolve(LIST);
     await flush();
-    expect(outcomes).toEqual([{ status: "failed" }, { status: "loaded", ...LIST }]);
+    expect(outcomes).toEqual([{ status: "failed" }, LOADED]);
   });
 
   test("reports nothing after cancel", async () => {

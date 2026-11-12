@@ -574,9 +574,13 @@ const MENU_INSETS = { top: 21, right: SIDE_INSET_PX, bottom: 0, left: 0 };
 const RAISED_MENU_INSETS = { ...MENU_INSETS, top: 40 };
 const MENU_INSET_VIEWPORT = { width: SIDE_INSET_VIEWPORT.width, height: 220 };
 
-/** Waits until a Radix menu stops moving, then returns its top edge and side. */
+/**
+ * Waits until a Radix menu stops moving, then returns its top edge and side. The menu is the
+ * positioned Radix content: a Select's listbox itself, or the popover around a filterable list.
+ */
 async function settledMenuBox(menu: ReturnType<StoryPage["getByRole"]>) {
-  return menu.evaluate(async (element) => {
+  return menu.evaluate(async (listbox) => {
+    const element = listbox.closest("[data-side]") ?? listbox;
     const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
     let last = "";
     for (let i = 0; i < 60; i++) {
@@ -643,7 +647,7 @@ async function assertMenuClearsSafeArea(page: StoryPage) {
     // The insets come after the resize, with no resize of their own, as they can when a folding
     // phone switches displays.
     await setInsets(MENU_INSETS);
-    // A touch tap opens Radix Select on click; a hidden copy of the trigger can exist.
+    // A touch tap opens the project switcher on click; a hidden copy of the trigger can exist.
     await page.locator("[data-testid=project-selector]:visible").evaluate((el) => {
       (el as HTMLElement).click();
     });

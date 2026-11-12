@@ -61,6 +61,7 @@ describe("Cmd/Ctrl+Option/Alt+Shift chords: workspace actions menu (#6328), sand
     ["TOGGLE_COMPLETED_SUB_AGENTS", "KeyA", "\u00c5"],
     ["RUN_OUTSIDE_SANDBOX", "KeyY", "\u00c1"],
     ["DENY_OUTSIDE_SANDBOX", "KeyN", "\u02dc"],
+    ["OPEN_CREATION_ENVIRONMENT", "KeyE", "\u00b4"],
   ] as const;
 
   test("macOS: Cmd+Option+Shift on the physical key, whatever character Option makes", () => {

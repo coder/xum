@@ -329,28 +329,48 @@ describe("AgentPluginInstallService marketplaces", () => {
     ]);
   });
 
-  test("a skill that Xum rejects counts nowhere: not in the listing, not for the Skills CLI", async () => {
-    // Like anthropics/skills `claude-api`: a description over 1024 characters.
+  /** Adds an `api` entry whose SKILL.md is `apiSkill`, then lists it and previews it as Skills. */
+  async function listWithApiSkill(apiSkill: string) {
     await writeFiles(marketDir, {
       ".claude-plugin/marketplace.json": marketplace([
         DOCS,
         { name: "api", source: "./", strict: false, skills: ["./skills/api"] },
       ]),
-      "skills/api/SKILL.md": `---\nname: api\ndescription: ${"x".repeat(1025)}\n---\nBody\n`,
+      "skills/api/SKILL.md": apiSkill,
     });
     await commit(marketDir, "add api");
 
     const listed = await service.previewSource({ input: marketDir });
     if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
-    expect(singleBuildRows(listed.marketplace).map((row) => [row.name, row.skillCount])).toEqual([
+    const rows = singleBuildRows(listed.marketplace).map((row) => [row.name, row.skillCount]);
+    const asSkills = await service.preview({ input: marketDir, method: { kind: "skills" } });
+    return { rows, asSkills };
+  }
+
+  test("a skill that Xum rejects counts nowhere: not in the listing, not for the Skills CLI", async () => {
+    const { rows, asSkills } = await listWithApiSkill("---\nname: api\n---\nBody\n");
+
+    expect(rows).toEqual([
       ["docs", 2],
       ["api", 0],
     ]);
-
-    const asSkills = await service.preview({ input: marketDir, method: { kind: "skills" } });
     expect(asSkills.skills.map((skill) => skill.name)).toEqual(["art", "pdf", "xlsx"]);
     expect(asSkills.warnings.some((warning) => warning.includes("api"))).toBe(true);
     expect(asSkills.skillsCliSkills).toEqual(["art", "pdf", "xlsx"]);
+  });
+
+  test("a skill with a description over 1024 characters counts like any other, as anthropics/skills claude-api does", async () => {
+    const { rows, asSkills } = await listWithApiSkill(
+      `---\nname: api\ndescription: ${"x".repeat(1025)}\n---\nBody\n`
+    );
+
+    expect(rows).toEqual([
+      ["docs", 2],
+      ["api", 1],
+    ]);
+    expect(asSkills.skills.map((skill) => skill.name)).toEqual(["api", "art", "pdf", "xlsx"]);
+    expect(asSkills.warnings.some((warning) => warning.includes("api"))).toBe(false);
+    expect(asSkills.skillsCliSkills).toEqual(["api", "art", "pdf", "xlsx"]);
   });
 
   test("Skills installs the whole marketplace repository instead", async () => {
@@ -1018,9 +1038,7 @@ describe("AgentPluginInstallService marketplaces", () => {
   // The catalog of anthropics/skills at its present scale: five entries that share "./" and list
   // 4, 12, 1, 1 and 1 skills. The names and lists follow its marketplace.json, the text is ours.
   // This test used to copy a local clone of that repository (445 files, 13 MB) and ran only on
-  // the one machine that had it, so CI skipped it. On the real data Xum counts 0 skills for
-  // `claude-api` (its description is over 1024 characters: see "a skill that Xum rejects counts
-  // nowhere"), and the generated skill has a short one, so it counts 1 here.
+  // the one machine that had it, so CI skipped it.
   test("a catalog shaped like anthropics/skills lists five entries; document-skills previews its four skills", async () => {
     const catalog: Record<string, string[]> = {
       "document-skills": ["xlsx", "docx", "pptx", "pdf"],

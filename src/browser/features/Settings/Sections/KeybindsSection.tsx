@@ -12,6 +12,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SEND_HELD_INPUT: "Send oldest unsent message",
   DISCARD_HELD_INPUT: "Discard oldest unsent message",
   SET_DEFAULT_ISOLATION: "Make the new workspace's isolation the project default",
+  OPEN_CREATION_ENVIRONMENT: "Open the new workspace's environment panel",
   FOCUS_BACKGROUND_PROCESSES: "Focus background processes",
   OPEN_TODO_PANEL: "Open TODO list",
   OPEN_SUB_AGENTS_PANEL: "Open sub-agents",

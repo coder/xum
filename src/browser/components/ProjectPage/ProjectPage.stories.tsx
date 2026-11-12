@@ -438,21 +438,19 @@ export const DockerUnavailable: AppStory = {
     await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
-    // Wait for the isolation selects to appear
-    await canvas.findByLabelText("Workspace isolation", {}, { timeout: 10000 });
+    // Open the environment panel from its chip; its rows are portaled to the body.
+    await userEvent.click(
+      await canvas.findByTestId("creation-environment", {}, { timeout: 10000 })
+    );
 
     // Wait for Docker option to become disabled (runtimeAvailability loads async).
     await waitFor(async () => {
-      const runtimeTrigger = canvas.getByLabelText("Workspace isolation");
-      await userEvent.click(runtimeTrigger);
-
-      const dockerOption = await within(document.body).findByRole("option", {
+      const dockerOption = await within(document.body).findByRole("radio", {
         name: /^Docker/i,
       });
       await expect(dockerOption).toHaveAttribute("aria-disabled", "true");
-
-      await userEvent.keyboard("{Escape}");
     });
+    await userEvent.keyboard("{Escape}");
   },
 };
 

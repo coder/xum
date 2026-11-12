@@ -45,6 +45,7 @@ import {
   COMPUTER_USE_SCROLL_DIRECTIONS,
 } from "@/common/constants/computerUse";
 import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
+import { LayoutAuditReportSchema } from "@/common/types/artifactLayoutAudit";
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { SkillLookupNameSchema, SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
@@ -1212,6 +1213,13 @@ export const TaskStopToolResultSchema = z
 export const TaskRemoveToolArgsSchema = z
   .object({
     task_ids: z.array(z.string().min(1)).min(1).describe("Inactive child task IDs to remove."),
+    force: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Remove even if the child holds unsaved work, and delete that work. " +
+          "Set only when the user asked for cleanup or the work is provably saved (pushed, merged, or in an applied patch)."
+      ),
   })
   .strict();
 
@@ -1220,6 +1228,8 @@ const TaskRemoveToolBaseResultSchema = z.object({
   workspaceId: z.string().optional(),
   descendantTaskIds: z.array(z.string()).optional(),
   paths: z.array(z.string()).optional(),
+  /** What a forced removal deleted: the work, the checkout and the branch. */
+  deletedWork: z.string().optional(),
   error: z.string().optional(),
 });
 
@@ -1405,6 +1415,8 @@ const TaskWorkspaceLifecycleBaseResultSchema = z.object({
   workspaceId: z.string().optional(),
   displayName: z.string().optional(),
   paths: z.array(z.string()).optional(),
+  /** What a forced removal deleted: the work, the checkout and the branch. */
+  deletedWork: z.string().optional(),
   activeTaskIds: z.array(z.string()).optional(),
   descendantTaskIds: z.array(z.string()).optional(),
   note: z.string().optional(),
@@ -2098,6 +2110,12 @@ export const ArtifactToolSuccessResultSchema = z.object({
   kind: ArtifactKindSchema,
   title: z.string(),
   pin: z.enum(["project", "global"]).nullable(),
+  /**
+   * HTML only: what the publish-time layout audit found. `.catch`: a stored row whose `layout` this
+   * build cannot read (a reason a newer build added) drops the field instead of failing the whole
+   * parse, so the chat card still renders after a downgrade. The card never reads it.
+   */
+  layout: LayoutAuditReportSchema.optional().catch(undefined),
 });
 export type ArtifactToolSuccessResult = z.infer<typeof ArtifactToolSuccessResultSchema>;
 
@@ -3024,7 +3042,7 @@ export const TOOL_DEFINITIONS = {
   task_remove: {
     resultSchema: TaskRemoveToolResultSchema,
     description:
-      "Irreversibly remove inactive child workspaces you own; they cannot be restored or reawakened. Use it only for consumed best-of candidates, overlapping or obsolete roles, a bench over its limit, or a user request, not as routine cleanup. Remove descendants first. A child with uncommitted or untracked work, or commits without a ready patch artifact, is refused; only the user can discard that work.",
+      "Irreversibly remove inactive child workspaces you own; they cannot be restored or reawakened. Use it only for consumed best-of candidates, overlapping or obsolete roles, a bench over its limit, or a user request, not as routine cleanup. Remove descendants first. A child with uncommitted or untracked work, or commits without a ready patch artifact, is refused unless you set force, which deletes that work and reports it. Set force only when the user asked for cleanup or the work is provably saved.",
     schema: TaskRemoveToolArgsSchema,
   },
   task_workspace_lifecycle: {
@@ -3113,7 +3131,9 @@ export const TOOL_DEFINITIONS = {
       'JSON {"$xum":"table","columns":[..],"rows":[..]} is a table (columns optional; rows: objects or arrays). ' +
       "HTML is sandboxed (its CSP blocks network, not guaranteed): never put secrets in it. Inline JS/CSS or use relative files; scripts may load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com, cdn.tailwindcss.com if the user allows. " +
       "HTML may call window.xum.send(text, data?) from a click handler (sent at once; the user did not review the text; arrives as an <artifact_interaction> message) and window.xum.setState(obj) (shown here). " +
-      "If agent-browser is available, screenshot new HTML via file:// at 390px and desktop widths and attach_file them (unsandboxed there: CDN content can differ).",
+      "Publishing HTML with the artifact tool checks its layout in agent-browser (when installed) at phone, tablet and desktop widths and lists clipped or overflowing text and unreachable or covered controls in the result's `layout`: fix those and publish again. " +
+      "A published page edited after its last check (else after its last publish) is checked again when a main-chat turn ends, three pages at most (not a sub-agent or Plan mode turn). " +
+      "A screenshot via file:// and attach_file is an optional visual check (unsandboxed there: CDN content can differ).",
     schema: z
       .object({
         scope: z
@@ -3140,7 +3160,9 @@ export const TOOL_DEFINITIONS = {
     resultSchema: ArtifactToolResultSchema,
     description:
       "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ in the user's Artifacts tab, shown as a chat card. " +
-      "The tab shows the file as it is now, so edit it in place; publish again to show a new card or to change its title, kind or pin.",
+      "The tab shows the file as it is now, so edit it in place; publish again to show a new card or to change its title, kind or pin. " +
+      "For HTML the result's `layout` lists layout issues found in agent-browser; `checked: false` means a width was not checked, never that the page is clean. " +
+      "Xum also checks a published HTML page edited after its last check (else after its last publish) when a main-chat turn ends, three pages at most (not a sub-agent or Plan mode turn), and asks you to publish it again if that finds an issue you were not shown.",
     schema: z
       .object({
         path: z.string().describe("Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),

@@ -269,5 +269,6 @@ export function renderToolValue(value: unknown, maxChars: number): string {
   const { text, complete } = serializeToolValue(value, maxChars + REDACTION_LOOKAHEAD_CHARS);
   if (complete && text.length <= maxChars) return redactSecretLike(text);
   const cutChars = `${text.length - maxChars}${complete ? "" : "+"}`;
-  return `${redactWithinCap(text, maxChars).slice(0, maxChars)} [truncated ${cutChars} more chars for memory harvest]`;
+  const shown = redactWithinCap(text, maxChars, { cut: !complete }).slice(0, maxChars);
+  return `${shown} [truncated ${cutChars} more chars for memory harvest]`;
 }

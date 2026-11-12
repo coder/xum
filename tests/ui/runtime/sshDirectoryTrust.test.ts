@@ -10,35 +10,27 @@ import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, openProjectCreationView } from "../helpers";
+import {
+  cleanupView,
+  closeCreationEnvironment,
+  openCreationEnvironment,
+  openProjectCreationView,
+  selectCreationIsolation,
+} from "../helpers";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { expandProjects } from "@/browser/stories/helpers/uiState";
 import type { ProjectConfig } from "@/common/types/project";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
-type IsolationAxis = "Project isolation" | "Workspace isolation";
 type AppView = ReturnType<typeof renderApp>;
 
-async function selectIsolation(container: HTMLElement, axis: IsolationAxis, label: string) {
-  const trigger = await waitFor(
-    () => {
-      const button = container.querySelector<HTMLButtonElement>(`button[aria-label="${axis}"]`);
-      if (!button) throw new Error(`${axis} trigger not found`);
-      return button;
-    },
-    { timeout: 5_000 }
-  );
-  fireEvent.click(trigger);
-  const option = await waitFor(() => {
-    const match = Array.from(document.querySelectorAll<HTMLElement>('[role="option"]')).find(
-      (candidate) => candidate.textContent?.startsWith(label)
-    );
-    if (!match) throw new Error(`Option '${label}' not found`);
-    return match;
-  });
-  fireEvent.click(option);
-}
+/**
+ * The host and directory inputs are in the environment panel, which is portaled to document.body;
+ * the trust row stays on the page and "Set as default" is in the panel's footer. Both are under the document body. The
+ * panel is modal, so a test closes it before it uses the page.
+ */
+const page = (): HTMLElement => document.body;
 
 function findButton(container: HTMLElement, name: string): HTMLButtonElement | null {
   return (
@@ -60,24 +52,26 @@ function findButtonEventually(container: HTMLElement, name: string) {
 async function openSshNoneForm(view: AppView, projectPath: string, dir: string) {
   await view.waitForReady();
   await openProjectCreationView(view, projectPath);
-  await selectIsolation(view.container, "Project isolation", "SSH");
-  await selectIsolation(view.container, "Workspace isolation", "None");
+  await selectCreationIsolation(view.container, "Project isolation", "SSH");
+  await selectCreationIsolation(view.container, "Workspace isolation", "None");
 
-  const user = userEvent.setup({ document: view.container.ownerDocument });
+  const user = userEvent.setup({ document: page().ownerDocument });
   const hostInput = await waitFor(() => {
-    const input = view.container.querySelector<HTMLInputElement>('input[placeholder="user@host"]');
+    const input = page().querySelector<HTMLInputElement>('input[placeholder="user@host"]');
     if (!input) throw new Error("SSH host input not found");
     return input;
   });
   await user.clear(hostInput);
   await user.type(hostInput, "devbox");
-  const dirInput = view.container.querySelector<HTMLInputElement>(
+  const dirInput = page().querySelector<HTMLInputElement>(
     'input[aria-label="Project directory on host"]'
   );
   if (!dirInput) throw new Error("Directory input not found");
   await user.clear(dirInput);
   await user.type(dirInput, dir);
-  return { user, dirInput };
+  // The panel is modal: close it so the tests can use the trust row on the page.
+  await closeCreationEnvironment(view.container);
+  return { user };
 }
 
 function trustedProject(projectPath: string): Map<string, ProjectConfig> {
@@ -98,13 +92,18 @@ describeIntegration("SSH+None directory trust (UI)", () => {
       const view = renderApp({ apiClient: client });
 
       try {
-        const { user, dirInput } = await openSshNoneForm(view, projectPath, dir);
-        await user.click(await findButtonEventually(view.container, "Trust directory"));
+        const { user } = await openSshNoneForm(view, projectPath, dir);
+        await user.click(await findButtonEventually(page(), "Trust directory"));
 
-        await findButtonEventually(view.container, "Untrust");
-        expect(view.container.textContent).toContain("Trusted directory");
-        // The host-resolved path replaces ~ in the field, matching the stored trust entry.
-        expect(dirInput.value).toBe(dir.replace(/^~/, "/home/mock"));
+        await findButtonEventually(page(), "Untrust");
+        expect(page().textContent).toContain("Trusted directory");
+        // The host-resolved path replaces ~ in the field, matching the stored trust entry. The
+        // trust row is on the page, so clicking it closed the panel that holds the field.
+        await openCreationEnvironment(view.container);
+        const dirInput = page().querySelector<HTMLInputElement>(
+          'input[aria-label="Project directory on host"]'
+        );
+        expect(dirInput?.value).toBe(dir.replace(/^~/, "/home/mock"));
       } finally {
         await cleanupView(view, cleanupDom);
       }
@@ -131,15 +130,15 @@ describeIntegration("SSH+None directory trust (UI)", () => {
 
     try {
       const { user } = await openSshNoneForm(view, projectPath, "~/app");
-      await user.click(await findButtonEventually(view.container, "Trust directory"));
-      const pending = await findButtonEventually(view.container, "Trusting…");
+      await user.click(await findButtonEventually(page(), "Trust directory"));
+      const pending = await findButtonEventually(page(), "Trusting…");
       expect(pending.disabled).toBe(true);
-      expect(
-        view.container.querySelector('[data-component="SshDirectoryTrust"]')?.textContent
-      ).toContain("Resolving ~/app on devbox…");
+      expect(page().querySelector('[data-component="SshDirectoryTrust"]')?.textContent).toContain(
+        "Resolving ~/app on devbox…"
+      );
 
       release();
-      await findButtonEventually(view.container, "Untrust");
+      await findButtonEventually(page(), "Untrust");
     } finally {
       release();
       await cleanupView(view, cleanupDom);
@@ -164,10 +163,10 @@ describeIntegration("SSH+None directory trust (UI)", () => {
 
     try {
       const { user } = await openSshNoneForm(view, projectPath, "~/app");
-      await user.click(await findButtonEventually(view.container, "Trust directory"));
-      await findButtonEventually(view.container, "Trusting…");
+      await user.click(await findButtonEventually(page(), "Trust directory"));
+      await findButtonEventually(page(), "Trusting…");
       // Leave SSH x None while the host resolves ~, so the reply finds no field to update.
-      await selectIsolation(view.container, "Workspace isolation", "Worktree");
+      await selectCreationIsolation(view.container, "Workspace isolation", "Worktree");
       release();
       await waitFor(() => {
         const saved = client.projects.list().then((list) => new Map(list).get(projectPath));
@@ -176,9 +175,9 @@ describeIntegration("SSH+None directory trust (UI)", () => {
         });
       });
 
-      await selectIsolation(view.container, "Workspace isolation", "None");
-      await findButtonEventually(view.container, "Untrust");
-      const dirInput = view.container.querySelector<HTMLInputElement>(
+      await selectCreationIsolation(view.container, "Workspace isolation", "None");
+      await findButtonEventually(page(), "Untrust");
+      const dirInput = page().querySelector<HTMLInputElement>(
         'input[aria-label="Project directory on host"]'
       );
       expect(dirInput?.value).toBe("/home/mock/app");
@@ -197,10 +196,20 @@ describeIntegration("SSH+None directory trust (UI)", () => {
 
     try {
       const { user } = await openSshNoneForm(view, projectPath, "/srv/app");
-      await user.click(await findButtonEventually(view.container, "Set as default"));
+      // "Set as default" is in the panel's footer.
+      await openCreationEnvironment(view.container);
+      // Its text also holds the shortcut's keycap, so it is found by its start.
+      const setDefault = await waitFor(() => {
+        const button = Array.from(page().querySelectorAll("button")).find((candidate) =>
+          candidate.textContent?.trim().startsWith("Set as default")
+        );
+        if (!button) throw new Error("Set as default button not found");
+        return button;
+      });
+      await user.click(setDefault);
 
       await waitFor(() => {
-        const state = view.container.querySelector('[data-component="IsolationDefaultState"]');
+        const state = page().querySelector('[data-component="IsolationDefaultState"]');
         if (!state) throw new Error("Default state not shown");
       });
       const saved = new Map(await client.projects.list()).get(projectPath);
@@ -218,22 +227,25 @@ describeIntegration("SSH+None directory trust (UI)", () => {
     const view = renderApp({ apiClient: client });
 
     try {
+      // The panel is closed here: the shortcut belongs to the page, not to the footer button.
       await openSshNoneForm(view, projectPath, "/srv/app");
-      await findButtonEventually(view.container, "Set as default");
-      fireEvent.keyDown(window, {
+      const chord = new window.KeyboardEvent("keydown", {
         key: "D",
         code: "KeyD",
         ctrlKey: true,
         altKey: true,
         shiftKey: true,
+        bubbles: true,
+        cancelable: true,
       });
+      // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+      Object.defineProperty(chord, "getModifierState", { value: () => false });
+      fireEvent(window, chord);
 
-      await waitFor(() => {
-        const state = view.container.querySelector('[data-component="IsolationDefaultState"]');
-        if (!state) throw new Error("Default state not shown");
+      await waitFor(async () => {
+        const saved = new Map(await client.projects.list()).get(projectPath);
+        expect(saved?.defaultIsolation).toEqual({ project: "ssh", workspace: "none" });
       });
-      const saved = new Map(await client.projects.list()).get(projectPath);
-      expect(saved?.defaultIsolation).toEqual({ project: "ssh", workspace: "none" });
     } finally {
       await cleanupView(view, cleanupDom);
     }

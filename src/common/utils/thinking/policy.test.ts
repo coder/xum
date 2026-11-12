@@ -909,13 +909,21 @@ describe("GLM 5.3 thinking policy", () => {
     expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", "off")).toBe("low");
   });
 
+  test("recognizes self-hosted GLM 5.3 ids with deployment tags in any case", () => {
+    for (const model of [
+      "omlx:GLM-5.3-Flash-oQ4e-mtp",
+      "lmstudio:mlx-community/GLM-5.3-Flash-MLX-4bit",
+      "ollama:glm-5.3-flash:q4_K_M",
+      "vllm:zai-org/GLM-5.3-FP8",
+    ]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "high", "max"]);
+    }
+  });
+
   test("does not apply the GLM 5.3 policy to named variants", () => {
-    expect(getThinkingPolicyForModel("zai:glm-5.3-flashx")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
+    for (const model of ["zai:glm-5.3-flashx", "omlx:GLM-5.3-FlashX-4bit", "omlx:GLM-5.3-Air"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
+    }
   });
 });
 

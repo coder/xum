@@ -1402,6 +1402,69 @@ describe("WorkspaceService multi-project lifecycle", () => {
       }
     });
   });
+  test("remove() with force=true returns a warning when a project's checkout could not be deleted", async () => {
+    await withTempMuxRoot(async (rootDir) => {
+      const workspaceId = "ws-multi-remove-forced-failure";
+      const workspaceName = "feature-remove-forced-failure";
+      const projectAPath = path.join(rootDir, "project-a");
+      const projectBPath = path.join(rootDir, "project-b");
+      const config = await createTrustedProjectsConfig(rootDir, [projectAPath, projectBPath]);
+      const mockAIService = createMockAIService({
+        isStreaming: mock(() => false),
+        stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        getWorkspaceMetadata: mock(() =>
+          Promise.resolve(
+            Ok<WorkspaceMetadata>({
+              id: workspaceId,
+              name: workspaceName,
+              projectPath: projectAPath,
+              projectName: "project-a+project-b",
+              projects: [
+                { projectPath: projectAPath, projectName: "project-a" },
+                { projectPath: projectBPath, projectName: "project-b" },
+              ],
+              runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "src") },
+            })
+          )
+        ),
+      });
+      const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockImplementation(
+        (_runtimeConfig, options) => {
+          const deleted = options?.projectPath === projectAPath;
+          return {
+            deleteWorkspace: mock(() =>
+              Promise.resolve(
+                deleted
+                  ? { success: true as const, deletedPath: "/tmp/deleted-a" }
+                  : { success: false as const, error: "worktree is locked" }
+              )
+            ),
+          } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
+        }
+      );
+      const removeContainerSpy = spyOn(
+        ContainerManager.prototype,
+        "removeContainer"
+      ).mockResolvedValue();
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          aiService: mockAIService,
+        });
+        const result = await workspaceService.remove(workspaceId, true);
+        // The forced removal still succeeds, and says that project-b's checkout may remain.
+        expect(result.success).toBe(true);
+        const warnings = result.warnings ?? [];
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]?.kind).toBe("leftover");
+        expect(warnings[0]?.description).toContain("[project-b] worktree is locked");
+      } finally {
+        removeContainerSpy.mockRestore();
+        createRuntimeSpy.mockRestore();
+      }
+    });
+  });
   test("rename() renames all project workspaces and recreates the shared container", async () => {
     await withTempMuxRoot(async (rootDir) => {
       const workspaceId = "ws-multi-rename";

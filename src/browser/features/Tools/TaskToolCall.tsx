@@ -1959,6 +1959,35 @@ export const TaskStopToolCall: React.FC<TaskStopToolCallProps> = (props) => {
   );
 };
 
+interface TaskRemoveResultRowProps {
+  result: {
+    taskId: string;
+    status?: string;
+    error?: string;
+    paths?: string[];
+    /** What a forced removal deleted. */
+    deletedWork?: string;
+  };
+}
+
+const TaskRemoveResultRow: React.FC<TaskRemoveResultRowProps> = (props) => (
+  <div className="bg-code-bg rounded-sm p-2">
+    <TaskId id={props.result.taskId} />
+    {props.result.status != null && <TaskStatusBadge status={props.result.status} />}
+    {props.result.error != null && (
+      <div className="text-danger mt-1 text-[11px]">{props.result.error}</div>
+    )}
+    {props.result.deletedWork != null && (
+      <div className="text-secondary mt-1 text-[11px] break-words">{props.result.deletedWork}</div>
+    )}
+    {props.result.paths?.map((filePath) => (
+      <div key={filePath} className="text-secondary font-mono text-[11px] break-all">
+        {filePath}
+      </div>
+    ))}
+  </div>
+);
+
 interface TaskRemoveToolCallProps {
   args: TaskRemoveToolArgs;
   result?: TaskRemoveToolSuccessResult;
@@ -1968,12 +1997,8 @@ interface TaskRemoveToolCallProps {
 export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => {
   const { expanded, toggleExpanded } = useToolExpansion(false);
   const results = props.result?.results ?? [];
-  const displayResults: Array<{
-    taskId: string;
-    status?: string;
-    error?: string;
-    paths?: string[];
-  }> = results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
+  const displayResults: Array<TaskRemoveResultRowProps["result"]> =
+    results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
   const removed = results.filter((result) => result.status === "removed").length;
   return (
     <ToolContainer expanded={expanded}>
@@ -1992,18 +2017,7 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
         <ToolDetails>
           <div className="task-surface mt-1 space-y-2 rounded-md p-3">
             {displayResults.map((result, index) => (
-              <div key={result.taskId ?? index} className="bg-code-bg rounded-sm p-2">
-                <TaskId id={result.taskId} />
-                {result.status != null && <TaskStatusBadge status={result.status} />}
-                {result.error != null && (
-                  <div className="text-danger mt-1 text-[11px]">{result.error}</div>
-                )}
-                {result.paths?.map((filePath) => (
-                  <div key={filePath} className="text-secondary font-mono text-[11px] break-all">
-                    {filePath}
-                  </div>
-                ))}
-              </div>
+              <TaskRemoveResultRow key={result.taskId ?? index} result={result} />
             ))}
           </div>
         </ToolDetails>

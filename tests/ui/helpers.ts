@@ -230,10 +230,14 @@ export async function openProjectCreationView(
   );
   // The page renders its composer before the branch list loads, and until then the trunk branch
   // is empty, so a send that fast is refused for a worktree runtime ("Trunk branch is required").
-  // A slow host reaches that state (#6016): wait for the branch selector, as a user would.
+  // A slow host reaches that state (#6016): wait for the branch list, as a user would.
   await waitFor(
     () => {
-      if (!view.container.querySelector('[aria-label="Select source branch"]')) {
+      if (
+        !view.container.querySelector(
+          '[data-component="RuntimeTypeGroup"][data-branch-load="loaded"]'
+        )
+      ) {
         throw new Error("Source branches not loaded");
       }
     },
@@ -572,4 +576,88 @@ export async function showEveryTranscriptStep(env: {
   await env.orpc.config.updateUserPreferences({
     patches: [{ appearance: { transcriptDensity: "normal" } }],
   });
+}
+
+export type CreationIsolationAxis = "Project isolation" | "Workspace isolation";
+
+/**
+ * Opens the creation page's environment panel unless it is open. The panel holds the isolation
+ * options, their fields (host, image, directory trust) and the base branch; it is portaled to
+ * document.body, so query its content there, not in the app container.
+ */
+export async function openCreationEnvironment(container: HTMLElement): Promise<void> {
+  const chip = await waitFor(
+    () => {
+      const button = container.querySelector<HTMLButtonElement>(
+        '[data-testid="creation-environment"]'
+      );
+      if (!button) throw new Error("Environment chip not found");
+      return button;
+    },
+    { timeout: 5_000 }
+  );
+  if (chip.getAttribute("aria-expanded") !== "true") fireEvent.click(chip);
+  await waitFor(() => {
+    if (!document.querySelector('[role="radiogroup"][aria-label="Project isolation"]')) {
+      throw new Error("Environment panel did not open");
+    }
+  });
+}
+
+/**
+ * Closes the environment panel if it is open. The panel is modal, so the page behind it takes no
+ * pointer input until it closes: do this before a test goes back to the composer or the page.
+ */
+export async function closeCreationEnvironment(container: HTMLElement): Promise<void> {
+  const chip = container.querySelector<HTMLButtonElement>('[data-testid="creation-environment"]');
+  if (chip?.getAttribute("aria-expanded") !== "true") return;
+  const done = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')
+  ).find((button) => button.textContent?.trim() === "Done");
+  if (!done) throw new Error("Environment panel has no Done button");
+  fireEvent.click(done);
+  await waitFor(() => {
+    if (chip.getAttribute("aria-expanded") === "true") {
+      throw new Error("Environment panel did not close");
+    }
+  });
+}
+
+/** An option row of the open environment panel, by the label it starts with. */
+export function findCreationIsolationOption(
+  axis: CreationIsolationAxis,
+  label: string
+): HTMLElement | null {
+  const group = document.querySelector(`[role="radiogroup"][aria-label="${axis}"]`);
+  return (
+    Array.from(group?.querySelectorAll<HTMLElement>('[role="radio"]') ?? []).find((option) =>
+      option.textContent?.startsWith(label)
+    ) ?? null
+  );
+}
+
+/** Picks an isolation option in the environment panel, opening the panel first if needed. */
+export async function selectCreationIsolation(
+  container: HTMLElement,
+  axis: CreationIsolationAxis,
+  label: string
+): Promise<void> {
+  await openCreationEnvironment(container);
+  const option = await waitFor(
+    () => {
+      const candidate = findCreationIsolationOption(axis, label);
+      if (!candidate) throw new Error(`${axis} option '${label}' not found`);
+      return candidate;
+    },
+    { timeout: 5_000 }
+  );
+  fireEvent.click(option);
+}
+
+/** The label of the checked option on one axis of the open environment panel. */
+export function checkedCreationIsolation(axis: CreationIsolationAxis): string {
+  const checked = document.querySelector(
+    `[role="radiogroup"][aria-label="${axis}"] [role="radio"][aria-checked="true"]`
+  );
+  return checked?.textContent ?? "";
 }

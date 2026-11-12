@@ -196,6 +196,8 @@ interface HarvestPiece {
   part: number;
   /** Set on a segment of a long text part, as in `HarvestEvidenceRow.segment`. */
   segment?: string;
+  /** Set on the piece of a text part that its cut left empty: the piece is the cut's note alone. */
+  noteOnly?: true;
 }
 
 /**
@@ -211,7 +213,9 @@ function boundedTextPart(raw: string): RowText {
   const window = takeWithoutMedia(raw, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
   // The cap is in the part's own characters: what redaction shortens does not bring the lookahead
   // into the kept text, where a key that the window's end cut would show as it is.
-  const prepared = neutralizeHarvestText(redactWithinCap(window.text, HARVEST_MAX_TEXT_PART_CHARS));
+  const prepared = neutralizeHarvestText(
+    redactWithinCap(window.text, HARVEST_MAX_TEXT_PART_CHARS, { cut: window.cut })
+  );
   const text = prepared.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
   const pastCap = Math.max(0, window.text.length - HARVEST_MAX_TEXT_PART_CHARS);
   return { text, cutChars: raw.length - window.read + pastCap + prepared.length - text.length };
@@ -227,6 +231,11 @@ function truncationNote(cutChars: number): string {
   return `[truncated ${cutChars} more chars for memory harvest]`;
 }
 
+/** `text` and the note of its cut on a line of its own, or the note alone when nothing is left. */
+function withTruncationNote(text: string, cutChars: number): string {
+  return text === "" ? truncationNote(cutChars) : `${text}\n${truncationNote(cutChars)}`;
+}
+
 function piecesOfPart(
   part: MuxMessage["parts"][number],
   position: number,
@@ -235,7 +244,9 @@ function piecesOfPart(
   if (part.type !== "text" || (text.length <= HARVEST_MAX_ROW_TEXT_CHARS && cutChars === 0)) {
     return [{ text, truncated: false, part: position }];
   }
-  const count = Math.ceil(text.length / HARVEST_MAX_ROW_TEXT_CHARS);
+  // At least one piece: a part that its cut left empty (a JWT that starts it and that the window
+  // ends inside) still carries its note, so the row says it was cut.
+  const count = Math.max(1, Math.ceil(text.length / HARVEST_MAX_ROW_TEXT_CHARS));
   return Array.from({ length: count }, (_, index): HarvestPiece => {
     const segment = text.slice(
       index * HARVEST_MAX_ROW_TEXT_CHARS,
@@ -243,12 +254,33 @@ function piecesOfPart(
     );
     const isCutEnd = cutChars > 0 && index === count - 1;
     return {
-      text: isCutEnd ? `${segment}\n${truncationNote(cutChars)}` : segment,
+      text: isCutEnd ? withTruncationNote(segment, cutChars) : segment,
       truncated: isCutEnd,
       part: position,
       segment: `${index + 1} of ${count}`,
+      ...(text === "" && { noteOnly: true }),
     };
   });
+}
+
+/** Whether a part gives a row text: a part its cut left empty does, as its piece carries the note. */
+function hasRowText(rowText: RowText): boolean {
+  return rowText.text !== "" || rowText.cutChars > 0;
+}
+
+/**
+ * Whether `piece` joins the row of `group`, whose text with the piece's would be `joinedChars` long.
+ * No piece fits behind a segment, as the group starts with it. A short segment fits behind other
+ * pieces (a cut part whose secret redaction shortened to a marker). The note of a part
+ * that its cut left empty keeps a row of its own: behind another part it would read as a cut of
+ * that part.
+ */
+function fitsBehind(group: HarvestPiece[], piece: HarvestPiece, joinedChars: number): boolean {
+  return (
+    group[0].segment === undefined &&
+    piece.noteOnly !== true &&
+    joinedChars <= HARVEST_MAX_ROW_TEXT_CHARS
+  );
 }
 
 /**
@@ -265,7 +297,7 @@ function formatMessageForHarvest(message: MuxMessage): HarvestEvidenceRow[] {
   };
   const texts = message.parts
     .map((part) => ({ part, rowText: rowTextOfPart(part) }))
-    .filter(({ rowText }) => rowText.text !== "");
+    .filter(({ rowText }) => hasRowText(rowText));
   if (texts.length === 0) return [{ ...base, text: "", truncated: false }];
 
   const pieces = texts.flatMap(({ part, rowText }, index) =>
@@ -277,13 +309,7 @@ function formatMessageForHarvest(message: MuxMessage): HarvestEvidenceRow[] {
     const group = groups.at(-1);
     // The newline that joins the piece to the row's text counts too.
     const joinedChars = groupChars + 1 + piece.text.length;
-    // A segment's row stays its own: the first segment is a whole row's text, so it never fits
-    // behind another piece, and no piece fits behind a segment, as the group starts with it.
-    const fits =
-      group !== undefined &&
-      group[0].segment === undefined &&
-      joinedChars <= HARVEST_MAX_ROW_TEXT_CHARS;
-    if (fits) {
+    if (group !== undefined && fitsBehind(group, piece, joinedChars)) {
       group.push(piece);
       groupChars = joinedChars;
     } else {
@@ -553,7 +579,7 @@ const ANALYZER_TOOL_DESCRIPTION =
  */
 function summaryText(summary: MuxMessage): string {
   const { text, cutChars } = boundedTextPart(summary.parts.map(partToText).join("\n"));
-  return cutChars > 0 ? `${text}\n${truncationNote(cutChars)}` : text;
+  return cutChars > 0 ? withTruncationNote(text, cutChars) : text;
 }
 
 function buildChunkPrompt(args: {

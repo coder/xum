@@ -6,6 +6,7 @@ import { ContextBudgetExceededError } from "./contextBudgetError";
 import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE } from "@/common/constants/coderOAuth";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -851,6 +852,34 @@ describe("TurnRequestBuilder model attempt preparation", () => {
       namespace: "openai",
       included: "coderKnob",
       excluded: "anthropicKnob",
+    },
+    {
+      name: "merges extras where a google-typed Coder instance's client reads them",
+      rawConfig: {
+        google: { modelParameters: { "*": { googleKnob: "yes" } } },
+        openai: { modelParameters: { "*": { openaiKnob: "no" } } },
+      },
+      snapshot: {
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "agents-google", type: "google" }],
+          canonicalRoutes: { google: "agents-google" },
+        },
+      },
+      options: {
+        rawModelString: "google:gemini-4-carbon",
+        canonicalModelString: "google:gemini-4-carbon",
+        canonicalProviderName: "google" as const,
+        effectiveModelString: "google:gemini-4-carbon",
+        optionsModelString: "google:gemini-4-carbon",
+        wireProviderName: "openai",
+        routeProvider: "coder" as const,
+      },
+      namespace: CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
+      included: "googleKnob",
+      excluded: "openaiKnob",
     },
   ])("$name", async (testCase) => {
     const harness = await createPreparationHarness();

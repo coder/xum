@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Controls with no text node, covered</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      .field {
+        position: relative;
+        margin-top: 18px;
+        padding: 8px;
+      }
+      input,
+      select,
+      button {
+        display: block;
+        width: 220px;
+        height: 36px;
+        font-size: 16px;
+      }
+      .cover {
+        position: absolute;
+        inset: 0;
+        background: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Profile</h1>
+      <section class="field">
+        <input id="name" value="Jane Doe" aria-label="Name" />
+        <div class="cover"></div>
+      </section>
+      <section class="field">
+        <select id="plan" aria-label="Plan">
+          <option>Team</option>
+          <option>Solo</option>
+        </select>
+        <div class="cover"></div>
+      </section>
+      <section class="field">
+        <button id="close" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M2 2l12 12M14 2L2 14" stroke="#1b2630" stroke-width="2" />
+          </svg>
+        </button>
+        <div class="cover"></div>
+      </section>
+      <section class="field">
+        <label>Name <input id="in-label" value="Jane Doe" /></label>
+        <div class="cover"></div>
+      </section>
+      <section class="field">
+        <input id="email" value="jane@example.com" aria-label="Email" />
+      </section>
+    </main>
+  </body>
+</html>

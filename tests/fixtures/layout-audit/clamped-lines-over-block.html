@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>A line-clamped paragraph above an opaque block</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      /* Two lines show. The rest of the text is laid out below the paragraph and cut away, and the
+         opaque card that follows sits where those lines would be. Nobody sees a covered line. */
+      .clamped {
+        margin: 0;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        line-clamp: 2;
+        overflow: hidden;
+        font-size: 20px;
+        line-height: 1.3;
+      }
+      .card {
+        min-height: 4000px;
+        padding: 18px;
+        background: #f6e7c8;
+        border: 1px solid #aebbc4;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Release notes</h1>
+      <p id="notes" class="clamped">The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved. The release notes list every change that shipped this week, from the new export option to the faster search index and the rewritten settings page, so that nobody has to read the commit log to learn what moved.</p>
+      <div class="card">Open issues</div>
+    </main>
+  </body>
+</html>
