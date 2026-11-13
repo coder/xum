@@ -396,6 +396,19 @@ function withSshNoneProjectDir(
   };
 }
 
+/**
+ * With the SSH directory's trust row, the column is as wide as the environment chip, so the row
+ * under the chip takes the chip's width (the user's choice over widening the chip to the row).
+ * The row's container query adds no width of its own, so `w-fit` fits the chip alone. On a touch
+ * phone the chip fills the width, and so does the column.
+ */
+function runtimeGroupClass(hasTrustRow: boolean): string {
+  return cn(
+    "flex min-w-0 flex-col gap-1.5",
+    hasTrustRow && "w-fit max-w-full [@media(max-width:768px)_and_(pointer:coarse)]:w-full"
+  );
+}
+
 /** The trust row for the SSH+None directory being configured; nothing for other selections. */
 function SshNoneDirectoryTrust(props: {
   runtime: Extract<ParsedRuntime, { mode: "ssh" }> | null;
@@ -1033,7 +1046,7 @@ function CreationControlsContent(props: CreationControlsProps) {
       </div>
 
       <div
-        className="flex min-w-0 flex-col gap-1.5"
+        className={runtimeGroupClass(sshNoneRuntime !== null)}
         data-component="RuntimeTypeGroup"
         // Tests and stories wait on this the way a user waits for the branch to appear.
         data-branch-load={props.branchLoad}

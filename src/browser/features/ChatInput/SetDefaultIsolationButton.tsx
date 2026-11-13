@@ -43,7 +43,9 @@ export function setDefaultShortcut(
 export function DefaultSaveError(props: { saver: DefaultIsolationSaver }) {
   if (props.saver.error === null) return null;
   return (
-    <span role="alert" className="text-error text-xs">
+    // Inline-size containment: it wraps to the column instead of widening it, so a column that
+    // fits the environment chip (with the SSH directory's trust row) stays the chip's width.
+    <span role="alert" className="text-error text-xs [contain:inline-size]">
       {props.saver.error}
     </span>
   );
