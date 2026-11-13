@@ -42,6 +42,8 @@ interface FakeTools {
   validateCodes?: number[];
   /** `status` in the JSON that `xcrun notarytool submit --wait` prints. */
   notaryStatus?: string;
+  /** Plain-text error that `xcrun notarytool submit` prints, with exit code 1, instead of JSON. */
+  notaryError?: string;
 }
 
 /**
@@ -62,8 +64,13 @@ function installFakeTools(tools: FakeTools): void {
 ${log}
 case "$1 $2" in
   "--find notarytool") echo /usr/bin/notarytool; exit 0 ;;
-  "notarytool submit") echo '{"id":"fake-id","status":"${tools.notaryStatus ?? "Accepted"}","message":"fake"}'; exit 0 ;;
-  "notarytool log") echo '{}'; exit 0 ;;
+  "notarytool submit")
+    ${
+      tools.notaryError === undefined
+        ? `echo '{"id":"fake-id","status":"${tools.notaryStatus ?? "Accepted"}","message":"fake"}'; exit 0`
+        : `echo '${tools.notaryError}'; exit 1`
+    } ;;
+  "notarytool log") echo 'fake notary log'; exit 0 ;;
   "stapler staple"|"stapler validate")
     codes="${tempDir}/$2-codes"
     count=$(grep -c "^xcrun stapler $2" "${callLog}")
@@ -229,9 +236,25 @@ test("a failed notarization fails the hook at once, without a staple", async () 
   const error = await rejection(notarizeMac.default(macContext()));
 
   expect(error.message).toContain("Failed to notarize via notarytool");
+  expect(error.message).toContain("fake notary log");
   expect(calls().filter((call) => call.command.startsWith("xcrun notarytool submit"))).toHaveLength(
     1
   );
+  expect(stapleCalls()).toEqual([]);
+});
+
+test("a plain-text notarytool error keeps Apple's message instead of a JSON parse error", async () => {
+  const appleError =
+    "Error: HTTP status code: 403. A required agreement is missing or has expired.";
+  installFakeTools({ stapleCodes: [0], notaryError: appleError });
+  setApiKeyCredentials();
+
+  const error = await rejection(notarizeMac.default(macContext()));
+
+  expect(error.message).toContain("with code: 1");
+  expect(error.message).toContain(appleError);
+  // No submission id, so there is no log to fetch.
+  expect(calls().filter((call) => call.command.startsWith("xcrun notarytool log"))).toEqual([]);
   expect(stapleCalls()).toEqual([]);
 });
 

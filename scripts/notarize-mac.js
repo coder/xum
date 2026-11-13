@@ -11,6 +11,12 @@
  * 30 s apart. Any other failure, and a staple or validation that still fails, stays a hard
  * failure.
  *
+ * The hook also runs `notarytool submit` itself instead of @electron/notarize's
+ * notarizeAndWaitForNotaryTool: that function JSON-parses notarytool's output before it checks the
+ * exit code, but notarytool prints request errors as plain text ("Error: HTTP status code: 403.
+ * ...") even with `--output-format json`. The build then failed with only "Unexpected token 'E',
+ * "Error: HTT"... is not valid JSON" and hid Apple's reason (nightly run 43391540035).
+ *
  * Why a hook and not a step after `make dist-mac`: electron-builder runs afterSign before it builds
  * the dmg and zip targets from the .app, so they package the stapled app. A staple after the build
  * would change only the loose .app, and the shipped dmg and zip would carry no ticket.
@@ -41,9 +47,9 @@ const notarizeLibDir = path.join(
   "lib"
 );
 const { checkSignatures } = require(path.join(notarizeLibDir, "check-signature.js"));
-const { isNotaryToolAvailable, notarizeAndWaitForNotaryTool } = require(
-  path.join(notarizeLibDir, "notarytool.js")
-);
+const { isNotaryToolAvailable } = require(path.join(notarizeLibDir, "notarytool.js"));
+const { makeSecret, withTempDir } = require(path.join(notarizeLibDir, "helpers.js"));
+const { spawn: spawnTool } = require(path.join(notarizeLibDir, "spawn.js"));
 
 const STAPLE_ATTEMPTS = 5;
 const STAPLE_RETRY_DELAY_MS = 30_000;
@@ -118,6 +124,51 @@ async function stapleWithRetry(appPath, options = {}) {
   console.log(`✅ Validated the stapled ticket of ${name} (attempt ${validated} of ${attempts})`);
 }
 
+/**
+ * Zips the app and submits it with `xcrun notarytool submit --wait`, as
+ * @electron/notarize's notarizeAndWaitForNotaryTool does, but keeps notarytool's own output in the
+ * error when it is not JSON or the submission is not accepted.
+ * @param {string} appPath
+ * @param {unknown[]} authArgs `--key`, `--key-id` and `--issuer` with makeSecret() values
+ */
+async function submitToNotaryService(appPath, authArgs) {
+  await withTempDir(async (dir) => {
+    const zipPath = path.join(dir, `${path.parse(appPath).name}.zip`);
+    const zip = await spawnTool(
+      "ditto",
+      ["-c", "-k", "--sequesterRsrc", "--keepParent", path.basename(appPath), zipPath],
+      { cwd: path.dirname(appPath) }
+    );
+    if (zip.code !== 0) {
+      throw new Error(`Failed to zip ${appPath} with code: ${zip.code}\n\n${zip.output}`);
+    }
+    const submit = await spawnTool("xcrun", [
+      "notarytool",
+      "submit",
+      zipPath,
+      ...authArgs,
+      "--wait",
+      "--output-format",
+      "json",
+    ]);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(submit.output.trim());
+    } catch {
+      // Plain-text request error; the thrown message below carries it.
+    }
+    if (submit.code === 0 && parsed?.status === "Accepted") return;
+    let notaryLog = "";
+    if (typeof parsed?.id === "string") {
+      const log = await spawnTool("xcrun", ["notarytool", "log", parsed.id, ...authArgs]);
+      notaryLog = `\n\nNotary log (code ${log.code}):\n${log.output}`;
+    }
+    throw new Error(
+      `Failed to notarize via notarytool with code: ${submit.code}\n\n${submit.output}${notaryLog}`
+    );
+  });
+}
+
 /** @param {import("electron-builder").AfterPackContext} context */
 async function notarizeMac(context) {
   // afterSign also runs for signed Windows builds.
@@ -145,12 +196,15 @@ async function notarizeMac(context) {
     throw new Error("notarytool is not available, you must be on at least Xcode 13");
   }
   console.log(`🔏 Notarizing ${appPath}...`);
-  await notarizeAndWaitForNotaryTool({
-    appPath,
-    appleApiKey: APPLE_API_KEY,
-    appleApiKeyId: APPLE_API_KEY_ID,
-    appleApiIssuer: APPLE_API_ISSUER,
-  });
+  // makeSecret keeps them out of @electron/notarize's DEBUG spawn log, as the library does.
+  await submitToNotaryService(appPath, [
+    "--key",
+    makeSecret(APPLE_API_KEY),
+    "--key-id",
+    makeSecret(APPLE_API_KEY_ID),
+    "--issuer",
+    makeSecret(APPLE_API_ISSUER),
+  ]);
   await stapleWithRetry(appPath);
 }
 
