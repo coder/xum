@@ -179,7 +179,8 @@ function SshDirectoryTrustRow(props: {
           {copy.action}
         </Button>
         {props.error !== null && (
-          <span role="alert" className="text-error col-start-2 @md:col-span-2">
+          // col-end, not col-span: a span would replace col-start and put the error under the icon.
+          <span role="alert" className="text-error col-start-2 @md:col-end-4">
             {props.error}
           </span>
         )}

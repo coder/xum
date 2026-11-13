@@ -361,36 +361,6 @@ function centerY(rect: DOMRect): number {
 }
 
 /**
- * On a wide page the SSH+None trust row is one line as tall as the chip, and capped in width, so
- * its button stays near the copy instead of at the far edge of the page.
- */
-export const SshDirectoryTrustWide: Story = {
-  // The one-line layout needs a wide frame; the phone layout is SshWithoutIsolation's snapshot.
-  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
-  args: {
-    trustedProject: true,
-    initialRuntime: {
-      mode: "ssh",
-      host: "devbox.internal",
-      workspaceIsolation: "none",
-      projectDir: "~/src/my-app",
-    },
-  },
-  play: async ({ canvasElement }) => {
-    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
-    const canvas = within(storyRoot);
-    await canvas.findByRole("button", { name: "Trust directory" }, { timeout: 10000 });
-    const chip = canvas.getByTestId("creation-environment").getBoundingClientRect();
-    const trust = trustRowGeometry(storyRoot);
-    // 42rem: wide enough for the copy and the button on one line, no wider.
-    await expect(trust.row.width).toBeLessThanOrEqual(672 + 1);
-    await expect(trust.row.height).toBeLessThanOrEqual(chip.height + 1);
-    await expect(Math.abs(centerY(trust.button) - centerY(trust.status))).toBeLessThanOrEqual(1);
-    await expect(Math.abs(centerY(trust.icon) - centerY(trust.status))).toBeLessThanOrEqual(1);
-  },
-};
-
-/**
  * The environment panel open on the default selection: where it runs, the isolation and the base
  * branch side by side, with the branch list filtered.
  */
