@@ -336,6 +336,95 @@ describe("StreamEndLedger decisions", () => {
     }
   );
 
+  // The report binding (`taskReportAttemptId`, written by every report) only adds refusals: a
+  // binding that names another attempt, or none, leaves the status rule as it is.
+  test("an inherited reported row whose binding names the predecessor still continues", () => {
+    const t = harness();
+    t.state.config = configWithRow({
+      taskStatus: "reported",
+      reportedAt: PREDECESSOR_REPORTED_AT,
+      taskAttemptId: ATTEMPT,
+      taskReportAttemptId: OTHER,
+    });
+    const owned = attempt(ATTEMPT, { taskStatus: "reported" });
+    const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("nonreport");
+    expect(owned.receiptEligible).toBe(true);
+  });
+
+  test.each([
+    { name: "names the attempt", binding: ATTEMPT },
+    { name: "names the predecessor", binding: OTHER },
+    { name: "is absent", binding: undefined },
+  ])(
+    "an inherited interrupted row that the row has since replaced in the same millisecond stays indeterminate when the binding $name",
+    (c) => {
+      const t = harness();
+      t.state.config = configWithRow({
+        taskStatus: "reported",
+        reportedAt: PREDECESSOR_REPORTED_AT,
+        taskAttemptId: ATTEMPT,
+        ...(c.binding != null ? { taskReportAttemptId: c.binding } : {}),
+      });
+      const owned = attempt(ATTEMPT, { taskStatus: "interrupted" });
+      const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+      expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+      expect(decision?.outcome).toBe("indeterminate");
+      expect(owned.receiptEligible).toBe(false);
+    }
+  );
+
+  // A failure turns a reported row interrupted and keeps its report time, and another backend's
+  // report turns it back: the status says the same as before. The binding names who reported.
+  test.each([
+    {
+      name: "a reported row that a failure and another report turned back",
+      inherited: "reported",
+      row: { taskStatus: "reported", reportedAt: "2026-10-01T00:00:09.000Z" },
+    },
+    {
+      name: "a reported row whose report time equals the inherited one",
+      inherited: "reported",
+      row: { taskStatus: "reported", reportedAt: PREDECESSOR_REPORTED_AT },
+    },
+    {
+      name: "an interrupted row that carries the attempt's report (reported, then a failure)",
+      inherited: "reported",
+      row: { taskStatus: "interrupted", reportedAt: "2026-10-01T00:00:09.000Z" },
+    },
+    {
+      name: "the same row for an attempt that began interrupted",
+      inherited: "interrupted",
+      row: { taskStatus: "interrupted", reportedAt: "2026-10-01T00:00:09.000Z" },
+    },
+  ] as const)("a report that names the attempt turns the decision indeterminate: $name", (c) => {
+    const t = harness();
+    t.state.config = configWithRow({
+      ...c.row,
+      taskAttemptId: ATTEMPT,
+      taskReportAttemptId: ATTEMPT,
+    });
+    const owned = attempt(ATTEMPT, { taskStatus: c.inherited });
+    const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("indeterminate");
+    expect(owned.receiptEligible).toBe(false);
+  });
+
+  test("a binding that names the attempt counts only while the row carries a completed report", () => {
+    const t = harness();
+    t.state.config = configWithRow({
+      taskStatus: "running",
+      taskAttemptId: ATTEMPT,
+      taskReportAttemptId: ATTEMPT,
+    });
+    const owned = attempt(ATTEMPT, null);
+    const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("nonreport");
+  });
+
   test("an unowned stream whose row reads reported is refused, never assumed to continue", () => {
     const t = harness();
     t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });

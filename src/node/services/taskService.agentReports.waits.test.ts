@@ -453,6 +453,63 @@ describe("TaskService", () => {
     });
   });
 
+  // The adoption writes `reported` for the row's attempt, and the row's report binding names that
+  // attempt (a row without an attempt id has none to name).
+  test.each([
+    { name: "a row with an attempt id", attemptId: "att_00000000000000c1" },
+    { name: "a row without one", attemptId: undefined },
+  ])("adopting a persisted report writes the report binding for $name", async (c) => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-111";
+    const childId = "child-222";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_explore_child",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "running",
+          ...(c.attemptId != null ? { taskAttemptId: c.attemptId } : {}),
+        }),
+      ],
+      testTaskSettings(1, 3)
+    );
+    const { taskService } = createTaskServiceHarness(config);
+    spyOn(
+      (
+        taskService as unknown as {
+          gitPatchArtifactService: { maybeStartGeneration: (...args: unknown[]) => Promise<void> };
+        }
+      ).gitPatchArtifactService,
+      "maybeStartGeneration"
+    ).mockResolvedValue(undefined);
+    await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
+      workspaceId: parentId,
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
+      childTaskId: childId,
+      parentWorkspaceId: parentId,
+      ancestorWorkspaceIds: [parentId],
+      reportMarkdown: "persisted report",
+      title: "persisted title",
+      taskAttemptId: c.attemptId,
+      nowMs: Date.now(),
+    });
+
+    await taskService.waitForAgentReport(childId, {
+      timeoutMs: 10,
+      requestingWorkspaceId: parentId,
+    });
+
+    const row = findWorkspaceInConfig(config, childId);
+    expect(row?.taskStatus).toBe("reported");
+    expect(row?.taskReportAttemptId).toBe(c.attemptId);
+  });
+
   test("waitForAgentReport returns persisted artifact for stale running task", async () => {
     const config = await createTestConfig(rootDir);
 
