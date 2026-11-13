@@ -101,6 +101,8 @@ export const BANNED_PACKAGES: readonly string[] = [
   // desktop main imports them lazily in loadServices() so they stay after the splash (#4423).
   "effect",
   "zod",
+  // The macOS agent sandbox (srt and its zod 3); only agent commands need it.
+  "@anthropic-ai/sandbox-runtime",
 ];
 
 export interface EagerImportViolation {

@@ -13,6 +13,7 @@ import {
 } from "@/node/utils/runtime/planLocation";
 import { InstallationIdentityError } from "@/node/config/installationIdentity";
 import { isRuntimeTransportError } from "@/node/runtime/Runtime";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import {
   WorkspaceGoalChildWorkspaceError,
   WorkspaceGoalTransitionError,
@@ -293,6 +294,14 @@ export async function answerWorkspaceQuestion(
   return result.success
     ? { success: true as const, data: undefined }
     : { success: false as const, error: result.error };
+}
+
+export function answerWorkspaceSandboxApproval(
+  input: z.infer<typeof schemas.workspace.answerSandboxApproval.input>
+) {
+  return sandboxApprovalManager.answer(input.workspaceId, input.toolCallId, input.approved)
+    ? { success: true as const, data: undefined }
+    : { success: false as const, error: "No sandbox approval is pending for this tool call" };
 }
 
 export function answerDelegatedWorkspaceToolCall(

@@ -1,9 +1,21 @@
 import { describe, expect, it } from "bun:test";
-import { generateText, type AssistantModelMessage, type ModelMessage } from "ai";
+import {
+  generateText,
+  type AssistantModelMessage,
+  type LanguageModel,
+  type ModelMessage,
+} from "ai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE } from "@/common/constants/coderOAuth";
 
 import { transformModelMessages } from "@/browser/utils/messages/modelMessageTransform";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type MuxMessage,
+  type ToolCallReplayMetadata,
+} from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { createTestHistoryService } from "./testHistoryService";
 import { prepareMessagesForProvider, sanitizeAssistantModelMessages } from "./messagePipeline";
@@ -252,9 +264,8 @@ describe("reasoning replay in built provider requests", () => {
     expect(await replayed("anthropic:claude-sonnet-5-5", "low")).toBe(1);
     expect(await replayed("anthropic:claude-haiku-5-5", "low")).toBe(1);
     expect(await replayed("anthropic:claude-sonnet-5", "off")).toBe(1);
-    // Mythos 5.1 does not run the prefix check (#5889), so "off" keeps its history thinking.
-    expect(await replayed("anthropic:claude-mythos-5-1", "off")).toBe(1);
-    // Mythos 5.2 runs it on every account, so "off" strips it like Fable.
+    // Mythos 5.1 and 5.2 run it on every account, so "off" strips it like Fable.
+    expect(await replayed("anthropic:claude-mythos-5-1", "off")).toBe(0);
     expect(await replayed("anthropic:claude-mythos-5-2", "off")).toBe(0);
   });
 
@@ -848,6 +859,155 @@ describe("reasoning replay in built provider requests", () => {
       expect(input.some((item) => item.type === "item_reference")).toBe(false);
       expect(raw).not.toContain("rs_stale");
     });
+  });
+});
+
+describe("tool-call thought signatures in built provider requests", () => {
+  // A retry or resume rebuilds the current turn from chat.jsonl, and Gemini
+  // rejects its function calls without their thought signatures.
+  function historyWithToolCall(providerOptions?: unknown): MuxMessage[] {
+    return [
+      createMuxMessage("user-1", "user", "list files", { timestamp: 1000 }),
+      {
+        id: "assistant-1",
+        role: "assistant",
+        metadata: { timestamp: 1001 },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call-1",
+            toolName: "bash",
+            state: "output-available",
+            input: { script: "ls" },
+            output: "README.md",
+            ...(providerOptions != null
+              ? { providerOptions: providerOptions as ToolCallReplayMetadata }
+              : {}),
+          },
+        ],
+      },
+    ];
+  }
+
+  function buildRequest(
+    messages: MuxMessage[],
+    providerForMessages: string,
+    toolCallReplayNamespace: string
+  ): Promise<ModelMessage[]> {
+    return prepareMessagesForProvider({
+      messagesWithSentinel: messages,
+      effectiveAgentId: "exec",
+      toolNamesForSentinel: [],
+      providerForMessages,
+      effectiveThinkingLevel: "high",
+      modelString: `${providerForMessages}:model`,
+      workspaceId: "test-ws",
+      toolCallReplayNamespace,
+    });
+  }
+
+  async function captureBody(
+    model: (fetch: typeof globalThis.fetch) => LanguageModel,
+    response: unknown,
+    messages: ModelMessage[]
+  ): Promise<unknown> {
+    const bodies: unknown[] = [];
+    const captureFetch = Object.assign(
+      (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        bodies.push(JSON.parse(init?.body as string));
+        return Promise.resolve(
+          new Response(JSON.stringify(response), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    await generateText({ model: model(captureFetch), messages, maxRetries: 0 });
+    expect(bodies).toHaveLength(1);
+    return bodies[0];
+  }
+
+  /** The thought_signature a google-typed Coder instance's client sends for call-1. */
+  async function coderGoogleWireSignature(messages: ModelMessage[]): Promise<unknown> {
+    const body = (await captureBody(
+      (captureFetch) =>
+        createOpenAICompatible({
+          name: CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
+          baseURL: "https://gateway.test/v1",
+          fetch: captureFetch,
+        })("gemini-4-carbon"),
+      {
+        id: "chatcmpl-test",
+        choices: [
+          { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      },
+      messages
+    )) as {
+      messages: Array<{ tool_calls?: Array<{ id: string; extra_content?: unknown }> }>;
+    };
+    const toolCall = body.messages.flatMap((message) => message.tool_calls ?? [])[0];
+    expect(toolCall?.id).toBe("call-1");
+    return (toolCall?.extra_content as { google?: { thought_signature?: unknown } } | undefined)
+      ?.google?.thought_signature;
+  }
+
+  const bothSignatures = {
+    coderGoogle: { thoughtSignature: "sig-coder" },
+    google: { thoughtSignature: "sig-native" },
+  };
+
+  it.each([
+    {
+      name: "replays the signature the Coder route recorded",
+      stored: bothSignatures,
+      sent: "sig-coder",
+    },
+    // The compatible client falls back to providerOptions.google, so a signature
+    // from the native route would leak into the gateway request.
+    {
+      name: "does not send a native-route signature to the Coder route",
+      stored: { google: { thoughtSignature: "sig-native" } },
+      sent: undefined,
+    },
+    {
+      name: "replays legacy history without signatures unchanged",
+      stored: undefined,
+      sent: undefined,
+    },
+    {
+      name: "drops a malformed persisted signature",
+      stored: { coderGoogle: { thoughtSignature: 42 } },
+      sent: undefined,
+    },
+  ])("Coder google wire: $name", async ({ stored, sent }) => {
+    const messages = await buildRequest(
+      historyWithToolCall(stored),
+      "openai",
+      CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE
+    );
+    expect(await coderGoogleWireSignature(messages)).toBe(sent);
+  });
+
+  it("replays a native Gemini signature instead of the skip sentinel", async () => {
+    const body = (await captureBody(
+      (captureFetch) =>
+        createGoogleGenerativeAI({ apiKey: "test", fetch: captureFetch })("gemini-3-pro-preview"),
+      {
+        candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+        usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 },
+      },
+      await buildRequest(historyWithToolCall(bothSignatures), "google", "google")
+    )) as {
+      contents: Array<{ parts: Array<{ functionCall?: unknown; thoughtSignature?: unknown }> }>;
+    };
+    const functionCalls = body.contents
+      .flatMap((content) => content.parts)
+      .filter((part) => part.functionCall != null);
+    expect(functionCalls.map((part) => part.thoughtSignature)).toEqual(["sig-native"]);
   });
 });
 

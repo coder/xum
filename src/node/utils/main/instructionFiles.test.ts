@@ -312,4 +312,39 @@ describe("instructionFiles", () => {
       expect(result?.files.map((file) => file.filename)).toEqual(["CLAUDE.md"]);
     });
   });
+
+  describe("readInstructionSetFromRuntime under the agent sandbox", () => {
+    it("withholds an instruction file that links to a file the sandbox hides", async () => {
+      const root = await fs.realpath(tempDir);
+      const workspace = path.join(root, "workspace");
+      const home = path.join(root, "home");
+      await fs.mkdir(path.join(home, ".ssh"), { recursive: true });
+      await fs.mkdir(workspace);
+      await fs.writeFile(path.join(home, ".ssh", "id_rsa"), "PRIVATE KEY");
+      await fs.symlink(path.join(home, ".ssh", "id_rsa"), path.join(workspace, "AGENTS.md"));
+      await fs.writeFile(path.join(workspace, "CLAUDE.md"), "claude instructions");
+      await fs.writeFile(path.join(workspace, "AGENTS.local.md"), "local instructions");
+      const runtime = new LocalRuntime(workspace);
+      runtime.agentSandboxPolicy = () => ({
+        writeRoots: [workspace],
+        gitCommonDirs: [],
+        denyWrite: [],
+        denyRead: [home],
+        allowRead: [workspace],
+        network: "allowlist",
+        allowedHosts: [],
+        allowLocalBinding: true,
+      });
+
+      const result = await readInstructionSetFromRuntime(
+        runtime,
+        workspace,
+        INSTRUCTION_SCOPE.WORKSPACE
+      );
+
+      // AGENTS.md still exists, so CLAUDE.md does not replace it, and its companion still loads.
+      expect(result?.files.map((file) => file.filename)).toEqual(["AGENTS.local.md"]);
+      expect(result?.combinedContent).not.toContain("PRIVATE KEY");
+    });
+  });
 });

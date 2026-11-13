@@ -1,0 +1,91 @@
+import assert from "node:assert/strict";
+import type { BashSandboxApprovalEvent } from "@/common/types/stream";
+
+export type SandboxApprovalAnswer = "approved" | "denied";
+
+interface PendingSandboxApproval {
+  resolve: (answer: SandboxApprovalAnswer) => void;
+  /** The pending event the bash call emitted, replayed to a chat that subscribes later. */
+  event?: BashSandboxApprovalEvent;
+}
+
+/**
+ * The bash calls that wait for the user to let one blocked command run outside the sandbox.
+ * Only the user answers, through workspace.answerSandboxApproval; no agent tool reaches it. An
+ * answer covers one call, and nothing is remembered: the next call asks again, and a restart
+ * drops every pending request (its tool call is gone too).
+ */
+export class SandboxApprovalManager {
+  private pendingByWorkspace = new Map<string, Map<string, PendingSandboxApproval>>();
+  private noUserToAnswer = false;
+
+  /**
+   * For a process that no user can answer, such as the `xum run` and `xum workflow` CLIs: their
+   * agents (sub-agents and workflow agents too) get no tool policy that says so, and a request
+   * there would wait forever.
+   */
+  denyAllRequests(): void {
+    this.noUserToAnswer = true;
+  }
+
+  /** Waits for the user's answer to `toolCallId`. An abort (Stop) denies it. */
+  request(
+    workspaceId: string,
+    toolCallId: string,
+    abortSignal?: AbortSignal,
+    event?: BashSandboxApprovalEvent
+  ): Promise<SandboxApprovalAnswer> {
+    assert(workspaceId.length > 0, "workspaceId must be non-empty");
+    assert(toolCallId.length > 0, "toolCallId must be non-empty");
+    if (this.noUserToAnswer || abortSignal?.aborted) return Promise.resolve("denied");
+    let workspaceMap = this.pendingByWorkspace.get(workspaceId);
+    if (!workspaceMap) {
+      workspaceMap = new Map();
+      this.pendingByWorkspace.set(workspaceId, workspaceMap);
+    }
+    assert(!workspaceMap.has(toolCallId), `sandbox approval already pending for ${toolCallId}`);
+    const pending = workspaceMap;
+    return new Promise<SandboxApprovalAnswer>((resolve) => {
+      const onAbort = () => resolve("denied");
+      abortSignal?.addEventListener("abort", onAbort, { once: true });
+      pending.set(toolCallId, {
+        event,
+        resolve: (answer) => {
+          abortSignal?.removeEventListener("abort", onAbort);
+          resolve(answer);
+        },
+      });
+    }).finally(() => this.forget(workspaceId, toolCallId, pending));
+  }
+
+  private forget(
+    workspaceId: string,
+    toolCallId: string,
+    pending: Map<string, PendingSandboxApproval>
+  ): void {
+    pending.delete(toolCallId);
+    if (pending.size === 0 && this.pendingByWorkspace.get(workspaceId) === pending) {
+      this.pendingByWorkspace.delete(workspaceId);
+    }
+  }
+
+  /**
+   * The pending events of a workspace, for a chat subscription that starts while a bash call
+   * waits (reload, another window): without them it shows no card to answer.
+   */
+  pendingEvents(workspaceId: string): BashSandboxApprovalEvent[] {
+    const pending = this.pendingByWorkspace.get(workspaceId);
+    if (!pending) return [];
+    return [...pending.values()].flatMap((entry) => (entry.event ? [entry.event] : []));
+  }
+
+  /** Answers a pending request; false when none is pending (already answered, or gone). */
+  answer(workspaceId: string, toolCallId: string, approved: boolean): boolean {
+    const entry = this.pendingByWorkspace.get(workspaceId)?.get(toolCallId);
+    if (!entry) return false;
+    entry.resolve(approved ? "approved" : "denied");
+    return true;
+  }
+}
+
+export const sandboxApprovalManager = new SandboxApprovalManager();

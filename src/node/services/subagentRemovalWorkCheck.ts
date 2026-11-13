@@ -1,6 +1,8 @@
 /**
- * Finds work that removing a sub-agent checkout would destroy and nothing preserves (#4723). Only
- * model-driven task_remove consults it; user-confirmed and automatic removals keep force-removing.
+ * Finds work that removing a sub-agent checkout would destroy and nothing preserves (#4723).
+ * Model-driven task_remove consults it: by default a finding refuses the removal, and with the
+ * tool's `force` flag the removal goes on and reports the finding as what it deleted.
+ * User-confirmed and automatic removals keep force-removing without consulting it.
  */
 import assert from "node:assert/strict";
 
@@ -96,7 +98,8 @@ async function openGitRepo(
     `p=${gitPath}; if [ -e "$p" ] || [ -L "$p" ]; then echo yes; else ` +
       `d=$(dirname "$p"); while [ ! -e "$d" ] && [ ! -L "$d" ]; do d=$(dirname "$d"); done; ` +
       `if [ -d "$d" ] && [ -x "$d" ]; then echo no; else echo unknown; fi; fi`,
-    { cwd: "/", timeout: 10 }
+    // Xum code, not agent code: a fixed read-only probe, and the sandbox refuses a cwd of /.
+    { cwd: "/", timeout: 10, sandbox: "internal" }
   );
   const answer = exists.stdout.trim();
   if (exists.exitCode !== 0 || (answer !== "yes" && answer !== "no")) {

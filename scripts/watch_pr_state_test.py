@@ -13,6 +13,18 @@ SCRIPT = Path(__file__).resolve().parent / "watch_pr_state.sh"
 HEAD = "1" * 40
 MERGE = "2" * 40
 START = 1_800_000_000
+# Hang guard for one run of the script, not a speed requirement: the doubles answer from the
+# fixture and nothing sleeps, so only a loop that never ends reaches this bound. Every poll starts
+# several Python doubles (gh, timeout, sleep, date), so a run takes a time that grows with its polls
+# and with the load of the host. With 8 to 16 copies of this file on two cores of a host that other
+# jobs load (three runs, 32 copies), the longest single run took 18.8 s, 24.4 s and 29.4 s (median
+# 2.4 s to 4.3 s), so the 30 s this replaced could fail the test with TimeoutExpired, which says
+# nothing about the script. On a host that other agents load more (16 busy loops beside three
+# copies of this file, 2026-11-09), a run took 1.7 s at the median and 106.6 s at the longest of
+# 576 runs, and 3 of them took more than 30 s, so the 120 s that followed was about 1.1 times the
+# longest run. The bound is about 3 times the longest run seen. The pr.yml step that runs the gate
+# tests stops at 15 minutes, so a hang in every run cannot hold the job.
+WATCH_RUN_TIMEOUT_SECS = 300
 
 # Strict protocol doubles. gh answers poll N with fixture entry N and fails on any call
 # the fixture does not cover. sleep advances the clock that date reads instead of waiting.
@@ -201,7 +213,7 @@ class WatchPrStateTest(unittest.TestCase):
         tmp.mkdir(exist_ok=True)
         env["TMPDIR"] = str(tmp)
         result = subprocess.run(
-            ["bash", str(SCRIPT), *args], env=env, text=True, capture_output=True, timeout=30, check=False
+            ["bash", str(SCRIPT), *args], env=env, text=True, capture_output=True, timeout=WATCH_RUN_TIMEOUT_SECS, check=False
         )
         self.assertEqual(list(tmp.iterdir()), [], "the script removes its temp files")
         self.queries = [json.loads(line)[7] for line in files["calls"].read_text().splitlines()]
@@ -328,7 +340,7 @@ class WatchPrStateTest(unittest.TestCase):
         ], "101")
         self.assertEqual(self.lines, [
             "#101 pending head 1111111 1/2 checks done",
-            "#101 failed head 1111111 failed 1/2 checks",
+            "#101 failed head 1111111 failed 1/2 checks (0 on the merge commit)",
         ])
         self.assertEqual(self.result, "RESULT fail 101:failed")
 
@@ -351,7 +363,7 @@ class WatchPrStateTest(unittest.TestCase):
         self.assertEqual(self.lines, [
             "#101 pending head 1111111 0/2 checks done",
             "#102 ready head 1111111",
-            "#101 failed head 1111111 failed 3/4 checks",
+            "#101 failed head 1111111 failed 3/4 checks (1 on the merge commit)",
         ])
         self.assertEqual(self.result, "RESULT fail 101:failed 102:ready")
 
@@ -412,7 +424,21 @@ class WatchPrStateTest(unittest.TestCase):
 
     def test_a_failure_on_the_merge_commit_fails_the_pr(self):
         self.assert_watch(1, [reply(checked(101, [check()], merge_nodes=[check("Integration", "FAILURE")]))], "101")
-        self.assertEqual(self.lines, ["#101 failed head 1111111 failed 1/2 checks"])
+        self.assertEqual(self.lines, ["#101 failed head 1111111 failed 1/2 checks (1 on the merge commit)"])
+
+    def test_failures_on_the_merge_commit_are_counted_apart_from_the_head_commit(self):
+        # gh pr view --json statusCheckRollup lists the head commit only: the count says how many of the
+        # failures it does not list. A failing visual check is on neither count.
+        for name, head, merge, expected in (
+            ("head only", [check("A", "FAILURE"), check()], [check("M")], "failed 1/3 checks (0 on the merge commit)"),
+            ("merge only", [check()], [check("A", "FAILURE"), check("B", "CANCELLED")], "failed 2/3 checks (2 on the merge commit)"),
+            ("both", [check("A", "FAILURE")], [check("B", "TIMED_OUT")], "failed 2/2 checks (1 on the merge commit)"),
+            ("pending on the merge commit", [check("A", "FAILURE")], [check("B", None, "IN_PROGRESS")], "failed 1/2 checks (0 on the merge commit)"),
+            ("visual on the merge commit", [check("A", "FAILURE")], [pixel("FAILURE")], "failed 1/1 checks (0 on the merge commit)"),
+        ):
+            with self.subTest(case=name):
+                self.assert_watch(1, [reply(checked(101, head, merge_nodes=merge))], "101")
+                self.assertEqual(self.lines, [f"#101 failed head 1111111 {expected}"])
 
     def test_unknown_or_partial_check_reads_are_errors(self):
         moved = checked(101, [check()])
@@ -458,6 +484,8 @@ class WatchPrStateTest(unittest.TestCase):
             ({"rc": 1, "stdout": {**data, "errors": [{"extensions": HOSTILE}, HOSTILE, {"message": None}]}}, ["GitHub read failed"]),
             # A message that is not a string must not hide the messages after it.
             ({"rc": 1, "stdout": {"errors": [{"message": None}, {"message": "Real message"}]}}, ["GitHub error: Real message"]),
+            # Nor must an error that is no object.
+            ({"rc": 1, "stdout": {"errors": ["x", {"message": "Real"}]}}, ["GitHub error: Real"]),
             # A long message is cut at 300 characters.
             ({"rc": 1, "stdout": {"errors": [{"message": "A" * 400}]}}, ["GitHub error: " + "A" * 300 + "\n"]),
         ):
@@ -496,7 +524,7 @@ class WatchPrStateTest(unittest.TestCase):
             with self.subTest(variable=variable):
                 result = self.assert_watch(1, [reply(data)], "101", **{variable: "api"})
                 self.assert_no_hostile_text(result)
-                self.assertEqual(self.lines, ["#101 failed head 1111111 failed 2/2 checks"])
+                self.assertEqual(self.lines, ["#101 failed head 1111111 failed 2/2 checks (0 on the merge commit)"])
 
     def test_only_messages_that_start_with_the_scripts_prefix_survive_the_jq_filter(self):
         stub = self.directory / "jq"

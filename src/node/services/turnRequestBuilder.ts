@@ -1,3 +1,8 @@
+import {
+  agentSandboxCoversTools,
+  fileToolSandboxContext,
+  lazyFileToolSandboxGate,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { withExecutionScope } from "./tools/withExecutionScope";
 import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
@@ -76,7 +81,7 @@ import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpC
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { isRlmModeEnabled } from "@/node/services/branchSummary";
 import type { ProviderService } from "@/node/services/providerService";
-import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { workspaceSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultStore";
 import type { InitStateManager } from "./initStateManager";
@@ -147,6 +152,7 @@ import {
   buildProviderOptions,
   buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
+  resolveRequestProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -332,6 +338,18 @@ import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService"
  */
 function ptcRanForTools(ptcEnabled: boolean, tools: Record<string, Tool>): boolean {
   return ptcEnabled && tools.code_execution !== undefined;
+}
+
+/**
+ * Headless callers (`xum run`, ACP) turn off ask_user_question because no user can answer it; no
+ * user can answer a sandbox approval card there either. A sub-agent has no user either: its own
+ * denial of ask_user_question is in the agent policy, not the caller's `toolPolicy`, so without
+ * this its approval card waited forever (Codex review).
+ */
+function hasNoInteractiveUser(isSubagentWorkspace: boolean, toolPolicy?: ToolPolicy): boolean {
+  return (
+    isSubagentWorkspace || applyToolPolicyToNames(["ask_user_question"], toolPolicy).length === 0
+  );
 }
 
 /** Options used to prepare and execute a turn. */
@@ -1206,6 +1224,19 @@ export class TurnRequestBuilder {
     { messageId: string; turn: AgentInterfaceStatusPageTurn }
   >();
 
+  /**
+   * Each workspace's latest prepared turn whose agent can call the artifact tool and is not
+   * plan-like, for the turn-end layout nudge (turnCanRepublishArtifacts). The nudge asks for a
+   * publish, and its continuation keeps the turn's agent, tool policy and request assembly: a turn
+   * without the tool could not follow it. `toolSent` is whether the tools of the turn's latest
+   * attempt still held `artifact` after assembly (followArtifactToolAfterAssembly). One entry per
+   * workspace: the next prepare replaces or drops it.
+   */
+  private readonly artifactPublishTurns = new Map<
+    string,
+    { messageId: string; toolSent: boolean }
+  >();
+
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
   /** Turn timings, record timestamps and retry delays share the stream's HostClock. */
@@ -1218,6 +1249,13 @@ export class TurnRequestBuilder {
   forgetWorkspace(workspaceId: string): void {
     this.toolCatalogOverviews.delete(workspaceId);
     this.agentInterfaceTurns.delete(workspaceId);
+    this.artifactPublishTurns.delete(workspaceId);
+  }
+
+  /** Whether the turn whose assistant message is `messageId` could publish an artifact. */
+  turnCanRepublishArtifacts(workspaceId: string, messageId: string): boolean {
+    const entry = this.artifactPublishTurns.get(workspaceId);
+    return entry?.messageId === messageId && entry.toolSent;
   }
 
   /**
@@ -1232,6 +1270,39 @@ export class TurnRequestBuilder {
     if (entry?.messageId !== messageId) return undefined;
     this.agentInterfaceTurns.delete(workspaceId);
     return entry.turn;
+  }
+
+  private recordArtifactPublishTurn(
+    workspaceId: string,
+    messageId: string,
+    agent: { planLike: boolean; toolPolicy: ToolPolicy | undefined }
+  ): void {
+    // A plan-like agent (a custom one included) may edit only its plan file, as for the status
+    // page nudge (recordAgentInterfaceTurn).
+    // Not sent until an attempt's assembled tools hold the tool (followArtifactToolAfterAssembly).
+    if (!agent.planLike && applyToolPolicyToNames(["artifact"], agent.toolPolicy).length > 0) {
+      this.artifactPublishTurns.set(workspaceId, { messageId, toolSent: false });
+    } else {
+      this.artifactPublishTurns.delete(workspaceId);
+    }
+  }
+
+  /**
+   * The policy allows the tool, but request.assemble middleware, XUM_DISABLE_AGENT_TOOLS or
+   * capability grants can still remove it from the request. Each attempt (a model fallback reruns
+   * assembly) sets the record from the tools it sends. With Programmatic Tool Calling the tool is
+   * bridged into code_execution (`xum.artifact`), built from the same policy-filtered tools that
+   * request hooks never see, so code_execution carries it.
+   */
+  private followArtifactToolAfterAssembly(
+    workspaceId: string,
+    messageId: string,
+    attempt: { tools: Record<string, Tool>; ptcEnabled: boolean }
+  ): void {
+    const entry = this.artifactPublishTurns.get(workspaceId);
+    if (entry?.messageId !== messageId) return;
+    entry.toolSent =
+      attempt.tools.artifact !== undefined || ptcRanForTools(attempt.ptcEnabled, attempt.tools);
   }
 
   private recordAgentInterfaceTurn(
@@ -1369,9 +1440,11 @@ export class TurnRequestBuilder {
         clock: this.hostClock,
       })
       .catch(() => ({ overrides: undefined, authoritative: false }));
-    const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+    const projectSecrets = workspaceSecrets(
+      metadata,
+      this.dependencies.secretsStore,
+      this.dependencies.config
+    );
     await mcpServerManager.getToolsForWorkspace(
       {
         workspaceId,
@@ -1379,6 +1452,7 @@ export class TurnRequestBuilder {
         runtime,
         workspacePath,
         trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        runtimeConfig: metadata.runtimeConfig,
         overrides: read.overrides,
         overridesAuthoritative: read.authoritative,
         ...(read.authoritative
@@ -1434,8 +1508,10 @@ export class TurnRequestBuilder {
       overridesIdentity.modelString,
       options.effectiveModelString
     );
-    const namespaceKey = resolveProviderOptionsNamespaceKey(
+    const namespaceKey = resolveRequestProviderOptionsNamespaceKey(
       options.wireProviderName,
+      options.optionsModelString,
+      options.providersConfigSnapshot,
       options.routeProvider
     );
     const extrasWireCompatible =
@@ -1868,6 +1944,8 @@ export class TurnRequestBuilder {
       minimumThinkingLevelOverride: ThinkingLevel | undefined;
       enforceMinimum: boolean;
       recordTiming?: boolean;
+      /** A refusal-fallback hop: the refused model's Anthropic Fast pick does not carry over. */
+      refusalFallback?: boolean;
     }) => {
       if (
         options.enforceMinimum &&
@@ -1914,6 +1992,7 @@ export class TurnRequestBuilder {
           workspaceId,
           providersConfig: providersConfigSnapshot,
           getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          withoutAnthropicFastMode: options.refusalFallback === true,
           getAnthropicCacheTtlOverride: () => agentCacheTtl.value,
           promptCacheScope,
         }
@@ -2266,6 +2345,14 @@ export class TurnRequestBuilder {
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
     const agentDefinitionCache = new AgentDefinitionRequestCache();
+    const projectSecrets = workspaceSecrets(
+      metadata,
+      this.dependencies.secretsStore,
+      this.dependencies.config
+    );
+    // Bash and the file tools get these too, so the agent definition and instruction reads
+    // follow the same sandbox.
+    const projectSecretsRecord = await secretsToRecord(projectSecrets);
     const resolveAgentForStreamStartedAt = this.hostClock.nowMs();
     const agentResult = await resolveAgentForStream({
       workspaceId,
@@ -2285,6 +2372,7 @@ export class TurnRequestBuilder {
         onPreStartError?.(event);
       },
       agentDefinitionCache,
+      sandboxEnv: projectSecretsRecord,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
     if (!agentResult.success) {
@@ -2645,6 +2733,7 @@ export class TurnRequestBuilder {
         instructionHost: {
           files: this.dependencies.hostServices.hostFiles,
           paths: this.dependencies.hostServices.hostPaths,
+          sandboxEnv: projectSecretsRecord,
         },
         metadata,
         workspacePath,
@@ -2695,10 +2784,6 @@ export class TurnRequestBuilder {
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
-    const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
-
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 
     let mcpTools: Record<string, Tool> | undefined;
@@ -2719,6 +2804,7 @@ export class TurnRequestBuilder {
             runtime,
             workspacePath,
             trusted: projectTrusted,
+            runtimeConfig: metadata.runtimeConfig,
             overrides: mcpOverrides,
             overridesAuthoritative: mcpOverridesAuthoritative,
             // A non-authoritative read that exhausted its budget (unreachable
@@ -2810,6 +2896,8 @@ export class TurnRequestBuilder {
         {
           cwd: path.dirname(runtimeTempDir),
           timeout: 10,
+          // Xum code, not agent code: removes Xum's own folder under ~/.xum-tmp.
+          sandbox: "internal",
         }
       );
       if (removed.exitCode !== 0)
@@ -2844,7 +2932,6 @@ export class TurnRequestBuilder {
       costsUsd: sessionCostsUsd,
       scratchDir,
     });
-    const projectSecretsRecord = await secretsToRecord(projectSecrets);
     Object.assign(
       xumEnv,
       await this.bashAiProxyEnv(
@@ -2909,6 +2996,7 @@ export class TurnRequestBuilder {
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
               }),
+            // A nested workflow's path comes from the script, which an agent can write.
             resolveWorkflowScript: (scriptPath) =>
               resolveWorkflowScript({
                 scriptPath,
@@ -2918,6 +3006,9 @@ export class TurnRequestBuilder {
                 projectTrusted: getWorkflowProjectTrusted(),
                 skillStorageContext: workflowSkillStorageContext,
                 runtimeFactory: this.dependencies.runtimeFactory,
+                sandboxGate: lazyFileToolSandboxGate(runtime, workspacePath, {
+                  env: projectSecretsRecord,
+                }),
               }),
             assertStoredPluginWorkflowReviewed: (stored) =>
               assertStoredPluginWorkflowReviewed({
@@ -3044,6 +3135,10 @@ export class TurnRequestBuilder {
       // The same rule the prompt follows, so the nudge asks for what the prompt told the agent.
       statusPageAgent: statusUpdateUsable(statusPageAgentActive, effectiveToolPolicy),
     });
+    this.recordArtifactPublishTurn(workspaceId, assistantMessageId, {
+      planLike: agentIsPlanLike,
+      toolPolicy: effectiveToolPolicy,
+    });
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
@@ -3080,6 +3175,7 @@ export class TurnRequestBuilder {
       // - read: plan file is readable in all agents (useful context)
       // - write: allowed in all agents; plan agents still lock other edits to the exact plan path
       planFileOnly: agentIsPlanLike,
+      noInteractiveUser: hasNoInteractiveUser(isSubagentWorkspace, toolPolicy),
       emitChatEvent: (event) => {
         // Defensive: tools should only emit events for the workspace they belong to.
         if ("workspaceId" in event && event.workspaceId !== workspaceId) {
@@ -3200,6 +3296,7 @@ export class TurnRequestBuilder {
       cwd: toolsForModelConfig.cwd,
       runtime: toolsForModelConfig.runtime,
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
+      sandbox: fileToolSandboxContext(toolsForModelConfig),
     });
     const ptcEnabled = !isSideChat && experiments.programmaticToolCalling;
     const mcpWarningSection = mcpStats
@@ -3335,6 +3432,7 @@ export class TurnRequestBuilder {
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
             locks: this.dependencies.historyService.locks,
+            blocksGlobalWrites: () => agentSandboxCoversTools(toolsForModelConfig),
           },
         });
         if (options.recordTimings) {
@@ -3477,6 +3575,10 @@ export class TurnRequestBuilder {
             ? {}
             : applyCapabilityGrants(attemptTools, capabilityGrants);
         }
+        this.followArtifactToolAfterAssembly(workspaceId, assistantMessageId, {
+          tools: attemptTools,
+          ptcEnabled,
+        });
 
         // The window section goes last, resolved from the rows being sent, so start() can
         // re-render it without rerunning assembly middleware or tool construction.
@@ -4169,6 +4271,7 @@ export class TurnRequestBuilder {
                     nextModelString
                   ),
                   enforceMinimum: true,
+                  refusalFallback: true,
                 });
                 if (!nextSeedResult.success) {
                   return Err(formatSendMessageError(nextSeedResult.error).message);

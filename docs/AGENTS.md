@@ -38,7 +38,7 @@ description: Agent instructions for AI assistants working on the Xum codebase
 
 ## Key Features & Performance
 
-- Core UX: projects sidebar (left panel), workspace management (local git worktrees or SSH clones), config stored in `~/.xum/config.json`.
+- Core UX: projects sidebar (left panel) and workspaces on local, worktree, SSH, Docker, devcontainer or Coder runtimes (`src/node/runtime/`).
 - Fetch bulk data in one IPC call—no O(n) frontend→backend loops.
 - **React Compiler enabled** — auto-memoization handles components/hooks; do not add manual `React.memo()`, `useMemo`, or `useCallback` for memoization purposes. Focus instead on fixing unstable object references that the compiler cannot optimize (e.g., `new Set()` in state setters, inline object literals as props).
 - **useEffect** — Before adding effects, consult the `react-effects` skill (`.xum/skills/react-effects/SKILL.md`). Most effects for derived state, prop resets, or event-triggered logic are anti-patterns.
@@ -54,10 +54,7 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.
 - CRAP gate: `make crap-check` scores the functions you changed. When it (or the report after an agent `git commit`/`git push`) names a function, read the `crap-gate` skill (`.xum/skills/crap-gate/SKILL.md`) before fixing it. In block mode, `Quality / CRAP` violations fail `Required`. Agents must not add the `crap-debt` label or a `Crap-Debt:` trailer without the maintainer's explicit approval for that PR: the label skips every CI block (the trailer skips only local checks: the commit hook and `make crap-check`), and agent PRs run as the maintainer's account, so GitHub cannot tell who added them.
 - DRY and mutation gates: `make dry-check` reports near-duplicate functions that your change makes, and `make mutate-check` reports mutants in the functions you changed that the unit tests do not kill. CI warns unless the `DRY_MODE` or `MUTATION_MODE` repo variable is `block`. Before you fix a finding or accept one with a marker, read the `gauntlet` skill (`.xum/skills/gauntlet/SKILL.md`).
-- `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.
-- `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.
-- `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.
-- To wait on PR checks, a stack or the merge queue, run `./scripts/watch_pr_state.sh <pr>... [--queue]` instead of a hand-written polling loop. It prints each state change, ends on every final state (merged, removed from the queue, closed, failed, ready) and exits 2 on a read it cannot classify. It prints states, counts and GitHub IDs, not check names: after `failed`, list the head commit's checks with `gh pr view <pr_number> --json statusCheckRollup`.
+- To wait on PR checks, a stack or the merge queue, run `./scripts/watch_pr_state.sh <pr>... [--queue]` instead of a hand-written polling loop. It prints each state change, ends on every final state (merged, removed from the queue, closed, failed, ready) and exits 2 on a read it cannot classify. It prints states, counts and GitHub IDs, not check names: after `failed`, list the head commit's checks with `gh pr view <pr_number> --json statusCheckRollup`. The failed count also includes the failures on GitHub's merge commit, which that read does not list, so the count names how many of them there are.
 
 ## Dependencies & Supply Chain
 
@@ -85,6 +82,7 @@ Never `open` a URL that carries a token or another credential: it is readable in
 - If a PR has `coder-agents-review` feedback, address it and reply before resolving: either reply inline on each finding or leave a PR comment that explicitly lists each finding and your response. Do not silently resolve those threads.
 - If a PR has Codex review comments, address + resolve them, then re-request review by commenting `@codex review` on the PR.
 - Prefer `gh` CLI for GitHub interactions over manual web/curl flows. Use `./scripts/wait_pr_ready.sh` for readiness: `gh pr checks` deduplicates names across check suites and can hide failures.
+- A PR that changes UI shows it: put cropped screenshots of each main UI change (and its states, such as pending, error and done) in the PR body, so a human can review it without running the branch. Use the dark theme; add light-theme shots only when the change is interesting across themes (colors, contrast). Capture from the real app (`verify-xum` skill) or a story, crop to the changed area, and add a 375px shot when the narrow layout changed. Host the images on an orphan branch `pr-assets/<pr number>` that holds only them, never on the PR branch (the squash merge would land them in main), and embed them by commit SHA (`https://raw.githubusercontent.com/coder/xum/<sha>/<file>`). Keep that branch after the merge so the links keep working.
 - User preference: use `gh stack` to manage GitHub-native stacked PRs; keep every PR linked in the native stack, not just chained by base branches.
 
 - User preference: when work is already on an open PR, push branch updates at the end of each completed change set so the PR stays current.
@@ -124,7 +122,7 @@ Deferred does not mean fixed. Every deferred fix must have a follow-up: a stacke
 
 ## Testing: HistoryService
 
-HistoryService is pure local disk I/O with a single dependency (`getSessionDir`). **Always use a real instance** via `createTestHistoryService()` (`src/node/services/testHistoryService.ts`) rather than mocking.
+HistoryService is pure local disk I/O. **Always use a real instance** via `createTestHistoryService()` (`src/node/services/testHistoryService.ts`) rather than mocking.
 
 - Partial message lifecycle (`readPartial` / `writePartial` / `deletePartial` / `commitPartial`) is part of HistoryService; there is no separate PartialService.
 - For pre-seeded data: call `historyService.appendToHistory()` in `beforeEach`
@@ -132,7 +130,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - For call tracking: `spyOn(historyService, "method")` without `mockImplementation` — real impl runs, calls are recorded
 - For assertions: read history back with `getHistoryFromLatestBoundary()` or `getLastMessages()` instead of checking mock calls
 
-## Refactoring & Runtime Etiquette
+## Refactoring
 
 - Use `git mv` to retain history when moving files.
 
@@ -141,12 +139,15 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - Prefer **self-healing** behavior: if corrupted or invalid data exists in persisted state (e.g., `chat.jsonl`), the system should sanitize or filter it at load/request time rather than failing permanently.
 - Never let a single malformed line in history brick a workspace—apply defensive filtering in request-building paths so the user can continue working.
 - When streaming crashes, any incomplete state committed to disk should either be repairable on next load or excluded from provider requests to avoid API validation errors.
+- In `src/node/services/memorySecretRedaction.ts`, do not add a pass that rewrites redaction output after the existing passes: an output change after a context-dependent pass (URL userinfo bounds, cookie frames) can make inputs that redact stably redact differently on a second pass (#8126), and whether position-tracked removal is allowed is open in #8143.
 - **Startup-time initialization must never crash the app.** Wrap in try-catch, use timeouts, fall back silently.
 - **`server.lock` liveness is decided by process identity** (pid, start time, boot id, PID namespace and platform; `judgeHolder()` in `src/node/utils/concurrency/processLiveness.ts`), except that a lock with this process's own pid is live only if this process wrote it. The `/version` probe (`src/node/services/xumBackendProbe.ts`) covers only what identity cannot decide, for example macOS, Windows, locks from older builds, and identity that is incomplete or unreadable. Do not add more liveness heuristics (timeouts, extra probes, process-state guesses) to `src/node/services/serverLockfile.ts` or the probe. A lock reader never deletes a lock: `acquire()` replaces a stale one, and its owner's `release()` removes it.
 
 ## Agent Plugins
 
 - Plugin install-method choice is a Draft (`rfc/20261106_plugin-install-method-choice.md` at commit `4a1cf82e1da83bfabc04c340c8f080e2fc3eb7e4` of branch `plugin-install-method-choice-parked`). Before anyone builds it, its design must cover what every other Xum build does to a plugin whose saved manifest that build does not load: hook trust, OAuth sign-ins, the registry row and updates. Never repair state that another build changed: fail closed and let a reinstall review it.
+- Hostile repositories and slow `realpath` (plugin staging, the marketplace list): the fixed limits are the design. A marketplace path has at most 32 folders, a staged tree at most 64 levels, the list checks entry folders with `lstat` before `realpath`, and staging checks links only after the walk. Do not add a rule for each new way a hostile repository's paths or links can make `realpath` slow: a preview that the user started can be slow on a hostile repository.
+- "Update all" review queue (Settings → Plugins, `useUpdateReviewQueue`): do not add mechanism for a palette "Update All Plugins" run that races an open Plugins section. The premise "the section must stay consistent with any palette intent at any time" is banned. The palette cannot open over the Settings dialog (the `isDialogOpen()` gate in `App.tsx`), and `installService.update` refuses a capability-changing update that comes without a consent, and a consent whose `fromSha` is not the installed `lockedSha`, so no capability-changing update applies without current consent. Decline findings that need such a guard.
 
 ## Command Palette & UI Access
 
@@ -161,7 +162,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - For tool call headers, use `ToolIcon` from `src/browser/features/Tools/Shared/ToolPrimitives.tsx`.
 - If a tool/agent provides an emoji string (e.g., todo-derived status or `displayStatus`), render via `EmojiIcon` (`src/browser/components/icons/EmojiIcon/EmojiIcon.tsx`) instead of rendering the emoji.
 - If a new emoji appears in tool output, extend `EmojiIcon` to map it to an SVG icon.
-- Colors defined in `src/browser/styles/globals.css` (`:root @theme` block). Reference via CSS variables (e.g., `var(--color-plan-mode)`), never hardcode hex values.
+- Color tokens are defined in `src/browser/styles/theme-dark.css` (`@theme` block); `globals.css` holds the other themes' overrides. Reference via CSS variables (e.g., `var(--color-plan-mode)`), never hardcode hex values.
 - Tooltips must use the shared `Tooltip`/`TooltipIfPresent` components, not native `title` attributes. Native titles create duplicate OS tooltips and cannot be z-indexed; shared tooltips portal above clipped containers.
 - For incrementing numeric UI (costs, timers, token counts, percentages), use semantic numeric typography utilities (`counter-nums` / `counter-nums-mono`) to prevent width jitter.
 - Choose `counter-nums-mono` only when monospace is an intentional visual style (e.g., terminal/telemetry), not merely as a workaround.
@@ -174,6 +175,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - Never render attacker-controlled data through `dangerouslySetInnerHTML`, `innerHTML`, `outerHTML`, or `insertAdjacentHTML`.
 - Prefer React element trees for highlighting (split + `<mark>` nodes) so React escaping stays in effect.
 - If raw HTML/SVG rendering is unavoidable (e.g., Shiki/Mermaid), require explicit sanitization/hardening and document the trust boundary with a `SECURITY AUDIT` comment at the sink.
+- Checks of repository-controlled plugin rows (backups, marketplaces) must reuse the installer's own rules (source parser, subfolder, ref, `reviewUrlOf`, `pointsAtThisMachine`) instead of a separate grammar. A restore must not make git contact a host that only the backup names, except through a plain https URL that the user reviews.
 
 ## TypeScript Discipline
 
@@ -182,7 +184,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - Apply utility types (`Omit`, `Pick`, etc.) to build UI-specific variants of backend types, preventing unnecessary re-renders and clarifying intent.
 - Let types drive design: prefer discriminated unions for state, minimize runtime checks, and simplify when types feel unwieldy.
 - Use `using` declarations (or equivalent disposables) for processes, file handles, etc., to ensure cleanup even on errors.
-- Centralize magic constants under `src/constants/`; share them instead of duplicating values across layers.
+- Centralize magic constants under `src/constants/` or `src/common/constants/`; share them instead of duplicating values across layers.
 - Never repeat constant values (like keybinds) in comments—they become stale when the constant changes.
 - **Avoid `void asyncFn()`** - fire-and-forget async calls hide race conditions. When state is observable by other code (in-memory cache, event emitters), ensure visibility order matches invariants. If memory and disk must stay in sync, persist before updating memory so observers see consistent state.
 - **Avoid `setTimeout` for component coordination** - racy and fragile; use callbacks or effects.
@@ -231,12 +233,12 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 
 ## Debugging & Diagnostics
 
-- Debug CLI (`src/cli/debug/index.ts`): `bun run debug list-workspaces`, `bun run debug costs <workspace-id>`, `bun run debug send-message <workspace-id> [--edit <message-id>] [--message <text>]`. Workspace names live in `~/.xum/sessions/`. To inspect raw provider requests, enable API Debug Logs and read `~/.xum/sessions/<workspace>/devtools.jsonl`.
+- Debug CLI (`src/cli/debug/index.ts`): `bun run debug list-workspaces`, `bun run debug costs <workspace-id>`, `bun run debug send-message <workspace-id> [--edit <message-id>] [--message <text>]`. Workspace IDs are the directory names in `~/.xum/sessions/`. To inspect raw provider requests, enable API Debug Logs and read `~/.xum/sessions/<workspace>/devtools.jsonl`.
 
 ## UX Guardrails
 
 - Do not add UX flourishes (auto-dismiss, animations, tooltips, etc.) unless requested. Ship the simplest behavior that meets requirements.
-- Enforce DRY: if you repeat code/strings, factor a shared helper/constant (search first; if cross-layer, move to `src/constants/` or `src/common/types/`).
+- Enforce DRY: if you repeat code/strings, factor a shared helper/constant (search first; if cross-layer, move to `src/constants/`, `src/common/constants/` or `src/common/types/`).
 - Hooks that detect a condition should handle it directly when they already have the data—avoid unnecessary callback hop chains.
 - Every operation must have a keyboard shortcut. The keyboard shortcut should not be visible on mobile views.
 
@@ -257,12 +259,8 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 
 ## UI Component Testability (tests/ui)
 
-- **Radix Popover portals don't work in happy-dom** — content renders to `document.body` via portal but happy-dom doesn't support this properly. Popover content won't appear in tests.
-- **Use conditional rendering for testability:** Components like `AgentModePicker` use `{isOpen && <div>...}` instead of Radix Portal. This renders inline and works in happy-dom.
-- When adding new dropdown/popover components that need tests/ui coverage, prefer the conditional rendering pattern over Radix Portal.
-- E2E tests (tests/e2e) work with Radix but are slow (~2min startup); reserve for scenarios that truly need real Electron.
+- Read the `tests` skill (`.xum/skills/tests/SKILL.md`) before you write or change tests. It covers the doctrine, the commands, and the `tests/ui` and happy-dom conventions.
 - **Storybook responsive/Pixel validation:** Do not prove responsive snapshots by only resizing `iframe.html`; that bypasses the Pixel viewport matrix configuration. If a story depends on a breakpoint (wide gutters, mobile), pin an explicit `parameters.pixel.matrix.viewports` variant (named widths: phone 390, tablet 744, laptop 1200, desktop 1900), mirror it with story `globals.viewport` for local viewing, and validate through the Storybook manager or an equivalent viewport-pinned check. Pixel does not emulate touch, so `pointer: coarse` media queries never match in snapshots; touch-only affordances need play/static contracts instead. Add a play/static contract when a missing variant would silently snapshot the wrong UI. Caveat: the Storybook test-runner (CI `Test / Storybook`) applies neither `globals.viewport` nor Pixel matrix variants, plays execute at desktop window size, so breakpoint-dependent play assertions must force the narrow width themselves (fixed-width wrapper/decorator, as in `App.phoneViewports.stories.tsx`) or guard on the rendered width before asserting.
-- Only use `validateApiKeys()` in tests that actually make AI API calls.
 
 ## Bug Bash and Repro Tests (tests/bugbash)
 
@@ -273,13 +271,9 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 - One reviewed exception (#7027, #7029): `BUGBASH_SCENARIO=scripted-tools` runs the app with agent tools on, so repros can see the real tool block. Its only model is a fixed loopback script (`tests/bugbash/scriptedModel.ts`) that ignores typed text and calls only `todo_write` and `file_read` of the seeded README.md. `startApp.ts` refuses it outside the sandbox, in a model-driven job and with a mounted proxy socket, and keeps terminals and project automation off. Only the exact-step sandbox job (`make test-bugbash-repros-sandbox`: no network, no proxy, no explorer model) selects its `tools-on` repros. Do not add tool calls to that script, or run it with a model, without a new security review.
 - A finding is a bug only once a repro fails for the reported reason. Put it in `tests/bugbash/repros/<slug>.e2e.ts` (tracked). Use exact `screen`/`browser`/`expect` steps where they work. A repro may use `agent.*` steps only when each of its tests has the `agent` tag (`tests/bugbash/reproRules.test.ts` enforces this): the free runs pass `--exclude-tag agent`, so only a model-driven sandbox job runs it: `make test-stories` (needs `BUGBASH_BUDGET_USD`). CI's `Stories` workflow (`.github/workflows/stories.yml`) runs that target with Sonnet 5.5 in the merge queue (pr.yml's `Test / Stories` job, which `Required` counts only when the repo variable `STORIES_MODE` is `block`), nightly on main and on demand, and with Haiku 5.5 on each push to a PR that is not a draft (`Test / Stories (Haiku)`, where Sonnet 5.5 judges the story tests' asserts and Haiku the agent repros', and which `Required` counts only when `STORIES_PR_MODE` is `block`). That target also runs the story tests, user stories that an agent drives in `tests/stories/*.e2e.ts`, and the Electron stories in `tests/stories/electron/*.e2e.ts` on Xum Electron under Xvfb (it runs `make electron-binary` first). Prove it: restore the bug in a scratch edit, rebuild, see `ASSERTION_FAILED` on the bug's own assertion, then restore and see it pass.
 - Tags: `bugbash` plus the bug ID. Add `mock-only` when the test needs a `[mock:...]` prompt or a terminal. Add `known-failure` plus the issue number for an open bug, and remove that tag in the PR that fixes it. Add `tools-on` when the test needs the scripted-tools scenario: only `make test-bugbash-repros-sandbox` selects it.
-- `make test-bugbash-repros` runs the repros (known failures excluded), and `make test-bugbash-known-failures` runs the open-bug repros. `make test-e2e` runs the repros after Playwright unless `BUGBASH_REPROS=0`. CI runs them once, on linux shard 1, with the mock: in the merge queue, and on PR pushes only when the PR changes `tests/e2e`, `tests/bugbash`, `playwright.config.ts`, `pr.yml`, `Makefile`, `package.json` or `bun.lock`. Locally they need Node 22.22.3+ or 24.8+ (`E2E_NODE`) and `node_modules/.bin/e2e-web install chromium`. With a provider key set, `BUGBASH_AI=auto` makes paid app-model calls (Haiku 5.5): use `BUGBASH_AI=mock` for none.
-- CI's `Test / Bug-bash sandbox` job runs `make bug-bash-sandbox-check` and `make test-bugbash-repros-sandbox` without secrets, and `Required` needs it. It runs in the merge queue, and on PR pushes only when the PR changes the same files. To run it (and the other queue-only jobs) before the queue, dispatch the PR workflow on the branch.
+- `make test-bugbash-repros` runs the repros (known failures excluded), and `make test-bugbash-known-failures` runs the open-bug repros. `make test-e2e` runs the repros after Playwright unless `BUGBASH_REPROS=0`. CI runs them once, on linux shard 1, with the mock: in the merge queue, and on PR pushes only when the PR changes a path in the `e2e_tests` filter of `pr.yml`. Locally they need Node 22.22.3+ or 24.8+ (`E2E_NODE`) and `node_modules/.bin/e2e-web install chromium`. With a provider key set, `BUGBASH_AI=auto` makes paid app-model calls (Haiku 5.5): use `BUGBASH_AI=mock` for none.
+- CI's `Test / Bug-bash sandbox` job runs `make bug-bash-sandbox-check` and `make test-bugbash-repros-sandbox` without secrets, and `Required` needs it. It runs in the merge queue, and on PR pushes only when the PR changes a path in the same filter. To run it (and the other queue-only jobs) before the queue, dispatch the PR workflow on the branch.
 
 ## Tool: todo_write
 
 - Keep the TODO list current during multi-step work; sidebar progress is derived from it.
-
-## GitHub
-
-Many tasks involve reading and writing from GitHub, prefer the `gh` CLI over web search and manual curl requests when helping the User.

@@ -53,12 +53,15 @@ describe("NEW_SIDEBAR_TAB keybind", () => {
   });
 });
 
-describe("workspace actions menu keybinds (#6328)", () => {
+describe("Cmd/Ctrl+Option/Alt+Shift chords: workspace actions menu (#6328), sandbox approvals", () => {
   const keys = [
     ["FORK_WORKSPACE", "KeyB", "\u222b"],
     ["STOP_WORKSPACE_RUNTIME", "KeyX", "\u02db"],
     ["MARK_WORKSPACE_UNREAD", "KeyM", "\u00c2"],
     ["TOGGLE_COMPLETED_SUB_AGENTS", "KeyA", "\u00c5"],
+    ["RUN_OUTSIDE_SANDBOX", "KeyY", "\u00c1"],
+    ["DENY_OUTSIDE_SANDBOX", "KeyN", "\u02dc"],
+    ["OPEN_CREATION_ENVIRONMENT", "KeyE", "\u00b4"],
   ] as const;
 
   test("macOS: Cmd+Option+Shift on the physical key, whatever character Option makes", () => {

@@ -224,6 +224,54 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
     ]);
   });
 
+  /** Makes the runtime fail to delete this workspace's checkout and name no leftover. */
+  function failDiskDeletionOf(workspaceName: string) {
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- applied with the runtime as this
+    const deleteWorkspace = WorktreeRuntime.prototype.deleteWorkspace;
+    spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockImplementation(function (
+      this: WorktreeRuntime,
+      ...args: Parameters<WorktreeRuntime["deleteWorkspace"]>
+    ) {
+      if (args[1] !== workspaceName) return deleteWorkspace.apply(this, args);
+      return Promise.resolve({ success: false, error: "teardown failed" });
+    });
+  }
+
+  // A forced removal drops the row even when the disk deletion failed. With no named leftover it
+  // used to say nothing, so a caller could not tell that the checkout may still exist.
+  test("a descendant whose forced disk deletion failed is returned as a warning", async () => {
+    failDiskDeletionOf(childId);
+
+    const result = await removeRootWithTree();
+
+    expect(result.success).toBe(true);
+    expect(result.warnings).toEqual([
+      {
+        kind: "leftover",
+        description: `${checkouts.get(childId)!} could not be deleted (teardown failed) and may still exist; remove it manually.`,
+      },
+    ]);
+    expect(findWorkspaceInConfig(a.config, childId)).toBeUndefined();
+  });
+
+  test("a forced task_remove whose disk deletion failed says the work may remain", async () => {
+    failDiskDeletionOf(grandchildId);
+    const checkout = checkouts.get(grandchildId)!;
+    await fsPromises.writeFile(path.join(checkout, "notes.txt"), "unsaved\n");
+
+    const result = await a.taskService.removeInactiveDescendantAgentTask(rootId, grandchildId, {
+      lossyWorkPolicy: "force",
+    });
+
+    expect(result.success).toBe(true);
+    const data = result.success ? result.data : undefined;
+    expect(data?.status).toBe("removed");
+    expect(data?.paths).toEqual(["notes.txt"]);
+    expect(data?.deletedWork).toContain(checkout);
+    expect(data?.deletedWork).toContain("may remain");
+    expect(findWorkspaceInConfig(a.config, grandchildId)).toBeUndefined();
+  });
+
   // #5028: the mark a task gets when the write ending it rejects (#4747) is in-memory only and
   // has no reader once the row is gone. White-box: the leak is its only observable effect.
   test("removing tasks drops their unpersisted-end marks", async () => {

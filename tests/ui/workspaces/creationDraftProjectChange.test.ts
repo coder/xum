@@ -52,8 +52,9 @@ async function pickProject(container: HTMLElement, label: string): Promise<void>
   if (!trigger) throw new Error("Project selector not found");
   fireEvent.click(trigger);
   const option = await waitFor(() => {
+    // A row also shows the project's path, so match on its label alone.
     const candidate = Array.from(document.querySelectorAll<HTMLElement>('[role="option"]')).find(
-      (element) => element.textContent?.trim() === label
+      (element) => element.querySelector("[data-filter-list-label]")?.textContent?.trim() === label
     );
     if (!candidate) throw new Error(`Project option '${label}' not found`);
     return candidate;
@@ -235,7 +236,10 @@ describeIntegration("Creation draft project change", () => {
       const option = await waitFor(() => {
         const candidate = Array.from(
           document.querySelectorAll<HTMLElement>('[role="option"]')
-        ).find((element) => element.textContent?.trim() === subLabel);
+        ).find(
+          (element) =>
+            element.querySelector("[data-filter-list-label]")?.textContent?.trim() === subLabel
+        );
         if (!candidate) throw new Error(`Project option '${subLabel}' not found`);
         return candidate;
       });

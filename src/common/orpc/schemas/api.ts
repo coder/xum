@@ -89,11 +89,8 @@ import {
   McpAppViewSchema,
 } from "./mcpApps";
 import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
-import {
-  RuntimeConfigSchema,
-  RuntimeAvailabilitySchema,
-  RuntimeEnablementIdSchema,
-} from "./runtime";
+import { RuntimeConfigSchema, RuntimeAvailabilitySchema } from "./runtime";
+import { IsolationChoiceSchema } from "@/common/schemas/isolation";
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
@@ -301,6 +298,9 @@ export { perfCaptures } from "./perfCaptures";
 
 // Re-export agent resource limit schemas
 export { agentResourceLimits } from "./agentResourceLimits";
+
+// Re-export macOS agent sandbox schemas
+export { agentSandbox } from "./agentSandbox";
 
 // Re-export "Report slowness" bundle schemas
 export { perfReports } from "./perfReports";
@@ -941,6 +941,11 @@ export const projects = {
     input: z.object({ projectPath: z.string() }),
     output: BranchListResultSchema,
   },
+  /** Host aliases from ~/.ssh/config, to suggest on the new-workspace page. */
+  listSshConfigHosts: {
+    input: z.void(),
+    output: z.object({ hosts: z.array(z.string()) }),
+  },
   gitInit: {
     input: z.object({ projectPath: z.string() }),
     output: ResultSchema(z.void(), z.string()),
@@ -948,6 +953,18 @@ export const projects = {
   setTrust: {
     input: z.object({ projectPath: z.string(), trusted: z.boolean() }),
     output: z.void(),
+  },
+  // Trust for one SSH+None directory of a project (ProjectConfig.trustedSshDirectories).
+  // Granting requires the project itself to be trusted. Returns the stored (resolved) projectDir.
+  setSshDirectoryTrust: {
+    input: z.object({
+      projectPath: z.string(),
+      host: z.string(),
+      port: z.number().int().nullish(),
+      projectDir: z.string(),
+      trusted: z.boolean(),
+    }),
+    output: ResultSchema(z.object({ projectDir: z.string() }), z.string()),
   },
   setDisplayName: {
     input: z
@@ -2184,6 +2201,20 @@ export const workspace = {
       .strict(),
     output: ResultSchema(z.void(), z.string()),
   },
+  /**
+   * Answers the sandbox approval card of one bash call: approved runs that one call outside the
+   * sandbox. Only the user calls it; sandboxed commands do not get the server token.
+   */
+  answerSandboxApproval: {
+    input: z
+      .object({
+        workspaceId: z.string(),
+        toolCallId: z.string(),
+        approved: z.boolean(),
+      })
+      .strict(),
+    output: ResultSchema(z.void(), z.string()),
+  },
   answerDelegatedToolCall: {
     input: z
       .object({
@@ -3399,7 +3430,7 @@ export const config = {
       coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS),
       worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS),
       runtimeEnablement: z.record(z.string(), z.boolean()),
-      defaultRuntime: z.string().nullable(),
+      defaultIsolation: IsolationChoiceSchema.nullable(),
       agentAiDefaults: AgentAiDefaultsSchema,
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
@@ -3529,7 +3560,8 @@ export const config = {
       .object({
         projectPath: z.string().nullish(),
         runtimeEnablement: z.record(z.string(), z.boolean()).nullish(),
-        defaultRuntime: RuntimeEnablementIdSchema.nullish(),
+        // null clears the default (project override or global); undefined leaves it unchanged.
+        defaultIsolation: IsolationChoiceSchema.nullish(),
         runtimeOverridesEnabled: z.boolean().nullish(),
       })
       .strict(),

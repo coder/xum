@@ -52,7 +52,7 @@ interface Internals {
     identity: {
       attemptId: string;
       receiptEligible: boolean;
-      inheritedReport: boolean;
+      inheritedReport: null;
       abortSignal?: AbortSignal;
     }
   ) => unknown;
@@ -442,7 +442,7 @@ describe("TaskService queue drain: reservations, refusals and launch leases", ()
         internals(taskService).beginOwnedTaskAttempt("child", "reservation", {
           attemptId: RESERVED_ATTEMPT_ID,
           receiptEligible: true,
-          inheritedReport: false,
+          inheritedReport: null,
           abortSignal: reservation.signal,
         });
       }

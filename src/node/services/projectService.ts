@@ -12,7 +12,12 @@ import {
   isInsideGitRepository,
   stripTrailingSlashes,
 } from "@/node/utils/pathUtils";
-import { listLocalBranches, detectDefaultTrunkBranch } from "@/node/git";
+import {
+  listLocalBranches,
+  listRecentLocalBranches,
+  detectDefaultTrunkBranch,
+  detectRepositoryDefaultBranch,
+} from "@/node/git";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { Secret } from "@/common/types/secrets";
@@ -63,7 +68,13 @@ import {
   withProjectRegistrationFileLock,
   withProjectRegistrationLock,
 } from "@/node/config/projectRegistrationLock";
-import { isProjectTrusted, isProjectTrustedIn } from "@/node/utils/projectTrust";
+import { isProjectTrusted, isProjectTrustedIn, trustOwnerPathIn } from "@/node/utils/projectTrust";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import {
+  applySshDirectoryTrust,
+  parseSshDirectoryTrustTarget,
+  TRUST_PROJECT_FIRST_ERROR,
+} from "@/common/utils/sshDirectoryTrust";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -1000,7 +1011,12 @@ export class ProjectService {
     const trusted = [...projects.keys()].filter((projectPath) =>
       isProjectTrustedIn(projects, projectPath)
     );
-    return JSON.stringify(trusted.sort());
+    // Trusted SSH+None directories gate project plugins too, so a change to them counts.
+    return JSON.stringify(
+      trusted
+        .sort()
+        .map((projectPath) => [projectPath, projects.get(projectPath)?.trustedSshDirectories ?? []])
+    );
   }
 
   async *cloneWithProgress(
@@ -1808,7 +1824,11 @@ export class ProjectService {
       }
 
       const recommendedTrunk = await detectDefaultTrunkBranch(normalizedPath, branches);
-      return { branches, recommendedTrunk };
+      // Recency only orders the picker, so a failure here must not fail the list (the list is
+      // the creation page's send barrier).
+      const recentBranches = await listRecentLocalBranches(normalizedPath).catch(() => []);
+      const defaultBranch = await detectRepositoryDefaultBranch(normalizedPath, branches);
+      return { branches, recommendedTrunk, defaultBranch, recentBranches };
     } catch (error) {
       log.error("Failed to list branches:", error);
       throw error instanceof Error ? error : new Error(String(error));
@@ -2108,11 +2128,25 @@ export class ProjectService {
       return config;
     });
 
-    const affectedPaths = [normalizedPath];
-    for (const [candidatePath, project] of this.config.loadConfigOrDefault().projects) {
+    this.publishProjectTrust(normalizedPath);
+  }
+
+  /**
+   * Publish the trust of `projectPath` and its sub-projects to the MCP manager. Each update
+   * carries the owner's trusted SSH directories so the manager computes per-workspace trust (an
+   * SSH+None workspace also needs its directory trusted) instead of applying the project-wide bit.
+   */
+  private publishProjectTrust(projectPath: string): void {
+    const projects = this.config.loadConfigOrDefault().projects;
+    // Directory trust lives on the trust owner (a sub-project's parent).
+    const trustedSshDirectories = projects.get(
+      trustOwnerPathIn(projects, projectPath)
+    )?.trustedSshDirectories;
+    const affectedPaths = [projectPath];
+    for (const [candidatePath, project] of projects) {
       if (
         project.parentProjectPath !== undefined &&
-        stripTrailingSlashes(project.parentProjectPath) === normalizedPath
+        stripTrailingSlashes(project.parentProjectPath) === projectPath
       ) {
         affectedPaths.push(candidatePath);
       }
@@ -2121,7 +2155,8 @@ export class ProjectService {
       this.mcpServerManager?.applyProjectTrust(
         affectedPaths.map((candidatePath) => ({
           projectPath: candidatePath,
-          trusted: isProjectTrusted(this.config, candidatePath),
+          trusted: isProjectTrustedIn(projects, candidatePath),
+          trustedSshDirectories,
         }))
       );
     } finally {
@@ -2129,6 +2164,72 @@ export class ProjectService {
       // trust change is published, even when the MCP update throws; synchronous, never throws.
       clearRemoteProjectPluginSnapshots();
     }
+  }
+
+  /**
+   * Trust or untrust one SSH+None directory for a project. The directory is not the local
+   * project, so project trust alone does not cover it (isWorkspaceDirTrusted); this grant does,
+   * and only while the project itself stays trusted. Granting requires a trusted project.
+   *
+   * projectDir is stored as SSH+None workspaces persist it: absolute, resolved on the host the
+   * way workspace creation resolves it (~ and relative paths need the host). Returns the stored
+   * projectDir.
+   */
+  async setSshDirectoryTrust(input: {
+    projectPath: string;
+    host: string;
+    port?: number | null;
+    projectDir: string;
+    trusted: boolean;
+  }): Promise<Result<{ projectDir: string }, string>> {
+    const target = parseSshDirectoryTrustTarget(input);
+    if (!target.success) {
+      return Err(target.error);
+    }
+    const rawDirectory = target.data;
+    const trustOwnerPath = trustOwnerPathIn(
+      this.config.loadConfigOrDefault().projects,
+      input.projectPath
+    );
+    if (input.trusted && !isProjectTrusted(this.config, trustOwnerPath)) {
+      return Err(TRUST_PROJECT_FIRST_ERROR);
+    }
+
+    let projectDir = rawDirectory.projectDir;
+    if (!projectDir.startsWith("/")) {
+      try {
+        projectDir = await createRuntime({
+          type: "ssh",
+          ...rawDirectory,
+          // Unused by resolvePath; any valid value.
+          srcBaseDir: "~/mux",
+          workspaceIsolation: "none",
+        }).resolvePath(rawDirectory.projectDir);
+      } catch (error) {
+        return Err(
+          `Failed to resolve ${rawDirectory.projectDir} on ${rawDirectory.host}: ${getErrorMessage(error)}`
+        );
+      }
+    }
+    const directory = { ...rawDirectory, projectDir };
+
+    try {
+      await this.config.editConfig((config) => {
+        // Re-checks project trust under the config lock: it may have been revoked meanwhile.
+        applySshDirectoryTrust(
+          config.projects.get(trustOwnerPath),
+          trustOwnerPath,
+          directory,
+          input.trusted
+        );
+        return config;
+      });
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+
+    this.publishProjectTrust(trustOwnerPath);
+    return Ok({ projectDir });
   }
 
   async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {

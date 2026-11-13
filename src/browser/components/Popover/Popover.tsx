@@ -3,6 +3,7 @@ import * as PopoverPrimitive from "@radix-ui/react-popover";
 
 import { cn } from "@/common/lib/utils";
 import { useSafeAreaCollisionPadding } from "@/browser/hooks/useSafeAreaCollisionPadding";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
 
 const Popover = PopoverPrimitive.Root;
 
@@ -44,4 +45,17 @@ const PopoverContent = React.forwardRef<
 );
 PopoverContent.displayName = PopoverPrimitive.Content.displayName;
 
-export { Popover, PopoverTrigger, PopoverContent, PopoverAnchor };
+/**
+ * Content props for a popover opened with `<Popover modal>` that holds its own controls (rows,
+ * fields, a filter). The page has several global key listeners (shortcuts, the composer's
+ * suggestion menu); giving each an exception for each popover did not hold up in review. Instead
+ * the popover is modal: `aria-modal` makes isDialogOpen() true, so shortcuts stand down, and keys
+ * pressed inside stop here, so document listeners never act on them. Radix closes on Escape in
+ * the capture phase, before this runs.
+ */
+const MODAL_POPOVER_CONTENT_PROPS = {
+  "aria-modal": true,
+  onKeyDown: stopKeyboardPropagation,
+} as const;
+
+export { Popover, PopoverTrigger, PopoverContent, PopoverAnchor, MODAL_POPOVER_CONTENT_PROPS };

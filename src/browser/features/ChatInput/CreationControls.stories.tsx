@@ -1,13 +1,13 @@
 import { useState, type ComponentProps, type ReactNode, useEffect, useMemo } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import type { WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import {
   mockCoderInfoAvailable,
   mockCoderInfoMissing,
@@ -21,11 +21,8 @@ import {
   type ParsedRuntime,
   type RuntimeAvailabilityStatus,
 } from "@/common/types/runtime";
-import {
-  CreationControls,
-  RuntimeButtonGroup,
-  type RuntimeButtonGroupProps,
-} from "./CreationControls";
+import type { CoderInfo } from "@/common/orpc/schemas/coder";
+import { CreationControls } from "./CreationControls";
 import type { RuntimeAvailabilityState } from "./useCreationWorkspace";
 import {
   SettingsSectionStory,
@@ -86,30 +83,6 @@ const DEVCONTAINER_MULTI_CONFIG = getLoadedRuntimeAvailability({
   ],
 });
 
-const BASE_ARGS = {
-  value: RUNTIME_MODE.WORKTREE,
-  defaultMode: RUNTIME_MODE.WORKTREE,
-  onChange: fn(),
-  runtimeAvailabilityState: getLoadedRuntimeAvailability({ available: true }),
-} satisfies RuntimeButtonGroupProps;
-
-const meta = {
-  ...lightweightMeta,
-  title: "App/Chat/Creation Controls",
-  component: RuntimeButtonGroup,
-  render: (args) => (
-    <div className="bg-background p-6">
-      <div className="w-full max-w-64">
-        <RuntimeButtonGroup {...args} />
-      </div>
-    </div>
-  ),
-} satisfies Meta<typeof RuntimeButtonGroup>;
-
-export default meta;
-
-type Story = StoryObj<typeof meta>;
-
 type CreationControlsProps = ComponentProps<typeof CreationControls>;
 
 const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
@@ -122,7 +95,6 @@ const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
   onTrunkBranchChange: fn(),
   coderConfigFallback: {},
   sshHostFallback: "devbox.internal",
-  defaultRuntimeMode: RUNTIME_MODE.WORKTREE,
   disabled: false,
   projectPath: "/home/user/projects/my-app",
   userProjects: new Map(),
@@ -164,55 +136,124 @@ function DevcontainerCreationControlsStory(props: {
   );
 }
 
-async function openWorkspaceTypeMenu(storyRoot: HTMLElement): Promise<void> {
-  const canvas = within(storyRoot);
-  const trigger = await canvas.findByLabelText("Workspace type", {}, { timeout: 10000 });
-  await userEvent.click(trigger);
+/** The project and workspace isolation selects, driven by a real selection state. */
+function IsolationPickerStory(props: {
+  runtimeAvailabilityState: RuntimeAvailabilityState;
+  coderInfo?: CoderInfo | null;
+  initialRuntime?: ParsedRuntime;
+  /** Pins a phone-width container; the test-runner plays at desktop size (AGENTS.md). */
+  phoneWidth?: boolean;
+  /** The story's project is trusted (SSH+None directory trust is offered only then). */
+  trustedProject?: boolean;
+}) {
+  const [selectedRuntime, setSelectedRuntime] = useState<ParsedRuntime>(
+    props.initialRuntime ?? { mode: RUNTIME_MODE.WORKTREE }
+  );
+
+  return (
+    <SettingsSectionStory setup={() => setupSettingsStory({})}>
+      <div className={props.phoneWidth ? "bg-background p-2" : "bg-background p-6"}>
+        <div
+          className={props.phoneWidth ? "w-[375px]" : "max-w-3xl"}
+          data-testid="isolation-picker-frame"
+        >
+          <CreationControls
+            {...DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS}
+            selectedRuntime={selectedRuntime}
+            onSelectedRuntimeChange={setSelectedRuntime}
+            runtimeAvailabilityState={props.runtimeAvailabilityState}
+            coderInfo={props.coderInfo}
+            userProjects={
+              props.trustedProject
+                ? new Map([
+                    [
+                      DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS.projectPath,
+                      { workspaces: [], trusted: true },
+                    ],
+                  ])
+                : DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS.userProjects
+            }
+          />
+        </div>
+      </div>
+    </SettingsSectionStory>
+  );
+}
+
+const meta = {
+  ...lightweightMeta,
+  title: "App/Chat/Creation Controls",
+  component: IsolationPickerStory,
+  args: {
+    runtimeAvailabilityState: getLoadedRuntimeAvailability({ available: true }),
+  },
+} satisfies Meta<typeof IsolationPickerStory>;
+
+export default meta;
+
+type Story = StoryObj<typeof meta>;
+
+/**
+ * Opens the environment panel from its chip. The panel is portaled, so its rows and fields are
+ * queried on document.body.
+ */
+async function openEnvironmentPanel(storyRoot: HTMLElement): Promise<void> {
+  const chip = await within(storyRoot).findByTestId("creation-environment", {}, { timeout: 10000 });
+  if (chip.getAttribute("aria-expanded") !== "true") await userEvent.click(chip);
+  await within(document.body).findByRole("radiogroup", { name: "Project isolation" });
 }
 
 /** Coder option is visible and selectable when Coder CLI is available. */
 export const CoderAvailable: Story = {
   args: {
-    ...BASE_ARGS,
     coderInfo: mockCoderInfoAvailable,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openWorkspaceTypeMenu(storyRoot);
-    await within(document.body).findByRole("option", { name: /^Coder/i }, { timeout: 10000 });
+    await openEnvironmentPanel(storyRoot);
+    await within(document.body).findByRole("radio", { name: /^Coder/i }, { timeout: 10000 });
     await userEvent.keyboard("{Escape}");
+
+    // Closing returns focus to the chip without opening its tooltip, which would cover the
+    // project heading above it.
+    const chip = within(storyRoot).getByTestId("creation-environment");
+    await waitFor(() => expect(chip).toHaveFocus());
+    await expect(within(document.body).queryByRole("tooltip")).toBeNull();
   },
 };
 
 /** Coder option is hidden when Coder CLI is missing. */
 export const CoderNotAvailable: Story = {
+  // Its closed-menu snapshot is the same as CoderAvailable's; the play checks the behavior.
+  parameters: { pixel: PIXEL_DISABLED },
   args: {
-    ...BASE_ARGS,
     coderInfo: mockCoderInfoMissing,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openWorkspaceTypeMenu(storyRoot);
-    await within(document.body).findByRole("option", { name: /^SSH/i }, { timeout: 10000 });
-    await expect(within(document.body).queryByRole("option", { name: /^Coder/i })).toBeNull();
+    await openEnvironmentPanel(storyRoot);
+    await within(document.body).findByRole("radio", { name: /^SSH/i }, { timeout: 10000 });
+    await expect(within(document.body).queryByRole("radio", { name: /^Coder/i })).toBeNull();
     await userEvent.keyboard("{Escape}");
   },
 };
 
 /** Coder option remains visible but disabled when CLI version is outdated. */
 export const CoderOutdated: Story = {
+  // Closed, the chip looks the same as CoderAvailable's; the play checks the disabled row. This
+  // keeps the Pixel snapshot budget level now that EnvironmentPanelOpen snapshots the open panel.
+  parameters: { pixel: PIXEL_DISABLED },
   args: {
-    ...BASE_ARGS,
     coderInfo: mockCoderInfoOutdated,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openWorkspaceTypeMenu(storyRoot);
+    await openEnvironmentPanel(storyRoot);
     const coderOption = await within(document.body).findByRole(
-      "option",
+      "radio",
       { name: /^Coder/i },
       { timeout: 10000 }
     );
@@ -227,20 +268,86 @@ export const CoderOutdated: Story = {
 /** Dev container runtime unavailable (option remains visible but disabled). */
 export const DevcontainerUnavailable: Story = {
   args: {
-    ...BASE_ARGS,
     runtimeAvailabilityState: DEVCONTAINER_UNAVAILABLE,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openWorkspaceTypeMenu(storyRoot);
+    await openEnvironmentPanel(storyRoot);
 
-    const devcontainerOption = await within(document.body).findByRole("option", {
+    const devcontainerOption = await within(document.body).findByRole("radio", {
       name: /^Dev container/i,
     });
 
     await expect(devcontainerOption).toHaveAttribute("aria-disabled", "true");
     await userEvent.keyboard("{Escape}");
+  },
+};
+
+/**
+ * SSH with no workspace isolation runs in an existing directory on the host. The containers have no
+ * SSH backend yet, so they stay listed but disabled with the reason.
+ */
+export const SshWithoutIsolation: Story = {
+  // On a phone the environment panel spans the viewport and its columns stack, so this story is
+  // the phone snapshot of the creation controls, with the panel left open.
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  args: {
+    phoneWidth: true,
+    trustedProject: true,
+    initialRuntime: {
+      mode: "ssh",
+      host: "devbox.internal",
+      workspaceIsolation: "none",
+      projectDir: "~/src/my-app",
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(storyRoot);
+    const body = within(document.body);
+
+    // Narrow-layout contract: the chip stays inside the phone-width frame.
+    const frame = canvas.getByTestId("isolation-picker-frame").getBoundingClientRect();
+    const chip = await canvas.findByTestId("creation-environment", {}, { timeout: 10000 });
+    await expect(chip.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
+    // Closed, the chip names the host and the shared directory, not "SSH" and "None".
+    await expect(chip).toHaveTextContent("devbox.internal");
+    await expect(chip).toHaveTextContent("~/src/my-app");
+
+    // The project is trusted but this host directory is not: its own trust is offered, on the
+    // page (checked before the panel opens: the panel is modal and hides the page from queries).
+    await expect(canvas.getByRole("button", { name: "Trust directory" })).toBeVisible();
+
+    await openEnvironmentPanel(storyRoot);
+    await expect(await body.findByLabelText("Project directory on host")).toHaveValue(
+      "~/src/my-app"
+    );
+    await expect(body.getByLabelText("Host")).toHaveValue("devbox.internal");
+
+    const dockerOption = await body.findByRole("radio", { name: /^Docker/i });
+    await expect(dockerOption).toHaveAttribute("aria-disabled", "true");
+    await expect(dockerOption).toHaveTextContent("Not yet supported on SSH projects");
+  },
+};
+
+/**
+ * The environment panel open on the default selection: where it runs, the isolation and the base
+ * branch side by side, with the branch list filtered.
+ */
+export const EnvironmentPanelOpen: Story = {
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const body = within(document.body);
+
+    await openEnvironmentPanel(storyRoot);
+    const filter = await body.findByRole("combobox", { name: "Select source branch" });
+    await userEvent.type(filter, "dev");
+    // Filtering narrows the list to the match and keeps the selection.
+    await expect(body.getByRole("option", { name: "develop" })).toBeVisible();
+    await expect(body.queryByRole("option", { name: "main" })).toBeNull();
+    await expect(within(storyRoot).getByTestId("creation-environment")).toHaveTextContent("main");
   },
 };
 
@@ -250,12 +357,14 @@ export const DevcontainerSingleConfig: Story = {
     <DevcontainerCreationControlsStory runtimeAvailabilityState={DEVCONTAINER_SINGLE_CONFIG} />
   ),
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
+    const body = within(document.body);
 
-    const configSelect = await canvas.findByRole("combobox", { name: "Dev container config" });
+    // The config sits under the Dev container row of the environment panel.
+    await openEnvironmentPanel(canvasElement);
+    const configSelect = await body.findByRole("combobox", { name: "Dev container config" });
     await expect(configSelect).toBeEnabled();
     await expect(
-      canvas.findByText("Default (.devcontainer/devcontainer.json)")
+      body.findByText("Default (.devcontainer/devcontainer.json)")
     ).resolves.toBeInTheDocument();
   },
 };
@@ -266,8 +375,9 @@ export const DevcontainerMultiConfig: Story = {
     <DevcontainerCreationControlsStory runtimeAvailabilityState={DEVCONTAINER_MULTI_CONFIG} />
   ),
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
+    const canvas = within(document.body);
 
+    await openEnvironmentPanel(canvasElement);
     const configSelect = await canvas.findByRole("combobox", { name: "Dev container config" });
     await userEvent.click(configSelect);
 
@@ -337,7 +447,6 @@ const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   selectedRuntime: { mode: RUNTIME_MODE.WORKTREE },
   coderConfigFallback: {},
   sshHostFallback: "devbox",
-  defaultRuntimeMode: RUNTIME_MODE.WORKTREE,
   onSelectedRuntimeChange: fn(),
   disabled: false,
   projectPath: CREATION_PROJECT_PATH,
@@ -345,7 +454,7 @@ const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   onSelectedProjectPathChange: fn(),
   projectSelectDisabled: false,
   projectName: "my-project",
-  runtimeAvailabilityState: BASE_ARGS.runtimeAvailabilityState,
+  runtimeAvailabilityState: getLoadedRuntimeAvailability({ available: true }),
   nameState: BASE_CREATION_NAME_STATE,
 } satisfies CreationControlsProps;
 

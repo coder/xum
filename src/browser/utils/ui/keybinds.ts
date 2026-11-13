@@ -405,6 +405,18 @@ export const KEYBINDS = {
   /** Discard the oldest held (refused, unsent) message from an empty composer */
   DISCARD_HELD_INPUT: { key: "Backspace", ctrl: true, alt: true },
 
+  /**
+   * New-workspace page: make the shown isolation the project's default ("Set as default").
+   * Shift keeps Ctrl+Alt+D (AltGr+D on Windows layouts) free for typing in the composer.
+   */
+  SET_DEFAULT_ISOLATION: { key: "d", code: "KeyD", ctrl: true, alt: true, shift: true },
+
+  /**
+   * New-workspace page: open the environment panel (where it runs, isolation, base branch).
+   * Shift for the same reason as SET_DEFAULT_ISOLATION: AltGr+E types a character on some layouts.
+   */
+  OPEN_CREATION_ENVIRONMENT: { key: "e", code: "KeyE", ctrl: true, alt: true, shift: true },
+
   /** Send message after current turn ends */
   SEND_MESSAGE_AFTER_TURN: { key: "Enter", ctrl: true },
 
@@ -852,6 +864,10 @@ export const KEYBINDS = {
    * Not while typing: only from an empty or unfocused field.
    */
   RUN_LATEST_PLAN_ACTION: { key: "Enter", alt: true },
+
+  /** Answer the latest pending sandbox approval card. A chord, so no stray key approves. */
+  RUN_OUTSIDE_SANDBOX: { key: "y", code: "KeyY", ctrl: true, alt: true, shift: true },
+  DENY_OUTSIDE_SANDBOX: { key: "n", code: "KeyN", ctrl: true, alt: true, shift: true },
 
   /** Copy image to clipboard (scoped to image lightbox / image context menu) */
   IMAGE_COPY: { key: "c", ctrl: true },

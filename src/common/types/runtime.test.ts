@@ -3,8 +3,10 @@ import {
   buildRuntimeString,
   CODER_RUNTIME_PLACEHOLDER,
   parseRuntimeModeAndHost,
+  parsedRuntimeNeedsTrunk,
   RUNTIME_MODE,
   runtimeModeSupportsSharedTaskWorkspace,
+  sshNoneRuntimeOf,
 } from "./runtime";
 
 describe("runtimeModeSupportsSharedTaskWorkspace", () => {
@@ -127,5 +129,28 @@ describe("round-trip parsing and building", () => {
     const built = buildRuntimeString({ mode: "ssh", host: CODER_RUNTIME_PLACEHOLDER });
     const parsed = parseRuntimeModeAndHost(built);
     expect(parsed).toEqual({ mode: "ssh", host: CODER_RUNTIME_PLACEHOLDER });
+  });
+});
+
+describe("sshNoneRuntimeOf / parsedRuntimeNeedsTrunk", () => {
+  const sshNone = {
+    mode: "ssh",
+    host: "box",
+    workspaceIsolation: "none",
+    projectDir: "/srv",
+  } as const;
+  const sshWorktree = { mode: "ssh", host: "box" } as const;
+
+  it("picks out only the SSH+None selection", () => {
+    expect(sshNoneRuntimeOf(sshNone)).toBe(sshNone);
+    expect(sshNoneRuntimeOf(sshWorktree)).toBeNull();
+    expect(sshNoneRuntimeOf({ mode: "local" })).toBeNull();
+  });
+
+  it("needs a trunk branch only for runtimes that build a checkout", () => {
+    expect(parsedRuntimeNeedsTrunk({ mode: "local" })).toBe(false);
+    expect(parsedRuntimeNeedsTrunk(sshNone)).toBe(false);
+    expect(parsedRuntimeNeedsTrunk(sshWorktree)).toBe(true);
+    expect(parsedRuntimeNeedsTrunk({ mode: "worktree" })).toBe(true);
   });
 });

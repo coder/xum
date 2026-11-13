@@ -32,6 +32,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
 import type { HistoryService } from "@/node/services/historyService";
 import { log } from "@/node/services/log";
+import { lazyFileToolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
 import {
@@ -1532,7 +1533,8 @@ export async function resolveWorkflowContext(
           },
           getProjectTrusted: resolveWorkflowProjectTrusted,
         }),
-      resolveWorkflowScript: (scriptPath) =>
+      // A nested workflow's path comes from the script, which an agent can write.
+      resolveWorkflowScript: async (scriptPath) =>
         resolveWorkflowScript({
           scriptPath,
           runtime,
@@ -1541,6 +1543,9 @@ export async function resolveWorkflowContext(
           projectTrusted: resolveWorkflowProjectTrusted(),
           skillStorageContext,
           runtimeFactory: context.aiService.runtimeFactory,
+          sandboxGate: lazyFileToolSandboxGate(runtime, workspacePath, {
+            env: await context.aiService.getWorkspaceSandboxEnv(metadata),
+          }),
         }),
       assertStoredPluginWorkflowReviewed: (stored) =>
         assertStoredPluginWorkflowReviewed({

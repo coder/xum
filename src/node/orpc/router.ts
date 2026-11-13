@@ -100,6 +100,7 @@ import {
   archiveWorkspaceGoal,
   answerDelegatedWorkspaceToolCall,
   answerWorkspaceQuestion,
+  answerWorkspaceSandboxApproval,
   clearWorkspaceGoal,
   createMultiProjectWorkspace,
   createScratchWorkspace,
@@ -163,6 +164,7 @@ import {
 } from "./routerSubscriptions";
 
 import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
+import { listSSHConfigHosts } from "@/node/runtime/sshConfigParser";
 
 import { getAgentSkill, listAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import {
@@ -1552,6 +1554,10 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.projectService.listBranches(input.projectPath)
         ),
+      listSshConfigHosts: t
+        .input(schemas.projects.listSshConfigHosts.input)
+        .output(schemas.projects.listSshConfigHosts.output)
+        .handler(async () => ({ hosts: await listSSHConfigHosts() })),
       gitInit: t
         .input(schemas.projects.gitInit.input)
         .output(schemas.projects.gitInit.output)
@@ -1562,6 +1568,10 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.projectService.setTrust(input.projectPath, input.trusted)
         ),
+      setSshDirectoryTrust: t
+        .input(schemas.projects.setSshDirectoryTrust.input)
+        .output(schemas.projects.setSshDirectoryTrust.output)
+        .handler(({ context, input }) => context.projectService.setSshDirectoryTrust(input)),
 
       setDisplayName: t
         .input(schemas.projects.setDisplayName.input)
@@ -2215,6 +2225,10 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.answerAskUserQuestion.input)
         .output(schemas.workspace.answerAskUserQuestion.output)
         .handler(({ context, input }) => answerWorkspaceQuestion(context, input)),
+      answerSandboxApproval: t
+        .input(schemas.workspace.answerSandboxApproval.input)
+        .output(schemas.workspace.answerSandboxApproval.output)
+        .handler(({ input }) => answerWorkspaceSandboxApproval(input)),
       answerDelegatedToolCall: t
         .input(schemas.workspace.answerDelegatedToolCall.input)
         .output(schemas.workspace.answerDelegatedToolCall.output)
@@ -2961,6 +2975,22 @@ export const router = (authToken?: string) => {
         .input(schemas.agentResourceLimits.setEnabled.input)
         .output(schemas.agentResourceLimits.setEnabled.output)
         .handler(({ context, input }) => context.agentResourceLimits.setEnabled(input.enabled)),
+    },
+    agentSandbox: {
+      get: t
+        .input(schemas.agentSandbox.get.input)
+        .output(schemas.agentSandbox.get.output)
+        .handler(({ context }) => context.agentSandbox.get()),
+      set: t
+        .input(schemas.agentSandbox.set.input)
+        .output(schemas.agentSandbox.set.output)
+        .handler(({ context, input }) => context.agentSandbox.set(input)),
+      setProject: t
+        .input(schemas.agentSandbox.setProject.input)
+        .output(schemas.agentSandbox.setProject.output)
+        .handler(({ context, input }) =>
+          context.agentSandbox.setProject(input.projectPath, input.sandbox)
+        ),
     },
     perfCaptures: {
       list: t

@@ -11,7 +11,7 @@ import assert from "@/common/utils/assert";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { Config, ProjectsConfig } from "@/node/config";
+import { CONFIG_UNCHANGED, configFilePath, type Config, type ProjectsConfig } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
@@ -674,13 +674,18 @@ class ConfigSnapshot {
     return this.store.fallbackIds !== undefined;
   }
 
+  /** Whether the lenient walk built this entry from its config row alone (see loadAllMetadataTolerant). */
+  isFallbackEntry(workspaceId: string): boolean {
+    return this.store.fallbackIds?.has(workspaceId) === true;
+  }
+
   /**
    * Throws for an entry that the lenient walk built from its config row alone: its name and
    * runtime may live only in its unreadable metadata.json, so the checkout it names may not
    * hold its override file, and a disable there is unknown, not absent.
    */
   assertReadableEntry(workspaceId: string): void {
-    if (this.store.fallbackIds?.has(workspaceId) === true) {
+    if (this.isFallbackEntry(workspaceId)) {
       throw new Error(
         `Workspace ${workspaceId} metadata is unreadable; its MCP overrides are unknown`
       );
@@ -697,6 +702,20 @@ class ConfigSnapshot {
       this.store.canonical.set(filePath, pending);
     }
     return pending;
+  }
+}
+
+/**
+ * Refuses a save (see writeOverridesLocked) whose inherited state the lenient walk could not
+ * establish. That walk lists a degraded legacy entry under its fallback id, so the child's parent
+ * can be that entry: its settings, a disable included, are unknown. An own document written now
+ * would detach the child from them, whatever revision the caller holds.
+ */
+function assertParentKnownForSave(snapshot: ConfigSnapshot, current: ResolvedOverrides): void {
+  if (snapshot.lenientRegistry && current.authorityLostInherited === true) {
+    throw new Error(
+      "The parent workspace's MCP settings could not be read (another workspace's metadata is unreadable); the settings were not saved."
+    );
   }
 }
 
@@ -1450,10 +1469,16 @@ export class WorkspaceMcpOverridesService {
   ): Promise<void> {
     const expected =
       options?.onlyIfEquals === undefined ? undefined : JSON.stringify(options.onlyIfEquals);
-    await this.config.editConfig((config) => {
+    // Every save calls this. An edit that changes nothing still rewrote the whole config.json
+    // (at 7,550 workspaces each save re-serialized the registry), so the transform reports
+    // CONFIG_UNCHANGED when there is no value to clear. It decides under the edit's lock: a
+    // check read before the lock skipped the clear of a value that another process (a
+    // downgraded Xum) committed under that lock.
+    await this.config.editConfigIfChanged((config) => {
       for (const [_projectPath, projectConfig] of config.projects) {
         const workspace = projectConfig.workspaces.find((w) => w.id === workspaceId);
         if (workspace) {
+          if (workspace.mcp === undefined) return CONFIG_UNCHANGED;
           if (expected !== undefined && JSON.stringify(workspace.mcp) !== expected) {
             log.debug(
               "[MCP] Legacy workspace MCP overrides changed since they were read; not clearing",
@@ -1461,13 +1486,13 @@ export class WorkspaceMcpOverridesService {
                 workspaceId,
               }
             );
-            return config;
+            return CONFIG_UNCHANGED;
           }
           delete workspace.mcp;
           return config;
         }
       }
-      return config;
+      return CONFIG_UNCHANGED;
     });
   }
 
@@ -1476,6 +1501,19 @@ export class WorkspaceMcpOverridesService {
     snapshot?: ConfigSnapshot
   ): Promise<ResolvedWorkspace> {
     return this.resolveWorkspace(await this.getWorkspaceMetadata(workspaceId, snapshot));
+  }
+
+  /**
+   * getRuntimeAndWorkspacePath for a write (a save, a new workspace's sanitize, a fork copy)
+   * through the tolerant walk: one unrelated malformed legacy entry must not refuse it (see
+   * loadAllMetadataTolerant).
+   */
+  private async resolveForWrite(
+    workspaceId: string,
+    snapshot: ConfigSnapshot
+  ): Promise<ResolvedWorkspace> {
+    await snapshot.loadAllMetadataTolerant([workspaceId]);
+    return this.getRuntimeAndWorkspacePath(workspaceId, snapshot);
   }
 
   /** Same as getRuntimeAndWorkspacePath for callers that already hold the metadata (no config re-scan). */
@@ -3059,10 +3097,7 @@ export class WorkspaceMcpOverridesService {
                 try {
                   return await withDeadline(
                     (async () => {
-                      const lockedSource = await this.getRuntimeAndWorkspacePath(
-                        sourceWorkspaceId,
-                        locked
-                      );
+                      const lockedSource = await this.resolveForWrite(sourceWorkspaceId, locked);
                       return this.prepareForkCopySource(
                         sourceWorkspaceId,
                         lockedSource,
@@ -3122,7 +3157,7 @@ export class WorkspaceMcpOverridesService {
         let source: ResolvedWorkspace;
         try {
           source = await withDeadline(
-            this.getRuntimeAndWorkspacePath(sourceWorkspaceId, snapshot),
+            this.resolveForWrite(sourceWorkspaceId, snapshot),
             attemptBudget(),
             "fork source metadata did not resolve in time",
             () => snapshot.cancel()
@@ -3651,9 +3686,10 @@ export class WorkspaceMcpOverridesService {
     snapshot: ConfigSnapshot
   ): Promise<boolean> {
     const fresh = new ConfigSnapshot(this.config, /* hostFilesystemView */ true);
+    // Tolerant like the resolution being re-checked (see resolveForWrite).
     const [before, after] = await Promise.all([
       snapshot.loadAllMetadata(),
-      fresh.loadAllMetadata(),
+      fresh.loadAllMetadataTolerant([source.id]),
     ]);
     const legacyBefore = snapshot.loadLegacyConfig();
     const legacyAfter = fresh.loadLegacyConfig();
@@ -4246,8 +4282,10 @@ export class WorkspaceMcpOverridesService {
     // Workspace lock first (see acquireWorkspaceLock): a rename of THIS
     // workspace holds it across its checkout move, so the path resolved
     // below is the one the document is written to.
-    return this.withWorkspaceLocks([workspaceId], (locked) =>
-      this.runExclusive(async () => {
+    let lockedRun = false;
+    return this.withWorkspaceLocks([workspaceId], (locked) => {
+      lockedRun = true;
+      return this.runExclusive(async () => {
         const unresolvable = locked.unresolvable[0];
         if (unresolvable !== undefined) {
           throw unresolvable.error;
@@ -4268,8 +4306,26 @@ export class WorkspaceMcpOverridesService {
           // write; it must land before the locks are released.
           await snapshot.settleSideEffects();
         }
-      })
-    );
+      });
+    }).catch((error: unknown) => {
+      // A config.json that does not parse fails the lock derivation, before anything is written.
+      throw lockedRun ? error : this.explainUnreadableConfig(error);
+    });
+  }
+
+  /**
+   * `error`, or what to repair when config.json itself does not load strictly. Only for a
+   * failure before the save wrote anything: the advice says the settings were not saved.
+   */
+  private explainUnreadableConfig(error: unknown): unknown {
+    try {
+      this.config.loadConfigOrDefault({ throwOnError: true });
+      return error;
+    } catch (configError) {
+      return new Error(
+        `Xum could not read ${configFilePath(this.config.rootDir)} (${getErrorMessage(configError)}); the settings were not saved. Repair the file or restore it from a backup, then try again.`
+      );
+    }
   }
 
   /** Body of setOverridesForWorkspace, run under the workspace and global locks. */
@@ -4279,10 +4335,14 @@ export class WorkspaceMcpOverridesService {
     options: Parameters<WorkspaceMcpOverridesService["setOverridesForWorkspace"]>[2],
     snapshot: ConfigSnapshot
   ): Promise<void> {
-    const { metadata, runtime, workspacePath } = await this.getRuntimeAndWorkspacePath(
+    // config.json itself must still load strictly. Nothing is written yet, so a failure here is
+    // a refusal.
+    const { metadata, runtime, workspacePath } = await this.resolveForWrite(
       workspaceId,
       snapshot
-    );
+    ).catch((error: unknown) => {
+      throw this.explainUnreadableConfig(error);
+    });
     const filePaths = this.getOverridesFilePaths(workspacePath, metadata.runtimeConfig);
     const canonicalPath = filePaths[0];
     const hostFilesystemSave = overridesOnHostFilesystem(metadata.runtimeConfig);
@@ -4304,6 +4364,7 @@ export class WorkspaceMcpOverridesService {
     // Resolved for every save (not only CAS ones): an inheriting child that
     // detaches below must carry its effective source's opaque fields.
     const current = await bounded(this.resolveOverridesFor(metadata, "lenient", snapshot));
+    assertParentKnownForSave(snapshot, current);
     if (options?.expectedRevision !== undefined || options?.validateAgainstCurrent) {
       // Repair path: a dialog opened while the state could not be established
       // (malformed document, unreadable checkout) carries the UNAVAILABLE
@@ -4599,8 +4660,12 @@ export class WorkspaceMcpOverridesService {
     /** Fields this build does not own from the sharers' legacy values (see opaqueLegacyFieldsOf); carried into the written document. */
     opaqueFields: Record<string, unknown>;
   }> {
-    const legacyById = legacyOverridesById(snapshot.loadLegacyConfig());
+    const legacyConfig = snapshot.loadLegacyConfig();
+    const legacyById = legacyOverridesById(legacyConfig);
     const all = await snapshot.loadAllMetadata();
+    // After the walk: it records whether the registry is lenient and which entries it built
+    // from config.json alone.
+    this.assertNoUnreachableLegacyValue(legacyConfig, snapshot);
     // Legacy values are pre-migration leftovers, and only a carrier's sharing
     // matters here: canonicalize the carriers, never every registered
     // checkout (one realpath each made saves at 7,550 workspaces take seconds).
@@ -4639,6 +4704,32 @@ export class WorkspaceMcpOverridesService {
       mergeOpaqueFields(opaqueFields, fields, sharer.id);
     }
     return { sharerIds: sharers.map((m) => m.id), opaqueFields };
+  }
+
+  /**
+   * On a degraded host, refuses every save while a config row carries a legacy `workspace.mcp`
+   * value that no id lookup above can reach: a row with no id (a null id counts as none, as
+   * config.json accepts it for a legacy row), or one that the lenient walk built from config.json
+   * alone. Such a row's runtime may live only in an unreadable metadata.json (the walk gives a row
+   * without one the default runtime), so the sharer scan cannot tell whether it shares the written
+   * checkout. Wherever it is, its value could survive a clear and migrate back over the user's
+   * write once the file is readable. A healthy registry skips the check, as on main.
+   */
+  private assertNoUnreachableLegacyValue(
+    legacyConfig: ProjectsConfig,
+    snapshot: ConfigSnapshot
+  ): void {
+    if (!snapshot.lenientRegistry) return;
+    for (const project of legacyConfig.projects.values()) {
+      for (const row of project.workspaces) {
+        if (row.mcp === undefined) continue;
+        if (row.id == null || snapshot.isFallbackEntry(row.id)) {
+          throw new Error(
+            `The workspace registered at ${row.path} carries legacy MCP settings that Xum cannot match to a workspace id while a workspace's metadata.json is unreadable; the settings were not saved. Repair the unreadable metadata.json, then try again.`
+          );
+        }
+      }
+    }
   }
 
   /**
@@ -4719,7 +4810,7 @@ export class WorkspaceMcpOverridesService {
     snapshot: ConfigSnapshot
   ): Promise<void> {
     const resolved = await withDeadline(
-      this.getRuntimeAndWorkspacePath(workspaceId, snapshot),
+      this.resolveForWrite(workspaceId, snapshot),
       budget.remaining(),
       "workspace enumeration exceeded the plugin-prune budget"
     );
@@ -4731,7 +4822,11 @@ export class WorkspaceMcpOverridesService {
       `pruning workspace ${workspaceId} exceeded the plugin-prune budget`,
       () => step.cancel()
     );
-    if (options?.publish) {
+    if (options?.publish && snapshot.lenientRegistry) {
+      // Same as publishSweptWorkspaces: inheritance resolved from this registry can read a
+      // degraded parent as gone. Evict every cache instead, so the next read goes to disk.
+      await options.publish(null, ALL_WORKSPACES_TARGET);
+    } else if (options?.publish) {
       // Strict re-read: the prune above already threw on anything
       // unreadable, so a failure here is a real regression and must keep
       // the caller's retry tombstone rather than publish a guess.

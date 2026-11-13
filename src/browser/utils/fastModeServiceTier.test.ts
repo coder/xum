@@ -225,7 +225,6 @@ describe("fast mode service tier", () => {
       "claude-mythos-5-2",
       "claude-opus-5-5",
       "claude-opus-5",
-      "claude-opus-4-8",
     ]) {
       expect(
         getFastModeProvider(`anthropic:${model}`, {
@@ -235,8 +234,10 @@ describe("fast mode service tier", () => {
       ).toBe("anthropic");
     }
     // Opus 4.7 errors and Opus 4.6 silently runs at standard speed. Fable/Mythos
-    // gained Fast mode with 5.2; earlier versions do not have it.
+    // gained Fast mode with 5.2; earlier versions do not have it. Opus 4.8 loses it
+    // on 2026-11-30.
     for (const model of [
+      "claude-opus-4-8",
       "claude-opus-4-7",
       "claude-opus-4-6",
       "claude-sonnet-5",

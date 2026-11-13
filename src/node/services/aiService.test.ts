@@ -107,9 +107,11 @@ import { MemoryService, projectMemoryDirName } from "@/node/services/memoryServi
 import * as toolAssembly from "./toolAssembly";
 import * as agentInterfaceStatusPage from "./agentInterfaceStatusPage";
 import {
+  LAYOUT_TURN_END_NUDGE,
   STATUS_PAGE_AGENT_TURN_END_NUDGE,
   STATUS_PAGE_TURN_END_NUDGE,
 } from "@/common/utils/machineTurnPrompts";
+import * as turnEndLayoutAudit from "./layoutAudit/turnEndLayoutAudit";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import type { WorkspaceHeartbeatToolService } from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -362,7 +364,8 @@ function resolvedAgentResultFor(
       },
       agentDiscoveryRuntime: new LocalRuntime(metadata.projectPath),
       agentDiscoveryPath: metadata.projectPath,
-      isSubagentWorkspace: false,
+      // As resolveAgentForStream decides it.
+      isSubagentWorkspace: Boolean(metadata.parentWorkspaceId),
       agentInheritanceChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentAiSettingsChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentIsPlanLike: false,
@@ -878,6 +881,219 @@ describe("AIService status page turn-end nudge", () => {
       expect(await nudge("another-turn")).toBeNull();
       expect(await nudge(messageId)).toBe(row.nudge);
       expect(await nudge(messageId)).toBeNull();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+});
+
+const ARTIFACT_OFF: ToolPolicy = [{ regex_match: "artifact", action: "disable" }];
+
+describe("AIService layout turn-end nudge", () => {
+  afterEach(() => mock.restore());
+
+  async function setup(artifactsOn = true, ptc = false) {
+    const testHistory = await createTestHistoryService();
+    const projectPath = path.join(testHistory.tempDir, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "layout-nudge";
+    await testHistory.config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath,
+      // A project-dir local workspace runs in its project folder.
+      namedWorkspacePath: projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    const experimentsService = await experimentsServiceWith(testHistory.tempDir, [
+      ...(artifactsOn ? [EXPERIMENT_IDS.ARTIFACTS] : []),
+      ...(ptc ? [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING] : []),
+    ]);
+    const harness = createBasicAIService(testHistory.tempDir, {
+      historyService: testHistory.historyService,
+      experimentsService,
+    });
+    const audit = spyOn(turnEndLayoutAudit, "workspaceHasNewLayoutIssueAtTurnEnd");
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    stubCommonStreamMessageDependencies({
+      ...harness,
+      metadata,
+      startStreamCalls,
+      allTools: {
+        // An executable tool, as the real one: Programmatic Tool Calling can bridge it.
+        artifact: tool({
+          description: "publish",
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: () => Promise.resolve({ success: true }),
+        }),
+      },
+    });
+    // A real turn start records whether the turn could publish (TurnRequestBuilder); the nudge
+    // reads that record for the ended turn's message.
+    const startTurn = async (agent: { planLike?: boolean; toolPolicy?: ToolPolicy } = {}) => {
+      const resolved = resolvedAgentResultFor(metadata);
+      if (!resolved.success) throw new Error("Expected resolved agent");
+      resolved.data.agentIsPlanLike = agent.planLike === true;
+      resolved.data.effectiveToolPolicy = agent.toolPolicy;
+      spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(resolved);
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "Fix the page")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      if (!result.success) throw new Error(JSON.stringify(result.error));
+      return result.data.messageId;
+    };
+    const turn = await startTurn();
+    const nudge = (abortSignal = new AbortController().signal, messageId = turn) =>
+      harness.service.layoutTurnEndNudge(workspaceId, { messageId, abortSignal });
+    const sentToolNames = () => Object.keys(startStreamCalls.at(-1)?.tools ?? {});
+    return {
+      testHistory,
+      projectPath,
+      workspaceId,
+      audit,
+      nudge,
+      startTurn,
+      sentToolNames,
+      config: harness.config,
+    };
+  }
+
+  it("asks for the nudge when the audit finds a new issue, and gives it the turn's workspace", async () => {
+    const { testHistory, projectPath, workspaceId, audit, nudge } = await setup();
+    try {
+      audit.mockResolvedValue(true);
+      const stop = new AbortController();
+
+      expect(await nudge(stop.signal)).toBe(LAYOUT_TURN_END_NUDGE);
+      expect(audit).toHaveBeenCalledTimes(1);
+      const call = audit.mock.calls[0]?.[0];
+      expect(call).toMatchObject({
+        workspaceId,
+        metadata: { id: workspaceId, projectPath, namedWorkspacePath: projectPath },
+        // The agent's cwd, where a publish runs its audit too.
+        cwd: projectPath,
+      });
+      // Identity, not structure: two AbortSignals match each other structurally.
+      expect(call?.abortSignal).toBe(stop.signal);
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("is silent when the audit finds nothing, and when the audit fails", async () => {
+    const { testHistory, audit, nudge } = await setup();
+    try {
+      audit.mockResolvedValueOnce(false);
+      expect(await nudge()).toBeNull();
+      audit.mockRejectedValueOnce(new Error("runtime unreachable"));
+      expect(await nudge()).toBeNull();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit when the experiment is off", async () => {
+    const { testHistory, audit, nudge } = await setup(false);
+    try {
+      audit.mockResolvedValue(true);
+      expect(await nudge()).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  // The nudge asks for a publish, and its continuation keeps the turn's agent and tool policy.
+  it.each([
+    { name: "a policy that disables the artifact tool", agent: { toolPolicy: ARTIFACT_OFF } },
+    { name: "a custom plan-like agent", agent: { planLike: true } },
+  ])("does not audit after a turn that cannot publish: $name", async ({ agent }) => {
+    const { testHistory, audit, nudge, startTurn } = await setup();
+    try {
+      audit.mockResolvedValue(true);
+      const turn = await startTurn(agent);
+      expect(await nudge(undefined, turn)).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+      // The next turn that can publish gets it: the page stayed due.
+      expect(await nudge(undefined, await startTurn())).toBe(LAYOUT_TURN_END_NUDGE);
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit a workspace that is no longer in the config", async () => {
+    const { testHistory, audit, nudge, config } = await setup();
+    try {
+      audit.mockResolvedValue(true);
+      spyOn(config, "findWorkspace").mockReturnValue(null);
+      expect(await nudge()).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit after a turn whose sent tools lost artifact in request assembly", async () => {
+    const { testHistory, audit, nudge, startTurn, workspaceId } = await setup();
+    const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
+      if (ctx.workspaceId !== workspaceId) return;
+      const { artifact: _dropped, ...rest } = ctx.tools;
+      ctx.tools = rest;
+    });
+    try {
+      audit.mockResolvedValue(true);
+      const turn = await startTurn();
+      expect(await nudge(undefined, turn)).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+      removeHook();
+      // Without the hook the next turn sends the tool, and the page that stayed due is audited.
+      expect(await nudge(undefined, await startTurn())).toBe(LAYOUT_TURN_END_NUDGE);
+    } finally {
+      removeHook();
+      await testHistory.cleanup();
+    }
+  });
+
+  it("audits after a turn that reaches artifact through Programmatic Tool Calling", async () => {
+    const { testHistory, audit, nudge, sentToolNames } = await setup(true, true);
+    try {
+      audit.mockResolvedValue(true);
+      // The request carries code_execution only: the agent publishes with xum.artifact(...).
+      expect(sentToolNames()).toEqual(["code_execution"]);
+      expect(await nudge()).toBe(LAYOUT_TURN_END_NUDGE);
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit after a PTC turn whose request lost code_execution", async () => {
+    const { testHistory, audit, nudge, startTurn, workspaceId } = await setup(true, true);
+    const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
+      if (ctx.workspaceId !== workspaceId) return;
+      const { code_execution: _dropped, ...rest } = ctx.tools;
+      ctx.tools = rest;
+    });
+    try {
+      audit.mockResolvedValue(true);
+      expect(await nudge(undefined, await startTurn())).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+    } finally {
+      removeHook();
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit for a message that is not the workspace's latest prepared turn", async () => {
+    const { testHistory, audit, nudge } = await setup();
+    try {
+      audit.mockResolvedValue(true);
+      expect(await nudge(undefined, "another-turn")).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
     } finally {
       await testHistory.cleanup();
     }
@@ -2250,6 +2466,34 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(goalIds).toEqual(["goal-dispatched", undefined]);
   });
 
+  // The sub-agent denial of ask_user_question lives in the agent policy, not the caller's.
+  it.each([
+    { kind: "root", parentWorkspaceId: undefined, expected: false },
+    { kind: "sub-agent", parentWorkspaceId: "parent-workspace", expected: true },
+  ])(
+    "refuses sandbox approval cards at once only in a sub-agent ($kind)",
+    async ({ kind, parentWorkspaceId, expected }) => {
+      using xumHome = new DisposableTempDir(`ai-service-no-interactive-user-${kind}`);
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = `workspace-no-interactive-user-${kind}`;
+      const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, {
+        ...(parentWorkspaceId != null ? { parentWorkspaceId } : {}),
+      });
+      const harness = createHarness(xumHome.path, metadata);
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+
+      expect(result.success).toBe(true);
+      expect(harness.getToolsForModelSpy.mock.calls.at(-1)?.[1]?.noInteractiveUser).toBe(expected);
+    }
+  );
+
   // Sub-agents own goals, but a turn TaskService drove (here: a recovery re-drive) carries its
   // provenance into the goal tool context and must not set one.
   it("keeps set_goal disabled on a child workspace's automatic task turns", async () => {
@@ -2517,6 +2761,120 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+
+  /**
+   * Runs `body` with Anthropic Fast mode on the route (Coder workspaces export a gateway
+   * ANTHROPIC_BASE_URL, which takes it off) and the JSON bodies of the requests to the provider.
+   * Only serialized requests are inspected: no provider is ever contacted.
+   */
+  async function withCapturedAnthropicBodies(
+    body: (bodies: Array<{ speed?: string }>) => Promise<void>
+  ): Promise<void> {
+    const hostBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_BASE_URL;
+    const bodies: Array<{ speed?: string }> = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
+        bodies.push(JSON.parse(init.body) as { speed?: string });
+        return Promise.resolve(new Response("{}", { status: 400 }));
+      }, globalThis.fetch)
+    );
+    try {
+      await body(bodies);
+    } finally {
+      fetchSpy.mockRestore();
+      if (hostBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = hostBaseUrl;
+    }
+  }
+
+  const sendOnce = (model: LanguageModel) =>
+    generateText({ model, prompt: "continue", maxRetries: 0 }).catch(() => undefined);
+
+  // Anthropic limits Fast mode to some models (Opus 5 needs a waitlist) and rejects `speed: "fast"`
+  // elsewhere, so a refusal fallback must not inherit the refused model's Fast pick.
+  it.each([
+    { pick: "the chat's Fast pick", chatTier: "priority" as const, providerSpeed: undefined },
+    { pick: "the provider's Fast preference", chatTier: undefined, providerSpeed: "fast" as const },
+  ])("a refusal fallback never sends Anthropic Fast mode ($pick)", async (c) => {
+    using xumHome = new DisposableTempDir("ai-service-fallback-no-fast");
+    const sourceModel = KNOWN_MODELS.FABLE.id;
+    const fallbackModel = "anthropic:claude-opus-5";
+    await writeMainConfig(xumHome.path, {
+      modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+    });
+    const metadata = createLocalWorkspaceMetadata("fallback-no-fast", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      anthropic: {
+        apiKey: "test-key",
+        ...(c.providerSpeed != null ? { speed: c.providerSpeed } : {}),
+      },
+    });
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    await withCapturedAnthropicBodies(async (bodies) => {
+      const holder: NonNullable<StreamMessageOptions["activeTurnThinkingOverride"]> = {};
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: sourceModel,
+        thinkingLevel: "off",
+        ...(c.chatTier != null
+          ? { muxProviderOptions: { openai: { serviceTier: c.chatTier } } }
+          : {}),
+        activeTurnThinkingOverride: holder,
+      });
+      expect(result.success).toBe(true);
+      const primary = harness.startStreamCalls[0];
+      const fallback = await primary.modelFallback!.prepare(fallbackModel);
+      if (!fallback.success) throw new Error("Expected prepared fallback");
+      // Control: the refused model itself still runs in Fast mode.
+      await sendOnce(primary.model);
+      expect(bodies.at(-1)?.speed).toBe("fast");
+      await sendOnce(fallback.data.model);
+      expect(bodies.at(-1)).not.toHaveProperty("speed");
+      // A Fast pick made mid-turn does not reach the fallback either.
+      holder.serviceTier = "priority";
+      await sendOnce(fallback.data.model);
+      expect(bodies.at(-1)).not.toHaveProperty("speed");
+      expect(bodies).toHaveLength(3);
+    });
+  });
+
+  // The Auto-routing tier fallback is not a refusal fallback: the composer's model is the one the
+  // user picked, so it keeps the chat's Fast pick.
+  it("an Auto-routing tier fallback keeps the chat's Anthropic Fast pick", async () => {
+    using xumHome = new DisposableTempDir("ai-service-auto-fallback-keeps-fast");
+    const composerModel = KNOWN_MODELS.FABLE.id;
+    const tierModel = "no-such-provider:tier-model";
+    const metadata = createLocalWorkspaceMetadata("auto-fallback-fast", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      anthropic: { apiKey: "test-key" },
+    });
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    await withCapturedAnthropicBodies(async (bodies) => {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: tierModel,
+        thinkingLevel: "off",
+        muxProviderOptions: { openai: { serviceTier: "priority" } },
+        autoModelRouting: {
+          requestedFallbackModel: composerModel,
+          tierId: "hard",
+          model: tierModel,
+          status: "routed",
+        },
+      });
+      expect(result.success).toBe(true);
+      // The tier model cannot be built, so the turn runs on the composer's model.
+      expect(harness.startStreamCalls[0].modelString).toBe(composerModel);
+      await sendOnce(harness.startStreamCalls[0].model);
+      expect(bodies.at(-1)?.speed).toBe("fast");
+    });
   });
 
   it.each([false, true])("pins assembly across attempts (budget=%s)", async (tokenBudget) => {
@@ -5235,7 +5593,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     expect(result.success).toBe(true);
     expect(harness.startStreamCalls[0]?.providerOptions).toEqual({
-      openai: { parallelToolCalls: true, reasoningEffort: "medium" },
+      coderGoogle: {
+        extra_body: {
+          google: { thinking_config: { include_thoughts: true, thinking_level: "medium" } },
+        },
+      },
     });
   });
 

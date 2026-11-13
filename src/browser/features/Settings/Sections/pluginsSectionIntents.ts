@@ -26,8 +26,11 @@ export type PluginsSectionIntent =
   | { type: "review-components"; name: string }
   /** Open the uninstall confirmation for a managed plugin. */
   | { type: "confirm-uninstall"; name: string }
-  /** Show the in-place update review for a capability-changing update the palette previewed. */
-  | { type: "review-update"; review: AgentPluginUpdateReview }
+  /**
+   * Show the in-place update reviews of the capability-changing updates the palette previewed:
+   * the first opens, and each confirm or cancel opens the next.
+   */
+  | { type: "review-updates"; reviews: readonly AgentPluginUpdateReview[] }
   /** Backend plugin state changed outside the section (e.g. palette Update All); re-query. */
   | { type: "refresh" }
   /**
@@ -66,15 +69,21 @@ export function consumePendingPluginsSectionIntent(): PluginsSectionIntent | nul
   return intent;
 }
 
-/** Subscribe a mounted section; returns an unsubscribe. */
+/**
+ * Subscribe a mounted section; returns an unsubscribe. `alreadyRead` is the intent the section
+ * read from the buffer when it mounted: it already acted on it, so it is not delivered again. An
+ * intent published after that read (the section renders before its effects run) reaches the
+ * listener now, instead of being dropped with the buffer. Only the Plugins section subscribes, so
+ * nothing else is waiting for the buffer: a second subscriber would find it cleared.
+ */
 export function subscribePluginsSectionIntents(
-  listener: (intent: PluginsSectionIntent) => void
+  listener: (intent: PluginsSectionIntent) => void,
+  alreadyRead: PluginsSectionIntent | null = null
 ): () => void {
   listeners.add(listener);
-  // The subscribing section already read the buffered intent at mount (peek above). Only the
-  // Plugins section subscribes, so nothing else is waiting for it: a second subscriber would
-  // find the buffer cleared.
+  const buffered = pendingIntent;
   pendingIntent = null;
+  if (buffered !== null && buffered !== alreadyRead) listener(buffered);
   return () => {
     listeners.delete(listener);
   };

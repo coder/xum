@@ -63,6 +63,12 @@ import {
 } from "./PluginInstallMethods";
 import { MarketplaceListing } from "./PluginMarketplaceListing";
 import {
+  UpdateAllButton,
+  UpdateAllStatus,
+  useUpdateAll,
+  useUpdateReviewQueue,
+} from "./PluginsUpdateAll";
+import {
   BackupQueueHeader,
   installSource,
   seededForm,
@@ -827,7 +833,11 @@ const AddPluginPanel: React.FC<{
   // A backed-up plugin previews itself; its fields stay editable, so a preview that fails (a
   // repository that moved, a host that is down) can be fixed by hand.
   usePreviewOnMount(api, props.seed, {
-    onStart: () => setBusy(true),
+    onStart: () => {
+      setBusy(true);
+      // A reconnect previews again: the failure of the client that dropped no longer applies.
+      setError(null);
+    },
     onResult: showPreview,
     onError: setError,
     onEnd: () => setBusy(false),
@@ -1221,7 +1231,7 @@ const NotAppliedList: React.FC<{ items?: readonly AgentPluginNotApplied[]; class
   );
 };
 
-/** What a read-only agent loses: its edit tools, and its shell when a `disallowedTools` list removed it. */
+/** What a read-only agent loses: its edit tools, and its shell when its mapped tool list removed it. */
 const ReadonlyAgentNote: React.FC<{ preview: AgentPluginInstallPreview; agent: string }> = (
   props
 ) => {
@@ -1233,9 +1243,9 @@ const ReadonlyAgentNote: React.FC<{ preview: AgentPluginInstallPreview; agent: s
 };
 
 /**
- * A file name inside a line of text. It moves to the next line as a whole instead of splitting at
- * the card's edge, and wraps inside itself only when it is longer than a line (`break-all` split
- * every name at phone width).
+ * A file name or slash command name inside a line of text. It moves to the next line as a whole
+ * instead of splitting at the card's edge, and wraps inside itself only when it is longer than a
+ * line (`break-all` split every name at phone width).
  */
 const FileName: React.FC<{ name: string }> = (props) => (
   <span className="text-foreground inline-block max-w-full font-mono break-words">
@@ -1303,7 +1313,7 @@ const PreviewDisclosures: React.FC<{
         <ul className="space-y-1">
           {props.preview.slashCommands.map((command) => (
             <li key={command.name} className="text-xs">
-              <span className="text-foreground font-mono">/{command.name}</span>
+              <FileName name={`/${command.name}`} />
               {command.description && <span className="text-muted"> — {command.description}</span>}
             </li>
           ))}
@@ -1362,6 +1372,8 @@ const PreviewDisclosures: React.FC<{
 const UninstallConfirm: React.FC<{
   item: AgentPluginListItem;
   busy: boolean;
+  /** Another plugin's action is in flight: the section ignores a confirm until it settles. */
+  locked: boolean;
   onConfirm: (deletePluginData: boolean) => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1386,7 +1398,7 @@ const UninstallConfirm: React.FC<{
           variant="destructive"
           size="sm"
           onClick={() => props.onConfirm(deletePluginData)}
-          disabled={props.busy}
+          disabled={props.busy || props.locked}
         >
           {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
           {props.busy ? "Uninstalling…" : "Uninstall"}
@@ -1488,7 +1500,10 @@ const UpdateReviewPanel: React.FC<{
   review: AgentPluginUpdateReview;
   mode: ReviewPanelMode;
   selective: boolean;
+  /** This review's plugin has the action in flight: the confirm shows its progress. */
   busy: boolean;
+  /** Another plugin's action is in flight: the section ignores a confirm until it settles. */
+  locked: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1534,7 +1549,11 @@ const UpdateReviewPanel: React.FC<{
         </p>
       )}
       <div className="flex gap-2">
-        <Button size="sm" onClick={props.onConfirm} disabled={props.busy || mustExpand.length > 0}>
+        <Button
+          size="sm"
+          onClick={props.onConfirm}
+          disabled={props.busy || props.locked || mustExpand.length > 0}
+        >
           {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
           {props.busy ? copy.busy : copy.confirm}
         </Button>
@@ -1789,6 +1808,7 @@ const ComponentReviewRow: React.FC<{
   item: AgentPluginListItem;
   review: AgentPluginUpdateReview | null;
   busy: boolean;
+  locked: boolean;
   onConfirm: (review: AgentPluginUpdateReview) => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1800,6 +1820,7 @@ const ComponentReviewRow: React.FC<{
       mode="components"
       selective={false}
       busy={props.busy}
+      locked={props.locked}
       onConfirm={() => props.onConfirm(review)}
       onCancel={props.onCancel}
     />
@@ -1871,9 +1892,11 @@ export const PluginsSettingsSection: React.FC = () => {
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
   /** Pending update whose capability changes await the user's confirmation. */
-  const [updateReview, setUpdateReview] = useState<AgentPluginUpdateReview | null>(
-    initialIntent?.type === "review-update" ? initialIntent.review : null
+  const updateReviews = useUpdateReviewQueue(
+    initialIntent?.type === "review-updates" ? initialIntent.reviews : [],
+    items
   );
+  const updateReview = updateReviews.open;
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
   const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
@@ -2005,8 +2028,8 @@ export const PluginsSettingsSection: React.FC = () => {
         case "confirm-uninstall":
           setUninstallTarget(intent.name);
           break;
-        case "review-update":
-          setUpdateReview(intent.review);
+        case "review-updates":
+          updateReviews.show(intent.reviews);
           break;
         case "review-components":
           latestComponentReview.current.openFromIntent(intent);
@@ -2016,9 +2039,30 @@ export const PluginsSettingsSection: React.FC = () => {
           void checkForUpdates();
           break;
       }
-    });
+    }, initialIntent);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribe on API reconnect only; the listener reads the latest handlers via closure per subscription
   }, [api]);
+
+  const startUpdate = () => {
+    setError(null);
+    updateReviews.clear();
+    updateAll.dismissStatus();
+    // The update moves lockedSha, so an open component review would confirm against a stale tree.
+    componentReview.close();
+  };
+
+  const updateAll = useUpdateAll({
+    api,
+    busyPlugin,
+    setBusyPlugin,
+    items,
+    updateChecks,
+    waitingReviews: updateReviews.waiting,
+    onStart: startUpdate,
+    onReviews: updateReviews.show,
+    refresh,
+    checkForUpdates,
+  });
 
   /**
    * Update click: review first. A capability-neutral update applies right
@@ -2029,10 +2073,7 @@ export const PluginsSettingsSection: React.FC = () => {
   const handleUpdate = async (name: string) => {
     if (!api || busyPlugin !== null) return;
     setBusyPlugin(name);
-    setError(null);
-    setUpdateReview(null);
-    // The update moves lockedSha, so an open component review would confirm against a stale tree.
-    componentReview.close();
+    startUpdate();
     try {
       const preview = await api.agentPlugins.previewUpdate({ name });
       if (!preview.success) {
@@ -2040,7 +2081,7 @@ export const PluginsSettingsSection: React.FC = () => {
         return;
       }
       if (preview.data.changes.length > 0) {
-        setUpdateReview(preview.data);
+        updateReviews.show([preview.data]);
         return;
       }
       await applyUpdate(name, undefined);
@@ -2057,11 +2098,15 @@ export const PluginsSettingsSection: React.FC = () => {
     setError(null);
     try {
       // Only the shown components get consent records (#6498).
-      await applyUpdate(review.name, {
-        fromSha: review.fromSha,
-        toSha: review.toSha,
-        reviewed: reviewedComponents(review),
-      });
+      await applyUpdate(
+        review.name,
+        {
+          fromSha: review.fromSha,
+          toSha: review.toSha,
+          reviewed: reviewedComponents(review),
+        },
+        review
+      );
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -2070,14 +2115,17 @@ export const PluginsSettingsSection: React.FC = () => {
   };
 
   /** Shared tail of both update paths; callers own busy state and error capture. */
-  const applyUpdate = async (name: string, consent: AgentPluginUpdateConsent | undefined) => {
+  const applyUpdate = async (
+    name: string,
+    consent: AgentPluginUpdateConsent | undefined,
+    settled?: AgentPluginUpdateReview
+  ) => {
     if (!api) return;
     const result = await api.agentPlugins.update({ name, consent: consent ?? null });
     if (result.success) {
       // Mounted composers cache contributed slash-command/skill
       // descriptors; an update can change them without a remount.
       publishAgentPluginsMutated();
-      setUpdateReview(null);
     }
     // Refresh regardless of outcome (the swap may be partially visible),
     // but re-assert the mutation error AFTER the refresh: refresh's
@@ -2085,7 +2133,11 @@ export const PluginsSettingsSection: React.FC = () => {
     // the failure the user needs to see.
     await refresh();
     await checkForUpdates();
-    if (!result.success) {
+    if (result.success) {
+      // After the refresh, so the next queued review does not open while this update still holds
+      // `busyPlugin` (its own name is not the busy one, so its controls would look enabled).
+      updateReviews.settle(settled);
+    } else {
       setError(result.error);
     }
   };
@@ -2102,6 +2154,7 @@ export const PluginsSettingsSection: React.FC = () => {
         publishAgentPluginsMutated();
         setUninstallTarget(null);
         await refresh();
+        updateReviews.drop(name);
       } else {
         // Keep the confirmation open and surface the error after the list
         // refresh (whose success path clears error state).
@@ -2121,7 +2174,7 @@ export const PluginsSettingsSection: React.FC = () => {
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
           {containerLocation !== null ? (
-            <code className="text-accent-text break-all">{containerLocation}</code>
+            <code className="text-accent-text break-words">{containerLocation}</code>
           ) : (
             "the managed plugins directory"
           )}
@@ -2134,7 +2187,13 @@ export const PluginsSettingsSection: React.FC = () => {
       <div>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-foreground text-sm font-medium">Installed plugins</h3>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <UpdateAllButton
+              count={updateAll.count}
+              running={updateAll.running}
+              disabled={busyPlugin !== null}
+              onClick={() => void updateAll.run()}
+            />
             <Button
               variant="outline"
               size="sm"
@@ -2168,6 +2227,7 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         )}
 
+        <UpdateAllStatus status={updateAll.status} />
         {installSucceeded && (
           <p role="status" className="text-accent-text mb-3 text-xs">
             Plugin installed.
@@ -2309,18 +2369,18 @@ export const PluginsSettingsSection: React.FC = () => {
                   )}
                   {item.interface && <PluginInterfaceDetails info={item.interface} />}
                   <div className="text-muted mt-2 space-y-0.5 text-[11px]">
-                    {/* break-all: locations/sources can contain unbreakable
-                        64-char tokens (max-length plugin names) that would
-                        otherwise overflow the card at phone widths. The counts
-                        are prose and wrap at spaces. */}
+                    {/* break-words: the counts, the location and the source wrap at
+                        spaces, so a location or a commit id moves to the next line
+                        whole. A word splits only when it is longer than a line (a
+                        max-length plugin name), so nothing overflows the card at phone
+                        widths. */}
                     <p className="counter-nums break-words">
                       {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
                       imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
-                      {item.mcpServerCount} MCP servers imported ·{" "}
-                      <code className="break-all">{item.location}</code>
+                      {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
                     </p>
                     {formatSource(item) && (
-                      <p className="break-all">
+                      <p className="break-words">
                         {formatSource(item)}
                         {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
                       </p>
@@ -2364,14 +2424,16 @@ export const PluginsSettingsSection: React.FC = () => {
                       mode="update"
                       selective={item.importedComponents !== undefined}
                       busy={isBusy}
+                      locked={busyPlugin !== null}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
-                      onCancel={() => setUpdateReview(null)}
+                      onCancel={() => updateReviews.settle(updateReview)}
                     />
                   )}
                   <ComponentReviewRow
                     item={item}
                     review={componentReview.review}
                     busy={isBusy}
+                    locked={busyPlugin !== null}
                     onConfirm={(review) => void componentReview.confirm(review)}
                     onCancel={componentReview.close}
                   />
@@ -2379,6 +2441,7 @@ export const PluginsSettingsSection: React.FC = () => {
                     <UninstallConfirm
                       item={item}
                       busy={isBusy}
+                      locked={busyPlugin !== null}
                       onConfirm={(deletePluginData) =>
                         void handleUninstall(item.name, deletePluginData)
                       }

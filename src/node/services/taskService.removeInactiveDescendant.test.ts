@@ -55,7 +55,7 @@ interface RemovalProbes {
     withOperationLock<T>(id: string, operation: () => Promise<T>): Promise<T>;
     waitForGeneration(id: string): Promise<void>;
   };
-  refuseLossySubagentRemoval(...args: unknown[]): Promise<unknown>;
+  settleLossySubagentRemoval(...args: unknown[]): Promise<unknown>;
   describeSubagentRemovalPreview(...args: unknown[]): Promise<unknown>;
   persistRemovedAgentTaskTombstones(taskId: string): Promise<Result<void, string>>;
 }
@@ -86,8 +86,8 @@ function traceRemovalProbes(taskService: TaskService, trace: string[]) {
     });
   };
   patches.waitForGeneration = traced(trace, patches.waitForGeneration.bind(patches), "wait-patch");
-  const lossy = mock(traced(trace, probes.refuseLossySubagentRemoval.bind(taskService), "lossy"));
-  probes.refuseLossySubagentRemoval = lossy;
+  const lossy = mock(traced(trace, probes.settleLossySubagentRemoval.bind(taskService), "lossy"));
+  probes.settleLossySubagentRemoval = lossy;
   const preview = mock(
     traced(trace, probes.describeSubagentRemovalPreview.bind(taskService), "preview")
   );
@@ -412,7 +412,7 @@ describe("TaskService removeInactiveDescendantAgentTask: scope, refusals, hold a
     const workspace: unknown = expect.objectContaining({ id: "child", taskAttemptId: ATTEMPT_ID });
     const checkedEntry = { projectPath: f.projectPath, workspace };
     const artifact: unknown = expect.objectContaining({ childTaskId: "child", status: "skipped" });
-    expect(f.lossy.mock.calls.at(-1)).toEqual(["child", checkedEntry, artifact]);
+    expect(f.lossy.mock.calls.at(-1)).toEqual(["child", checkedEntry, artifact, "refuse"]);
     expect(f.preview.mock.calls.at(-1)).toEqual(["child", checkedEntry, artifact]);
   }, 20_000);
 

@@ -40,6 +40,7 @@ describe("Known Models Integration", () => {
     ["astra", /^openai:gpt-[\d.]+-astra$/],
     ["gemini", /^google:gemini-.*pro/],
     ["argon", /^google:gemini-4-argon/],
+    ["carbon", /^google:gemini-4-carbon/],
     ["gemini-flash", /^google:gemini-.*flash/],
     ["grok", /^xai:grok-/],
     ["muse", /^meta:muse-wonder-/],
