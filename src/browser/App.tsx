@@ -1468,7 +1468,7 @@ function AppInner() {
   return (
     <>
       <div
-        className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
+        className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-(--safe-area-top) pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
         ref={appShellRef}
       >
         <LeftSidebarToggleBar
