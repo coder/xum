@@ -4,7 +4,7 @@
 // are not part of the `bun test src` lane).
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -18,7 +18,11 @@ import {
 let rootDir: string;
 
 beforeEach(async () => {
-  rootDir = await mkdtemp(path.join(tmpdir(), "startup-imports-"));
+  // mkdtemp sits under macOS's symlinked /var (=/private/var) while esbuild
+  // reports absolute paths through /private/var; path.relative then produces
+  // keys that never match the walked graph. Resolve the link so both sides
+  // agree (Linux tmpdirs are already real paths).
+  rootDir = await realpath(await mkdtemp(path.join(tmpdir(), "startup-imports-")));
   // Mirror the repo's `@/*` alias so alias edges are followed, not treated as packages.
   await writeFile(
     path.join(rootDir, "tsconfig.json"),
