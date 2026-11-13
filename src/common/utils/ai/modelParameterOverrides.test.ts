@@ -466,7 +466,7 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
-  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon and Carbon", () => {
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon, Carbon and Hydrogen", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         max_output_tokens: 32768,
