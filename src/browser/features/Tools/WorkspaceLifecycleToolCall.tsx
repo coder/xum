@@ -303,6 +303,21 @@ function blockedHint(
   }
 }
 
+// An "error" row with paths is the lossy-snapshot refusal (#3950). An "archived" row with paths
+// is a forced archive: the snapshot did not keep those untracked files (their removal is best
+// effort, so the label does not claim they are gone).
+function pathsLabel(status: TaskWorkspaceLifecycleStatus): string {
+  switch (status) {
+    case "requires_confirmation":
+    case "error":
+      return "Untracked files that would be lost";
+    case "archived":
+      return "Untracked files not kept";
+    default:
+      return "Paths";
+  }
+}
+
 // Labeled, scrollable list of identifiers (untracked paths or active task ids). Both are
 // repo-/runtime-controlled strings that can be long, so break-all + a capped scroll keep the
 // row from overflowing its container on narrow/mobile widths.
@@ -364,15 +379,7 @@ const WorkspaceRow: React.FC<{
       {row.note && <div className="text-secondary mt-1 pl-6 break-words">{row.note}</div>}
       <div className="pl-6">
         {row.paths && row.paths.length > 0 && (
-          <DetailList
-            label={
-              // Since #3950 the lossy-snapshot refusal is the only "error" row with paths.
-              row.status === "requires_confirmation" || row.status === "error"
-                ? "Untracked files that would be lost"
-                : "Paths"
-            }
-            items={row.paths}
-          />
+          <DetailList label={pathsLabel(row.status)} items={row.paths} />
         )}
         {row.activeTaskIds && row.activeTaskIds.length > 0 && (
           <DetailList label="Active turns" items={row.activeTaskIds} />
