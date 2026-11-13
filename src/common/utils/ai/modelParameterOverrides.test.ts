@@ -466,7 +466,7 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
-  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon and Carbon", () => {
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon, Carbon and Hydrogen", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         max_output_tokens: 32768,
@@ -480,6 +480,8 @@ describe("resolveModelParameterOverrides", () => {
       "google:gemini-3.8-flash",
       "google:gemini-4-argon",
       "google:gemini-4-carbon",
+      "google:gemini-4-hydrogen",
+      "openrouter:google/gemini-4-hydrogen",
     ]) {
       const result = resolveModelParameterOverrides(providersConfig, "google", model);
 
@@ -505,6 +507,10 @@ describe("resolveModelParameterOverrides", () => {
     ).toEqual({ standard: { seed: 42 } });
     expect(
       resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-argon")
+    ).toEqual({ standard: { seed: 42, frequencyPenalty: 0.5, presencePenalty: 0.5 } });
+    // Hydrogen has no documented penalty rejection (unlike Carbon), so overrides pass through.
+    expect(
+      resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-hydrogen")
     ).toEqual({ standard: { seed: 42, frequencyPenalty: 0.5, presencePenalty: 0.5 } });
   });
 

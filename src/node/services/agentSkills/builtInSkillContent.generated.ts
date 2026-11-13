@@ -5381,6 +5381,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| Gemini 3.8 Flash       | google:gemini-3.8-flash       | `gemini-flash`                                               |         |",
       "| Gemini 4 Argon         | google:gemini-4-argon         | `argon`, `gemini-argon`, `gemini-4`                          |         |",
       "| Gemini 4 Carbon        | google:gemini-4-carbon        | `carbon`, `gemini-carbon`                                    |         |",
+      "| Gemini 4 Hydrogen      | google:gemini-4-hydrogen      | `hydrogen`, `gemini-hydrogen`                                |         |",
       "| Grok 4.7               | xai:grok-4.7                  | `grok`, `grok-4.7`                                           |         |",
       "| DeepSeek V4 Pro        | deepseek:deepseek-v4-pro      | `deepseek`, `deepseek-pro`, `deepseek-v4`, `deepseek-v4-pro` |         |",
       "| DeepSeek V4 Flash      | deepseek:deepseek-v4-flash    | `deepseek-flash`, `deepseek-v4-flash`                        |         |",

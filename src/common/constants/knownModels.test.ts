@@ -41,7 +41,11 @@ describe("Known Models Integration", () => {
     ["gemini", /^google:gemini-.*pro/],
     ["argon", /^google:gemini-4-argon/],
     ["carbon", /^google:gemini-4-carbon/],
+    ["hydrogen", /^google:gemini-4-hydrogen/],
+    ["gemini-hydrogen", /^google:gemini-4-hydrogen/],
     ["gemini-flash", /^google:gemini-.*flash/],
+    // `gemini-4` stays on Argon even after newer Gemini 4 tiers land; Hydrogen is additive.
+    ["gemini-4", /^google:gemini-4-argon$/],
     ["grok", /^xai:grok-/],
     ["muse", /^meta:muse-wonder-/],
     ["wonder", /^meta:muse-wonder-/],
