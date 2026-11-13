@@ -9,6 +9,7 @@ import {
   spyOn,
   test,
 } from "bun:test";
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -16,8 +17,10 @@ import * as path from "node:path";
 import {
   __closeFileSinkForTests,
   __resetFileSinkForTests,
+  MAX_PENDING_SINK_BYTES,
   clearLogFiles,
   closeLogFile,
+  getLogFilePath,
   log,
 } from "./log";
 import { subscribeLogFeed, type LogEntry } from "./logBuffer";
@@ -295,5 +298,184 @@ describe("log file sink state machine", () => {
     expect(() => log.info("line after close should be dropped")).not.toThrow();
     expect(createWriteStreamSpy.mock.calls.length).toBe(createCallsBeforeClose);
     expect(writeSpy.mock.calls.length).toBe(writeCallsBeforeClose);
+  });
+
+  // A rotation or clear waits for the sink's first stream to close. Here that stream ignores end()
+  // until the test releases it, so the transition stays in flight while the test writes lines.
+  function stickFirstStream() {
+    const originalCreateWriteStream = fs.createWriteStream;
+    const streams: fs.WriteStream[] = [];
+    let releaseFirstStream = (): Promise<void> => Promise.resolve();
+    let onSecondStream: (stream: fs.WriteStream) => void = () => undefined;
+    const secondStream = new Promise<fs.WriteStream>((resolve) => {
+      onSecondStream = resolve;
+    });
+    spyOn(fs, "createWriteStream").mockImplementation((...args) => {
+      const stream = originalCreateWriteStream(...args);
+      if (streams.length === 0) {
+        const endSpy = spyOn(stream, "end").mockImplementation(() => stream);
+        releaseFirstStream = async () => {
+          endSpy.mockRestore();
+          await new Promise<void>((resolve) => {
+            stream.once("close", () => resolve());
+            stream.end();
+          });
+        };
+      } else if (streams.length === 1) {
+        onSecondStream(stream);
+      }
+      streams.push(stream);
+      return stream;
+    });
+    return { streams, releaseFirstStream: () => releaseFirstStream(), secondStream };
+  }
+
+  // The sink starts from the size of the file that it finds, and it rotates at 10 MiB. A sparse file
+  // of that size makes the next log line rotate, with no 10 MiB write.
+  async function makeNextLineRotate(): Promise<void> {
+    const logFile = getLogFilePath();
+    await fsPromises.mkdir(path.dirname(logFile), { recursive: true });
+    await fsPromises.writeFile(logFile, "");
+    await fsPromises.truncate(logFile, 10 * 1024 * 1024);
+  }
+
+  async function readLog(): Promise<string> {
+    return await fsPromises.readFile(getLogFilePath(), "utf8");
+  }
+
+  test("lines written while a rotation is in flight reach the new log, in order", async () => {
+    const { releaseFirstStream, secondStream } = stickFirstStream();
+    await makeNextLineRotate();
+    const logsDir = path.dirname(getLogFilePath());
+    await fsPromises.writeFile(path.join(logsDir, "mux.1.log"), "older rotated log\n");
+    await fsPromises.writeFile(path.join(logsDir, "mux.2.log"), "oldest rotated log\n");
+    log.info("line that rotates the log");
+    log.info("held line one");
+    log.info("held line two");
+
+    await releaseFirstStream();
+    const next = await secondStream;
+    closeLogFile();
+    await once(next, "close");
+
+    const current = await readLog();
+    expect(current.indexOf("held line one")).toBeGreaterThanOrEqual(0);
+    expect(current.indexOf("held line two")).toBeGreaterThan(current.indexOf("held line one"));
+    expect(current).not.toContain("line that rotates the log");
+    const rotated = await fsPromises.readFile(
+      path.join(path.dirname(getLogFilePath()), "mux.1.log")
+    );
+    expect(rotated.subarray(-4096).toString()).toContain("line that rotates the log");
+    // The older files moved up one place.
+    expect(await fsPromises.readFile(path.join(logsDir, "mux.2.log"), "utf8")).toBe(
+      "older rotated log\n"
+    );
+    expect(await fsPromises.readFile(path.join(logsDir, "mux.3.log"), "utf8")).toBe(
+      "oldest rotated log\n"
+    );
+  });
+
+  test("a later transition does not write the held lines again", async () => {
+    const { streams, releaseFirstStream, secondStream } = stickFirstStream();
+    await makeNextLineRotate();
+    log.info("line that rotates the log");
+    log.info("held line");
+
+    await releaseFirstStream();
+    await secondStream;
+    // The clear ends the second stream, which writes the held line, and opens a third one.
+    await clearLogFiles();
+    closeLogFile();
+    await once(streams[2], "close");
+
+    expect(await readLog()).not.toContain("held line");
+  });
+
+  test("lines written while a clear is in flight reach the cleared log", async () => {
+    const { releaseFirstStream, secondStream } = stickFirstStream();
+    log.info("line before the clear");
+    const clearing = clearLogFiles();
+    log.info("held during the clear");
+
+    await releaseFirstStream();
+    await clearing;
+    const next = await secondStream;
+    closeLogFile();
+    await once(next, "close");
+
+    const current = await readLog();
+    expect(current).toContain("held during the clear");
+    expect(current).not.toContain("line before the clear");
+  });
+
+  test("a clear on an idle sink leaves the sink able to open", async () => {
+    const createWriteStreamSpy = spyOn(fs, "createWriteStream");
+
+    await clearLogFiles();
+    // The sink queue lowers its depth a few microtasks after the clear resolves.
+    await new Promise((resolve) => setImmediate(resolve));
+    log.info("line after a clear of an idle sink");
+
+    expect(createWriteStreamSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("held lines are bounded, and the lines past the bound are the ones dropped", async () => {
+    const { releaseFirstStream, secondStream } = stickFirstStream();
+    spyOn(console, "log").mockImplementation(() => undefined);
+    await makeNextLineRotate();
+    log.info("line that rotates the log");
+    const third = Math.ceil(MAX_PENDING_SINK_BYTES / 3) + 1;
+    // Three lines that cannot all fit, then a short one that cannot fit either once the bound is hit.
+    log.info(`first held line ${"a".repeat(third)}`);
+    log.info(`second held line ${"b".repeat(third)}`);
+    log.info(`third held line ${"c".repeat(third)}`);
+
+    await releaseFirstStream();
+    const next = await secondStream;
+    closeLogFile();
+    await once(next, "close");
+
+    const current = await readLog();
+    expect(current).toContain("first held line");
+    expect(current).toContain("second held line");
+    expect(current).not.toContain("third held line");
+  });
+
+  test("a reset drops held lines", async () => {
+    const { streams, releaseFirstStream } = stickFirstStream();
+    await makeNextLineRotate();
+    log.info("line that rotates the log");
+    log.info("line held, then dropped by the reset");
+
+    __resetFileSinkForTests();
+    // The file is still the 10 MiB one, and a sink that opens on it would rotate at once.
+    await fsPromises.truncate(getLogFilePath(), 0);
+    log.info("line after the reset");
+    expect(streams).toHaveLength(2);
+    closeLogFile();
+    await once(streams[1], "close");
+    const current = await readLog();
+    // The rotation that the reset abandoned finishes now, and it finds the sink reset.
+    await releaseFirstStream();
+
+    expect(current).toContain("line after the reset");
+    expect(current).not.toContain("line held, then dropped by the reset");
+  });
+
+  test("a closed sink never writes held lines, and a rotation that finishes later opens nothing", async () => {
+    const { streams, releaseFirstStream } = stickFirstStream();
+    await makeNextLineRotate();
+    log.info("line that rotates the log");
+    log.info("line held, then dropped by the close");
+
+    closeLogFile();
+    await releaseFirstStream();
+    await __closeFileSinkForTests();
+
+    expect(streams).toHaveLength(1);
+    const rotated = await fsPromises.readFile(
+      path.join(path.dirname(getLogFilePath()), "mux.1.log")
+    );
+    expect(rotated.toString()).not.toContain("line held, then dropped by the close");
   });
 });
