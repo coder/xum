@@ -133,9 +133,9 @@ function SshDirectoryTrustRow(props: {
   const ActionIcon = busy ? Loader2 : null;
 
   // Layout, so the row looks balanced at every width:
-  // - As wide as the environment chip above it: CreationControls caps their column and stretches
-  //   both to it. A full-width bar put the button ~1,000px from the shield on a wide screen, and a
-  //   fixed cap (not a content-hugging width) keeps the button still when the copy changes length.
+  // - As wide as the environment chip above it, so the two read as one control: CreationControls
+  //   fits their column to the chip, and this row's @container adds no width of its own. A
+  //   full-width bar put the button ~1,000px from the shield on a wide screen.
   // - One line from @md up: icon, status, button, with the row as tall as the chip above it (32px).
   // - Narrower (a phone): the title, the detail and the button stack in the text column, with the
   //   shield on the title's line. Side by side they squeezed the copy into a ~180px column.

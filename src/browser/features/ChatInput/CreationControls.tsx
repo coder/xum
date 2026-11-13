@@ -397,12 +397,16 @@ function withSshNoneProjectDir(
 }
 
 /**
- * With the SSH directory's trust row, the environment chip and the row share one width (the chip
- * stretches to it): capped so the row's button stays near its copy on a wide page, and the whole
- * column on a narrow one.
+ * With the SSH directory's trust row, the column is as wide as the environment chip, so the row
+ * under the chip takes the chip's width (the user's choice over widening the chip to the row).
+ * The row's container query adds no width of its own, so `w-fit` fits the chip alone. On a touch
+ * phone the chip fills the width, and so does the column.
  */
 function runtimeGroupClass(hasTrustRow: boolean): string {
-  return cn("flex min-w-0 flex-col gap-1.5", hasTrustRow && "max-w-2xl");
+  return cn(
+    "flex min-w-0 flex-col gap-1.5",
+    hasTrustRow && "w-fit max-w-full [@media(max-width:768px)_and_(pointer:coarse)]:w-full"
+  );
 }
 
 /** The trust row for the SSH+None directory being configured; nothing for other selections. */
@@ -1087,7 +1091,6 @@ function CreationControlsContent(props: CreationControlsProps) {
             fieldErrorAttempt={props.runtimeFieldErrorAttempt ?? 0}
             footerAction={<SetDefaultIsolationButton saver={defaultSaver} />}
             footerShortcut={setDefaultShortcut(defaultSaver)}
-            fill={sshNoneRuntime !== null}
           />
         </div>
 
