@@ -136,7 +136,10 @@ function SshDirectoryTrustRow(props: {
   // - As wide as the environment chip above it, so the two read as one control: CreationControls
   //   fits their column to the chip, and this row's @container adds no width of its own. A
   //   full-width bar put the button ~1,000px from the shield on a wide screen.
-  // - One line from @md up: icon, status, button, with the row as tall as the chip above it (32px).
+  // - From @md up the button sits beside the status; with one line of copy the row is as tall as
+  //   the chip above it (32px). The status gets the button's 24px height (py-1) and the shield sits
+  //   on its first line, so a status that wraps (a long path widens the chip) keeps the shield on
+  //   the title instead of centring it on the block.
   // - Narrower (a phone): the title, the detail and the button stack in the text column, with the
   //   shield on the title's line. Side by side they squeezed the copy into a ~180px column.
   // - The error sits in the text column, under the status it explains.
@@ -150,12 +153,12 @@ function SshDirectoryTrustRow(props: {
         <StatusIcon
           aria-hidden
           className={cn(
-            "size-4 shrink-0",
+            "size-4 shrink-0 @md:mt-1 @md:self-start",
             props.trusted ? "text-success-text" : "text-warning-text"
           )}
         />
         {/* Announced when it changes, so a trust or untrust is confirmed without looking. */}
-        <span role="status" className="min-w-0">
+        <span role="status" className="min-w-0 @md:py-1">
           <span className="text-foreground block font-medium @md:inline">{copy.title}</span>
           <span className="text-muted">
             <span className="hidden @md:inline"> · </span>
