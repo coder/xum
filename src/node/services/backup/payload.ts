@@ -128,12 +128,15 @@ export function hidesSecretBehindEscapes(text: string): boolean {
 }
 
 /**
- * True when `text` carries a secret that the publish-time scan of the JSON text it is written as
- * would not find. JSON writes a control character as an escape: `"\nghp_..."` has no word boundary
- * before the token, so the scan passes it while a reader of the decoded string sees the token. The
- * same goes for a percent escape (`hidesSecretBehindEscapes`). A token that the scan finds in the
- * written text is not hidden: the scan holds that file for the user's review, the flow a push uses
- * for any file that looks like a secret.
+ * True when `text` carries a secret that the raw-text check of the publish-time scan would not find
+ * in the JSON text it is written as. JSON writes a control character as an escape: `"\nghp_..."` has
+ * no word boundary before the token, so that check passes it while a reader of the decoded string
+ * sees the token. The same goes for a percent escape (`hidesSecretBehindEscapes`). The scan also
+ * checks each decoded JSON string of a file (`jsonStringsMatchSecretPattern`), which holds
+ * the file for the first kind of escape and not for the second. The first kind still counts here:
+ * a plugin row is left out of the list, so a push does not stop for review over a name the
+ * installer took. A token that the raw-text check finds is not hidden: the scan holds that file
+ * for the user's review, the flow a push uses for any file that looks like a secret.
  */
 function stringHidesSecret(text: string): boolean {
   if (matchesSecretPattern(JSON.stringify(text))) return false;
@@ -142,8 +145,8 @@ function stringHidesSecret(text: string): boolean {
 
 /**
  * True when a string of a JSON value, a value or an object key at any depth, hides a secret from
- * the publish-time scan of the JSON text (`stringHidesSecret`). Checking the strings themselves
- * leaves nothing for a JSON escape to hide behind.
+ * the raw-text check of the publish-time scan of the JSON text (`stringHidesSecret`). Checking the
+ * strings themselves leaves nothing for a JSON escape to hide behind.
  */
 export function jsonValueHidesSecret(value: unknown): boolean {
   if (typeof value === "string") return stringHidesSecret(value);
@@ -152,6 +155,35 @@ export function jsonValueHidesSecret(value: unknown): boolean {
     return Object.entries(value).some(
       ([key, entry]) => jsonValueHidesSecret(key) || jsonValueHidesSecret(entry)
     );
+  }
+  return false;
+}
+
+/**
+ * The patterns start with `\b`, but in a JSON string `\n`, `\t`, `\r` and `\uXXXX` end in a
+ * word character, so a token written after one has no boundary in the raw text and the raw
+ * check misses it. Checking each decoded string (keys and values, at any depth) sees what a
+ * reader of the file sees.
+ *
+ * It runs on every file, whatever its name: a skill's `.md` or `.txt` file is published without
+ * review and can hold JSON text (a saved API response), and an extension is not what a reader
+ * of the text goes by. Text that is not JSON reads as it is, and only a quoted string can match.
+ *
+ * This reads tokens instead of parsing: `jsonc.parse` keeps only the last of a duplicate key
+ * and drops `__proto__`, so a token in either would escape the check, and a file that does
+ * not parse would be skipped whole. The scanner never throws and does not recurse.
+ */
+function jsonStringsMatchSecretPattern(text: string): boolean {
+  // mutation-equivalent: without a backslash each decoded string is the raw text between two
+  // quotes (or up to a line break or the end of the file), and those are non-word characters, so
+  // the raw check has already seen every match here with the same word boundaries. Only the
+  // time differs, and this scan is synchronous.
+  if (!text.includes("\\")) return false;
+  const scanner = jsonc.createScanner(text);
+  for (let token = scanner.scan(); token !== jsonc.SyntaxKind.EOF; token = scanner.scan()) {
+    if (token === jsonc.SyntaxKind.StringLiteral && matchesSecretPattern(scanner.getTokenValue())) {
+      return true;
+    }
   }
   return false;
 }
@@ -1781,7 +1813,7 @@ export function scanBackupFilesForSecrets(
   return files
     .filter((file) => {
       const content = file.content.toString("utf-8");
-      if (matchesSecretPattern(content)) return true;
+      if (matchesSecretPattern(content) || jsonStringsMatchSecretPattern(content)) return true;
       if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content, mcpOptions)) {
         return true;
       }

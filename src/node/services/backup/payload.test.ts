@@ -10,6 +10,7 @@ import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  ARTIFACT_SHELF_BACKUP_DIR,
   BACKUP_SCHEMA_VERSION,
   BACKUP_SCHEMA_VERSION_LITERAL_HEADERS,
   BackupCommandApprovalRequiredError,
@@ -3874,6 +3875,99 @@ describe("backup payload", () => {
     expect(scanBackupFilesForSecrets(payload.files, CONTENTS)).toContain("AGENTS.md");
   });
 
+  describe("secrets inside JSON string escapes", () => {
+    // Built from repeated letters so no test line is a credential. Each token matches one
+    // SECRET_PATTERNS entry that starts with `\b`.
+    const TOKENS = [
+      `sk-${"a".repeat(20)}`,
+      `ghp_${"a".repeat(36)}`,
+      `github_pat_${"a".repeat(22)}`,
+      `AKIA${"A".repeat(16)}`,
+      `AIza${"a".repeat(35)}`,
+      `xoxb-${"a".repeat(12)}`,
+    ];
+    const TOKEN = TOKENS[1];
+    // The file text holds a backslash and a letter or digit right before the token, which is
+    // a word character, so `\b` finds no boundary in the raw text.
+    const ESCAPES = ["\\n", "\\t", "\\r", "\\u0020", "\\u000a"];
+    // An auto-published JSON file: shelf entry metadata is not held for review by path.
+    const META_PATH = `${ARTIFACT_SHELF_BACKUP_DIR}/entry/meta.json`;
+
+    function scan(filePath: string, text: string): string[] {
+      return scanBackupFilesForSecrets([{ path: filePath, content: Buffer.from(text) }], CONTENTS);
+    }
+
+    it.each(ESCAPES)("flags a token after the %s escape in a JSON string value", (escape) => {
+      expect(scan(META_PATH, `{"title":"x${escape}${TOKEN}"}`)).toEqual([META_PATH]);
+      expect(scan(META_PATH, `{"title":"x${escape}${"a".repeat(36)}"}`)).toEqual([]);
+    });
+
+    it.each(TOKENS)("flags the escaped form of every pattern: %#", (token) => {
+      expect(scan(META_PATH, `{"title":"x\\n${token}"}`)).toEqual([META_PATH]);
+    });
+
+    it("flags a token in an object key and at any depth", () => {
+      expect(scan(META_PATH, JSON.stringify({ [`x\n${TOKEN}`]: 1 }))).toEqual([META_PATH]);
+      expect(scan(META_PATH, JSON.stringify({ a: [{ b: { c: [`x\t${TOKEN}`] } }] }))).toEqual([
+        META_PATH,
+      ]);
+    });
+
+    it("flags a token in a duplicate key's earlier value that a parse would drop", () => {
+      const text = `{"title":"x\\n${TOKEN}","title":"clean","__proto__":"x\\n${TOKEN}"}`;
+      expect(scan(META_PATH, text)).toEqual([META_PATH]);
+      expect(scan(META_PATH, `{"title":"x\\n${"a".repeat(36)}","title":"clean"}`)).toEqual([]);
+    });
+
+    it("decodes a .jsonc file that has comments and a trailing comma", () => {
+      const withToken = `// notes\n{ /* c */ "servers": { "api": { "url": "https://example.com/mcp", "note": "x\\n${TOKEN}", }, }, }\n`;
+      expect(scan("mcp.jsonc", withToken)).toEqual(["mcp.jsonc"]);
+      expect(scan("mcp.jsonc", withToken.replace(TOKEN, "a".repeat(36)))).toEqual([]);
+    });
+
+    it("still decodes a JSON file that does not parse", () => {
+      expect(scan(META_PATH, `{"title":"x\\n${TOKEN}"`)).toEqual([META_PATH]);
+    });
+
+    // A skill's .md or .txt file is published without review, and a saved API response or a note
+    // can hold JSON text. The file name does not say how a reader reads the text.
+    it.each([
+      "skills/demo/response.md",
+      "skills/demo/response.txt",
+      "memory/global/response.txt",
+      "AGENTS.md",
+    ])("flags JSON text with an escaped token in %s", (filePath) => {
+      const jsonText = (value: string) => JSON.stringify({ response: `line one\n${value}` });
+      expect(scan(filePath, jsonText(TOKEN))).toEqual([filePath]);
+      expect(scan(filePath, jsonText("a".repeat(36)))).toEqual([]);
+    });
+
+    it("still checks the raw text of a JSONC file, where a comment holds the token", () => {
+      // A comment is not a string token, so only the raw-text check sees this one.
+      expect(scan("mcp.jsonc", `{ /* ${TOKEN} */ "servers": {} }`)).toEqual(["mcp.jsonc"]);
+      expect(scan("mcp.jsonc", `{ /* ${"a".repeat(36)} */ "servers": {} }`)).toEqual([]);
+    });
+
+    it("blocks a push whose preferences.json holds an escaped token", async () => {
+      // `terminalFontConfig.fontFamily` is free text that reaches preferences.json, which
+      // `JSON.stringify` writes with the newline as the two characters backslash and `n`.
+      const error = await captureRejection(
+        createBackupPayload({
+          muxRoot,
+          contents: CONTENTS,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          preferences: {
+            appearance: { terminalFontConfig: { fontFamily: `x\n${TOKEN}`, fontSize: 12 } },
+          },
+        })
+      );
+      expect((error as Error).message).toContain(
+        "Backup contains possible secrets in: preferences.json"
+      );
+    });
+  });
+
   it("refuses to back up a file hard-linked to one outside the collected set", async () => {
     // A hard link carries the outside file's bytes past the allowlist the way a symlink
     // would, and AGENTS.md is published without being held for review.
@@ -5786,30 +5880,36 @@ describe("jsonValueHidesSecret", () => {
     );
 
   // JSON writes each of these first characters as an escape, so the token has no word boundary in
-  // the text the publish-time scan reads. The strings themselves have one.
+  // the text the raw check reads. The strings themselves have one, and the scan reads them too: it
+  // holds the file for review as well. The row check still finds the token, so a plugin row that
+  // carries one is left out of the list and no push has to stop over it.
   it.each([
     ["a newline", "\n"],
     ["a tab", "\t"],
     ["a carriage return", "\r"],
     ["a control character written as \\u00XX", "\u0001"],
     ["a lone surrogate", "\ud800"],
-  ])("finds a token after %s that the scan of the JSON text passes", (_label, prefix) => {
+  ])("finds a token after %s that only a decoded string shows", (_label, prefix) => {
     const value = { importedComponents: { skills: [], mcpServers: [`${prefix}${token}`] } };
 
-    expect(publishScan(value)).toEqual([]);
     expect(jsonValueHidesSecret(value)).toBe(true);
+    expect(publishScan(value)).toEqual(["agent-plugins/manifest.json"]);
   });
 
   it("finds a token in an object key, at any depth", () => {
     const value = { a: [{ b: { [`\n${token}`]: 1 } }] };
 
-    expect(publishScan(value)).toEqual([]);
     expect(jsonValueHidesSecret(value)).toBe(true);
+    expect(publishScan(value)).toEqual(["agent-plugins/manifest.json"]);
   });
 
-  it("finds a token that a percent escape hides, in a value or a key", () => {
-    expect(jsonValueHidesSecret({ url: `https://h/%20${token}/r.git` })).toBe(true);
-    expect(jsonValueHidesSecret({ [`%20${token}`]: "x" })).toBe(true);
+  it("finds a token that a percent escape hides, in a value or a key, which the scan does not read", () => {
+    const hidden = [{ url: `https://h/%20${token}/r.git` }, { [`%20${token}`]: "x" }];
+
+    for (const value of hidden) {
+      expect(jsonValueHidesSecret(value)).toBe(true);
+      expect(publishScan(value)).toEqual([]);
+    }
   });
 
   it("leaves a token that the scan of the JSON text finds to the scan, which holds the file for review", () => {
