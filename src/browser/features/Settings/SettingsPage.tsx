@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import {
   Blocks,
   Brain,
+  Mic,
   Settings,
   Key,
   Cpu,
@@ -29,6 +30,7 @@ import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
 import { HeartbeatSection } from "./Sections/HeartbeatSection";
 import { ProvidersSection } from "./Sections/ProvidersSection";
+import { VoiceSection } from "./Sections/VoiceSection";
 import { ModelsSection } from "./Sections/ModelsSection";
 import { MemorySection } from "./Sections/MemorySection";
 import { Button } from "@/browser/components/Button/Button";
@@ -83,6 +85,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Models",
     icon: <Cpu className="h-4 w-4" />,
     component: ModelsSection,
+  },
+  {
+    id: "voice",
+    label: "Voice",
+    icon: <Mic className="h-4 w-4" />,
+    component: VoiceSection,
   },
   {
     id: "mcp",

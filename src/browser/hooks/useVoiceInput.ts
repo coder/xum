@@ -1,12 +1,12 @@
 /**
- * Voice input via backend transcription (OpenAI credentials).
+ * Voice input with local models or OpenAI transcription.
  *
  * State machine: idle → requesting → recording → transcribing → idle
  *
  * Hidden on touch devices where native keyboard dictation is available.
  */
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, type MutableRefObject } from "react";
 import { matchesKeybind, KEYBINDS, isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
@@ -15,6 +15,13 @@ import {
 } from "@/browser/utils/voice/silenceGate";
 import type { APIClient } from "@/browser/contexts/API";
 import { trackVoiceTranscription } from "@/common/telemetry";
+import {
+  isLocalVoiceModelId,
+  LOCAL_VOICE_MAX_SECONDS,
+  type VoiceModelId,
+} from "@/common/constants/localVoiceModels";
+import { transcribeVoiceRecording } from "@/browser/utils/voice/transcribeVoiceRecording";
+import { hasTouchDictation, isRemoteVoiceCaptureBlocked } from "@/browser/stores/LocalVoiceStore";
 import { getErrorMessage } from "@/common/utils/errors";
 
 export type VoiceInputState = "idle" | "requesting" | "recording" | "transcribing";
@@ -24,8 +31,9 @@ export interface UseVoiceInputOptions {
   onError?: (error: string) => void;
   /** Called after successful transcription if stop({ send: true }) was used */
   onSend?: () => void;
-  /** Whether voice transcription is available (OpenAI enabled and its key set). */
+  /** Whether the selected model has its required download or credentials. */
   isTranscriptionAvailable: boolean;
+  voiceModel?: VoiceModelId | null;
   /**
    * When true, hook manages global keybinds during recording:
    * - Space: stop and send (requires release after start)
@@ -57,28 +65,15 @@ export interface UseVoiceInputResult {
 // Platform Detection
 // =============================================================================
 
-/**
- * Detect touch devices where native keyboard dictation is typically available.
- * This includes phones, tablets (iPad), and touch-enabled laptops in tablet mode.
- * We hide our voice UI on these devices to avoid redundancy with system dictation.
- */
-function hasTouchDictation(): boolean {
-  if (typeof window === "undefined" || typeof navigator === "undefined") return false;
-
-  const maxTouchPoints =
-    typeof navigator.maxTouchPoints === "number" ? navigator.maxTouchPoints : 0;
-  const hasTouch = "ontouchstart" in window || maxTouchPoints > 0;
-
-  // Touch-only check: most touch devices have native dictation.
-  // We don't check screen size because iPads are large but still have dictation.
-  return hasTouch;
-}
-
 // Capability checks run at call time, not module load: this module can be evaluated
 // before MediaRecorder/mediaDevices exist in the environment (notably under Bun's test
 // module caching), which would otherwise freeze stale negatives.
 function hasMediaRecorder(): boolean {
-  return typeof window !== "undefined" && typeof MediaRecorder !== "undefined";
+  return (
+    typeof window !== "undefined" &&
+    typeof MediaRecorder !== "undefined" &&
+    !isRemoteVoiceCaptureBlocked()
+  );
 }
 
 function hasGetUserMedia(): boolean {
@@ -102,7 +97,10 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const recordingModelRef = useRef<VoiceModelId | null>("openai");
+  const transcriptionControllerRef = useRef<AbortController | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const recordingDeadlineRef = useRef<number | undefined>(undefined);
   const meterIntervalRef = useRef<number | null>(null);
   const rmsFramesRef = useRef<number[]>([]);
 
@@ -162,20 +160,15 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     const audioDurationSecs = (Date.now() - recordingStartTimeRef.current) / 1000;
 
     try {
-      // Encode audio as base64 for IPC transport
-      const buffer = await audioBlob.arrayBuffer();
-      const base64 = btoa(
-        new Uint8Array(buffer).reduce((str, byte) => str + String.fromCharCode(byte), "")
+      const controller = new AbortController();
+      transcriptionControllerRef.current = controller;
+      const result = await transcribeVoiceRecording(
+        recordingModelRef.current,
+        audioBlob,
+        callbacksRef.current.api,
+        controller.signal
       );
-
-      const api = callbacksRef.current.api;
-      if (!api) {
-        callbacksRef.current.onError?.("Voice API not available");
-        trackVoiceTranscription(audioDurationSecs, false);
-        return;
-      }
-
-      const result = await api.voice.transcribe({ audioBase64: base64 });
+      if (controller.signal.aborted) return;
 
       if (!result.success) {
         callbacksRef.current.onError?.(result.error);
@@ -200,10 +193,12 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
         setTimeout(() => callbacksRef.current.onSend?.(), 0);
       }
     } catch (err) {
+      if (transcriptionControllerRef.current?.signal.aborted) return;
       const msg = getErrorMessage(err);
       callbacksRef.current.onError?.(`Transcription failed: ${msg}`);
       trackVoiceTranscription(audioDurationSecs, false);
     } finally {
+      transcriptionControllerRef.current = null;
       setState("idle");
     }
   }, []);
@@ -213,6 +208,8 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
   // ---------------------------------------------------------------------------
 
   const releaseStream = useCallback(() => {
+    window.clearTimeout(recordingDeadlineRef.current);
+    recordingDeadlineRef.current = undefined;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
   }, []);
@@ -267,6 +264,21 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
   );
 
   // ---------------------------------------------------------------------------
+  // Stop Recording (triggers transcription)
+  // ---------------------------------------------------------------------------
+
+  const stop = useCallback((options?: { send?: boolean }) => {
+    window.clearTimeout(recordingDeadlineRef.current);
+    if (options?.send) shouldSendRef.current = true;
+
+    if (recorderRef.current?.state !== "inactive") {
+      recorderRef.current?.stop();
+      recorderRef.current = null;
+      setMediaRecorder(null);
+    }
+  }, []);
+
+  // ---------------------------------------------------------------------------
   // Start Recording
   // ---------------------------------------------------------------------------
 
@@ -280,12 +292,21 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
       callbacksRef.current.isTranscriptionAvailable;
 
     if (!canStart) return;
+    wasCancelledRef.current = false;
+
+    // Keep the selected provider for this recording. Settings changes must not redirect local audio.
+    recordingModelRef.current =
+      callbacksRef.current.voiceModel === undefined ? "openai" : callbacksRef.current.voiceModel;
 
     // Show loading state immediately while requesting mic access
     setState("requesting");
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (wasCancelledRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       streamRef.current = stream;
 
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -336,6 +357,10 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
       startMetering(stream);
       recorder.start();
       recordingStartTimeRef.current = Date.now();
+      if (isLocalVoiceModelId(recordingModelRef.current)) {
+        // Stop local capture at its processing limit without discarding the completed recording.
+        recordingDeadlineRef.current = window.setTimeout(stop, LOCAL_VOICE_MAX_SECONDS * 1000);
+      }
       setState("recording");
     } catch (err) {
       stopMetering();
@@ -351,21 +376,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
       );
       setState("idle");
     }
-  }, [state, transcribe, releaseStream, startMetering, stopMetering]);
-
-  // ---------------------------------------------------------------------------
-  // Stop Recording (triggers transcription)
-  // ---------------------------------------------------------------------------
-
-  const stop = useCallback((options?: { send?: boolean }) => {
-    if (options?.send) shouldSendRef.current = true;
-
-    if (recorderRef.current?.state !== "inactive") {
-      recorderRef.current?.stop();
-      recorderRef.current = null;
-      setMediaRecorder(null);
-    }
-  }, []);
+  }, [state, transcribe, releaseStream, startMetering, stopMetering, stop]);
 
   // ---------------------------------------------------------------------------
   // Cancel Recording (discard audio, no transcription)
@@ -373,6 +384,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
 
   const cancel = useCallback(() => {
     wasCancelledRef.current = true;
+    transcriptionControllerRef.current?.abort();
     stop();
   }, [stop]);
 
@@ -382,8 +394,9 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
 
   const toggle = useCallback(() => {
     if (state === "recording") stop();
+    else if (state === "transcribing") cancel();
     else if (state === "idle") void start();
-  }, [state, start, stop]);
+  }, [state, start, stop, cancel]);
 
   // ---------------------------------------------------------------------------
   // Cleanup on unmount
@@ -391,57 +404,15 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
 
   useEffect(() => {
     return () => {
+      wasCancelledRef.current = true;
+      transcriptionControllerRef.current?.abort();
       recorderRef.current?.stop();
       releaseStream();
       stopMetering();
     };
   }, [releaseStream, stopMetering]);
 
-  // ---------------------------------------------------------------------------
-  // Recording keybinds (when useRecordingKeybinds is true)
-  // ---------------------------------------------------------------------------
-
-  // Track if space was held when recording started to prevent immediate send
-  const spaceHeldAtStartRef = useRef(false);
-
-  useEffect(() => {
-    if (!options.useRecordingKeybinds || state !== "recording") {
-      spaceHeldAtStartRef.current = false;
-      return;
-    }
-
-    // Use global key state instead of assuming - handles async mic access delay
-    spaceHeldAtStartRef.current = isSpaceHeldRef.current;
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (isDesktopViewportFocused(e.target)) return;
-      if (e.key === " ") spaceHeldAtStartRef.current = false;
-    };
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Global capture runs before noVNC can contain the guest's keyboard input.
-      if (isDesktopViewportFocused(e.target)) return;
-      if (e.key === " " && !spaceHeldAtStartRef.current) {
-        e.preventDefault();
-        stop({ send: true });
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        stopKeyboardPropagation(e);
-        cancel();
-      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_VOICE_INPUT)) {
-        e.preventDefault();
-        stop();
-      }
-    };
-
-    // Use capture phase to intercept before focused elements consume the event
-    window.addEventListener("keyup", handleKeyUp, true);
-    window.addEventListener("keydown", handleKeyDown, true);
-    return () => {
-      window.removeEventListener("keyup", handleKeyUp, true);
-      window.removeEventListener("keydown", handleKeyDown, true);
-    };
-  }, [options.useRecordingKeybinds, state, stop, cancel]);
+  useVoiceRecordingKeys(options.useRecordingKeybinds, state, isSpaceHeldRef, stop, cancel);
 
   // ---------------------------------------------------------------------------
   // Return
@@ -459,4 +430,64 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     cancel,
     toggle,
   };
+}
+
+function voiceKeyAction(
+  event: KeyboardEvent,
+  state: VoiceInputState,
+  spaceHeld: boolean
+): "cancel" | "send" | "stop" | null {
+  // Guest desktop shortcuts must not control the host recording.
+  if (isDesktopViewportFocused(event.target)) return null;
+  if (event.key === "Escape") return "cancel";
+  if (state === "transcribing") return null;
+  if (event.key === " " && !spaceHeld) return "send";
+  if (matchesKeybind(event, KEYBINDS.TOGGLE_VOICE_INPUT)) return "stop";
+  return null;
+}
+
+function useVoiceRecordingKeys(
+  enabled: boolean | undefined,
+  state: VoiceInputState,
+  isSpaceHeldRef: MutableRefObject<boolean>,
+  stop: (options?: { send?: boolean }) => void,
+  cancel: () => void
+) {
+  // Track if space was held when recording started to prevent immediate send
+  const spaceHeldAtStartRef = useRef(false);
+
+  useEffect(() => {
+    if (!enabled || (state !== "recording" && state !== "transcribing")) {
+      spaceHeldAtStartRef.current = false;
+      return;
+    }
+
+    // Use global key state instead of assuming - handles async mic access delay
+    spaceHeldAtStartRef.current = isSpaceHeldRef.current;
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
+      if (e.key === " ") spaceHeldAtStartRef.current = false;
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const action = voiceKeyAction(e, state, spaceHeldAtStartRef.current);
+      if (action === null) return;
+      e.preventDefault();
+      if (action === "cancel") {
+        stopKeyboardPropagation(e);
+        cancel();
+      } else {
+        stop({ send: action === "send" });
+      }
+    };
+
+    // Use capture phase to intercept before focused elements consume the event
+    window.addEventListener("keyup", handleKeyUp, true);
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      window.removeEventListener("keyup", handleKeyUp, true);
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [enabled, state, stop, cancel, isSpaceHeldRef]);
 }
