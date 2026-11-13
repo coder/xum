@@ -57,6 +57,14 @@ function goal(overrides: Partial<GoalRecordV1> = {}): GoalRecordV1 {
   };
 }
 
+/** The raw reply of the review-threads GraphQL query; `flags` are the isResolved values, one per thread. */
+function threadsReply(totalCount: unknown, flags: readonly unknown[]): string {
+  const nodes = flags.map((isResolved) => ({ isResolved }));
+  return JSON.stringify({
+    data: { repository: { pullRequest: { reviewThreads: { totalCount, nodes } } } },
+  });
+}
+
 /** gh stand-in: answers by which command the script runs. */
 function ghRunner(answers: { view: string | null; threads?: string | null }): GoalBoardBashRunner {
   return (_workspaceId, script) =>
@@ -134,7 +142,16 @@ describe("summarizeChecks", () => {
 
 describe("fetchGoalBoardPrSection", () => {
   test("gh failure or garbage output is unavailable, and the board says so", async () => {
-    for (const view of [null, "not json", JSON.stringify({ number: "x" })]) {
+    const url = "https://github.com/acme/widgets/pull/42";
+    for (const view of [
+      null,
+      "not json",
+      JSON.stringify({ number: "x" }),
+      // One bad field is enough: the number must be a safe integer and the URL a string.
+      JSON.stringify({ number: "x", url }),
+      JSON.stringify({ number: 1.5, url }),
+      JSON.stringify({ number: 42, url: 7 }),
+    ]) {
       expect(await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view }))).toEqual({
         kind: "unavailable",
       });
@@ -149,6 +166,64 @@ describe("fetchGoalBoardPrSection", () => {
     expect(html).not.toContain("Last CI run");
   });
 
+  test("a thread counts as resolved only when its flag is the boolean true", async () => {
+    // GitHub's isResolved is a Boolean!. A value of another type must not read as resolved: a jq `not`
+    // made the string "false" and the number 0 resolved.
+    const resolved = [true, true, false, "false", 0, null, {}, "true", 1];
+    const threads = threadsReply(resolved.length, resolved);
+    expect(
+      await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
+    ).toMatchObject({ status: { unresolvedThreads: { count: 7, atLeast: false } } });
+  });
+
+  test("the thread query names the repository and the number of the PR", async () => {
+    const scripts: string[] = [];
+    const runner: GoalBoardBashRunner = (_workspaceId, script) => {
+      scripts.push(script);
+      return Promise.resolve(script.includes("gh api graphql") ? null : PR_VIEW);
+    };
+    await fetchGoalBoardPrSection(WORKSPACE_ID, runner);
+    const query = scripts.filter((script) => script.includes("gh api graphql"));
+    expect(query).toHaveLength(1);
+    expect(query[0]).toMatch(/-F owner=\W*acme\W* -F name=\W*widgets\W* -F number=42$/);
+  });
+
+  test("a thread reply that is no list of threads leaves the thread count unavailable", async () => {
+    const reply = (reviewThreads: unknown) =>
+      JSON.stringify({ data: { repository: { pullRequest: { reviewThreads } } } });
+    for (const threads of [
+      // The shape of an older query (a count computed by jq).
+      JSON.stringify({ total: 3, seen: 3, unresolved: 3 }),
+      // A GraphQL error carries no data.
+      JSON.stringify({ errors: [{ message: "Could not resolve to a PullRequest" }] }),
+      JSON.stringify({ data: null }),
+      reply(null),
+      reply({ nodes: [{ isResolved: true }] }),
+      reply({ totalCount: "3", nodes: [{ isResolved: true }] }),
+      reply({ totalCount: 3, nodes: "true" }),
+      reply({ totalCount: 3 }),
+    ]) {
+      expect(
+        await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
+      ).toMatchObject({ kind: "pr", status: { unresolvedThreads: null } });
+    }
+  });
+
+  test("a thread entry that is no object counts as unresolved", async () => {
+    const reply = JSON.stringify({
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: { totalCount: 3, nodes: [{ isResolved: true }, null, "x"] },
+          },
+        },
+      },
+    });
+    expect(
+      await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads: reply }))
+    ).toMatchObject({ status: { unresolvedThreads: { count: 2, atLeast: false } } });
+  });
+
   test("no PR omits the section", async () => {
     const pr = await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: '{"no_pr":true}\n' }));
     expect(pr).toEqual({ kind: "none" });
@@ -157,7 +232,8 @@ describe("fetchGoalBoardPrSection", () => {
   });
 
   test("reports checks and unresolved threads; a failed thread query keeps the checks", async () => {
-    const threads = "banner\n" + JSON.stringify({ total: 120, seen: 100, unresolved: 3 });
+    const flags = [...Array.from({ length: 97 }, () => true), false, false, false];
+    const threads = "banner\n" + threadsReply(120, flags);
     expect(
       await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
     ).toEqual({
