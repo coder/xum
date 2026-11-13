@@ -450,6 +450,122 @@ interface WorkflowStep {
   with?: Record<string, unknown>;
 }
 
+interface WorkflowJob {
+  "runs-on"?: unknown;
+  steps?: WorkflowStep[];
+}
+
+// The runner labels of a job: `runs-on` is a label, a list of labels, or `{ group, labels }`.
+function runnerLabels(runsOn: unknown): string[] {
+  if (typeof runsOn === "string") return [runsOn];
+  if (Array.isArray(runsOn)) return runsOn.flatMap(runnerLabels);
+  if (typeof runsOn === "object" && runsOn !== null && "labels" in runsOn) {
+    return runnerLabels(runsOn.labels);
+  }
+  return [];
+}
+
+// What in a `run` script may build the Linux AppImage: `make` with `dist` after it on the same line
+// (`make dist`, `make -j4 dist`, `make dist-linux`, `make dist-linux-arm64`), any electron-builder
+// call (`--linux`, `-l`, or none: electron-builder then builds for the host), and the npm scripts
+// `dist` and `dist:linux`.
+const APPIMAGE_COMMANDS = [
+  /\bmake\b[^\n]*\bdist\b/,
+  /electron-builder/,
+  /\bdist:linux\b/,
+  /\brun dist\b/,
+];
+
+// Whether a job may build the Linux AppImage: its runner can be Linux, and the text of a `run`
+// script holds one of the commands above. The check over-flags by design: it is a substring match on
+// the text, so a comment, prose, `make dist/cli/index.js` or `electron-builder --dir` counts too. A
+// job that is flagged but builds no AppImage fails the test with its name, and the fix is to pass
+// the input. A job that builds one and is not flagged is the failure that matters, so the check
+// never tries to read the commands. Only a runner label that names macOS or Windows (in any case,
+// in a string, a list or a `{ group, labels }`) rules a job out. `runs-on` is often an expression,
+// which can name any runner, so an expression counts as Linux.
+function buildsAppImage(job: WorkflowJob): boolean {
+  const mayRunOnLinux = !runnerLabels(job["runs-on"]).some((label) =>
+    /^(?:macos|windows)\b/i.test(label)
+  );
+  return (
+    mayRunOnLinux &&
+    (job.steps ?? []).some((step) =>
+      APPIMAGE_COMMANDS.some((command) => command.test(step.run ?? ""))
+    )
+  );
+}
+
+// A workflow that builds an AppImage in a form this test does not know would skip the tool check
+// and download the tool with no retry. Each row is one `run` text that the check must flag or leave.
+describe("the AppImage job detector", () => {
+  const linux = "ubuntu-latest";
+  test.each<[string, unknown, string, boolean]>([
+    ["electron-builder --linux", linux, "bun x electron-builder --linux --publish always", true],
+    [
+      "electron-builder over several lines",
+      linux,
+      "bun x electron-builder \\\n  --linux \\\n  --publish always",
+      true,
+    ],
+    ["electron-builder -l", linux, "bun x electron-builder -l --publish never", true],
+    ["electron-builder with no platform option", linux, "bun x electron-builder", true],
+    ["make dist-linux", linux, "make dist-linux", true],
+    ["make dist-linux-arm64", linux, "make dist-linux-arm64", true],
+    ["a plain make dist", linux, "make dist", true],
+    ["make with a flag before dist", linux, "make -j4 dist", true],
+    ["make dist behind a retry wrapper", linux, "./scripts/retry.sh 3 30 make dist", true],
+    ["make dist after cd and &&", linux, "cd app && make dist", true],
+    ["bun run dist", linux, "bun run dist", true],
+    ["bun run dist:linux", linux, "bun run dist:linux", true],
+    ["yarn dist:linux", linux, "yarn dist:linux", true],
+    [
+      "a plain make dist on a runner named by an expression",
+      "${{ needs.changes.outputs.runner-4 }}",
+      "make dist",
+      true,
+    ],
+    [
+      "a plain make dist on a self-hosted Linux runner",
+      ["self-hosted", "linux"],
+      "make dist",
+      true,
+    ],
+    // Over-flags by design: each is a job that the check names and a person fixes by passing the input.
+    ["a comment about make dist", linux, "# make dist is not run here\ntrue", true],
+    ["prose after echo", linux, "echo do not run make dist here", true],
+    ["make dist/cli/index.js", linux, "make dist/cli/index.js", true],
+    ["electron-builder --dir", linux, "bun x electron-builder --dir", true],
+    ["a file named electron-builder.yml", linux, "cat electron-builder.yml", true],
+    ["no build command", linux, "bun run build\nmake test", false],
+    ["no run script", linux, "", false],
+    ["a plain make dist on a macOS runner", "macos-15", "make dist", false],
+    ["a plain make dist on a macOS-latest runner", "macOS-latest", "make dist", false],
+    ["a plain make dist on a Windows-2022 runner", "Windows-2022", "make dist", false],
+    ["a plain make dist on a windows-latest runner", "windows-latest", "make dist", false],
+    [
+      "a plain make dist on a self-hosted macOS runner",
+      ["self-hosted", "macOS", "ARM64"],
+      "make dist",
+      false,
+    ],
+    [
+      "a plain make dist on a runner group with macOS labels",
+      { group: "g", labels: ["macOS"] },
+      "make dist",
+      false,
+    ],
+    [
+      "electron-builder --linux on a macOS runner",
+      "macos-15",
+      "bun x electron-builder --linux",
+      false,
+    ],
+  ])("%s", (_name, runsOn, run, builds) => {
+    expect(buildsAppImage({ "runs-on": runsOn, steps: [{ run }] })).toBe(builds);
+  });
+});
+
 describe("the AppImage tool wiring", () => {
   test("setup-xum fetches the tool only when the caller asks, after it restores the electron-builder cache", async () => {
     const steps = await setupActionSteps();
@@ -483,17 +599,14 @@ describe("the AppImage tool wiring", () => {
     const builders: string[] = [];
     for (const file of (await readdir(WORKFLOWS)).filter((name) => name.endsWith(".yml"))) {
       const workflow = parse(await readFile(path.join(WORKFLOWS, file), "utf8")) as {
-        jobs?: Record<string, { steps?: WorkflowStep[] }>;
+        jobs?: Record<string, WorkflowJob>;
       };
       for (const [id, job] of Object.entries(workflow.jobs ?? {})) {
-        const steps = job.steps ?? [];
-        // electron-builder builds an AppImage for `--linux`, directly or through `make dist-linux`.
-        const builds = steps.some((step) =>
-          /electron-builder\b.*--linux|make dist-linux/.test(step.run ?? "")
-        );
-        if (!builds) continue;
+        if (!buildsAppImage(job)) continue;
         builders.push(`${file}:${id}`);
-        const setup = steps.filter((step) => step.uses === "./.github/actions/setup-xum");
+        const setup = (job.steps ?? []).filter(
+          (step) => step.uses === "./.github/actions/setup-xum"
+        );
 
         expect(setup, `${file}:${id} calls setup-xum once`).toHaveLength(1);
         expect(setup[0]?.with?.["appimage-tool"], `${file}:${id} asks for the tool`).toBe("true");
