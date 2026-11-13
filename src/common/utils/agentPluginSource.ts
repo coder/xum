@@ -72,15 +72,52 @@ export function pointsAtThisMachine(url: string): boolean {
   return host === undefined || isLoopbackHost(host);
 }
 
+// Git for Windows reads a drive path as local only when `has_dos_drive_prefix(url) &&
+// is_valid_path(url)` (url.c). It reads any ASCII character and a colon as a drive, also without a
+// slash (`C:market`), and `is_valid_win32_path` (mingw.c) refuses a colon, a wildcard, a reserved
+// device name and a name that ends in a space or a period. Otherwise it reads the URL as scp to the
+// host named by the drive. Xum does not copy `is_valid_win32_path`: it grants rights to a subset of
+// the valid paths, an ASCII letter and a colon followed by this allowlist only.
+const WIN32_DRIVE_PATH = /^[A-Za-z]:[A-Za-z0-9._ ()\-/\\]*$/;
+// A name that Windows reserves for a device, with or without an extension (`aux.git`). `CONIN$` and
+// `CONOUT$` need a `$`, which the allowlist does not have.
+const WIN32_DEVICE_NAME = /^(?:con|prn|aux|nul|com\d|lpt\d) *(?:\..*)?$/i;
+
+function isPlainWin32DrivePath(url: string): boolean {
+  if (!WIN32_DRIVE_PATH.test(url)) return false;
+  return url
+    .slice(2)
+    .split(/[\\/]/)
+    .every(
+      (name) =>
+        name === "." || name === ".." || (!/[ .]$/.test(name) && !WIN32_DEVICE_NAME.test(name))
+    );
+}
+
 /**
- * `pointsAtThisMachine` for a check that grants rights instead of refusing a source: a marketplace
- * on this machine may name local paths and ssh sources. `pointsAtThisMachine` reads any first
- * character and a colon as a drive, as Git for Windows does, which is the safe side when a source
- * is left out. Here it is not: git on Linux and macOS reads `h:org/repo.git` or `C:repo` as ssh to
- * the host alias `h` or `C`. So a drive counts only with a letter and a slash (`C:\repo`, `C:/repo`).
+ * True only when git on `platform` (`process.platform`: common code cannot read it) reads `url` as
+ * a path on this machine: `file://` in lowercase, or what `url_is_local_not_ssh` (url.c) calls
+ * local, no colon or a slash before the first one. Git for Windows adds a drive path (`C:\repo`,
+ * `C:/repo`, `C:repo`). Git on Linux and macOS reads `C:/repo` as ssh to the host `C`.
+ *
+ * A Windows network share is another machine: Git for Windows reads `//server/share`,
+ * `\\server\share` and `file://server/share` as one, so none of them counts there.
+ *
+ * Used for a check that grants rights: a marketplace on this machine may name local paths and ssh
+ * sources. No host counts, loopback included. A host is read before git reads it, and the two can
+ * differ: git decodes a scheme URL first, so `ssh://localhost/y%40%5bevil.example%5d/x` signs in to
+ * evil.example, and an `@[` anywhere moves the host (see git's `host_end`). A path has no host to
+ * misread. `pointsAtThisMachine` leans the other way, which is right when a source is left out: it
+ * counts a first character and a colon as a drive, and a URL that Xum cannot read as this machine.
  */
-export function surelyOnThisMachine(url: string): boolean {
-  return /^[a-zA-Z]:[\\/]/.test(url) || (!/^.:/su.test(url) && pointsAtThisMachine(url));
+export function surelyOnThisMachine(url: string, platform: NodeJS.Platform): boolean {
+  const windows = platform === "win32";
+  if (url.startsWith(windows ? "file:///" : "file://")) return true;
+  if (windows && /^[\\/]{2}/.test(url)) return false;
+  const colon = url.indexOf(":");
+  const slash = url.indexOf("/");
+  if (colon === -1 || (slash !== -1 && slash < colon)) return true;
+  return windows && isPlainWin32DrivePath(url);
 }
 
 /**
