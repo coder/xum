@@ -89,6 +89,11 @@ interface CreationEnvironmentPanelProps {
    * key events from the page's window listeners, so the page's own listener never sees it.
    */
   footerShortcut: { keybind: Keybind; run: () => void } | null;
+  /**
+   * Stretch the chip to the width of its column instead of its text: a row under it (the SSH
+   * directory's trust) shares that width, so the two read as one control.
+   */
+  fill: boolean;
 }
 
 // A quiet mono caption: the column names are labels for the eye, not headings to read.
@@ -691,7 +696,8 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
                 // A phone gets a full-width, thumb-sized chip; the desktop chip is as wide as its text.
                 "bg-background-secondary hover:bg-hover focus-visible:ring-accent flex h-8 max-w-full min-w-0 items-center gap-2 rounded-[7px] border px-2.5 text-[13px] font-medium outline-none focus-visible:ring-1 disabled:cursor-not-allowed disabled:opacity-50 [@media(max-width:768px)_and_(pointer:coarse)]:h-11 [@media(max-width:768px)_and_(pointer:coarse)]:w-full",
                 props.summary.error !== null ? "border-error" : "border-border-medium",
-                open && "bg-hover"
+                open && "bg-hover",
+                props.fill && "w-full"
               )}
             >
               <ChipSummary

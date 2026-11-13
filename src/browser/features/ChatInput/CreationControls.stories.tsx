@@ -323,6 +323,10 @@ export const SshWithoutIsolation: Story = {
     // button under them (not squeezed beside the copy), with the shield on the title's line.
     const trust = trustRowGeometry(storyRoot);
     await expect(trust.row.right).toBeLessThanOrEqual(frame.right + 1);
+    // The chip and the trust row under it are one control: the same edges.
+    const chipBox = chip.getBoundingClientRect();
+    await expect(Math.abs(chipBox.left - trust.row.left)).toBeLessThanOrEqual(1);
+    await expect(Math.abs(chipBox.right - trust.row.right)).toBeLessThanOrEqual(1);
     await expect(trust.button.top).toBeGreaterThanOrEqual(trust.status.bottom);
     await expect(Math.abs(trust.button.left - trust.status.left)).toBeLessThanOrEqual(1);
     await expect(Math.abs(centerY(trust.icon) - (trust.status.top + 8))).toBeLessThanOrEqual(2);

@@ -396,6 +396,15 @@ function withSshNoneProjectDir(
   };
 }
 
+/**
+ * With the SSH directory's trust row, the environment chip and the row share one width (the chip
+ * stretches to it): capped so the row's button stays near its copy on a wide page, and the whole
+ * column on a narrow one.
+ */
+function runtimeGroupClass(hasTrustRow: boolean): string {
+  return cn("flex min-w-0 flex-col gap-1.5", hasTrustRow && "max-w-2xl");
+}
+
 /** The trust row for the SSH+None directory being configured; nothing for other selections. */
 function SshNoneDirectoryTrust(props: {
   runtime: Extract<ParsedRuntime, { mode: "ssh" }> | null;
@@ -1033,7 +1042,7 @@ function CreationControlsContent(props: CreationControlsProps) {
       </div>
 
       <div
-        className="flex min-w-0 flex-col gap-1.5"
+        className={runtimeGroupClass(sshNoneRuntime !== null)}
         data-component="RuntimeTypeGroup"
         // Tests and stories wait on this the way a user waits for the branch to appear.
         data-branch-load={props.branchLoad}
@@ -1078,6 +1087,7 @@ function CreationControlsContent(props: CreationControlsProps) {
             fieldErrorAttempt={props.runtimeFieldErrorAttempt ?? 0}
             footerAction={<SetDefaultIsolationButton saver={defaultSaver} />}
             footerShortcut={setDefaultShortcut(defaultSaver)}
+            fill={sshNoneRuntime !== null}
           />
         </div>
 

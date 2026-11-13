@@ -133,9 +133,9 @@ function SshDirectoryTrustRow(props: {
   const ActionIcon = busy ? Loader2 : null;
 
   // Layout, so the row looks balanced at every width:
-  // - Capped at max-w-2xl: a full-width bar put the button ~1,000px from the shield on a wide
-  //   screen. A fixed cap (not a content-hugging width) keeps the button still when the copy
-  //   changes length between states.
+  // - As wide as the environment chip above it: CreationControls caps their column and stretches
+  //   both to it. A full-width bar put the button ~1,000px from the shield on a wide screen, and a
+  //   fixed cap (not a content-hugging width) keeps the button still when the copy changes length.
   // - One line from @md up: icon, status, button, with the row as tall as the chip above it (32px).
   // - Narrower (a phone): the title, the detail and the button stack in the text column, with the
   //   shield on the title's line. Side by side they squeezed the copy into a ~180px column.
@@ -143,7 +143,7 @@ function SshDirectoryTrustRow(props: {
   return (
     <div className="@container w-full">
       <div
-        className="border-border-medium grid w-full max-w-2xl grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2.5 gap-y-1.5 rounded-[7px] border px-2.5 py-1.5 text-xs @md:grid-cols-[auto_minmax(0,1fr)_auto] @md:items-center @md:py-[3px]"
+        className="border-border-medium grid w-full grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2.5 gap-y-1.5 rounded-[7px] border px-2.5 py-1.5 text-xs @md:grid-cols-[auto_minmax(0,1fr)_auto] @md:items-center @md:py-[3px]"
         data-component="SshDirectoryTrust"
         data-trusted={props.trusted}
       >
