@@ -1,5 +1,14 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  setDefaultTimeout,
+  spyOn,
+  test,
+} from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
@@ -77,6 +86,12 @@ import {
   readAgentDefinition,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+
+// These tests install and update over real git, and the sign-out tests' setup alone runs about 40
+// git processes. One such test took 1.9 to 7.9 s on a loaded host against Bun's 5 s default, and a
+// whole-file run at host load above 100 timed out about 50 tests at 5 s. A timed-out test keeps
+// running after its teardown. 20 s matches the explicit timeouts below, and a real hang still fails.
+setDefaultTimeout(20_000);
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -3694,6 +3709,22 @@ describe("AgentPluginInstallService", () => {
       return { updater, failing, result };
     };
     const stopStub = { stopServersWithKeyPrefix: () => Promise.resolve() };
+    /**
+     * Freezes the monotonic clock until the end of the test, so a pass budget
+     * (reconciliationTimeoutMs) ends only when the test advances the clock. The budget starts when
+     * the pass takes the lock, and the record read counts against it: on a loaded host a 20 ms
+     * budget was gone before the first logout, and the pass started none (#6627).
+     */
+    const freezeMonotonicClock = () => {
+      let now = performance.now();
+      const spy = spyOn(performance, "now").mockImplementation(() => now);
+      return {
+        advance: (ms: number) => {
+          now += ms;
+        },
+        [Symbol.dispose]: () => spy.mockRestore(),
+      };
+    };
 
     test("is recorded, keeps discovery closed, and finishes at the next start", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
@@ -4132,6 +4163,13 @@ describe("AgentPluginInstallService", () => {
       );
       // Still fail-closed.
       expect(await discovered()).toBe(0);
+      // That scan's gate started a sign-out pass in the background. A pass that reads the record
+      // while a swap below leaves it absent then calls rm on that path. rm deletes a FIFO that
+      // replaced the record (it fails on a directory), and the review reports "files changed"
+      // instead of the record's state. Let the pass end first.
+      await (
+        updater as unknown as { settledSignOutPasses: () => Promise<void> }
+      ).settledSignOutPasses();
       // A record that can be stat'ed but not read names its read error too.
       await fsPromises.rm(record);
       await fsPromises.mkdir(record);
@@ -4225,6 +4263,10 @@ describe("AgentPluginInstallService", () => {
       const restarted = new AgentPluginInstallService(config, {
         mcpServerManager: stopStub as unknown as MCPServerManager,
       });
+      // The retry wait after a failed pass ends only when the test advances the clock. On a slow
+      // run the real 30 s could pass first, and the status reads and scans below would start
+      // passes that clear the fixture records.
+      using clock = freezeMonotonicClock();
       // Before the sign-in service is wired, no pass ran: the record is pending without an error.
       expect(await restarted.pendingSignOutStatus()).toEqual({
         kind: "pending",
@@ -4283,13 +4325,9 @@ describe("AgentPluginInstallService", () => {
       // Reading the status retries like the discovery gate, so a fixed cause clears it.
       fail = false;
       await internals.settledSignOutPasses();
-      const later = spyOn(performance, "now").mockReturnValue(performance.now() + 31_000);
-      try {
-        // The read waits for the retry it started, so it already reports the cleared record.
-        expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
-      } finally {
-        later.mockRestore();
-      }
+      clock.advance(31_000);
+      // The read waits for the retry it started, so it already reports the cleared record.
+      expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
       await oauth.dispose();
     });
 
@@ -4304,6 +4342,7 @@ describe("AgentPluginInstallService", () => {
       let calls = 0;
       let release!: () => void;
       const released = new Promise<void>((resolve) => (release = resolve));
+      using _clock = freezeMonotonicClock();
       restarted.setMcpOauthService({
         logout: async () => {
           calls++;
@@ -4343,8 +4382,11 @@ describe("AgentPluginInstallService", () => {
         settledSignOutPasses: () => Promise<void>;
       };
       internals.deps.reconciliationTimeoutMs = 20;
-      await updater.list();
-      await internals.settledSignOutPasses();
+      {
+        using _clock = freezeMonotonicClock();
+        await updater.list();
+        await internals.settledSignOutPasses();
+      }
       expect(calls).toBe(1);
       await writeServer("client-c");
       const review = await updater.previewUpdate({ name: "demo-plugin" });
@@ -4386,9 +4428,10 @@ describe("AgentPluginInstallService", () => {
       const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
       const urls = [serverUrl, "https://b.example/mcp", "https://c.example/mcp"];
       await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls }));
+      const budgetMs = 20;
       const restarted = new AgentPluginInstallService(config, {
         mcpServerManager: stopStub as unknown as MCPServerManager,
-        reconciliationTimeoutMs: 20,
+        reconciliationTimeoutMs: budgetMs,
       });
       const internals = restarted as unknown as {
         settledSignOutPasses: () => Promise<void>;
@@ -4398,10 +4441,12 @@ describe("AgentPluginInstallService", () => {
       await internals.reconciliationState;
       await internals.settledSignOutPasses();
       let calls = 0;
+      using clock = freezeMonotonicClock();
       restarted.setMcpOauthService({
-        // The first logout hangs past the deadline.
+        // The first logout hangs past the deadline: the clock reaches it when the logout starts.
         logout: () => {
           calls++;
+          clock.advance(budgetMs);
           return new Promise<never>(() => undefined);
         },
         credentialKey: (url: string) => url,
@@ -4426,6 +4471,9 @@ describe("AgentPluginInstallService", () => {
         reconciliationTimeoutMs: 20,
       });
       let calls = 0;
+      // The budget stays open, so the second spelling reaches the first one's logout instead of
+      // stopping at the deadline.
+      using _clock = freezeMonotonicClock();
       restarted.setMcpOauthService({
         logout: () => {
           calls++;
