@@ -12,7 +12,11 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 
-import { shouldRunIntegrationTests } from "../../testUtils";
+import {
+  DUMMY_PROVIDER_CONFIG,
+  getProviderConfigOrDummy,
+  shouldRunIntegrationTests,
+} from "../../testUtils";
 import { setupProviders } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
 
@@ -95,7 +99,12 @@ describeIntegration("Thinking selector", () => {
     const harness = await createAppHarness({
       branchPrefix: "thinking-selector",
       beforeRenderEnvironment: async (env) => {
-        await setupProviders(env, { xai: { apiKey: "dummy" } });
+        // The picker lists only curated models of configured providers. A run without keys has no
+        // OpenAI to show Sol, and one with only an xAI key has none either.
+        await setupProviders(env, {
+          xai: DUMMY_PROVIDER_CONFIG,
+          openai: getProviderConfigOrDummy("OPENAI_API_KEY"),
+        });
         const result = await env.orpc.providers.setModels({
           provider: "openai",
           models: [NON_PRO_PROVIDER_MODEL_ID],

@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { shouldRunIntegrationTests, setupWorkspaceWithoutProvider } from "../setup";
+import { DUMMY_PROVIDER_CONFIG } from "../../testUtils";
 import {
   createWorkspace,
   generateBranchName,
@@ -60,8 +61,9 @@ describeIntegration("workspace MCP overrides in derived workspaces", () => {
   test("a globally disabled server enabled per-workspace reaches sub-agent children and forks", async () => {
     const { env, workspaceId, tempGitRepo, cleanup } =
       await setupWorkspaceWithoutProvider("mcp-inherit");
-    // Any provider config lets the request build; startStream is intercepted before I/O.
-    env.services.providersConfigStore.saveProvidersConfig({ anthropic: { apiKey: "dummy" } });
+    // Any provider config lets the request build; startStream is intercepted before I/O. The
+    // dummy points at an unreachable loopback URL, so a request that slips past still stays local.
+    env.services.providersConfigStore.saveProvidersConfig({ anthropic: DUMMY_PROVIDER_CONFIG });
     const client = resolveOrpcClient(env);
     try {
       expect(

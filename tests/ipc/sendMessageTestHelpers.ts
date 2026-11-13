@@ -21,7 +21,7 @@ import {
 } from "./helpers";
 import { detectDefaultTrunkBranch } from "../../src/node/git";
 import type { FrontendWorkspaceMetadata } from "../../src/common/types/workspace";
-import { getApiKey } from "../testUtils";
+import { getProviderConfigOrDummy } from "../testUtils";
 
 // Shared test environment and git repo
 let sharedEnv: TestEnvironment | null = null;
@@ -117,10 +117,13 @@ export async function withSharedWorkspace(
   const metadata = result.metadata;
   const workspaceId = metadata.id;
 
-  // Setup provider with API key
-  const apiKey = getApiKey(provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY");
+  // Setup the provider. Callers that only need a configured provider (tests/ui) run without keys
+  // on a dummy that cannot reach the API. A caller that streams from the provider checks its keys
+  // up front (validateApiKeys), so it always gets the real one.
   await setupProviders(env, {
-    [provider]: { apiKey },
+    [provider]: getProviderConfigOrDummy(
+      provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY"
+    ),
   });
 
   // Create stream collector
