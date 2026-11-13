@@ -594,10 +594,16 @@ export function GeneralSection() {
   // Load SSH host from server on mount (browser mode only)
   useEffect(() => {
     if (isBrowserMode() && api) {
-      void api.server.getSshHost().then((host) => {
-        setSshHost(host ?? "");
-        setSshHostLoaded(true);
-      });
+      api.server
+        .getSshHost()
+        .then((host) => {
+          setSshHost(host ?? "");
+          setSshHostLoaded(true);
+        })
+        // Opened while Xum reconnects, the kept client's read fails at once: the field stays
+        // hidden until a read answers, and the next client (this effect depends on it) reads
+        // again. No error to show, and it must not be an unhandled rejection.
+        .catch((error: unknown) => console.debug("[GeneralSection] SSH host not loaded:", error));
     }
   }, [api]);
 
