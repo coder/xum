@@ -1870,6 +1870,97 @@ describe("WorkspaceMcpOverridesService", () => {
       }
     );
 
+    it.each(saveKinds)(
+      "a settings $kind fails when another writer rewrites config.json in place after the legacy clear's locked read and keeps its stat",
+      async ({ kind, overrides }) => {
+        // As above, but the downgraded Xum rewrites config.json in place at the same size, so
+        // the inode and the size stay. Within one tick of a coarse filesystem clock the mtime
+        // stays too; utimes restores it here. Only the bytes tell the rewrite apart.
+        const id = `rewritten-after-read-${kind}`;
+        const dir = path.join(tempDir, id);
+        await registerLocalWorkspaces(config, [{ dir, id }]);
+        await fs.mkdir(path.join(dir, ".xum"), { recursive: true });
+        await fs.writeFile(
+          path.join(dir, ".xum", "mcp.local.jsonc"),
+          JSON.stringify({ disabledServers: ["consent-sensitive"] })
+        );
+        const configFile = path.join(config.rootDir, "config.json");
+        // Room for the legacy value, so the rewrite keeps the file's size.
+        nodeFs.writeFileSync(
+          configFile,
+          nodeFs.readFileSync(configFile, "utf-8") + " ".repeat(200)
+        );
+        // A whole second, so the rewrite can restore the mtime exactly. Set before the load, so
+        // the snapshot stays valid and the clear's locked read is the next read of the file.
+        const mtime = new Date(Math.floor(Date.now() / 1000) * 1000);
+        nodeFs.utimesSync(configFile, mtime, mtime);
+        config.loadConfigOrDefault();
+        const service = new WorkspaceMcpOverridesService(config);
+        const statKey = () => {
+          const st = nodeFs.statSync(configFile, { bigint: true });
+          return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+        };
+        const realRead = nodeFs.readFileSync;
+        let armed = false;
+        let rewritten = 0;
+        let keptStat = false;
+        const readSpy = spyOn(nodeFs, "readFileSync").mockImplementation(((
+          ...args: Parameters<typeof nodeFs.readFileSync>
+        ) => {
+          const bytes = realRead(...args);
+          if (armed && String(args[0]) === configFile) {
+            armed = false;
+            rewritten++;
+            const before = statKey();
+            const outside = JSON.parse(String(bytes)) as {
+              projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+            };
+            for (const [, project] of outside.projects) {
+              for (const entry of project.workspaces) {
+                if (entry.id === id) entry.mcp = { enabledServers: ["consent-sensitive"] };
+              }
+            }
+            const text = JSON.stringify(outside);
+            const size = Buffer.byteLength(String(bytes));
+            expect(Buffer.byteLength(text)).toBeLessThanOrEqual(size);
+            nodeFs.writeFileSync(configFile, text + " ".repeat(size - Buffer.byteLength(text)));
+            nodeFs.utimesSync(configFile, mtime, mtime);
+            keptStat = statKey() === before;
+          }
+          return bytes;
+        }) as typeof nodeFs.readFileSync);
+        const spy = spyLegacyClears({
+          before: () => {
+            armed = rewritten === 0;
+          },
+        });
+        let outcome: string;
+        try {
+          outcome = await service
+            .setOverridesForWorkspace(id, overrides, {
+              publish: () => Promise.resolve(),
+              hasSnapshot: () => false,
+            })
+            .then(
+              () => "saved",
+              (error: unknown) => String(error)
+            );
+        } finally {
+          spy.mockRestore();
+          readSpy.mockRestore();
+        }
+        expect(rewritten).toBe(1);
+        expect(keptStat).toBe(true);
+        const reader = new WorkspaceMcpOverridesService(new Config(config.rootDir));
+        const { overrides: effective } = await reader.getOverridesForWorkspace(id);
+        // Both in one assertion, so a failure shows the outcome and the server state together.
+        expect({
+          outcome: outcome.includes("changed on disk") ? "refused" : outcome,
+          serverEnabled: (effective.enabledServers ?? []).includes("consent-sensitive"),
+        }).toEqual({ outcome: "refused", serverEnabled: false });
+      }
+    );
+
     it("a sharer's legacy value that another process sets again during the save is still retired", async () => {
       // The save retires a sharer's legacy value under the config lock as well. Another process
       // clears that value after the writer's own clear, and sets a new one before it releases
