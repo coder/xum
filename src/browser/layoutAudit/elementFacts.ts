@@ -236,17 +236,30 @@ function isJudgedTextHolder(page: LayoutPage, holder: Element | null): holder is
   return holder !== null && !isExcludedElement(page, holder) && paintsContent(page, holder);
 }
 
+/** A rendered line of text, and the element whose text node it belongs to. */
+export interface TextLine {
+  rect: Box;
+  holder: Element;
+}
+
 /**
- * The rendered line rectangles of the text `el` is judged on. A text boundary reads the text of
- * what it holds, minus the text that is not shown there. The caller has already judged `el`
- * itself, so its own text is not checked again.
+ * The rendered lines of the text `el` is judged on. A text boundary reads the text of what it
+ * holds, minus the text that is not shown there. The caller has already judged `el` itself, so
+ * its own text is not checked again.
  */
-export function textFragments(page: LayoutPage, el: Element): Box[] {
+export function judgedTextLines(page: LayoutPage, el: Element): TextLine[] {
   const nodes: Text[] = [];
   collectTextNodes(el, isSemanticTextBoundary(el), nodes);
-  return nodes
-    .filter((node) => node.parentElement === el || isJudgedTextHolder(page, node.parentElement))
-    .flatMap((node) => page.textLines(node));
+  return nodes.flatMap((node) => {
+    const holder = node.parentElement;
+    if (holder === null || (holder !== el && !isJudgedTextHolder(page, holder))) return [];
+    return page.textLines(node).map((rect) => ({ rect, holder }));
+  });
+}
+
+/** The rectangles of `judgedTextLines`. */
+export function textFragments(page: LayoutPage, el: Element): Box[] {
+  return judgedTextLines(page, el).map((line) => line.rect);
 }
 
 /** Which cut the author asked for; a line clamp wins over an ellipsis (it covers both axes). */
@@ -371,16 +384,19 @@ function cutAt(rect: Edges, { box, axes }: ClippingBoundary): Edges {
 }
 
 /**
- * The part of `rect`, a rendered line or the box of `el`, that overflow leaves visible: `rect`
- * cut at the padding box of `el` and of each element that clips (`overflow: hidden | clip`) among
- * the ones that contain it, on the axes it clips. A line clamp or a short box still has line
- * rectangles for the lines it cuts away, so a rule that samples what a user sees reads them
- * through this. Null when none is left.
+ * The part of `rect`, a rendered line or the box of `holder`, that overflow leaves visible: `rect`
+ * cut at the padding box of `holder` and of each element that clips (`overflow: hidden | clip`)
+ * among the ones that contain it, on the axes it clips. `holder` is the element the rect is drawn
+ * in: the one that has the line's text node (a span that is absolutely positioned elsewhere is
+ * cut by what contains the span, not by the paragraph that holds it in the markup), or the
+ * control whose box it is. A line clamp or a short box still has line rectangles for the lines
+ * it cuts away, so a rule that samples what a user sees reads them through this. Null when none
+ * is left.
  */
-export function visiblePart(page: LayoutPage, el: Element, rect: Box): Box | null {
+export function visiblePart(page: LayoutPage, holder: Element, rect: Box): Box | null {
   let cut: Edges = rect;
   for (
-    let node: Element | null = el;
+    let node: Element | null = holder;
     node && !isRootElement(page, node);
     node = containingBlockOf(page, node)
   ) {
