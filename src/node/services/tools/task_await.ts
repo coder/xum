@@ -38,16 +38,42 @@ import {
 import { buildWorkflowProgressSummary, formatWorkflowProgressNote } from "./workflowProgress";
 import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import {
+  AgentReportWaitTimeoutError,
   ForegroundWaitBackgroundedError,
   type AgentTaskStatusLookup,
   type AgentTaskTimestamps,
+  type TaskService,
 } from "@/node/services/taskService";
+import { TaskNotFoundError, WorkspaceTurnNotFoundError } from "@/node/services/taskWaiters";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 
 const DEFAULT_TASK_AWAIT_TIMEOUT_MS = 600_000;
 const WORKFLOW_AWAIT_POLL_INTERVAL_MS = 250;
 // Shared fallback used when a workspace-turn record errored without a specific message,
 // so every error-status await result path reports identical text.
 const WORKSPACE_TURN_DEFAULT_ERROR = "Workspace turn failed";
+
+/**
+ * A handle is stored under its owner. An ancestor of the handle's child that does not own it (the
+ * direct parent of a child that a higher ancestor reawakened) reads the handle's stored result
+ * through the child's ancestry, once the turn is terminal. The failure row names the failed
+ * turn's handle for every parent, so this keeps the call on that turn even after the child runs
+ * a newer one. Null when the caller owns the handle (the owner path reads it) or may not read it.
+ */
+async function readHandleThroughAncestry(
+  taskService: TaskService,
+  workspaceTurnManager: WorkspaceTurnManager,
+  workspaceId: string,
+  handleId: string
+) {
+  const readThroughAncestry =
+    taskService.getDescendantTerminalWorkspaceTurnSnapshot?.bind(taskService);
+  if (readThroughAncestry == null) return null;
+  const owned = await workspaceTurnManager.getWorkspaceTurnSnapshot(workspaceId, handleId);
+  return owned != null
+    ? null
+    : await readThroughAncestry(workspaceId, handleId, { consumingWorkspaceId: workspaceId });
+}
 
 // Status values for which task_await still treats an agent task as live and
 // should surface the live status (plus an `elapsed_ms` field) instead of
@@ -591,12 +617,18 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           const isAgentContinuation = workspaceTurnTaskId !== taskId;
           const resolveAgentExecution =
             taskService.getDescendantAgentTaskExecutionSnapshot?.bind(taskService);
-          const resolvedExecution =
-            isAgentContinuation && resolveAgentExecution != null
+          const resolvedExecution = isAgentContinuation
+            ? resolveAgentExecution != null
               ? await resolveAgentExecution(workspaceId, taskId, {
                   consumingWorkspaceId: workspaceId,
                 })
-              : null;
+              : null
+            : await readHandleThroughAncestry(
+                taskService,
+                workspaceTurnManager,
+                workspaceId,
+                workspaceTurnTaskId
+              );
           const workspaceTurnOwnerId = resolvedExecution?.ownerWorkspaceId ?? workspaceId;
           const getWorkspaceTurnSnapshotForAwait = () =>
             workspaceTurnManager.getWorkspaceTurnSnapshot(
@@ -783,7 +815,9 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 ...workspaceTurnIdentityFields(latest.workspaceId),
               };
             }
-            if (/out of scope/i.test(message) || /not found/i.test(message)) {
+            // Match the class, never the text: a failed turn can quote the same words, and its
+            // stored text is read below.
+            if (error instanceof WorkspaceTurnNotFoundError) {
               return { status: "invalid_scope" as const, taskId };
             }
             const latest = await getWorkspaceTurnSnapshotForAwait().catch(() => null);
@@ -866,7 +900,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             };
           } catch (error: unknown) {
             const message = getErrorMessage(error);
-            if (/not found/i.test(message)) {
+            if (error instanceof TaskNotFoundError) {
               return { status: "not_found" as const, taskId };
             }
             return { status: "error" as const, taskId, error: message };
@@ -925,10 +959,12 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           }
 
           const message = getErrorMessage(error);
-          if (/not found/i.test(message)) {
+          if (error instanceof TaskNotFoundError) {
             return { status: "not_found" as const, taskId };
           }
-          if (/timed out/i.test(message)) {
+          // The class, never the text: a failed task's own error text can say "timed out", and it
+          // must reach the parent as that text.
+          if (error instanceof AgentReportWaitTimeoutError) {
             const status = taskService.getAgentTaskStatus(taskId);
             if (isAgentTaskActiveStatus(status)) {
               return { status, taskId, ...getAgentTaskElapsedField(taskId) };

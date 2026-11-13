@@ -12,10 +12,12 @@ import {
 } from "@/common/utils/tools/toolDefinitions";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
 import { createTaskAwaitTool } from "./task_await";
+import { TaskNotFoundError, WorkspaceTurnNotFoundError } from "@/node/services/taskWaiters";
 import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { getSubagentGitPatchArtifactsFilePath } from "@/node/services/subagentGitPatchArtifacts";
 import {
+  AgentReportWaitTimeoutError,
   ForegroundWaitBackgroundedError,
   type AgentTaskReport,
   type TaskService,
@@ -67,6 +69,7 @@ type FakeTaskServiceApi = Pick<
   | "getAgentTaskTimestamps"
   | "getAgentTaskExecutionId"
   | "getDescendantAgentTaskExecutionSnapshot"
+  | "getDescendantTerminalWorkspaceTurnSnapshot"
   | "markWorkflowRunTerminalAttentionSettled"
   | "waitForAgentReport"
 >;
@@ -1989,10 +1992,10 @@ describe("task_await tool", () => {
 
     const waitForAgentReport = mock((taskId: string) => {
       if (taskId === "timeout") {
-        return Promise.reject(new Error("Timed out waiting for agent_report"));
+        return Promise.reject(new AgentReportWaitTimeoutError());
       }
       if (taskId === "missing") {
-        return Promise.reject(new Error("Task not found"));
+        return Promise.reject(new TaskNotFoundError());
       }
       return Promise.reject(new Error("Boom"));
     });
@@ -2016,6 +2019,313 @@ describe("task_await tool", () => {
         { status: "error", taskId: "boom", error: "Boom" },
       ],
     });
+  });
+
+  // After the failure row stopped carrying the child's error text, task_await is the only way the
+  // parent reads it. Common terminal failures hold the words "not found" (model_not_found, "its
+  // definition was not found", SSH "repository not found"): those must come back as text, and
+  // only the unknown-task errors (by class, never by text) map to not_found and invalid_scope.
+  describe("error text that holds the words 'not found'", () => {
+    const modelNotFound = "The model `claude-x` was not found for this API key";
+
+    it("returns it for a blocking wait on an agent task", async () => {
+      using tempDir = new TestTempDir("test-task-await-error-text-blocking");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      const taskServices = createFakeTaskServices({
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => "interrupted" as const),
+        waitForAgentReport: mock(() => Promise.reject(new Error(modelNotFound))),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["failed"], timeout_secs: 5 }, mockToolCallOptions)
+      );
+
+      expect(result).toEqual({
+        results: [{ status: "error", taskId: "failed", error: modelNotFound }],
+      });
+    });
+
+    it("returns the text of a failed agent task that says it timed out", async () => {
+      using tempDir = new TestTempDir("test-task-await-error-text-timed-out");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      // A provider timeout is the child's own failure, not the wait running out.
+      const text = "Upstream provider request timed out after 30s";
+      const taskServices = createFakeTaskServices({
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => "interrupted" as const),
+        waitForAgentReport: mock(() => Promise.reject(new Error(text))),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      for (const timeout_secs of [0, 5]) {
+        const result: unknown = await Promise.resolve(
+          tool.execute!({ task_ids: ["failed"], timeout_secs }, mockToolCallOptions)
+        );
+        expect(result).toEqual({ results: [{ status: "error", taskId: "failed", error: text }] });
+      }
+    });
+
+    it("returns it for a non-blocking read of an agent task", async () => {
+      using tempDir = new TestTempDir("test-task-await-error-text-timeout-zero");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      const taskServices = createFakeTaskServices({
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => "interrupted" as const),
+        waitForAgentReport: mock(() => Promise.reject(new Error(modelNotFound))),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["failed"], timeout_secs: 0 }, mockToolCallOptions)
+      );
+
+      expect(result).toEqual({
+        results: [{ status: "error", taskId: "failed", error: modelNotFound }],
+      });
+    });
+
+    it("returns it for a blocking wait on a workspace turn that failed with it", async () => {
+      using tempDir = new TestTempDir("test-task-await-error-text-workspace-turn");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      const turn = {
+        kind: "workspace_turn",
+        handleId: "wst_failed",
+        ownerWorkspaceId: "parent-workspace",
+        workspaceId: "child-workspace",
+        turnId: "turn-failed",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        updatedAt: "2026-06-19T00:00:10.000Z",
+        createdWorkspace: false,
+        disposableWorkspace: false,
+      } as const;
+      // The turn is running when the wait starts and has failed by the time the wait rejects.
+      const snapshots: WorkspaceTurnTaskHandleRecord[] = [
+        { ...turn, status: "running" },
+        { ...turn, status: "error", error: modelNotFound },
+      ];
+      const taskServices = createFakeTaskServices({
+        listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+        markWorkspaceTurnTerminalAttentionConsumed: mock(() => Promise.resolve()),
+        getWorkspaceTurnSnapshot: mock(() => Promise.resolve(snapshots.shift() ?? snapshots[0])),
+        waitForWorkspaceTurn: mock(() => Promise.reject(new Error(modelNotFound))),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["wst_failed"], timeout_secs: 5 }, mockToolCallOptions)
+      );
+
+      expect(result).toEqual({
+        results: [{ status: "error", taskId: "wst_failed", error: modelNotFound }],
+      });
+    });
+
+    it("returns a failed task's text even when that text is the unknown-task sentinel", async () => {
+      using tempDir = new TestTempDir("test-task-await-sentinel-collision");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      // The task has no status (it was removed, and a persisted failure keeps it in scope), and
+      // the rejection is its own error text, which is only the same words as the unknown-task
+      // error.
+      const taskServices = createFakeTaskServices({
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => null),
+        waitForAgentReport: mock(() => Promise.reject(new Error("Task not found"))),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      for (const timeout_secs of [0, 5]) {
+        const result: unknown = await Promise.resolve(
+          tool.execute!({ task_ids: ["failed"], timeout_secs }, mockToolCallOptions)
+        );
+        expect(result).toEqual({
+          results: [{ status: "error", taskId: "failed", error: "Task not found" }],
+        });
+      }
+    });
+
+    it("returns a failed workspace turn's text even when that text is the unknown-handle sentinel", async () => {
+      using tempDir = new TestTempDir("test-task-await-handle-sentinel-collision");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      const sentinel = "Workspace turn not found or out of scope";
+      const turn = {
+        kind: "workspace_turn",
+        handleId: "wst_failed",
+        ownerWorkspaceId: "parent-workspace",
+        workspaceId: "child-workspace",
+        turnId: "turn-failed",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        updatedAt: "2026-06-19T00:00:10.000Z",
+        createdWorkspace: false,
+        disposableWorkspace: false,
+      } as const;
+      const snapshots: WorkspaceTurnTaskHandleRecord[] = [
+        { ...turn, status: "running" },
+        { ...turn, status: "error", error: sentinel },
+      ];
+      const taskServices = createFakeTaskServices({
+        listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+        markWorkspaceTurnTerminalAttentionConsumed: mock(() => Promise.resolve()),
+        getWorkspaceTurnSnapshot: mock(() => Promise.resolve(snapshots.shift() ?? snapshots[0])),
+        waitForWorkspaceTurn: mock(() => Promise.reject(new Error(sentinel))),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["wst_failed"], timeout_secs: 5 }, mockToolCallOptions)
+      );
+
+      expect(result).toEqual({
+        results: [{ status: "error", taskId: "wst_failed", error: sentinel }],
+      });
+    });
+
+    it("maps the unknown-task error to not_found for a non-blocking read", async () => {
+      using tempDir = new TestTempDir("test-task-await-unknown-task-timeout-zero");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      const taskServices = createFakeTaskServices({
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => null),
+        waitForAgentReport: mock(() => Promise.reject(new TaskNotFoundError())),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["missing"], timeout_secs: 0 }, mockToolCallOptions)
+      );
+
+      expect(result).toEqual({ results: [{ status: "not_found", taskId: "missing" }] });
+    });
+
+    it("maps the unknown-task errors to not_found and invalid_scope", async () => {
+      using tempDir = new TestTempDir("test-task-await-unknown-task");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      const goneSnapshots: WorkspaceTurnTaskHandleRecord[] = [
+        {
+          kind: "workspace_turn",
+          handleId: "wst_gone",
+          ownerWorkspaceId: "parent-workspace",
+          workspaceId: "child-workspace",
+          turnId: "turn-gone",
+          status: "running",
+          createdAt: "2026-06-19T00:00:00.000Z",
+          updatedAt: "2026-06-19T00:00:10.000Z",
+          createdWorkspace: false,
+          disposableWorkspace: false,
+        },
+      ];
+      const taskServices = createFakeTaskServices({
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => null),
+        waitForAgentReport: mock(() => Promise.reject(new TaskNotFoundError())),
+        listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+        // The turn exists when the wait starts and is gone when the wait rejects.
+        getWorkspaceTurnSnapshot: mock(
+          (): Promise<WorkspaceTurnTaskHandleRecord | null> =>
+            Promise.resolve(goneSnapshots.shift() ?? null)
+        ),
+        waitForWorkspaceTurn: mock(() => Promise.reject(new WorkspaceTurnNotFoundError())),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["missing", "wst_gone"], timeout_secs: 5 }, mockToolCallOptions)
+      );
+
+      expect(result).toEqual({
+        results: [
+          { status: "not_found", taskId: "missing" },
+          { status: "invalid_scope", taskId: "wst_gone" },
+        ],
+      });
+    });
+  });
+
+  it("reads a failed handle the caller owns directly, without the ancestry read", async () => {
+    using tempDir = new TestTempDir("test-task-await-owned-handle");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const failed = {
+      kind: "workspace_turn",
+      handleId: "wst_owned_failed",
+      ownerWorkspaceId: "parent-workspace",
+      workspaceId: "child-workspace",
+      turnId: "turn-failed",
+      status: "error",
+      error: "Provider said: boom",
+      createdAt: "2026-06-19T00:00:00.000Z",
+      updatedAt: "2026-06-19T00:00:10.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    } as const;
+    const readThroughAncestry = mock(() => Promise.resolve(null));
+    const taskServices = createFakeTaskServices({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+      getWorkspaceTurnSnapshot: mock(
+        (ownerWorkspaceId: string): Promise<WorkspaceTurnTaskHandleRecord | null> =>
+          Promise.resolve(ownerWorkspaceId === "parent-workspace" ? failed : null)
+      ),
+      getDescendantTerminalWorkspaceTurnSnapshot: readThroughAncestry,
+      markWorkspaceTurnTerminalAttentionConsumed: mock(() => Promise.resolve()),
+    });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["wst_owned_failed"], timeout_secs: 0 }, mockToolCallOptions)
+    );
+
+    expect(result).toEqual({
+      results: [{ status: "error", taskId: "wst_owned_failed", error: "Provider said: boom" }],
+    });
+    expect(readThroughAncestry).not.toHaveBeenCalled();
+  });
+
+  it("lets an ancestor that does not own a failed handle read its stored error", async () => {
+    using tempDir = new TestTempDir("test-task-await-non-owner-handle");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const failed = {
+      kind: "workspace_turn",
+      handleId: "wst_failed",
+      ownerWorkspaceId: "grandparent-workspace",
+      workspaceId: "child-workspace",
+      turnId: "turn-failed",
+      status: "error",
+      error: "Provider said: boom",
+      createdAt: "2026-06-19T00:00:00.000Z",
+      updatedAt: "2026-06-19T00:00:10.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    } as const;
+    const markConsumed = mock(() => Promise.resolve());
+    const readThroughAncestry = mock(() =>
+      Promise.resolve({ ownerWorkspaceId: "grandparent-workspace", record: failed })
+    );
+    const taskServices = createFakeTaskServices({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+      // The parent owns no such handle: it is stored under the grandparent.
+      getWorkspaceTurnSnapshot: mock(
+        (ownerWorkspaceId: string): Promise<WorkspaceTurnTaskHandleRecord | null> =>
+          Promise.resolve(ownerWorkspaceId === "grandparent-workspace" ? failed : null)
+      ),
+      getDescendantTerminalWorkspaceTurnSnapshot: readThroughAncestry,
+      markWorkspaceTurnTerminalAttentionConsumed: markConsumed,
+    });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["wst_failed"], timeout_secs: 0 }, mockToolCallOptions)
+    );
+
+    expect(result).toEqual({
+      results: [{ status: "error", taskId: "wst_failed", error: "Provider said: boom" }],
+    });
+    expect(readThroughAncestry).toHaveBeenCalledWith("parent-workspace", "wst_failed", {
+      consumingWorkspaceId: "parent-workspace",
+    });
+    // The result counts as read for the owner that stores it.
+    expect(markConsumed).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerWorkspaceId: "grandparent-workspace", handleId: "wst_failed" })
+    );
   });
 
   it("treats timeout_secs=0 as non-blocking for agent tasks", async () => {

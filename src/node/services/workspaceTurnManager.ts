@@ -26,16 +26,15 @@ import {
   type WorkspaceTurnHost,
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
+import { WorkspaceTurnNotFoundError } from "@/node/services/taskWaiters";
 import type { HistoryService } from "@/node/services/historyService";
 import type { HistoryControlRow } from "@/node/services/historyScanner";
 import { findLastRetryUserMessage, retriedWorkspaceTurn } from "@/node/services/retryUserMessage";
 import type { SendIdentity } from "@/node/services/sendIds";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import {
-  SUBAGENT_FAILURE_ENVELOPE_TAG,
-  parseSubagentReportEnvelope,
-} from "@/common/utils/subagentReportEnvelope";
+import { parseSubagentFailureExecutionVersion } from "@/common/utils/subagentFailureEnvelope";
+import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import {
   AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
@@ -235,8 +234,7 @@ function sameExecutionMirror(a: ExecutionMirror, b: ExecutionMirror): boolean {
 function parseTerminalSubagentExecutionVersion(content: string): string | null {
   const report = parseSubagentReportEnvelope(content);
   if (report?.executionVersion != null) return report.executionVersion;
-  if (!content.startsWith(SUBAGENT_FAILURE_ENVELOPE_TAG)) return null;
-  return /<execution_version>([^\n<]+)<\/execution_version>/.exec(content)?.[1] ?? null;
+  return parseSubagentFailureExecutionVersion(content);
 }
 
 type WorkspaceTurnQueueDispatchMode = "tool-end" | "turn-end";
@@ -2981,7 +2979,9 @@ export class WorkspaceTurnManager {
               : record.finalMessage?.metadata?.finishReason === "tool-calls"
                 ? "workspace_turn_incomplete"
                 : "workspace_turn_error",
-            errorMessage: record.error ?? "Workspace turn failed",
+            // Every direct parent reads the failed turn by its handle: the owner directly, and any
+            // other ancestor of the child through task_await's ancestry read of a terminal handle.
+            awaitTaskId: record.handleId,
           });
     if (!alreadyDelivered) {
       const message = createMuxMessage(
@@ -3513,7 +3513,7 @@ export class WorkspaceTurnManager {
         const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
         if (settled) return;
         if (record == null) {
-          waiterEntry.reject(new Error("Workspace turn not found or out of scope"));
+          waiterEntry.reject(new WorkspaceTurnNotFoundError());
           return;
         }
         if (record.status === "completed") {

@@ -13,6 +13,20 @@ export interface SubagentFailureEnvelope {
   executionId?: string;
 }
 
+// The header lists the execution version straight after the task ID. A version tag further down
+// is body text: rows written before the body became fixed Xum text can hold anything there.
+const FAILURE_HEADER_EXECUTION_VERSION =
+  /^<mux_subagent_failure>\n<task_id>[^\n<>]+<\/task_id>\n<execution_version>([^\n<>]+)<\/execution_version>\n/;
+
+/**
+ * The execution version a failure row names in its header, else null. Delivery dedupe reads this
+ * rather than parseSubagentFailureEnvelope: it must also see rows that do not parse as complete
+ * envelopes, but it must never read a version out of the body.
+ */
+export function parseSubagentFailureExecutionVersion(content: string): string | null {
+  return FAILURE_HEADER_EXECUTION_VERSION.exec(content)?.[1] ?? null;
+}
+
 /** Parse the persisted failure protocol without changing the model-facing message. */
 export function parseSubagentFailureEnvelope(content: string): SubagentFailureEnvelope | null {
   // Match the entire producer envelope so malformed or mixed-content messages remain visible as-is.
