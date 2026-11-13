@@ -132,38 +132,58 @@ function SshDirectoryTrustRow(props: {
   const StatusIcon = props.trusted ? ShieldCheck : ShieldAlert;
   const ActionIcon = busy ? Loader2 : null;
 
+  // Layout, so the row looks balanced at every width:
+  // - Capped at max-w-2xl: a full-width bar put the button ~1,000px from the shield on a wide
+  //   screen. A fixed cap (not a content-hugging width) keeps the button still when the copy
+  //   changes length between states.
+  // - One line from @md up: icon, status, button, with the row as tall as the chip above it (32px).
+  // - Narrower (a phone): the title, the detail and the button stack in the text column, with the
+  //   shield on the title's line. Side by side they squeezed the copy into a ~180px column.
+  // - The error sits in the text column, under the status it explains.
   return (
-    <div
-      className="border-border-medium flex w-full flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border px-2.5 py-1.5 text-xs"
-      data-component="SshDirectoryTrust"
-      data-trusted={props.trusted}
-    >
-      <StatusIcon
-        aria-hidden
-        className={cn("size-4 shrink-0", props.trusted ? "text-success-text" : "text-warning-text")}
-      />
-      {/* Announced when it changes, so a trust or untrust is confirmed without looking. */}
-      <span role="status" className="min-w-0 flex-1">
-        <span className="text-foreground font-medium">{copy.title}</span>
-        <span className="text-muted"> · {copy.detail}</span>
-      </span>
-      <Button
-        variant={props.trusted ? "ghost" : "outline"}
-        size="xs"
-        className="shrink-0"
-        disabled={props.disabled || busy}
-        aria-busy={busy}
-        onClick={() => props.onSetTrust(!props.trusted)}
+    <div className="@container w-full">
+      <div
+        className="border-border-medium grid w-full max-w-2xl grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2.5 gap-y-1.5 rounded-[7px] border px-2.5 py-1.5 text-xs @md:grid-cols-[auto_minmax(0,1fr)_auto] @md:items-center @md:py-[3px]"
+        data-component="SshDirectoryTrust"
+        data-trusted={props.trusted}
       >
-        {ActionIcon && <ActionIcon aria-hidden className="animate-spin" />}
-        {copy.action}
-      </Button>
-      {props.error !== null && (
-        // Indented to the text column (icon + gap), so it reads as part of the status.
-        <span role="alert" className="text-error w-full pl-7">
-          {props.error}
+        <StatusIcon
+          aria-hidden
+          className={cn(
+            "size-4 shrink-0",
+            props.trusted ? "text-success-text" : "text-warning-text"
+          )}
+        />
+        {/* Announced when it changes, so a trust or untrust is confirmed without looking. */}
+        <span role="status" className="min-w-0">
+          <span className="text-foreground block font-medium @md:inline">{copy.title}</span>
+          <span className="text-muted">
+            <span className="hidden @md:inline"> · </span>
+            {copy.detail}
+          </span>
         </span>
-      )}
+        <Button
+          variant="outline"
+          size="xs"
+          // One width for every label, so the button does not jump between states; Untrust is
+          // outlined too (a bare label read as loose text), but muted, as the quieter action.
+          className={cn(
+            "col-start-2 min-w-[6.75rem] justify-self-start @md:col-start-3 @md:row-start-1",
+            props.trusted && "text-muted hover:text-foreground"
+          )}
+          disabled={props.disabled || busy}
+          aria-busy={busy}
+          onClick={() => props.onSetTrust(!props.trusted)}
+        >
+          {ActionIcon && <ActionIcon aria-hidden className="animate-spin" />}
+          {copy.action}
+        </Button>
+        {props.error !== null && (
+          <span role="alert" className="text-error col-start-2 @md:col-span-2">
+            {props.error}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

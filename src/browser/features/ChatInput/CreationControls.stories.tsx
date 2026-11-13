@@ -319,6 +319,13 @@ export const SshWithoutIsolation: Story = {
     // The project is trusted but this host directory is not: its own trust is offered, on the
     // page (checked before the panel opens: the panel is modal and hides the page from queries).
     await expect(canvas.getByRole("button", { name: "Trust directory" })).toBeVisible();
+    // Too narrow for one line, the row stacks in its text column: title and detail, then the
+    // button under them (not squeezed beside the copy), with the shield on the title's line.
+    const trust = trustRowGeometry(storyRoot);
+    await expect(trust.row.right).toBeLessThanOrEqual(frame.right + 1);
+    await expect(trust.button.top).toBeGreaterThanOrEqual(trust.status.bottom);
+    await expect(Math.abs(trust.button.left - trust.status.left)).toBeLessThanOrEqual(1);
+    await expect(Math.abs(centerY(trust.icon) - (trust.status.top + 8))).toBeLessThanOrEqual(2);
 
     await openEnvironmentPanel(storyRoot);
     await expect(await body.findByLabelText("Project directory on host")).toHaveValue(
@@ -329,6 +336,57 @@ export const SshWithoutIsolation: Story = {
     const dockerOption = await body.findByRole("radio", { name: /^Docker/i });
     await expect(dockerOption).toHaveAttribute("aria-disabled", "true");
     await expect(dockerOption).toHaveTextContent("Not yet supported on SSH projects");
+  },
+};
+
+/** Where the SSH+None trust row's parts sit, for its layout contracts. */
+function trustRowGeometry(storyRoot: HTMLElement) {
+  const row = storyRoot.querySelector<HTMLElement>('[data-component="SshDirectoryTrust"]');
+  if (!row) throw new Error("SSH directory trust row not found");
+  const part = (selector: string) => {
+    const el = row.querySelector(selector);
+    if (!el) throw new Error(`${selector} not found in the trust row`);
+    return el.getBoundingClientRect();
+  };
+  return {
+    row: row.getBoundingClientRect(),
+    icon: part("svg"),
+    status: part('[role="status"]'),
+    button: part("button"),
+  };
+}
+
+function centerY(rect: DOMRect): number {
+  return rect.top + rect.height / 2;
+}
+
+/**
+ * On a wide page the SSH+None trust row is one line as tall as the chip, and capped in width, so
+ * its button stays near the copy instead of at the far edge of the page.
+ */
+export const SshDirectoryTrustWide: Story = {
+  // The one-line layout needs a wide frame; the phone layout is SshWithoutIsolation's snapshot.
+  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
+  args: {
+    trustedProject: true,
+    initialRuntime: {
+      mode: "ssh",
+      host: "devbox.internal",
+      workspaceIsolation: "none",
+      projectDir: "~/src/my-app",
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(storyRoot);
+    await canvas.findByRole("button", { name: "Trust directory" }, { timeout: 10000 });
+    const chip = canvas.getByTestId("creation-environment").getBoundingClientRect();
+    const trust = trustRowGeometry(storyRoot);
+    // 42rem: wide enough for the copy and the button on one line, no wider.
+    await expect(trust.row.width).toBeLessThanOrEqual(672 + 1);
+    await expect(trust.row.height).toBeLessThanOrEqual(chip.height + 1);
+    await expect(Math.abs(centerY(trust.button) - centerY(trust.status))).toBeLessThanOrEqual(1);
+    await expect(Math.abs(centerY(trust.icon) - centerY(trust.status))).toBeLessThanOrEqual(1);
   },
 };
 
