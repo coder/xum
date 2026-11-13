@@ -27,6 +27,23 @@ def is_passing_check:
   (.bucket == "pass") or (.state == "SUCCESS");
 def is_skipped_check: .state | IN("SKIPPED", "NEUTRAL");
 def is_unready_check: is_failed_check or is_pending_check;
+def is_cancelled_check: (.bucket == "cancel") or (.state == "CANCELLED");
+def drop_superseded_cancelled:
+  . as $all
+  | [ to_entries[]
+      | .key as $i
+      | .value as $c
+      | select(
+          ($c | is_cancelled_check | not)
+          or (
+            any($all[$i + 1:][];
+              .name == $c.name and .commit == $c.commit
+              and (is_passing_check or is_pending_check)
+            ) | not
+          )
+        )
+      | $c
+    ];
 # One statusCheckRollup context, as selected by check_context_graphql_fields.
 def normalize_check($oid):
   if .__typename == "CheckRun" then
