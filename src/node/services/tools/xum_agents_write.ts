@@ -5,6 +5,11 @@ import {
   type XumAgentsWriteToolArgs,
   type XumAgentsWriteToolResult,
 } from "@/common/types/tools";
+import {
+  assertProjectFileReachable,
+  GLOBAL_WRITE_SANDBOX_ERROR,
+  sandboxBlocksGlobalWrites,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -13,6 +18,12 @@ import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { generateDiff } from "./fileCommon";
 import { resolveAgentsPathOnRuntime, resolveAgentsPathWithinRoot } from "./xum_agents_path";
 import { resolveXumAgentsStorageContext } from "./xum_agents_storage_context";
+
+/** Why this call must not write AGENTS.md, or undefined. */
+function writeRefusal(args: XumAgentsWriteToolArgs, config: ToolConfiguration): string | undefined {
+  if (!args.confirm) return "Refusing to write AGENTS.md without confirm: true";
+  return sandboxBlocksGlobalWrites(config) ? GLOBAL_WRITE_SANDBOX_ERROR : undefined;
+}
 
 export const createXumAgentsWriteTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
@@ -23,11 +34,9 @@ export const createXumAgentsWriteTool: ToolFactory = (config: ToolConfiguration)
       { abortSignal: _abortSignal }
     ): Promise<XumAgentsWriteToolResult> => {
       try {
-        if (!args.confirm) {
-          return {
-            success: false,
-            error: "Refusing to write AGENTS.md without confirm: true",
-          };
+        const refusal = writeRefusal(args, config);
+        if (refusal !== undefined) {
+          return { success: false, error: refusal };
         }
 
         const ctx = resolveXumAgentsStorageContext(config);
@@ -51,6 +60,7 @@ export const createXumAgentsWriteTool: ToolFactory = (config: ToolConfiguration)
           }
 
           const writePath = resolved.kind === "existing" ? resolved.realPath : runtimeAgentsPath;
+          await assertProjectFileReachable(config, writePath, "write");
           await writeFileString(config.runtime, writePath, args.newContent);
 
           const diff = generateDiff(writePath, originalContent, args.newContent);
@@ -90,6 +100,7 @@ export const createXumAgentsWriteTool: ToolFactory = (config: ToolConfiguration)
           writePath = resolved.writePath;
         }
 
+        await assertProjectFileReachable(config, writePath, "write");
         await nodeHostFiles.promises.writeFile(writePath, args.newContent, "utf-8");
 
         const diff = generateDiff(writePath, originalContent, args.newContent);

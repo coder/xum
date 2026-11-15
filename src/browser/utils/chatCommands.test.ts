@@ -33,7 +33,8 @@ import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient } from "@/browser/testUtils";
-import type { RuntimeConfig, RuntimeEnablementId } from "@/common/types/runtime";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import { isolationFromRuntimeId, type IsolationChoice } from "@/common/types/isolation";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   EDIT_HISTORY_CHANGED_MESSAGE,
@@ -2142,16 +2143,18 @@ describe("prepareCompactionMessage", () => {
 
 describe("createNewWorkspace", () => {
   afterEach(() => {
-    getAppConfigStore().updateOptimistically({ defaultRuntime: undefined });
+    getAppConfigStore().updateOptimistically({ defaultIsolation: undefined });
   });
 
   test("/new applies only a configured local default runtime, the project's first", async () => {
     const runtimeConfigs: Array<RuntimeConfig | undefined> = [];
-    let projectDefaultRuntime: RuntimeEnablementId | undefined;
+    let projectDefaultIsolation: IsolationChoice | undefined;
     const client = createTestApiClient({
       projects: {
         list: () =>
-          Promise.resolve([["/repo", { workspaces: [], defaultRuntime: projectDefaultRuntime }]]),
+          Promise.resolve([
+            ["/repo", { workspaces: [], defaultIsolation: projectDefaultIsolation }],
+          ]),
       },
       workspace: {
         create: (input: { runtimeConfig?: RuntimeConfig }) => {
@@ -2167,8 +2170,11 @@ describe("createNewWorkspace", () => {
       ["local", "worktree"],
       ["worktree", "local"],
     ] as const) {
-      getAppConfigStore().updateOptimistically({ defaultRuntime: globalDefault });
-      projectDefaultRuntime = projectDefault;
+      getAppConfigStore().updateOptimistically({
+        defaultIsolation: isolationFromRuntimeId(globalDefault),
+      });
+      projectDefaultIsolation =
+        projectDefault === undefined ? undefined : isolationFromRuntimeId(projectDefault);
       await createNewWorkspace({ client, projectPath: "/repo", trunkBranch: "main" });
     }
 

@@ -107,7 +107,10 @@ describe("TaskService", () => {
       const initialization = taskService.initialize();
       try {
         // Replay must finish accepting every ID while the provider turn is still held open.
-        expect((await raceWithAbortAndTimeout(initialization, { timeoutMs: 1_000 })).kind).toBe(
+        // The provider turn never resolves before the finally block, so a replay that waits
+        // for it always hits this bound. The bound only has to be finite: 1 s failed once on
+        // a loaded host (the test took about 2.5 s) while replay was correct.
+        expect((await raceWithAbortAndTimeout(initialization, { timeoutMs: 15_000 })).kind).toBe(
           "ok"
         );
       } finally {
@@ -126,7 +129,9 @@ describe("TaskService", () => {
       }
       expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
       expect(recovered).toEqual(["compaction", "guidance", "guidance"]);
-    }
+    },
+    // Longer than the 15 s replay bound, so a stuck replay fails on that assertion.
+    30_000
   );
 
   // The restart nudge is an automatic recovery turn, not parent guidance or user input: its

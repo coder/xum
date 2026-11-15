@@ -87,7 +87,7 @@ export interface TurnStopContinuation {
 
 /**
  * The turn.stop continuation from the plugin hooks' reasons and Xum's nudges (TODO first, then
- * the status page), or null for none.
+ * the status page, then layout), or null for none.
  */
 export function mergeTurnStopContinuation(input: {
   hookReasons: readonly TurnStopContinueReason[];

@@ -10,6 +10,8 @@ import {
   GAP_MODES,
   type ConnectionHarness,
 } from "@/browser/contexts/connection.testHarness";
+import { RouterProvider } from "@/browser/contexts/RouterContext";
+import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { TestApiOverrides } from "@/browser/testUtils";
@@ -74,11 +76,15 @@ describe.each([...GAP_MODES])("BackupSection across a reconnect (%s)", (mode) =>
   test("keeps the form until the reload answers", async () => {
     const view = render(
       <harness.Wrapper>
-        <ThemeProvider forcedTheme="dark">
-          <TooltipProvider>
-            <BackupSection />
-          </TooltipProvider>
-        </ThemeProvider>
+        <RouterProvider>
+          <SettingsProvider>
+            <ThemeProvider forcedTheme="dark">
+              <TooltipProvider>
+                <BackupSection />
+              </TooltipProvider>
+            </ThemeProvider>
+          </SettingsProvider>
+        </RouterProvider>
       </harness.Wrapper>
     );
     await waitFor(() => expect(view.queryByDisplayValue("git@example.com:old.git")).not.toBeNull());
@@ -102,11 +108,15 @@ describe.each([...GAP_MODES])("BackupSection across a reconnect (%s)", (mode) =>
   test("disables Save for a kept draft until the reload answers", async () => {
     const view = render(
       <harness.Wrapper>
-        <ThemeProvider forcedTheme="dark">
-          <TooltipProvider>
-            <BackupSection />
-          </TooltipProvider>
-        </ThemeProvider>
+        <RouterProvider>
+          <SettingsProvider>
+            <ThemeProvider forcedTheme="dark">
+              <TooltipProvider>
+                <BackupSection />
+              </TooltipProvider>
+            </ThemeProvider>
+          </SettingsProvider>
+        </RouterProvider>
       </harness.Wrapper>
     );
     const branch = await waitFor(() => view.getByDisplayValue("main"));

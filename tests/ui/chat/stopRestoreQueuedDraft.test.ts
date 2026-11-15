@@ -353,7 +353,6 @@ describe("ArrowUp and a queued artifact send", () => {
               id: "i-1",
               artifactPath: "form.html",
               title: "Form",
-              version: 0,
               action: "send",
               text: "Ship it",
             },

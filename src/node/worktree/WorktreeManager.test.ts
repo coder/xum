@@ -2,7 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { InitLogger } from "@/node/runtime/Runtime";
@@ -2700,14 +2700,49 @@ describe("WorktreeManager.deleteWorkspace", () => {
   }, 20_000);
 
   it("force-delete fallback does not execute shell payloads embedded in branch names", async () => {
+    // The payload names its sentinel by absolute path, and that path becomes part of the branch
+    // name. Git refuses a name with a component that starts with a dot or holds a character such as
+    // `~` or `:`, and a path with shell syntax (`&`, `;`, `$(`) is split or run by the shell, so on
+    // such a host the create below failed, or the sentinel could never appear, and this test never
+    // reached the deletion it covers. Pick the first temp directory with a shell-safe path, whose
+    // whole branch name git accepts, and for which a shell that expands the name creates the
+    // sentinel (a control: an absent sentinel below could otherwise mean that the payload cannot
+    // run here, not that the deletion kept it from running). The path is filtered before any shell
+    // sees it, because git accepts names that the shell would run, and the real `touch` of a split
+    // path would leave a stray file.
+    const payloadFor = (dir: string) => {
+      const sentinelPath = path.join(
+        dir,
+        `mux_injection_test_${Date.now()}_${Math.random().toString(16).slice(2)}`
+      );
+      return { sentinelPath, branchName: `feature/inject-$(touch\${IFS}${sentinelPath})` };
+    };
+    const payloadRuns = (payload: { sentinelPath: string; branchName: string }): boolean => {
+      try {
+        execFileSync("git", ["check-ref-format", "--branch", payload.branchName], {
+          stdio: "ignore",
+        });
+        execFileSync("sh", ["-c", `: ${payload.branchName}`], { stdio: "ignore" });
+        return existsSync(payload.sentinelPath);
+      } catch {
+        return false;
+      } finally {
+        rmSync(payload.sentinelPath, { force: true });
+      }
+    };
+    const payload = [os.tmpdir(), "/tmp"]
+      .filter((dir) => /^[\w./-]+$/.test(dir))
+      .map(payloadFor)
+      .find(payloadRuns);
+    if (payload === undefined) {
+      throw new Error(
+        "Expected a shell-safe temp directory that git accepts in a branch name and sh can write"
+      );
+    }
+    const { sentinelPath, branchName } = payload;
     const fixture = await createWorktreeManagerFixture({
       tempDirPrefix: "worktree-manager-delete-",
     });
-    const sentinelPath = path.join(
-      os.tmpdir(),
-      `mux_injection_test_${Date.now()}_${Math.random().toString(16).slice(2)}`
-    );
-    const branchName = `feature/inject-$(touch\${IFS}${sentinelPath})`;
 
     let execFileAsyncSpy: { mockRestore: () => void } | null = null;
 

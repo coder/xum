@@ -101,6 +101,7 @@ import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationA
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { secretsForWorkspace } from "@/node/utils/projectTrust";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -707,7 +708,7 @@ export const CoreWiringLive: Layer.Layer<
       const secrets =
         metadata && isMultiProject(metadata)
           ? mergeMultiProjectSecrets(metadata, secretsStore)
-          : secretsStore.getEffectiveSecrets(projectPath);
+          : secretsForWorkspace(secretsStore, config, projectPath, metadata?.runtimeConfig);
       return secretsToRecord(secrets);
     });
 

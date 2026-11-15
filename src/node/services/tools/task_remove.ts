@@ -2,12 +2,18 @@ import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TaskRemoveToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import type { LossyWorkPolicy } from "@/node/services/taskService";
 import {
   dedupeStrings,
   parseToolResult,
   requireTaskService,
   requireWorkspaceId,
 } from "./toolUtils";
+
+/** Only `force: true` forces: false, null (strict-mode providers) and an omitted flag refuse. */
+function lossyWorkPolicyFor(force: boolean | null | undefined): LossyWorkPolicy {
+  return force === true ? "force" : "refuse";
+}
 
 export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
@@ -30,11 +36,12 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
 
       const results = [];
       for (const taskId of taskIds) {
-        // The model's decision is not user consent: refuse removals that would lose work (#4723).
+        // The model's decision is not user consent: refuse removals that would lose work (#4723),
+        // unless the call sets `force`, which deletes that work and reports it on the result.
         const result = await taskService.removeInactiveDescendantAgentTask(
           ownerWorkspaceId,
           taskId,
-          { lossyWorkPolicy: "refuse" }
+          { lossyWorkPolicy: lossyWorkPolicyFor(args.force) }
         );
         if (!result.success) {
           results.push({ status: "error" as const, taskId, error: result.error });
@@ -51,6 +58,9 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
               status: data.status,
               taskId,
               ...(data.workspaceId != null ? { workspaceId: data.workspaceId } : {}),
+              // Only a forced removal sets these; otherwise they are undefined and leave the JSON.
+              deletedWork: data.deletedWork,
+              paths: data.paths,
             });
             break;
           case "error":
@@ -62,6 +72,8 @@ export const createTaskRemoveTool: ToolFactory = (config: ToolConfiguration) => 
                 ? { descendantTaskIds: data.descendantTaskIds }
                 : {}),
               ...(data.paths != null ? { paths: data.paths } : {}),
+              // A forced removal that failed part-way reports what it may have deleted.
+              deletedWork: data.deletedWork,
               error: data.error ?? "Task removal failed.",
             });
             break;

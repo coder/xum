@@ -27,6 +27,12 @@ export const MUTATION_LOCK_FILE = "mutation.lock";
 /** Renewal cadence for pre-#4415 builds (they reclaim by age); never a takeover threshold. */
 const MUTATION_LOCK_STALE_MS = 30 * 60 * 1000;
 
+/**
+ * How long an acquire waits on a live holder before failing (covers a full clone). The installer
+ * and the settings backup's plugin read wait this long, so both give up on the same holder.
+ */
+export const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
+
 export function acquirePluginMutationLock(
   rootDir: string,
   options: { timeoutMs: number; signal?: AbortSignal }

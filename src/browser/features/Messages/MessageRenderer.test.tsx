@@ -8,6 +8,7 @@ import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvel
 import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
   BACKGROUND_WORK_WAKE_OPENINGS,
+  LAYOUT_TURN_END_NUDGE,
   STATUS_PAGE_AGENT_TURN_END_NUDGE,
   STATUS_PAGE_TURN_END_NUDGE,
   TODO_TURN_END_NUDGE,
@@ -789,6 +790,45 @@ describe("MessageRenderer TODO nudge rows", () => {
       expect(typed.container.querySelector("[data-status-page-turn-end-nudge]")).toBeNull();
     }
   );
+
+  // The summary is the only text of the collapsed row, so it names each joined nudge's ask.
+  test.each([
+    { name: "alone", content: LAYOUT_TURN_END_NUDGE, asks: [] },
+    {
+      name: "after the TODO nudge",
+      content: `${TODO_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["TODO list"],
+    },
+    {
+      name: "after the status page nudge",
+      content: `${STATUS_PAGE_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["status page"],
+    },
+    {
+      name: "after both",
+      content: `${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_AGENT_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["TODO list", "status page"],
+    },
+  ])("collapses a layout nudge $name and names each ask", ({ content, asks }) => {
+    const view = renderNudge(content, true);
+    const row = view.container.querySelector("[data-layout-turn-end-nudge]");
+    expect(row).not.toBeNull();
+    const summary = view.getByText(/^Asked the agent to /).textContent ?? "";
+    expect(summary).toContain("layout issues");
+    const named: readonly string[] = asks;
+    for (const ask of ["TODO list", "status page"]) {
+      expect(summary.includes(ask)).toBe(named.includes(ask));
+    }
+  });
+
+  test("keeps a full bubble for a typed layout nudge and one joined to a plugin's prompt", () => {
+    const typed = renderNudge(LAYOUT_TURN_END_NUDGE, false);
+    expect(typed.container.querySelector("[data-layout-turn-end-nudge]")).toBeNull();
+    cleanup();
+    const joined = renderNudge(`Run the failing tests again.\n\n${LAYOUT_TURN_END_NUDGE}`, true);
+    expect(joined.container.querySelector("[data-layout-turn-end-nudge]")).toBeNull();
+    expect(joined.getByText(/Run the failing tests again/)).toBeDefined();
+  });
 });
 
 describe("MessageRenderer bash monitor wake rows", () => {

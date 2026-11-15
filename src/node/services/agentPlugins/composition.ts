@@ -1,4 +1,6 @@
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
+import assert from "@/common/utils/assert";
+import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type {
   WorkspaceComposition,
   WorkspaceCompositionEntry,
@@ -172,6 +174,41 @@ function remoteCheckoutSkillRoots(args: BuildWorkspaceCompositionArgs) {
   };
 }
 
+/**
+ * The agents of a composition, and a diagnostic for each one that cannot run in this workspace
+ * (it is not part of what a turn loads, so it is not an agent entry). An unavailable agent still
+ * holds its ID, so a lower agent of that ID shows as shadowed by it (the `task` list hides that
+ * agent too).
+ */
+function compositionAgents(descriptors: AgentDefinitionDescriptor[]): {
+  agents: WorkspaceCompositionEntry[];
+  unavailableAgentDiagnostics: WorkspaceComposition["diagnostics"];
+} {
+  const entries = markShadowed(
+    descriptors.map((agent) => ({
+      name: agent.id,
+      source: sourceLabel(agent.scope, agent.pluginName),
+      ...(agent.description !== undefined ? { description: agent.description } : {}),
+    }))
+  );
+  const agents: WorkspaceCompositionEntry[] = [];
+  const unavailableAgentDiagnostics: WorkspaceComposition["diagnostics"] = [];
+  descriptors.forEach((agent, index) => {
+    if (agent.unavailableReason === undefined) {
+      agents.push(entries[index]);
+      return;
+    }
+    assert(agent.unavailablePath !== undefined, "an unavailable agent names its file");
+    unavailableAgentDiagnostics.push({
+      path: agent.unavailablePath,
+      scope: agent.scope === "global" ? "global" : "project",
+      severity: "warning",
+      message: agent.unavailableReason,
+    });
+  });
+  return { agents, unavailableAgentDiagnostics };
+}
+
 export async function buildWorkspaceComposition(
   args: BuildWorkspaceCompositionArgs
 ): Promise<WorkspaceComposition> {
@@ -244,13 +281,7 @@ export async function buildWorkspaceComposition(
     projectPluginsTrusted: args.projectTrusted,
     runtimeFactory,
   });
-  const agents = markShadowed(
-    agentDescriptors.map((agent) => ({
-      name: agent.id,
-      source: sourceLabel(agent.scope, agent.pluginName),
-      ...(agent.description !== undefined ? { description: agent.description } : {}),
-    }))
-  );
+  const { agents, unavailableAgentDiagnostics } = compositionAgents(agentDescriptors);
 
   // Workflow discovery already dedupes by skill name and plugin identity, so
   // these are effective entries only (skill shadowing shows up under skills).
@@ -321,12 +352,15 @@ export async function buildWorkspaceComposition(
 
   return {
     plugins: plugins.map(summarizePlugin),
-    diagnostics: diagnostics.map((diagnostic) => ({
-      path: diagnostic.path,
-      scope: diagnostic.scope,
-      severity: diagnostic.severity,
-      message: diagnostic.message,
-    })),
+    diagnostics: [
+      ...diagnostics.map((diagnostic) => ({
+        path: diagnostic.path,
+        scope: diagnostic.scope,
+        severity: diagnostic.severity,
+        message: diagnostic.message,
+      })),
+      ...unavailableAgentDiagnostics,
+    ],
     skills,
     agents,
     workflows,

@@ -35,12 +35,13 @@ import type {
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
+import type { BackupPluginEntry } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
-  consumePendingPluginsSectionIntent,
+  peekPendingPluginsSectionIntent,
   subscribePluginsSectionIntents,
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
@@ -61,6 +62,21 @@ import {
   offersSkillsCli,
 } from "./PluginInstallMethods";
 import { MarketplaceListing } from "./PluginMarketplaceListing";
+import {
+  UpdateAllButton,
+  UpdateAllStatus,
+  useUpdateAll,
+  useUpdateReviewQueue,
+} from "./PluginsUpdateAll";
+import {
+  BackupQueueHeader,
+  installSource,
+  seededForm,
+  selectedComponents,
+  usePreviewOnMount,
+  useSeedForPreview,
+  type PreviewResult,
+} from "./pluginBackupQueue";
 
 /**
  * Settings → Plugins (global scope only).
@@ -648,15 +664,118 @@ function focusFirstControlOnMount(view: HTMLDivElement | null): void {
   first?.focus();
 }
 
+/** The Add plugin form's source fields; Enter previews like the Preview button. */
+const PluginSourceForm: React.FC<{
+  input: string;
+  setInput: (value: string) => void;
+  gitRef: string;
+  setRef: (value: string) => void;
+  subpath: string;
+  setSubpath: (value: string) => void;
+  busy: boolean;
+  error: string | null;
+  onPreview: () => void;
+  onClose: () => void;
+}> = (props) => {
+  const previewOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") props.onPreview();
+  };
+  return (
+    <>
+      <div>
+        <label htmlFor="plugin-source" className="text-muted mb-1 block text-xs">
+          Git URL or owner/repo
+        </label>
+        <input
+          id="plugin-source"
+          type="text"
+          autoFocus
+          placeholder="e.g., owner/repo, owner/repo/path/to/plugin, owner/repo@v1.2.0, or https://github.com/owner/repo.git"
+          value={props.input}
+          onChange={(e) => props.setInput(e.target.value)}
+          onKeyDown={previewOnEnter}
+          spellCheck={false}
+          className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+        />
+      </div>
+      <div>
+        <label htmlFor="plugin-ref" className="text-muted mb-1 block text-xs">
+          Branch, tag, or commit SHA (optional — defaults to the default branch)
+        </label>
+        <input
+          id="plugin-ref"
+          type="text"
+          placeholder="e.g., main, v1.2.0, or a full 40-character SHA"
+          value={props.gitRef}
+          onChange={(e) => props.setRef(e.target.value)}
+          onKeyDown={previewOnEnter}
+          spellCheck={false}
+          className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+        />
+      </div>
+      {/* Full URLs (GitLab, self-hosted, SSH, file) cannot carry a folder
+          in the source field, so monorepo folders need their own field. */}
+      <div>
+        <label htmlFor="plugin-subpath" className="text-muted mb-1 block text-xs">
+          Plugin folder in the repository (optional — for monorepos)
+        </label>
+        <input
+          id="plugin-subpath"
+          type="text"
+          placeholder="e.g., packages/my-plugin"
+          value={props.subpath}
+          onChange={(e) => props.setSubpath(e.target.value)}
+          onKeyDown={previewOnEnter}
+          spellCheck={false}
+          className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+        />
+      </div>
+      {props.error && (
+        <div
+          role="alert"
+          className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+        >
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 break-words">{props.error}</span>
+        </div>
+      )}
+      <div className="flex gap-2">
+        <Button
+          size="sm"
+          onClick={props.onPreview}
+          disabled={props.busy || props.input.trim().length === 0}
+        >
+          {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+          {props.busy ? "Fetching…" : "Preview"}
+        </Button>
+        <Button variant="ghost" size="sm" onClick={props.onClose} disabled={props.busy}>
+          Cancel
+        </Button>
+      </div>
+    </>
+  );
+};
+
+/** The marketplace entry a preview method selects, if it selects one. */
+function entryOfMethod(method: AgentPluginInstallMethod | null): string | null {
+  return method !== null && "entry" in method ? method.entry : null;
+}
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
   onClose: () => void;
+  /** A plugin a settings backup lists: it fills the form, and its pinned commit is previewed on mount. */
+  seed?: BackupPluginEntry;
+  /** Shown above the form; gets the busy flag so its controls wait for a running request. */
+  header?: (busy: boolean) => React.ReactNode;
 }> = (props) => {
   const { api } = useAPI();
-  const [input, setInput] = useState("");
-  const [ref, setRef] = useState("");
-  const [subpath, setSubpath] = useState("");
+  const form = seededForm(props.seed);
+  const seedFor = useSeedForPreview(props.seed);
+  const [input, setInput] = useState(form.input);
+  const [ref, setRef] = useState(form.ref);
+  const [subpath, setSubpath] = useState(form.subpath);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
@@ -676,31 +795,34 @@ const AddPluginPanel: React.FC<{
   const [previewedEntry, setPreviewedEntry] = useState<string | null>(null);
 
   /** `method`: the Install as choice; null takes the first method that fits. */
+  const showPreview = (result: PreviewResult, method: AgentPluginInstallMethod | null) => {
+    if (!result.success) {
+      setError(result.error);
+    } else if (result.data.kind === "marketplace") {
+      setMarketplace(result.data.marketplace);
+    } else {
+      const next = result.data.preview;
+      setPreview(next);
+      setPreviewedEntry(entryOfMethod(method));
+      // An accepted preview starts a new consent decision; failed attempts retain choices.
+      setSelected(selectedComponents(next, seedFor(next)));
+    }
+  };
+
   const handlePreview = async (method: AgentPluginInstallMethod | null) => {
     if (!api || input.trim().length === 0 || busy) return;
     setBusy(true);
     setError(null);
     try {
-      const result = await api.agentPlugins.preview({
-        input: input.trim(),
-        ref: optionalField(ref),
-        subpath: optionalField(subpath),
-        method,
-      });
-      if (!result.success) {
-        setError(result.error);
-      } else if (result.data.kind === "marketplace") {
-        setMarketplace(result.data.marketplace);
-      } else {
-        const next = result.data.preview;
-        setPreview(next);
-        setPreviewedEntry(method !== null && "entry" in method ? method.entry : null);
-        // An accepted preview starts a new consent decision; failed attempts retain choices.
-        setSelected({
-          skills: next.skills.map((skill) => skill.name),
-          mcpServers: next.mcpServers.map((server) => server.serverName),
-        });
-      }
+      showPreview(
+        await api.agentPlugins.preview({
+          input: input.trim(),
+          ref: optionalField(ref),
+          subpath: optionalField(subpath),
+          method,
+        }),
+        method
+      );
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -708,9 +830,18 @@ const AddPluginPanel: React.FC<{
     }
   };
 
-  const previewOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") void handlePreview(null);
-  };
+  // A backed-up plugin previews itself; its fields stay editable, so a preview that fails (a
+  // repository that moved, a host that is down) can be fixed by hand.
+  usePreviewOnMount(api, props.seed, {
+    onStart: () => {
+      setBusy(true);
+      // A reconnect previews again: the failure of the client that dropped no longer applies.
+      setError(null);
+    },
+    onResult: showPreview,
+    onError: setError,
+    onEnd: () => setBusy(false),
+  });
 
   /** Back from a preview: to the marketplace entries when they led here, else to the source. */
   const backToSource = () => {
@@ -725,7 +856,7 @@ const AddPluginPanel: React.FC<{
     setError(null);
     try {
       const result = await api.agentPlugins.install({
-        source: preview.source,
+        source: installSource(preview, seedFor(preview)),
         method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
@@ -748,6 +879,7 @@ const AddPluginPanel: React.FC<{
 
   return (
     <div className="border-border-medium bg-background-secondary space-y-3 rounded-md border p-3">
+      {props.header?.(busy)}
       {preview === null && marketplace !== null ? (
         <MarketplaceListing
           listing={marketplace}
@@ -764,78 +896,18 @@ const AddPluginPanel: React.FC<{
           onPickMethod={(method) => void handlePreview(method)}
         />
       ) : preview === null ? (
-        <>
-          <div>
-            <label htmlFor="plugin-source" className="text-muted mb-1 block text-xs">
-              Git URL or owner/repo
-            </label>
-            <input
-              id="plugin-source"
-              type="text"
-              autoFocus
-              placeholder="e.g., owner/repo, owner/repo/path/to/plugin, owner/repo@v1.2.0, or https://github.com/owner/repo.git"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={previewOnEnter}
-              spellCheck={false}
-              className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
-            />
-          </div>
-          <div>
-            <label htmlFor="plugin-ref" className="text-muted mb-1 block text-xs">
-              Branch, tag, or commit SHA (optional — defaults to the default branch)
-            </label>
-            <input
-              id="plugin-ref"
-              type="text"
-              placeholder="e.g., main, v1.2.0, or a full 40-character SHA"
-              value={ref}
-              onChange={(e) => setRef(e.target.value)}
-              onKeyDown={previewOnEnter}
-              spellCheck={false}
-              className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
-            />
-          </div>
-          {/* Full URLs (GitLab, self-hosted, SSH, file) cannot carry a folder
-              in the source field, so monorepo folders need their own field. */}
-          <div>
-            <label htmlFor="plugin-subpath" className="text-muted mb-1 block text-xs">
-              Plugin folder in the repository (optional — for monorepos)
-            </label>
-            <input
-              id="plugin-subpath"
-              type="text"
-              placeholder="e.g., packages/my-plugin"
-              value={subpath}
-              onChange={(e) => setSubpath(e.target.value)}
-              onKeyDown={previewOnEnter}
-              spellCheck={false}
-              className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
-            />
-          </div>
-          {error && (
-            <div
-              role="alert"
-              className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
-            >
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="min-w-0 break-words">{error}</span>
-            </div>
-          )}
-          <div className="flex gap-2">
-            <Button
-              size="sm"
-              onClick={() => void handlePreview(null)}
-              disabled={busy || input.trim().length === 0}
-            >
-              {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-              {busy ? "Fetching…" : "Preview"}
-            </Button>
-            <Button variant="ghost" size="sm" onClick={props.onClose} disabled={busy}>
-              Cancel
-            </Button>
-          </div>
-        </>
+        <PluginSourceForm
+          input={input}
+          setInput={setInput}
+          gitRef={ref}
+          setRef={setRef}
+          subpath={subpath}
+          setSubpath={setSubpath}
+          busy={busy}
+          error={error}
+          onPreview={() => void handlePreview(null)}
+          onClose={props.onClose}
+        />
       ) : (
         <div ref={focusFirstControlOnMount} className="space-y-3">
           <InstallMethodPicker
@@ -883,6 +955,66 @@ const AddPluginPanel: React.FC<{
     </div>
   );
 };
+
+/**
+ * Reinstalls the plugins of a settings backup, one install review at a time. Each plugin gets its
+ * own Add plugin panel (a new key remounts it, so no state carries over), and nothing installs
+ * until the user confirms that plugin's preview. Skipping every plugin ends as a close, with no
+ * install notice. Closing after some installs still reports them, so the list shows what was added.
+ */
+const BackupInstallQueue: React.FC<{
+  entries: readonly BackupPluginEntry[];
+  onInstalled: () => void;
+  onClose: () => void;
+}> = (props) => {
+  const [index, setIndex] = useState(0);
+  const [installedAny, setInstalledAny] = useState(false);
+  const seed = props.entries[index];
+  const finish = (installed: boolean) => (installed ? props.onInstalled() : props.onClose());
+  /** Leaves this plugin and reviews the next one, or ends the queue after the last. */
+  const next = (installed: boolean) => {
+    const any = installedAny || installed;
+    if (index + 1 >= props.entries.length) {
+      finish(any);
+      return;
+    }
+    setInstalledAny(any);
+    setIndex(index + 1);
+  };
+  return (
+    <AddPluginPanel
+      key={index}
+      seed={seed}
+      header={(busy) => (
+        <BackupQueueHeader
+          position={index + 1}
+          total={props.entries.length}
+          name={seed.name}
+          busy={busy}
+          onSkip={() => next(false)}
+        />
+      )}
+      onInstalled={() => next(true)}
+      onClose={() => finish(installedAny)}
+    />
+  );
+};
+
+/** The open Add plugin panel: the plain form, or the install reviews of a backup's plugins. */
+const AddPanelView: React.FC<{
+  backup?: readonly BackupPluginEntry[];
+  onInstalled: () => void;
+  onClose: () => void;
+}> = (props) =>
+  props.backup === undefined ? (
+    <AddPluginPanel onInstalled={props.onInstalled} onClose={props.onClose} />
+  ) : (
+    <BackupInstallQueue
+      entries={props.backup}
+      onInstalled={props.onInstalled}
+      onClose={props.onClose}
+    />
+  );
 
 /** Name, method, version, description and source of a consent preview. */
 const PreviewHeader: React.FC<{ preview: AgentPluginInstallPreview }> = (props) => (
@@ -948,7 +1080,7 @@ const CodexHooksDisclosure: React.FC<{ hooks: AgentPluginInstallPreview["codexHo
           {props.hooks.map((hook) => {
             const note = hookStatusNote(hook);
             return (
-              <li key={hook.key} className="text-xs break-all">
+              <li key={hook.key} className="text-xs break-words">
                 <span className="text-foreground font-mono">{showOneLineControls(hook.event)}</span>
                 {hook.matcher !== undefined && (
                   <span className="text-muted font-mono">
@@ -1099,6 +1231,28 @@ const NotAppliedList: React.FC<{ items?: readonly AgentPluginNotApplied[]; class
   );
 };
 
+/** What a read-only agent loses: its edit tools, and its shell when its mapped tool list removed it. */
+const ReadonlyAgentNote: React.FC<{ preview: AgentPluginInstallPreview; agent: string }> = (
+  props
+) => {
+  if (!props.preview.readonlyAgents.includes(props.agent)) return null;
+  const shell = props.preview.shellRemovedAgents.includes(props.agent)
+    ? "shell removed"
+    : "shell still available";
+  return <span className="text-muted"> (edit tools removed, {shell})</span>;
+};
+
+/**
+ * A file name or slash command name inside a line of text. It moves to the next line as a whole
+ * instead of splitting at the card's edge, and wraps inside itself only when it is longer than a
+ * line (`break-all` split every name at phone width).
+ */
+const FileName: React.FC<{ name: string }> = (props) => (
+  <span className="text-foreground inline-block max-w-full font-mono break-words">
+    {props.name}
+  </span>
+);
+
 /** Agents, workflows, slash commands and hooks of a consent preview: the import choice does not cover them. */
 const PreviewDisclosures: React.FC<{
   preview: AgentPluginInstallPreview;
@@ -1116,18 +1270,17 @@ const PreviewDisclosures: React.FC<{
           {props.preview.agents.map((agent, index) => (
             <React.Fragment key={agent}>
               {index > 0 && ", "}
-              <span className="text-foreground font-mono break-all">{agent}</span>
-              {props.preview.readonlyAgents.includes(agent) && (
-                <span className="text-muted"> (edit tools removed, shell still available)</span>
-              )}
+              <FileName name={agent} />
+              <ReadonlyAgentNote preview={props.preview} agent={agent} />
             </React.Fragment>
           ))}{" "}
           <span className="text-muted">
             — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only field
             such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed only by its
             Claude Code tools or disallowedTools list. Unless that list removes Bash, it can run
-            shell commands, which can change any file. readonly: true removes only the file edit and
-            task tools.
+            shell commands, which can change any file. A list of only Read, Grep, Glob and LS that
+            names Grep, Glob or LS also gets the shell, for search. readonly: true removes only the
+            file edit and task tools.
           </span>
         </p>
       </div>
@@ -1139,9 +1292,12 @@ const PreviewDisclosures: React.FC<{
           Workflows ({props.preview.workflows.length})
         </h4>
         <p className="text-xs">
-          <span className="text-foreground font-mono break-all">
-            {props.preview.workflows.join(", ")}
-          </span>{" "}
+          {props.preview.workflows.map((workflow, index) => (
+            <React.Fragment key={workflow}>
+              {index > 0 && ", "}
+              <FileName name={workflow} />
+            </React.Fragment>
+          ))}{" "}
           <span className="text-muted">
             — executable workflow scripts, invokable after install.
           </span>
@@ -1157,7 +1313,7 @@ const PreviewDisclosures: React.FC<{
         <ul className="space-y-1">
           {props.preview.slashCommands.map((command) => (
             <li key={command.name} className="text-xs">
-              <span className="text-foreground font-mono">/{command.name}</span>
+              <FileName name={`/${command.name}`} />
               {command.description && <span className="text-muted"> — {command.description}</span>}
             </li>
           ))}
@@ -1216,6 +1372,8 @@ const PreviewDisclosures: React.FC<{
 const UninstallConfirm: React.FC<{
   item: AgentPluginListItem;
   busy: boolean;
+  /** Another plugin's action is in flight: the section ignores a confirm until it settles. */
+  locked: boolean;
   onConfirm: (deletePluginData: boolean) => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1240,7 +1398,7 @@ const UninstallConfirm: React.FC<{
           variant="destructive"
           size="sm"
           onClick={() => props.onConfirm(deletePluginData)}
-          disabled={props.busy}
+          disabled={props.busy || props.locked}
         >
           {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
           {props.busy ? "Uninstalling…" : "Uninstall"}
@@ -1324,8 +1482,8 @@ const ReviewedDefinitions: React.FC<{
         {props.items.map((item) => (
           <li key={`${item.kind}:${item.name}`} className="text-xs">
             <details>
-              <summary className="text-foreground cursor-pointer break-all">
-                {REVIEWED_KIND_LABEL[item.kind]} <span className="font-mono">{item.name}</span>
+              <summary className="text-foreground cursor-pointer">
+                {REVIEWED_KIND_LABEL[item.kind]} <FileName name={item.name} />
               </summary>
               <pre className="bg-modal-bg border-border-medium mt-1 max-h-64 overflow-auto rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
                 {item.detail}
@@ -1342,7 +1500,10 @@ const UpdateReviewPanel: React.FC<{
   review: AgentPluginUpdateReview;
   mode: ReviewPanelMode;
   selective: boolean;
+  /** This review's plugin has the action in flight: the confirm shows its progress. */
   busy: boolean;
+  /** Another plugin's action is in flight: the section ignores a confirm until it settles. */
+  locked: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1388,7 +1549,11 @@ const UpdateReviewPanel: React.FC<{
         </p>
       )}
       <div className="flex gap-2">
-        <Button size="sm" onClick={props.onConfirm} disabled={props.busy || mustExpand.length > 0}>
+        <Button
+          size="sm"
+          onClick={props.onConfirm}
+          disabled={props.busy || props.locked || mustExpand.length > 0}
+        >
           {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
           {props.busy ? copy.busy : copy.confirm}
         </Button>
@@ -1643,6 +1808,7 @@ const ComponentReviewRow: React.FC<{
   item: AgentPluginListItem;
   review: AgentPluginUpdateReview | null;
   busy: boolean;
+  locked: boolean;
   onConfirm: (review: AgentPluginUpdateReview) => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1654,11 +1820,26 @@ const ComponentReviewRow: React.FC<{
       mode="components"
       selective={false}
       busy={props.busy}
+      locked={props.locked}
       onConfirm={() => props.onConfirm(review)}
       onCancel={props.onCancel}
     />
   );
 };
+
+/** The Add plugin panel an intent opens (the plain form, or a backup's plugins), or null for any other intent. */
+function addPanelOf(
+  intent: PluginsSectionIntent | null
+): { id: number; backup?: readonly BackupPluginEntry[] } | null {
+  switch (intent?.type) {
+    case "open-add-panel":
+      return { id: 0 };
+    case "install-from-backup":
+      return { id: 0, backup: intent.entries };
+    default:
+      return null;
+  }
+}
 
 export const PluginsSettingsSection: React.FC = () => {
   const { api } = useAPI();
@@ -1685,8 +1866,12 @@ export const PluginsSettingsSection: React.FC = () => {
   // below covers commands invoked while this section is already on screen
   // (same-route navigation preserves the mounted component, so no re-init
   // happens).
-  const [initialIntent] = useState(() => consumePendingPluginsSectionIntent());
-  const [addOpen, setAddOpen] = useState(initialIntent?.type === "open-add-panel");
+  const [initialIntent] = useState(() => peekPendingPluginsSectionIntent());
+  // The open Add plugin panel: the plain form, or a reinstall of a backup's plugins. A new id
+  // remounts it, so a backup reinstall starts from its first plugin and a closed panel leaves
+  // nothing behind for the next plain add.
+  const [addPanel, setAddPanel] = useState(() => addPanelOf(initialIntent));
+  const nextAddPanelId = useRef(0);
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(
     initialIntent?.type === "confirm-uninstall" ? initialIntent.name : null
   );
@@ -1707,9 +1892,11 @@ export const PluginsSettingsSection: React.FC = () => {
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
   /** Pending update whose capability changes await the user's confirmation. */
-  const [updateReview, setUpdateReview] = useState<AgentPluginUpdateReview | null>(
-    initialIntent?.type === "review-update" ? initialIntent.review : null
+  const updateReviews = useUpdateReviewQueue(
+    initialIntent?.type === "review-updates" ? initialIntent.reviews : [],
+    items
   );
+  const updateReview = updateReviews.open;
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
   const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
@@ -1729,12 +1916,18 @@ export const PluginsSettingsSection: React.FC = () => {
   const addButtonFocus = useFocusOnNextMount();
   const closeAddPanel = () => {
     addButtonFocus.arm();
-    setAddOpen(false);
+    setAddPanel(null);
   };
-  const openAddPanel = () => {
+  const openAddPanel = (backup?: readonly BackupPluginEntry[]) => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
     setInstallSucceeded(false);
-    setAddOpen(true);
+    setAddPanel({ id: ++nextAddPanelId.current, backup });
+  };
+  const addPanelInstalled = () => {
+    closeAddPanel();
+    setInstallSucceeded(true);
+    void refresh();
+    void checkForUpdates();
   };
 
   const refresh = async () => {
@@ -1823,6 +2016,9 @@ export const PluginsSettingsSection: React.FC = () => {
         case "open-add-panel":
           openAddPanel();
           break;
+        case "install-from-backup":
+          openAddPanel(intent.entries);
+          break;
         case "manage-components":
           setComponentsTarget(intent.name);
           break;
@@ -1832,8 +2028,8 @@ export const PluginsSettingsSection: React.FC = () => {
         case "confirm-uninstall":
           setUninstallTarget(intent.name);
           break;
-        case "review-update":
-          setUpdateReview(intent.review);
+        case "review-updates":
+          updateReviews.show(intent.reviews);
           break;
         case "review-components":
           latestComponentReview.current.openFromIntent(intent);
@@ -1843,9 +2039,30 @@ export const PluginsSettingsSection: React.FC = () => {
           void checkForUpdates();
           break;
       }
-    });
+    }, initialIntent);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribe on API reconnect only; the listener reads the latest handlers via closure per subscription
   }, [api]);
+
+  const startUpdate = () => {
+    setError(null);
+    updateReviews.clear();
+    updateAll.dismissStatus();
+    // The update moves lockedSha, so an open component review would confirm against a stale tree.
+    componentReview.close();
+  };
+
+  const updateAll = useUpdateAll({
+    api,
+    busyPlugin,
+    setBusyPlugin,
+    items,
+    updateChecks,
+    waitingReviews: updateReviews.waiting,
+    onStart: startUpdate,
+    onReviews: updateReviews.show,
+    refresh,
+    checkForUpdates,
+  });
 
   /**
    * Update click: review first. A capability-neutral update applies right
@@ -1856,10 +2073,7 @@ export const PluginsSettingsSection: React.FC = () => {
   const handleUpdate = async (name: string) => {
     if (!api || busyPlugin !== null) return;
     setBusyPlugin(name);
-    setError(null);
-    setUpdateReview(null);
-    // The update moves lockedSha, so an open component review would confirm against a stale tree.
-    componentReview.close();
+    startUpdate();
     try {
       const preview = await api.agentPlugins.previewUpdate({ name });
       if (!preview.success) {
@@ -1867,7 +2081,7 @@ export const PluginsSettingsSection: React.FC = () => {
         return;
       }
       if (preview.data.changes.length > 0) {
-        setUpdateReview(preview.data);
+        updateReviews.show([preview.data]);
         return;
       }
       await applyUpdate(name, undefined);
@@ -1884,11 +2098,15 @@ export const PluginsSettingsSection: React.FC = () => {
     setError(null);
     try {
       // Only the shown components get consent records (#6498).
-      await applyUpdate(review.name, {
-        fromSha: review.fromSha,
-        toSha: review.toSha,
-        reviewed: reviewedComponents(review),
-      });
+      await applyUpdate(
+        review.name,
+        {
+          fromSha: review.fromSha,
+          toSha: review.toSha,
+          reviewed: reviewedComponents(review),
+        },
+        review
+      );
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -1897,14 +2115,17 @@ export const PluginsSettingsSection: React.FC = () => {
   };
 
   /** Shared tail of both update paths; callers own busy state and error capture. */
-  const applyUpdate = async (name: string, consent: AgentPluginUpdateConsent | undefined) => {
+  const applyUpdate = async (
+    name: string,
+    consent: AgentPluginUpdateConsent | undefined,
+    settled?: AgentPluginUpdateReview
+  ) => {
     if (!api) return;
     const result = await api.agentPlugins.update({ name, consent: consent ?? null });
     if (result.success) {
       // Mounted composers cache contributed slash-command/skill
       // descriptors; an update can change them without a remount.
       publishAgentPluginsMutated();
-      setUpdateReview(null);
     }
     // Refresh regardless of outcome (the swap may be partially visible),
     // but re-assert the mutation error AFTER the refresh: refresh's
@@ -1912,7 +2133,11 @@ export const PluginsSettingsSection: React.FC = () => {
     // the failure the user needs to see.
     await refresh();
     await checkForUpdates();
-    if (!result.success) {
+    if (result.success) {
+      // After the refresh, so the next queued review does not open while this update still holds
+      // `busyPlugin` (its own name is not the busy one, so its controls would look enabled).
+      updateReviews.settle(settled);
+    } else {
       setError(result.error);
     }
   };
@@ -1929,6 +2154,7 @@ export const PluginsSettingsSection: React.FC = () => {
         publishAgentPluginsMutated();
         setUninstallTarget(null);
         await refresh();
+        updateReviews.drop(name);
       } else {
         // Keep the confirmation open and surface the error after the list
         // refresh (whose success path clears error state).
@@ -1948,7 +2174,7 @@ export const PluginsSettingsSection: React.FC = () => {
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
           {containerLocation !== null ? (
-            <code className="text-accent-text">{containerLocation}</code>
+            <code className="text-accent-text break-words">{containerLocation}</code>
           ) : (
             "the managed plugins directory"
           )}
@@ -1961,7 +2187,13 @@ export const PluginsSettingsSection: React.FC = () => {
       <div>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-foreground text-sm font-medium">Installed plugins</h3>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <UpdateAllButton
+              count={updateAll.count}
+              running={updateAll.running}
+              disabled={busyPlugin !== null}
+              onClick={() => void updateAll.run()}
+            />
             <Button
               variant="outline"
               size="sm"
@@ -1975,8 +2207,8 @@ export const PluginsSettingsSection: React.FC = () => {
               )}
               Check for updates
             </Button>
-            {!addOpen && (
-              <Button size="sm" onClick={openAddPanel} ref={addButtonFocus.ref}>
+            {addPanel === null && (
+              <Button size="sm" onClick={() => openAddPanel()} ref={addButtonFocus.ref}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
@@ -1984,20 +2216,18 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         </div>
 
-        {addOpen && (
+        {addPanel !== null && (
           <div className="mb-4">
-            <AddPluginPanel
-              onInstalled={() => {
-                closeAddPanel();
-                setInstallSucceeded(true);
-                void refresh();
-                void checkForUpdates();
-              }}
+            <AddPanelView
+              key={addPanel.id}
+              backup={addPanel.backup}
+              onInstalled={addPanelInstalled}
               onClose={closeAddPanel}
             />
           </div>
         )}
 
+        <UpdateAllStatus status={updateAll.status} />
         {installSucceeded && (
           <p role="status" className="text-accent-text mb-3 text-xs">
             Plugin installed.
@@ -2139,16 +2369,18 @@ export const PluginsSettingsSection: React.FC = () => {
                   )}
                   {item.interface && <PluginInterfaceDetails info={item.interface} />}
                   <div className="text-muted mt-2 space-y-0.5 text-[11px]">
-                    {/* break-all: locations/sources can contain unbreakable
-                        64-char tokens (max-length plugin names) that would
-                        otherwise overflow the card at phone widths. */}
-                    <p className="counter-nums break-all">
+                    {/* break-words: the counts, the location and the source wrap at
+                        spaces, so a location or a commit id moves to the next line
+                        whole. A word splits only when it is longer than a line (a
+                        max-length plugin name), so nothing overflows the card at phone
+                        widths. */}
+                    <p className="counter-nums break-words">
                       {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
                       imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
                       {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
                     </p>
                     {formatSource(item) && (
-                      <p className="break-all">
+                      <p className="break-words">
                         {formatSource(item)}
                         {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
                       </p>
@@ -2192,14 +2424,16 @@ export const PluginsSettingsSection: React.FC = () => {
                       mode="update"
                       selective={item.importedComponents !== undefined}
                       busy={isBusy}
+                      locked={busyPlugin !== null}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
-                      onCancel={() => setUpdateReview(null)}
+                      onCancel={() => updateReviews.settle(updateReview)}
                     />
                   )}
                   <ComponentReviewRow
                     item={item}
                     review={componentReview.review}
                     busy={isBusy}
+                    locked={busyPlugin !== null}
                     onConfirm={(review) => void componentReview.confirm(review)}
                     onCancel={componentReview.close}
                   />
@@ -2207,6 +2441,7 @@ export const PluginsSettingsSection: React.FC = () => {
                     <UninstallConfirm
                       item={item}
                       busy={isBusy}
+                      locked={busyPlugin !== null}
                       onConfirm={(deletePluginData) =>
                         void handleUninstall(item.name, deletePluginData)
                       }

@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { execFile } from "child_process";
 import { EventEmitter } from "events";
 import { promisify } from "util";
@@ -6,10 +6,23 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { getXumHome } from "@/common/constants/paths";
-import { createAskpassSession, parseHostKeyPrompt } from "./sshAskpass";
+import { askpassSessionsRoot, createAskpassSession, parseHostKeyPrompt } from "./sshAskpass";
 
 describe("sshAskpass", () => {
   describe("createAskpassSession", () => {
+    // Sessions live in Xum's home folder: keep them out of the real one.
+    const savedRoot = process.env.XUM_ROOT;
+    let isolatedRoot: string;
+    beforeAll(() => {
+      isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xum-askpass-root-"));
+      process.env.XUM_ROOT = isolatedRoot;
+    });
+    afterAll(() => {
+      if (savedRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = savedRoot;
+      fs.rmSync(isolatedRoot, { recursive: true, force: true });
+    });
+
     async function simulateAskpassInvocation(
       askpassDir: string,
       promptText: string,
@@ -46,9 +59,8 @@ describe("sshAskpass", () => {
     }
 
     async function listAskpassTempDirs(): Promise<string[]> {
-      return (await fs.promises.readdir(os.tmpdir()))
-        .filter((entry) => entry.startsWith("mux-askpass-"))
-        .sort();
+      const entries = await fs.promises.readdir(askpassSessionsRoot()).catch(() => []);
+      return entries.filter((entry) => entry.startsWith("mux-askpass-")).sort();
     }
 
     test("does not leak temp dir when script bootstrap fails", async () => {
@@ -87,7 +99,7 @@ describe("sshAskpass", () => {
         writeFileSpy.mockRestore();
         for (const dir of leakedDirs) {
           await fs.promises
-            .rm(path.join(os.tmpdir(), dir), { recursive: true, force: true })
+            .rm(path.join(askpassSessionsRoot(), dir), { recursive: true, force: true })
             .catch(() => undefined);
         }
       }
@@ -162,9 +174,11 @@ describe("sshAskpass", () => {
         async (...args: Parameters<typeof fs.promises.writeFile>) => {
           const target = args[0];
           if (typeof target === "string" && target.includes(`response.${requestId}`)) {
-            await realWriteFile(args[0], "");
+            // Create the file as the real call does (same flags), then fill it.
+            await realWriteFile(target, "", args[2]);
             windowOpen.resolve();
             await readerLooked.promise;
+            return realWriteFile(target, args[1]);
           }
           return realWriteFile(...args);
         }
@@ -240,6 +254,38 @@ describe("sshAskpass", () => {
         watch.mockRestore();
       }
     });
+
+    // Agent commands in the macOS sandbox can write the temp folder, and the sandbox hides
+    // askpassSessionsRoot() (agentSandboxTargets.test.ts).
+    test("keeps each session in the folder that the sandbox hides", async () => {
+      const session = await createAskpassSession(() => Promise.resolve("ok"));
+      try {
+        expect(path.dirname(session.env.MUX_ASKPASS_DIR)).toBe(askpassSessionsRoot());
+      } finally {
+        session.cleanup();
+      }
+    });
+
+    test.skipIf(process.platform === "win32")(
+      "does not write an answer through a link at its temp name",
+      async () => {
+        const session = await createAskpassSession(() => Promise.resolve("secret"));
+        const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "askpass-outside-"));
+        const outside = path.join(outsideDir, "target.txt");
+        await fs.promises.writeFile(outside, "original");
+
+        try {
+          const askpassDir = session.env.MUX_ASKPASS_DIR;
+          await fs.promises.symlink(outside, path.join(askpassDir, "response.link.txt.tmp"));
+
+          expect(await simulateAskpassInvocation(askpassDir, "Password:", "link")).toBe("secret");
+          expect(await fs.promises.readFile(outside, "utf-8")).toBe("original");
+        } finally {
+          session.cleanup();
+          fs.rmSync(outsideDir, { recursive: true, force: true });
+        }
+      }
+    );
 
     test("ignores duplicate request IDs", async () => {
       let callCount = 0;

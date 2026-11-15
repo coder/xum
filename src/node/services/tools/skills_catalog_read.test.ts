@@ -63,6 +63,35 @@ describe("skills_catalog_read", () => {
     fetchContentSpy.mockRestore();
   });
 
+  // Claude Code and Codex load such a skill, so a catalog read returns it with the text cut.
+  it("reads a skill whose description and when_to_use are over the cap, cut to the cap", async () => {
+    using tempDir = new TestTempDir("test-skills-catalog-read-long-text");
+    const config = createTestToolConfig(tempDir.path, { workspaceId: GLOBAL_WORKSPACE_ID });
+    const description = "d".repeat(1500);
+    const whenToUse = "w".repeat(1100);
+    const fetchContentSpy = spyOn(catalogFetch, "fetchSkillContent").mockResolvedValue({
+      content: `---\nname: test-skill\ndescription: ${description}\nwhen_to_use: ${whenToUse}\n---\n# Body\n`,
+      path: "skills/test-skill/SKILL.md",
+      branch: "main",
+    });
+
+    try {
+      const tool = createSkillsCatalogReadTool(config);
+      const result = (await tool.execute!(
+        { owner: "test-owner", repo: "test-repo", skillId: "test-skill" },
+        mockToolCallOptions
+      )) as SkillsCatalogReadToolResult;
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.frontmatter?.description).toBe("d".repeat(1024));
+      expect(result.frontmatter?.when_to_use).toBe("w".repeat(1024));
+      expect(result.body).toContain("# Body");
+    } finally {
+      fetchContentSpy.mockRestore();
+    }
+  });
+
   it("pages a long body and reads the rest with offset_chars", async () => {
     using tempDir = new TestTempDir("test-skills-catalog-read-pages");
     const config = createTestToolConfig(tempDir.path, { workspaceId: GLOBAL_WORKSPACE_ID });

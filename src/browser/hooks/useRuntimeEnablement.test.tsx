@@ -33,7 +33,7 @@ describe("useRuntimeEnablement", () => {
     cleanupDom = installDom();
     getAppConfigStore().updateOptimistically({
       runtimeEnablement: DEFAULT_RUNTIME_ENABLEMENT,
-      defaultRuntime: "local",
+      defaultIsolation: { project: "local", workspace: "none" },
     });
   });
 
@@ -50,13 +50,16 @@ describe("useRuntimeEnablement", () => {
 
     act(() => {
       result.current.setRuntimeEnabled("ssh", false);
-      result.current.setDefaultRuntime("worktree");
+      result.current.setDefaultIsolation({ project: "local", workspace: "worktree" });
     });
 
     expect(getAppConfigStore().getSnapshot()?.runtimeEnablement).toEqual(
       DEFAULT_RUNTIME_ENABLEMENT
     );
-    expect(getAppConfigStore().getSnapshot()?.defaultRuntime).toBe("local");
+    expect(getAppConfigStore().getSnapshot()?.defaultIsolation).toEqual({
+      project: "local",
+      workspace: "none",
+    });
     expect(alert).toHaveBeenCalledTimes(2);
     alert.mockRestore();
   });

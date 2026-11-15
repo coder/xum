@@ -31,6 +31,8 @@ type ForeignToolListKey = (typeof FOREIGN_TOOL_LIST_KEYS)[number];
  *   Xum tools do the same job and no more. Every other name grants nothing:
  *   its Xum tools do more than the Claude tool (todo_write replaces the whole
  *   checklist, task_send_message reaches workspaces outside the agent tree).
+ *   The one exception is a read-only search list (see READ_ONLY_SEARCH_TOOLS):
+ *   Xum has no read-only search tool, so there Grep, Glob and LS grant bash.
  * - `deny` (in `disallowedTools`) removes every Xum tool that can do the job,
  *   so several names share one family: denying Write also removes Edit.
  */
@@ -113,6 +115,7 @@ const CLAUDE_TOOLS: Readonly<Record<string, ClaudeToolMapping>> = {
   CronList: SCHEDULE,
   Grep: NONE,
   Glob: NONE,
+  LS: NONE,
   LSP: NONE,
   PowerShell: NONE,
   Monitor: NONE,
@@ -147,13 +150,18 @@ function isXumFormat(raw: Record<string, unknown>): boolean {
   return XUM_ONLY_KEYS.some((key) => key in raw) || isPlainObject(raw.tools);
 }
 
+export function isForeignPluginAgentFormat(raw: Record<string, unknown>): boolean {
+  return !isXumFormat(raw);
+}
+
 /**
- * Cursor `readonly: true` in a Claude Code or Cursor format file: the mapping runs it on Explore,
- * and a mapped tool list only removes tools, so file edits stay off. A Xum-format file keeps its
- * own base and `tools.add`, so `readonly` means nothing there.
+ * Cursor `readonly: true`, or a Claude Code read-only search list, in a Claude Code or Cursor
+ * format file: the mapping runs it on Explore, and a mapped tool list only removes tools, so file
+ * edits stay off. A Xum-format file keeps its own base and `tools.add`, so neither means anything
+ * there.
  */
 export function isReadonlyForeignPluginAgent(raw: Record<string, unknown>): boolean {
-  return !isXumFormat(raw) && raw.readonly === true;
+  return !isXumFormat(raw) && (raw.readonly === true || hasReadOnlySearchList(raw));
 }
 
 /** A Claude list key in a raw frontmatter (`tools` only in its list form). */
@@ -186,20 +194,24 @@ function splitToolList(value: string): string[] {
 }
 
 /** Claude accepts a comma-separated string or a YAML list. */
-function readToolList(raw: Record<string, unknown>, key: ForeignToolListKey): string[] {
-  const value = raw[key];
+function parseToolList(value: unknown): string[] | undefined {
   const entries =
     typeof value === "string"
       ? splitToolList(value)
       : Array.isArray(value) && value.every((entry) => typeof entry === "string")
         ? value
         : undefined;
+  return entries?.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+}
+
+function readToolList(raw: Record<string, unknown>, key: ForeignToolListKey): string[] {
+  const entries = parseToolList(raw[key]);
   if (entries === undefined) {
     throw new ForeignPluginAgentToolsError(
       `Claude Code '${key}' must be a comma-separated string or a list of tool names.`
     );
   }
-  return entries.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  return entries;
 }
 
 /** Claude tools whose specifier does not narrow them in a sub-agent's `tools` list. */
@@ -259,6 +271,50 @@ function mapAllowedEntry(entry: string): readonly string[] {
 }
 
 /**
+ * A Claude `tools` list of only these names, with at least one of Grep, Glob and LS, is a
+ * read-only search list: Xum has no read-only search tool, so such an agent runs on Explore with
+ * the bash tools to search. egm's reviewers, which list Read, Grep and Glob, are the case it
+ * exists for.
+ */
+const READ_ONLY_SEARCH_TOOLS: readonly string[] = ["Read", "Grep", "Glob", "LS"];
+
+function lowercaseToolName(entry: string): string | undefined {
+  return TOOL_ENTRY_PATTERN.exec(entry)?.[1].toLowerCase();
+}
+
+/**
+ * Claude Code removes `disallowedTools` first and keeps the `tools` entries left, so a denied
+ * Grep is not part of the list the rule sees.
+ */
+function isReadOnlySearchList(entries: readonly string[], denylist: readonly string[]): boolean {
+  // mutation-equivalent: a tool name matches \w+, so it is never "" and ?? agrees with ||
+  const deniedNames = new Set(denylist.flatMap((entry) => lowercaseToolName(entry) ?? []));
+  const left = entries.filter((entry) => {
+    const name = lowercaseToolName(entry);
+    return name === undefined || !deniedNames.has(name);
+  });
+  return (
+    left.every((entry) => READ_ONLY_SEARCH_TOOLS.includes(entry)) &&
+    left.some((entry) => entry !== "Read")
+  );
+}
+
+function readDeniedEntries(raw: Record<string, unknown>): string[] {
+  return foreignToolListKeys(raw).includes("disallowedTools")
+    ? readToolList(raw, "disallowedTools")
+    : [];
+}
+
+/** Unlike mapToolLists, this does not refuse a list it cannot read: such an agent has no base. */
+function hasReadOnlySearchList(raw: Record<string, unknown>): boolean {
+  const keys = foreignToolListKeys(raw);
+  if (!keys.includes("tools")) return false;
+  const entries = parseToolList(raw.tools);
+  const denylist = keys.includes("disallowedTools") ? parseToolList(raw.disallowedTools) : [];
+  return entries !== undefined && denylist !== undefined && isReadOnlySearchList(entries, denylist);
+}
+
+/**
  * Translate Claude `tools` / `disallowedTools` lists to Xum `tools.remove`
  * patterns on top of the Exec (or Explore) base, which enables every tool.
  * Claude Code removes `disallowedTools` first, then keeps only the `tools`
@@ -268,14 +324,18 @@ function mapToolLists(raw: Record<string, unknown>): { remove: string[] } | unde
   const keys = foreignToolListKeys(raw);
   if (keys.length === 0) return undefined;
 
-  const denied = keys.includes("disallowedTools")
-    ? [...new Set(readToolList(raw, "disallowedTools").flatMap(mapDeniedEntry))]
-    : [];
+  const deniedEntries = readDeniedEntries(raw);
+  const denied = [...new Set(deniedEntries.flatMap(mapDeniedEntry))];
   const remove = [...denied];
 
   if (keys.includes("tools")) {
     const entries = readToolList(raw, "tools");
-    const grants = [...new Set(entries.flatMap(mapAllowedEntry))];
+    const grants = [
+      ...new Set([
+        ...entries.flatMap(mapAllowedEntry),
+        ...(isReadOnlySearchList(entries, deniedEntries) ? BASH_TOOLS : []),
+      ]),
+    ];
     const allowed = XUM_BUILT_IN_TOOL_NAMES.filter(
       (name) => matchesAnyPattern(name, grants) && !matchesAnyPattern(name, denied)
     );
@@ -356,20 +416,20 @@ export function mapForeignPluginAgentFrontmatter(
 
   const ai = mapAiDefaults(raw);
   const tools = mapToolLists(raw);
+  const readonly = isReadonlyForeignPluginAgent(raw);
 
   const mapped: Record<string, unknown> = {
     ...raw,
     name: raw.name ?? agentId,
     // Omitted tools inherit every tool in both ecosystems: Exec is Xum's
-    // all-tools agent. Cursor `readonly: true` narrows to Explore (no file
-    // edits or task spawning). Explore keeps bash, so it is not fully read-only.
-    base: isReadonlyForeignPluginAgent(raw) ? "explore" : "exec",
+    // all-tools agent.
+    base: readonly ? "explore" : "exec",
     // Both ecosystems spawn these as sub-agents, never as main-chat modes, and
     // their bodies are written for delegates, so keep them out of the picker.
     ui: { hidden: true },
     subagent: { runnable: true, ...(raw.is_background === true ? { background_hint: true } : {}) },
     // `readonly` agents get Explore's prompt before their own body (Cursor plugin RFC, D13).
-    prompt: { append: isReadonlyForeignPluginAgent(raw) },
+    prompt: { append: readonly },
     ...(Object.keys(ai).length > 0 ? { ai } : {}),
     // Replaces the Claude list. Kept in the mapped frontmatter, so the install
     // consent fingerprint changes when the effective tool list changes.

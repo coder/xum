@@ -195,8 +195,6 @@ export type ArtifactAnnotationAnchor =
   | { kind: "point"; x: number; y: number; selector?: string };
 
 export interface ArtifactAnnotationRef {
-  /** Artifact version the comment was made on (0: the live file had no stored version). */
-  version: number;
   anchor: ArtifactAnnotationAnchor;
 }
 
@@ -391,7 +389,7 @@ export function formatReviewForModel(data: ReviewNoteData): string {
       comment: data.userNote.trim(),
     }).replace(/</g, "\\u003c");
     return (
-      `<artifact_annotation artifact="${escapeXml(data.filePath)}" version="${data.artifact.version}">` +
+      `<artifact_annotation artifact="${escapeXml(data.filePath)}">` +
       `${body}</artifact_annotation>`
     );
   }

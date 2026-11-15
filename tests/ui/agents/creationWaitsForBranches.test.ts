@@ -16,7 +16,14 @@ import {
 } from "../../ipc/sendMessageTestHelpers";
 
 import { renderApp } from "../renderReviewPanel";
-import { addProjectViaUI, cleanupView, setupTestDom, waitForOpenDraftId } from "../helpers";
+import {
+  addProjectViaUI,
+  cleanupView,
+  closeCreationEnvironment,
+  selectCreationIsolation,
+  setupTestDom,
+  waitForOpenDraftId,
+} from "../helpers";
 import { ChatHarness } from "../harness";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -36,25 +43,6 @@ function sendButton(container: HTMLElement): HTMLButtonElement {
   const button = section?.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
   if (!button) throw new Error("Send button not found");
   return button;
-}
-
-async function selectRuntime(container: HTMLElement, label: string): Promise<void> {
-  const trigger = container.querySelector<HTMLElement>(
-    '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace type"]'
-  );
-  if (!trigger) throw new Error("Workspace type trigger not found");
-  fireEvent.click(trigger);
-  const option = await waitFor(
-    () => {
-      const candidate = Array.from(document.querySelectorAll<HTMLElement>('[role="option"]')).find(
-        (element) => element.textContent?.includes(label)
-      );
-      if (!candidate) throw new Error(`Runtime option '${label}' not found`);
-      return candidate;
-    },
-    { timeout: 5_000 }
-  );
-  fireEvent.click(option);
 }
 
 /** Holds every listBranches call until release() so the creation view stays "branches loading". */
@@ -154,9 +142,8 @@ function runInitButtonNow(container: HTMLElement): HTMLButtonElement | null {
 
 function workspaceTypeLabel(container: HTMLElement): string {
   return (
-    container.querySelector(
-      '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace type"]'
-    )?.textContent ?? ""
+    // The environment chip names the selected isolation.
+    container.querySelector('[data-component="WorkspaceIsolationSummary"]')?.textContent ?? ""
   );
 }
 
@@ -331,8 +318,11 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       held.release();
       await waitFor(
         () => {
-          const trigger = view.container.querySelector('[aria-label="Select source branch"]');
-          if (!trigger?.textContent || trigger.textContent === "Select source branch") {
+          if (
+            !view.container.querySelector(
+              '[data-component="BranchSelector"][data-branch-load="selected"]'
+            )
+          ) {
             throw new Error("source branch not selected yet");
           }
         },
@@ -385,7 +375,9 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
   test("a local workspace can be sent while the branches are still loading", async () => {
     const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches();
     try {
-      await selectRuntime(view.container, "Local");
+      await selectCreationIsolation(view.container, "Workspace isolation", "None");
+      // The panel is modal: close it before going back to the composer.
+      await closeCreationEnvironment(view.container);
       await chat.typeWithoutSending("hello on the local runtime");
       await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
         timeout: 10_000,
@@ -432,7 +424,9 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
         timeout: 10_000,
       });
-      await selectRuntime(view.container, "Coder");
+      await selectCreationIsolation(view.container, "Project isolation", "Coder");
+      // The panel is modal: close it before going back to the composer.
+      await closeCreationEnvironment(view.container);
       await waitFor(() => expect(presets).toHaveBeenCalled(), { timeout: 10_000 });
       // The composer reports from an effect, and the page renders the banner after it.
       await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {

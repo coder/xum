@@ -307,7 +307,7 @@ function swallowHeldKey(code: string) {
   window.addEventListener("blur", stop);
 }
 
-// ArrowDown/ArrowUp move focus between the rows and stop at the ends, as in ArtifactVersionMenu.
+// ArrowDown/ArrowUp move focus between the rows and stop at the ends, as in ArtifactPinMenu.
 // Tab still works. The popover focuses the first row when it opens (#6103).
 function handleRowArrowKeys(event: React.KeyboardEvent<HTMLElement>) {
   if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;

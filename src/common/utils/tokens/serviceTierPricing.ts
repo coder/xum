@@ -176,8 +176,11 @@ const SERVICE_TIER_FACTORS: Readonly<
   "gpt-4o-2024-05-13": { fast: fastShortOnly(1.75) },
   "gpt-4o-mini": { fast: fastShortOnly(5 / 3) },
   // Anthropic Fast mode: 2× Standard across the full context window, with prompt
-  // caching multipliers applied on top (Opus 5.5 $8/$40, Opus 5 and 4.8 $10/$50).
+  // caching multipliers applied on top (Fable/Mythos 5.2 $16/$80, Opus 5.5 $8/$40,
+  // Opus 5 and 4.8 $10/$50).
   // https://platform.claude.com/docs/en/build-with-claude/fast-mode#pricing
+  "claude-fable-5-2": { fast: DOUBLE_BOTH_BANDS },
+  "claude-mythos-5-2": { fast: DOUBLE_BOTH_BANDS },
   "claude-opus-5-5": { fast: DOUBLE_BOTH_BANDS },
   "claude-opus-5": { fast: DOUBLE_BOTH_BANDS },
   "claude-opus-4-8": { fast: DOUBLE_BOTH_BANDS },

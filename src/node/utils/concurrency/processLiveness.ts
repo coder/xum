@@ -166,9 +166,11 @@ export function parseProcessIdentity(record: Record<string, unknown>): ProcessId
   };
 }
 
-export type Verdict = { dead: true } | { dead: false; why: string };
+/** Only a verified local PID sets running. Unknown identity evidence still blocks automatic mutation. */
+export type Verdict = { dead: true } | { dead: false; why: string; running?: true };
 const DEAD: Verdict = { dead: true };
 const refuse = (why: string): Verdict => ({ dead: false, why });
+const running = (why: string): Verdict => ({ dead: false, why, running: true });
 
 function pidGone(pid: number): boolean {
   try {
@@ -220,7 +222,7 @@ export function judgeHolder(holder: HolderEvidence, ownTokenLive: boolean): Verd
     const current = recorded?.startsWith("linux-ticks:") ? linuxBirth(pid) : null;
     return current !== null && current !== recorded
       ? DEAD
-      : refuse("it was written by an older Xum build and that pid is running");
+      : running("it was written by an older Xum build and that pid is running");
   }
   const self = getSelfIdentity();
   const differs = (a: string | null, b: string | null) => a !== null && b !== null && a !== b;
@@ -240,13 +242,13 @@ export function judgeHolder(holder: HolderEvidence, ownTokenLive: boolean): Verd
     return refuse("it names a PID domain this process cannot verify");
   }
   if (pid === process.pid) {
-    return ownTokenLive ? refuse("it is held by this process") : DEAD;
+    return ownTokenLive ? running("it is held by this process") : DEAD;
   }
   if (pidGone(pid)) {
     return DEAD;
   }
   if (!linuxDomain) {
-    return refuse("that pid is running");
+    return running("that pid is running");
   }
   if (record.birth === null) {
     return refuse("its process start time is unknown");
@@ -255,5 +257,5 @@ export function judgeHolder(holder: HolderEvidence, ownTokenLive: boolean): Verd
   if (current === null) {
     return refuse("its process start time cannot be read");
   }
-  return current === record.birth ? refuse("that process is running") : DEAD;
+  return current === record.birth ? running("that process is running") : DEAD;
 }

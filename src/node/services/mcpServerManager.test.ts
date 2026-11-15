@@ -5046,6 +5046,54 @@ describe("MCPServerManager", () => {
     expect(result.overridesUsed).toEqual({});
   });
 
+  test("an uncached workspace's first serve fails closed when a save that skips its publication lands during the disk read", async () => {
+    // A settings save publishes only to workspaces this manager holds state for
+    // (hasWorkspaceOverridesSnapshot), so an uncached sharer of the written checkout gets no
+    // publication. Its first serve, parked on a disk read from before the save, must be
+    // stopped by the epoch that the save moved, before any server starts.
+    manager.dispose();
+    let epoch = "epoch-1";
+    let readStarted: () => void = () => undefined;
+    const readStartedPromise = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    let resolveRead: (value: Record<string, unknown>) => void = () => undefined;
+    const pendingRead = new Promise<Record<string, unknown>>((resolve) => {
+      resolveRead = resolve;
+    });
+    let reads = 0;
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("plugin-epoch"),
+        readOverridesEpoch: () => Promise.resolve(epoch),
+        readWorkspaceOverrides: () => {
+          reads += 1;
+          if (reads > 1) return Promise.resolve({ disabledServers: ["ordinary"] }); // After the save.
+          readStarted();
+          return pendingRead;
+        },
+      },
+    });
+    configService.listServers = mock(() =>
+      Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
+    );
+    servers.serve("node ordinary.js");
+    const workspaceId = "ws-uncached-sharer";
+    expect(manager.hasWorkspaceOverridesSnapshot(workspaceId)).toBe(false);
+
+    const serve = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    await readStartedPromise;
+    // The save: the document is written and the epoch moves; no publication reaches here.
+    epoch = "epoch-2";
+    resolveRead({}); // The pre-save state, which leaves "ordinary" enabled.
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(serve).rejects.toThrow(/about to start/);
+    expect(servers.exec).not.toHaveBeenCalled();
+    expect(servers.connectCount("node ordinary.js")).toBe(0);
+  });
+
   test("stopServersWithKeyPrefix invalidates instances published by an in-flight startup, then retries them", async () => {
     const workspaceId = "ws-swap-race";
     const pluginKey = "plugin:abc123:echo";
@@ -5534,6 +5582,38 @@ describe("MCPServerManager", () => {
 
   /** Mirrors mcpServerManager's fail-safe wait for a timed-out startup's abort cleanup. */
   const STARTUP_CLEANUP_WAIT_MS = MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS;
+
+  test("a startup that neither hangs nor ends fails with its cause, not the test timeout", async () => {
+    // connect() never resolves and the connection does not hang on purpose, so the startup waits
+    // for a deadline that fake timers never fire. The harness bounds its wait in real time.
+    configService.listServers = mock(() => Promise.resolve({ idle: stdioConfig("idle-cmd") }));
+    servers.serve("idle-cmd", { connect: () => new Promise<void>(() => undefined) });
+    servers.startupHangWaitMs = 100;
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      servers.expireStartupDeadline(() =>
+        manager.getToolsForWorkspace(workspaceRequest("ws-idle-startup"))
+      )
+    ).rejects.toThrow("startup never hung (still running after 100 ms)");
+  });
+
+  test("the startup deadline fires once a connection hangs, however long real I/O delays the hang", async () => {
+    // This test follows the bounded-wait test above on purpose: that one shortens the harness's
+    // real-time bound to 100 ms, and reset() must put it back, or this 400 ms hang fails.
+    // The harness waits for the hang itself. It once gave the hang a fixed number of event-loop
+    // turns, which a loaded host used up before the startup's real I/O (here a child process that
+    // runs 400 ms: fake timers fake every sleep, so only I/O takes real time) reached the hang:
+    // "startup never hung".
+    configService.listServers = mock(() => Promise.resolve({ late: stdioConfig("late-cmd") }));
+    servers.serve("late-cmd", {
+      connect: async () => void (await Bun.spawn(["sleep", "0.4"]).exited),
+      hang: true,
+    });
+    const result = await servers.expireStartupDeadline(() =>
+      manager.getToolsForWorkspace(workspaceRequest("ws-late-hang"))
+    );
+    expect(result.stats.failedServerNames).toEqual(["late"]);
+  });
 
   test("a startup timeout waits for its abort cleanup before surfacing", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
@@ -7652,6 +7732,46 @@ describe("MCPServerManager", () => {
     );
     expect(descriptors.map((descriptor) => descriptor.serverName)).toEqual(["stable"]);
     expect(servers.connectCount("cmd-1")).toBe(0);
+  });
+
+  // Codex P1: a project-wide trust grant overwrote recorded options and overlaid later requests, so
+  // an SSH+None workspace's project-local servers started in a host directory the user never
+  // trusted. Its trust is project trust AND trust of that exact directory.
+  test("trusting the project does not enable an SSH+None workspace until its directory is trusted", async () => {
+    const workspaceId = "ws-ssh-none-trust";
+    const runtimeConfig = {
+      type: "ssh",
+      host: "devbox",
+      srcBaseDir: "~/xum",
+      workspaceIsolation: "none",
+      projectDir: "/srv/app",
+    };
+    configService.listServers = mock((_projectPath: string, trusted: boolean) =>
+      Promise.resolve(
+        trusted
+          ? { server: stdioConfig("cmd-1"), stable: stdioConfig("cmd-stable") }
+          : { stable: stdioConfig("cmd-stable") }
+      )
+    );
+    servers.serve("cmd-1", { tools: { echo: testTool() } });
+    servers.serve("cmd-stable", { tools: { echo: testTool() } });
+    const request = () => workspaceRequest(workspaceId, { trusted: false, runtimeConfig });
+
+    await manager.getToolsForWorkspace(request());
+    manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: true }]);
+    const afterProjectTrust = await manager.getToolsForWorkspace(request());
+    expect(Object.keys(afterProjectTrust.tools)).toEqual(["stable_echo"]);
+    expect(servers.connectCount("cmd-1")).toBe(0);
+
+    manager.applyProjectTrust([
+      {
+        projectPath: PROJECT_PATH,
+        trusted: true,
+        trustedSshDirectories: [{ host: "devbox", projectDir: "/srv/app" }],
+      },
+    ]);
+    const afterDirectoryTrust = await manager.getToolsForWorkspace(request());
+    expect(Object.keys(afterDirectoryTrust.tools).sort()).toEqual(["server_echo", "stable_echo"]);
   });
 
   test("excludes servers reconfigured while leased from prompt discovery", async () => {

@@ -13,7 +13,7 @@
  * Steps:
  * 1. Create a temp root holding XUM_ROOT, HOME and a throwaway git repo.
  * 2. Start the server on a private port and seed it through the HTTP API: the demo project
- *    (trusted), one workspace with a few artifacts (one with stored versions), onboarding marked
+ *    (trusted), one workspace with a few artifacts (one published), onboarding marked
  *    seen, the artifacts and mcp-apps experiments, and a fake Anthropic provider on a dead loopback port.
  * 3. Stop that server, then serve the same root on `--port`. e2e polls `--port` for readiness,
  *    so no explorer can open the app before seeding has finished. SIGUSR2 restarts that server
@@ -440,6 +440,10 @@ async function seed(
   fs.writeFileSync(guide, GUIDE_ARTIFACT_HTML);
   const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   fs.utimesSync(guide, anHourAgo, anHourAgo);
+  // A hash-router page (repros/artifactsHashRouter.e2e.ts), dated back like the guide.
+  const hashRouter = path.join(artifactsDir, "hash-router.html");
+  fs.writeFileSync(hashRouter, HASH_ROUTER_ARTIFACT_HTML);
+  fs.utimesSync(hashRouter, anHourAgo, anHourAgo);
   // Artifacts that send a message to the agent: an HTML page that sends on a click (at once) and
   // from a timer after a click (the confirm strip asks), and a canvas whose button sends at once.
   // Dated back like the guide, so the default artifact stays the same.
@@ -451,7 +455,7 @@ async function seed(
     fs.writeFileSync(file, body);
     fs.utimesSync(file, anHourAgo, anHourAgo);
   }
-  await seedVersionedArtifact(base, xumRoot, workspaceId, artifactsDir);
+  await seedPublishedArtifact(base, xumRoot, workspaceId, artifactsDir);
   return workspaceId;
 }
 
@@ -503,9 +507,63 @@ const GUIDE_ARTIFACT_HTML = `<!doctype html>
 `;
 
 /**
- * Same id as getArtifactId (src/node/services/artifactVersionStore.ts): a slug plus a short hash
- * of the exact path. The harness imports nothing from src/, so seedVersionedArtifact checks the
- * result through the listVersions route instead of trusting this copy.
+ * A hash router: it renders the route from location.hash on every hashchange, and has a link, a
+ * location.hash button and a history.replaceState button for each way an app moves between routes.
+ */
+const HASH_ROUTER_ARTIFACT_HTML = `<!doctype html>
+<html>
+  <body>
+    <nav>
+      <a href="#/">Home</a>
+      <a href="#/s/alpha">Alpha</a>
+      <a href="#/s/beta">Beta</a>
+      <button id="set-hash" type="button">Gamma by hash</button>
+      <button id="replace" type="button">Delta by replaceState</button>
+    </nav>
+    <p id="route"></p>
+    <p id="click"></p>
+    <script>
+      function render() {
+        document.getElementById("route").textContent =
+          "Route is " + (location.hash.replace(/^#/, "") || "/") + ".";
+      }
+      addEventListener("hashchange", render);
+      // Counts the hashchange events that arrive between the start of a click and a window click
+      // listener of the artifact's own. The bridge script runs first, so this listener comes after its
+      // click listener.
+      var hashchanges = 0;
+      var atClickStart = 0;
+      addEventListener("hashchange", function () {
+        hashchanges++;
+      });
+      addEventListener(
+        "click",
+        function () {
+          atClickStart = hashchanges;
+        },
+        true
+      );
+      addEventListener("click", function () {
+        document.getElementById("click").textContent =
+          "Hashchanges before this click handler: " + (hashchanges - atClickStart) + ".";
+      });
+      document.getElementById("set-hash").addEventListener("click", function () {
+        location.hash = "#/s/gamma";
+      });
+      document.getElementById("replace").addEventListener("click", function () {
+        history.replaceState(null, "", "#/s/delta");
+        render();
+      });
+      render();
+    </script>
+  </body>
+</html>
+`;
+
+/**
+ * Same id as getArtifactId (src/node/services/artifactRecordStore.ts): a slug plus a short hash
+ * of the exact path. The harness imports nothing from src/, so seedPublishedArtifact checks the
+ * result through the list route instead of trusting this copy.
  */
 function artifactId(relPath: string): string {
   const slug = relPath
@@ -533,55 +591,36 @@ lru.onchange = save; ttl.onchange = save; show();
 }
 
 /**
- * A published HTML artifact with two stored versions, so explorers can use the version menu and
- * window.xum.setState without a model publishing anything (real mode has no agent tools). The
- * index is in the format older builds wrote: v1 is a turn-end snapshot and the index keeps the
- * old bookkeeping fields, so the run also covers reading old history.
+ * A published HTML artifact, so explorers can use window.xum.setState without a model
+ * publishing anything (real mode has no agent tools). `artifact-versions` is
+ * ARTIFACT_STORE_DIR_NAME, kept from older builds.
  */
-async function seedVersionedArtifact(
+async function seedPublishedArtifact(
   base: string,
   xumRoot: string,
   workspaceId: string,
   artifactsDir: string
 ): Promise<void> {
   const relPath = "options.html";
-  const id = artifactId(relPath);
-  const dir = path.join(xumRoot, "sessions", workspaceId, "artifact-versions", id);
+  const dir = path.join(xumRoot, "sessions", workspaceId, "artifact-versions", artifactId(relPath));
   fs.mkdirSync(dir, { recursive: true });
   const now = Date.now();
-  const versions = [
-    { title: "Options v1", label: null, source: "turn-end", at: now - 3_600_000 },
-    { title: "Options v2", label: "Options v2", source: "publish", at: now - 600_000 },
-  ].map((entry, i) => {
-    const bytes = Buffer.from(optionsPage(entry.title));
-    fs.writeFileSync(path.join(dir, `v${i + 1}`), bytes);
-    return {
-      version: i + 1,
-      label: entry.label,
-      source: entry.source,
-      createdAtMs: entry.at,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      size: bytes.length,
-      path: relPath,
-      sourceModifiedMs: entry.at,
-    };
-  });
   fs.writeFileSync(
-    path.join(dir, "index.json"),
-    JSON.stringify({ id, path: relPath, pin: null, lastPublishedAtMs: now - 600_000, versions })
+    path.join(dir, "record.json"),
+    JSON.stringify({ path: relPath, title: "Options", pin: null, publishedAtMs: now - 600_000 })
   );
   // Dated back like guide.html, so the artifact the tab opens by default stays the same.
   const live = path.join(artifactsDir, relPath);
-  fs.writeFileSync(live, optionsPage("Options v2"));
+  fs.writeFileSync(live, optionsPage("Options"));
   const anHourAgo = new Date(now - 60 * 60 * 1000);
   fs.utimesSync(live, anHourAgo, anHourAgo);
-  const listed = await api<{ success: boolean; data?: { versions: unknown[] } }>(
+  const listed = await api<{ success: boolean; data?: { publishedPaths?: string[] } }>(
     base,
-    "artifacts/listVersions",
-    { workspaceId, path: relPath }
+    "artifacts/list",
+    { workspaceId }
   );
-  if (!listed.success || listed.data?.versions.length !== versions.length) {
-    fail(`seeded ${relPath} versions are not listed: ${JSON.stringify(listed).slice(0, 300)}`);
+  if (!listed.success || !listed.data?.publishedPaths?.includes(relPath)) {
+    fail(`seeded ${relPath} is not listed as published: ${JSON.stringify(listed).slice(0, 300)}`);
   }
 }
 

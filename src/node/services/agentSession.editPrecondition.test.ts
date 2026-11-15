@@ -850,7 +850,7 @@ describe("AgentSession edit precondition", () => {
       }
     ).fileChangeTracker;
     spyOn(tracker, "getChangedAttachments").mockResolvedValueOnce({
-      attachments: [{ type: "edited_text_file", filename: "a.ts", snippet: "-old\n+new" }],
+      attachments: [{ type: "edited_text_file", filename: "a.ts" }],
       commit: () => undefined,
     });
     const clientRows = await resumeAsLiveClient(h, rows);

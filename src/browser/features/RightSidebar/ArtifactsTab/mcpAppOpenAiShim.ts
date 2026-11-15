@@ -26,7 +26,7 @@
  * initialize), so it gets every later message from the host itself. When that initialize falls
  * inside the lifecycle (after tool-input, before tool-result), the later messages wait for the
  * replay of the earlier ones, so the client still gets them in order. The shim sees that moment
- * because it wraps `window.parent.postMessage` (the document's port, mcpAppDocumentChannel.ts).
+ * because it wraps `window.parent.postMessage` (the document's port, frameDocumentChannel.ts).
  * Each lifecycle message is cached as a copy, so a widget that mutates its globals does not
  * change what its client is replayed. The shim leaves teardown replies to that client.
  * Members without a standard equivalent warn once; their Promises reject and nothing throws.

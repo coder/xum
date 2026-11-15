@@ -11,10 +11,11 @@ import { createTestApiClient, createTestPreferencesConfig } from "@/browser/test
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import type { IsolationChoice } from "@/common/types/isolation";
 
 function createStubApiClient(
   preferences?: UserPreferences,
-  defaultRuntime: string | null = null
+  defaultIsolation: IsolationChoice | null = null
 ): APIClient {
   // useModelLRU() only needs providers.getConfig + providers.onConfigChanged.
   // Provide a minimal stub so tests can run without spinning up a real oRPC client.
@@ -26,7 +27,7 @@ function createStubApiClient(
   return createTestApiClient({
     config: {
       ...config,
-      getConfig: async () => ({ ...(await config.getConfig()), defaultRuntime }),
+      getConfig: async () => ({ ...(await config.getConfig()), defaultIsolation }),
     },
     providers: {
       getConfig: () => Promise.resolve({}),
@@ -46,9 +47,9 @@ const runtimeConfigPrefs = (path: string, lastRuntimeConfig: Record<string, unkn
 function createWrapper(
   projectPath: string,
   preferences?: UserPreferences,
-  defaultRuntime?: string
+  defaultIsolation?: IsolationChoice
 ): React.FC<{ children: React.ReactNode }> {
-  const client = createStubApiClient(preferences, defaultRuntime);
+  const client = createStubApiClient(preferences, defaultIsolation);
   const Wrapper: React.FC<{ children: React.ReactNode }> = (props) => (
     <APIProvider client={client}>
       <ProjectProvider>
@@ -85,7 +86,7 @@ describe("useDraftWorkspaceSettings", () => {
     getAppConfigStore().updateOptimistically({
       userPreferences: undefined,
       defaultModel: undefined,
-      defaultRuntime: undefined,
+      defaultIsolation: undefined,
     });
     mock.restore();
     globalThis.window = originalWindow;
@@ -219,12 +220,13 @@ describe("useDraftWorkspaceSettings", () => {
 
   test("applies remembered runtime options that load after mount", async () => {
     const projectPath = "/tmp/project";
-    getAppConfigStore().updateOptimistically({ defaultRuntime: "docker" });
+    const dockerDefault: IsolationChoice = { project: "local", workspace: "docker" };
+    getAppConfigStore().updateOptimistically({ defaultIsolation: dockerDefault });
     const lastRuntimeConfig = { docker: { image: "ubuntu:22.04" } };
     const wrapper = createWrapper(
       projectPath,
       runtimeConfigPrefs(projectPath, lastRuntimeConfig),
-      "docker"
+      dockerDefault
     );
 
     const { result } = renderHook(
@@ -303,7 +305,9 @@ describe("useDraftWorkspaceSettings", () => {
   test("keeps Coder default even after plain SSH usage", async () => {
     const projectPath = "/tmp/project";
 
-    getAppConfigStore().updateOptimistically({ defaultRuntime: "coder" });
+    getAppConfigStore().updateOptimistically({
+      defaultIsolation: { project: "coder", workspace: "worktree" },
+    });
     const lastRuntimeConfig = {
       ssh: {
         host: "dev@host",
@@ -322,12 +326,87 @@ describe("useDraftWorkspaceSettings", () => {
     );
 
     await waitFor(() => {
-      expect(result.current.settings.defaultRuntimeMode).toBe("coder");
+      expect(result.current.settings.defaultIsolation).toEqual({
+        project: "coder",
+        workspace: "worktree",
+      });
       expect(result.current.settings.selectedRuntime).toEqual({
         mode: "ssh",
         host: CODER_RUNTIME_PLACEHOLDER,
         coder: { existingWorkspace: false },
       });
+    });
+  });
+
+  test("an SSH+None default runs in the project's remembered directory", async () => {
+    const projectPath = "/tmp/project";
+    const sshNoneDefault: IsolationChoice = { project: "ssh", workspace: "none" };
+    getAppConfigStore().updateOptimistically({ defaultIsolation: sshNoneDefault });
+    const lastRuntimeConfig = { ssh: { host: "dev@host", projectDir: "~/src/app" } };
+    const wrapper = createWrapper(
+      projectPath,
+      runtimeConfigPrefs(projectPath, lastRuntimeConfig),
+      sshNoneDefault
+    );
+
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      { wrapper }
+    );
+
+    await waitFor(() => {
+      expect(result.current.settings.selectedRuntime).toEqual({
+        mode: "ssh",
+        host: "dev@host",
+        coder: undefined,
+        workspaceIsolation: "none",
+        projectDir: "~/src/app",
+      });
+    });
+  });
+
+  test("switching SSH to no isolation refills the remembered directory once", async () => {
+    const projectPath = "/tmp/project";
+    const lastRuntimeConfig = { ssh: { host: "dev@host", projectDir: "~/src/app" } };
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      { wrapper }
+    );
+    // Remembered options load after mount; the refill reads them.
+    await waitFor(() => {
+      expect(result.current.sshHostFallback).toBe("dev@host");
+    });
+
+    act(() => {
+      result.current.setSelectedRuntime({ mode: "ssh", host: "dev@host" });
+    });
+    act(() => {
+      result.current.setSelectedRuntime({
+        mode: "ssh",
+        host: "dev@host",
+        workspaceIsolation: "none",
+        projectDir: "",
+      });
+    });
+    await waitFor(() => {
+      expect(result.current.settings.selectedRuntime).toMatchObject({
+        workspaceIsolation: "none",
+        projectDir: "~/src/app",
+      });
+    });
+
+    // Clearing the field while already in SSH+None keeps it empty instead of refilling it.
+    act(() => {
+      result.current.setSelectedRuntime({
+        mode: "ssh",
+        host: "dev@host",
+        workspaceIsolation: "none",
+        projectDir: "",
+      });
+    });
+    await waitFor(() => {
+      expect(result.current.settings.selectedRuntime).toMatchObject({ projectDir: "" });
     });
   });
 

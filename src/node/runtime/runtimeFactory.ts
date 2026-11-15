@@ -228,6 +228,9 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
         bgOutputDir: config.bgOutputDir,
         identityFile: config.identityFile,
         port: config.port,
+        // SSH+None: run in projectDir directly instead of a per-workspace worktree.
+        workspaceIsolation: config.workspaceIsolation,
+        projectDir: config.projectDir,
       };
 
       const useSSH2 = shouldUseSSH2Runtime();

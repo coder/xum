@@ -44,7 +44,7 @@ function createProbes(): Probes {
     "position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;" +
     "padding:env(safe-area-inset-top,0px) 0 0 env(safe-area-inset-left,0px)";
   const right = document.createElement("div");
-  right.style.cssText = "width:0;height:0;padding-right:env(safe-area-inset-right,0px)";
+  right.style.cssText = "width:0;height:0;padding-right:var(--safe-area-right)";
   topLeft.appendChild(right);
   document.body.appendChild(topLeft);
   if (typeof window.ResizeObserver === "function") {

@@ -57,6 +57,13 @@ import {
 } from "./refinementJournal";
 import { withTargetMutationLocks } from "./targetMutationLocks";
 import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
+import { GLOBAL_WRITE_SANDBOX_ERROR } from "@/node/services/agentSandbox/fileToolSandbox";
+import {
+  AUTOMATION_ENTRY_ROOTS,
+  expandSandboxPathSpelling,
+  isPathAtOrUnder,
+  realpathOfNearest,
+} from "@/node/runtime/sandbox/sandboxPaths";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
 
@@ -85,6 +92,11 @@ export interface RollbackRefinementOptions {
   reason?: string;
   /** The rollback and target locks (phase 4: SessionLocks). Absent: the Node layer. */
   locks?: SessionLocks;
+  /**
+   * The acting workspace is under the agent sandbox: refuse an inverse that writes global memory
+   * or a global skill, which every workspace loads, as the memory and skill tools do.
+   */
+  refuseGlobalWrites?: boolean;
   /**
    * Test seam: runs after filesystem mutation, immediately before the
    * commit-point ownership re-check — the only way to deterministically
@@ -249,6 +261,33 @@ function inferMemoryLayout(sessionDir: string): { muxRoot: string; sessionsDir: 
     return null;
   }
   return { muxRoot: path.dirname(sessionsDir), sessionsDir };
+}
+
+/**
+ * Global memory and the global skill roots, as spelled and as real paths: every workspace loads
+ * them, also one without the agent sandbox (Codex review).
+ */
+function globalWriteRoots(sessionDir: string): string[] {
+  const layout = inferMemoryLayout(sessionDir);
+  const spelled = [
+    ...(layout === null
+      ? []
+      : [path.join(layout.muxRoot, "memory", "global"), path.join(layout.muxRoot, "skills")]),
+    ...AUTOMATION_ENTRY_ROOTS.map(expandSandboxPathSpelling),
+  ];
+  return [...spelled, ...spelled.map(realpathOfNearest)];
+}
+
+function assertGlobalWritesAllowed(
+  opts: Pick<RollbackRefinementOptions, "sessionDir" | "refuseGlobalWrites">,
+  inverseTargets: readonly string[]
+): void {
+  if (opts.refuseGlobalWrites !== true) return;
+  const globalRoots = globalWriteRoots(opts.sessionDir);
+  const targets = inverseTargets.flatMap((p) => [p, realpathOfNearest(p)]);
+  if (targets.some((p) => globalRoots.some((root) => isPathAtOrUnder(p, root)))) {
+    throw new RollbackError(GLOBAL_WRITE_SANDBOX_ERROR);
+  }
 }
 
 /**
@@ -798,6 +837,7 @@ export async function rollbackRefinement(
     for (const p of inversePaths(inverse)) {
       roots.set(p, resolveConfinementRoot(opts.sessionDir, kind, p));
     }
+    assertGlobalWritesAllowed(opts, [...roots.keys()]);
     const assertConfinement = async (): Promise<void> => {
       for (const [p, root] of roots) {
         await assertRootComponentsNotSymlinked(root);

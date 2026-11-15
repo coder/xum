@@ -4,7 +4,7 @@
  * chat metadata instead of only the curated KNOWN_MODELS list (#3727).
  */
 
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { KNOWN_MODELS, RETIRED_KNOWN_MODEL_IDS } from "@/common/constants/knownModels";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import modelsData from "./models.json";
 import { resolveRawModelEntry } from "./modelStats";
@@ -23,7 +23,8 @@ function isOfferedCatalogEntry(id: string, key: string): boolean {
 
 /**
  * Canonical `provider:model` ids for every catalog entry with resolvable model
- * stats, unioned with the curated KNOWN_MODELS ids. Sorted. Cached because
+ * stats, unioned with the curated KNOWN_MODELS ids and the retired built-ins
+ * that still have stats. Sorted. Cached because
  * models.json is static for the process lifetime.
  */
 export function listModelCatalogIds(): string[] {
@@ -31,6 +32,14 @@ export function listModelCatalogIds(): string[] {
     const ids = new Set<string>();
     for (const model of Object.values(KNOWN_MODELS)) {
       ids.add(model.id);
+    }
+    // A built-in that a successor replaced must stay findable, even when only
+    // models-extra describes it and models.json has no row to offer it.
+    for (const id of RETIRED_KNOWN_MODEL_IDS) {
+      const resolved = resolveRawModelEntry(id);
+      if (resolved != null && resolved.data.retired !== true) {
+        ids.add(id);
+      }
     }
     for (const [key, metadata] of Object.entries(
       modelsData as Record<string, Record<string, unknown>>

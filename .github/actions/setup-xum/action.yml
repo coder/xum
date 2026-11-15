@@ -5,6 +5,18 @@ inputs:
     description: "Skip Electron and electron-builder caches (for test-only jobs)"
     required: false
     default: "false"
+  electron-zip:
+    description: "Cache the Electron zip that jobs launching Electron download, and fetch it with retries on a cache miss. Exports ELECTRON_ZIP_DIR, the directory of the checked zips, for electron-builder's electronDist"
+    required: false
+    default: "false"
+  electron-zip-targets:
+    description: "With electron-zip: the zips to fetch, as space-separated <platform>-<arch> (darwin-x64, darwin-arm64, linux-arm64, win32-x64). Empty means this runner's own platform and arch. Name every arch that electron-builder builds in the job: it needs the zip of each"
+    required: false
+    default: ""
+  appimage-tool:
+    description: "Put electron-builder's AppImage tool into its cache, downloaded with retries and a pinned checksum, so that electron-builder downloads nothing"
+    required: false
+    default: "false"
 runs:
   using: "composite"
   steps:
@@ -103,6 +115,12 @@ runs:
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-
 
+    # A cache is saved only when its exact key missed. The callers that build an AppImage
+    # (appimage-tool) therefore use a key family of their own: the other jobs finish sooner and
+    # would save the key first, with no tool in it, and every later AppImage job would hit that
+    # entry and download the tool. The family's key also hashes scripts/ci/prefetch-appimage-tool.sh,
+    # so a new tool version or pin starts a new entry, which the first AppImage job saves with the
+    # tool in it (the job fails when the tool is missing, and a failed job saves nothing).
     - name: Cache electron-builder
       if: ${{ inputs.skip-build-caches != 'true' }}
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -111,6 +129,106 @@ runs:
           ~/.cache/electron-builder
           ~/Library/Caches/electron-builder
           ~/AppData/Local/electron-builder/Cache
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ inputs.appimage-tool == 'true' && format('appimage-{0}', hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock', 'scripts/ci/prefetch-appimage-tool.sh')) || hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-builder-
+
+    # The zip that node_modules/electron/install.js downloads from github.com on the first
+    # launch (bun skips Electron's postinstall, so nothing downloads it earlier). The caches
+    # above never served E2E and Stories: they key on the lockfiles alone, and whichever job
+    # misses a new key first saves it. Linux's entry held only the stale zips that its
+    # restore-keys prefix had restored (44.5.1 and 40.9.3). macOS's held the zip flat in the
+    # cache root, where @electron/get does not look. So every E2E and Stories job downloaded
+    # the zip, and a 504 from github.com failed those jobs on 2026-11-08.
+    # This cache has one purpose: the current zip, in a directory of its own that
+    # electron_config_cache points @electron/get at. The key hashes checksums.json, so a new
+    # Electron version or checksum starts a fresh cache, and there is no restore-keys fallback
+    # to bring old zips back. The key does not start with `<os>-<arch>-electron-`, the
+    # restore-keys prefix of the two Electron caches above, so their prefix lookups cannot
+    # return it (scripts/ci/cachePaths.test.ts). @electron/get checks each zip against
+    # checksums.json on every use, so a restored entry never supplies unpinned bytes. On a
+    # miss the zips are downloaded here, retrying for 15 minutes, and saved at once.
+    # The zips to fetch (ELECTRON_ZIP_TARGETS) are part of the cache key (ELECTRON_ZIP_SLUG): two
+    # jobs on one runner type that need other zips, such as the two macOS arches, must not share
+    # an entry. On Windows $HOME is an MSYS path that node reads as C:\c\Users\..., so cygpath
+    # gives the C:/Users/... form there and changes nothing elsewhere.
+    - name: Point Electron downloads at their own cache
+      if: ${{ inputs.electron-zip == 'true' }}
+      shell: bash
+      env:
+        TARGETS_INPUT: ${{ inputs.electron-zip-targets }}
+      run: |
+        home=$(cygpath -m "$HOME" 2>/dev/null || echo "$HOME")
+        targets=${TARGETS_INPUT:-$(node -p 'process.platform + "-" + process.arch')}
+        {
+          echo "electron_config_cache=$home/.cache/xum-electron-zip"
+          echo "ELECTRON_ZIP_TARGETS=$targets"
+          echo "ELECTRON_ZIP_SLUG=${targets// /_}"
+        } >> "$GITHUB_ENV"
+
+    - name: Restore Electron zip
+      if: ${{ inputs.electron-zip == 'true' }}
+      id: cache-electron-zip
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ env.electron_config_cache }}
+        key: xum-electron-zip-${{ runner.os }}-${{ runner.arch }}-${{ env.ELECTRON_ZIP_SLUG }}-${{ hashFiles('node_modules/electron/checksums.json') }}
+
+    # The 15 minute budget fits both callers: E2E has no job time limit, and a Stories run
+    # (4 to 5 minutes warm) stops at 50 minutes in the merge queue.
+    - name: Download Electron zip
+      if: ${{ inputs.electron-zip == 'true' && steps.cache-electron-zip.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        # shellcheck disable=SC2086 # ELECTRON_ZIP_TARGETS is a space-separated list
+        ./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 --fatal-status 64 0 2 node scripts/ci/prefetch-electron-zip.cjs $ELECTRON_ZIP_TARGETS
+
+    # Saved at once: a later failing step in the job must not discard a zip that took minutes.
+    - name: Save Electron zip
+      if: ${{ inputs.electron-zip == 'true' && steps.cache-electron-zip.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ env.electron_config_cache }}
+        key: ${{ steps.cache-electron-zip.outputs.cache-primary-key }}
+
+    # electron-builder downloads its own Electron zip with app-builder, which retries nothing, and
+    # Build / Linux failed five queue runs on a github.com 504 (2026-11-08) although its caches hit:
+    # none held that zip in app-builder's layout. electron-builder's `electronDist` can name a
+    # directory that holds electron-v<version>-<platform>-<arch>.zip, and then unpacks that zip and
+    # downloads nothing. This step finds the directory of the zips above (@electron/get checks each
+    # cached file against checksums.json again, with no network) and exports it as ELECTRON_ZIP_DIR,
+    # which the Makefile's dist targets and the release workflow pass on. The prefetch's output
+    # (retry.sh's attempt groups, its retry warnings and its final ::error::) goes to the log as it
+    # happens: with `tee`, because a failed command substitution would show none of it.
+    - name: Locate Electron zip
+      if: ${{ inputs.electron-zip == 'true' }}
+      shell: bash
+      run: |
+        out=$(mktemp "${TMPDIR:-/tmp}/electron-zip.XXXXXX")
+        # shellcheck disable=SC2086 # ELECTRON_ZIP_TARGETS is a space-separated list
+        ./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 --fatal-status 64 0 2 node scripts/ci/prefetch-electron-zip.cjs $ELECTRON_ZIP_TARGETS | tee "$out"
+        dir=$(sed -n 's/^Electron zip dir: //p' "$out")
+        zips=$(sed -n 's/^Electron zip ready: //p' "$out")
+        if [ -z "$dir" ] || [ -z "$zips" ]; then
+          echo "::error::the Electron zip prefetch named no zip"
+          exit 1
+        fi
+        while IFS= read -r zip; do
+          if [ ! -f "$zip" ]; then
+            echo "::error::the Electron zip is not in the cache: '$zip'"
+            exit 1
+          fi
+        done <<< "$zips"
+        echo "ELECTRON_ZIP_DIR=$dir" >> "$GITHUB_ENV"
+
+    # electron-builder builds an AppImage with app-builder, which downloads appimage-12.0.1.7z from
+    # github.com and retries nothing. The `Cache electron-builder` step above holds the unpacked
+    # tool after a job that built an AppImage, but a cold or stale cache sends the next job to that
+    # download (a restore-keys hit holds whatever an older job saved). This step runs after the
+    # restore, on a hit too (it does nothing when the tool is there), and leaves the tool in the
+    # directory that the cache saves at the end of the job. Only the callers that build an AppImage
+    # ask for it.
+    - name: Fetch the AppImage tool
+      if: ${{ inputs.appimage-tool == 'true' }}
+      shell: bash
+      run: ./scripts/ci/prefetch-appimage-tool.sh

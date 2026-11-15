@@ -63,7 +63,6 @@ export const createArtifactReadTool: ToolFactory = (config) =>
         name: input.path,
         title: read.meta.title,
         kind: read.meta.kind,
-        version: read.meta.version,
         sourcePath: read.meta.sourcePath,
         content: truncated ? text.slice(0, ARTIFACT_READ_MAX_CHARS) : text,
         ...(truncated

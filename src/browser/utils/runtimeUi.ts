@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 import type { RuntimeEnablementId, RuntimeMode } from "@/common/types/runtime";
 import type { RuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
+import type { ProjectIsolation, WorkspaceIsolation } from "@/common/types/isolation";
 import {
   SSHIcon,
   WorktreeIcon,
@@ -8,6 +9,7 @@ import {
   DockerIcon,
   DevcontainerIcon,
   CoderIcon,
+  LocalMachineIcon,
 } from "@/browser/components/icons/RuntimeIcons/RuntimeIcons";
 
 export interface RuntimeIconProps {
@@ -29,6 +31,12 @@ export const RUNTIME_OPTION_FIELDS = {
     placeholder: "user@host",
     summary: "Host (user@host)",
   },
+  sshProjectDir: {
+    field: "projectDir",
+    label: "Directory",
+    placeholder: "~/src/project",
+    summary: "Existing project directory on the host",
+  },
   docker: {
     field: "image",
     label: "Image",
@@ -41,7 +49,7 @@ export const RUNTIME_OPTION_FIELDS = {
     placeholder: ".devcontainer/devcontainer.json",
     summary: "Config path (devcontainer.json)",
   },
-} as const satisfies Partial<Record<RuntimeEnablementId, RuntimeOptionFieldSpec>>;
+} as const satisfies Record<string, RuntimeOptionFieldSpec>;
 
 export function getRuntimeOptionField(
   runtimeId: RuntimeEnablementId
@@ -242,6 +250,91 @@ export const RUNTIME_BADGE_UI = {
     badge: RUNTIME_UI.devcontainer.badge,
   },
 } satisfies Record<RuntimeChoice, Pick<RuntimeUiSpec, "Icon" | "badge">>;
+
+/** A selectable option on one isolation axis (project or workspace). */
+export interface IsolationOptionUi {
+  label: string;
+  description: string;
+  docsPath: string;
+  Icon: ComponentType<RuntimeIconProps>;
+  /** Classes for the select trigger while this option is selected. */
+  triggerClass: string;
+  iconClass: string;
+}
+
+/**
+ * Where the project lives and commands run. Tailwind only generates classes it finds as literals,
+ * so every accent below is spelled out.
+ */
+export const PROJECT_ISOLATION_UI = {
+  local: {
+    label: "Local",
+    description: "This machine",
+    docsPath: "/runtime",
+    Icon: LocalMachineIcon,
+    triggerClass:
+      "border-[var(--color-runtime-local)]/60 bg-[var(--color-runtime-local)]/15 text-foreground",
+    iconClass: "text-[var(--color-runtime-local)]",
+  },
+  ssh: {
+    label: "SSH",
+    description: "A remote host",
+    docsPath: RUNTIME_UI.ssh.docsPath,
+    Icon: RUNTIME_UI.ssh.Icon,
+    triggerClass:
+      "border-[var(--color-runtime-ssh)]/60 bg-[var(--color-runtime-ssh)]/15 text-[var(--color-runtime-ssh-text)]",
+    iconClass: "text-[var(--color-runtime-ssh-text)]",
+  },
+  coder: {
+    label: "Coder",
+    description: CODER_RUNTIME_UI.description,
+    docsPath: CODER_RUNTIME_UI.docsPath,
+    Icon: CODER_RUNTIME_UI.Icon,
+    triggerClass:
+      "border-[var(--color-runtime-ssh)]/60 bg-[var(--color-runtime-ssh)]/15 text-[var(--color-runtime-ssh-text)]",
+    iconClass: "text-[var(--color-runtime-ssh-text)]",
+  },
+} satisfies Record<ProjectIsolation, IsolationOptionUi>;
+
+/** How each workspace is separated from its siblings within the project. */
+export const WORKSPACE_ISOLATION_UI = {
+  none: {
+    label: "None",
+    description: "Work in the project directory",
+    docsPath: RUNTIME_UI.local.docsPath,
+    Icon: RUNTIME_UI.local.Icon,
+    triggerClass:
+      "border-[var(--color-runtime-local)]/60 bg-[var(--color-runtime-local)]/15 text-foreground",
+    iconClass: "text-[var(--color-runtime-local)]",
+  },
+  worktree: {
+    label: "Worktree",
+    description: "A git worktree per workspace",
+    docsPath: RUNTIME_UI.worktree.docsPath,
+    Icon: RUNTIME_UI.worktree.Icon,
+    triggerClass:
+      "border-[var(--color-runtime-worktree)]/60 bg-[var(--color-runtime-worktree)]/15 text-[var(--color-runtime-worktree-text)]",
+    iconClass: "text-[var(--color-runtime-worktree-text)]",
+  },
+  docker: {
+    label: "Docker",
+    description: "A container per workspace",
+    docsPath: RUNTIME_UI.docker.docsPath,
+    Icon: RUNTIME_UI.docker.Icon,
+    triggerClass:
+      "border-[var(--color-runtime-docker)]/60 bg-[var(--color-runtime-docker)]/15 text-[var(--color-runtime-docker-text)]",
+    iconClass: "text-[var(--color-runtime-docker-text)]",
+  },
+  devcontainer: {
+    label: "Dev container",
+    description: "Built from devcontainer.json",
+    docsPath: RUNTIME_UI.devcontainer.docsPath,
+    Icon: RUNTIME_UI.devcontainer.Icon,
+    triggerClass:
+      "border-[var(--color-runtime-devcontainer)]/60 bg-[var(--color-runtime-devcontainer)]/15 text-[var(--color-runtime-devcontainer-text)]",
+    iconClass: "text-[var(--color-runtime-devcontainer-text)]",
+  },
+} satisfies Record<WorkspaceIsolation, IsolationOptionUi>;
 
 export interface DevcontainerStatusChip {
   label: string;

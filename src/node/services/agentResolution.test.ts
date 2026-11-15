@@ -7,6 +7,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   AgentDefinitionRequestCache,
@@ -1348,5 +1349,151 @@ describe("resolveAgentForStream agentAiSettingsChain (Cursor model: fast)", () =
       "5m"
     );
     expect(fast.effectiveToolPolicy).toEqual(plain.effectiveToolPolicy);
+  });
+});
+
+describe("resolveAgentForStream with an unreachable foreign plugin agent (plugin install methods RFC, A4)", () => {
+  test("a foreign plugin exec that names its plugin folder, on an SSH workspace, leaves main-chat resolution and a base chain through exec unchanged", async () => {
+    using hostHome = new DisposableTempDir("agent-resolution-unreachable-home");
+    using checkoutDir = new DisposableTempDir("agent-resolution-unreachable-checkout");
+    const checkout = await fs.realpath(checkoutDir.path);
+    const pluginDir = path.join(hostHome.path, "plugins", "egm");
+    await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "egm",
+      })
+    );
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "exec.md"),
+      "---\nname: Plugin Exec\ndescription: Foreign exec\n---\nRead ${CLAUDE_PLUGIN_ROOT}/agents/exec.md\n"
+    );
+    await fs.mkdir(path.join(checkout, ".xum", "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(checkout, ".xum", "agents", "child.md"),
+      "---\nname: Child\nbase: exec\n---\nChild body\n"
+    );
+    const runtime = new HostKeyShellRemoteRuntime(checkout, "agent-resolution-unreachable");
+    const metadata: WorkspaceMetadata = {
+      id: "main-workspace",
+      name: "main-workspace",
+      projectName: path.basename(checkout),
+      projectPath: checkout,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          checkout,
+          {
+            trusted: true,
+            workspaces: [{ id: "main-workspace", name: "main-workspace", path: checkout }],
+          },
+        ],
+      ]),
+    };
+    const resolve = (requestedAgentId: string) =>
+      resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: "main-workspace",
+        metadata,
+        runtime,
+        workspacePath: checkout,
+        requestedAgentId,
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg,
+        emitError: () => undefined,
+      });
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = hostHome.path;
+    try {
+      // The main chat resolves the plugin's `exec` with the placeholder as written, because only
+      // a `task` spawn refuses an unreachable folder.
+      const exec = await resolve("exec");
+      expect(exec.success).toBe(true);
+      if (!exec.success) return;
+      expect(exec.data.effectiveAgentId).toBe("exec");
+      expect(exec.data.agentDefinition.scope).toBe("global");
+      expect(exec.data.agentDefinition.body).toContain("${CLAUDE_PLUGIN_ROOT}/agents/exec.md");
+
+      const child = await resolve("child");
+      expect(child.success).toBe(true);
+      if (!child.success) return;
+      expect(child.data.effectiveAgentId).toBe("child");
+      expect(child.data.agentInheritanceChain.map((entry) => `${entry.id}:${entry.scope}`)).toEqual(
+        ["child:project", "exec:global", "exec:built-in"]
+      );
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }, 60_000);
+});
+
+// Codex review: the agent sandbox hides a checkout file that a project secret names, so a turn
+// passes the secrets its commands start with to every agent definition read.
+describe("resolveAgentForStream with the project's secrets", () => {
+  test("skips a project agent that links to a file a project secret names", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-sandbox-env");
+    const root = await fs.realpath(tempDir.path);
+    const projectPath = path.join(root, "project");
+    const secret = path.join(projectPath, "secrets", "reviewer.md");
+    const projectAgents = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(path.dirname(secret), { recursive: true });
+    await fs.mkdir(projectAgents, { recursive: true });
+    await fs.writeFile(secret, "---\nname: Reviewer\n---\nSecret file.\n");
+    await fs.symlink(secret, path.join(projectAgents, "reviewer.md"));
+    const runtime = new LocalRuntime(projectPath);
+    runtime.agentSandboxPolicy = (input) => ({
+      writeRoots: [projectPath],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+      allowRead: [projectPath],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+    const metadata: WorkspaceMetadata = {
+      id: "sandbox-env-ws",
+      name: "sandbox-env-ws",
+      projectName: "project",
+      projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const resolve = (sandboxEnv?: NodeJS.ProcessEnv) =>
+      resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: metadata.id,
+        metadata,
+        runtime,
+        workspacePath: projectPath,
+        requestedAgentId: "reviewer",
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg: { projects: new Map([[projectPath, { trusted: true, workspaces: [] }]]) },
+        emitError: () => undefined,
+        sandboxEnv,
+      });
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = path.join(root, "xum-home");
+    try {
+      expect(await resolve()).toMatchObject({
+        success: true,
+        data: { effectiveAgentId: "reviewer" },
+      });
+      expect(await resolve({ HF_TOKEN_PATH: secret })).toMatchObject({
+        success: true,
+        data: { effectiveAgentId: "exec" },
+      });
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
   });
 });

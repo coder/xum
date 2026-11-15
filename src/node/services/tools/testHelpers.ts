@@ -29,6 +29,28 @@ export class TestTempDir implements Disposable {
 
 export const TEST_GLOBAL_WORKSPACE_ID = "workspace-global";
 
+/**
+ * The background-process wrapper records its exit with `echo $? > exit_code`, so the marker
+ * exists, empty, from the redirect's create until the write, and a slow host can stretch that
+ * gap. A status read in the gap sees an empty marker and reports "running": wait for the code,
+ * not for the file or a fixed time. The poll runs until a deadline (a count of polls stretches
+ * with host load, a deadline does not) and returns "" when it passes, so a test that calls it
+ * needs its own timeout above `timeoutMs`.
+ */
+export async function readExitCodeWhenWritten(
+  outputDir: string,
+  timeoutMs = 20_000
+): Promise<string> {
+  const exitCodePath = path.join(outputDir, "exit_code");
+  const deadline = Date.now() + timeoutMs;
+  let content = await fsPromises.readFile(exitCodePath, "utf-8").catch(() => "");
+  while (content.trim() === "" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    content = await fsPromises.readFile(exitCodePath, "utf-8").catch(() => "");
+  }
+  return content.trim();
+}
+
 export const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
@@ -390,6 +412,27 @@ export function createFakeWorkspaceTurnManager(
   methods: Partial<WorkspaceTurnManager> = {}
 ): WorkspaceTurnManager {
   return methods as WorkspaceTurnManager;
+}
+
+/**
+ * Stubs `runtime`'s macOS agent sandbox policy: `workspace` is open except `denyWrite`, and the
+ * file that the command environment's HF_TOKEN_PATH names is hidden, as the real policy hides it.
+ */
+export function stubSandboxHidingTokenPath(
+  runtime: LocalRuntime,
+  workspace: string,
+  denyWrite: string[] = []
+): void {
+  runtime.agentSandboxPolicy = (input) => ({
+    writeRoots: [workspace],
+    gitCommonDirs: [],
+    denyWrite,
+    denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+    allowRead: [workspace],
+    network: "allowlist",
+    allowedHosts: [],
+    allowLocalBinding: true,
+  });
 }
 
 export function createTestToolConfig(

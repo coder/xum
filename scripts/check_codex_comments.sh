@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
-USAGE="Usage: $0 <pr_number> [--wait-for-review <seconds>]"
+USAGE="Usage: $0 <pr_number> [--wait-for-review <seconds>] [--counts-only]"
+
+# Default output lists every unresolved Codex comment and thread with its body: reading them is
+# this script's job, and CI's Codex Comments job shows them. Codex quotes PR code, so the
+# bodies carry text that the PR author controls. --counts-only prints counts and fixed lines
+# instead, for gates (wait_pr_codex.sh, wait_pr_ready.sh) that must not print them.
 
 # Exit codes: 0 no unresolved Codex comments; 1 unresolved comments or threads;
 # 10 Codex is still reviewing and nothing else blocks (wait_pr_codex.sh keeps
@@ -23,8 +31,13 @@ fi
 # push. Without a wait budget the gate fails on the in-progress summary and nobody
 # re-runs it. The budget only delays the verdict; an unfinished review still fails.
 WAIT_FOR_REVIEW_SECS=0
+COUNTS_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --counts-only)
+      COUNTS_ONLY=1
+      shift
+      ;;
     --wait-for-review)
       if [ $# -lt 2 ] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
         echo "❌ --wait-for-review requires a non-negative integer number of seconds" >&2
@@ -50,6 +63,9 @@ fi
 
 BOT_LOGIN_GRAPHQL="chatgpt-codex-connector"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 PR_HEAD_OID=""
 REGULAR_COMMENTS='[]'
@@ -162,7 +178,7 @@ compute_codex_sets_from_arrays() {
 set_pr_head_oid() {
   PR_HEAD_OID="$1"
   if ! [[ "$PR_HEAD_OID" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "❌ assertion failed: PR headRefOid is missing or malformed: '$PR_HEAD_OID'" >&2
+    echo "❌ assertion failed: PR headRefOid is missing or malformed in the GitHub reply" >&2
     exit 1
   fi
 }
@@ -203,7 +219,7 @@ load_result_from_cache() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected cached comments hasPreviousPage value '$comments_has_previous'" >&2
+      echo "❌ assertion failed: unexpected cached comments hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
@@ -219,15 +235,16 @@ load_result_from_cache() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected cached reviewThreads hasPreviousPage value '$threads_has_previous'" >&2
+      echo "❌ assertion failed: unexpected cached reviewThreads hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
 
   local cached_comments
   local cached_threads
-  cached_comments=$(jq -c '.data.repository.pullRequest.comments.nodes // []' "$PR_DATA_FILE")
-  cached_threads=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' "$PR_DATA_FILE")
+  # The cache holds the reply as wait_pr_codex.sh read it. A cache of the wrong shape falls back to the API.
+  cached_comments=$(reply_connection_nodes "$(<"$PR_DATA_FILE")" comments) || return 1
+  cached_threads=$(reply_connection_nodes "$(<"$PR_DATA_FILE")" reviewThreads) || return 1
   set_pr_head_oid "$(jq -r '.data.repository.pullRequest.headRefOid // empty' "$PR_DATA_FILE")"
   compute_codex_sets_from_arrays "$cached_comments" "$cached_threads"
   return 0
@@ -278,7 +295,7 @@ fetch_all_comments_via_api() {
       set_pr_head_oid "$(echo "$page_data" | jq -r '.data.repository.pullRequest.headRefOid // empty')"
     fi
 
-    page_comments=$(echo "$page_data" | jq -c '.data.repository.pullRequest.comments.nodes // []')
+    page_comments=$(reply_connection_nodes "$page_data" comments) || return 1
     # Accumulated pages outgrow MAX_ARG_STRLEN, so concatenate via stdin rather than --argjson.
     all_comments=$(printf '%s\n%s' "$all_comments" "$page_comments" | jq -cs '.[0] + .[1]')
 
@@ -297,7 +314,7 @@ fetch_all_comments_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected comments hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected comments hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -354,7 +371,7 @@ fetch_all_threads_via_api() {
       return 1
     fi
 
-    page_threads=$(echo "$page_data" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
+    page_threads=$(reply_connection_nodes "$page_data" reviewThreads) || return 1
     # Same MAX_ARG_STRLEN concern as the comments accumulator above.
     all_threads=$(printf '%s\n%s' "$all_threads" "$page_threads" | jq -cs '.[0] + .[1]')
 
@@ -373,7 +390,7 @@ fetch_all_threads_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -428,16 +445,20 @@ if [ "$TOTAL_UNRESOLVED" -gt 0 ]; then
   echo ""
   echo "❌ Found ${TOTAL_UNRESOLVED} unresolved comment(s) from Codex in PR #${PR_NUMBER}"
   echo ""
-  echo "Codex comments:"
+  if [ "$COUNTS_ONLY" -eq 1 ]; then
+    echo "Read them with: ./scripts/check_codex_comments.sh $PR_NUMBER"
+  else
+    echo "Codex comments:"
 
-  if [ "$REGULAR_COUNT" -gt 0 ]; then
-    echo "$REGULAR_COMMENTS" | jq -r '.[] | "  - [\(.createdAt)]\n\(.body)\n"'
-  fi
+    if [ "$REGULAR_COUNT" -gt 0 ]; then
+      echo "$REGULAR_COMMENTS" | jq -r '.[] | "  - [\(.createdAt)]\n\(.body)\n"'
+    fi
 
-  if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
-    echo "$UNRESOLVED_THREADS" | jq -r '.[] | "  - [\(.comments.nodes[0].createdAt)] thread=\(.id) \(.comments.nodes[0].path // "comment"):\(.comments.nodes[0].line // "")\n\(.comments.nodes[0].body)\n"'
-    echo ""
-    echo "Resolve review threads with: ./scripts/resolve_pr_comment.sh <thread_id>"
+    if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
+      echo "$UNRESOLVED_THREADS" | jq -r '.[] | "  - [\(.comments.nodes[0].createdAt)] thread=\(.id) \(.comments.nodes[0].path // "comment"):\(.comments.nodes[0].line // "")\n\(.comments.nodes[0].body)\n"'
+      echo ""
+      echo "Resolve review threads with: ./scripts/resolve_pr_comment.sh <thread_id>"
+    fi
   fi
 
   echo ""

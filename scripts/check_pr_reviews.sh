@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # Check for unresolved PR review comments
-# Usage: ./scripts/check_pr_reviews.sh <pr_number>
+# Usage: ./scripts/check_pr_reviews.sh <pr_number> [--counts-only]
 # Exits 0 if all resolved, 1 if unresolved comments exist
+#
+# Default output lists each unresolved comment (author and body) and its thread ID: reading
+# them is this script's job. Anyone who can comment writes those bodies. --counts-only prints
+# UNRESOLVED_THREADS=<n> and fixed text instead, for gates that must not print them.
 
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
 if [ $# -eq 0 ]; then
-  echo "Usage: $0 <pr_number>"
+  echo "Usage: $0 <pr_number> [--counts-only]"
   exit 1
 fi
 
@@ -15,7 +22,23 @@ if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "❌ PR number must be numeric. Got: '$PR_NUMBER'" >&2
   exit 1
 fi
+shift
 
+COUNTS_ONLY=0
+for arg in "$@"; do
+  if [ "$arg" = "--counts-only" ]; then
+    COUNTS_ONLY=1
+  else
+    echo "❌ Unknown argument: '$arg'" >&2
+    echo "Usage: $0 <pr_number> [--counts-only]" >&2
+    exit 1
+  fi
+done
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 UNRESOLVED=""
 
@@ -120,7 +143,7 @@ load_unresolved_from_cache() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected cached hasPreviousPage value '$has_previous'" >&2
+      echo "❌ assertion failed: unexpected cached hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
@@ -181,6 +204,8 @@ fetch_unresolved_via_api() {
       return 1
     fi
 
+    # `nodes[]?` below skips a value that is no list, so a reply of another shape would read as "no unresolved threads".
+    reply_connection_nodes "$page_data" reviewThreads >/dev/null || return 1
     unresolved_page=$(echo "$page_data" | jq -r '.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved == false) | {thread_id: .id, user: (.comments.nodes[0].author.login // "unknown"), body: (.comments.nodes[0].body // ""), diff_hunk: (.comments.nodes[0].diffHunk // ""), commit_id: (.comments.nodes[0].commit.oid // "")}')
     append_unresolved_records "$unresolved_page"
 
@@ -199,7 +224,7 @@ fetch_unresolved_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -221,11 +246,17 @@ if [ "$loaded_from_cache" -eq 1 ]; then
 fi
 
 if [ -n "$UNRESOLVED" ]; then
-  echo "❌ Unresolved review comments found:"
-  echo "$UNRESOLVED" | jq -r '"  \(.user): \(.body)"'
-  echo ""
-  echo "To resolve a comment thread, use:"
-  echo "$UNRESOLVED" | jq -r '"  ./scripts/resolve_pr_comment.sh \(.thread_id)"'
+  if [ "$COUNTS_ONLY" -eq 1 ]; then
+    echo "❌ Unresolved review comments found."
+    echo "UNRESOLVED_THREADS=$(echo "$UNRESOLVED" | jq -s 'length')"
+    echo "Read them with: ./scripts/check_pr_reviews.sh $PR_NUMBER"
+  else
+    echo "❌ Unresolved review comments found:"
+    echo "$UNRESOLVED" | jq -r '"  \(.user): \(.body)"'
+    echo ""
+    echo "To resolve a comment thread, use:"
+    echo "$UNRESOLVED" | jq -r '"  ./scripts/resolve_pr_comment.sh \(.thread_id)"'
+  fi
   echo ""
 
   # Best-effort PR link. If repo context wasn't resolved on this path, fall back to default.

@@ -21,7 +21,11 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceProjectTrustedIn,
+  isInitHookTrusted,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { EventEmitter } from "events";
@@ -166,6 +170,10 @@ import {
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import {
+  creationRuntimeConfigError,
+  sshProjectDirConfigToResolve,
+} from "@/node/services/utils/workspaceCreationRuntime";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { getLegacyPlanFilePath, sharesPlanDirectory } from "@/common/utils/planStorage";
 import {
@@ -297,6 +305,7 @@ import type {
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
   WorkspaceRemoveWarning,
+  WorkspaceBackgroundProcessBlocker,
 } from "@/common/types/workspace";
 import { type DynamicToolPart, isDynamicToolPart } from "@/common/types/toolParts";
 import {
@@ -353,6 +362,7 @@ import {
   hasSrcBaseDir,
   getSrcBaseDir,
   isSSHRuntime,
+  isSshSharedProjectDirRuntime,
   isDockerRuntime,
   isDevcontainerRuntime,
 } from "@/common/types/runtime";
@@ -629,6 +639,42 @@ export function nameRestartBlockerWorkspaces(
   return labeled
     .map(({ id, label }) => ((labelCounts.get(label) ?? 0) > 1 ? `${label} (${id})` : label))
     .sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * The warnings of a forced removal whose runtime failed to delete the checkout: the row is removed
+ * anyway, so the failure must reach the caller, or a caller would report the checkout as deleted
+ * (task_remove force does). A container left behind still holds this workspace's plan (#5143): the
+ * plan step cannot reach it once the worktree is gone. Forced paths that skip the Force Delete
+ * dialog (bulk delete, cancel-creation, shift-click) never saw the non-forced error that names it.
+ * A failure that names no leftover can still leave the checkout itself, so that is named.
+ */
+function forcedDeleteFailureWarnings(params: {
+  workspaceId: string;
+  deleteResult: { error?: string; leftoverPaths?: string[] };
+  checkoutPath: string;
+  planContainer: string | undefined;
+}): WorkspaceRemoveWarning[] {
+  const { deleteResult } = params;
+  if (!deleteResult.leftoverPaths?.length) {
+    return [
+      {
+        kind: "leftover",
+        description: `${params.checkoutPath} could not be deleted (${deleteResult.error ?? "unknown error"}) and may still exist; remove it manually.`,
+      },
+    ];
+  }
+  log.warn("Forced removal left these behind; a container may still hold the plan", {
+    workspaceId: params.workspaceId,
+    leftovers: deleteResult.leftoverPaths,
+  });
+  return deleteResult.leftoverPaths.map((leftover) => ({
+    kind: "leftover",
+    description:
+      leftover === params.planContainer
+        ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
+        : `${leftover} was left behind; remove it manually.`,
+  }));
 }
 
 /**
@@ -6152,14 +6198,16 @@ export class WorkspaceService
       return Err(initialConflict);
     }
 
-    const workspaceId = this.config.generateStableId();
-
-    // Local runtime doesn't need a trunk branch; worktree/SSH runtimes require it
-    const isLocalRuntime = finalRuntimeConfig.type === "local";
     const normalizedTrunkBranch = trunkBranch?.trim() ?? "";
-    if (!isLocalRuntime && normalizedTrunkBranch.length === 0) {
-      return Err("Trunk branch is required for worktree and SSH runtimes");
+    const runtimeConfigError = creationRuntimeConfigError(
+      finalRuntimeConfig,
+      normalizedTrunkBranch
+    );
+    if (runtimeConfigError) {
+      return Err(runtimeConfigError);
     }
+
+    const workspaceId = this.config.generateStableId();
 
     let runtime;
     try {
@@ -6175,6 +6223,18 @@ export class WorkspaceService
             ...finalRuntimeConfig,
             srcBaseDir: resolvedSrcBaseDir,
           };
+          runtime = createRuntime(finalRuntimeConfig, {
+            projectPath: owningProjectPath,
+            workspaceId,
+          });
+        }
+      }
+      // SSH+None: persist the project directory absolute (~ expanded on the host), like srcBaseDir.
+      const sshProjectDirConfig = sshProjectDirConfigToResolve(finalRuntimeConfig, runtime);
+      if (sshProjectDirConfig !== null) {
+        const resolvedProjectDir = await runtime.resolvePath(sshProjectDirConfig.projectDir.trim());
+        if (resolvedProjectDir !== sshProjectDirConfig.projectDir) {
+          finalRuntimeConfig = { ...sshProjectDirConfig, projectDir: resolvedProjectDir };
           runtime = createRuntime(finalRuntimeConfig, {
             projectPath: owningProjectPath,
             workspaceId,
@@ -6247,7 +6307,7 @@ export class WorkspaceService
       }
 
       const createEnv = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(owningProjectPath)
+        secretsForWorkspace(this.secretsStore, this.config, owningProjectPath, finalRuntimeConfig)
       );
       const maxCollisionRetries = hasSanitizedWorkspaceName
         ? 0
@@ -6538,7 +6598,13 @@ export class WorkspaceService
           initLogger,
           env: createEnv,
           abortSignal: initAbortController.signal,
-          trusted: projectConfig.trusted ?? false,
+          // SSH+None: the host directory is not the local project, so it needs its own trust too.
+          trusted: isInitHookTrusted(
+            this.config,
+            projectConfig.trusted,
+            owningProjectPath,
+            finalRuntimeConfig
+          ),
         };
         // The deferred checkout's settlement grants or clears the pending default from here on.
         pendingDefaultHandedOff = pendingMaterialization !== undefined;
@@ -7166,11 +7232,13 @@ export class WorkspaceService
     options?: {
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
+      acknowledgedUnknownProcessRecords?: string[];
     }
   ): Promise<
     Result<void> & {
       descendants?: WorkspaceRemovalDescendant[];
       warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
   > {
     return await this.removeLocked(workspaceId, force, options);
@@ -7179,33 +7247,42 @@ export class WorkspaceService
   private async removeLocked(
     workspaceId: string,
     force: boolean,
-    options?: {
+    options: {
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
-    }
+      acknowledgedUnknownProcessRecords?: string[];
+    } = {}
   ): Promise<
     Result<void> & {
       descendants?: WorkspaceRemovalDescendant[];
       warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
   > {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
-        const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
+        const decision = options.beforeRemove == null ? true : await options.beforeRemove();
         if (decision === false) {
           return Ok(undefined);
         }
         const binding = decision === true ? undefined : decision;
-        const failure = (error: string) => {
+        const failure = (
+          error: string,
+          backgroundProcesses?: WorkspaceBackgroundProcessBlocker[]
+        ) => {
           const descendants =
             this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
-          return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
+          return {
+            ...Err(error),
+            ...(descendants?.length ? { descendants } : {}),
+            backgroundProcesses,
+          };
         };
         let releaseTreeGate: (() => Promise<void>) | undefined;
         // What the acknowledged descendants' forced removals left behind (#5143).
         let descendantWarnings: WorkspaceRemoveWarning[] = [];
         try {
-          if (options?.acknowledgedDescendantIds != null) {
+          if (options.acknowledgedDescendantIds != null) {
             if (this.agentTaskIntegration == null) {
               return failure("Task lifecycle service is unavailable.");
             }
@@ -7222,9 +7299,11 @@ export class WorkspaceService
             ]);
             const gate = await this.acquireStructuralMutationGate(
               [...gatedIds],
-              REMOVAL_OWN_ACTIVITY_POLICY
+              REMOVAL_OWN_ACTIVITY_POLICY,
+              options.acknowledgedUnknownProcessRecords
             );
-            if (!gate.success) return failure(`Cannot remove workspace: ${gate.error}`);
+            if (!gate.success)
+              return failure(`Cannot remove workspace: ${gate.error}`, gate.backgroundProcesses);
             releaseTreeGate = gate.data;
             const descendantsResult =
               await this.agentTaskIntegration.removeAcknowledgedDescendantsWhileTaskTreeLocked(
@@ -7239,9 +7318,11 @@ export class WorkspaceService
             workspaceId,
             force,
             binding,
-            releaseTreeGate != null ? { mutationGateHeld: true } : undefined
+            releaseTreeGate != null
+              ? { mutationGateHeld: true }
+              : { acknowledgedUnknownProcessRecords: options.acknowledgedUnknownProcessRecords }
           );
-          if (!result.success) return failure(result.error);
+          if (!result.success) return failure(result.error, result.backgroundProcesses);
           const warnings = [...descendantWarnings, ...(result.warnings ?? [])];
           return { ...result, ...(warnings.length > 0 ? { warnings } : {}) };
         } catch (error) {
@@ -7256,7 +7337,7 @@ export class WorkspaceService
         }
       };
       // Defer the project-list refresh until the complete descendant cascade ends.
-      return options?.acknowledgedDescendantIds != null
+      return options.acknowledgedDescendantIds != null
         ? await this.config.withDeferredChangeNotifications(operation)
         : await operation();
     });
@@ -7272,7 +7353,12 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     return await this.removeUnlocked(workspaceId, force, binding, options);
   }
 
@@ -7352,7 +7438,12 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     const result = await this.removeSingleWorkspaceUnlocked(workspaceId, force, binding, options);
     // Both removal entrypoints must discard side chats, but only after the parent is gone.
     // Keep this outside the parent's checkout locks and do not reacquire a task-tree lock:
@@ -7368,11 +7459,17 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Only the checkout options reach the runtime.
-    const { mutationGateHeld, ...checkoutOptions } = options ?? {};
-    const runtimeOptions = mutationGateHeld === undefined ? options : checkoutOptions;
+    const { mutationGateHeld, acknowledgedUnknownProcessRecords, ...checkoutOptions } =
+      options ?? {};
+    const runtimeOptions = Object.keys(checkoutOptions).length > 0 ? checkoutOptions : undefined;
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -7436,9 +7533,14 @@ export class WorkspaceService
       if (mutationGateHeld !== true) {
         const gate = await this.acquireStructuralMutationGate(
           workspaceId,
-          REMOVAL_OWN_ACTIVITY_POLICY
+          REMOVAL_OWN_ACTIVITY_POLICY,
+          acknowledgedUnknownProcessRecords
         );
-        if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
+        if (!gate.success)
+          return {
+            ...Err(`Cannot remove workspace: ${gate.error}`),
+            backgroundProcesses: gate.backgroundProcesses,
+          };
         releaseMutationGate = gate.data;
       }
       // #4914: the marker, the deregistration and other backends' task commits all find the row
@@ -7886,6 +7988,14 @@ export class WorkspaceService
             log.error(
               `Failed to fully delete multi-project workspace from disk, but force=true. Removing from config. Errors: ${deleteErrors.join("; ")}`
             );
+            // The row goes away with the checkouts possibly still on disk: return that as a warning
+            // too, so a caller never reports the workspace as deleted (task_remove force).
+            removalWarnings = [
+              {
+                kind: "leftover",
+                description: `Part of this workspace could not be deleted (${deleteErrors.join("; ")}) and may still exist; remove it manually.`,
+              },
+            ];
           }
         } else if (metadata.kind === "scratch") {
           if (
@@ -7979,27 +8089,14 @@ export class WorkspaceService
             log.error(
               `Failed to delete workspace from disk, but force=true. Removing from config. Error: ${deleteResult.error}`
             );
-            // A container left behind still holds this workspace's plan (#5143): the plan step
-            // below cannot reach it once the worktree is gone. Name it for the user's logs, and
-            // return it as a warning: forced paths that skip the Force Delete dialog (bulk delete,
-            // cancel-creation, shift-click) never saw the non-forced error that names it.
-            if (deleteResult.leftoverPaths?.length) {
-              log.warn("Forced removal left these behind; a container may still hold the plan", {
-                workspaceId,
-                leftovers: deleteResult.leftoverPaths,
-              });
-              const planContainer =
-                runtime instanceof DevcontainerRuntime
-                  ? containerLabel(runtime.getWorkspacePath(projectPath, metadata.name))
-                  : undefined;
-              removalWarnings = deleteResult.leftoverPaths.map((leftover) => ({
-                kind: "leftover",
-                description:
-                  leftover === planContainer
-                    ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
-                    : `${leftover} was left behind; remove it manually.`,
-              }));
-            }
+            const checkoutPath = runtime.getWorkspacePath(projectPath, metadata.name);
+            removalWarnings = forcedDeleteFailureWarnings({
+              workspaceId,
+              deleteResult,
+              checkoutPath,
+              planContainer:
+                runtime instanceof DevcontainerRuntime ? containerLabel(checkoutPath) : undefined,
+            });
           }
 
           // Note: Coder workspace deletion is handled by CoderSSHRuntime.deleteWorkspace()
@@ -10381,7 +10478,8 @@ export class WorkspaceService
 
   /**
    * Model-only view of getWorkspaceNamingCandidates for "small model" callers
-   * whose runtime ignores thinking (AI sidebar status). Public so
+   * that pick their own thinking level (AI sidebar status runs with thinking
+   * off). Public so
    * AgentStatusService can share the precedence.
    */
   public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
@@ -11228,8 +11326,13 @@ export class WorkspaceService
       // "refuse": also this backend's tracked background processes; "allow": only processes this
       // backend does not track (another backend's, or survivors of a crashed one).
       backgroundProcesses: "refuse" | "allow";
+    },
+    acknowledgedUnknownProcessRecords?: readonly string[]
+  ): Promise<
+    Result<() => Promise<void>> & {
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
-  ): Promise<Result<() => Promise<void>>> {
+  > {
     const targets = new Set(typeof workspaceId === "string" ? [workspaceId] : workspaceId);
     const workspaceIds = [...targets];
     const config = this.config.loadConfigOrDefault();
@@ -11249,15 +11352,24 @@ export class WorkspaceService
     try {
       release = await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
         ignoreOwnKinds: new Map([...targets].map((id) => [id, own.ignoreKinds])),
-        hasRunningBackgroundProcesses: (id) =>
-          own.backgroundProcesses === "refuse" || !targets.has(id)
-            ? this.hasRunningBackgroundBashProcesses(id)
-            : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
-                extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
-              }),
+        hasRunningBackgroundProcesses: (id) => this.hasRunningBackgroundBashProcesses(id),
+        ...(own.backgroundProcesses === "allow"
+          ? {
+              getBackgroundProcessBlockers: (id: string) =>
+                this.getRemovalBackgroundProcessBlockers(
+                  id,
+                  targets,
+                  acknowledgedUnknownProcessRecords
+                ),
+            }
+          : {}),
       });
     } catch (error) {
-      if (error instanceof WorkspaceBusyError) return Err(error.message);
+      if (error instanceof WorkspaceBusyError)
+        return {
+          ...Err(error.message),
+          ...(error.backgroundProcesses ? { backgroundProcesses: error.backgroundProcesses } : {}),
+        };
       throw error;
     }
     // #4909: ignoring this backend's own terminal/editor leases must not let the mutation race an
@@ -11280,6 +11392,31 @@ export class WorkspaceService
       }
     }
     return Ok(release);
+  }
+
+  private async getRemovalBackgroundProcessBlockers(
+    workspaceId: string,
+    targets: ReadonlySet<string>,
+    acknowledgedUnknownProcessRecords?: readonly string[]
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
+    // Shared-checkout siblings are not removal targets. Their tracked processes still block removal.
+    if (!targets.has(workspaceId) && (await this.hasRunningBackgroundBashProcesses(workspaceId))) {
+      throw new WorkspaceBusyError(
+        `Workspace ${workspaceId} has a running background process; stop it and try again.`
+      );
+    }
+    const blockers = await this.backgroundProcessManager.getOrphanedBackgroundProcessBlockers(
+      workspaceId,
+      { extraRecordDirs: this.extraBgRecordDirsForWorkspace(workspaceId) }
+    );
+    const acknowledged = new Set(acknowledgedUnknownProcessRecords);
+    // Force never authorizes this bypass. Consent applies only to exact unknown records in removal targets.
+    return blockers.filter(
+      (record) =>
+        record.state !== "unknown" ||
+        !targets.has(workspaceId) ||
+        !acknowledged.has(record.recordPath)
+    );
   }
 
   /**
@@ -13660,8 +13797,14 @@ export class WorkspaceService
           return cachedEnv;
         }
 
+        // An SSH+None fork shares the source's host directory, so the source runtime decides.
         const projectEnv = await secretsToRecord(
-          this.secretsStore.getEffectiveSecrets(normalizedRuntimeProjectPath)
+          secretsForWorkspace(
+            this.secretsStore,
+            this.config,
+            normalizedRuntimeProjectPath,
+            sourceRuntimeConfig
+          )
         );
         projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
         return projectEnv;
@@ -13750,7 +13893,13 @@ export class WorkspaceService
           initLogger,
           env: secrets,
           abortSignal: initAbortController.signal,
-          trusted: projectConfig.trusted ?? false,
+          // SSH+None: the host directory is not the local project, so it needs its own trust too.
+          trusted: isInitHookTrusted(
+            this.config,
+            projectConfig.trusted,
+            foundProjectPath,
+            forkedRuntimeConfig
+          ),
         },
         newWorkspaceId,
         workspaceUseLeasesFor(this.config),
@@ -14065,7 +14214,9 @@ export class WorkspaceService
           rolledBack &&
           (isWorktreeRuntime(forkedRuntimeConfig) ||
             isDevcontainerRuntime(forkedRuntimeConfig) ||
-            isSSHRuntime(forkedRuntimeConfig) ||
+            // An SSH+None fork shares the source's directory, like a local project-dir fork.
+            (isSSHRuntime(forkedRuntimeConfig) &&
+              !isSshSharedProjectDirRuntime(forkedRuntimeConfig)) ||
             isDockerRuntime(forkedRuntimeConfig) ||
             targetRuntime instanceof MultiProjectRuntime)
         ) {
@@ -20295,7 +20446,12 @@ export class WorkspaceService
       // Multi-project bash shares one execution environment, so inject the union of repo secrets.
       const projectSecrets = isMultiProject(metadata)
         ? mergeMultiProjectSecrets(metadata, this.secretsStore)
-        : this.secretsStore.getEffectiveSecrets(metadata.projectPath);
+        : secretsForWorkspace(
+            this.secretsStore,
+            this.config,
+            metadata.projectPath,
+            metadata.runtimeConfig
+          );
 
       // Create scoped temp directory for this IPC call
       using tempDir = new DisposableTempDir("mux-ipc-bash");

@@ -19,6 +19,15 @@ ME = 100
 MINE_STARTED = "2026-09-25T10:00:00Z"
 RUNS_PATH = f"repos/{REPO}/actions/workflows/pr.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
 
+# Hang guard for one script run, not a speed requirement: a run ends when its fixture ends (the gh
+# double answers from the fixture and nothing waits on a clock), so only a loop that never ends
+# reaches this bound. On the same host and load as scripts/watch_pr_state_test.py, a run took 1.4
+# s at the median and 2.3 s at the longest of 180 runs. The bound is the one of
+# scripts/watch_pr_state_test.py, the slowest of the three files. The 30 s this replaced failed
+# these tests with TimeoutExpired, which says nothing about the script. The pr.yml step that runs
+# the gate tests stops at 15 minutes, so a hang in every run cannot hold the job for hours.
+SCRIPT_RUN_TIMEOUT_SECS = 300
+
 
 def run(run_id, started=MINE_STARTED, attempt=1, pr=PR, base=BASE, status="pending", conclusion=None):
     return {
@@ -72,7 +81,7 @@ print(json.dumps(responses[min(index, len(responses) - 1)]))
             "PR_NUMBER": str(PR),
         }
         return subprocess.run(
-            ["bash", str(SCRIPT)], env=env, text=True, capture_output=True, timeout=30
+            ["bash", str(SCRIPT)], env=env, text=True, capture_output=True, timeout=SCRIPT_RUN_TIMEOUT_SECS
         )
 
     def assert_decision(self, expected, runs):

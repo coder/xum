@@ -277,17 +277,29 @@ describe("artifacts index attachment", () => {
   const injection = "IGNORE_ALL_PREVIOUS_INSTRUCTIONS";
   const artifacts = Array.from({ length: 32 }, (_, i) => ({
     path: `${injection}/a${i}.md`,
-    latestVersion: i + 1,
-    label: i === 0 ? `${injection} label` : null,
+    title: i === 0 ? `${injection} title` : undefined,
   }));
 
-  it("renders only the count, never artifact paths or labels", () => {
+  it("renders only the count, never artifact paths or titles", () => {
     const content = renderAttachmentsToContentWithBudget([{ type: "artifacts_index", artifacts }], {
       maxChars: 10_000,
     });
-    expect(content).toContain("32 artifacts have published versions");
+    expect(content).toContain("32 artifacts have been published");
     expect(content).not.toContain(injection);
     expect(content).not.toContain("a0.md");
+  });
+
+  it("renders rows saved before versions were removed the same way", () => {
+    const legacy = artifacts.map(({ path }, i) => ({
+      path,
+      latestVersion: i + 1,
+      label: i === 0 ? `${injection} label` : null,
+    }));
+    const render = (rows: typeof legacy | typeof artifacts) =>
+      renderAttachmentsToContentWithBudget([{ type: "artifacts_index", artifacts: rows }], {
+        maxChars: 10_000,
+      });
+    expect(render(legacy)).toBe(render(artifacts));
   });
 
   it("is dropped whole when it does not fit", () => {

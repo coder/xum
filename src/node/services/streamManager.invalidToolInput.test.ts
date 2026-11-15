@@ -12,7 +12,7 @@ import { StreamManager } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
 
 describe("StreamManager - invalid tool input", () => {
-  test("the model's same-turn retry and the persisted history both get the concise summary", async () => {
+  test("the same-turn retry gets the concise summary and no rejected input; history keeps the summary", async () => {
     const h = await createTestHistoryService();
     const workspaceId = "invalid-tool-input";
     const messageId = "invalid-tool-input-assistant";
@@ -105,6 +105,12 @@ describe("StreamManager - invalid tool input", () => {
       expect(summary).toContain("received 2100 characters");
       expect(summary).not.toContain("xxxx");
       expect(summary.length).toBeLessThan(300);
+      // The rejected call never ran, so its arguments are not replayed for the model to copy.
+      const retryToolCall = retryPrompt
+        ?.flatMap((message) => (message.role === "assistant" ? message.content : []))
+        .find((part) => part.type === "tool-call" && part.toolCallId === toolCallId);
+      if (retryToolCall?.type !== "tool-call") throw new Error("Expected the tool-call");
+      expect(retryToolCall.input).toEqual({});
 
       // Later turns: the persisted tool part carries the same summary.
       expect((await h.historyService.commitPartial(workspaceId)).success).toBe(true);

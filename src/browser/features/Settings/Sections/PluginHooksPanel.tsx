@@ -325,7 +325,7 @@ const PluginHookRow: React.FC<{
         )}
         {note === null && <span className={label.className}>{label.text}</span>}
       </div>
-      <p className="text-foreground font-mono break-all">{summary}</p>
+      <p className="text-foreground font-mono break-words">{summary}</p>
       {detail !== null && (
         <HookReviewDetailText detail={detail} expanded={props.expanded} onExpand={props.onExpand} />
       )}

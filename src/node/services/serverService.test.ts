@@ -13,6 +13,12 @@ import {
 import type { ORPCContext } from "@/node/orpc/context";
 import { Config } from "@/node/config";
 import { ServerLockDataSchema } from "./serverLockfile";
+import {
+  identityOf,
+  startFakeBackend,
+  startUnrelatedProcess,
+  unservedBaseUrl,
+} from "./testXumBackend";
 
 describe("ServerService", () => {
   test("initializes with null path", async () => {
@@ -147,40 +153,196 @@ describe("ServerService.startServer", () => {
   test("does not delete another process's lockfile when start fails", async () => {
     const service = new ServerService();
 
-    // Create a lockfile simulating another running server (use our own PID so it appears "alive")
+    // Create a lockfile simulating another running server: a live pid that is not ours, and a
+    // xum backend that answers at its baseUrl.
+    const running = await startFakeBackend("xum");
+    const otherServer = startUnrelatedProcess();
     const lockPath = path.join(tempDir, "server.lock");
     const existingLockData = {
-      pid: process.pid,
-      baseUrl: "http://127.0.0.1:9999",
+      pid: otherServer.pid,
+      baseUrl: running.baseUrl,
       token: "other-server-token",
       startedAt: new Date().toISOString(),
     };
     await fs.writeFile(lockPath, JSON.stringify(existingLockData, null, 2));
 
-    // Try to start - should fail due to existing server
-    let thrownError: Error | null = null;
     try {
-      await service.startServer({
+      // Try to start - should fail due to existing server
+      let thrownError: Error | null = null;
+      try {
+        await service.startServer({
+          xumHome: tempDir,
+          context: stubContext,
+          authToken: "test-token",
+          port: 0,
+        });
+      } catch (err) {
+        thrownError = err as Error;
+      }
+
+      expect(thrownError).not.toBeNull();
+      expect(thrownError!.message).toMatch(/already running/i);
+
+      // Critical: call stopServer (simulating cleanup in finally block)
+      await service.stopServer();
+
+      // Verify the OTHER process's lockfile was NOT deleted
+      const lockContent = await fs.readFile(lockPath, "utf-8");
+      const lockData = ServerLockDataSchema.parse(JSON.parse(lockContent));
+      expect(lockData.baseUrl).toBe(running.baseUrl);
+      expect(lockData.token).toBe("other-server-token");
+    } finally {
+      otherServer.kill();
+      await running.close();
+    }
+  });
+
+  test.skipIf(process.platform !== "linux")(
+    "start refuses next to a backend that is frozen (SIGSTOP), and replaces its lock once it is gone",
+    async () => {
+      const service = new ServerService();
+      const lockPath = path.join(tempDir, "server.lock");
+      const backend = startUnrelatedProcess();
+      // The frozen backend's lock: its process identity, and a port that nothing answers on.
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({
+          pid: backend.pid,
+          baseUrl: await unservedBaseUrl(),
+          token: "frozen-token",
+          startedAt: new Date().toISOString(),
+          identity: identityOf(backend.pid),
+        })
+      );
+      const start = () =>
+        service.startServer({
+          xumHome: tempDir,
+          context: stubContext,
+          authToken: "test-token",
+          port: 0,
+        });
+
+      process.kill(backend.pid, "SIGSTOP");
+      try {
+        const refused = await start().then(
+          () => null,
+          (error: unknown) => error
+        );
+        expect(refused instanceof Error ? refused.message : "").toMatch(/already running/i);
+        expect(
+          ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8"))).token
+        ).toBe("frozen-token");
+      } finally {
+        backend.kill();
+      }
+      await backend.exited;
+
+      // The backend is gone: the same lock is stale now, and start replaces it.
+      const info = await start();
+      try {
+        expect(info.baseUrl).not.toBe("");
+        expect(
+          ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8"))).token
+        ).toBe("test-token");
+      } finally {
+        await service.stopServer();
+      }
+    }
+  );
+
+  test("start replaces a lock whose pid an unrelated live process now holds", async () => {
+    const service = new ServerService();
+    const lockPath = path.join(tempDir, "server.lock");
+    const unrelated = startUnrelatedProcess();
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: unrelated.pid, // alive, but not a xum backend
+        baseUrl: await unservedBaseUrl(),
+        token: "dead-server-token",
+        startedAt: new Date().toISOString(),
+      })
+    );
+
+    try {
+      const info = await service.startServer({
         xumHome: tempDir,
         context: stubContext,
         authToken: "test-token",
         port: 0,
       });
-    } catch (err) {
-      thrownError = err as Error;
+      try {
+        const lockData = ServerLockDataSchema.parse(
+          JSON.parse(await fs.readFile(lockPath, "utf-8"))
+        );
+        expect(lockData.pid).toBe(process.pid);
+        expect(lockData.baseUrl).toBe(info.baseUrl);
+      } finally {
+        await service.stopServer();
+      }
+    } finally {
+      unrelated.kill();
     }
+  });
 
-    expect(thrownError).not.toBeNull();
-    expect(thrownError!.message).toMatch(/already running/i);
+  test("start replaces a lock that an earlier run with this pid wrote", async () => {
+    // Each run of a container is pid 1: the old run's lock names the new run's own pid, and a
+    // xum backend (this run's own, once started) answers at the lock's baseUrl.
+    const service = new ServerService();
+    const lockPath = path.join(tempDir, "server.lock");
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        baseUrl: await unservedBaseUrl(),
+        token: "earlier-run-token",
+        startedAt: "2026-01-01T00:00:00.000Z",
+      })
+    );
 
-    // Critical: call stopServer (simulating cleanup in finally block)
-    await service.stopServer();
+    const info = await service.startServer({
+      xumHome: tempDir,
+      context: stubContext,
+      authToken: "test-token",
+      port: 0,
+    });
+    try {
+      const lockData = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8")));
+      expect(lockData.token).toBe("test-token");
+      expect(lockData.baseUrl).toBe(info.baseUrl);
+    } finally {
+      await service.stopServer();
+    }
+  });
 
-    // Verify the OTHER process's lockfile was NOT deleted
-    const lockContent = await fs.readFile(lockPath, "utf-8");
-    const lockData = ServerLockDataSchema.parse(JSON.parse(lockContent));
-    expect(lockData.baseUrl).toBe("http://127.0.0.1:9999");
-    expect(lockData.token).toBe("other-server-token");
+  test("start replaces the stale lock of a dead server", async () => {
+    const service = new ServerService();
+    const lockPath = path.join(tempDir, "server.lock");
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 999999999, // Not a live process
+        baseUrl: "http://127.0.0.1:9999",
+        token: "dead-server-token",
+        startedAt: new Date().toISOString(),
+      })
+    );
+
+    const info = await service.startServer({
+      xumHome: tempDir,
+      context: stubContext,
+      authToken: "test-token",
+      port: 0,
+    });
+
+    try {
+      const lockData = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8")));
+      expect(lockData.pid).toBe(process.pid);
+      expect(lockData.baseUrl).toBe(info.baseUrl);
+      expect(lockData.token).toBe("test-token");
+    } finally {
+      await service.stopServer();
+    }
   });
 
   test("successful start creates lockfile and server", async () => {

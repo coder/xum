@@ -43,7 +43,7 @@ make dev-server-sandbox
 
 ## Agent usage with `bash.monitor`
 
-When you need the sandbox to keep running while you continue or end the turn, start it as a monitored background bash. The monitor wakes the workspace on useful server output; call `task_await` only if you need surrounding logs.
+When you need the sandbox to keep running while you continue or end the turn, start it as a monitored background bash. The monitor wakes the workspace on useful server output. The wake carries no output, so read the logs with `task_await`.
 
 ```ts
 bash({

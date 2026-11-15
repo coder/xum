@@ -70,7 +70,6 @@ import {
   ArtifactReadOutcomeSchema,
   ArtifactShelfListingSchema,
   ArtifactShelfScopeSchema,
-  ArtifactVersionListSchema,
   PinnedArtifactFilesSchema,
 } from "./artifacts";
 import { ResultSchema } from "./result";
@@ -90,11 +89,8 @@ import {
   McpAppViewSchema,
 } from "./mcpApps";
 import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
-import {
-  RuntimeConfigSchema,
-  RuntimeAvailabilitySchema,
-  RuntimeEnablementIdSchema,
-} from "./runtime";
+import { RuntimeConfigSchema, RuntimeAvailabilitySchema } from "./runtime";
+import { IsolationChoiceSchema } from "@/common/schemas/isolation";
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
@@ -302,6 +298,9 @@ export { perfCaptures } from "./perfCaptures";
 
 // Re-export agent resource limit schemas
 export { agentResourceLimits } from "./agentResourceLimits";
+
+// Re-export macOS agent sandbox schemas
+export { agentSandbox } from "./agentSandbox";
 
 // Re-export "Report slowness" bundle schemas
 export { perfReports } from "./perfReports";
@@ -942,6 +941,11 @@ export const projects = {
     input: z.object({ projectPath: z.string() }),
     output: BranchListResultSchema,
   },
+  /** Host aliases from ~/.ssh/config, to suggest on the new-workspace page. */
+  listSshConfigHosts: {
+    input: z.void(),
+    output: z.object({ hosts: z.array(z.string()) }),
+  },
   gitInit: {
     input: z.object({ projectPath: z.string() }),
     output: ResultSchema(z.void(), z.string()),
@@ -949,6 +953,18 @@ export const projects = {
   setTrust: {
     input: z.object({ projectPath: z.string(), trusted: z.boolean() }),
     output: z.void(),
+  },
+  // Trust for one SSH+None directory of a project (ProjectConfig.trustedSshDirectories).
+  // Granting requires the project itself to be trusted. Returns the stored (resolved) projectDir.
+  setSshDirectoryTrust: {
+    input: z.object({
+      projectPath: z.string(),
+      host: z.string(),
+      port: z.number().int().nullish(),
+      projectDir: z.string(),
+      trusted: z.boolean(),
+    }),
+    output: ResultSchema(z.object({ projectDir: z.string() }), z.string()),
   },
   setDisplayName: {
     input: z
@@ -1501,20 +1517,6 @@ export const artifacts = {
     input: z.object({ workspaceId: z.string() }),
     output: ArtifactCapabilitiesSchema,
   },
-  /** Versions of the artifact at `path` (relative to the artifacts dir), newest first. */
-  listVersions: {
-    input: z.object({ workspaceId: z.string(), path: z.string() }),
-    output: ResultSchema(ArtifactVersionListSchema, z.string()),
-  },
-  /** One stored version, in the same shape as `read` (modifiedMs = version creation time). */
-  readVersion: {
-    input: z.object({
-      workspaceId: z.string(),
-      artifactId: z.string(),
-      version: z.number().int().positive(),
-    }),
-    output: ArtifactReadOutcomeSchema,
-  },
   /** Pinned workspace files with their current size/mtime (live, no snapshots). */
   listPinned: {
     input: z.object({ workspaceId: z.string() }),
@@ -1556,12 +1558,11 @@ export const artifacts = {
     }),
     output: ArtifactReadOutcomeSchema,
   },
-  /** User pin: copy one stored version to the project or global shelf. */
+  /** User pin: copy the artifact's current bytes to the project or global shelf. */
   pinToShelf: {
     input: z.object({
       workspaceId: z.string(),
-      artifactId: z.string(),
-      version: z.number().int().positive(),
+      path: z.string(),
       scope: ArtifactShelfScopeSchema,
     }),
     output: ResultSchema(z.object({ name: z.string() }), z.string()),
@@ -1579,19 +1580,17 @@ export const artifacts = {
   /**
    * A send the user clicked or confirmed in the Artifacts tab (window.xum.send or a canvas button). The
    * backend persists it, then delivers it as a user message at the next tool boundary (M5b).
-   * `version: null` targets the live file (latest stored version).
    */
   sendInteraction: {
     input: z.object({
       workspaceId: z.string(),
       path: z.string(),
-      version: z.number().int().nonnegative().nullable(),
       text: z.string(),
       data: z.unknown().optional(),
     }),
     output: ResultSchema(z.object({ id: z.string() }), z.string()),
   },
-  /** Persisted window.xum.state of an artifact (null when none); one state for all versions. */
+  /** Persisted window.xum.state of an artifact (null when none). */
   getState: {
     input: z.object({
       workspaceId: z.string(),
@@ -1923,6 +1922,8 @@ export const workspace = {
         .object({
           force: z.boolean().optional(),
           acknowledgedDescendantIds: z.array(z.string()).optional(),
+          // A separate user confirmation; force alone never accepts unknown activity.
+          acknowledgedUnknownProcessRecords: z.array(z.string()).optional(),
         })
         .optional(),
     }),
@@ -2196,6 +2197,20 @@ export const workspace = {
         workspaceId: z.string(),
         toolCallId: z.string(),
         answers: z.record(z.string(), z.string()),
+      })
+      .strict(),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  /**
+   * Answers the sandbox approval card of one bash call: approved runs that one call outside the
+   * sandbox. Only the user calls it; sandboxed commands do not get the server token.
+   */
+  answerSandboxApproval: {
+    input: z
+      .object({
+        workspaceId: z.string(),
+        toolCallId: z.string(),
+        approved: z.boolean(),
       })
       .strict(),
     output: ResultSchema(z.void(), z.string()),
@@ -3415,7 +3430,7 @@ export const config = {
       coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS),
       worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS),
       runtimeEnablement: z.record(z.string(), z.boolean()),
-      defaultRuntime: z.string().nullable(),
+      defaultIsolation: IsolationChoiceSchema.nullable(),
       agentAiDefaults: AgentAiDefaultsSchema,
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
@@ -3545,7 +3560,8 @@ export const config = {
       .object({
         projectPath: z.string().nullish(),
         runtimeEnablement: z.record(z.string(), z.boolean()).nullish(),
-        defaultRuntime: RuntimeEnablementIdSchema.nullish(),
+        // null clears the default (project override or global); undefined leaves it unchanged.
+        defaultIsolation: IsolationChoiceSchema.nullish(),
         runtimeOverridesEnabled: z.boolean().nullish(),
       })
       .strict(),

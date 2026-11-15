@@ -1,5 +1,6 @@
 import assert from "@/common/utils/assert";
-import { isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
+import type { Runtime } from "@/node/runtime/Runtime";
+import { isPluginPathUsableFrom } from "@/node/services/agentPlugins/pluginPathAvailability";
 import { toPosixPath } from "@/node/utils/paths";
 
 import type { ResolvedAgentSkill } from "./agentSkillsService";
@@ -23,18 +24,6 @@ const OFF_HOST_REASON =
 
 const OTHER_CHECKOUT_REASON =
   "This skill was read from the project's main checkout, not from this workspace's checkout. Call agent_skill_read for its directory in this workspace.";
-
-/**
- * True when commands run directly on the Xum host. Positive check on purpose:
- * SSH/Docker (RemoteRuntime), devcontainers (exec inside the container) and
- * multi-project wrappers (which can wrap SSH runtimes) all fail it, so a host
- * path is never reported for a runtime Xum cannot prove shares the host
- * filesystem.
- */
-function execsOnHost(runtime: Runtime): boolean {
-  // "local" is a LocalBaseRuntime that is not a DevcontainerRuntime (see Runtime.location).
-  return runtime.location === "local";
-}
 
 /**
  * Resolve the skill directory that `bash` on `workspaceRuntime` can use.
@@ -135,13 +124,7 @@ function getSkillDirectoryUnavailableReason(
   if (discoveredOutsideWorkspace && resolved.package.scope === "project") {
     return OTHER_CHECKOUT_REASON;
   }
-  // A shared instance proves a shared filesystem only for remote runtimes, which
-  // read and execute on the same machine. A DevcontainerRuntime (or a wrapper
-  // around one) reads the host but executes in the container.
-  const sameRemote =
-    resolved.sourceRuntime === workspaceRuntime && isRemoteRuntime(workspaceRuntime);
-  const bothOnHost = execsOnHost(resolved.sourceRuntime) && execsOnHost(workspaceRuntime);
-  return sameRemote || bothOnHost ? null : OFF_HOST_REASON;
+  return isPluginPathUsableFrom(resolved.sourceRuntime, workspaceRuntime) ? null : OFF_HOST_REASON;
 }
 
 /**

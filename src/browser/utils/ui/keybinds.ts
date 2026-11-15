@@ -405,6 +405,18 @@ export const KEYBINDS = {
   /** Discard the oldest held (refused, unsent) message from an empty composer */
   DISCARD_HELD_INPUT: { key: "Backspace", ctrl: true, alt: true },
 
+  /**
+   * New-workspace page: make the shown isolation the project's default ("Set as default").
+   * Shift keeps Ctrl+Alt+D (AltGr+D on Windows layouts) free for typing in the composer.
+   */
+  SET_DEFAULT_ISOLATION: { key: "d", code: "KeyD", ctrl: true, alt: true, shift: true },
+
+  /**
+   * New-workspace page: open the environment panel (where it runs, isolation, base branch).
+   * Shift for the same reason as SET_DEFAULT_ISOLATION: AltGr+E types a character on some layouts.
+   */
+  OPEN_CREATION_ENVIRONMENT: { key: "e", code: "KeyE", ctrl: true, alt: true, shift: true },
+
   /** Send message after current turn ends */
   SEND_MESSAGE_AFTER_TURN: { key: "Enter", ctrl: true },
 
@@ -648,9 +660,9 @@ export const KEYBINDS = {
   FIT_ARTIFACT_IMAGE: { key: "0" },
   /** Show an image artifact at actual size (100%) */
   ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
-  /** Pin the shown artifact version to the project shelf */
+  /** Pin the shown artifact to the project shelf */
   PIN_ARTIFACT_TO_PROJECT_SHELF: { key: "p" },
-  /** Pin the shown artifact version to the global shelf */
+  /** Pin the shown artifact to the global shelf */
   PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
   /** Unpin the selected shelf entry */
   UNPIN_SHELF_ENTRY: { key: "u" },
@@ -780,6 +792,10 @@ export const KEYBINDS = {
   // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
   SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
   SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: { key: "u", code: "KeyU", ctrl: true, alt: true },
+  // Not Ctrl+Alt+P (PIN_WORKSPACE) or Ctrl+Alt+L (the lock-screen key on several desktops).
+  SETTINGS_BACKUP_TOGGLE_PLUGINS: { key: "x", code: "KeyX", ctrl: true, alt: true },
+  SETTINGS_BACKUP_REVIEW_PLUGINS: { key: "y", code: "KeyY", ctrl: true, alt: true },
+  SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL: { key: "z", code: "KeyZ", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },
@@ -848,6 +864,10 @@ export const KEYBINDS = {
    * Not while typing: only from an empty or unfocused field.
    */
   RUN_LATEST_PLAN_ACTION: { key: "Enter", alt: true },
+
+  /** Answer the latest pending sandbox approval card. A chord, so no stray key approves. */
+  RUN_OUTSIDE_SANDBOX: { key: "y", code: "KeyY", ctrl: true, alt: true, shift: true },
+  DENY_OUTSIDE_SANDBOX: { key: "n", code: "KeyN", ctrl: true, alt: true, shift: true },
 
   /** Copy image to clipboard (scoped to image lightbox / image context menu) */
   IMAGE_COPY: { key: "c", ctrl: true },

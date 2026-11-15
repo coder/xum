@@ -18,6 +18,7 @@ import {
 } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
 import {
+  cutToCap,
   firstNonEmptyLine,
   normalizeNewlines,
   splitFrontmatter,
@@ -69,8 +70,9 @@ export function claudeCommandSkillMarkdown(name: string, content: string): strin
     description:
       typeof description === "string" && description.trim().length > 0
         ? description
-        : (firstNonEmptyLine(parts.body) ?? `Command /${name}`).slice(
-            0,
+        : cutToCap(
+            // mutation-equivalent: firstNonEmptyLine returns undefined or a non-empty line, so ?? and || agree
+            firstNonEmptyLine(parts.body) ?? `Command /${name}`,
             MAX_SKILL_DESCRIPTION_LENGTH
           ),
     "disable-model-invocation": true,

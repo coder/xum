@@ -50,7 +50,9 @@ describe("useWorkspaceSwitchAutoFocus", () => {
 
   test("focuses the composer when a workspace opens", async () => {
     renderFocus();
-    await waitFor(() => expect(document.activeElement).toBe(input));
+    // Compare with `===`: the first poll fails, and a failing `toBe` on happy-dom nodes formats
+    // their whole window graph (17 MB, ~490 ms).
+    await waitFor(() => expect(document.activeElement === input).toBe(true));
     expect(states.at(-1)).toBe("done");
   });
 

@@ -35,6 +35,59 @@ Surfaces:
 - Model-driven explorers and story tests run only in the bug-bash sandbox. See the
   [bug-bash](../bug-bash/SKILL.md) skill.
 
+## Threat model
+
+CAUTION: Run this skill only on a host where you are the only local account. agent-browser starts
+Chrome with a DevTools port on `127.0.0.1` (`--remote-debugging-port=0`), which asks for no
+credentials and which agent-browser cannot turn off. While the signed-in app is open, any local
+account that finds that port can control the browser, read the page and take the stored token.
+
+The skill trusts the checkout. Launch runs the checkout's code, and Bun loads the checkout's
+`.env` files into the processes launch starts, so a line such as `NODE_OPTIONS=--require=<file>`
+there runs code in Vite and the backend. None of the protections below holds against a checkout
+you do not trust.
+
+These protections matter on a host where you are the only local account too:
+
+- No text evidence keeps the token: `capture` replaces it with `<redacted>` in the files it
+  writes, and cleanup in every text file of the evidence and in the server log (see Evidence).
+  Screenshots are not redacted.
+- `env` and `open` keep the token out of your terminal and the agent's transcript: `env` prints
+  none, and `open` does not print agent-browser's output, which repeats the URL with the token
+  (when the open fails, it prints that output redacted).
+- Vite never serves the token: launch and every command that reads a run refuse a run home in a
+  folder that Vite serves (see Evidence), and `vite.config.ts` denies `server.lock` and its
+  temporary copies.
+- A web page that rebinds its DNS name to this machine cannot reach the app that Vite serves.
+  Launch's `env -i` drops every `VITE_ALLOWED_HOSTS` spelling and the port-forward proxy
+  variables. Bun still loads the checkout's `.env` files into the sandbox script, so launch
+  refuses unless the `Allowed hosts:` line in `server.log` reads `loopback only`. Vite then
+  accepts only `localhost`, a `*.localhost` name or an IP address as the Host (an IP address
+  cannot be rebound) and refuses every other name, also on its WebSocket proxy to the backend.
+  The backend's own TCP port has no Host check, but its API calls (`/orpc`, and `/api` except
+  its spec and docs) need the token. The `Allowed hosts:` check catches a `.env` line written for
+  remote access, not a hostile checkout.
+- Other machines cannot reach Vite or the backend: launch refuses unless both listen only on a
+  loopback address. A `.env` line such as `XUM_VITE_HOST=0.0.0.0` makes a server listen on every
+  interface, and Vite accepts an IP-address Host. This check too catches a `.env` line written
+  for remote access, not a hostile checkout.
+- `open` turns off agent-browser's live stream, a WebSocket on `127.0.0.1` that any local account
+  can connect to, and so can a web page on a `localhost`, `127.0.0.1` or `[::1]` origin (see
+  Drive).
+
+These protections matter only when other local accounts exist, and they are not enough there:
+the DevTools port above stays open.
+
+- The token is in no command line: `open`, launch, `doctor` and the redaction pass it to node or
+  curl on stdin or fd 3 (see Drive and Doctor). `make dev-server` exports it to the server's own
+  processes, whose environment only you and root can read.
+- No other account except root can replace or write the run's files: launch makes the run
+  folder (with the run's 0600 token copy) and the server tree's TMPDIR with mode 0700, and the
+  run home too when it makes it. Launch and every command that reads a run refuse a run home or
+  run folder that group or others can write, every command refuses such a git dir, and all of
+  them refuse a folder above these that group or others can write without the sticky bit (see
+  Launch and Evidence).
+
 ## Launch
 
 The script runs on Linux only: it needs `setsid`, `flock`, `ss` and `/proc`. Every command
@@ -54,9 +107,10 @@ the message then says to use a checkout under folders you own. Bun on PATH must 
 ```
 
 Launch runs `make dev-server-sandbox` with `--clean-providers --clean-projects`, the mock AI and an
-`env -i` allowlist, in its own process group. It returns when the app is usable, in about 15 s when
-`dist/` is already built. It gives up when the whole launch, seed included, takes longer than
-`VERIFY_XUM_READY_TIMEOUT` seconds (default 300).
+`env -i` allowlist, in its own process group. It returns when the app is usable. That takes about
+2 to 3 minutes on a busy host, most of it the module walk below, plus the rebuild of `dist/` after a
+source change. It gives up when the whole launch, seed and module walk included, takes longer than
+`VERIFY_XUM_READY_TIMEOUT` seconds (default 600).
 Ready means all of these hold:
 
 - the backend that nodemon restarts after the first watch build owns `server.lock` and answers
@@ -64,7 +118,14 @@ Ready means all of these hold:
 - Vite serves the app,
 - the seed is done: onboarding marked seen, a fake Anthropic provider on a dead loopback port (the
   composer refuses to send without a provider), the trusted project `demo-app` (a throwaway git
-  repo) and the workspace `Verify playground` with its worktree set up.
+  repo) and the workspace `Verify playground` with its worktree set up,
+- Vite has transformed every module that the renderer's served code imports, statically or with
+  `import()` (about 1,600). Worker scripts are left out (see Gotchas). Vite transforms a module on
+  its first request, on one thread. For the first page load that is about 45 CPU seconds, most of
+  it in Babel, where React Compiler runs. A cold Vite makes the first `open` plus `idle` take
+  longer than agent-browser's 25 s wait. `scripts/warmViteModules.ts` requests the whole graph over
+  HTTP, so the first `open` gets modules from Vite's cache. It fails the launch on a module that
+  Vite cannot serve.
 
 It prints the run's `export` lines and the URL of the seeded workspace. A failed launch prints the
 server log tail and cleans up. Launch refuses while the process group of this checkout's newest
@@ -72,9 +133,12 @@ run is alive, by the same identity check as cleanup: two dev servers in one chec
 and `node_modules/.vite`. The group's first process writes the group id into the run's
 `state.env` before it starts the server. From that moment, right after the spawn, the check and
 cleanup find the group even when the launcher was killed. Until then the group holds the launch
-lock, so a second launch waits for it. Launch also stops at once when the
-sandbox copied a `config.json` (the recipes assume default preferences) and when the backend
-crashes after its rebuild (nodemon then waits for a file change that never comes).
+lock, so a second launch waits for it. Launch also stops at once when the sandbox copied a
+`config.json` (the recipes assume default preferences), when the sandbox's `Allowed hosts:` line
+does not read `loopback only`, when Vite or the backend listens on an address that is not
+loopback, `ss` fails or, once it answers, `ss` shows no socket for it (see Threat model), when the
+backend has no auth token (see Doctor), and when the backend crashes after its rebuild (nodemon
+then waits for a file change that never comes).
 
 ## Doctor
 
@@ -88,10 +152,15 @@ Every check line must read `ok`. A `note` line only informs. It checks that the 
 lives and carries the run's id (`VERIFY_XUM_SERVER_OF` in its env), the checkout's newest-run link
 names the run, the backend pid in the sandbox `server.lock` and the app port belong to the group,
 `/health` answers, `/version` reports the launch commit, and the backend env has `XUM_MOCK_AI=1`.
-The backend always has an auth token: launch runs make under `env -i`, which drops
-`XUM_DEV_SERVER_NO_AUTH`. (A checkout from before #7904 starts it without one, and the skill works
-the same.) Doctor and launch read the token from `server.lock` and send it to curl on stdin, never
-in argv.
+The backend always has an auth token: launch refuses a backend whose `server.lock` has none.
+Launch's `env -i` drops `XUM_DEV_SERVER_NO_AUTH`, but Bun loads the checkout's `.env` files into
+the sandbox script, so a `.env` line `XUM_DEV_SERVER_NO_AUTH=1` turns auth off again. The refusal
+names that line and says to remove it. (A checkout from before #7904 starts the backend without a
+token, so launch refuses it too.) Doctor and launch send the token to the backend only over its
+Unix socket, which the Makefile puts in a folder that only you can write, and give it to curl on
+stdin, never in argv. They never send it to the TCP port: while the backend starts, stops or
+restarts under nodemon, that port can be free for another account to bind. Doctor's `/health`
+check needs no token and goes to the TCP port.
 Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive
@@ -115,23 +184,21 @@ agent-browser find role button click --name "Open settings" --exact
 - Open pages with `verify-xum.sh open <path>`, not `agent-browser open`. `make dev-server` starts
   the backend with an auth token, and the first page of a browser session needs it as
   `?token=<token>` (the app keeps it and strips it from the address bar). `open` builds that URL in
-  node from `server.lock` and hands it to `agent-browser batch` on stdin, so the token is in no
-  command line or environment. CAUTION: never put the token in an `agent-browser` argument. Every
-  local account can read a process's command line while it runs.
-- CAUTION: Run this skill only on a host where you are the only local account. agent-browser
-  starts Chrome with a DevTools port on `127.0.0.1` (`--remote-debugging-port=0`), which asks for
-  no credentials and which agent-browser cannot turn off. While the signed-in app is open, any
-  local account that finds that port can control the browser, read the page and take the stored
-  token.
+  node from `server.lock` (or the run's token copy) and hands it to `agent-browser batch` on
+  stdin, so no command line or environment of `open`'s processes holds the token. CAUTION: never
+  put the token in an `agent-browser` argument. Every local account can read a process's command
+  line while it runs.
 - `open` turns off agent-browser's live stream for the session first, every time, and refuses to
   open the page while it is on. agent-browser 0.33 serves each session's screen and input as a
-  WebSocket on `127.0.0.1` that any local account can connect to, starts it with each new
-  daemon, and has no setting to keep it off. CAUTION: never run `agent-browser stream enable` in
-  a run's session. Another account could then watch and drive the signed-in app.
+  WebSocket on `127.0.0.1` that any local account can connect to, and so can a web page on a
+  `localhost`, `127.0.0.1` or `[::1]` origin. agent-browser starts the stream with each new
+  daemon and has no setting to keep it off. CAUTION: never run `agent-browser stream enable` in a
+  run's session. Another account could then watch and drive the signed-in app.
 - `idle` waits until the page settles: no CSS transition runs, and on a `/workspace/` page the
   `Conversation transcript` log is neither loading nor streaming (`aria-busy="false"`). A click
   while the right sidebar slides open lands where the target was and is lost. `idle` exits 3
-  when the page shows `<name> failed to load.` (see Gotchas).
+  when the page shows `<name> failed to load.` or the boot screen's `Xum could not load` (see
+  Gotchas).
 - `send-ready` waits until the composer's `Send message` button is enabled. Fill the message, run
   `send-ready`, then send. The workspace composer keeps Send disabled until the transcript has
   caught up, and the new-workspace composer until the branch list has loaded and the draft is
@@ -148,14 +215,20 @@ agent-browser find role button click --name "Open settings" --exact
   `[mock:list-languages]` are in `src/node/services/mock/mockAiRouter.ts`. Mock tool calls are
   canned and leave the worktree alone. A canned `todo_write` (`[mock:todo-nudge]`) still writes
   its TODO list to the workspace's session folder.
-- The CLI drives the same server. Run it under `env -i`: the live Xum's server URL and auth
+- The CLI drives the same server. Run it through `verify-xum.sh cli`, which runs
+  `dist/cli/api.mjs` against the newest run under `env -i`: the live Xum's server URL and auth
   token are in your env under both `XUM_*` and legacy `MUX_*` names, and the CLI reads either.
   With them gone it finds the sandbox through `XUM_ROOT`:
 
   ```bash
-  env -i PATH="$PATH" HOME="$HOME" XUM_ROOT="$VERIFY_XUM_ROOT" \
-    node "$VERIFY_XUM_CHECKOUT/dist/cli/api.mjs" workspace list
+  verify-xum.sh cli workspace list
   ```
+
+  The CLI talks to the TCP port that `server.lock` names, and it has no Unix-socket mode. So
+  `cli` first checks that the pid in `server.lock` carries this run's id and is the only listener
+  on that port, and refuses otherwise (a backend that is stopping or restarting). The CLI's own
+  read of `server.lock` ignores a lock whose pid has died. A backend that dies in the moment
+  between that read and the CLI's TCP connect is not covered.
 
 ## Evidence
 
@@ -184,6 +257,76 @@ shows the token.
 `<step>.url.txt` under `evidence/<feature>/`. Pass absolute paths to any other `agent-browser`
 output: it resolves relative paths against its daemon's directory.
 
+### WebKit capture
+
+agent-browser drives Chromium. Phone users run Safari, which is WebKit, and the two engines lay
+some pages out differently, so a Chromium pass cannot show a WebKit-only defect. Playwright WebKit
+on Linux is still not iOS Safari: a phone-width screenshot of it did not reproduce the exact iPhone
+Safari Mermaid overflow that led to this capture. So a clean `-webkit` capture is not proof for iOS
+Safari. `webkit-capture` opens a page
+of the run in Playwright WebKit at a phone viewport:
+
+```bash
+.xum/skills/verify-xum/scripts/verify-xum.sh webkit-capture "/workspace/$VERIFY_XUM_WORKSPACE_ID" chat/reply
+```
+
+`webkit-capture <path> <feature>/<step>` loads `<path>` in a new browser (390x844 at 3x, mobile,
+touch), waits as `idle` does, and writes `<step>-webkit.png` and `<step>-webkit.txt` under
+`evidence/<feature>/`. `idle`'s test reads a page as settled while it still shows the loading
+screen or a Mermaid diagram that is still rendering, so this command also waits for both to go.
+After 60 s it exits 1 and names what still shows. It exits 3 on `<name> failed to load.` or the boot
+screen's `Xum could not load`, as `idle` does, and 1 when the page shows the startup connection
+error or the token prompt instead of the page. A failed run leaves no `-webkit` files from an
+earlier run of the same name.
+
+The report holds only fixed text and numbers: the URL you gave (without the token), the engine and
+its mode, the viewport, `document.documentElement.scrollWidth <= innerWidth` with both numbers (or
+`unknown` when the page does not return two numbers), and the counts of console errors and page
+errors. It holds no text from the page, because the page can
+be a hostile branch and its text would reach your terminal and the transcript. Nothing the helper
+prints comes from the page either: the checks that wait for the page return one integer, and the
+helper treats anything else as not settled. A hostile page can still make those numbers lie, as it
+can change what it paints, so the PNG is the evidence. Open it: the width line sees only page-level
+overflow, not content that paints outside its frame inside the page, and the PNG is the 390x844
+viewport, not the whole page. The helper still redacts the token and replaces control characters
+in everything it writes, as a second layer.
+
+- The browser starts at `<path>`. It shows what a URL and the server's state give: a transcript
+  that `agent-browser` steps built (the history is on the server), a route, a saved setting. A
+  state that only clicks reach (an open dialog) cannot be captured this way: report that and say
+  what you checked instead.
+- It uses the repo's locked `playwright-core`. WebKit needs GTK and GStreamer libraries that many
+  hosts lack. On `auto` (the default of `VERIFY_XUM_WEBKIT`, which can also be `host` or
+  `docker`) it runs on the host when WebKit launches there (`node_modules/.bin/playwright
+  install webkit`, and `--with-deps` for the libraries). Otherwise it runs the same helper in
+  `mcr.microsoft.com/playwright@sha256:2f05f8a7...` (Playwright 1.64.1, pinned by digest, pulled
+  once). The image's browsers belong to that Playwright version: after a Playwright bump, set
+  `WEBKIT_IMAGE` and `WEBKIT_IMAGE_PLAYWRIGHT_CORE` in `verify-xum.sh` (the recipe is in the
+  comment above them). The test fails until the version constant moves, and Docker mode refuses
+  while `node_modules` and the constant differ. When neither mode works, the command exits 1 and
+  names both fixes.
+- The token reaches the helper on stdin, as it reaches curl in `doctor`, so it is in no command
+  line (see Threat model). It is in no environment either, and the helper's redaction runs over
+  everything it writes, as `capture`'s does. The browser's profile lives in a temporary
+  folder (the container's tmpfs, or the run's `tmp` folder, which cleanup deletes). The host
+  helper runs under `env -i` with an allowlist. Playwright drives WebKit over a pipe, so this
+  command adds no DevTools port or stream to the one that the Threat model names for
+  agent-browser. Playwright opens a debugging port (`--remote-debugging-port=0`) only for its
+  `webkit-wsl` channel, a Windows option that the helper does not select.
+- CAUTION: in Docker mode `--network host` lets the container reach every loopback port of the
+  host, the sandbox's backend and its token included. The container gets the token on stdin only,
+  runs one file of this repo from the pinned image as your uid with no capabilities and a
+  read-only root, and mounts only `node_modules` (read-only), that file (read-only) and the
+  `<feature>` evidence folder of the step (the command refuses a name without a `<feature>/`).
+  The command refuses a Docker endpoint that is not a local socket (the token would leave the
+  host), refuses a control character or a byte that is not valid UTF-8 in that endpoint and in any
+  path it hands to Docker (Docker can echo a path to your terminal), and runs the docker CLI with
+  an empty private config (its `proxies` would otherwise go into the container's environment). The
+  single-account CAUTION of the Threat model applies to this command too.
+- Nothing outlives the command except the evidence: the container is removed when it exits and
+  stops itself after 180 s at most, and the private Docker config sits in the run's `tmp` folder
+  that cleanup deletes. Cleanup redacts the report like every other text file of the evidence.
+
 Proof standards:
 
 - Drive the path a user takes. No test-only routes, no state written behind the UI's back except
@@ -202,6 +345,12 @@ Proof standards:
   does not show it, follow the phone layout's own path to it or capture that it is absent, and
   say which. Run `agent-browser set viewport 1280 720` afterwards. A change with no UI needs no
   phone pass: say so.
+- For every UI change to layout, CSS, SVG or scrolling, add a WebKit capture
+  (`verify-xum.sh webkit-capture`, above) of each page the change reaches, and read the
+  `-webkit` PNG next to the `-375` one. Phone users run Safari, which is WebKit, and agent-browser
+  is Chromium: a page that fits in the `-375` capture can still break in WebKit. Say which captures
+  you could not make in WebKit, and why. For a bug a user saw in iOS Safari, a clean `-webkit`
+  capture does not close it: report it as not checked on a real iPhone.
 - Check side effects next to what is visible: rows in
   `$VERIFY_XUM_ROOT/sessions/<workspace id>/chat.jsonl`, entries in `$VERIFY_XUM_ROOT/config.json`,
   git state in the worktree, or the CLI view above.
@@ -231,13 +380,29 @@ after their other arguments. Without one they use the newest launch from this ch
 - The first open of a lazily loaded panel on a cold Vite cache (Review, for one) reloads the page:
   `server.log` shows `optimized dependencies changed. reloading`. The panel and its tab stay open
   across the reload. Run `idle`, wait for the panel's text, and continue from the open tab (see
-  the Review recipe).
-- Now and then a lazily loaded module request from agent-browser to Vite never completes. The
-  page or panel then shows `<name> failed to load.` with a `Reload` button, and the console logs
-  `Failed to fetch dynamically imported module`. curl gets the same module at once, so it is not
-  a product failure. `verify-xum.sh idle` exits 3 on it. Run `agent-browser reload`, then repeat
-  the step, and note the reload in your report.
-- A page that stays on `Loading Xum` under host load recovers with `agent-browser reload`.
+  the Review recipe). Vite's scan does not see the dependencies of the highlight worker
+  (`@pierre/highlights`), and a request for that worker on a cache without them logs the same
+  lines. Launch's module walk leaves workers out, so a cold cache still reloads at that request.
+  Vite then invalidates every module it had transformed, so the page load after the reload is as
+  slow as a cold one.
+- Now and then Chrome fails every module request that is still queued (a dozen to over a hundred
+  while the page loads) with `net::ERR_NETWORK_CHANGED`, because a network interface or address of
+  the host changed. A Docker container that starts on a shared host adds one: `ip monitor link`
+  shows its `veth` links at that instant. Vite is not at fault: curl gets the same module at once.
+  What the page shows depends on the failed modules. A lazily loaded one shows
+  `<name> failed to load.` with a `Reload` button, the console logs
+  `Failed to fetch dynamically imported module`, and `verify-xum.sh idle` exits 3. A module of the
+  first-load graph replaces `Loading Xum` with the boot screen's `Xum could not load` and a
+  focused `Reload` button, and `idle` exits 3 too. `React.lazy` keeps a failure, so only a reload
+  recovers. Run `agent-browser reload`, then repeat the step, and note the reload in your report.
+  Launch warms Vite, so a page load takes a few seconds and the window for such a change is
+  short. Under heavy host load a warm load can still take 20 s.
+- A page that stays on `Loading Xum` after `idle` timed out is slow or has a request that hangs (a
+  hung request raises no error, so the boot screen shows none). A slow transform is not the usual
+  cause after a launch, because Vite has already transformed every module. Vite transforms a module
+  again after a source edit, and every module again after a dependency re-optimization (the first
+  item above). Then the page can stay on `Loading Xum` for as long as a cold load takes, which is
+  longer than one `idle`: run `idle` again, then `agent-browser reload`.
 - agent-browser's headless Chromium matches `(hover: none)`, so Tailwind's `hover:` and
   `group-hover:` variants never apply. Controls that appear on hover (a sidebar row's archive
   icon) ignore clicks there. Focus them (`agent-browser focus '[aria-label="<name>"]'`) and press

@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { localBgWorkspaceDir } from "@/node/services/backgroundProcessExecutor";
 import { spawn } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as path from "path";
@@ -79,6 +81,20 @@ describe("structural workspace mutations across two backends on one root", () =>
   let deleteWorkspace: ReturnType<typeof mock>;
   let ensureReady: ReturnType<typeof mock>;
   const leases: WorkspaceUseLease[] = [];
+  const processRecordDirs: string[] = [];
+
+  async function createProcessRecord(
+    meta?: { pid: number; status: string },
+    workspaceId = rootId
+  ): Promise<string> {
+    const recordPath = path.join(localBgWorkspaceDir(workspaceId), `recovery-${randomUUID()}`);
+    processRecordDirs.push(recordPath);
+    await fsPromises.mkdir(recordPath, { recursive: true });
+    if (meta != null) {
+      await fsPromises.writeFile(path.join(recordPath, "meta.json"), JSON.stringify(meta));
+    }
+    return recordPath;
+  }
 
   beforeEach(async () => {
     const fixture = await createTestHistoryService();
@@ -112,6 +128,9 @@ describe("structural workspace mutations across two backends on one root", () =>
 
   afterEach(async () => {
     for (const lease of leases.splice(0)) await lease.release();
+    for (const recordPath of processRecordDirs.splice(0)) {
+      await fsPromises.rm(recordPath, { recursive: true, force: true });
+    }
     mock.restore();
     await cleanupFixture();
   });
@@ -217,6 +236,80 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(await a.workspaceService.remove(rootId, true)).toMatchObject({ success: true });
     expect(deleteWorkspace).toHaveBeenCalledTimes(1);
     expect(rowOf(a.config, rootId)).toBeUndefined();
+  });
+
+  test("force alone refuses unknown process records; exact confirmation permits removal", async () => {
+    const recordPath = await createProcessRecord();
+    const refused = await a.workspaceService.remove(rootId, true);
+    expect(refused).toMatchObject({
+      success: false,
+      backgroundProcesses: [{ recordPath, state: "unknown", workspaceId: rootId }],
+    });
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    expect(rowOf(a.config, rootId)?.pendingRemoval).toBeUndefined();
+
+    const removed = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [recordPath],
+    });
+    expect(removed.success).toBe(true);
+    expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    expect(deleteWorkspace.mock.calls[0]?.[5]).toBeUndefined();
+    // Recovery authorizes deletion, not removal of process evidence.
+    expect(await fsPromises.readdir(recordPath)).toEqual([]);
+  });
+
+  test("confirmation does not cover a new unknown process record", async () => {
+    const acknowledged = await createProcessRecord();
+    const newRecord = await createProcessRecord();
+    const refused = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [acknowledged],
+    });
+    expect(refused).toMatchObject({
+      success: false,
+      backgroundProcesses: [{ recordPath: newRecord, state: "unknown" }],
+    });
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("unknown-record confirmation cannot bypass a running process", async () => {
+    const unknown = await createProcessRecord();
+    const live = await createProcessRecord({ pid: process.pid, status: "running" });
+    const refused = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [unknown, live],
+    });
+    expect(refused).toMatchObject({
+      success: false,
+      backgroundProcesses: [{ recordPath: live, state: "running" }],
+    });
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("unknown-record confirmation cannot bypass another backend's lease", async () => {
+    const recordPath = await createProcessRecord();
+    await hold(b, rootId, "turn");
+    const refused = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [recordPath],
+    });
+    expect(errorOf(refused)).toContain(inUseElsewhere);
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("confirmation for the parent cannot bypass a shared-checkout sibling's unknown record", async () => {
+    await a.config.editConfig((config) => {
+      config.projects.get(projectPath)!.workspaces.push({
+        ...projectWorkspace(projectPath, "root", sharedChildId, { name: "shared" }),
+        parentWorkspaceId: rootId,
+        taskIsolation: "none",
+        runtimeConfig: { type: "worktree", srcBaseDir },
+      });
+      return config;
+    });
+    const recordPath = await createProcessRecord(undefined, sharedChildId);
+    const refused = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [recordPath],
+    });
+    expect(errorOf(refused)).toContain("running background process");
+    expect(deleteWorkspace).not.toHaveBeenCalled();
   });
 
   test("remove still ends this backend's own turn and terminals itself", async () => {

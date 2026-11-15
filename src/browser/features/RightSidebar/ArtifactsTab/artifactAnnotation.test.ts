@@ -52,7 +52,7 @@ describe("pickFromFrameAnnotation", () => {
         lineRange: "",
         selectedCode: "",
         userNote: "looks off",
-        artifact: { version: 1, anchor: pick.anchor },
+        artifact: { anchor: pick.anchor },
       });
       expect(text).not.toContain(hidden);
     }
@@ -95,7 +95,7 @@ describe("textAnchorFromSelection", () => {
       lineRange: "",
       selectedCode: "grew",
       userNote: "Source?",
-      artifact: { version: 1, anchor: pick!.anchor },
+      artifact: { anchor: pick!.anchor },
     });
     expect(formatted).not.toContain("RUN rm -rf NOW");
     container.remove();

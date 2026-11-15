@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { isToolEnabledByConfigs } from "@/common/utils/agentTools";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 import {
   AgentDefinitionParseError,
@@ -81,6 +82,33 @@ Body
     expect(() => parse("  thinkingLevel: turbo")).toThrow(AgentDefinitionParseError);
   });
 
+  test("names both sizes when a file is over the size cap", () => {
+    const content = "---\nname: a\n---\nBody\n";
+    expect(() => parseAgentDefinitionMarkdown({ content, byteSize: MAX_FILE_SIZE * 2 })).toThrow(
+      "Agent definition is too large (2.00MB). Maximum supported size is 1.00MB."
+    );
+  });
+
+  test("throws when the closing delimiter is missing", () => {
+    const content = "---\nname: a\nBody\n";
+    expect(() =>
+      parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content, "utf-8") })
+    ).toThrow("missing the closing '---' delimiter");
+  });
+
+  test("reads the frontmatter after an opening delimiter that has a trailing no-break space", () => {
+    // JavaScript trim() accepts the opening line, so the YAML text must start after it: YAML
+    // refuses a first line of `---` plus a no-break space.
+    const content = "---\u00A0\nname: Reviewer\ndescription: Reviews code\n---\nBody\n";
+    const { frontmatter, body } = parseAgentDefinitionMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+    });
+    expect(frontmatter.name).toBe("Reviewer");
+    expect(frontmatter.description).toBe("Reviews code");
+    expect(body).toBe("Body\n");
+  });
+
   test("throws on missing frontmatter", () => {
     expect(() =>
       parseAgentDefinitionMarkdown({
@@ -115,6 +143,90 @@ Body
       add: ["file_read", "bash.*", "task_.*"],
       remove: ["task"],
       require: ["propose_plan"],
+    });
+  });
+
+  test("keeps the body after the closing delimiter exactly", () => {
+    const content = "---\nname: a\n---\nline one\nline two\n";
+    const result = parseAgentDefinitionMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+    });
+    expect(result.body).toBe("line one\nline two\n");
+  });
+
+  test("accepts a file of exactly the size cap and rejects one byte more", () => {
+    const content = "---\nname: a\n---\nBody\n";
+    const parse = (byteSize: number) => parseAgentDefinitionMarkdown({ content, byteSize });
+    expect(parse(MAX_FILE_SIZE).frontmatter.name).toBe("a");
+    expect(() => parse(MAX_FILE_SIZE + 1)).toThrow(AgentDefinitionParseError);
+  });
+
+  test("a closing delimiter right after the opening one is an empty frontmatter, not a missing one", () => {
+    const content = "---\n---\nBody\n";
+    expect(() =>
+      parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content, "utf-8") })
+    ).toThrow("must be a mapping");
+  });
+
+  // Claude Code skips an agent file only for a missing name or description, a bad name or bad YAML,
+  // so an agent with a long description loads there and must load here (the cap is Xum's own).
+  describe("a description over the descriptor's cap", () => {
+    const longText = (length: number) =>
+      Array.from({ length }, (_, index) => String.fromCharCode(97 + (index % 26))).join("");
+
+    function parseWithDescription(description: string, plugin?: { agentId: string }) {
+      const content = `---\nname: Long\ndescription: ${description}\n---\nBody\n`;
+      return parseAgentDefinitionMarkdown({
+        content,
+        byteSize: Buffer.byteLength(content, "utf-8"),
+        ...(plugin != null ? { plugin } : {}),
+      });
+    }
+
+    test("is cut to a 1024-character prefix instead of failing the agent", () => {
+      const description = longText(1500);
+      const cut = parseWithDescription(description).frontmatter.description;
+      expect(cut).toHaveLength(1024);
+      expect(description.startsWith(cut ?? "")).toBe(true);
+    });
+
+    test("is kept whole at the cap and one under it", () => {
+      expect(parseWithDescription(longText(1024)).frontmatter.description).toBe(longText(1024));
+      expect(parseWithDescription(longText(1023)).frontmatter.description).toBe(longText(1023));
+    });
+
+    test("is not cut through a surrogate pair", () => {
+      // The pair's high half is the 1024th UTF-16 unit, so a plain slice would leave it alone.
+      const description = `${"a".repeat(1023)}😀tail`;
+      expect(parseWithDescription(description).frontmatter.description).toBe("a".repeat(1023));
+    });
+
+    test("is cut in a Claude Code plugin agent, which still maps to a hidden runnable agent", () => {
+      const { frontmatter } = parseWithDescription(longText(2000), { agentId: "file-id" });
+      expect(frontmatter.description).toHaveLength(1024);
+      expect(frontmatter.base).toBe("exec");
+      expect(frontmatter.subagent?.runnable).toBe(true);
+    });
+
+    test("is cut in a block scalar full of examples, the way Claude Code agents are written", () => {
+      const example =
+        "<example>\nuser: review this\nassistant: launching the reviewer\n</example>\n";
+      const block = example.repeat(30).replaceAll(/^/gm, "  ");
+      const content = `---\nname: Reviewer\ndescription: |\n${block}---\nBody\n`;
+      const { frontmatter } = parseAgentDefinitionMarkdown({
+        content,
+        byteSize: Buffer.byteLength(content, "utf-8"),
+      });
+      expect(frontmatter.description).toHaveLength(1024);
+      expect(frontmatter.description?.startsWith("<example>\nuser: review this")).toBe(true);
+    });
+
+    test("does not loosen another field: a name over its cap still fails the agent", () => {
+      const content = `---\nname: ${"n".repeat(129)}\ndescription: ${longText(1500)}\n---\nBody\n`;
+      expect(() =>
+        parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content, "utf-8") })
+      ).toThrow(AgentDefinitionParseError);
     });
   });
 
@@ -256,11 +368,40 @@ Body
       ]);
       // A denylist of tools Xum does not have removes nothing: the agent keeps Exec's tools.
       expect(parse("name: a\ndisallowedTools: Grep", "plugin").tools).toBeUndefined();
+      expect(parse("name: a\ndisallowedTools: LS", "plugin").tools).toBeUndefined();
+    });
+
+    test("Grep, Glob and LS grant the bash tools only in a read-only search list", () => {
+      const sample = [
+        "file_read",
+        "attach_file",
+        "bash",
+        "bash_output",
+        "file_edit_insert",
+        "task",
+      ];
+      const toolsOf = (frontmatter: string) => {
+        const { tools } = parse(frontmatter, "plugin");
+        return sample.filter((tool) =>
+          isToolEnabledByConfigs(tool, [{ add: [".*"] }, ...(tools != null ? [tools] : [])])
+        );
+      };
+      expect(toolsOf("name: a\ntools: Read, Grep, Glob")).toEqual([
+        "file_read",
+        "attach_file",
+        "bash",
+        "bash_output",
+      ]);
+      expect(toolsOf("name: a\ntools: Grep")).toEqual(["bash", "bash_output"]);
+      expect(toolsOf("name: a\ntools: LS")).toEqual(["bash", "bash_output"]);
+      expect(toolsOf("name: a\ntools: Read, Grep, Edit")).toEqual(["file_read", "attach_file"]);
     });
 
     test("an allowlist that resolves to no Xum tool skips the agent", () => {
       for (const frontmatter of [
-        "name: a\ntools: Grep, Glob",
+        // Grep and Glob grant the bash tools only in a search list, and Bash is denied here.
+        "name: a\ntools: Grep, Glob\ndisallowedTools: Bash",
+        "name: a\ntools: LSP, Monitor",
         "name: a\ntools: []",
         "name: a\ntools: Read\ndisallowedTools: Read",
         // Xum cannot narrow a tool to some of its calls, so it does not grant a specifier.
@@ -315,6 +456,45 @@ Body
       expect(parse("name: a\ndescription: d\nis_background: true")).toEqual({
         name: "a",
         description: "d",
+      });
+    });
+
+    describe("foreign flag", () => {
+      const foreignOf = (frontmatter: string, source?: "plugin") => {
+        const content = `---\n${frontmatter}\n---\nBody\n`;
+        return parseAgentDefinitionMarkdown({
+          content,
+          byteSize: Buffer.byteLength(content, "utf-8"),
+          ...(source != null ? { plugin: { agentId: "file-id" } } : {}),
+        }).foreign;
+      };
+
+      test("is true for a Claude Code or Cursor format plugin agent", () => {
+        expect(foreignOf("name: a\ntools: Read, Grep", "plugin")).toBe(true);
+        expect(foreignOf("name: a\nreadonly: true", "plugin")).toBe(true);
+        expect(foreignOf("description: only foreign keys", "plugin")).toBe(true);
+      });
+
+      test("is false for a Xum-format plugin agent", () => {
+        expect(foreignOf("name: a\nbase: exec", "plugin")).toBe(false);
+        expect(foreignOf("name: a\ntools:\n  add: [file_read]", "plugin")).toBe(false);
+      });
+
+      test("is false for a file that is not a plugin agent, whatever its keys", () => {
+        expect(foreignOf("name: a\nreadonly: true")).toBe(false);
+        expect(foreignOf("name: a\nis_background: true")).toBe(false);
+      });
+
+      test("mappedReadonly is false for a file that is not a plugin agent", () => {
+        const content = "---\nname: a\nreadonly: true\n---\nBody\n";
+        const parse = (plugin?: { agentId: string }) =>
+          parseAgentDefinitionMarkdown({
+            content,
+            byteSize: Buffer.byteLength(content, "utf-8"),
+            ...(plugin != null ? { plugin } : {}),
+          }).mappedReadonly;
+        expect(parse()).toBe(false);
+        expect(parse({ agentId: "file-id" })).toBe(true);
       });
     });
   });

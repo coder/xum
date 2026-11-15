@@ -11,7 +11,7 @@ import { deriveProjectRelativePath } from "@/common/utils/review/assistedReview"
 import { createSkillPathsMatcher } from "@/common/utils/skills/skillPaths";
 import { log } from "@/node/services/log";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { resolvePathWithinCwd } from "@/node/services/tools/fileCommon";
+import { resolveFileToolPath } from "@/node/services/tools/fileCommon";
 import { formatSkillIndexDescription } from "@/node/services/tools/agent_skill_read";
 
 /**
@@ -132,7 +132,7 @@ function toWorkspaceRelativePath(
   cwd: string,
   runtime: Runtime
 ): string | undefined {
-  const { resolvedPath } = resolvePathWithinCwd(toolPath, cwd, runtime);
+  const { resolvedPath } = resolveFileToolPath(toolPath, cwd, runtime);
   const relativePath = deriveProjectRelativePath(runtime.normalizePath(".", cwd), resolvedPath);
   if (relativePath == null || relativePath === "" || relativePath.startsWith("../")) {
     return undefined;

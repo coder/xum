@@ -5,6 +5,7 @@ import type { ToolExecutionOptions } from "ai";
 import type { ProposePlanToolResult } from "@/common/types/tools";
 import { createProposePlanTool } from "./propose_plan";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import type { AgentSandboxPolicy } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { setTodosForSessionDir } from "./todo";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
@@ -54,6 +55,47 @@ describe("propose_plan tool", () => {
       { content: "Writing the plan", status: "completed" },
       { content: "Wait for approval", status: "pending" },
     ]);
+  });
+
+  // A sandboxed command can replace the plan file with a link, and the plan goes into the chat.
+  it("reads the plan file only where the agent sandbox lets the file tools read", async () => {
+    using tempDir = new TestTempDir("propose-plan-sandbox");
+    const home = await fs.realpath(tempDir.path);
+    const workspace = path.join(home, "ws");
+    const plans = path.join(home, "plans");
+    await fs.mkdir(workspace);
+    await fs.mkdir(plans);
+    await fs.writeFile(path.join(home, "id_rsa"), "PRIVATE KEY");
+    const policy: AgentSandboxPolicy = {
+      writeRoots: [workspace],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: [home],
+      allowRead: [workspace],
+      network: "loopback",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    };
+    const config = createTestToolConfig(workspace);
+    config.runtime.agentSandboxPolicy = () => policy;
+    const propose = async (planPath: string) => {
+      const recorded: string[] = [];
+      const tool = createProposePlanTool({
+        ...config,
+        planFilePath: planPath,
+        recordProposedPlan: (_id, content) => recorded.push(content),
+      });
+      const result = (await tool.execute!({}, toolCallOptions)) as { success: boolean };
+      return { success: result.success, recorded };
+    };
+
+    const plan = path.join(plans, "plan.md");
+    await fs.writeFile(plan, "# Plan\n");
+    expect(await propose(plan)).toEqual({ success: true, recorded: ["# Plan\n"] });
+
+    const linked = path.join(plans, "linked.md");
+    await fs.symlink(path.join(home, "id_rsa"), linked);
+    expect(await propose(linked)).toEqual({ success: false, recorded: [] });
   });
 
   // #4826: "No plan file found … write your plan" would invite the agent to

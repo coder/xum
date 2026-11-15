@@ -14,10 +14,12 @@ import type {
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { SettingsBackup } from "@/common/config/schemas/settingsBackup";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
+import type { AgentSandboxConfig } from "@/common/config/schemas/agentSandbox";
 import type { z } from "zod";
 import type { ProjectConfigSchema, WorkspaceConfigSchema } from "../orpc/schemas";
 import type { AgentAiDefaults } from "./agentAiDefaults";
 import type { AutoModelRoutingConfig } from "./autoModelRouting";
+import type { IsolationChoice } from "./isolation";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings } from "./tasks";
 import type { ThinkingLevel } from "./thinking";
@@ -116,6 +118,8 @@ export interface ProjectsConfig {
   agentResourceLimits?: AgentResourceLimits;
   /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
   agentResourceLimitsEnabled?: boolean;
+  /** macOS sandbox for local agent commands. Absent = off. */
+  agentSandbox?: AgentSandboxConfig;
   /** Global defaults for new workspace goals. */
   goalDefaults?: GoalDefaults;
   /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */
@@ -185,7 +189,13 @@ export interface ProjectsConfig {
    */
   stopCoderWorkspaceOnArchive?: boolean;
 
-  /** Global default runtime for new workspaces. */
+  /** Global default project × workspace isolation for new workspaces. */
+  defaultIsolation?: IsolationChoice;
+
+  /**
+   * Legacy mirror of `defaultIsolation` for downgrade compatibility (older builds read only this
+   * flat runtime id). Derived from `defaultIsolation` on save; read only as a migration fallback.
+   */
   defaultRuntime?: RuntimeEnablementId;
 
   /**

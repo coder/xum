@@ -198,6 +198,14 @@ export function hasUrlCredentials(repoUrl: string): boolean {
   }
 }
 
+/**
+ * Whitespace, control characters (C0 and C1) and invisible format characters (bidi controls,
+ * zero-width spaces and joiners): none belongs in a remote URL. They are how a
+ * command injection into a later shell paste starts, and how a URL shown to the user is made to
+ * read differently from the one git gets. Not global, so `.test` keeps no state between calls.
+ */
+export const UNSAFE_URL_CHARACTERS = /[\s\p{Cc}\p{Cf}]/u;
+
 /** Bounds project-bundle manifest parsing work, mirroring the MCP redaction caps. */
 export const MAX_BACKUP_PROJECT_ENTRIES = 256;
 
@@ -212,10 +220,7 @@ export const MAX_BACKUP_PROJECT_ENTRIES = 256;
 export function sanitizeBackupGitRemote(rawUrl: string): string | undefined {
   const url = rawUrl.trim();
   if (url === "" || url.length > 2048) return undefined;
-  // Control characters and whitespace have no place in a remote URL and are how command
-  // injection into a later shell paste would start.
-  // eslint-disable-next-line no-control-regex
-  if (/[\s\u0000-\u001f\u007f]/.test(url)) return undefined;
+  if (UNSAFE_URL_CHARACTERS.test(url)) return undefined;
   // Percent-escapes would let a credential pattern hide from the publish-time secret scan
   // (which sees the manifest text, not its decoded form); real remotes do not need them.
   if (/%[0-9A-Fa-f]{2}/.test(url)) return undefined;
@@ -302,6 +307,13 @@ const BackupContentFlagsSchema = z.object({
    * artifacts are agent output, not settings. Project shelves travel only with includeProjects.
    */
   includeGlobalArtifacts: z.boolean().optional(),
+  /**
+   * The list of managed Agent Plugins (source URL, tracked ref and pinned commit) as an
+   * `agent-plugins/` sidecar. On by default, like the other settings: the list carries no code
+   * and no consent, and a restore installs nothing by itself. It only offers each missing
+   * plugin for the normal install review.
+   */
+  includePlugins: z.boolean().optional(),
 });
 
 export type BackupContentFlag = keyof z.infer<typeof BackupContentFlagsSchema>;
@@ -318,6 +330,7 @@ export const BACKUP_CONTENT_DEFAULTS: BackupContents = {
   includePreferences: true,
   includeProjects: false,
   includeGlobalArtifacts: false,
+  includePlugins: true,
 };
 
 export const BACKUP_CONTENT_FLAGS: readonly BackupContentFlag[] =

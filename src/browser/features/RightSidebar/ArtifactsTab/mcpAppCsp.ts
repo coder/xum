@@ -1,7 +1,7 @@
 import type { McpAppCspDeclaration } from "@/common/orpc/schemas/mcpApps";
 import { mcpAppGrantableOrigin } from "@/common/utils/mcpApps";
 import { ARTIFACT_IN_PAGE_LINK_SCRIPT } from "./artifactBridge";
-import { mcpAppDocumentChannelScript } from "./mcpAppDocumentChannel";
+import { mcpAppDocumentChannelScript } from "./frameDocumentChannel";
 
 /**
  * CSP for MCP Apps views (mcp-apps experiment).

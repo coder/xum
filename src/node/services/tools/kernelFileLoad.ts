@@ -14,6 +14,7 @@ import {
   StreamByteCeilingExceededError,
   streamToStringWithByteCeiling,
 } from "@/node/runtime/streamUtils";
+import type { FileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { MAX_FILE_SIZE, resolvePathWithinCwd, validateFileSize } from "./fileCommon";
 import { KERNEL_LOAD_PREVIEW_CHARS } from "@/constants/kernelOutput";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
@@ -91,12 +92,19 @@ export function createKernelFileLoader(config: {
   cwd: string;
   runtime: Runtime;
   hooks?: HookConfig;
+  sandbox?: FileToolSandboxContext;
 }): KernelFileLoader {
   const readWholeFile = async (
     path: string,
     abortSignal?: AbortSignal
   ): Promise<KernelLoadedFile> => {
-    const { resolvedPath } = resolvePathWithinCwd(path, config.cwd, config.runtime);
+    const { resolvedPath } = await resolvePathWithinCwd(
+      path,
+      config.cwd,
+      config.runtime,
+      "read",
+      config.sandbox
+    );
     // stat throws a RuntimeError with a clear message for missing paths.
     const stat = await config.runtime.stat(resolvedPath, abortSignal);
     if (stat.isDirectory) {

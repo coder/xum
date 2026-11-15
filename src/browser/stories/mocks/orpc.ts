@@ -3,12 +3,15 @@
  *
  * Creates a client that matches the AppRouter interface with configurable mock data.
  */
+import { isolationFromRuntimeId, type IsolationChoice } from "@/common/types/isolation";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
+import { patchAgentSandbox, type AgentSandboxPatch } from "@/common/config/schemas/agentSandbox";
+import type { AgentSandboxState } from "@/common/orpc/schemas/agentSandbox";
 import type { ExperimentId } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -19,9 +22,9 @@ import type {
   ArtifactListing,
   ArtifactReadResult,
   ArtifactShelfListing,
-  ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
+import { EMPTY_BACKUP_PLUGIN_REPORT, type BackupPluginReport } from "@/common/orpc/schemas/backup";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
@@ -99,6 +102,11 @@ import {
 } from "@/common/config/schemas/userPreferences";
 import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import {
+  parseSshDirectoryTrustTarget,
+  TRUST_PROJECT_FIRST_ERROR,
+  withSshDirectoryTrust,
+} from "@/common/utils/sshDirectoryTrust";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import {
   normalizeAutoModelRoutingConfig,
@@ -153,6 +161,11 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
   MockBackupRouteOutput<Route>,
   { success: true }
 >["data"];
+/** A fixture may leave out the plugin report: the mock then reports a backup with no plugin list. */
+type MockBackupFixture<Route extends "preview" | "restore"> = Omit<
+  MockBackupData<Route>,
+  "plugins"
+> & { plugins?: BackupPluginReport };
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
 
 export interface MockORPCClientOptions {
@@ -174,6 +187,8 @@ export interface MockORPCClientOptions {
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
     hooks?: Record<string, AgentPluginHooks>;
+    /** Returned by agentPlugins.containerLocation; defaults to `~/.mux/plugins`. */
+    containerLocation?: string;
     /** Returned by agentPlugins.pendingSignOuts; omit for no record. */
     pendingSignOuts?: AgentPluginPendingSignOuts;
     /**
@@ -209,6 +224,7 @@ export interface MockORPCClientOptions {
   /** Initial runtime enablement for config.getConfig */
   runtimeEnablement?: Record<string, boolean>;
   /** Initial default runtime for config.getConfig (global) */
+  /** Legacy flat default runtime, converted to the served defaultIsolation (stories stay terse). */
   defaultRuntime?: RuntimeEnablementId | null;
   /** Initial global heartbeat default prompt for config.getConfig */
   heartbeatDefaultPrompt?: string;
@@ -218,6 +234,8 @@ export interface MockORPCClientOptions {
   goalDefaults?: GoalDefaults;
   /** Agent resource limits and their status (Settings → Agents); off when omitted. */
   agentResourceLimits?: AgentResourceLimitsState;
+  /** Agent sandbox setting and support (Settings → Agents); off and supported when omitted. */
+  agentSandbox?: AgentSandboxState;
   /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
   autoModelRouting?: AutoModelRoutingConfig;
   /**
@@ -238,18 +256,12 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
-  /**
-   * Artifacts tab: listing for artifacts.list and read results keyed by relative path. The
-   * mock's artifact id is the path, so version contents are keyed by `${path}@${version}`.
-   */
+  /** Artifacts tab: listing for artifacts.list and read results keyed by relative path. */
   artifacts?: {
     listing: ArtifactListing;
     files: Record<string, ArtifactReadResult>;
     /** artifacts.capabilities answer; omitted means unknown (null). */
     agentBrowserAvailable?: boolean | null;
-    /** Stored versions per artifact path, newest first. */
-    versions?: Record<string, ArtifactVersion[]>;
-    versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
     pinnedFiles?: Record<string, ArtifactReadResult>;
     /** Shelf (M5c) listing and read results keyed by `${scope}:${name}`. */
@@ -259,6 +271,8 @@ export interface MockORPCClientOptions {
     states?: Record<string, unknown>;
     /** When set, artifacts.sendInteraction fails with this error (the strip's error state). */
     sendInteractionError?: string;
+    /** Gets every artifacts.setState call (window.xum.setState reached the host). */
+    onSetState?: (input: { path: string; state: unknown }) => void;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
@@ -446,9 +460,9 @@ export interface MockORPCClientOptions {
   };
   backupSettings?: MockBackupSettings | null;
   backupValidation?: MockBackupData<"validate">;
-  backupPreview?: MockBackupData<"preview">;
+  backupPreview?: MockBackupFixture<"preview">;
   backupPush?: MockBackupData<"push">;
-  backupRestore?: MockBackupData<"restore">;
+  backupRestore?: MockBackupFixture<"restore">;
   /** Per-workspace runtime statuses for RuntimeStatusStore stories */
   runtimeStatuses?: Map<string, "running" | "stopped" | "unknown" | "unsupported">;
 }
@@ -564,6 +578,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
     agentResourceLimits: initialAgentResourceLimits,
+    agentSandbox: initialAgentSandbox,
     autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
     timelineEvents = [],
@@ -743,11 +758,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     devcontainer: true,
   };
 
-  let defaultRuntime: RuntimeEnablementId | null = initialDefaultRuntime ?? null;
+  let defaultIsolation: IsolationChoice | null =
+    initialDefaultRuntime != null ? isolationFromRuntimeId(initialDefaultRuntime) : null;
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let agentResourceLimitsState =
     initialAgentResourceLimits ?? mockAgentResourceLimitsState(false, {});
+  let agentSandboxState: AgentSandboxState = initialAgentSandbox ?? {
+    global: {},
+    projects: {},
+    support: { state: "supported" },
+  };
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
   let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
@@ -816,15 +837,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     empty: false,
     credential: "gh",
   };
-  const backupPreviewResult: MockBackupData<"preview"> = backupPreview ?? {
-    pushChanges: [],
-    restoreChanges: [],
-    localOnlyFiles: [],
-    redactions: [],
-    commandApprovals: [],
-    projectImports: [],
-    projectBundleSkipped: false,
-    pushError: null,
+  const backupPreviewResult: MockBackupData<"preview"> = {
+    plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+    ...(backupPreview ?? {
+      pushChanges: [],
+      restoreChanges: [],
+      localOnlyFiles: [],
+      redactions: [],
+      commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
+      pushError: null,
+    }),
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
     commit: "abc1234",
@@ -832,14 +856,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     credential: backupValidationResult.credential,
     redactions: [],
   };
-  const backupRestoreResult: MockBackupData<"restore"> = backupRestore ?? {
-    commit: "def5678",
-    snapshotPath: "/tmp/mux-backup-snapshot",
-    changedFiles: [],
-    localOnlyFiles: [],
-    projectImportResults: [],
-    projectBundleSkipped: false,
-    unapprovedProjectImports: [],
+  const backupRestoreResult: MockBackupData<"restore"> = {
+    plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+    ...(backupRestore ?? {
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: [],
+    }),
   };
 
   const mockStats: ChatStats = {
@@ -968,7 +995,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           coderWorkspaceArchiveBehavior,
           worktreeArchiveBehavior,
           runtimeEnablement,
-          defaultRuntime,
+          defaultIsolation,
           agentAiDefaults,
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
@@ -1124,11 +1151,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       updateRuntimeEnablement: (input: {
         projectPath?: string | null;
         runtimeEnablement?: Record<string, boolean> | null;
-        defaultRuntime?: RuntimeEnablementId | null;
+        defaultIsolation?: IsolationChoice | null;
         runtimeOverridesEnabled?: boolean | null;
       }) => {
         const shouldUpdateRuntimeEnablement = input.runtimeEnablement !== undefined;
-        const shouldUpdateDefaultRuntime = input.defaultRuntime !== undefined;
+        const shouldUpdateDefaultIsolation = input.defaultIsolation !== undefined;
         const shouldUpdateOverridesEnabled = input.runtimeOverridesEnabled !== undefined;
         const projectPath = input.projectPath?.trim();
 
@@ -1162,11 +1189,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               }
             }
 
-            if (shouldUpdateDefaultRuntime) {
-              if (input.defaultRuntime !== null && input.defaultRuntime !== undefined) {
-                nextProject.defaultRuntime = input.defaultRuntime;
+            if (shouldUpdateDefaultIsolation) {
+              if (input.defaultIsolation != null) {
+                nextProject.defaultIsolation = input.defaultIsolation;
               } else {
-                delete nextProject.defaultRuntime;
+                delete nextProject.defaultIsolation;
               }
             }
 
@@ -1192,8 +1219,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           }
         }
 
-        if (shouldUpdateDefaultRuntime) {
-          defaultRuntime = input.defaultRuntime ?? null;
+        if (shouldUpdateDefaultIsolation) {
+          defaultIsolation = input.defaultIsolation ?? null;
         }
 
         notifyConfigChanged();
@@ -1362,7 +1389,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
-      containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      containerLocation: () =>
+        Promise.resolve(agentPluginsMock?.containerLocation ?? "~/.mux/plugins"),
       listForSettings: () =>
         Promise.resolve({
           list: { success: true as const, data: agentPluginsMock?.items ?? [] },
@@ -1841,8 +1869,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({
           branches: ["main", "develop", "feature/new-feature"],
           recommendedTrunk: "main",
+          defaultBranch: "main",
         });
       },
+      listSshConfigHosts: () => Promise.resolve({ hosts: ["devbox", "gpu-01"] }),
       runtimeAvailability: () =>
         Promise.resolve(
           customRuntimeAvailability ?? {
@@ -1887,6 +1917,32 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           project.trusted = input.trusted;
         }
         return Promise.resolve();
+      },
+      // As the backend: the trust owner (the parent of a sub-project) stores the directory as
+      // resolved on the host, where the mock's home is /home/mock.
+      setSshDirectoryTrust: (input: {
+        projectPath: string;
+        host: string;
+        port?: number | null;
+        projectDir: string;
+        trusted: boolean;
+      }) => {
+        const target = parseSshDirectoryTrustTarget(input);
+        if (!target.success) return Promise.resolve(target);
+        const ownerPath = projects.get(input.projectPath)?.parentProjectPath ?? input.projectPath;
+        const owner = projects.get(ownerPath);
+        if (input.trusted && owner?.trusted !== true) {
+          return Promise.resolve({ success: false as const, error: TRUST_PROJECT_FIRST_ERROR });
+        }
+        const projectDir = target.data.projectDir.replace(/^~(?=\/|$)/, "/home/mock");
+        if (owner) {
+          owner.trustedSshDirectories = withSshDirectoryTrust(
+            owner.trustedSshDirectories,
+            { ...target.data, projectDir },
+            input.trusted
+          );
+        }
+        return Promise.resolve({ success: true as const, data: { projectDir } });
       },
       setDisplayName: (input: { projectPath: string; displayName?: string | null }) => {
         const project = projects.get(input.projectPath);
@@ -2168,6 +2224,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({ success: true as const, data: undefined });
       },
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
+      answerSandboxApproval: () => Promise.resolve({ success: true, data: undefined }),
       setQueuedMessageDispatchMode: () => Promise.resolve({ success: true, data: true }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),
       truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
@@ -2569,24 +2626,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       capabilities: () =>
         Promise.resolve({ agentBrowserAvailable: artifacts.agentBrowserAvailable ?? null }),
-      listVersions: (input: { workspaceId: string; path: string }) =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            artifactId: input.path,
-            path: input.path,
-            pin: null,
-            versions: artifacts.versions?.[input.path] ?? [],
-          },
-        }),
-      readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
-        const file = artifacts.versionFiles?.[`${input.artifactId}@${input.version}`];
-        return Promise.resolve(
-          file
-            ? { success: true as const, data: file }
-            : { success: false as const, error: `Version not found: v${input.version}` }
-        );
-      },
       listPinned: () =>
         Promise.resolve({
           success: true as const,
@@ -2619,15 +2658,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `Shelf entry not found: ${input.name}` }
         );
       },
-      pinToShelf: (input: { artifactId: string }) =>
-        Promise.resolve({ success: true as const, data: { name: input.artifactId } }),
+      pinToShelf: (input: { path: string }) =>
+        Promise.resolve({ success: true as const, data: { name: input.path } }),
       unpinShelf: () => Promise.resolve({ success: true as const, data: undefined }),
       getState: (input: { workspaceId: string; path: string }) =>
         Promise.resolve({
           success: true as const,
           data: { state: artifacts.states?.[input.path] ?? null },
         }),
-      setState: () => Promise.resolve({ success: true as const, data: undefined }),
+      setState: (input: { path: string; state: unknown }) => {
+        artifacts.onSetState?.({ path: input.path, state: input.state });
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       sendInteraction: () =>
         Promise.resolve(
           artifacts.sendInteractionError != null
@@ -2747,6 +2789,26 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           projects
         );
         return Promise.resolve(agentResourceLimitsState);
+      },
+    },
+    // Saves are field patches (null removes a field), applied as the backend does.
+    agentSandbox: {
+      get: () => Promise.resolve(agentSandboxState),
+      set: (patch: AgentSandboxPatch) => {
+        const global = patchAgentSandbox(agentSandboxState.global, patch) ?? {};
+        agentSandboxState = { ...agentSandboxState, global };
+        return Promise.resolve(agentSandboxState);
+      },
+      setProject: (input: { projectPath: string; sandbox: AgentSandboxPatch }) => {
+        const projects = { ...agentSandboxState.projects };
+        const next = patchAgentSandbox(projects[input.projectPath], input.sandbox);
+        if (next === undefined) {
+          delete projects[input.projectPath];
+        } else {
+          projects[input.projectPath] = next;
+        }
+        agentSandboxState = { ...agentSandboxState, projects };
+        return Promise.resolve(agentSandboxState);
       },
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by

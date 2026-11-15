@@ -48,6 +48,10 @@ import {
   readAgentDefinition,
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import {
+  formatPluginAgentRefusal,
+  PluginAgentRefusalError,
+} from "@/node/services/agentDefinitions/pluginAgentRefusal";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
@@ -93,6 +97,7 @@ import { defaultModel } from "@/common/utils/ai/models";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type { ProjectsConfig } from "@/common/types/project";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -301,6 +306,35 @@ export function buildWorkspaceAgentContext(
     runtimeConfig: params.runtimeConfig,
     projectPluginsTrusted,
   };
+}
+
+/**
+ * Agent-discovery context for an existing target workspace's checkout. An entry without its own
+ * runtimeConfig runs on its owner's runtime, and trust follows the runtime it really runs on: an
+ * SSH+None directory needs its own trust (isWorkspaceProjectTrustedIn).
+ */
+export function buildTargetWorkspaceAgentContext(
+  projects: ProjectsConfig["projects"],
+  target: { projectPath: string; workspace: WorkspaceConfigEntry },
+  owner: Pick<WorkspaceMetadata, "runtimeConfig" | "name">
+): WorkspaceTurnAgentContext {
+  const runtimeConfig = target.workspace.runtimeConfig ?? owner.runtimeConfig;
+  return buildWorkspaceAgentContext(
+    {
+      runtimeConfig,
+      projectPath: target.projectPath,
+      // Entries created by workspaceService.create always carry a name; the fallback
+      // only satisfies the optional persisted-config type.
+      workspaceName: coerceNonEmptyString(target.workspace.name) ?? owner.name,
+      persistedWorkspacePath: target.workspace.path,
+      subProjectPath: target.workspace.subProjectPath,
+    },
+    isWorkspaceProjectTrustedIn(projects, {
+      kind: target.workspace.kind,
+      projectPath: target.projectPath,
+      runtimeConfig,
+    })
+  );
 }
 
 /**
@@ -767,6 +801,15 @@ function remoteBoxDeletionRefusal(
     return 'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".';
   }
   return undefined;
+}
+
+/**
+ * A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4): its reason is named.
+ */
+function agentLookupFailure(error: unknown, agentId: string): string {
+  return error instanceof PluginAgentRefusalError
+    ? `Task.createWorkspaceTurn: ${formatPluginAgentRefusal(error)}`
+    : `Task.createWorkspaceTurn: unknown agentId (${agentId})`;
 }
 
 export class WorkspaceTurnManager {
@@ -1293,7 +1336,7 @@ export class WorkspaceTurnManager {
           )
         );
       }
-      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+      return Err(agentLookupFailure(error, params.agentId));
     }
     let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
     try {
@@ -1312,7 +1355,7 @@ export class WorkspaceTurnManager {
           )
         );
       }
-      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+      return Err(agentLookupFailure(error, params.agentId));
     }
     if (!resolveAgentVisibility(frontmatter.ui).selectable) {
       return Err(
@@ -1440,7 +1483,7 @@ export class WorkspaceTurnManager {
           )
         );
       }
-      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+      return Err(agentLookupFailure(error, params.agentId));
     }
     if (resolvedScope === "project") {
       return Err(
@@ -1683,22 +1726,7 @@ export class WorkspaceTurnManager {
         );
         const targetContext =
           targetEntry != null
-            ? buildWorkspaceAgentContext(
-                {
-                  runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
-                  projectPath: targetEntry.projectPath,
-                  // Entries created by workspaceService.create always carry a name; the fallback
-                  // only satisfies the optional persisted-config type.
-                  workspaceName:
-                    coerceNonEmptyString(targetEntry.workspace.name) ?? parentMeta.name,
-                  persistedWorkspacePath: targetEntry.workspace.path,
-                  subProjectPath: targetEntry.workspace.subProjectPath,
-                },
-                isWorkspaceProjectTrustedIn(cfg.projects, {
-                  kind: targetEntry.workspace.kind,
-                  projectPath: targetEntry.projectPath,
-                })
-              )
+            ? buildTargetWorkspaceAgentContext(cfg.projects, targetEntry, parentMeta)
             : ownerContext;
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,

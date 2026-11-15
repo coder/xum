@@ -13,6 +13,7 @@ interface ToggleGroupProps<T extends string> {
   compact?: boolean; // If true, show only active option as clickable badge
   /** `aria-keyshortcuts` for every option button, when a shortcut switches between them. */
   keyShortcuts?: string;
+  disabled?: boolean;
 }
 
 export function ToggleGroup<T extends string>({
@@ -21,6 +22,7 @@ export function ToggleGroup<T extends string>({
   onChange,
   compact = false,
   keyShortcuts,
+  disabled = false,
 }: ToggleGroupProps<T>) {
   // Compact mode: show only active option, click cycles to next option
   if (compact) {
@@ -55,9 +57,10 @@ export function ToggleGroup<T extends string>({
             onClick={() => onChange(option.value)}
             aria-pressed={isActive}
             aria-keyshortcuts={keyShortcuts}
+            disabled={disabled}
             type="button"
             className={cn(
-              "px-1.5 py-0.5 text-[11px] font-sans rounded-sm border-none cursor-pointer transition-all duration-150 bg-transparent",
+              "px-1.5 py-0.5 text-[11px] font-sans rounded-sm border-none cursor-pointer transition-all duration-150 bg-transparent disabled:cursor-not-allowed disabled:opacity-50",
               isActive
                 ? "text-toggle-text-active bg-toggle-active font-medium"
                 : "text-toggle-text font-normal hover:text-toggle-text-hover hover:bg-toggle-hover",

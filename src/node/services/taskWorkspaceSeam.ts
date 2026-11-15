@@ -270,6 +270,8 @@ export interface RemovalAttemptBinding {
 /** keepBranch: remove only the checkout, e.g. undoing a creation that reused a branch (#4819). */
 export interface RemovalCheckoutOptions {
   keepBranch?: boolean;
+  /** Exact unknown record paths the user accepts for this removal only. */
+  acknowledgedUnknownProcessRecords?: string[];
   /**
    * The caller already holds this workspace's structural mutation gate: a parent removal gates
    * its whole sub-agent tree before removing any of it (#4477).

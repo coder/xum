@@ -87,6 +87,7 @@ import {
 } from "@/node/services/agentPlugins/approvedCopies";
 import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+import type { FileToolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
 import {
   getCanonicalProjectMetadataRelativePath,
   LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR,
@@ -669,6 +670,7 @@ async function isCandidateSkillContained(args: {
   directoryName: SkillName;
   /** Discovery only: report an escape as an invalid skill. */
   pushInvalidSkill?: (message: string, hint: string) => void;
+  sandboxGate: FileToolSandboxGate | undefined;
 }): Promise<boolean> {
   const { candidate, containment, skillDir, skillFilePath, directoryName } = args;
   if (candidate.pluginRoot != null) {
@@ -695,6 +697,8 @@ async function isCandidateSkillContained(args: {
       skillDir,
       skillFilePath,
     });
+    // A command can replace SKILL.md with a link to a file its sandbox hides (Codex review).
+    await args.sandboxGate?.(skillFilePath, "read");
     return true;
   } catch (error) {
     if (isRuntimeTransportError(error)) throw error;
@@ -1189,6 +1193,8 @@ export async function discoverAgentSkills(
     projectPluginsTrusted?: boolean;
     /** Builds the host-local runtimes of the plugin and global scans. */
     runtimeFactory: RuntimeFactory;
+    /** See readAgentSkill()'s `sandboxGate`. */
+    sandboxGate?: FileToolSandboxGate;
   }
 ): Promise<AgentSkillDiscoveryResult> {
   if (!workspacePath) {
@@ -1259,6 +1265,7 @@ export async function discoverAgentSkills(
         skillFilePath,
         directoryName,
         pushInvalidSkill,
+        sandboxGate: options.sandboxGate,
       });
       if (!contained) continue;
 
@@ -1544,7 +1551,8 @@ function isLookupCandidate(
 async function readCandidateSkill(
   candidate: AgentSkillScanCandidate,
   name: SkillName,
-  containment: ProjectSkillContainment
+  containment: ProjectSkillContainment,
+  sandboxGate: FileToolSandboxGate | undefined
 ): Promise<ResolvedAgentSkill | null> {
   let resolvedRoot: string;
   try {
@@ -1567,6 +1575,7 @@ async function readCandidateSkill(
     skillDir,
     skillFilePath,
     directoryName: name,
+    sandboxGate,
   });
   if (!contained) return null;
 
@@ -1617,6 +1626,11 @@ export async function readAgentSkill(
     projectPluginsTrusted?: boolean;
     /** Builds the host-local runtimes of the plugin and global scans. */
     runtimeFactory: RuntimeFactory;
+    /**
+     * For skills that reach the model: a project skill loads only where a sandboxed command could
+     * read its SKILL.md. Plugin folders are read-only to commands, global ones in a home folder.
+     */
+    sandboxGate?: FileToolSandboxGate;
   }
 ): Promise<ResolvedAgentSkill> {
   if (!workspacePath) {
@@ -1640,7 +1654,7 @@ export async function readAgentSkill(
 
   for (const candidate of candidates) {
     if (!isLookupCandidate(candidate, pluginName, name)) continue;
-    const resolved = await readCandidateSkill(candidate, name, containment);
+    const resolved = await readCandidateSkill(candidate, name, containment, options.sandboxGate);
     if (resolved !== null) return resolved;
   }
 

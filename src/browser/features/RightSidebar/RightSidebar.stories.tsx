@@ -2415,7 +2415,6 @@ export const ClosingPinnedLastTabFocusesToggle: Story = {
         writeArtifactSelection(PINNED_CLOSE_WORKSPACE_ID, {
           scope: "artifact",
           path: PINNED_REPORT.path,
-          version: null,
         });
         collapseLeftSidebar();
         seedSidebarLayout(PINNED_CLOSE_WORKSPACE_ID, ["artifacts"]);

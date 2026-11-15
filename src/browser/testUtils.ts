@@ -206,7 +206,7 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
     worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     runtimeEnablement: { ...DEFAULT_RUNTIME_ENABLEMENT },
-    defaultRuntime: null,
+    defaultIsolation: null,
     agentAiDefaults: {},
     chatTranscriptFullWidth: false,
     llmDebugLogs: false,

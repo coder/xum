@@ -1704,6 +1704,105 @@ const localPlugin = {
         };
       },
     },
+    "no-css-zoom": {
+      meta: {
+        type: "problem",
+        docs: {
+          description: "Disallow the CSS zoom property in renderer code",
+        },
+        messages: {
+          zoom: "Do not use `zoom` here. CSS zoom changes layout differently in Safari than in Chromium (iPhone Safari painted a diagram far outside its frame). Size the element with explicit pixels computed in code, as src/browser/features/Messages/mermaidDiagramBox.ts does. If this `zoom` is not a CSS property, rename it.",
+        },
+      },
+      create(context) {
+        // Any object key named zoom is reported, not only keys the rule can prove are styles: a
+        // style object can reach a component through a prop, a helper or a spread, and the
+        // rule cannot see those types. Rename a field that is not CSS.
+        const isZoom = (node, computed) =>
+          (node.type === "Identifier" && node.name === "zoom" && !computed) ||
+          (node.type === "Literal" && node.value === "zoom") ||
+          (node.type === "TemplateLiteral" &&
+            node.expressions.length === 0 &&
+            node.quasis[0].value.cooked === "zoom");
+        const isNamed = (node, name) =>
+          (node.type === "Identifier" && node.name === name) ||
+          (node.type === "Literal" && node.value === name);
+        // CSS names are case-insensitive and may carry a vendor prefix (-webkit-zoom).
+        const ZOOM_NAME = /^\s*(?:-[a-z]+-)?zoom\s*$/i;
+        // `width:1px;zoom:2` in a cssText or style attribute string.
+        const ZOOM_DECLARATION = /(?:^|[;{\s])(?:-[a-z]+-)?zoom\s*:/i;
+        // A Tailwind arbitrary property class such as `[zoom:2]` or `md:[zoom:2]`.
+        const ZOOM_UTILITY = /(?:^|[^\w-])\[(?:-[a-z]+-)?zoom:/i;
+        // The text of a string, a template literal without its expressions, or a concatenation.
+        const staticText = (node) => {
+          switch (node.type) {
+            case "Literal":
+              return typeof node.value === "string" ? node.value : "";
+            case "TemplateLiteral":
+              return node.quasis.map((quasi) => quasi.value.cooked ?? "").join("");
+            case "BinaryExpression":
+              return node.operator === "+" ? staticText(node.left) + staticText(node.right) : "";
+            case "ConditionalExpression":
+              return staticText(node.consequent) + ";" + staticText(node.alternate);
+            default:
+              return "";
+          }
+        };
+        const report = (node) => context.report({ node, messageId: "zoom" });
+        return {
+          Property(node) {
+            if (node.parent.type === "ObjectExpression" && isZoom(node.key, node.computed)) {
+              report(node.key);
+            }
+          },
+          MemberExpression(node) {
+            const owner = node.object;
+            if (
+              isZoom(node.property, node.computed) &&
+              owner.type === "MemberExpression" &&
+              isNamed(owner.property, "style")
+            ) {
+              report(node.property);
+            }
+          },
+          CallExpression(node) {
+            const callee = node.callee;
+            if (callee.type !== "MemberExpression" || node.arguments.length === 0) return;
+            const [first, second] = node.arguments;
+            // element.style.setProperty("zoom", "2"), "ZOOM" and a template literal
+            if (isNamed(callee.property, "setProperty") && ZOOM_NAME.test(staticText(first))) {
+              report(first);
+            }
+            // element.setAttribute("style", "zoom:2")
+            if (
+              isNamed(callee.property, "setAttribute") &&
+              staticText(first).trim().toLowerCase() === "style" &&
+              second &&
+              ZOOM_DECLARATION.test(staticText(second))
+            ) {
+              report(second);
+            }
+          },
+          // element.style.cssText = "zoom: 2"
+          AssignmentExpression(node) {
+            if (
+              node.left.type === "MemberExpression" &&
+              isNamed(node.left.property, "cssText") &&
+              ZOOM_DECLARATION.test(staticText(node.right))
+            ) {
+              report(node.right);
+            }
+          },
+          // className="[zoom:2]", cn("p-2", "[zoom:2]") and `p-2 [zoom:2]`
+          Literal(node) {
+            if (typeof node.value === "string" && ZOOM_UTILITY.test(node.value)) report(node);
+          },
+          TemplateElement(node) {
+            if (ZOOM_UTILITY.test(node.value.cooked ?? "")) report(node);
+          },
+        };
+      },
+    },
     "no-native-interactive-tooltips": {
       meta: {
         type: "problem",

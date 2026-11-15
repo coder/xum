@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { APIProvider } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
+import type { WorkspaceRemoveResult } from "@/common/types/workspace";
 import { createTestApiClient } from "@/browser/testUtils";
 import { DelegatedCreationInterruptedNotice } from "./DelegatedCreationInterruptedBanner";
 
@@ -13,7 +14,7 @@ const workspaceId = "orphan";
 
 function renderNotice(options: {
   confirmed: boolean;
-  removal?: { success: boolean; error?: string };
+  removal?: WorkspaceRemoveResult;
   keep?: { success: true; data: undefined } | { success: false; error: string };
 }) {
   const confirm = mock((_options: ConfirmDialogOptions) => Promise.resolve(options.confirmed));
@@ -84,6 +85,41 @@ describe("DelegatedCreationInterruptedNotice (#4983)", () => {
 
     expect((await view.findByRole("alert")).textContent).toBe(error);
   });
+
+  test.each([true, false])(
+    "unknown records retry only after risk acceptance (%s)",
+    async (accepted) => {
+      const recordPath = "/tmp/processes/orphan/unknown-record";
+      const { view, confirm, removeWorkspace } = renderNotice({ confirmed: accepted });
+      confirm.mockResolvedValueOnce(true);
+      removeWorkspace
+        .mockResolvedValueOnce({
+          success: false,
+          error: "Unknown process activity",
+          backgroundProcesses: [
+            {
+              workspaceId,
+              processId: "unknown-record",
+              recordPath,
+              state: "unknown",
+              reason: "No metadata",
+            },
+          ],
+        })
+        .mockResolvedValue({ success: true });
+
+      fireEvent.click(view.getByRole("button", { name: "Remove workspace…" }));
+
+      await waitFor(() => expect(confirm).toHaveBeenCalledTimes(2));
+      const button = view.getByRole("button", { name: "Remove workspace…" }) as HTMLButtonElement;
+      await waitFor(() => expect(button.disabled).toBe(false));
+      expect(removeWorkspace.mock.calls).toEqual(
+        accepted
+          ? [[workspaceId], [workspaceId, { acknowledgedUnknownProcessRecords: [recordPath] }]]
+          : [[workspaceId]]
+      );
+    }
+  );
 
   test("Keep clears the flag through the backend, and shows its refusal", async () => {
     const { view, keepInterruptedDelegatedWorkspace } = renderNotice({

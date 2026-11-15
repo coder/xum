@@ -62,7 +62,7 @@ export interface SshOptionDefaults {
 }
 
 interface RuntimeOptionFieldMap {
-  ssh: "host";
+  ssh: "host" | "projectDir";
   docker: "image";
   devcontainer: "configPath";
 }

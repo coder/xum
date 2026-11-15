@@ -438,21 +438,19 @@ export const DockerUnavailable: AppStory = {
     await openFirstProjectCreationView(storyRoot);
     const canvas = within(storyRoot);
 
-    // Wait for workspace type buttons to appear
-    await canvas.findByText("Workspace Type", {}, { timeout: 10000 });
+    // Open the environment panel from its chip; its rows are portaled to the body.
+    await userEvent.click(
+      await canvas.findByTestId("creation-environment", {}, { timeout: 10000 })
+    );
 
     // Wait for Docker option to become disabled (runtimeAvailability loads async).
     await waitFor(async () => {
-      const runtimeTrigger = canvas.getByLabelText("Workspace type");
-      await userEvent.click(runtimeTrigger);
-
-      const dockerOption = await within(document.body).findByRole("option", {
+      const dockerOption = await within(document.body).findByRole("radio", {
         name: /^Docker/i,
       });
       await expect(dockerOption).toHaveAttribute("aria-disabled", "true");
-
-      await userEvent.keyboard("{Escape}");
     });
+    await userEvent.keyboard("{Escape}");
   },
 };
 

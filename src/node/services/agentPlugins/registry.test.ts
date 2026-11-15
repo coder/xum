@@ -5,6 +5,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import type { MCPServerPluginProvenance } from "@/common/types/mcp";
 import {
   isPluginMcpServerAllowed,
+  parseRegistryEntriesLenient,
   readPluginComponentImports,
   readPluginMcpPolicy,
 } from "./registry";
@@ -209,5 +210,21 @@ describe("readPluginMcpPolicy", () => {
     expect((await readPluginMcpPolicy(path.join(alias, "plugins.json"))).registryPath).toBe(
       path.join(b, "plugins.json")
     );
+  });
+});
+
+describe("parseRegistryEntriesLenient", () => {
+  test("keeps the first row of a repeated name and skips a row it cannot read", () => {
+    const first = createTestPluginInstallEntry("demo");
+    const other = createTestPluginInstallEntry("other");
+    const repeated = { ...first, lockedSha: "b".repeat(40) };
+    const newer = { ...other, name: "newer", source: { type: "archive", url: "https://x.test/a" } };
+
+    const entries = parseRegistryEntriesLenient([first, newer, repeated, "not a row", other]);
+
+    expect(entries.map((entry) => [entry.name, entry.lockedSha])).toEqual([
+      ["demo", first.lockedSha],
+      ["other", other.lockedSha],
+    ]);
   });
 });

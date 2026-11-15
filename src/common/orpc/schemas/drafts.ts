@@ -4,6 +4,7 @@ import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "@/common/types/thinking";
 import { AgentDefinitionScopeSchema } from "./agentDefinition";
 import { CoderWorkspaceConfigSchema } from "./coder";
+import { SshWorkspaceIsolationSchema } from "./runtime";
 import { SendIdSchema, SendMessageOptionsSchema } from "./stream";
 
 /**
@@ -257,6 +258,8 @@ const ParsedRuntimeSchema = z.discriminatedUnion("mode", [
     mode: z.literal("ssh"),
     host: z.string(),
     coder: CoderWorkspaceConfigSchema.optional(),
+    workspaceIsolation: SshWorkspaceIsolationSchema.optional(),
+    projectDir: z.string().optional(),
   }),
   z.object({
     mode: z.literal("docker"),

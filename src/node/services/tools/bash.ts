@@ -19,6 +19,7 @@ import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCod
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { BashToolResult } from "@/common/types/tools";
+import { describeReceivedCommandLine } from "@/common/utils/tools/bashCommandAlias";
 import { resolveBashDisplayName } from "@/common/utils/tools/bashDisplayName";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -27,6 +28,7 @@ import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { getToolEnvPath } from "@/node/services/hooks";
 import { isLocalBaseRuntime } from "@/node/runtime/Runtime";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
 import {
   combineGitNoRepoAutomationEnvs,
   gitHooksAllowed,
@@ -37,6 +39,12 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
+import {
+  requestSandboxApproval,
+  SANDBOX_APPROVAL_DENIED,
+  sandboxExecOptions,
+  withSandboxDenials,
+} from "./bashSandbox";
 import { skillFileBashHint } from "./skillFileHint";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
@@ -543,7 +551,50 @@ function validateScript(script: string, config: ToolConfiguration): BashToolResu
     }
   }
 
+  const interactiveError = rejectInteractiveTui(script);
+  if (interactiveError) return interactiveError;
+
   return null; // Valid
+}
+
+// Programs that wait for a terminal when stdout is a pipe and stdin is closed, as in this tool.
+// Probed on macOS: these hang until the timeout; nano, less, more, man and ed exit at once, so
+// they are not listed.
+const INTERACTIVE_TUI_PROGRAMS = new Set(["vi", "vim", "view", "vimdiff", "nvim", "top", "htop"]);
+// A path names one of those programs only in a system bin directory: a project's own `./top`
+// or `bin/view` can be anything.
+const SYSTEM_BIN_DIRS = new Set(["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]);
+// Pipes, redirects, lists, subshells and expansions make the script more than a bare TUI launch.
+const SHELL_COMPOSITION_CHARS = /[|&;<>()$`\n]/;
+// Quoted and backslash-escaped text is literal to bash, so it composes nothing: `vim 'a&b'` still
+// launches Vim. Double quotes keep `$` and backticks live, but those only build an argument.
+const SHELL_LITERAL_TEXT = /\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*"/g;
+
+function isInteractiveTuiProgram(program: string): boolean {
+  if (!INTERACTIVE_TUI_PROGRAMS.has(path.posix.basename(program))) return false;
+  return !program.includes("/") || SYSTEM_BIN_DIRS.has(path.posix.dirname(program));
+}
+
+/**
+ * Models that mistake bash for another tool send `view <file>` (Vim) and wait the whole
+ * timeout for nothing. Reject only a bare launch: any flag (`top -l 1`, `vim -es`) or `+cmd`
+ * argument, or any shell composition outside quotes, may make the program exit on its own.
+ */
+function rejectInteractiveTui(script: string): BashToolResult | null {
+  const trimmed = script.trim();
+  if (SHELL_COMPOSITION_CHARS.test(trimmed.replace(SHELL_LITERAL_TEXT, ""))) return null;
+  const [program, ...args] = trimmed.split(/\s+/);
+  if (!isInteractiveTuiProgram(program)) return null;
+  if (args.some((arg) => arg.startsWith("-") || arg.startsWith("+"))) return null;
+  return {
+    success: false,
+    error:
+      `${describeReceivedCommandLine("script", trimmed)} starts an interactive program that waits for a terminal; ` +
+      "bash has no terminal, so it would hang until the timeout. " +
+      "To read a file, call file_read; for /memories paths, call the memory tool; otherwise run a non-interactive command line.",
+    exitCode: -1,
+    wall_duration_ms: 0,
+  };
 }
 
 /**
@@ -975,6 +1026,22 @@ async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
 }
 
 /**
+ * Foreground kill deadline. Providers send null for an omitted optional input, so null and absent
+ * both mean the model named no deadline and it gets the shared default.
+ */
+function foregroundTimeoutSecs(requested: number | null | undefined): number {
+  return requested ?? BASH_DEFAULT_TIMEOUT_SECS;
+}
+
+/**
+ * Background max lifetime, in the shape BackgroundProcessManager wants: absence stays absence, so a
+ * dev server started without a timeout outlives the foreground default until it is stopped.
+ */
+function backgroundTimeoutSecs(requested: number | null | undefined): number | undefined {
+  return requested ?? undefined;
+}
+
+/**
  * Bash execution tool factory for AI assistant
  * Creates a bash tool that can execute commands with a configurable timeout
  * @param config Required configuration including working directory
@@ -995,7 +1062,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
     description: buildBashToolDescription(config.cwd, config.projects ?? []),
     inputSchema: TOOL_DEFINITIONS.bash.schema,
     execute: async (
-      { script, timeout_secs, run_in_background, display_name, monitor },
+      { script, timeout_secs, run_in_background, display_name, monitor, outside_sandbox_reason },
       { abortSignal, toolCallId }
     ): Promise<BashToolResult> => {
       // Validate script input
@@ -1087,6 +1154,24 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
+      // One wait for both paths. It comes before exec(), so timeout_secs does not count it.
+      // Stop denies. With no user to ask (xum run, ACP), the request is denied at once.
+      const approval = await requestSandboxApproval(
+        config,
+        toolCallId,
+        script,
+        outside_sandbox_reason,
+        abortSignal
+      );
+      if (approval === "denied") {
+        return withNotice({
+          success: false,
+          error: SANDBOX_APPROVAL_DENIED,
+          exitCode: -1,
+          wall_duration_ms: 0,
+        });
+      }
+
       if (run_in_background) {
         if (!config.workspaceId || !config.backgroundProcessManager || !config.runtime) {
           return withNotice({
@@ -1153,12 +1238,13 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           scriptWithEnv,
           {
             cwd: config.cwd,
-            env: { ...(config.xumEnv ?? {}), ...(config.secrets ?? {}), ...hooksEnv },
+            env: { ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets), ...hooksEnv },
+            ...sandboxExecOptions(approval),
             pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
-            ...(monitorConfig ? { monitor: monitorConfig } : {}),
-            timeoutSecs: timeout_secs, // Auto-terminate after this duration
+            monitor: monitorConfig,
+            timeoutSecs: backgroundTimeoutSecs(timeout_secs),
           }
         );
 
@@ -1185,7 +1271,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       }
 
       // Setup execution parameters
-      const effectiveTimeout = timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS;
+      const effectiveTimeout = foregroundTimeoutSecs(timeout_secs);
       const startTime = performance.now();
       const totalBytesRef = { current: 0 }; // Use ref for shared access in line handler
       let overflowReason: string | null = null;
@@ -1246,7 +1332,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        env: { ...config.xumEnv, ...config.secrets, ...hooksEnv, ...NON_INTERACTIVE_ENV_VARS },
+        env: {
+          ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets),
+          ...hooksEnv,
+          ...NON_INTERACTIVE_ENV_VARS,
+        },
+        ...sandboxExecOptions(approval),
         pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
@@ -1622,6 +1713,7 @@ ${scriptWithEnv}`;
                 : claim?.success === false
                   ? claim.error
                   : "background process manager unavailable";
+            let failedMigrationExit = execStream.exitCode;
             if (config.backgroundProcessManager && config.workspaceId && claimLock) {
               const processId = claimLock.processId;
 
@@ -1633,6 +1725,7 @@ ${scriptWithEnv}`;
                 stdin: execStream.stdin,
                 exitCode: execStream.exitCode,
                 duration: execStream.duration,
+                localProcess: execStream.localProcess,
               };
 
               const migrateResult = await migrateToBackground(
@@ -1675,7 +1768,8 @@ ${scriptWithEnv}`;
               // name reserved until the aborted process's exit actually settles; if it never
               // does, leaking the name for the session is the safe fail-closed behavior.
               migrationError = migrateResult.error;
-              void execStream.exitCode
+              failedMigrationExit = migrateResult.exitCode;
+              void failedMigrationExit
                 .catch(() => undefined)
                 .finally(() => claimLock.releaseName());
             }
@@ -1703,11 +1797,12 @@ ${scriptWithEnv}`;
             // disposal, which deletes nothing, does not wait for a stopping migration (#5589).
             migrationHandedToExit = true;
             migration?.markStopping();
-            void execStream.exitCode.then(
+            // Publish confirmed-exit evidence before a removal finishes draining this migration.
+            void failedMigrationExit.then(
               () => migration?.[Symbol.dispose](),
               () => undefined
             );
-            await raceWithAbortAndTimeout(execStream.exitCode, {
+            await raceWithAbortAndTimeout(failedMigrationExit, {
               timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
               clock: config.clock,
             }).catch(() => undefined);
@@ -1815,15 +1910,19 @@ File will be automatically cleaned up when stream ends.`;
 
       // Format result based on exit code and truncation state
       return withNotice(
-        formatResult(
-          exitCode,
-          lines,
-          truncated,
-          overflowReason,
-          wall_duration_ms,
-          config.overflow_policy ?? "tmpfile",
-          effectiveTimeout,
-          stoppedAtFileLimit
+        await withSandboxDenials(
+          formatResult(
+            exitCode,
+            lines,
+            truncated,
+            overflowReason,
+            wall_duration_ms,
+            config.overflow_policy ?? "tmpfile",
+            effectiveTimeout,
+            stoppedAtFileLimit
+          ),
+          execStream,
+          exitCode !== 0
         )
       );
     },

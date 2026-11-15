@@ -31,8 +31,10 @@ const TUTORIAL_SEQUENCES: Record<TutorialSequence, TutorialStep[]> = {
     },
     {
       target: "trunk-branch",
-      title: "Branch From",
-      content: "Choose which branch to create your workspace from.",
+      // The target is the environment chip: it shows the base branch and opens the panel that
+      // also holds where the workspace runs.
+      title: "Environment",
+      content: "Choose where your workspace runs and which branch it starts from.",
       position: "top",
     },
     {

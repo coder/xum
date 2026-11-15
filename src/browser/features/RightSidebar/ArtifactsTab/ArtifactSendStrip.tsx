@@ -9,8 +9,6 @@ export interface PendingArtifactSend {
   id: number;
   text: string;
   data?: unknown;
-  /** The version on screen when the artifact asked (null: the live file). */
-  version: number | null;
 }
 
 /**

@@ -866,6 +866,7 @@ export const GitStatusPopover: AppStory = {
 
 // README: docs/img/plan-mermaid.webp
 export const PlanMermaidWithCosts: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() => {

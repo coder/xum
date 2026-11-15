@@ -7,7 +7,7 @@ import {
   MCP_APP_TOOL_CALLS_PER_WINDOW,
 } from "@/common/utils/mcpApps";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
-import { createBridgeRateLimiter } from "./artifactBridge";
+import { createBridgeRateLimiter } from "./frameDocumentChannel";
 import type { GrantedMcpAppCsp } from "./mcpAppCsp";
 
 /**
@@ -369,10 +369,10 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   /**
    * Set by the first initialized: the tool lifecycle (tool-input, then tool-result or
    * tool-cancelled) goes out once per mounted frame. A later handshake on the same frame gets
-   * its initialize reply only: in browser mode a page the frame navigated to can still post
-   * from this contentWindow until its load event, and must not receive the call's data. A
-   * view's own MCP Apps client that connects after the window.openai shim gets the data from
-   * the shim, inside the page (mcpAppOpenAiShim.ts).
+   * its initialize reply only. Only the view's own document can send one (the host reads only
+   * that document's port, frameDocumentChannel.ts), so a later handshake is a second client in
+   * the same view: its own MCP Apps client that connects after the window.openai shim gets the
+   * data from the shim, inside the page (mcpAppOpenAiShim.ts).
    */
   let initialized = false;
   /** Whether the user allowed this mounted view's model context (ui/update-model-context). */

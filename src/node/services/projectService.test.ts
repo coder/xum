@@ -6,6 +6,7 @@ import * as os from "os";
 import { execSync } from "child_process";
 import { createHash } from "crypto";
 import { Config } from "@/node/config";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { Ok } from "@/common/types/result";
 import { ORPCError } from "@orpc/server";
 import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
@@ -67,7 +68,7 @@ async function withEnv<T>(
 const DEFAULT_FAKE_GIT_SHIM = `#!/bin/sh
 printf '%s\n' "$@" > "$FAKE_GIT_ARGS_LOG"
 if [ "$1" = "clone" ]; then
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -109,7 +110,7 @@ async function cloneWithFakeGit(
   expect(result.success).toBe(true);
   if (!result.success) throw new Error("Expected success");
   const loggedArgs = (await fs.readFile(fakeGit.fakeGitArgsLogPath, "utf-8")).trim().split("\n");
-  return { result, loggedArgs, cloneWorkPath: loggedArgs[4] ?? "" };
+  return { result, loggedArgs, cloneWorkPath: loggedArgs[5] ?? "" };
 }
 
 async function collectCloneEvents(
@@ -894,8 +895,9 @@ exec ${realGit} "$@"
         if (testCase.expectedRepoUrl) {
           expect(captured.loggedArgs[0]).toBe("clone");
           expect(captured.loggedArgs[1]).toBe("--progress");
-          expect(captured.loggedArgs[2]).toBe("--");
-          expect(captured.loggedArgs[3]).toBe(testCase.expectedRepoUrl);
+          expect(captured.loggedArgs[2]).toBe("--no-local");
+          expect(captured.loggedArgs[3]).toBe("--");
+          expect(captured.loggedArgs[4]).toBe(testCase.expectedRepoUrl);
         }
         expect(path.dirname(captured.cloneWorkPath)).toBe(path.resolve(cloneParentDir));
         expect(path.basename(captured.cloneWorkPath)).toMatch(
@@ -938,14 +940,14 @@ exec ${realGit} "$@"
         cloneParentDir,
         sshAuthSock: path.join(tempDir, "fake-ssh-agent.sock"),
         gitShimBody: `#!/bin/sh
-printf '%s\\n' "$4" >> "$FAKE_GIT_ARGS_LOG"
-case "$4" in
+printf '%s\\n' "$5" >> "$FAKE_GIT_ARGS_LOG"
+case "$5" in
   git@github.com:*)
     echo "git@github.com: Permission denied (publickey)." >&2
     exit 128
     ;;
 esac
-mkdir -p "$5/.git"
+mkdir -p "$6/.git"
 exit 0
 `,
       });
@@ -987,14 +989,14 @@ exit 0
           }
         },
         gitShimBody: `#!/bin/sh
-printf '%s\n' "$4" >> "$FAKE_GIT_ARGS_LOG"
-case "$4" in
+printf '%s\n' "$5" >> "$FAKE_GIT_ARGS_LOG"
+case "$5" in
   git@github.com:*)
     echo "git@github.com: Permission denied (publickey)." >&2
     exit 128
     ;;
 esac
-mkdir -p "$5/.git"
+mkdir -p "$6/.git"
 exit 0
 `,
       });
@@ -1019,7 +1021,7 @@ exit 0
         repoUrl: "git@github.com:owner/private.git",
         cloneParentDir,
         gitShimBody: `#!/bin/sh
-printf '%s\\n' "$4" >> "$FAKE_GIT_ARGS_LOG"
+printf '%s\\n' "$5" >> "$FAKE_GIT_ARGS_LOG"
 echo "git@github.com: Permission denied (publickey)." >&2
 exit 128
 `,
@@ -1041,7 +1043,7 @@ exit 128
         repoUrl: "https://github.com/owner/private.git",
         cloneParentDir,
         gitShimBody: `#!/bin/sh
-printf '%s\\n' "$4" >> "$FAKE_GIT_ARGS_LOG"
+printf '%s\\n' "$5" >> "$FAKE_GIT_ARGS_LOG"
 echo "remote: Write access to repository not granted." >&2
 echo "fatal: unable to access 'https://github.com/owner/private.git/': The requested URL returned error: 403" >&2
 exit 128
@@ -1094,7 +1096,7 @@ exit 128
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
   echo 'progress: starting' >&2
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1131,6 +1133,40 @@ exit 1
       } finally {
         process.env.PATH = originalPath;
       }
+    });
+
+    // A repack of the source (git starts one in the background after a commit or fetch) deletes
+    // loose objects while a local-path clone copies them one by one, and the clone fails with
+    // "failed to copy file to ...". A test cannot pause that repack, so this plants what the copy
+    // cannot take: a symlink in objects/ ("symlink ... exists, refusing to clone with --local").
+    // `git upload-pack` never reads it.
+    it("clones a local repository through git's transport, not by copying its object files", async () => {
+      if (process.platform === "win32") {
+        // Creating a symlink needs a privilege that Windows runners lack.
+        return;
+      }
+
+      const sourceRepoPath = await createLocalGitRepository(tempDir, "source-repo-transport");
+      await fs.symlink(
+        "missing-target",
+        path.join(sourceRepoPath, ".git", "objects", "info", "stale-link")
+      );
+      const cloneParentDir = path.join(tempDir, "transport-clones");
+
+      const events: CloneEvent[] = [];
+      for await (const event of service.cloneWithProgress({
+        repoUrl: sourceRepoPath,
+        cloneParentDir,
+      })) {
+        events.push(event);
+      }
+
+      const terminalEvent = events[events.length - 1];
+      expect(terminalEvent?.type, JSON.stringify(terminalEvent)).toBe("success");
+      if (terminalEvent?.type !== "success") throw new Error("Expected success event");
+      const headOf = (repoPath: string) =>
+        execSync("git rev-parse HEAD", { cwd: repoPath, encoding: "utf-8" }).trim();
+      expect(headOf(terminalEvent.normalizedPath)).toBe(headOf(sourceRepoPath));
     });
 
     it("yields error and rolls back when cloned project cannot be persisted in config", async () => {
@@ -1212,7 +1248,7 @@ exit 1
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
   echo 'progress: starting' >&2
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   sleep 1000 &
   pid=$!
   trap 'kill $pid 2>/dev/null; exit 0' TERM INT
@@ -1284,7 +1320,7 @@ exit 1
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
   echo 'progress: starting' >&2
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   sleep 1000 &
   pid=$!
   trap 'kill $pid 2>/dev/null; exit 0' TERM INT
@@ -1351,7 +1387,7 @@ exit 1
         fakeGitPath,
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   mkdir -p "$CONCURRENT_DEST_PATH"
   printf 'keep\n' > "$CONCURRENT_MARKER_PATH"
   exit 1
@@ -1449,7 +1485,7 @@ exit 1
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
   printf 'SSH_ASKPASS=%s\nSSH_ASKPASS_REQUIRE=%s\nGIT_TERMINAL_PROMPT=%s\n' "\${SSH_ASKPASS:-}" "\${SSH_ASKPASS_REQUIRE:-}" "\${GIT_TERMINAL_PROMPT:-}" > "$FAKE_GIT_ENV_LOG"${sshAskpassGuard}
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1538,7 +1574,7 @@ if [ "$1" = "clone" ]; then
     echo "Host key verification failed." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1630,7 +1666,7 @@ if [ "$1" = "clone" ]; then
     echo "Host key verification failed." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1710,7 +1746,7 @@ if [ "$1" = "clone" ]; then
     echo "Host key verification failed." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1791,7 +1827,7 @@ if [ "$1" = "clone" ]; then
     echo "Host key verification failed." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1926,7 +1962,7 @@ if [ "$1" = "clone" ]; then
     echo "git@github.com: Permission denied (publickey,password)." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -2061,7 +2097,7 @@ if [ "$1" = "clone" ]; then
     echo "Permission denied (publickey,password)." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -2141,7 +2177,7 @@ if [ "$1" = "clone" ]; then
     echo "Unexpected SSH_ASKPASS for HTTPS clone" >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -2424,6 +2460,55 @@ exit 1
           { projectPath: childPath, trusted: true },
         ],
       ]);
+    });
+
+    it("setSshDirectoryTrust persists once, revokes, refuses an untrusted project, and publishes", async () => {
+      const parentPath = path.join(tempDir, "project");
+      const childPath = path.join(parentPath, "packages", "api");
+      await config.editConfig((current) => {
+        current.projects.set(parentPath, { workspaces: [] });
+        current.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+        return current;
+      });
+      const updates: Array<Parameters<MCPServerManager["applyProjectTrust"]>[0]> = [];
+      service.setMcpServerManager({
+        applyProjectTrust: (value) => updates.push(value),
+        forgetProjectTrust: () => undefined,
+      });
+      const directory = { host: "dev@box", port: 2222, projectDir: "/srv/app" };
+      const grant = { projectPath: childPath, ...directory, trusted: true };
+
+      // The directory's trust only means something on a trusted project.
+      const refused = await service.setSshDirectoryTrust(grant);
+      expect(refused.success).toBe(false);
+      expect(config.loadConfigOrDefault().projects.get(parentPath)?.trustedSshDirectories).toBe(
+        undefined
+      );
+      expect(updates).toEqual([]);
+
+      await service.setTrust(parentPath, true);
+      updates.length = 0;
+      // Granted from a sub-project: stored on the trust owner, idempotently.
+      expect(await service.setSshDirectoryTrust(grant)).toEqual({
+        success: true,
+        data: { projectDir: "/srv/app" },
+      });
+      expect(
+        (await service.setSshDirectoryTrust({ ...grant, projectDir: " /srv/app " })).success
+      ).toBe(true);
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(parentPath)?.trustedSshDirectories
+      ).toEqual([directory]);
+      expect(updates.at(-1)).toEqual([
+        { projectPath: parentPath, trusted: true, trustedSshDirectories: [directory] },
+        { projectPath: childPath, trusted: true, trustedSshDirectories: [directory] },
+      ]);
+
+      expect((await service.setSshDirectoryTrust({ ...grant, trusted: false })).success).toBe(true);
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(parentPath)?.trustedSshDirectories
+      ).toBe(undefined);
+      expect(updates.at(-1)?.[0]).toEqual({ projectPath: parentPath, trusted: true });
     });
 
     it("setTrust drops remote plugin snapshots even when the MCP update throws (#6426)", async () => {

@@ -21,6 +21,37 @@ function syncViewportHeight(): void {
 }
 
 /**
+ * iOS reports a visual viewport height of -33554432 after the iPhone Duo folds, until the app
+ * restarts, and Floating UI sizes every popper's collision viewport from it, so poppers open pinned
+ * to the top of the screen.
+ */
+function installVisualViewportHeightFix(): () => void {
+  const viewport = window.visualViewport;
+  if (viewport == null) return () => undefined;
+  const prototype = Object.getPrototypeOf(viewport) as object;
+  if (typeof Object.getOwnPropertyDescriptor(prototype, "height")?.get !== "function") {
+    return () => undefined;
+  }
+  try {
+    Object.defineProperty(viewport, "height", {
+      configurable: true,
+      get: () => {
+        const height = Reflect.get(prototype, "height", viewport) as number;
+        // Visual viewport units shrink with pinch zoom, so the stand-in height must too.
+        return height > 0 ? height : window.innerHeight / viewport.scale;
+      },
+    });
+  } catch (error) {
+    // main.tsx calls this before React mounts, and startup must never fail on it.
+    console.error("Viewport height sync: could not correct the visual viewport height", error);
+    return () => undefined;
+  }
+  return () => {
+    Reflect.deleteProperty(viewport, "height");
+  };
+}
+
+/**
  * Size the app shell from the visual viewport on iOS home-screen web apps, where iOS 26 can
  * resolve 100dvh as if a browser toolbar were still present and leave a blank band under
  * the footer, and the keyboard resizes nothing else. Other environments keep the CSS dvh
@@ -31,6 +62,7 @@ export function installViewportHeightSync(): () => void {
     return () => undefined;
   }
 
+  const removeVisualViewportHeightFix = installVisualViewportHeightFix();
   syncViewportHeight();
   window.addEventListener("resize", syncViewportHeight);
   window.visualViewport?.addEventListener("resize", syncViewportHeight);
@@ -38,7 +70,9 @@ export function installViewportHeightSync(): () => void {
 
   // Turning an iPad from landscape to portrait can fire resize while innerHeight still holds the
   // landscape height, and no later resize follows, so the app kept filling only the old height.
-  // A fixed box spanning the viewport resizes once the rotated layout exists; sync again then.
+  // Folding the iPhone Duo does the same once iosCoverColumn.ts has taken the cover display's
+  // column back, and its height arrives about three frames later, so a next-frame re-read misses it.
+  // A fixed box spanning the viewport resizes once the new layout exists; sync again then.
   const viewportBox = document.createElement("div");
   viewportBox.setAttribute("aria-hidden", "true");
   viewportBox.style.cssText =
@@ -65,6 +99,7 @@ export function installViewportHeightSync(): () => void {
     observer?.disconnect();
     viewportBox.remove();
     document.documentElement.style.removeProperty(APP_VIEWPORT_HEIGHT_PROPERTY);
+    removeVisualViewportHeightFix();
   };
 }
 
@@ -82,4 +117,21 @@ export function installIosFocusZoomGuard(): void {
   const meta = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
   if (meta == null || /maximum-scale/i.test(meta.content)) return;
   meta.content = `${meta.content}, maximum-scale=1`;
+}
+
+/**
+ * On the unfolded iPhone Duo, iOS 27.2 shrinks a home-screen web app by 82pt (the inner display's
+ * portrait status bar) when it comes back from the background, and only a fold cycle restores it.
+ * A black-translucent web clip keeps the full size there. Its status bar is a side column on the
+ * cover display and the landscape inner display, so the header blur that keeps the style out of
+ * index.html elsewhere (#5656) did not show on either. iOS reads the style once, when the user adds
+ * the page to the Home Screen. The Duo reports a 466x678 screen on both displays.
+ */
+export function installIphoneDuoStatusBarStyle(): void {
+  // iOS reports the portrait size in either orientation.
+  if (window.screen.width !== 466 || window.screen.height !== 678) return;
+  const meta = document.createElement("meta");
+  meta.name = "apple-mobile-web-app-status-bar-style";
+  meta.content = "black-translucent";
+  document.head.appendChild(meta);
 }

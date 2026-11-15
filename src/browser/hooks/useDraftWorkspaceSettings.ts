@@ -7,11 +7,15 @@ import {
   type RuntimeMode,
   type ParsedRuntime,
   type CoderWorkspaceConfig,
+  type SshWorkspaceIsolation,
   buildRuntimeString,
+  normalizeRuntimeEnablement,
   RUNTIME_MODE,
   CODER_RUNTIME_PLACEHOLDER,
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
+import { runtimeIdFromIsolation, type IsolationChoice } from "@/common/types/isolation";
+import { projectDefaultIsolation } from "@/browser/features/ChatInput/creationDraftProject";
 import {
   readOptionField,
   readSshOptionDefaults,
@@ -42,14 +46,16 @@ export interface DraftWorkspaceSettings {
    * Uses discriminated union so SSH has host, Docker has image, etc.
    */
   selectedRuntime: ParsedRuntime;
-  /** Persisted default runtime choice for this project (used to initialize selection) */
-  defaultRuntimeMode: RuntimeChoice;
+  /** Settings default (project override, else global) that initializes the selection. */
+  defaultIsolation: IsolationChoice;
   trunkBranch: string;
 }
 
 interface SshRuntimeConfig {
   host: string;
   coder?: CoderWorkspaceConfig;
+  workspaceIsolation?: SshWorkspaceIsolation;
+  projectDir?: string;
 }
 
 interface SshRuntimeState {
@@ -60,6 +66,7 @@ interface SshRuntimeState {
 
 interface RememberedRuntimeValues {
   ssh: SshRuntimeConfig;
+  sshProjectDir: string;
   dockerImage: string;
   dockerShareCredentials: boolean;
   devcontainerConfigPath: string;
@@ -93,6 +100,9 @@ const buildRuntimeForMode = (
         mode: "ssh",
         host: effectiveHost,
         coder: sshConfig.coder,
+        ...(sshConfig.workspaceIsolation === "none"
+          ? { workspaceIsolation: "none" as const, projectDir: sshConfig.projectDir ?? "" }
+          : {}),
       };
     }
     case RUNTIME_MODE.DOCKER:
@@ -109,11 +119,29 @@ const buildRuntimeForMode = (
   }
 };
 
+const isSshNone = (runtime: ParsedRuntime): boolean =>
+  runtime.mode === RUNTIME_MODE.SSH && runtime.workspaceIsolation === "none";
+
+// Takes the previous selection as primitives: passing the selected runtime object into a call from
+// the setter makes React Compiler treat it as mutable and drop the selection's memoization.
 const mergeRememberedRuntimeConfig = (
   nextRuntime: ParsedRuntime,
   previousMode: RuntimeMode,
+  previousWasSshNone: boolean,
   remembered: RememberedRuntimeValues
 ): ParsedRuntime => {
+  // Entering SSH+None (from any other pair) refills the remembered directory; edits within
+  // SSH+None keep what the user typed, even an empty field.
+  if (
+    nextRuntime.mode === RUNTIME_MODE.SSH &&
+    isSshNone(nextRuntime) &&
+    !previousWasSshNone &&
+    !nextRuntime.projectDir?.trim() &&
+    remembered.sshProjectDir.trim()
+  ) {
+    nextRuntime = { ...nextRuntime, projectDir: remembered.sshProjectDir };
+  }
+
   if (nextRuntime.mode === previousMode) {
     return nextRuntime;
   }
@@ -160,28 +188,6 @@ const mergeRememberedRuntimeConfig = (
   }
 };
 
-/** The default runtime-type button: Coder is an SSH sub-choice. */
-const resolveDefaultRuntimeChoice = (
-  defaultRuntimeMode: RuntimeMode,
-  coderDefaultFromString: boolean
-): RuntimeChoice =>
-  defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString ? "coder" : defaultRuntimeMode;
-
-const normalizeRuntimeChoice = (value: unknown): RuntimeChoice | null => {
-  if (
-    value === "coder" ||
-    value === RUNTIME_MODE.LOCAL ||
-    value === RUNTIME_MODE.WORKTREE ||
-    value === RUNTIME_MODE.SSH ||
-    value === RUNTIME_MODE.DOCKER ||
-    value === RUNTIME_MODE.DEVCONTAINER
-  ) {
-    return value;
-  }
-
-  return null;
-};
-
 const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
   switch (choice) {
     case "coder":
@@ -198,6 +204,36 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
       return { mode: RUNTIME_MODE.DEVCONTAINER, configPath: "" };
   }
 };
+
+interface SettingsDefaultIsolation {
+  isolation: IsolationChoice;
+  runtimeChoice: RuntimeChoice;
+  sshIsolation: SshWorkspaceIsolation | undefined;
+}
+
+/**
+ * The Settings default for new workspaces in a project: its override, else the global default,
+ * resolved against the isolations the project's Settings enable (projectDefaultIsolation). The
+ * backend migrates legacy defaultRuntime into defaultIsolation. This is its own hook because
+ * React Compiler treats hook results as frozen: computed inline, the calls below made it drop
+ * the memoized default runtime on every keystroke (#5937, useDraftWorkspaceSettings.compiler.test).
+ */
+function useSettingsDefaultIsolation(projectPath: string): SettingsDefaultIsolation {
+  const { userProjects } = useProjectContext();
+  const globalDefaultIsolation = useAppConfig((config) => config.defaultIsolation);
+  const globalEnablement = useAppConfig((config) => config.runtimeEnablement);
+  const isolation = projectDefaultIsolation(
+    userProjects.get(projectPath),
+    globalDefaultIsolation,
+    normalizeRuntimeEnablement(globalEnablement)
+  );
+  return {
+    isolation,
+    runtimeChoice: runtimeIdFromIsolation(isolation) ?? RUNTIME_MODE.WORKTREE,
+    sshIsolation:
+      isolation.project === "ssh" && isolation.workspace === "none" ? "none" : undefined,
+  };
+}
 
 /**
  * Hook to manage all draft workspace settings with centralized persistence
@@ -237,9 +273,6 @@ export function useDraftWorkspaceSettings(
   // Global AI settings (read-only from global state)
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
-
-  const { userProjects } = useProjectContext();
-  const projectConfig = userProjects.get(projectPath);
 
   const globalDefaultAgentId =
     useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId) ??
@@ -286,19 +319,7 @@ export function useDraftWorkspaceSettings(
 
   const lastRuntimeConfigs = useRuntimeOptionDefaults(projectPath);
 
-  const rawGlobalDefaultRuntime = useAppConfig((config) => config.defaultRuntime);
-  const globalDefaultRuntime = normalizeRuntimeChoice(rawGlobalDefaultRuntime);
-
-  const hasProjectRuntimeOverrides =
-    projectConfig?.runtimeOverridesEnabled === true ||
-    Boolean(projectConfig?.runtimeEnablement) ||
-    projectConfig?.defaultRuntime !== undefined;
-  const settingsDefaultRuntime: RuntimeChoice = hasProjectRuntimeOverrides
-    ? (projectConfig?.defaultRuntime ?? globalDefaultRuntime ?? RUNTIME_MODE.WORKTREE)
-    : (globalDefaultRuntime ?? RUNTIME_MODE.WORKTREE);
-
-  const parsedDefault = buildRuntimeFromChoice(settingsDefaultRuntime);
-  const defaultRuntimeMode: RuntimeMode = parsedDefault?.mode ?? RUNTIME_MODE.WORKTREE;
+  const settingsDefault = useSettingsDefaultIsolation(projectPath);
 
   const readRuntimeConfigFlag = (
     configs: LastRuntimeConfigs,
@@ -335,6 +356,7 @@ export function useDraftWorkspaceSettings(
   // Restore prior Coder selections when switching back into Coder mode.
   const coderConfigFallback = lastSshState.coderConfig ?? DEFAULT_CODER_CONFIG;
   const lastSsh = readSshRuntimeConfig(lastRuntimeConfigs);
+  const lastSshProjectDir = readOptionField(lastRuntimeConfigs, RUNTIME_MODE.SSH, "projectDir", "");
   const lastDockerImage = readOptionField(lastRuntimeConfigs, RUNTIME_MODE.DOCKER, "image", "");
   const lastShareCredentials = readRuntimeConfigFlag(
     lastRuntimeConfigs,
@@ -353,8 +375,6 @@ export function useDraftWorkspaceSettings(
     "shareCredentials"
   );
 
-  const coderDefaultFromString =
-    parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
   const setLastRuntimeConfig = useCallback(
     // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
@@ -384,6 +404,14 @@ export function useDraftWorkspaceSettings(
     },
     [projectPath]
   );
+
+  const settingsDefaultRuntime = settingsDefault.runtimeChoice;
+  const defaultSshIsolation = settingsDefault.sshIsolation;
+  const parsedDefault = buildRuntimeFromChoice(settingsDefaultRuntime);
+  const defaultRuntimeMode: RuntimeMode = parsedDefault?.mode ?? RUNTIME_MODE.WORKTREE;
+
+  const coderDefaultFromString =
+    parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
 
   const defaultSshHost =
     parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host.trim()
@@ -416,7 +444,12 @@ export function useDraftWorkspaceSettings(
   // Uses discriminated union: SSH has host, Docker has image.
   const defaultRuntime = buildRuntimeForMode(
     defaultRuntimeMode,
-    { host: defaultSshHost, coder: defaultSshCoder },
+    {
+      host: defaultSshHost,
+      coder: defaultSshCoder,
+      workspaceIsolation: defaultSshIsolation,
+      projectDir: lastSshProjectDir,
+    },
     defaultDockerImage,
     lastShareCredentials,
     defaultDevcontainerConfigPath,
@@ -425,6 +458,9 @@ export function useDraftWorkspaceSettings(
   // Until the draft holds a pick it follows the defaults, so options that load after mount apply.
   const selectedRuntime: ParsedRuntime = execution?.runtime ?? defaultRuntime;
 
+  const selectedMode = selectedRuntime.mode;
+  const selectedIsSshNone =
+    selectedRuntime.mode === RUNTIME_MODE.SSH && selectedRuntime.workspaceIsolation === "none";
   const lastSshHost = lastSsh.host;
   const lastSshCoder = lastSsh.coder;
 
@@ -433,8 +469,9 @@ export function useDraftWorkspaceSettings(
     // Construct remembered values only when the user changes runtimes. Keeping
     // this object off the render path lets React Compiler retain the setter
     // identity while unrelated ChatInput draft text changes.
-    const mergedRuntime = mergeRememberedRuntimeConfig(runtime, selectedRuntime.mode, {
+    const mergedRuntime = mergeRememberedRuntimeConfig(runtime, selectedMode, selectedIsSshNone, {
       ssh: { host: lastSshHost, coder: lastSshCoder },
+      sshProjectDir: lastSshProjectDir,
       dockerImage: lastDockerImage,
       dockerShareCredentials: lastShareCredentials,
       devcontainerConfigPath: lastDevcontainerConfigPath,
@@ -448,6 +485,9 @@ export function useDraftWorkspaceSettings(
     // Avoid persisting the Coder placeholder as the remembered SSH host.
     if (mergedRuntime.mode === RUNTIME_MODE.SSH) {
       writeSshRuntimeConfig({ host: mergedRuntime.host, coder: mergedRuntime.coder });
+      if (mergedRuntime.projectDir?.trim()) {
+        setLastRuntimeConfig(RUNTIME_MODE.SSH, "projectDir", mergedRuntime.projectDir);
+      }
     } else if (mergedRuntime.mode === RUNTIME_MODE.DOCKER) {
       if (mergedRuntime.image.trim()) {
         setLastRuntimeConfig(RUNTIME_MODE.DOCKER, "image", mergedRuntime.image);
@@ -486,7 +526,7 @@ export function useDraftWorkspaceSettings(
       agentId,
       selectedRuntime,
       // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
-      defaultRuntimeMode: resolveDefaultRuntimeChoice(defaultRuntimeMode, coderDefaultFromString),
+      defaultIsolation: settingsDefault.isolation,
       trunkBranch,
     },
     coderConfigFallback,

@@ -21,6 +21,7 @@ import { insertStepStartPartsForSdk } from "@/node/utils/messages/insertStepStar
 import { prepareMcpReplay } from "@/node/services/mcpModelOutput";
 import { planAnthropicThinkingStrip } from "@/node/utils/messages/anthropicThinkingReplay";
 import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
+import { attachToolCallReplayMetadata } from "@/node/utils/messages/toolCallReplayMetadata";
 import type { MuxMessage } from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -83,6 +84,12 @@ export interface PrepareMessagesOptions {
    * filter pass the rows from before it (#5886).
    */
   replayReceiptMessages?: MuxMessage[];
+  /**
+   * providerOptions namespace the request's client reads tool-call thought
+   * signatures from (resolveRequestProviderOptionsNamespaceKey). Unset sends
+   * none, as before signatures were persisted.
+   */
+  toolCallReplayNamespace?: string;
 }
 
 /**
@@ -129,6 +136,7 @@ export async function prepareMessagesForProvider(
     workspaceId,
     deferLoadingToolNames,
     replayReceiptMessages,
+    toolCallReplayNamespace,
   } = opts;
 
   // --- XumMessage-level transforms ---
@@ -187,7 +195,11 @@ export async function prepareMessagesForProvider(
 
   // Mirror persisted reasoning replay data (signatures, encrypted reasoning) into
   // providerMetadata, the only field convertToModelMessages forwards to the request.
-  const messagesWithReasoningReplay = attachReasoningReplayMetadata(messagesWithSdkSafeFileParts);
+  // Tool calls get their thought signatures back the same way (callProviderMetadata).
+  const messagesWithReasoningReplay = attachToolCallReplayMetadata(
+    attachReasoningReplayMetadata(messagesWithSdkSafeFileParts),
+    toolCallReplayNamespace
+  );
 
   // Preserved thinking: a thinking-replay receipt (MuxMetadata.anthropicThinkingReplay) says a
   // request of that turn sent earlier Anthropic thinking without its blocks. Removed blocks

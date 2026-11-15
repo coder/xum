@@ -4,7 +4,11 @@
 
 import type { z } from "zod";
 import type { RuntimeConfigSchema } from "../orpc/schemas";
-import { RuntimeEnablementIdSchema, RuntimeModeSchema } from "../orpc/schemas/runtime";
+import {
+  RuntimeEnablementIdSchema,
+  RuntimeModeSchema,
+  type SshWorkspaceIsolationSchema,
+} from "../orpc/schemas/runtime";
 import type { CoderWorkspaceConfig } from "../orpc/schemas/coder";
 
 // Re-export CoderWorkspaceConfig type from schema (single source of truth)
@@ -12,6 +16,9 @@ export type { CoderWorkspaceConfig };
 
 /** Runtime mode type - used in UI and runtime string parsing */
 export type RuntimeMode = z.infer<typeof RuntimeModeSchema>;
+
+/** Workspace isolations an SSH host supports (worktree is the default when absent). */
+export type SshWorkspaceIsolation = z.infer<typeof SshWorkspaceIsolationSchema>;
 
 /** Runtime mode constants */
 export const RUNTIME_MODE = {
@@ -108,7 +115,15 @@ export type RuntimeConfig = z.infer<typeof RuntimeConfigSchema>;
 export type ParsedRuntime =
   | { mode: "local" }
   | { mode: "worktree" }
-  | { mode: "ssh"; host: string; coder?: CoderWorkspaceConfig }
+  | {
+      mode: "ssh";
+      host: string;
+      coder?: CoderWorkspaceConfig;
+      /** Absent = per-workspace worktree on the host (the pre-split default). */
+      workspaceIsolation?: SshWorkspaceIsolation;
+      /** Existing directory on the host that SSH+None workspaces run in. */
+      projectDir?: string;
+    }
   | { mode: "docker"; image: string; shareCredentials?: boolean }
   | { mode: "devcontainer"; configPath: string; shareCredentials?: boolean };
 
@@ -223,6 +238,11 @@ export function buildRuntimeConfig(parsed: ParsedRuntime): RuntimeConfig | undef
         host: parsed.host.trim(),
         srcBaseDir: "~/mux", // Default remote base directory (tilde resolved by backend)
         coder: parsed.coder,
+        // Only persist the isolation fields for SSH+None so worktree configs stay byte-identical
+        // to what older builds write (downgrade-safe).
+        ...(parsed.workspaceIsolation === "none"
+          ? { workspaceIsolation: "none" as const, projectDir: parsed.projectDir?.trim() ?? "" }
+          : {}),
       };
     case RUNTIME_MODE.DOCKER:
       return {
@@ -251,6 +271,34 @@ export function isSSHRuntime(
   config: RuntimeConfig | undefined
 ): config is Extract<RuntimeConfig, { type: "ssh" }> {
   return config?.type === "ssh";
+}
+
+/** The SSH+None selection (runs in an existing host directory), or null for any other runtime. */
+export function sshNoneRuntimeOf(
+  runtime: ParsedRuntime
+): Extract<ParsedRuntime, { mode: "ssh" }> | null {
+  return runtime.mode === RUNTIME_MODE.SSH && runtime.workspaceIsolation === "none"
+    ? runtime
+    : null;
+}
+
+/**
+ * Whether creating a workspace with this selection builds a checkout from a trunk branch. Local
+ * and SSH+None run in an existing directory and need none, so a local git failure (no branch
+ * list) must not block them.
+ */
+export function parsedRuntimeNeedsTrunk(runtime: ParsedRuntime): boolean {
+  return runtime.mode !== RUNTIME_MODE.LOCAL && sshNoneRuntimeOf(runtime) === null;
+}
+
+/**
+ * SSH+None: workspaces run directly in an existing directory on the host. Like project-dir local,
+ * the directory is shared by every workspace and is never created, renamed or deleted by Xum.
+ */
+export function isSshSharedProjectDirRuntime(
+  config: RuntimeConfig | undefined
+): config is Extract<RuntimeConfig, { type: "ssh" }> & { workspaceIsolation: "none" } {
+  return isSSHRuntime(config) && config.workspaceIsolation === "none";
 }
 
 /**

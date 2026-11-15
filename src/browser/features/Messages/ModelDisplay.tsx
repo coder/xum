@@ -46,7 +46,7 @@ export const ModelDisplay: React.FC<ModelDisplayProps> = (props) => {
   const showTooltip = props.showTooltip ?? true;
 
   const iconClass =
-    "mr-[0.3em] inline-block h-[1.1em] w-[1.1em] align-[-0.19em] [&_svg]:block [&_svg]:h-full [&_svg]:w-full [&_svg_.st0]:fill-current [&_svg_circle]:!fill-current [&_svg_path]:!fill-current [&_svg_rect]:!fill-current";
+    "mr-[0.3em] inline-block h-[1.1em] w-[1.1em] align-[-0.19em] [&_svg]:block [&_svg]:h-full [&_svg]:w-full";
 
   const content = (
     <span className="inline normal-case" data-model-display>

@@ -99,6 +99,33 @@ describe("AppConfigOnDiskSchema", () => {
     ).toBe(true);
   });
 
+  it("accepts defaultIsolation alongside its legacy defaultRuntime mirror", () => {
+    const stored = {
+      defaultIsolation: { project: "ssh", workspace: "docker" },
+      defaultRuntime: "ssh",
+      projects: [
+        [
+          "/repo",
+          {
+            workspaces: [],
+            defaultIsolation: { project: "local", workspace: "none" },
+            defaultRuntime: "local",
+          },
+        ],
+      ],
+    };
+    expect(AppConfigOnDiskSchema.safeParse(stored).success).toBe(true);
+  });
+
+  it("rejects defaultIsolation values outside the known axes", () => {
+    expect(
+      AppConfigOnDiskSchema.safeParse({
+        defaultIsolation: { project: "mars", workspace: "worktree" },
+      }).success
+    ).toBe(false);
+    expect(AppConfigOnDiskSchema.safeParse({ defaultIsolation: "worktree" }).success).toBe(false);
+  });
+
   it("holds settingsBackup to the shape the backup API returns", () => {
     const stored = { repoUrl: "git@example.com:me/dotfiles.git", branch: "main", path: "mux" };
     const parsed = AppConfigOnDiskSchema.safeParse({ settingsBackup: stored });

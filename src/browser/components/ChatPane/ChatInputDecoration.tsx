@@ -558,8 +558,9 @@ function ChatActivityChipButton(props: {
         onClick={props.onToggle}
         onKeyDown={props.open ? (event) => closeOnEscape(event, props.onClose) : undefined}
         // The button is the touch target (globals.css grows buttons to 44px on touch phones) and
-        // the inner span draws the chip: 28px in a wide line, and in a phone-width line the 44px
-        // box of the approved phone design.
+        // the inner span draws the chip: 28px in a wide line, 32px in a phone-width line. The
+        // drawing stays smaller than the 44px box on purpose: a chip row that draws itself at the
+        // touch floor reads as loud as the composer's own controls below it.
         // The order classes put a spacer (in StreamingBarrierView) between the plain TODO chip at
         // the line's start and the bordered chips, which end the line next to Stop. The spacer
         // shows only with a plain chip (data-activity-chip-plain), else bordered chips sit left.
@@ -573,9 +574,9 @@ function ChatActivityChipButton(props: {
         <span
           className={cn(
             "inline-flex h-7 max-w-full min-w-0 items-center gap-1.5 rounded-md border px-2 text-xs leading-none whitespace-nowrap transition-colors",
-            // The live line is the nearest @container.
-            "@max-md:h-11 @max-md:rounded-[10px] @max-md:text-sm @max-md:[&_svg]:size-4",
-            !plain && "@max-md:px-2.5",
+            // The live line is the nearest @container. Only the height and radius change here: the
+            // phone line keeps the desktop text and icon sizes.
+            "@max-md:h-8 @max-md:rounded-lg",
             props.open || props.lit === true
               ? "text-foreground border-[var(--color-exec-mode)] bg-[color-mix(in_srgb,var(--color-exec-mode)_16%,transparent)]"
               : plain

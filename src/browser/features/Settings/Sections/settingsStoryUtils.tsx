@@ -111,6 +111,7 @@ interface SetupSettingsStoryOptions {
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
   agentResourceLimits?: MockORPCClientOptions["agentResourceLimits"];
+  agentSandbox?: MockORPCClientOptions["agentSandbox"];
   /** Sessions shown in Settings → Server Access. */
   serverAuthSessions?: ServerAuthSession[];
   /** Initial backend experiment values for config.getConfig */
@@ -134,6 +135,7 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     heartbeatDefaultIntervalMs: options.heartbeatDefaultIntervalMs,
     goalDefaults: options.goalDefaults,
     agentResourceLimits: options.agentResourceLimits,
+    agentSandbox: options.agentSandbox,
     taskSettings: options.taskSettings,
     serverAuthSessions: options.serverAuthSessions,
     experiments: options.experiments,

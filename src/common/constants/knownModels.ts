@@ -50,14 +50,15 @@ interface KnownModel extends KnownModelDefinition {
 // Model definitions. Note we avoid listing legacy models here. These represent the focal models
 // of the community.
 const MODEL_DEFINITIONS = {
-  // Claude Fable 5.1 - Mythos-class model (a tier above Opus), successor to Fable 5
-  // (released June 9, 2026) as the generally-available safeguarded variant, at the same
-  // pricing ($10/M input, $50/M output) except cheaper cache reads (0.025x input).
-  // API id `claude-fable-5-1`; Fable 5 stays usable as the custom model string
-  // `anthropic:claude-fable-5`.
+  // Claude Fable 5.2 - Mythos-class model (a tier above Opus), released November 9,
+  // 2026 as the successor to Fable 5.1 (the generally-available safeguarded variant).
+  // $8/M input, $40/M output (20% below Fable 5.1), cache reads still 0.025x input.
+  // API id `claude-fable-5-2`; Fable 5.1 and Fable 5 stay usable as the custom model
+  // strings `anthropic:claude-fable-5-1` and `anthropic:claude-fable-5`.
+  // https://platform.claude.com/docs/en/models/fable-5-2/overview
   FABLE: {
     provider: "anthropic",
-    providerModelId: "claude-fable-5-1",
+    providerModelId: "claude-fable-5-2",
     aliases: ["fable"],
     warm: true,
     // Fable/Mythos use the newer Opus 4.7+ tokenizer, which isn't published upstream;
@@ -66,19 +67,20 @@ const MODEL_DEFINITIONS = {
     // same text, so real usage can run ~1.0-1.3x higher than this estimate.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Mythos 5.1 - successor to Mythos 5 (released June 9, 2026 alongside Fable 5)
-  // as the restricted-access, safeguards-lifted twin of Fable 5.1, with identical specs
-  // and pricing ($10/M input, $50/M output, 0.025x-input cache reads) and unchanged
-  // availability (approved Project Glasswing customers only, no self-serve sign-up).
-  // API id `claude-mythos-5-1`; Mythos 5 stays usable as the custom model string
-  // `anthropic:claude-mythos-5`.
+  // Claude Mythos 5.2 - released November 9, 2026 alongside Fable 5.2 as its
+  // restricted-access, safeguards-lifted twin, with identical specs and pricing ($8/M
+  // input, $40/M output, 0.025x-input cache reads). Available only to organizations
+  // verified through Anthropic's verification programs (no self-serve sign-up).
+  // API id `claude-mythos-5-2`; Mythos 5.1 and Mythos 5 stay usable as the custom model
+  // strings `anthropic:claude-mythos-5-1` and `anthropic:claude-mythos-5`.
+  // https://platform.claude.com/docs/en/models/mythos-5-2/overview
   // Not warmed: most users cannot access it, and its tokenizer override is already
   // warmed via FABLE.
   MYTHOS: {
     provider: "anthropic",
-    providerModelId: "claude-mythos-5-1",
+    providerModelId: "claude-mythos-5-2",
     aliases: ["mythos"],
-    // Same tokenizer situation as Fable 5 (see FABLE above): reuse Opus 4.5 for
+    // Same tokenizer situation as FABLE above: reuse Opus 4.5 for
     // approximate counting; real usage can run ~1.0-1.3x higher.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
@@ -183,6 +185,15 @@ const MODEL_DEFINITIONS = {
     provider: "google",
     providerModelId: "gemini-4-argon",
     aliases: ["argon", "gemini-argon", "gemini-4"],
+    tokenizerOverride: "google/gemini-2.5-pro",
+  },
+  // Gemini 4 Carbon - GA on the paid Gemini API and Vertex AI on November 10, 2026
+  // (stable ID `gemini-4-carbon`; not on the free tier). `gemini-4` stays on Argon, which
+  // Google recommends for most work. See models-extra for limits and pricing.
+  GEMINI_4_CARBON: {
+    provider: "google",
+    providerModelId: "gemini-4-carbon",
+    aliases: ["carbon", "gemini-carbon"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
   // Grok 4.7 - xAI's frontier coding and knowledge-work model, released September 21,
@@ -294,7 +305,9 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
 // FABLE/OPUS comments); keep their approximate-tokenizer overrides so exact-id
 // lookup does not fall back to the generic per-provider tokenizer.
 const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  "anthropic:claude-fable-5-1": "anthropic/claude-opus-4.5",
   "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-mythos-5-1": "anthropic/claude-opus-4.5",
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
@@ -303,6 +316,15 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "openai:daybreak-blue-latest": "openai/gpt-5",
   "openai:daybreak-red-latest": "openai/gpt-5",
 };
+
+/**
+ * Ids of retired first-class models. The model catalogue keeps offering them so users can
+ * still find a model a newer built-in replaced, even when only models-extra describes it
+ * (Fable 5.1 and Mythos 5.1 are not in LiteLLM's models.json).
+ */
+export const RETIRED_KNOWN_MODEL_IDS: readonly string[] = Object.keys(
+  LEGACY_TOKENIZER_MODEL_OVERRIDES
+);
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   ...LEGACY_TOKENIZER_MODEL_OVERRIDES,

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Ellipsis does not excuse lost lines</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      p {
+        margin: 0 0 18px;
+        font-size: 18px;
+        line-height: 1.4;
+      }
+      /* An ellipsis marks the end of a line. This box keeps one line of several, with no clamp. */
+      #lost-lines {
+        height: 1.4em;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #one-line {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #clamped {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Messages</h1>
+      <p id="lost-lines">Your subscription renews on the first of the month, and the card on file will be charged for the whole term unless you cancel before then.</p>
+      <p id="one-line">Your subscription renews on the first of the month, and the card on file will be charged for the whole term unless you cancel before then.</p>
+      <p id="clamped">Your subscription renews on the first of the month, and the card on file will be charged for the whole term unless you cancel before then. Open the billing page to see every upcoming charge, change the card or cancel the plan.</p>
+    </main>
+  </body>
+</html>

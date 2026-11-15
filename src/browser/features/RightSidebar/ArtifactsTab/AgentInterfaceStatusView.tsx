@@ -45,11 +45,7 @@ import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { useArtifactInteractions } from "./useArtifactInteractions";
 
-const STATUS_TARGET = {
-  path: AGENT_INTERFACE_STATUS_ARTIFACT,
-  version: null,
-  latestVersion: null,
-} as const;
+const STATUS_TARGET = { path: AGENT_INTERFACE_STATUS_ARTIFACT } as const;
 
 /** Tracks an element's height (the composer dock), so the view ends where the dock begins. */
 function useElementHeight(ref: React.RefObject<HTMLElement | null>): number {

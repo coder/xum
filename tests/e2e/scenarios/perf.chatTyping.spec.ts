@@ -94,8 +94,9 @@ test.describe("chat typing performance profiling", () => {
 
     // Creation initializes branches, runtime availability, Coder status, and auto-naming
     // independently. Let those legitimate commits settle before resetting profiler samples.
-    await expect(page.getByRole("combobox", { name: "Workspace type" })).toBeEnabled();
-    await expect(page.getByRole("combobox", { name: "Select source branch" })).toBeEnabled();
+    const environment = page.getByTestId("creation-environment");
+    await expect(environment).toBeEnabled();
+    await expect(environment.locator('[data-branch-load="selected"]')).toBeVisible();
     const autoNamingButton = page.getByRole("button", { name: "Disable auto-naming" });
     await expect(autoNamingButton).toBeVisible();
     await autoNamingButton.click();

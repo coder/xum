@@ -45,6 +45,7 @@ import {
   COMPUTER_USE_SCROLL_DIRECTIONS,
 } from "@/common/constants/computerUse";
 import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
+import { LayoutAuditReportSchema } from "@/common/types/artifactLayoutAudit";
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { SkillLookupNameSchema, SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
@@ -64,6 +65,7 @@ import {
   type RuntimeMode,
 } from "@/common/types/runtime";
 import {
+  BASH_DEFAULT_TIMEOUT_SECS,
   BASH_HARD_MAX_LINES,
   BASH_MAX_LINE_BYTES,
   BASH_MAX_TOTAL_BYTES,
@@ -72,6 +74,10 @@ import {
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
 import { getDefaultBashDisplayName } from "@/common/utils/tools/bashDisplayName";
+import {
+  describeBrokenBashCommandAlias,
+  MEMORY_TOOL_COMMANDS,
+} from "@/common/utils/tools/bashCommandAlias";
 import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
@@ -1207,6 +1213,13 @@ export const TaskStopToolResultSchema = z
 export const TaskRemoveToolArgsSchema = z
   .object({
     task_ids: z.array(z.string().min(1)).min(1).describe("Inactive child task IDs to remove."),
+    force: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Remove even if the child holds unsaved work, and delete that work. " +
+          "Set only when the user asked for cleanup or the work is provably saved (pushed, merged, or in an applied patch)."
+      ),
   })
   .strict();
 
@@ -1215,6 +1228,8 @@ const TaskRemoveToolBaseResultSchema = z.object({
   workspaceId: z.string().optional(),
   descendantTaskIds: z.array(z.string()).optional(),
   paths: z.array(z.string()).optional(),
+  /** What a forced removal deleted: the work, the checkout and the branch. */
+  deletedWork: z.string().optional(),
   error: z.string().optional(),
 });
 
@@ -1400,6 +1415,8 @@ const TaskWorkspaceLifecycleBaseResultSchema = z.object({
   workspaceId: z.string().optional(),
   displayName: z.string().optional(),
   paths: z.array(z.string()).optional(),
+  /** What a forced removal deleted: the work, the checkout and the branch. */
+  deletedWork: z.string().optional(),
   activeTaskIds: z.array(z.string()).optional(),
   descendantTaskIds: z.array(z.string()).optional(),
   note: z.string().optional(),
@@ -1815,6 +1832,9 @@ const TruncatedInfoSchema = z.object({
   totalLines: z.number(),
 });
 
+/** What the macOS agent sandbox blocked, for example "write /Users/me/.zshrc". */
+const BashSandboxDenialsSchema = z.array(z.string()).optional();
+
 /**
  * Bash tool result - success, background spawn, or failure.
  */
@@ -1826,6 +1846,7 @@ const BashToolSuccessSchema = z
     wall_duration_ms: z.number(),
     note: z.string().optional(),
     truncated: TruncatedInfoSchema.optional(),
+    sandboxDenials: BashSandboxDenialsSchema,
   })
   .extend(ToolOutputUiOnlyFieldSchema);
 
@@ -1861,6 +1882,7 @@ const BashToolFailureSchema = z
     wall_duration_ms: z.number(),
     note: z.string().optional(),
     truncated: TruncatedInfoSchema.optional(),
+    sandboxDenials: BashSandboxDenialsSchema,
   })
   .extend(ToolOutputUiOnlyFieldSchema);
 
@@ -2077,22 +2099,24 @@ const AttachFileToolSuccessResultSchema = z
 
 /**
  * Result of the `artifact` tool (Artifacts M4). Deliberately tiny: the chat card renders from it
- * alone, so it survives compaction and older-history paging.
+ * alone, so it survives compaction and older-history paging. Not strict: results stored before
+ * versions were removed also carry `id` and `version`, and their card must still render.
  */
-export const ArtifactToolSuccessResultSchema = z
-  .object({
-    success: z.literal(true),
-    /** Stable artifact id (versions key), see getArtifactId. */
-    id: z.string(),
-    version: z.number().int().positive(),
-    /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
-    path: z.string(),
-    bytes: z.number(),
-    kind: ArtifactKindSchema,
-    title: z.string(),
-    pin: z.enum(["project", "global"]).nullable(),
-  })
-  .strict();
+export const ArtifactToolSuccessResultSchema = z.object({
+  success: z.literal(true),
+  /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
+  path: z.string(),
+  bytes: z.number(),
+  kind: ArtifactKindSchema,
+  title: z.string(),
+  pin: z.enum(["project", "global"]).nullable(),
+  /**
+   * HTML only: what the publish-time layout audit found. `.catch`: a stored row whose `layout` this
+   * build cannot read (a reason a newer build added) drops the field instead of failing the whole
+   * parse, so the chat card still renders after a downgrade. The card never reads it.
+   */
+  layout: LayoutAuditReportSchema.optional().catch(undefined),
+});
 export type ArtifactToolSuccessResult = z.infer<typeof ArtifactToolSuccessResultSchema>;
 
 export const ArtifactToolResultSchema = z.union([
@@ -2305,6 +2329,58 @@ function compactTableSchema(createTableSql: string): string {
   return `${match[1]}(${columns.join(", ")})`;
 }
 
+const BashToolArgsObjectSchema = z.object({
+  script: z.string().describe("Bash script to run"),
+  model_intent: z
+    .string()
+    .nullish()
+    .describe(
+      "User-facing purpose shown in collapsed chat: a present-participle phrase under 100 chars (e.g. 'Running the unit tests'), without the command or duration, which Xum shows."
+    ),
+  // The handler applies the default, not zod: a schema-level default would give every
+  // background dev server a timed death, and it must live until stopped. Rejecting an
+  // omitted value instead costs a model step that open-weight models pay constantly.
+  timeout_secs: z
+    .number()
+    .positive()
+    .nullish()
+    .describe(
+      "Seconds: foreground kill deadline, or background max lifetime. " +
+        // Scoped to background starts on purpose: a foreground command the user sends to
+        // background keeps the deadline it already had, so this must not promise an open
+        // lifetime for every background process.
+        `Omitted: foreground gets a ${BASH_DEFAULT_TIMEOUT_SECS}s kill deadline; a command started in the background has no kill deadline. ` +
+        "Start small; raise on retry."
+    ),
+  run_in_background: z
+    .boolean()
+    .nullish()
+    .default(false)
+    .describe(
+      "Run without blocking, for commands over ~5s (builds, dev servers, watchers); not for quick, interactive (no stdin), or real-time-output commands. " +
+        "Returns a taskId (bash:<processId>) at once: task_await reads new output, task_stop stops it, task_list lists it. " +
+        "Lives until timeout_secs, termination, or workspace removal. Without a monitor it never wakes you. " +
+        "Do not task_await it in the same parallel batch as this call, and do not poll task_await while it runs; await only when you need the output."
+    ),
+  monitor: BashMonitorSchema.nullish().describe(
+    "Background only. Each complete output line matching filter wakes this workspace, even after your response; it also wakes once when the process settles (exit, kill, timeout) unless wake_on_exit is false, max_events retired it, or it was cancelled (task_stop). Terminate monitored tasks you no longer need before finishing."
+  ),
+  outside_sandbox_reason: z
+    .string()
+    .nullish()
+    .describe(
+      "Only after the sandbox blocked this script: why it must run outside the sandbox. The user must approve it; a denial fails the call."
+    ),
+  display_name: z.string().describe("Human-readable process name, e.g. 'Dev Server'"),
+});
+
+// The keys a bash call may carry: its schema fields plus the aliases the preprocess renames.
+const BASH_ACCEPTED_KEYS: ReadonlySet<string> = new Set([
+  ...Object.keys(BashToolArgsObjectSchema.shape),
+  "command",
+  "description",
+]);
+
 export const TOOL_DEFINITIONS = {
   bash: {
     resultSchema: BashToolResultSchema,
@@ -2313,7 +2389,7 @@ export const TOOL_DEFINITIONS = {
       "Large outputs may be auto-filtered; the result's note says what was kept and where the full output was saved. " +
       "On Windows this is Git Bash: discard output with `>/dev/null`, not `>nul`.",
     schema: z.preprocess(
-      (value) => {
+      (value, ctx) => {
         // Compatibility shims for models that emit alias fields:
         // - some models emit `command` instead of `script`
         // - DeepSeek v4 emits `description` instead of `display_name`
@@ -2323,54 +2399,29 @@ export const TOOL_DEFINITIONS = {
         if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
 
         let obj = value as Record<string, unknown>;
+        const brokenAlias = describeBrokenBashCommandAlias(obj, BASH_ACCEPTED_KEYS);
+        if (brokenAlias != null) {
+          ctx.addIssue({ code: "custom", message: brokenAlias, path: ["command"] });
+          return obj;
+        }
         obj = renameAliasField(obj, "command", "script");
         obj = renameAliasField(obj, "description", "display_name");
         // Some models (mostly Haiku 5.5) omit the required display_name.
         // Rejecting the call costs a model step and a retry, so fill it here
         // while the model-visible schema keeps it required. The script-derived
         // name is the same one bash.ts already falls back to.
-        // timeout_secs gets no default on purpose: a short default would start a
-        // long install or build and kill it partway, while a rejection runs
-        // nothing and the model retries with a timeout.
         if (typeof obj.display_name !== "string" && typeof obj.script === "string") {
           obj = { ...obj, display_name: getDefaultBashDisplayName(obj.script) };
         }
         return obj;
       },
-      z
-        .object({
-          script: z.string().describe("Bash script to run"),
-          model_intent: z
-            .string()
-            .nullish()
-            .describe(
-              "User-facing purpose shown in collapsed chat: a present-participle phrase under 100 chars (e.g. 'Running the unit tests'), without the command or duration, which Xum shows."
-            ),
-          timeout_secs: z
-            .number()
-            .positive()
-            .describe(
-              "Seconds: foreground kill deadline, or background max lifetime. Start small; raise on retry."
-            ),
-          run_in_background: z
-            .boolean()
-            .nullish()
-            .default(false)
-            .describe(
-              "Run without blocking, for commands over ~5s (builds, dev servers, watchers); not for quick, interactive (no stdin), or real-time-output commands. " +
-                "Returns a taskId (bash:<processId>) at once: task_await reads new output, task_stop stops it, task_list lists it. " +
-                "Lives until timeout_secs, termination, or workspace removal. Without a monitor it never wakes you. " +
-                "Do not task_await it in the same parallel batch as this call, and do not poll task_await while it runs; await only when you need the output."
-            ),
-          monitor: BashMonitorSchema.nullish().describe(
-            "Background only. Each complete output line matching filter wakes this workspace, even after your response; it also wakes once when the process settles (exit, kill, timeout) unless wake_on_exit is false, max_events retired it, or it was cancelled (task_stop). Terminate monitored tasks you no longer need before finishing."
-          ),
-          display_name: z.string().describe("Human-readable process name, e.g. 'Dev Server'"),
-        })
-        .refine((args) => args.monitor == null || args.run_in_background === true, {
+      BashToolArgsObjectSchema.refine(
+        (args) => args.monitor == null || args.run_in_background === true,
+        {
           path: ["monitor"],
           message: "monitor requires run_in_background=true",
-        })
+        }
+      )
     ),
   },
   file_read: {
@@ -2494,9 +2545,7 @@ export const TOOL_DEFINITIONS = {
         return obj;
       },
       z.object({
-        command: z
-          .enum(["view", "create", "str_replace", "insert", "delete", "rename"])
-          .describe("The memory operation to perform."),
+        command: z.enum(MEMORY_TOOL_COMMANDS).describe("The memory operation to perform."),
         path: z
           .string()
           .nullish()
@@ -2993,7 +3042,7 @@ export const TOOL_DEFINITIONS = {
   task_remove: {
     resultSchema: TaskRemoveToolResultSchema,
     description:
-      "Irreversibly remove inactive child workspaces you own; they cannot be restored or reawakened. Use it only for consumed best-of candidates, overlapping or obsolete roles, a bench over its limit, or a user request, not as routine cleanup. Remove descendants first. A child with uncommitted or untracked work, or commits without a ready patch artifact, is refused; only the user can discard that work.",
+      "Irreversibly remove inactive child workspaces you own; they cannot be restored or reawakened. Use it only for consumed best-of candidates, overlapping or obsolete roles, a bench over its limit, or a user request, not as routine cleanup. Remove descendants first. A child with uncommitted or untracked work, or commits without a ready patch artifact, is refused unless you set force, which deletes that work and reports it. Set force only when the user asked for cleanup or the work is provably saved.",
     schema: TaskRemoveToolArgsSchema,
   },
   task_workspace_lifecycle: {
@@ -3082,7 +3131,9 @@ export const TOOL_DEFINITIONS = {
       'JSON {"$xum":"table","columns":[..],"rows":[..]} is a table (columns optional; rows: objects or arrays). ' +
       "HTML is sandboxed (its CSP blocks network, not guaranteed): never put secrets in it. Inline JS/CSS or use relative files; scripts may load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com, cdn.tailwindcss.com if the user allows. " +
       "HTML may call window.xum.send(text, data?) from a click handler (sent at once; the user did not review the text; arrives as an <artifact_interaction> message) and window.xum.setState(obj) (shown here). " +
-      "If agent-browser is available, screenshot new HTML via file:// at 390px and desktop widths and attach_file them (unsandboxed there: CDN content can differ).",
+      "Publishing HTML with the artifact tool checks its layout in agent-browser (when installed) at phone, tablet and desktop widths and lists clipped or overflowing text and unreachable or covered controls in the result's `layout`: fix those and publish again. " +
+      "A published page edited after its last check (else after its last publish) is checked again when a main-chat turn ends, three pages at most (not a sub-agent or Plan mode turn). " +
+      "A screenshot via file:// and attach_file is an optional visual check (unsandboxed there: CDN content can differ).",
     schema: z
       .object({
         scope: z
@@ -3108,14 +3159,16 @@ export const TOOL_DEFINITIONS = {
   artifact: {
     resultSchema: ArtifactToolResultSchema,
     description:
-      "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ as a labeled version in the user's Artifacts tab, shown as a chat card. " +
-      "Republishing a path adds a version (identical bytes add none); unpublished changes add no version.",
+      "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ in the user's Artifacts tab, shown as a chat card. " +
+      "The tab shows the file as it is now, so edit it in place; publish again to show a new card or to change its title, kind or pin. " +
+      "For HTML the result's `layout` lists layout issues found in agent-browser; `checked: false` means a width was not checked, never that the page is clean. " +
+      "Xum also checks a published HTML page edited after its last check (else after its last publish) when a main-chat turn ends, three pages at most (not a sub-agent or Plan mode turn), and asks you to publish it again if that finds an issue you were not shown.",
     schema: z
       .object({
         path: z.string().describe("Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),
-        title: z.string().nullish().describe("Version label. Default: file name."),
+        title: z.string().nullish().describe("Card title. Default: file name."),
         kind: ArtifactKindSchema.nullish().describe("Viewer; default by file extension."),
-        focus: z.boolean().nullish().describe("Open the Artifacts tab on this version."),
+        focus: z.boolean().nullish().describe("Open the Artifacts tab on this file."),
         pin: z
           .enum(["project", "global"])
           .nullish()

@@ -32,6 +32,7 @@ import type {
   WorkspaceRemoveResultSchema,
   WorkspaceRemoveWarningSchema,
   WorkspaceRemovalDescendantSchema,
+  WorkspaceBackgroundProcessBlockerSchema,
 } from "../orpc/schemas/workspace";
 
 export type WorkspaceMetadata = z.infer<typeof WorkspaceMetadataSchema>;
@@ -55,3 +56,6 @@ export type WorkspaceActivitySnapshot = z.infer<typeof WorkspaceActivitySnapshot
 export type WorkspaceRemoveResult = z.infer<typeof WorkspaceRemoveResultSchema>;
 export type WorkspaceRemovalDescendant = z.infer<typeof WorkspaceRemovalDescendantSchema>;
 export type WorkspaceRemoveWarning = z.infer<typeof WorkspaceRemoveWarningSchema>;
+export type WorkspaceBackgroundProcessBlocker = z.infer<
+  typeof WorkspaceBackgroundProcessBlockerSchema
+>;

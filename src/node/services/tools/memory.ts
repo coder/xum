@@ -5,6 +5,10 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS, buildMemoryToolDescription } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  GLOBAL_WRITE_SANDBOX_ERROR,
+  agentSandboxCoversTools,
+} from "@/node/services/agentSandbox/fileToolSandbox";
+import {
   MEMORY_SCOPES,
   MEMORY_VIRTUAL_ROOT,
   SHARED_MEMORY_SCOPES,
@@ -17,6 +21,7 @@ import {
   parseMemoryPath,
   type MemoryScopeContext,
   type MemoryService,
+  type MemoryWriteOptions,
 } from "@/node/services/memoryService";
 
 /**
@@ -134,6 +139,9 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
         error: `The ${scope} memory scope is read-only for this agent; only 'view' is allowed.`,
       };
     }
+    if (scope === "global" && agentSandboxCoversTools(config)) {
+      return { success: false, error: GLOBAL_WRITE_SANDBOX_ERROR };
+    }
     return null;
   }
 
@@ -170,7 +178,9 @@ export async function executeMemoryCommand(
   input: MemoryCommandInput,
   checkWriteAccess: (virtualPath: string) => MemoryToolResult | null,
   toolCallId?: string,
-  options?: {
+  // `MemoryWriteOptions` (rejectSecretLike) is handed on to every mutating command whole, so
+  // reading it adds no branch here.
+  options?: MemoryWriteOptions & {
     /**
      * Staged refine mutations only (r55 deletes, r58 inserts): staging-time
      * fingerprint of the mutation target, re-verified by MemoryService
@@ -219,7 +229,8 @@ export async function executeMemoryCommand(
             input.file_text,
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            options
           ))
         );
       }
@@ -236,7 +247,8 @@ export async function executeMemoryCommand(
             input.new_str ?? "",
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            options
           ))
         );
       }
@@ -257,7 +269,8 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.expectedTargetFingerprint,
-            options?.abortSignal
+            options?.abortSignal,
+            options
           ))
         );
       }
@@ -274,7 +287,7 @@ export async function executeMemoryCommand(
             toolCallId,
             options?.expectedTargetFingerprint,
             options?.abortSignal,
-            { rejectPinned: options?.rejectPinned }
+            options
           ))
         );
       }
@@ -294,7 +307,7 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.abortSignal,
-            { rejectPinned: options?.rejectPinned }
+            options
           ))
         );
       }

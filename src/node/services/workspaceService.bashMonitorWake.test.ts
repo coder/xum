@@ -29,7 +29,10 @@ import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { WorkspaceTurnHost } from "./taskWorkspaceSeam";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import { BackgroundProcessManager } from "./backgroundProcessManager";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import assert from "@/common/utils/assert";
+import * as os from "os";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -70,19 +73,21 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     return path.join(h.config.sessionsDir, h.workspaceId, "auto-retry-preference.json");
   }
 
-  async function createWakeWiringService() {
+  async function createWakeWiringService(realManager?: BackgroundProcessManager) {
     const { config, historyService, cleanup } = await createTestHistoryService();
-    const events = new EventEmitter();
-    const backgroundProcessManager = Object.assign(events, {
-      cleanup: mock(() => Promise.resolve()),
-      notifyMonitorWakeStateChanged: mock(() => undefined),
-      getActiveMonitorCount: mock(() => 0),
-      pullMonitorWakeSignals: mock(() => []),
-      getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
-      acknowledgeMonitorWake: mock(() => undefined),
-      dropRetiredMonitor: mock(() => undefined),
-      getForegroundToolCallIds: mock(() => []),
-    }) as unknown as BackgroundProcessManager;
+    const events = realManager ?? new EventEmitter();
+    const backgroundProcessManager =
+      realManager ??
+      (Object.assign(events, {
+        cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: mock(() => undefined),
+        getActiveMonitorCount: mock(() => 0),
+        pullMonitorWakeSignals: mock(() => []),
+        getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
+        acknowledgeMonitorWake: mock(() => undefined),
+        dropRetiredMonitor: mock(() => undefined),
+        getForegroundToolCallIds: mock(() => []),
+      }) as unknown as BackgroundProcessManager);
     const aiService = createMockAIService({ isStreaming: mock(() => false) });
     const extensionMetadata = new ExtensionMetadataService(
       path.join(config.rootDir, "wake-wiring-extension-metadata.json")
@@ -108,8 +113,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
   async function createActiveWakeHarness(options?: {
     workspaceGoalService?: WorkspaceGoalService | "real";
+    /** A real manager: its own snapshots and read cursor drive the wake, nothing is stubbed. */
+    realManager?: BackgroundProcessManager;
   }) {
-    const fixture = await createWakeWiringService();
+    const fixture = await createWakeWiringService(options?.realManager);
     const { config, service, historyService, backgroundProcessManager } = fixture;
     // "real": the session gets a real goal service over this fixture's stores.
     const workspaceGoalService =
@@ -179,12 +186,19 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       Promise.resolve({ model, agentId: "exec" });
     const signals: BashMonitorProcessSnapshot[] = [];
     let shown = 0;
-    spyOn(backgroundProcessManager, "pullMonitorWakeSignals").mockImplementation(() => [
-      ...signals,
-    ]);
-    spyOn(backgroundProcessManager, "getMonitorWakeDeliveryState").mockImplementation(() =>
-      Promise.resolve({ status: "settled", shownThroughOffset: shown, terminalStatusShown: false })
-    );
+    if (options?.realManager == null) {
+      spyOn(backgroundProcessManager, "pullMonitorWakeSignals").mockImplementation(() => [
+        ...signals,
+      ]);
+      spyOn(backgroundProcessManager, "getMonitorWakeDeliveryState").mockImplementation(() =>
+        Promise.resolve({
+          status: "settled",
+          shownThroughOffset: shown,
+          terminalStatusShown: false,
+          readCursorOffset: shown,
+        })
+      );
+    }
     const reconciler = internal.bashMonitorWakeReconciler;
     const dispatch = spyOn(internal, "dispatchBashMonitorWake");
     const complete = async (finishReason = "stop") => {
@@ -248,7 +262,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
             script: "watch",
             createdAt: "2026-01-01T00:00:00.000Z",
             retired: false,
-            match: { throughOffset: offset, lines: ["READY " + offset], totalMatches: 1 },
+            match: { throughOffset: offset },
           }))
         );
         fixture.events.emit("monitor:match", workspaceId, {});
@@ -266,6 +280,64 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       },
     };
   }
+
+  test("a real monitored process wakes its owner with no process output in any user-role message", async () => {
+    const root = await fsPromises.mkdtemp(path.join(os.tmpdir(), "wake-real-stack-"));
+    const manager = new BackgroundProcessManager(root);
+    const h = await createActiveWakeHarness({ realManager: manager });
+    const matched = "RESULT MARKER_MATCHED_LINE";
+    const tail = "MARKER_FINAL_LINE";
+    try {
+      const spawned = await manager.spawn(
+        new LocalRuntime(process.cwd()),
+        h.workspaceId,
+        `printf '${matched}\\n${tail}\\n'; exit 3`,
+        {
+          cwd: process.cwd(),
+          displayName: "real-stack-watcher",
+          monitor: { filter: "^RESULT ", pattern: /^RESULT /, exclude: false, cooldownMs: 0 },
+        }
+      );
+      assert(spawned.success, "spawn failed");
+      await waitForCondition(() => h.requests.length > 0, { timeoutMs: 10_000 });
+
+      const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+      assert(history.success, "history read failed");
+      const userText = history.data
+        .filter((message) => message.role === "user")
+        .map((message) => JSON.stringify(message.parts));
+      expect(userText.length).toBeGreaterThan(0);
+      for (const text of userText) {
+        expect(text).not.toContain("MARKER_");
+      }
+      const wakeMetadata = history.data.find(
+        (message) => message.metadata?.muxMetadata?.type === "bash-monitor-wake"
+      )?.metadata?.muxMetadata;
+      assert(wakeMetadata?.type === "bash-monitor-wake", "the wake row is in history");
+      expect(wakeMetadata.records[0]).toMatchObject({
+        processId: spawned.processId,
+        terminal: { status: "exited", exitCode: 3 },
+      });
+
+      // The output stays readable through the call task_await makes, as a tool result.
+      const read = await manager.getOutput(
+        spawned.processId,
+        undefined,
+        false,
+        0,
+        undefined,
+        h.workspaceId,
+        "task_await"
+      );
+      assert(read.success, "read failed");
+      expect(read.output).toContain(matched);
+      expect(read.output).toContain(tail);
+    } finally {
+      await manager.cleanup(h.workspaceId);
+      await h.finish();
+      await fsPromises.rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("a wake row already in history is consumed without a dispatch, even behind a compaction boundary", async () => {
     const h = await createActiveWakeHarness();
@@ -1823,11 +1895,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         processId: "failed-proc",
         lost: {
           reason: "runtime-failure",
-          failureMessage: "transport unavailable",
           failedOperations: ["readOutput"],
-          failedMatch: { lines: ["READY before failure"] },
+          failedMatch: { lines: [], totalMatches: 1, matchedThroughOffset: 12 },
         },
       });
+      expect(rows[0].lost).not.toHaveProperty("failureMessage");
       expect(scheduleReconcile).toHaveBeenCalledWith("owner");
     } finally {
       mock.restore();
@@ -2445,7 +2517,7 @@ describe("tree Stop and descendant bash monitor attention", () => {
             script: "watch",
             createdAt: "2026-01-01T00:00:00.000Z",
             retired: false,
-            match: { throughOffset: offset, lines: ["READY " + offset], totalMatches: 1 },
+            match: { throughOffset: offset },
           }))
         );
         events.emit("monitor:match", CHILD, {});

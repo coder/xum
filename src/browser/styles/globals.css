@@ -1020,7 +1020,7 @@ body,
      min-height 44px for touch targets, but allow growth for wrapped controls. */
   .mobile-sticky-header {
     position: fixed !important;
-    top: env(safe-area-inset-top, 0px) !important;
+    top: var(--safe-area-top) !important;
     left: env(safe-area-inset-left, 0px) !important;
     right: env(safe-area-inset-right, 0px) !important;
     z-index: 50 !important;
@@ -1075,7 +1075,7 @@ body,
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.5) !important;
 
     /* Account for iOS safe areas (the sidebar is position: fixed) */
-    padding-top: env(safe-area-inset-top, 0px) !important;
+    padding-top: var(--safe-area-top) !important;
     padding-left: env(safe-area-inset-left, 0px) !important;
   }
 
@@ -1118,8 +1118,8 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
-      env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right) env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 0px) !important;
   }
 
   .right-sidebar-fullscreen .right-sidebar-fullscreen-header {
@@ -1144,6 +1144,76 @@ body,
   }
 }
 
+/* The OS draws only in a band at the top of that column (measured on a folded Duo, 2.95 px per pt:
+   glyphs at x 398..437, y 87..151 of 466x678) and takes the touches there. Padding the shell by the
+   whole column gives up a fifth of the width for the whole page, so in narrow portrait the shell
+   keeps no right padding, the fixed header keeps its controls left of the column, and the band
+   below the header is painted over. Content below the band uses the full width.
+   Where no side column exists this changes nothing: iPhone and iPad portrait have none, and
+   landscape and wide layouts keep the shell padding, because there a side inset is a full-height
+   notch. .storybook/test-runner.ts asserts the band geometry. */
+@media (orientation: portrait) and (max-width: 768px) {
+  /* The shell's `pr-[env(safe-area-inset-right)]` utility still carries the other layouts;
+     !important is how the narrow-layout rules around here win over utilities. */
+  .mobile-layout {
+    padding-right: 0 !important;
+  }
+
+  /* The header's background spans the display; its controls stop at the column. Its own right
+     padding is px-2. */
+  .mobile-sticky-header {
+    right: 0 !important;
+    padding-right: calc(0.5rem + var(--safe-area-right) + var(--ios-status-corner, 0px)) !important;
+  }
+
+  /* On the body, the one element, rather than on the shell: `mobile-layout` is on three nested
+     elements, the reserve is fixed to the viewport edge anyway, and a pseudo-element adds no node to
+     the tree the phone skeleton pins (`make check-phone-chrome`). It paints the shell's own
+     background, which is what the band sits on. */
+  body::after {
+    content: "";
+    position: fixed;
+    /* From the top: the fixed header (z-50) covers its own part. */
+    top: 0;
+    /* IOS_STATUS_BAND_HEIGHT_PX: iosCoverColumn.ts takes no touches in the band. */
+    height: 172px;
+    right: 0;
+    /* Zero wherever there is no side column, so nothing paints. */
+    width: var(--safe-area-right);
+    background-color: var(--color-surface-primary);
+    /* Text that scrolls under the band fades out instead of being cut mid-letter. Both fades stay
+       clear of the glyphs, which start 16px into the column and end 20px above the band's bottom. */
+    -webkit-mask-image:
+      linear-gradient(to right, transparent, #000 16px),
+      linear-gradient(to top, transparent, #000 16px);
+    -webkit-mask-composite: source-in;
+    mask-image:
+      linear-gradient(to right, transparent, #000 16px),
+      linear-gradient(to top, transparent, #000 16px);
+    mask-composite: intersect;
+    /* The OS draws over this band and takes no touches there, so the reserve takes none either. */
+    pointer-events: none;
+    /* Above the page's own content, below the fixed phone header (z-50) and every overlay (1100+). */
+    z-index: 40;
+  }
+}
+
+/* The unfolded iPhone Duo held in portrait. iOS reports its 82 pt status bar as the top inset, but
+   draws only a ring in the top right corner (measured from a device screenshot: x 549..643,
+   y 26..69 of 669x951), so the inset left a bar across the whole width with nothing in it. Native
+   apps put their bar beside that ring; this does the same for the shell, its phone header and the
+   sidebar drawer. They keep the top 25 pt, where the system takes the touches, and the header's
+   controls stop left of the ring. Dialogs and sheets keep the full inset. The Duo reports a
+   466x678 screen on both displays, and only the inner one is wider than 600, so no other device
+   matches. min() keeps a web clip that reports no top inset (not black-translucent) unchanged. */
+@media (orientation: portrait) and (device-width: 466px) and (device-height: 678px) and (min-width: 600px) {
+  :root {
+    --safe-area-top: min(env(safe-area-inset-top, 0px), 25px);
+    /* From the ring's left edge to the display edge, plus a gap. */
+    --ios-status-corner: 128px;
+  }
+}
+
 /* Hide right sidebar when the workspace shell is too narrow to fit
    ChatPane(min 384px) + RightSidebar(min 300px) side-by-side. */
 @container (max-width: 684px) {
@@ -1160,8 +1230,8 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
-      env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right) env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 0px) !important;
   }
 
   .right-sidebar-fullscreen .right-sidebar-fullscreen-header {
@@ -1543,16 +1613,13 @@ html[data-renderer-inactive] *::after {
 }
 /* Desktop titlebar drag regions (Electron only)
  * -webkit-app-region: drag marks areas that can be used to drag the window
- * -webkit-app-region: no-drag marks interactive elements inside drag regions
+ * -webkit-app-region: no-drag marks interactive elements inside drag regions (the
+ * .titlebar-no-drag rule lives in transcript-content.css, shared with the VS Code webview)
  * These styles only apply in Electron; in browser mode they have no effect */
 .titlebar-drag {
   -webkit-app-region: drag;
   /* Prevent text selection while dragging */
   user-select: none;
-}
-
-.titlebar-no-drag {
-  -webkit-app-region: no-drag;
 }
 
 /* Titlebar-safe inset classes — consume the CSS custom properties set by
@@ -1596,3 +1663,15 @@ html[data-renderer-inactive] *::after {
 .titlebar-safe-right-gutter-2 {
   --titlebar-safe-right-gutter: 0.5rem;
 } /* px-2 */
+
+/* The creation page's environment panel is a bottom sheet on a touch phone. Radix positions a
+   popover through inline styles on a wrapper it owns, so the wrapper is matched by the marker on
+   its content and pinned to the bottom edge instead. */
+@media (max-width: 768px) and (pointer: coarse) {
+  [data-radix-popper-content-wrapper]:has(> [data-phone-sheet]) {
+    position: fixed !important;
+    inset: auto 0 0 0 !important;
+    transform: none !important;
+    min-width: 0 !important;
+  }
+}

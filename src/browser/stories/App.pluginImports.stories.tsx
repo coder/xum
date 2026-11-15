@@ -39,6 +39,7 @@ const preview: AgentPluginInstallPreview = {
   ],
   agents: ["reviewer.md"],
   readonlyAgents: [],
+  shellRemovedAgents: [],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
   consentDigest: "c".repeat(64),
@@ -147,6 +148,21 @@ async function checkPhoneBounds() {
   }
 }
 
+/**
+ * Pin the Settings content's scroll offset to the top. The snapshot includes it, and the play
+ * leaves it to timing: focusing "Save changes" scrolls the content down, and closing the panel
+ * shrinks it. The browser clamps the offset at the next layout, so the content ended at the top
+ * when a frame ran between "Done" and the reopened panel, and scrolled down when none did.
+ */
+function scrollSettingsContentToStart(inside: HTMLElement) {
+  let scroller = inside.parentElement;
+  while (scroller !== null && getComputedStyle(scroller).overflowY !== "auto") {
+    scroller = scroller.parentElement;
+  }
+  if (scroller === null) throw new Error("Settings content has no vertical scroller");
+  scroller.scrollTop = 0;
+}
+
 export const PreviewDesktop: AppStory = {
   globals: { viewport: { value: "desktop", isRotated: false } },
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["desktop"] } } },
@@ -202,6 +218,9 @@ export const ManageComponentsDesktop: AppStory = {
     await expect(canvas.getByRole("checkbox", { name: "research" })).toBeChecked();
     await expect(canvas.getByRole("button", { name: "Save changes" })).toBeDisabled();
     await checkPhoneBounds();
+    scrollSettingsContentToStart(
+      canvas.getByRole("button", { name: "Manage components for review-tools" })
+    );
   },
 };
 

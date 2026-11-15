@@ -1,7 +1,7 @@
 // Lightweight provider harness for isolated design-sync previews. Renders a
 // single component with the contexts it needs WITHOUT the app shell (AppLoader),
 // so previews stay thin (no shiki/mermaid/full-app graph). Providers are shimmed
-// to window.Mux (barrel exports them) so they share React-context identity with
+// to window.Xum (barrel exports them) so they share React-context identity with
 // the bundled components; the mock client bundles from source (it's data, not
 // identity-sensitive). Owned previews in .design-sync/previews/<Name>.tsx import
 // this via a relative path.
@@ -20,7 +20,7 @@ import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { AboutDialogProvider } from "@/browser/contexts/AboutDialogContext";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 
-// Mux's globals.css (bundled into the design system's CSS) pins the document to
+// Xum's globals.css (bundled into the design system's CSS) pins the document to
 // the viewport: `html,body,#root,#storybook-root{height:100vh;min-height:100vh}`
 // so the Electron app fills its window. Inside an isolated preview that rule is
 // actively harmful: the Design System gallery embeds each card in an iframe and

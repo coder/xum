@@ -1,9 +1,16 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
+import * as fs from "fs/promises";
+import * as fsPromisesModule from "node:fs/promises";
+import * as os from "os";
+import * as path from "path";
 import type { ORPCContext } from "@/node/orpc/context";
 import { Ok } from "@/common/types/result";
+import { Config } from "@/node/config";
+import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import {
   getWorkspaceMcpOverrides,
   listWorkspaceMcpPrompts,
+  setWorkspaceMcpOverrides,
   warmWorkspaceMcpServers,
 } from "./workspacePluginOperations";
 
@@ -71,6 +78,77 @@ describe("getWorkspaceMcpOverrides", () => {
       overrides: {},
       revision: "unavailable",
     });
+  });
+});
+
+describe("setWorkspaceMcpOverrides", () => {
+  test("a settings save skips the checkouts the MCP server manager holds no state for", async () => {
+    // At 7,550 workspaces each save canonicalized every registered checkout. The save may
+    // skip a workspace only when the manager reports no cached state for it, so the
+    // operation must pass the manager's answer through.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "ws-mcp-save-"));
+    try {
+      const config = new Config(path.join(root, "home"));
+      const writer = { id: "save-writer", dir: path.join(root, "writer") };
+      const unrelated = Array.from({ length: 8 }, (_, index) => ({
+        id: `save-unrelated-${index}`,
+        dir: path.join(root, `unrelated-${index}`),
+      }));
+      const entries = [writer, ...unrelated];
+      await Promise.all(entries.map((entry) => fs.mkdir(entry.dir, { recursive: true })));
+      await config.editConfig((current) => {
+        for (const entry of entries) {
+          current.projects.set(entry.dir, {
+            workspaces: [
+              {
+                path: entry.dir,
+                id: entry.id,
+                name: entry.id,
+                runtimeConfig: { type: "local" },
+                createdAt: "2026-11-06T00:00:00.000Z",
+              },
+            ],
+          });
+        }
+        return current;
+      });
+      const service = new WorkspaceMcpOverridesService(config);
+      const hasWorkspaceOverridesSnapshot = mock((_workspaceId: string) => false);
+      const context = {
+        workspaceMcpOverridesService: service,
+        mcpServerManager: {
+          applyWorkspaceOverrides: mock(() => Promise.resolve()),
+          forgetWorkspaceOverrides: mock(() => undefined),
+          forgetAllWorkspaceOverrides: mock(() => undefined),
+          hasWorkspaceOverridesSnapshot,
+        },
+      } as unknown as ORPCContext;
+      const { revision } = await service.getOverridesForWorkspace(writer.id);
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      let unrelatedRealpaths: number;
+      let result: Awaited<ReturnType<typeof setWorkspaceMcpOverrides>>;
+      try {
+        result = await setWorkspaceMcpOverrides(context, {
+          workspaceId: writer.id,
+          overrides: { disabledServers: ["shots"] },
+          expectedRevision: revision,
+        });
+        unrelatedRealpaths = realpathSpy.mock.calls.filter(([target]) =>
+          unrelated.some(
+            (entry) =>
+              String(target) === entry.dir || String(target).startsWith(entry.dir + path.sep)
+          )
+        ).length;
+      } finally {
+        realpathSpy.mockRestore();
+      }
+      expect(result).toEqual({ success: true, data: undefined });
+      expect(unrelatedRealpaths).toBe(0);
+      const asked = new Set(hasWorkspaceOverridesSnapshot.mock.calls.map(([id]) => id));
+      expect(unrelated.filter((entry) => !asked.has(entry.id))).toEqual([]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });
 

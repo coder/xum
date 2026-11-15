@@ -29,6 +29,10 @@ import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { CanvasArtifact } from "./CanvasArtifact";
 import { McpAppFrame } from "./McpAppFrame";
 import type { McpAppViewRef } from "./mcpAppViewsStore";
+import { frameDocumentOf, postFromFrameDocument } from "./frameDocument.testHarness";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 /*
  * A dropped backend connection: while it is down, useAPI() returns `api: null`; the reconnect
@@ -72,11 +76,9 @@ let failWith: string | null = null;
 let cutOffNextAssetRead = false;
 /** The artifacts the listing returns. */
 let listEntries = [{ path: "app.html", kind: "html" as const, size: 10, modifiedMs: 1 }];
-/** Only listVersions fails while set. */
-let failVersions = false;
 /** getState answers unsuccessfully while set. */
 let failGetState = false;
-let sends: Array<{ version: number | null }> = [];
+let sends: string[] = [];
 
 function fail() {
   return Promise.resolve({ success: false as const, error: failWith ?? "" });
@@ -115,29 +117,6 @@ function serverOverrides(): TestApiOverrides<APIClient> {
             : { success: false as const, error: `Artifact not found: ${input.path}` }
         );
       },
-      listVersions: (input: { path: string }) => {
-        if (failWith != null) return fail();
-        if (failVersions) return Promise.resolve({ success: false as const, error: "no list" });
-        return Promise.resolve({
-          success: true as const,
-          data: {
-            artifactId: "id",
-            path: input.path,
-            pin: null,
-            versions: [
-              {
-                version: 1,
-                label: null,
-                source: "publish" as const,
-                createdAtMs: 1,
-                sha256: "x",
-                size: 10,
-                path: input.path,
-              },
-            ],
-          },
-        });
-      },
       listPinned: () =>
         Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
       listShelf: () =>
@@ -156,8 +135,8 @@ function serverOverrides(): TestApiOverrides<APIClient> {
         persistedState = input.state;
         return Promise.resolve({ success: true as const, data: undefined });
       },
-      sendInteraction: (input: { version: number | null }) => {
-        sends.push({ version: input.version });
+      sendInteraction: (input: { text: string }) => {
+        sends.push(input.text);
         return Promise.resolve({ success: true as const, data: { id: "i1" } });
       },
     },
@@ -212,14 +191,8 @@ function expectSameFrame(current: HTMLElement | null, frame: HTMLIFrameElement) 
   );
 }
 
-function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
-  const event = new window.Event("message");
-  Object.defineProperty(event, "data", { value: data });
-  Object.defineProperty(event, "source", { value: frame.contentWindow });
-  act(() => {
-    window.dispatchEvent(event);
-  });
-}
+/** Deliver a bridge message as the artifact frame's document sends it: over its own port. */
+const postFromFrame = postFromFrameDocument;
 
 // Every case runs with the provider of today (null-gap) and after the switch (kept-gap).
 describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", (mode) => {
@@ -243,7 +216,6 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     getStateCalls = 0;
     getViewCalls = 0;
     failWith = null;
-    failVersions = false;
     failGetState = false;
     cutOffNextAssetRead = false;
     listEntries = [{ path: "app.html", kind: "html" as const, size: 10, modifiedMs: 1 }];
@@ -264,13 +236,13 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     await settle();
     const srcdoc = frame.getAttribute("srcdoc");
     const statesRead = getStateCalls;
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
+    await postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
     await waitFor(() => expect(savedStates).toEqual([{ step: 2 }]));
 
     await dropConnection();
     expectSameFrame(view.queryByTestId("artifact-frame"), frame);
     expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 3 } });
+    await postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 3 } });
 
     await reconnect();
     await waitFor(() => expect(savedStates).toEqual([{ step: 2 }, { step: 3 }]));
@@ -342,10 +314,8 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
       wrapper: ConnectionWrapper,
     });
     const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
-    const posted: Array<{ method?: string }> = [];
-    frame.contentWindow!.postMessage = ((message: { method?: string }) => {
-      posted.push(message);
-    }) as Window["postMessage"];
+    // Everything the host sends the view's document, over its port.
+    const posted = frameDocumentOf(frame).received as Array<{ method?: string }>;
 
     await dropConnection();
     harness.reconnect();
@@ -402,7 +372,11 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     await settle();
     await dropConnection();
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { marker: "zq-offline" } });
+    await postFromFrame(frame, {
+      xumArtifact: 1,
+      type: "setState",
+      state: { marker: "zq-offline" },
+    });
     // A tab switch unmounts the panel before the connection is back.
     view.unmount();
     expect(savedStates).toEqual([]);
@@ -419,31 +393,11 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     );
   });
 
-  test("Send does not record a version from a version list whose refresh failed", async () => {
-    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
-    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    await settle();
-    failVersions = true;
-    await dropConnection();
-    await reconnect();
-    // The kept list still keys the frame, so it is not rebuilt.
-    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
-
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship" });
-    const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
-    await waitFor(() => expect(sendButton.disabled).toBe(false), {
-      timeout: CONFIRM_ARM_DELAY_MS + 1000,
-    });
-    fireEvent.click(sendButton);
-    // Null: the server resolves the version, instead of the outdated newest one (1).
-    await waitFor(() => expect(sends).toEqual([{ version: null }]));
-  });
-
   test("Send while offline shows the reconnecting message and sends nothing", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     await settle();
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship" });
     const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
     await waitFor(() => expect(sendButton.disabled).toBe(false), {
       timeout: CONFIRM_ARM_DELAY_MS + 1000,

@@ -45,6 +45,7 @@ import {
   type WaterfallNext,
 } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
 
 export interface HookConfig {
   /** Runtime for hook execution (local or SSH) */
@@ -85,10 +86,7 @@ export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | nu
     runtimeTempDir: config.runtimeTempDir,
     workspaceId: config.workspaceId,
     // Match bash tool behavior: xumEnv is present and secrets override it.
-    env: {
-      ...(config.xumEnv ?? {}),
-      ...(config.secrets ?? {}),
-    },
+    env: mergeSecretsOverXumEnv(config.xumEnv, config.secrets),
     turn: config.hookTurn,
     clock: config.clock,
   };

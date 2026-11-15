@@ -193,6 +193,7 @@ export function createAgentSessionAIServiceFake(
       )
     ),
     getProvidersConfig: mock(() => null),
+    getWorkspaceSandboxEnv: mock(() => Promise.resolve({})),
     isExperimentEnabled: mock((_experimentId) => false),
     prepareStreamMessage: mock(() =>
       Promise.resolve(

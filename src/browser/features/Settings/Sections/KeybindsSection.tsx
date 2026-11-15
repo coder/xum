@@ -11,6 +11,8 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SEND_QUEUED_MESSAGE_NOW: "Send queued message now",
   SEND_HELD_INPUT: "Send oldest unsent message",
   DISCARD_HELD_INPUT: "Discard oldest unsent message",
+  SET_DEFAULT_ISOLATION: "Make the new workspace's isolation the project default",
+  OPEN_CREATION_ENVIRONMENT: "Open the new workspace's environment panel",
   FOCUS_BACKGROUND_PROCESSES: "Focus background processes",
   OPEN_TODO_PANEL: "Open TODO list",
   OPEN_SUB_AGENTS_PANEL: "Open sub-agents",
@@ -138,6 +140,9 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: "Toggle MCP stdio commands in backup",
   SETTINGS_BACKUP_TOGGLE_PROJECTS: "Toggle project backup",
   SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: "Toggle global artifact backup",
+  SETTINGS_BACKUP_TOGGLE_PLUGINS: "Toggle plugin list backup",
+  SETTINGS_BACKUP_REVIEW_PLUGINS: "Review and install backed-up plugins",
+  SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL: "Back up and remove plugins from the backup",
   // Modal-only keybinds; intentionally omitted from KEYBIND_GROUPS.
   CONFIRM_DIALOG_YES: "Confirm dialog action",
   CONFIRM_DIALOG_NO: "Cancel dialog action",
@@ -157,6 +162,8 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   REVIEW_COPY_FILE: "Copy file contents (immersive)",
   TOGGLE_PLAN_ANNOTATE: "Toggle plan annotate mode",
   RUN_LATEST_PLAN_ACTION: "Implement latest plan",
+  RUN_OUTSIDE_SANDBOX: "Run latest sandbox approval outside once",
+  DENY_OUTSIDE_SANDBOX: "Deny latest sandbox approval",
   // Transcript-menu-only actions show their shortcuts in that menu.
   COPY_MARKDOWN: "Copy Markdown (transcript context menu)",
   // Image-viewer-scoped keybinds (lightbox / image context menu); intentionally
@@ -213,6 +220,8 @@ const KEYBIND_GROUPS: Array<{
       "FOCUS_INPUT_A",
       "TOGGLE_PLAN_ANNOTATE",
       "RUN_LATEST_PLAN_ACTION",
+      "RUN_OUTSIDE_SANDBOX",
+      "DENY_OUTSIDE_SANDBOX",
       "CANCEL",
       "INTERRUPT_STREAM_NORMAL",
       "INTERRUPT_STREAM_VIM",
@@ -343,6 +352,9 @@ const KEYBIND_GROUPS: Array<{
       "SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS",
       "SETTINGS_BACKUP_TOGGLE_PROJECTS",
       "SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS",
+      "SETTINGS_BACKUP_TOGGLE_PLUGINS",
+      "SETTINGS_BACKUP_REVIEW_PLUGINS",
+      "SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL",
     ],
   },
   {

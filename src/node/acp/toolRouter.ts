@@ -5,6 +5,7 @@ import type {
   PermissionOption,
   RequestPermissionOutcome,
 } from "@agentclientprotocol/sdk";
+import { BASH_DEFAULT_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 import type { RuntimeMode } from "@/common/types/runtime";
 import { handleStringReplace } from "@/node/services/tools/file_edit_replace_shared";
 
@@ -217,13 +218,14 @@ export class ToolRouter {
 
     if (isTerminalTool(normalizedToolName)) {
       const startedAt = Date.now();
-      const bashTimeoutSecs =
-        normalizedToolName === "bash"
-          ? getOptionalNumber(params, "timeout_secs", toolName)
-          : undefined;
+      // Only bash has a timeout_secs, so only bash can omit one.
+      const isBash = normalizedToolName === "bash";
+      const bashTimeoutSecs = isBash
+        ? getOptionalNumber(params, "timeout_secs", toolName)
+        : undefined;
+      const foregroundWaitSecs = delegatedForegroundWaitSecs(isBash, bashTimeoutSecs);
       const runInBackground =
-        normalizedToolName === "bash" &&
-        (getOptionalBoolean(params, "run_in_background", toolName) ?? false);
+        isBash && (getOptionalBoolean(params, "run_in_background", toolName) ?? false);
 
       try {
         const terminal = await this.connection.createTerminal(
@@ -247,7 +249,7 @@ export class ToolRouter {
 
         let exitStatus: Awaited<ReturnType<DelegatedTerminalHandle["waitForExit"]>>;
         try {
-          exitStatus = await waitForTerminalExitWithTimeout(foregroundTerminal, bashTimeoutSecs);
+          exitStatus = await waitForTerminalExitWithTimeout(foregroundTerminal, foregroundWaitSecs);
         } catch (error) {
           if (!(error instanceof TerminalWaitTimeoutError)) {
             throw error;
@@ -812,6 +814,19 @@ function buildBashTimeoutErrorMessage(timeoutSecs: number): string {
   assert(Number.isFinite(timeoutSecs) && timeoutSecs > 0, "timeoutSecs must be > 0");
 
   return `Command exceeded timeout of ${timeoutSecs} seconds. You can increase the timeout by setting the \`timeout_secs\` parameter on the tool call. Do not use the \`timeout\` bash command to increase the timeout.`;
+}
+
+/**
+ * Foreground wait deadline for a delegated terminal. Bash carries an optional timeout_secs and an
+ * omitted one gets the shared bash deadline, so a hung command cannot block the turn without end; a
+ * terminal tool without that field keeps being waited on until it exits. A background terminal is
+ * bound by neither.
+ */
+function delegatedForegroundWaitSecs(
+  isBash: boolean,
+  requestedSecs: number | undefined
+): number | undefined {
+  return isBash ? (requestedSecs ?? BASH_DEFAULT_TIMEOUT_SECS) : requestedSecs;
 }
 
 async function waitForTerminalExitWithTimeout(

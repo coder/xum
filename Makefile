@@ -124,7 +124,11 @@ ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --out
 # Common esbuild flags for server runtime Docker bundle.
 # Place runtime bundles under dist/runtime so frontend dist/*.js layers remain stable.
 # External native modules (node-pty, ssh2) and electron remain runtime dependencies.
-ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
+# A CJS bundle leaves import.meta empty, and @anthropic-ai/sandbox-runtime calls
+# fileURLToPath(import.meta.url) when it loads, which crashed the server at startup. So
+# import.meta.url is the bundle's own file URL. The banner repeats "use strict" because a
+# directive only counts before the first statement.
+ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify --define:import.meta.url=__xumBundleUrl --banner:js='"use strict";var __xumBundleUrl=require("url").pathToFileURL(__filename).href;'
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
 # Each encoding ships as its own bundle next to the worker, and the worker bundle requires it
@@ -143,7 +147,7 @@ include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
+.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config check-no-css-zoom typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
 .PHONY: formal-check
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
@@ -151,8 +155,8 @@ include fmt.mk
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit test-storybook-paint-fixtures storybook-budget
+.PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome test-layout-audit-browser
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -427,6 +431,10 @@ BUILTIN_AGENTS_GENERATED := src/node/services/agentDefinitions/builtInAgentConte
 BUILTIN_SKILLS_GENERATED := src/node/services/agentSkills/builtInSkillContent.generated.ts
 WORKFLOW_RUNTIME_SOURCES_GENERATED := src/node/services/workflows/workflowRuntimeSources.generated.ts
 WORKFLOW_RUNTIME_SOURCES := $(shell find src/node/workflowRuntime -type f -name '*.js' 2>/dev/null)
+# The HTML artifact layout audit's page script: src/browser/layoutAudit bundled by esbuild (the
+# tests and test harnesses stay out), with the shared constants and types it imports.
+LAYOUT_AUDIT_SCRIPT_GENERATED := src/node/services/layoutAudit/layoutAuditPageScript.generated.ts
+LAYOUT_AUDIT_SOURCES := $(shell find src/browser/layoutAudit -type f \( -name '*.ts' -o -name '*.txt' \) ! -name '*.test.ts' ! -name '*.testHarness.ts' 2>/dev/null) src/common/constants/artifactLayoutAudit.ts src/common/types/artifactLayoutAudit.ts
 
 $(BUILTIN_AGENTS_GENERATED): src/node/builtinAgents/*.md scripts/generate-builtin-agents.sh
 	@./scripts/generate-builtin-agents.sh
@@ -437,9 +445,12 @@ $(BUILTIN_SKILLS_GENERATED): $(BUILTIN_SKILL_SOURCES) $(DOCS_SOURCES) scripts/ge
 $(WORKFLOW_RUNTIME_SOURCES_GENERATED): $(WORKFLOW_RUNTIME_SOURCES) scripts/gen_workflow_runtime_sources.ts
 	@bun scripts/gen_workflow_runtime_sources.ts
 
+$(LAYOUT_AUDIT_SCRIPT_GENERATED): $(LAYOUT_AUDIT_SOURCES) scripts/gen_layout_audit_script.ts
+	@bun scripts/gen_layout_audit_script.ts
+
 # models.json is bundled but not in $(TS_SOURCES); without this prerequisite a
 # catalog-only refresh would leave a stale main bundle (#3727).
-dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) src/common/utils/tokens/models.json $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) src/common/utils/tokens/models.json $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED)
 	@echo "Building main process..."
 	@NODE_ENV=production $(TSGO) -p tsconfig.main.json
 	@NODE_ENV=production bun x tsc-alias -p tsconfig.main.json
@@ -596,7 +607,7 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # (.oxlintrc.json, kept in step by check-oxlint-config); static-check-full also runs type-aware
 # ESLint on all files, so CI still catches what oxlint cannot check, including type-aware
 # findings that a change surfaces in files it did not touch.
-STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config lint-shellcheck lint-hadolint
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config check-no-css-zoom lint-shellcheck lint-hadolint
 
 static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
 
@@ -627,14 +638,20 @@ crap-check: ## CRAP gate on files changed since BASE (default: merge-base with o
 
 CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group crap --only-group test python
 
-# tree-sitter-language-pack downloads its grammars from GitHub releases on
-# first use. The script tests are in static-check-full (Required), so retry a
-# transient failure there (seen: HTTP 504) once, before any test uses them.
+# tree-sitter-language-pack downloads its grammars from GitHub releases on first use. The
+# script tests are in static-check-full (Required), so a transient failure there (seen: HTTP
+# 504) must not fail the job before any test uses the grammars. The script checks the pack's
+# manifest and bundle against sha256 pins that it holds, and then calls the pack's download(),
+# which extracts the grammars from them (and fetches them when they are missing). CI sets
+# GRAMMAR_STAGE_DIR to the directory that it caches, which holds only those two files, so a
+# cache hit needs no network (pr.yml's "Restore tree-sitter grammars" step). A cold cache gets
+# a budget of 15 minutes: the 504 outage of 2026-11-08 outlasted the old 3 tries 10 s apart.
+# The default keeps an offline local run short. The script exits 64 on an HTTP 4xx that no
+# retry changes, and on files that do not match the pins. A language added to `LANGUAGES` in
+# the script needs no new key: the key hashes the script.
+GRAMMAR_DOWNLOAD_BUDGET_SECS ?= 60
 tree-sitter-grammars:
-	@for attempt in 1 2 3; do \
-		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
-		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
-	done
+	@./scripts/retry.sh --budget-secs $(GRAMMAR_DOWNLOAD_BUDGET_SECS) --max-backoff-secs 60 --fatal-status 64 0 2 env $(CRAP_PYTHON) scripts/ci/download_tree_sitter_grammars.py
 
 test-crap-scripts: tree-sitter-grammars ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
@@ -677,15 +694,21 @@ check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is 
 check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies different rules than eslint.config.mjs to any lint file
 	@node scripts/check-oxlint-config.mjs
 
+# CSS zoom lays out differently in Safari than in Chromium: iPhone Safari painted a Mermaid
+# diagram far outside its frame. TS and TSX are covered by local/no-css-zoom.
+check-no-css-zoom: node_modules/.installed ## Fail when a tracked CSS, HTML or SVG file declares the zoom property
+	@bun test ./scripts/check-no-css-zoom.test.ts
+	@bun scripts/check-no-css-zoom.ts
+
 # <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
 	@bun test ./scripts/check-test-seam-comments.test.ts
 	@bun scripts/check-test-seam-comments.ts
 
-check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
+check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
 
-LINT_PREREQS := node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+LINT_PREREQS := node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED)
 # Type-aware ESLint lints vscode/src, whose types (@types/vscode) come from the extension's own
 # install. Without it, `make -j static-check-full` races typecheck's install and every vscode
 # type reads as `error`.
@@ -734,14 +757,14 @@ pin-actions: ## Pin GitHub Actions to SHA hashes (requires GH_TOKEN or gh CLI)
 	./scripts/pin-actions.sh .github/workflows/*.yml .github/actions/*/action.yml
 
 ifeq ($(OS),Windows_NT)
-typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run TypeScript type checking (uses tsgo for 10x speedup)
+typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED) ## Run TypeScript type checking (uses tsgo for 10x speedup)
 	@# On Windows, use npm run because bun x doesn't correctly pass arguments
 	@npm x concurrently -g \
 		"$(TSGO) --noEmit" \
 		"$(TSGO) --noEmit -p tsconfig.main.json" \
 		"$(TSGO) --noEmit -p tsconfig.tooling.json"
 else
-typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED)
 	@bun x concurrently -g \
 		"$(TSGO) --noEmit" \
 		"$(TSGO) --noEmit -p tsconfig.main.json" \
@@ -887,15 +910,22 @@ ensure-mac-sharp-runtime-deps: node_modules/.installed
 		fi; \
 	done
 
+# ELECTRON_ZIP_DIR (CI sets it, from setup-xum's electron-zip input) names the directory of the
+# checksum-checked electron-v<version>-<platform>-<arch>.zip files. electron-builder then unpacks
+# them and downloads nothing: its own download retries nothing, and a github.com 504 failed
+# Build / Linux in five queue runs on 2026-11-08. The directory must hold the zip of every arch
+# the call builds, or electron-builder looks for an unpacked Electron there and fails.
+ELECTRON_DIST_FLAG = $(if $(ELECTRON_ZIP_DIR),-c.electronDist="$(ELECTRON_ZIP_DIR)")
+
 dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@if [ -n "$$CSC_LINK" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
-		bun x electron-builder --mac --x64 --arm64 --publish never; \
+		bun x electron-builder --mac --x64 --arm64 --publish never $(ELECTRON_DIST_FLAG); \
 	else \
 		echo "Building macOS architectures in parallel..."; \
-		bun x electron-builder --mac --x64 --publish never & pid1=$$! ; \
-		bun x electron-builder --mac --arm64 --publish never & pid2=$$! ; \
+		bun x electron-builder --mac --x64 --publish never $(ELECTRON_DIST_FLAG) & pid1=$$! ; \
+		bun x electron-builder --mac --arm64 --publish never $(ELECTRON_DIST_FLAG) & pid2=$$! ; \
 		wait $$pid1 && wait $$pid2; \
 	fi
 	@# electron-updater skips an update when os.release() (the Darwin version) is below the
@@ -914,12 +944,12 @@ MAC_TARGETS ?=
 dist-mac-x64: build ## Build macOS x64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
-	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never $(ELECTRON_DIST_FLAG)
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
-	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
 	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
@@ -929,13 +959,13 @@ install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Appli
 	echo "Installed $$app_bundle to /Applications"
 
 dist-win: build ## Build Windows distributable
-	@bun x electron-builder --win --publish never
+	@bun x electron-builder --win --publish never $(ELECTRON_DIST_FLAG)
 
 dist-linux: build ## Build Linux distributable
-	@bun x electron-builder --linux --publish never
+	@bun x electron-builder --linux --publish never $(ELECTRON_DIST_FLAG)
 
 dist-linux-arm64: build ## Build Linux arm64 distributable
-	@bun x electron-builder --linux --arm64 --publish never
+	@bun x electron-builder --linux --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
 # MAC_ARCH=x64|arm64 validates a single-arch build (dist-mac-<arch>) instead of both.
 check-mac-attach-file-runtime: ## Validate packaged macOS attach_file runtime assets (requires prior dist-mac build)
@@ -1001,6 +1031,20 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	@# Storybook story transitions can exceed Jest's default 15s timeout on loaded CI runners.
 	@bun x test-storybook --testTimeout 30000
 
+# The runner opens the Storybook page once for every story file it is given, so only the files
+# that name a tag are visited.
+WEBKIT_STORY_FILES = $(shell grep -rlF -e '"webkit"' -e '"paint-check"' src/browser --include='*.stories.tsx')
+
+test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" or "paint-check" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
+	$(check_node_version)
+	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit or paint-check tag"; exit 1; }
+	@# paint-fixture stories are built to fail or to pass on purpose, so only test-storybook-paint-fixtures runs them.
+	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --excludeTags paint-fixture --testTimeout 30000 $(WEBKIT_STORY_FILES)
+
+test-storybook-paint-fixtures: node_modules/.installed ## Prove the paint-check runner's guards still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
+	$(check_node_version)
+	@bun scripts/check-paint-check-fixtures.ts
+
 storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
 	@# Node, not Bun: it drives Playwright like pixel-storybook (see storybook-flake-check).
@@ -1031,6 +1075,12 @@ generate-phone-chrome: build-main build-renderer build-static ## Capture the pho
 
 check-phone-chrome: node_modules/.installed ## Fail when the built live phone workspace page (run `make build` first) drifted from the checked-in skeleton
 	@bun scripts/perf/generatePhoneChrome.ts --check $(PHONE_CHROME_ARGS)
+
+# The shipped layout audit script, run in Chromium over the lavish-axi fixture pages (CI runs it
+# in Test / Phone chrome, which already sets up Playwright). LAYOUT_AUDIT_BROWSER_ARGS: --print
+# (only print the table), --chrome <executable>.
+test-layout-audit-browser: node_modules/.installed ## Run the shipped layout audit in Chromium over tests/fixtures/layout-audit at 390, 1440 and 768 px
+	@bun tests/layoutAudit/runFixtureAudit.ts $(LAYOUT_AUDIT_BROWSER_ARGS)
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Harbor and its Daytona SDK come from the harbor group in pyproject.toml; bump them there.
@@ -1069,7 +1119,7 @@ clean: ## Clean build artifacts
 ## Startup Performance Checks
 # Walks the static import graph of the startup entry points (no build needed).
 # The analyzer's fixture tests run first so a broken guard cannot pass vacuously.
-check-startup-imports: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Check that heavy packages stay off the eager startup import path
+check-startup-imports: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) $(LAYOUT_AUDIT_SCRIPT_GENERATED) ## Check that heavy packages stay off the eager startup import path
 	@bun test ./scripts/check-startup-imports.test.ts
 	@bun scripts/check-startup-imports.ts
 

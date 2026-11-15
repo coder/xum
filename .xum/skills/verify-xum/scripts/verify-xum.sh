@@ -8,9 +8,12 @@
 #   verify-xum.sh open PATH [RUN]  open PATH of the run's UI in its browser session, token in no argv
 #   verify-xum.sh workspace-field NAME FIELD [RUN]  print FIELD of workspace NAME from config.json
 #   verify-xum.sh capture NAME [RUN]  screenshot + ARIA snapshot + URL into the run's evidence
+#   verify-xum.sh webkit-capture PATH NAME [RUN]  phone-width WebKit screenshot + report of PATH
 #   verify-xum.sh idle [RUN]       wait until the page settles, exit 3 if a chunk failed to load
 #   verify-xum.sh send-ready [RUN] wait until the composer's Send button is enabled
 #   verify-xum.sh cleanup [RUN]    stop the run's processes, delete its XUM_ROOT, keep evidence
+#   verify-xum.sh cli ARGS...      run `xum api ARGS` against the newest run, once its TCP port is
+#                                  the run's backend
 #
 # RUN defaults to the newest launch from this checkout.
 set -euo pipefail
@@ -47,7 +50,7 @@ VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-$HOME/.cache/verify-xum}
 CHECKOUT_GIT_DIR=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-dir)
 LAUNCH_GUARD="$CHECKOUT_GIT_DIR/verify-xum.lock.guard"
 CURRENT_RUN_LINK="$CHECKOUT_GIT_DIR/verify-xum.current"
-READY_TIMEOUT=${VERIFY_XUM_READY_TIMEOUT:-300}
+READY_TIMEOUT=${VERIFY_XUM_READY_TIMEOUT:-600}
 DISCARD_BASE_URL=http://127.0.0.1:9/v1
 
 die() {
@@ -293,16 +296,33 @@ probe_before_launch_deadline() {
   curl -fs --max-time "$(launch_seconds_left)" -o /dev/null "$1"
 }
 
-# A backend started with auth (#7904's `make dev-server`) records its token in server.lock. The
-# header goes to curl on stdin, so the token stays out of every process's argv.
+# The Unix socket that the backend listens on next to its TCP port (the Makefile's
+# XUM_BACKEND_SOCKET) must sit in a folder that only this user can write, with no folder above it
+# that another account could rename (require_safe_ancestors): no one else can then create a socket
+# at that name.
+require_private_socket() {
+  local dir
+  # Unset in the state.env of a run that an older verify-xum.sh launched.
+  [[ ${VERIFY_XUM_BACKEND_SOCKET-} == /* ]] \
+    || die "run $VERIFY_XUM_RUN names no Unix socket for the backend (an older verify-xum.sh launched it). Run verify-xum.sh cleanup, then launch again."
+  dir=$(dirname "$VERIFY_XUM_BACKEND_SOCKET")
+  require_private_dir "$dir"
+  require_safe_ancestors "$(cd -P -- "$dir" && pwd -P)" "the backend's socket"
+}
+
+# Sends a request with the run's token to the backend over its Unix socket, never its TCP port. A
+# starting backend listens on the port before it writes server.lock, and a stopping one deletes
+# server.lock before it closes the port, so the port can be free for another local account to bind
+# while server.lock is missing or names a dead backend (a stop, or a nodemon restart). Only this
+# user can create the socket (require_private_socket), so the run's token copy is safe to send
+# too. The token goes to curl on stdin, so it is in no process's argv. Callers pass the TCP URL:
+# curl takes the path and the Host header from it. A `return` and not set -e: doctor calls this
+# inside `if` and reports the FAIL.
 backend_curl() {
   local token
-  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  if [[ -n $token ]]; then
-    printf 'Authorization: Bearer %s\n' "$token" | curl -H @- "$@"
-  else
-    curl "$@"
-  fi
+  require_private_socket
+  token=$(required_run_token) || return 1
+  printf 'Authorization: Bearer %s\n' "$token" | curl --unix-socket "$VERIFY_XUM_BACKEND_SOCKET" -H @- "$@"
 }
 
 api() {
@@ -344,8 +364,8 @@ backend_ready() {
 write_state() {
   local name
   for name in VERIFY_XUM_RUN_ID VERIFY_XUM_RUN VERIFY_XUM_CHECKOUT VERIFY_XUM_COMMIT VERIFY_XUM_PGID VERIFY_XUM_ROOT \
-    VERIFY_XUM_BACKEND VERIFY_XUM_URL VERIFY_XUM_PROJECT VERIFY_XUM_WORKSPACE_ID \
-    VERIFY_XUM_WORKTREE VERIFY_XUM_EVIDENCE AGENT_BROWSER_SESSION; do
+    VERIFY_XUM_BACKEND VERIFY_XUM_BACKEND_SOCKET VERIFY_XUM_URL VERIFY_XUM_PROJECT \
+    VERIFY_XUM_WORKSPACE_ID VERIFY_XUM_WORKTREE VERIFY_XUM_EVIDENCE AGENT_BROWSER_SESSION; do
     printf 'export %s=%q\n' "$name" "${!name-}"
   done >"$VERIFY_XUM_RUN/state.env.tmp"
   mv -f "$VERIFY_XUM_RUN/state.env.tmp" "$VERIFY_XUM_RUN/state.env"
@@ -406,6 +426,21 @@ seed() {
   [[ -d $VERIFY_XUM_WORKTREE ]] || die "no worktree at $VERIFY_XUM_WORKTREE"
 }
 
+# Vite transforms a module on its first request, on one thread, and a cold first page load asks for
+# about 900 of them: about 45 CPU seconds, most of it in Babel, where React Compiler runs. That
+# outlasts `idle`'s 25 s wait, so the page stays on "Loading Xum". For that whole time Chrome also
+# holds dozens of queued module requests, and a host network change fails them (ERR_NETWORK_CHANGED,
+# then "<name> failed to load." for a lazy part, or the boot screen's "Xum could not load" for a
+# module of the first load). Walking the module graph here, over HTTP and before `ready`, moves
+# that cost into the launch, so the first `open` gets cached modules. The walk prints to stderr:
+# stdout stays the run's `export` lines. env -i keeps the live Xum's token out of its environment.
+warm_vite_modules() {
+  before_launch_deadline
+  env -i PATH="$PATH" HOME="$HOME" bun "$CHECKOUT/scripts/warmViteModules.ts" \
+    "$VERIFY_XUM_URL" "$(launch_seconds_left)" >&2 \
+    || die "the module walk failed (reason above), so the first page load would not be reliable"
+}
+
 # nodemon waits for a file change after the backend crashes, and none comes during a launch. A
 # crash before the first rebuild is expected (a stale dist/): the rebuild restarts it.
 backend_crashed_after_rebuild() {
@@ -432,13 +467,55 @@ launch_failed() {
   cmd_cleanup "$VERIFY_XUM_RUN" >&2 || true
 }
 
+# Refuses when a socket that listens on PORT is not on a loopback address. A .env line such as
+# XUM_VITE_HOST=0.0.0.0 makes a server listen on every interface, and Vite then answers
+# http://<this machine's IP>:<port>/ (an IP-address Host passes its check). Launch runs it while
+# it waits for readiness too: a server on one non-loopback address never answers the loopback
+# probes, and launch would otherwise wait for its deadline. Returns 1 when nothing listens on
+# PORT. With "ready" it refuses then instead: the server answered a probe there, so ss cannot see
+# its sockets.
+refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what listens there> [ready]
+  local addr addrs
+  addrs=$(ss -Hltn "sport = :$1" 2>/dev/null) || die "ss failed, so launch cannot check which addresses $2 listens on"
+  addrs=$(awk '{print $4}' <<<"$addrs")
+  [[ -n $addrs || ${3-} != ready ]] || die "ss shows nothing listening on $2's port $1, so launch cannot check that only loopback reaches it"
+  while read -r addr; do
+    [[ -z $addr || $addr == 127.*:"$1" || $addr == "[::1]:$1" ]] \
+      || die "$2 listens on $addr, not only on loopback, so other machines can reach it. A .env file in $CHECKOUT sets its host (XUM_VITE_HOST, MUX_VITE_HOST, VITE_HOST, XUM_BACKEND_HOST, MUX_BACKEND_HOST or BACKEND_HOST): remove that line."
+  done <<<"$addrs"
+  [[ -n $addrs ]]
+}
+
+# The checks that need a ready backend: its listeners and the token in its server.lock. Sets
+# token. A nodemon restart kills the backend, and the next one writes its own lock once it listens
+# (see run_token), replacing the dead one's. So a missing lock, a lock that changed while the
+# checks ran, or a /health that stopped answering means a restart: return 1, and launch waits for
+# readiness again. Refuse only what one backend showed throughout.
+backend_checks_after_ready() {
+  local before after listening=yes
+  before=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || return 1
+  refuse_off_loopback_listener "$backend_port" "the backend" || listening=no
+  backend_ready "$t0" || return 1
+  after=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || return 1
+  [[ $after == "$before" ]] || return 1
+  [[ $listening == yes ]] \
+    || die "ss shows nothing listening on the backend's port $backend_port, so launch cannot check that only loopback reaches it"
+  # env -i drops XUM_DEV_SERVER_NO_AUTH, but Bun loads the checkout's .env files into the sandbox
+  # script, and a line there can set it again. The backend's TCP port has no Host check, so without
+  # a token any local account, and a web page that rebinds its DNS name to this machine, can
+  # call its API.
+  token=$(json_field_or_empty /dev/stdin token <<<"$after")
+  [[ -n $token ]] \
+    || die "the backend has no auth token, so any local account can control it. A .env file in $CHECKOUT sets XUM_DEV_SERVER_NO_AUTH=1: remove that line."
+}
+
 # The process group id that the new group's leader appended to state.env, if it has.
 recorded_pgid() {
   sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env" | tail -n 1
 }
 
 cmd_launch() {
-  local t0 backend_port vite_port log existing token leader
+  local t0 backend_port vite_port allowed_hosts log existing token leader
   need git curl node bun make setsid flock ss realpath agent-browser
   check_bun
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
@@ -521,29 +598,45 @@ cmd_launch() {
     VERIFY_XUM_ROOT=$(sed -n 's/^  XUM_ROOT: *//p' "$log")
     backend_port=$(sed -n 's|^  Backend: *http://127.0.0.1:||p' "$log")
     vite_port=$(sed -n 's|^  Frontend: *http://localhost:||p' "$log")
-    [[ -n $VERIFY_XUM_ROOT && -n $backend_port && -n $vite_port ]] && break
+    allowed_hosts=$(sed -n 's/^  Allowed hosts: *//p' "$log")
+    [[ -n $VERIFY_XUM_ROOT && -n $backend_port && -n $vite_port && -n $allowed_hosts ]] && break
     group_alive "$VERIFY_XUM_PGID" || die "make dev-server-sandbox exited during startup"
     before_launch_deadline
     sleep 0.5
   done
   # The recipes assume default preferences. With both --clean flags the sandbox copies no config.
   grep -q '^  Seed config: *(none)$' "$log" || die "the sandbox copied a config.json, so the run would not start from default preferences"
+  # Vite's Host check is the DNS-rebinding guard. env -i drops VITE_ALLOWED_HOSTS and the
+  # port-forward proxy variables, but Bun loads the checkout's .env files (.env, .env.local,
+  # .env.development, .env.development.local) into the sandbox script, and they can set them again.
+  [[ $allowed_hosts == "loopback only" ]] \
+    || die "the sandbox allows the Host headers '$allowed_hosts' besides loopback, so a web page that rebinds its DNS name to this machine could read the app. A .env file in $CHECKOUT sets VITE_ALLOWED_HOSTS or a proxy URI: remove that line."
   VERIFY_XUM_BACKEND="http://127.0.0.1:$backend_port"
   VERIFY_XUM_URL="http://127.0.0.1:$vite_port"
   write_state
 
-  until backend_ready "$t0" && probe_before_launch_deadline "$VERIFY_XUM_URL/"; do
+  until backend_ready "$t0" && probe_before_launch_deadline "$VERIFY_XUM_URL/" \
+    && refuse_off_loopback_listener "$vite_port" Vite ready && backend_checks_after_ready; do
     before_launch_deadline
     group_alive "$VERIFY_XUM_PGID" || die "the dev server exited before it was ready"
     backend_crashed_after_rebuild "$log" && die "the backend crashed after its rebuild (nodemon waits for a file change)"
+    refuse_off_loopback_listener "$vite_port" Vite || true
+    refuse_off_loopback_listener "$backend_port" "the backend" || true
     sleep 1
   done
   # Keep the token for redaction (run_token) while server.lock is gone. The run folder is 0700,
   # and the file is 0600.
-  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  [[ -z $token ]] || (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
+  (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
+  # The make banner names the backend's Unix socket: the seed's API calls, and doctor's, send the
+  # token there (backend_curl).
+  VERIFY_XUM_BACKEND_SOCKET=$(sed -n 's/^  Vite -> backend: *Unix socket //p' "$log" | head -n 1)
+  [[ -n $VERIFY_XUM_BACKEND_SOCKET ]] \
+    || die "the sandbox printed no 'Vite -> backend: Unix socket' line, so launch has no private way to send the backend its token"
+  require_private_socket
+  write_state
 
   seed
+  warm_vite_modules
   write_state
   trap - EXIT
   cat "$VERIFY_XUM_RUN/state.env"
@@ -580,8 +673,10 @@ cmd_doctor() {
     pid_in_group "$backend_pid" "$VERIFY_XUM_PGID"
   check "server.lock names $VERIFY_XUM_BACKEND" \
     test "$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" baseUrl)" = "$VERIFY_XUM_BACKEND"
-  check "GET $VERIFY_XUM_BACKEND/health answers" backend_curl -fs --max-time 5 -o /dev/null "$VERIFY_XUM_BACKEND/health"
-  version=$(backend_curl -fs --max-time 5 "$VERIFY_XUM_BACKEND/version" 2>/dev/null | json_field_or_empty /dev/stdin git_commit || true)
+  # /health needs no token, so it goes to the TCP port that the CLI uses. /version goes over the
+  # socket, with the token, as the seed's API calls do.
+  check "GET $VERIFY_XUM_BACKEND/health answers" curl -fs --max-time 5 -o /dev/null "$VERIFY_XUM_BACKEND/health"
+  version=$(backend_curl -fs --max-time 5 "$VERIFY_XUM_BACKEND/version" | json_field_or_empty /dev/stdin git_commit || true)
   check "backend build ${version:-unknown} is the launch commit $VERIFY_XUM_COMMIT" \
     test -n "$version" -a "${VERIFY_XUM_COMMIT#"$version"}" != "$VERIFY_XUM_COMMIT"
   if [[ $(git -C "$VERIFY_XUM_CHECKOUT" rev-parse HEAD) != "$VERIFY_XUM_COMMIT" ]]; then
@@ -604,24 +699,28 @@ cmd_env() {
   echo "unset $GIT_REPO_ENV"
 }
 
-# Opens PATH of the run's UI in the run's browser session. When the backend has an auth token, the
-# URL carries `?token=` (the app keeps the token and strips it from the address bar). node reads
-# the token from server.lock and pipes the command to `agent-browser batch` on stdin, so the token
-# is in no process's argv or environment: every local account can read argv.
-cmd_open() {
-  local path=${1:-} out token
-  [[ $path == /* ]] || die "open PATH must start with / (for example /workspace/<id>)"
-  load_run "${2:-}"
-  # Checked before agent-browser runs. A PATH like //host, /\host or /<tab>/host resolves to
-  # another origin: never send the token there. One that normalizes to //... (/..//host) stays on
-  # the origin, but the app cannot strip ?token= from such an address, so the token stays in it.
+# Opens PATH of the run's UI in the run's browser session. The URL carries `?token=` (the app keeps
+# the token and strips it from the address bar). node gets the run's token on fd 3 and pipes the
+# command to `agent-browser batch` on stdin, so the token is in no process's argv or environment:
+# every local account can read argv.
+# Checked before a browser gets the token. A PATH like //host, /\host or /<tab>/host resolves to
+# another origin: never send the token there. One that normalizes to //... (/..//host) stays on
+# the origin, but the app cannot strip ?token= from such an address, so the token stays in it.
+require_path_on_run_origin() { # require_path_on_run_origin <path>: after load_run
   node -e '
     const [base, path] = process.argv.slice(1);
     const url = new URL(path, base);
     if (url.origin !== new URL(base).origin || url.pathname.startsWith("//")) {
-      process.stderr.write("verify-xum: open PATH must stay on " + base + " and must not start with // once normalized\n");
+      process.stderr.write("verify-xum: PATH must stay on " + base + " and must not start with // once normalized\n");
       process.exit(1);
-    }' "$VERIFY_XUM_URL" "$path" || exit 1
+    }' "$VERIFY_XUM_URL" "$1" || exit 1
+}
+
+cmd_open() {
+  local path=${1:-} out token
+  [[ $path == /* ]] || die "open PATH must start with / (for example /workspace/<id>)"
+  load_run "${2:-}"
+  require_path_on_run_origin "$path"
   # agent-browser serves each session's screen and input as a WebSocket on 127.0.0.1 that every
   # local account can connect to, and a new daemon starts it on its own (no setting keeps it
   # off). Turn it off before the token reaches the browser, on every open because a restarted
@@ -629,16 +728,17 @@ cmd_open() {
   # when none runs: the browser it launches later keeps the stream off.
   agent-browser --session "$AGENT_BROWSER_SESSION" stream disable >/dev/null 2>&1 || true
   stream_is_off || die "agent-browser's stream for session $AGENT_BROWSER_SESSION is still on. Not opening the page with the token."
-  # server.lock's token, else the run's copy: a restarting backend deletes server.lock for a
-  # moment. node gets it on fd 3, never in argv.
-  token=$(run_token)
+  # The run's token (run_token: a stopped backend deletes server.lock, so it falls back to the
+  # copy launch keeps; a nodemon restart leaves the lock in place). node gets it on fd 3, never
+  # in argv.
+  token=$(required_run_token)
   # shellcheck disable=SC2001 # sed's character class; bash patterns have none
   out=$(node -e '
     const fs = require("fs");
     const [base, path] = process.argv.slice(1);
     const token = fs.readFileSync(3, "utf8");
     const url = new URL(path, base);
-    if (token) url.searchParams.set("token", token);
+    url.searchParams.set("token", token);
     process.stdout.write(JSON.stringify([["open", url.href]]));' \
     "$VERIFY_XUM_URL" "$path" 3< <(printf %s "$token") \
     | agent-browser --session "$AGENT_BROWSER_SESSION" batch --bail 2>&1) \
@@ -678,11 +778,25 @@ cmd_workspace_field() {
 }
 
 # The backend's token: server.lock's, else the copy launch keeps in the private run folder. A
-# restarting backend deletes server.lock for a moment, and a stopped one for good.
+# stopped backend deletes server.lock for good. A nodemon restart replaces it: the old backend
+# dies on SIGUSR2 and leaves its lock, which names a dead pid until the next one writes its own,
+# with the same token, once it listens (ServerLockfile.read ignores a stale lock and never
+# deletes it).
 run_token() {
   local token
   token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
   [[ -n $token || ! -f $VERIFY_XUM_RUN/token ]] || token=$(<"$VERIFY_XUM_RUN/token")
+  printf '%s' "$token"
+}
+
+# run_token, or exit 1 when it is empty. Launch refuses a backend without a token and keeps the
+# copy before it seeds, so every run it accepts has one. An empty one means a changed run folder,
+# or a run that a verify-xum.sh from before #7927 launched from a checkout from before #7904 (its
+# backend had no token): going on would open the app's token prompt or send requests that fail.
+required_run_token() {
+  local token
+  token=$(run_token)
+  [[ -n $token ]] || die "run $VERIFY_XUM_RUN has no auth token (server.lock and its token copy have none). Run verify-xum.sh cleanup, then launch again."
   printf '%s' "$token"
 }
 
@@ -728,9 +842,13 @@ redact_token() { # redact_token [PATH...]
     }' "$@" 3< <(printf %s "$token")
 }
 
+require_evidence_name() { # require_evidence_name <name>
+  [[ $1 =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] || die "NAME must look like <feature>/<step>, lowercase"
+}
+
 cmd_capture() {
   local name=${1:-} base
-  [[ $name =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] || die "capture NAME must look like <feature>/<step>, lowercase"
+  require_evidence_name "$name"
   load_run "${2:-}"
   base="$VERIFY_XUM_EVIDENCE/$name"
   mkdir -p "$(dirname "$base")"
@@ -740,7 +858,10 @@ cmd_capture() {
   echo "$base.png $base.aria.txt $base.url.txt"
 }
 
-CHUNK_LOAD_FAILED_JS="[...document.querySelectorAll('[role=\"alert\"]')].some((e) => e.textContent.includes(' failed to load.'))"
+# Two screens report a failed module: a lazily loaded part shows "<name> failed to load.", and the
+# boot screen (index.html's boot-load-failure script) marks #boot-loader when a module of the first
+# load failed.
+CHUNK_LOAD_FAILED_JS="(document.querySelector('#boot-loader[data-load-failed]') !== null || [...document.querySelectorAll('[role=\"alert\"]')].some((e) => e.textContent.includes(' failed to load.')))"
 SETTLED_OR_CHUNK_FAILED_JS="(() => {
   if ($CHUNK_LOAD_FAILED_JS) return true;
   const log = document.querySelector('[role=\"log\"][aria-label=\"Conversation transcript\"]');
@@ -750,9 +871,14 @@ SETTLED_OR_CHUNK_FAILED_JS="(() => {
 
 cmd_idle() {
   load_run "${1:-}"
-  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null
+  # A failed module ends the wait through CHUNK_LOAD_FAILED_JS. What times out is a slow load or a
+  # request that hangs, which raises no error. Say what to try, because "Wait timed out" does not.
+  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null || {
+    echo "verify-xum: the page did not settle. If it shows only 'Loading Xum', the load is slow or a request hangs: run idle once more, then agent-browser reload (SKILL.md Gotchas)." >&2
+    exit 1
+  }
   if [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" eval "$CHUNK_LOAD_FAILED_JS") == true ]]; then
-    echo "verify-xum: the page shows '<name> failed to load.': a module fetch from Vite failed. Run agent-browser reload, then repeat the step." >&2
+    echo "verify-xum: the page shows '<name> failed to load.' or 'Xum could not load': a module fetch failed (usually a host network change). Run agent-browser reload, then repeat the step." >&2
     exit 3
   fi
 }
@@ -763,8 +889,196 @@ cmd_send_ready() {
     "document.querySelector('[aria-label=\"Send message\"]')?.disabled === false" >/dev/null
 }
 
+# webkit-capture opens the page in Playwright WebKit, the engine of phone users' Safari. agent-browser
+# drives Chromium, which lays some pages out differently. Playwright is the checkout's locked
+# playwright-core. WebKit needs GTK and GStreamer libraries that many hosts lack, so the helper
+# runs on the host when WebKit launches there, and otherwise in this image. Its browsers are the
+# ones its Playwright version drives, so that version must be the one in package.json: the test
+# scripts/verifyXumWebkit.test.ts and webkit_in_docker check the version. Nothing offline ties a
+# digest to a version. To bump, run `docker pull mcr.microsoft.com/playwright:v<version>-noble`,
+# then `docker image inspect --format '{{index .RepoDigests 0}}'` on it, and set both constants.
+WEBKIT_IMAGE_PLAYWRIGHT_CORE=1.64.1
+WEBKIT_IMAGE=mcr.microsoft.com/playwright@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
+WEBKIT_HELPER=$SCRIPT_DIR/webkit-capture.mjs
+WEBKIT_NOT_LAUNCHED=4 # the helper's exit code when WebKit does not launch
+
+# The helper on the host, with the token on stdin and an allowlisted environment: the bash tool's
+# own carries the live Xum's auth token and provider keys.
+webkit_on_host() { # webkit_on_host <token> <helper args...>
+  local token=$1 host_env
+  shift
+  host_env=(PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" TMPDIR="$VERIFY_XUM_RUN/tmp")
+  [[ -z ${PLAYWRIGHT_BROWSERS_PATH:-} ]] || host_env+=(PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH")
+  printf %s "$token" | timeout -k 10 240 env -i "${host_env[@]}" node "$WEBKIT_HELPER" --mode host "$@"
+}
+
+# True when $1 holds a C0 or C1 control character or DEL (a C1 character is 0xC2 0x80-0x9F in UTF-8),
+# or is not well-formed UTF-8. Docker echoes a mount path in some errors, and a control character in
+# it could drive your terminal.
+has_control_char() { # has_control_char <string>
+  local LC_ALL=C text=$1 cont=[$'\x80'-$'\xbf']
+  [[ $text == *[[:cntrl:]]* || $text == *$'\xc2'[$'\x80'-$'\x9f']* ]] && return 0
+  # Each well-formed sequence (RFC 3629: no overlong form, no surrogate, nothing above U+10FFFF)
+  # becomes an ASCII "x", so its neighbours cannot join into a new sequence. A byte left is malformed.
+  text=${text//[$'\xc2'-$'\xdf']$cont/x}
+  text=${text//$'\xe0'[$'\xa0'-$'\xbf']$cont/x}
+  text=${text//[$'\xe1'-$'\xec'$'\xee'$'\xef']$cont$cont/x}
+  text=${text//$'\xed'[$'\x80'-$'\x9f']$cont/x}
+  text=${text//$'\xf0'[$'\x90'-$'\xbf']$cont$cont/x}
+  text=${text//[$'\xf1'-$'\xf3']$cont$cont$cont/x}
+  text=${text//$'\xf4'[$'\x80'-$'\x8f']$cont$cont/x}
+  [[ $text == *[$'\x80'-$'\xff']* ]]
+}
+
+# The helper in the pinned image. Trust boundary: --network host lets the container reach every
+# loopback port of this host, the sandbox's backend and its token included. It gets the token on
+# stdin only, runs one file of this repo from a digest-pinned image as your uid with no
+# capabilities and a read-only root, and sees only node_modules (read-only), that file (read-only)
+# and the step's <feature> evidence folder. Returns 125 with WEBKIT_DOCKER_REASON set (the caller declares
+# it) when Docker cannot run it: the code docker itself uses for that.
+webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args...>
+  local token=$1 out_dir=$2 endpoint installed config docker_cli rc=0
+  shift 2
+  local handed_over
+  for handed_over in "$CHECKOUT" "$WEBKIT_HELPER" "$out_dir" "$VERIFY_XUM_RUN"; do
+    if has_control_char "$handed_over"; then
+      WEBKIT_DOCKER_REASON="a folder or file handed to Docker has a control character in its path (not printed: it could drive your terminal)"
+      return 125
+    fi
+  done
+  command -v docker >/dev/null || { WEBKIT_DOCKER_REASON="docker is not installed"; return 125; }
+  # The user's endpoint, resolved once, then an empty private client config: the CLI copies the
+  # `proxies` of its config into every container's environment. A remote endpoint is refused:
+  # --network host would name another machine's network and the token would travel to it.
+  endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) || endpoint=
+  if has_control_char "$endpoint"; then
+    WEBKIT_DOCKER_REASON="the Docker endpoint has a control character (not printed: it could drive your terminal)"
+    return 125
+  fi
+  [[ $endpoint == unix:///?* ]] || { WEBKIT_DOCKER_REASON="the Docker endpoint '${endpoint:-unknown}' is not a local socket"; return 125; }
+  installed=$(node -p 'require(process.argv[1]).version' "$CHECKOUT/node_modules/playwright-core/package.json" 2>/dev/null) || installed=
+  if has_control_char "$installed"; then
+    installed="a version with a control character (not printed: it could drive your terminal)"
+  fi
+  if [[ $installed != "$WEBKIT_IMAGE_PLAYWRIGHT_CORE" ]]; then
+    WEBKIT_DOCKER_REASON="node_modules holds playwright-core ${installed:-none}, the image carries ${WEBKIT_IMAGE_PLAYWRIGHT_CORE}: run bun install, or bump WEBKIT_IMAGE in verify-xum.sh"
+    return 125
+  fi
+  # Not a command that can fail quietly: this function runs in a || list, where errexit is off, and
+  # a Docker run without the private config would pass the user's proxies on.
+  config=$(mktemp -d "$VERIFY_XUM_RUN/tmp/docker-config.XXXXXX") || { WEBKIT_DOCKER_REASON="cannot make a folder in $VERIFY_XUM_RUN/tmp"; return 125; }
+  docker_cli=(env -i PATH="$PATH" DOCKER_HOST="$endpoint" DOCKER_CONFIG="$config" docker)
+  if [[ $("${docker_cli[@]}" version --format '{{.Server.Os}}' 2>/dev/null) != linux ]]; then
+    rm -rf "$config"
+    WEBKIT_DOCKER_REASON="no Linux Docker daemon answers at $endpoint"
+    return 125
+  fi
+  # The pull has its own, longer limit: the first one fetches about 2 GB, and the run's limit would
+  # call it a hung capture.
+  if ! "${docker_cli[@]}" image inspect "$WEBKIT_IMAGE" >/dev/null 2>&1 \
+    && { echo "verify-xum: pulling $WEBKIT_IMAGE (about 2 GB, once)." >&2; ! timeout -k 10 1800 "${docker_cli[@]}" pull "$WEBKIT_IMAGE" >&2; }; then
+    rm -rf "$config"
+    WEBKIT_DOCKER_REASON="docker could not pull $WEBKIT_IMAGE"
+    return 125
+  fi
+  printf %s "$token" | timeout -k 10 300 "${docker_cli[@]}" run --rm -i --init \
+    --name "verify-xum-webkit-$VERIFY_XUM_RUN_ID-$$" --network host --user "$(id -u):$(id -g)" \
+    --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,size=512m \
+    -e HOME=/tmp -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    -v "$CHECKOUT/node_modules:$CHECKOUT/node_modules:ro" \
+    -v "$WEBKIT_HELPER:/verify-xum/webkit-capture.mjs:ro" \
+    -v "$out_dir:$out_dir" \
+    "$WEBKIT_IMAGE" node /verify-xum/webkit-capture.mjs --mode docker "$@" || rc=$?
+  rm -rf "$config"
+  return "$rc"
+}
+
+webkit_report() { # webkit_report <evidence base>
+  redact_token "$1.txt"
+  cat "$1.txt"
+  echo "$1.png $1.txt"
+}
+
+cmd_webkit_capture() {
+  local path=${1:-} name=${2:-} mode=${VERIFY_XUM_WEBKIT:-auto} base token output rc=0
+  local host_reason='' WEBKIT_DOCKER_REASON=''
+  [[ $path == /* ]] || die "webkit-capture PATH must start with / (for example /workspace/<id>)"
+  ! has_control_char "$path" || die "webkit-capture PATH must not hold a control character"
+  [[ $mode == auto || $mode == host || $mode == docker ]] || die "VERIFY_XUM_WEBKIT must be auto, host or docker"
+  require_evidence_name "$name"
+  # Docker mounts the folder of the name's last slash, so a name with no folder would mount every file of the evidence.
+  [[ $name == */* ]] || die "webkit-capture NAME must look like <feature>/<step>, lowercase (the container writes into the <feature> folder)"
+  load_run "${3:-}"
+  require_path_on_run_origin "$path"
+  need node timeout
+  [[ -d $VERIFY_XUM_RUN/tmp ]] || die "the run was cleaned up ($VERIFY_XUM_RUN/tmp is gone)"
+  base="$VERIFY_XUM_EVIDENCE/$name-webkit"
+  mkdir -p "$(dirname "$base")"
+  # A failed capture must not leave the last one's files behind as if they were its result. The
+  # .tmp files are the helper's staged names, left only by a helper that was killed.
+  rm -f "$base".{png,txt}{,.tmp}
+  token=$(run_token)
+  local helper_args=(--checkout "$CHECKOUT" --base "$VERIFY_XUM_URL" --path "$path" --out "$base.png"
+    --settled-js "$SETTLED_OR_CHUNK_FAILED_JS" --chunk-failed-js "$CHUNK_LOAD_FAILED_JS")
+
+  if [[ $mode != docker ]]; then
+    output=$(webkit_on_host "$token" "${helper_args[@]}" 2>&1) || rc=$?
+    case $rc in
+      0) webkit_report "$base"; return 0 ;;
+      "$WEBKIT_NOT_LAUNCHED") host_reason=${output#webkit-capture: } ;;
+      124) die "webkit-capture timed out on the host" ;;
+      *) printf '%s\n' "$output" | redact_token >&2; exit "$rc" ;;
+    esac
+  fi
+  if [[ $mode != host ]]; then
+    [[ $mode == docker ]] || echo "verify-xum: WebKit did not launch on this host (${host_reason:0:120}...). Running it in Docker." >&2
+    rc=0
+    webkit_in_docker "$token" "$(dirname "$base")" "${helper_args[@]}" || rc=$?
+    case $rc in
+      0) webkit_report "$base"; return 0 ;;
+      "$WEBKIT_NOT_LAUNCHED" | 125 | 126 | 127) WEBKIT_DOCKER_REASON=${WEBKIT_DOCKER_REASON:-docker run exited $rc (its output is above)} ;;
+      124) die "webkit-capture timed out in Docker" ;;
+      *) exit "$rc" ;;
+    esac
+  fi
+  die "WebKit did not run.
+  Host:   ${host_reason:-not tried (VERIFY_XUM_WEBKIT=docker)}
+  Docker: ${WEBKIT_DOCKER_REASON:-not tried (VERIFY_XUM_WEBKIT=host)}
+Make one of them work:
+  1. Host: run node_modules/.bin/playwright install --with-deps webkit (the locked Playwright; it installs the GTK and GStreamer packages with apt).
+  2. Docker: run a local Docker daemon. It pulls $WEBKIT_IMAGE (Playwright $WEBKIT_IMAGE_PLAYWRIGHT_CORE)."
+}
+
 is_dev_server_sandbox_root() {
   [[ -n $1 && -d $1 && $(basename "$1") == mux-dev-server-* ]]
+}
+
+# Runs the xum CLI (dist/cli/api.mjs) against the newest run, under env -i: the live Xum's server
+# URL and token are in the caller's env under XUM_* and MUX_* names, and the CLI reads either. The
+# CLI speaks only TCP and reads server.lock itself, so this first checks that the backend that
+# server.lock names carries this run's id and is what listens on its port. The port can be free
+# otherwise (see backend_curl), and the CLI would send the token to whoever bound it. The CLI's own
+# read of server.lock ignores a lock whose backend is gone (ServerLockfile.read: on Linux the pid
+# no longer has the start time the lock records; elsewhere the pid is dead or nothing at baseUrl
+# answers as a xum backend), so a restart after this check is caught there. What is left is the
+# moment between that read and the CLI's connect.
+cmd_cli() {
+  load_run ""
+  local lock pid port listeners
+  lock=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) \
+    || die "$VERIFY_XUM_ROOT/server.lock is gone (the backend stopped)."
+  pid=$(json_field_or_empty /dev/stdin pid <<<"$lock")
+  [[ $pid =~ ^[0-9]+$ ]] || die "server.lock names no backend pid"
+  grep -qszx "VERIFY_XUM_SERVER_OF=$VERIFY_XUM_RUN_ID" "/proc/$pid/environ" \
+    || die "the backend that server.lock names (pid $pid) is not a running process of this run, so the CLI does not get its token"
+  [[ $(json_field_or_empty /dev/stdin baseUrl <<<"$lock") == "$VERIFY_XUM_BACKEND" ]] \
+    || die "server.lock does not name $VERIFY_XUM_BACKEND"
+  port=${VERIFY_XUM_BACKEND##*:}
+  listeners=$(ss -Hltnp "sport = :$port" 2>/dev/null) || die "ss failed, so verify-xum cannot check who listens on the backend's port $port"
+  if [[ -z $listeners ]] || grep -qvF "pid=$pid," <<<"$listeners"; then
+    die "the backend's port $port is not held by pid $pid alone, so the CLI does not get its token"
+  fi
+  exec env -i PATH="$PATH" HOME="$HOME" XUM_ROOT="$VERIFY_XUM_ROOT" node "$CHECKOUT/dist/cli/api.mjs" "$@"
 }
 
 cmd_cleanup() {
@@ -830,8 +1144,13 @@ case ${1:-} in
   open) cmd_open "${2:-}" "${3:-}" ;;
   workspace-field) cmd_workspace_field "${2:-}" "${3:-}" "${4:-}" ;;
   capture) cmd_capture "${2:-}" "${3:-}" ;;
+  webkit-capture) cmd_webkit_capture "${2:-}" "${3:-}" "${4:-}" ;;
   idle) cmd_idle "${2:-}" ;;
   send-ready) cmd_send_ready "${2:-}" ;;
   cleanup) cmd_cleanup "${2:-}" ;;
-  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open PATH [RUN] | workspace-field NAME FIELD [RUN] | capture NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
+  cli)
+    shift
+    cmd_cli "$@"
+    ;;
+  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open PATH [RUN] | workspace-field NAME FIELD [RUN] | capture NAME [RUN] | webkit-capture PATH NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN] | cli ARGS..." ;;
 esac

@@ -68,10 +68,13 @@ const AgentDefinitionToolsSchema = z
   })
   .strip();
 
+/** UTF-16 units: what Zod's `.max()` counts. */
+export const MAX_AGENT_DESCRIPTION_LENGTH = 1024;
+
 export const AgentDefinitionFrontmatterSchema = z
   .object({
     name: z.string().min(1).max(128),
-    description: z.string().min(1).max(1024).optional(),
+    description: z.string().min(1).max(MAX_AGENT_DESCRIPTION_LENGTH).optional(),
 
     // Inheritance: reference a built-in or custom agent ID
     base: AgentIdSchema.optional(),
@@ -101,7 +104,7 @@ export const AgentDefinitionDescriptorSchema = z
     id: AgentIdSchema,
     scope: AgentDefinitionScopeSchema,
     name: z.string().min(1).max(128),
-    description: z.string().min(1).max(1024).optional(),
+    description: z.string().min(1).max(MAX_AGENT_DESCRIPTION_LENGTH).optional(),
     uiSelectable: z.boolean(),
     uiColor: z.string().min(1).optional(),
     subagentRunnable: z.boolean(),
@@ -131,6 +134,11 @@ export const AgentDefinitionDescriptorSchema = z
     tools: AgentDefinitionToolsSchema.optional(),
     // Agent Plugins: contributing plugin name (absent for non-plugin agents)
     pluginName: z.string().min(1).optional(),
+    // Set on a plugin agent that this workspace cannot run (its plugin folder is unreachable
+    // here): why, and the agent file. The `task` tool list leaves it out and the composition
+    // inspector reports it as a diagnostic.
+    unavailableReason: z.string().min(1).optional(),
+    unavailablePath: z.string().min(1).optional(),
   })
   .strict();
 

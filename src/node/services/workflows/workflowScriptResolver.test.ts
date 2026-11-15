@@ -24,6 +24,7 @@ import {
 } from "@/node/services/tools/testHelpers";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import { AgentSandboxPathError } from "@/node/services/agentSandbox/fileToolSandbox";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   assertStoredPluginWorkflowReviewed,
@@ -357,6 +358,31 @@ describe("resolveWorkflowScript", () => {
     expect(resolved.source).toContain("ok");
     expect(resolved.resolvedPath).toBe(path.join(tempDir.path, "workflows", "smoke.js"));
     expect(resolved.canonicalScriptPath).toBe("./workflows/smoke.js");
+  });
+
+  // A command can link a script at a file that its sandbox hides, and the run evaluates it.
+  test("reads no workspace or project skill script that the sandbox hides", async () => {
+    using tempDir = new TestTempDir("workflow-script-sandbox-gate");
+    await writeWorkflowFile(tempDir.path, "private/secret.js");
+    await writeProjectSkill(tempDir.path, "research", {
+      files: { "workflow.js": "export default function workflow() {}" },
+    });
+    const sandboxGate = (resolvedPath: string) =>
+      resolvedPath.endsWith(".js")
+        ? Promise.reject(new AgentSandboxPathError(resolvedPath, "read"))
+        : Promise.resolve();
+
+    for (const scriptPath of ["skill://research/workflow.js", "private/secret.js"]) {
+      const resolving = resolveWorkflowScript({
+        scriptPath,
+        runtime: new LocalRuntime(tempDir.path),
+        workspacePath: tempDir.path,
+        projectTrusted: true,
+        runtimeFactory,
+        sandboxGate,
+      });
+      await expect(resolving).rejects.toBeInstanceOf(AgentSandboxPathError);
+    }
   });
 
   test("rejects missing paths, directories, non-js files, traversal, and untrusted workspace files", async () => {

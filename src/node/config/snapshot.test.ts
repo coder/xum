@@ -232,6 +232,49 @@ describe("Config snapshots", () => {
     }
   });
 
+  it.each([
+    ["an unreadable", (file: string) => fs.mkdirSync(file, { recursive: true })],
+    ["a malformed", (file: string) => fs.writeFileSync(file, "{ not json")],
+  ] as const)(
+    "does not memoize a lenient build that degraded on %s second legacy metadata file",
+    async (_kind, breakFile) => {
+      // The canonical file names the stable id, so the entry keeps it. The old basename layout's
+      // file, a second id that destructive callers must keep, could not be read: a retained
+      // build would hide that id after the file is repaired.
+      const legacyPath = path.join(root, "legacy");
+      await saveWorkspaces([{ path: legacyPath }]);
+      const legacyId = config.generateLegacyId(projectPath, legacyPath);
+      const canonical = path.join(config.sessionsDir, legacyId, "metadata.json");
+      fs.mkdirSync(path.dirname(canonical), { recursive: true });
+      fs.writeFileSync(
+        canonical,
+        JSON.stringify({ id: "stable-legacy-id", name: "legacy", createdAt: older })
+      );
+      const alias = path.join(config.sessionsDir, path.basename(legacyPath), "metadata.json");
+      fs.mkdirSync(path.dirname(alias), { recursive: true });
+      breakFile(alias);
+      // No migration write: it would change the snapshot and rebuild whatever the memo holds.
+      const aliasIds = async () => {
+        const ids = new Set<string>();
+        await config.getAllWorkspaceMetadata({
+          probeCheckouts: false,
+          persistMigrations: false,
+          legacyAliasIds: ids,
+        });
+        return [...ids];
+      };
+      const logError = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        expect(await aliasIds()).toEqual([]);
+        fs.rmSync(alias, { recursive: true, force: true });
+        fs.writeFileSync(alias, JSON.stringify({ id: "alias-legacy-id" }));
+        expect(await aliasIds()).toEqual(["alias-legacy-id"]);
+      } finally {
+        logError.mockRestore();
+      }
+    }
+  );
+
   it("drops a failed registry-only build from the memo", async () => {
     const internals = config as unknown as { buildWorkspaceMetadata: BuildWorkspaceMetadata };
     const original = internals.buildWorkspaceMetadata.bind(config);

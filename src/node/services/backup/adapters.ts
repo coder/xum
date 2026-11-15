@@ -2,7 +2,11 @@ import * as path from "node:path";
 import { listBackupManagedPathSpellings } from "@/common/compat/legacyMux";
 import { VERSION } from "@/version";
 import type { Config } from "@/node/config";
-import type { BackupFileChange, BackupProjectImport } from "@/common/orpc/schemas/backup";
+import {
+  EMPTY_BACKUP_PLUGIN_REPORT,
+  type BackupFileChange,
+  type BackupProjectImport,
+} from "@/common/orpc/schemas/backup";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import {
   MAX_BACKUP_PROJECT_ENTRIES,
@@ -49,6 +53,12 @@ import {
   writeShelfBackup,
   type ShelfRestoreEntry,
 } from "./artifactShelfBackup";
+import {
+  exportPluginBackup,
+  readPluginRestore,
+  readPluginSidecar,
+  readPriorPluginList,
+} from "./agentPluginBackup";
 import { BackupRepoCache } from "./gitRepo";
 import {
   MAX_BACKUP_FILE_COUNT,
@@ -527,6 +537,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     async exportTo(exportOptions) {
       const payload = await buildPayload(exportOptions.contents);
       const destination = await managedDir(exportOptions.repositoryRoot, exportOptions.managedPath);
+      // The checked-out backup's plugin list, read before the core write clears the managed path:
+      // a push that leaves one of its plugins out removes it from the backup.
+      const priorPlugins = await readPriorPluginList(destination);
       // Owner-only like the safety snapshot: the export copies allowlisted sources that may
       // themselves be owner-only, and it lands here before the secret scan has said anything
       // about it. Git records only the exec bit, so the modes never reach the remote.
@@ -584,6 +597,15 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           },
         ];
       }
+      // The plugin list is a few kilobytes of URLs and commit ids, so it is written before the
+      // shelf measures what is left of the tree's budgets. It joins the same secret scan.
+      const plugins = await exportPluginBackup({
+        muxRoot,
+        destination,
+        contents: exportOptions.contents,
+        prior: priorPlugins,
+      });
+      scanFiles = [...scanFiles, ...plugins.files];
       // The shelf sidecar goes last, into whatever the core payload and bundle left of the
       // managed tree's budgets: an entry that does not fit is skipped and reported rather
       // than failing the whole push over agent output.
@@ -624,6 +646,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         secretFiles,
         secretApproval: backupSecretApprovalDigest(scanFiles, secretFiles),
         shelfSkipped,
+        pluginRemoval: plugins.pluginRemoval,
       };
     },
 
@@ -640,6 +663,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           commandApprovals: [],
           projectImports: [],
           projectBundleSkipped: false,
+          plugins: EMPTY_BACKUP_PLUGIN_REPORT,
         };
       }
 
@@ -725,6 +749,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         projectImports,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
+        plugins: await readPluginRestore({ muxRoot, sourceDir, contents }),
         symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped, ...shelf.skipped].sort(),
       };
     },
@@ -751,6 +776,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // The same preflight the restore runs, so a payload it would refuse is refused here,
       // before the caller takes a safety snapshot it would have no use for.
       await planRestoreWrites(muxRoot, payload);
+      // So is a plugin list this machine cannot read from disk. A list it cannot parse is only
+      // reported, and reading either writes nothing.
+      await readPluginSidecar(sourceDir, validateOptions.contents);
       // A shelf sidecar the restore would refuse is refused before the snapshot, too.
       const shelf = await omitSymlinkedShelfEntries(
         muxRoot,
@@ -883,6 +911,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         shelfPlan.entries,
         restoreOptions.symlinkSkipped
       );
+      // Only reported, never written: a plugin comes back through the install review, which is
+      // the consent a restore cannot give on the user's behalf (agentPluginBackup.ts).
+      const plugins = await readPluginRestore({ muxRoot, sourceDir, contents });
       let projectBundleSkipped = false;
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];
@@ -1042,6 +1073,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
+        plugins,
         symlinkSkipped: [
           ...symlinkSkipped,
           ...memorySymlinkSkipped,

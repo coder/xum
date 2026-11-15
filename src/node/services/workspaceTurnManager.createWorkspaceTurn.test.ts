@@ -391,6 +391,50 @@ describe("WorkspaceTurnManager", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("createWorkspaceTurn names why a plugin agent that Xum loads is refused, not unknown agentId (A4)", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
+    // A trusted project's own plugin, with an agent file that has no frontmatter.
+    const pluginDir = path.join(projectPath, ".xum", "plugins", "egm");
+    await fsPromises.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "egm",
+      })
+    );
+    await fsPromises.writeFile(path.join(pluginDir, "agents", "broken.md"), "No frontmatter.\n");
+
+    const createWorkspace = makeCreateMockReturning(
+      Ok({ metadata: createWorkspaceTurnMetadata(projectPath) })
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "broken",
+      prompt: "Should not run",
+      title: "Refused plugin agent",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain(
+        "Task.createWorkspaceTurn: invalid-definition: plugin agent broken of egm"
+      );
+      expect(result.error).not.toContain("unknown agentId");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("createWorkspaceTurn rejects bad agent ids without ever dispatching a turn", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);

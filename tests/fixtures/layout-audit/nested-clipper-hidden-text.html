@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Clipper inside a paragraph with hidden text</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      p {
+        font-size: 18px;
+        line-height: 1.4;
+      }
+      /* The tag is 90 px wide and its visible text fits. The long text after it is hidden. */
+      .tag {
+        display: inline-block;
+        width: 90px;
+        overflow: hidden;
+        white-space: nowrap;
+        vertical-align: bottom;
+        padding: 0 4px;
+        background: #d6eaff;
+      }
+      .hint {
+        visibility: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p>
+        Visible introduction
+        <span class="tag">Short<span class="hint"> and a long hint that only shows on hover</span></span>
+      </p>
+    </main>
+  </body>
+</html>

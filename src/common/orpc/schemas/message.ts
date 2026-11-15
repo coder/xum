@@ -350,4 +350,8 @@ export const BranchListResultSchema = z.object({
   branches: z.array(z.string()),
   /** Recommended trunk branch, or null for non-git directories */
   recommendedTrunk: z.string().nullable(),
+  /** The repository's default branch (origin's HEAD, else a conventional trunk name), if known. */
+  defaultBranch: z.string().nullable().optional(),
+  /** The few local branches committed to most recently, newest first. */
+  recentBranches: z.array(z.string()).optional(),
 });

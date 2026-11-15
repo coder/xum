@@ -209,7 +209,7 @@ describe("BashMonitorRegistryStore", () => {
     });
   });
 
-  test("persists bounded runtime failure evidence until delivery", async () => {
+  test("persists runtime failure counts and offsets but no output or error text", async () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
     await store.upsert(armedPayload());
     await store.recordLost("owner-1", "proc-1", "2026-01-01T00:00:00.000Z", {
@@ -225,20 +225,19 @@ describe("BashMonitorRegistryStore", () => {
       failedAt: "2026-01-01T00:00:02.000Z",
     });
 
+    // Read back through the strict schema, which an older build shares: it must accept the row.
     const lost = (await store.listAll("owner-1"))[0].lost;
-    expect(lost).toMatchObject({
+    expect(lost).toEqual({
       reason: "runtime-failure",
-      failureMessage: "transport unavailable",
       failedOperations: ["readOutput", "getExitCode"],
       failedAt: "2026-01-01T00:00:02.000Z",
       failedMatch: {
+        lines: [],
         totalMatches: 60,
-        droppedLines: 12,
+        droppedLines: 62,
         matchedThroughOffset: 120,
       },
     });
-    expect(lost?.failedMatch?.lines).toHaveLength(50);
-    expect(lost?.failedMatch?.lines[0]).toBe("line-10");
   });
 
   test("bounds persisted script length", async () => {

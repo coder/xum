@@ -1635,10 +1635,12 @@ export async function createNewWorkspace(
   if (runtime === undefined) {
     // A project default replaces the global one, as in the creation UI.
     const projects = new Map(await options.client.projects.list());
-    const defaultRuntime =
-      projects.get(options.projectPath)?.defaultRuntime ??
-      getAppConfigStore().getSnapshot()?.defaultRuntime;
-    if (defaultRuntime === RUNTIME_MODE.LOCAL) runtime = defaultRuntime;
+    const defaultIsolation =
+      projects.get(options.projectPath)?.defaultIsolation ??
+      getAppConfigStore().getSnapshot()?.defaultIsolation;
+    if (defaultIsolation?.project === "local" && defaultIsolation.workspace === "none") {
+      runtime = RUNTIME_MODE.LOCAL;
+    }
   }
   const runtimeConfig = parseRuntimeString(runtime);
 

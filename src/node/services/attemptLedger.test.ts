@@ -14,6 +14,7 @@ import { readSubagentAttemptSettlementReceiptStrict } from "@/node/services/suba
 import type {
   AdmittedSend,
   AgentTaskReport,
+  InheritedReport,
   OwnedTaskAttempt,
   SettlementReceiptDecision,
   StreamEndDecision,
@@ -194,13 +195,33 @@ function createHarness() {
 function begin(
   ledger: AttemptLedger,
   attemptId: string | undefined = ATTEMPT,
-  receiptEligible = true
+  receiptEligible = true,
+  inheritedReport: InheritedReport | null = null
 ): OwnedTaskAttempt {
-  return ledger.beginOwnedTaskAttempt(TASK, "test", { attemptId, receiptEligible });
+  return ledger.beginOwnedTaskAttempt(TASK, "test", {
+    attemptId,
+    receiptEligible,
+    inheritedReport,
+  });
 }
 
 describe("AttemptLedger", () => {
   describe("attempt identity", () => {
+    test("an attempt keeps the inherited report the CAS that published it passed, whatever its row reads later", () => {
+      const { ledger, state } = createHarness();
+      // The row reads reported by now, as when another backend reported the fresh attempt after
+      // the commit: only the CAS's own read says whether that report was inherited.
+      state.config = configWithRow({
+        parentWorkspaceId: PARENT,
+        taskAttemptId: ATTEMPT,
+        taskStatus: "reported",
+        reportedAt: "2026-10-01T00:00:00.000Z",
+      });
+      expect(begin(ledger, ATTEMPT, true, null).inheritedReport).toBeNull();
+      const inherited = { taskStatus: "reported" } as const;
+      expect(begin(ledger, OTHER, true, inherited).inheritedReport).toBe(inherited);
+    });
+
     test("a new attempt replaces the owner, bumps its generation and drops the stream-end decisions", () => {
       const { ledger, events } = createHarness();
       const first = begin(ledger, ATTEMPT);
@@ -253,7 +274,11 @@ describe("AttemptLedger", () => {
     test("an empty task id or a malformed attempt id is refused; a pre-identity owner is not", () => {
       const { ledger } = createHarness();
       const begin1 = (taskId: string, attemptId: string | undefined) =>
-        ledger.beginOwnedTaskAttempt(taskId, "test", { attemptId, receiptEligible: false });
+        ledger.beginOwnedTaskAttempt(taskId, "test", {
+          attemptId,
+          receiptEligible: false,
+          inheritedReport: null,
+        });
       expect(() => begin1("", ATTEMPT)).toThrow();
       expect(() => begin1(TASK, "not-an-attempt-id")).toThrow();
       expect(begin1("t", undefined).attemptId).toBeUndefined();
@@ -266,6 +291,7 @@ describe("AttemptLedger", () => {
       const reserved = ledger.beginOwnedTaskAttempt(TASK, "test", {
         attemptId: ATTEMPT,
         receiptEligible: true,
+        inheritedReport: null,
         abortSignal: signal,
       });
       expect(reserved.abortSignal).toBe(signal);
@@ -393,6 +419,7 @@ describe("AttemptLedger", () => {
         attempt: undefined,
         attemptId: ATTEMPT,
         messageId: "msg-1",
+        inheritedReport: null,
         outcome,
         turn: undefined,
       };
@@ -896,6 +923,7 @@ describe("AttemptLedger", () => {
         attempt: undefined,
         attemptId: ATTEMPT,
         messageId: "msg-1",
+        inheritedReport: null,
         outcome,
         turn: undefined,
       });

@@ -50,9 +50,9 @@ function basename(path: string): string {
 }
 
 /**
- * Chat card for the `artifact` tool: "<KIND> name · v<N> · title", opening the Artifacts tab
- * at that exact version. It renders from the tool result alone (no lookups), so the card
- * survives compaction and older-history paging.
+ * Chat card for the `artifact` tool: "<KIND> name · title", opening the Artifacts tab on the
+ * file. It renders from the tool result alone (no lookups), so the card survives compaction and
+ * older-history paging.
  */
 export const ArtifactToolCall: React.FC<ArtifactToolCallProps> = (props) => {
   const parsed =
@@ -79,7 +79,7 @@ export const ArtifactToolCall: React.FC<ArtifactToolCallProps> = (props) => {
     if (!sawPendingRef.current) return;
     sawPendingRef.current = false;
     if (published && focusRequested && workspaceId) {
-      openArtifact({ workspaceId, path: published.path, versionId: published.version });
+      openArtifact({ workspaceId, path: published.path });
     }
   }, [props.result, published, focusRequested, workspaceId]);
 
@@ -112,10 +112,10 @@ export const ArtifactToolCall: React.FC<ArtifactToolCallProps> = (props) => {
       <button
         type="button"
         disabled={!workspaceId}
-        aria-label={`Open ${published.path} version ${published.version} in Artifacts`}
+        aria-label={`Open ${published.path} in Artifacts`}
         onClick={() => {
           if (!workspaceId) return;
-          openArtifact({ workspaceId, path: published.path, versionId: published.version });
+          openArtifact({ workspaceId, path: published.path });
         }}
         className="border-accent hover:bg-accent/10 focus-visible:ring-accent flex w-full min-w-0 cursor-pointer items-center gap-2.5 rounded-lg border border-dashed px-2.5 py-2 text-left font-sans text-[13px] focus-visible:ring-1 focus-visible:outline-none disabled:cursor-default"
       >
@@ -124,11 +124,7 @@ export const ArtifactToolCall: React.FC<ArtifactToolCallProps> = (props) => {
         </span>
         <span className="min-w-0 truncate">
           <strong className="text-foreground font-semibold">{published.path}</strong>
-          <span className="text-secondary">
-            {" "}
-            · <span className="counter-nums">v{published.version}</span>
-            {showTitle && ` · ${published.title}`}
-          </span>
+          {showTitle && <span className="text-secondary">{` · ${published.title}`}</span>}
         </span>
       </button>
     </ToolContainer>

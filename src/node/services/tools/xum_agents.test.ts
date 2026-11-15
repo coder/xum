@@ -4,7 +4,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import type { ToolExecutionOptions } from "ai";
 
-import type { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 const GLOBAL_WORKSPACE_ID = "workspace-global";
 const GLOBAL_WORKSPACE_NAME = "global-scope";
 const GLOBAL_WORKSPACE_TITLE = "Global Scope";
@@ -14,7 +14,12 @@ import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import { resolveAgentsPathOnRuntime } from "./xum_agents_path";
 import { createXumAgentsReadTool } from "./xum_agents_read";
 import { createXumAgentsWriteTool } from "./xum_agents_write";
-import { TestTempDir, createTestToolConfig, RemotePathMappedRuntime } from "./testHelpers";
+import {
+  TestTempDir,
+  createTestToolConfig,
+  RemotePathMappedRuntime,
+  stubSandboxHidingTokenPath,
+} from "./testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -341,6 +346,51 @@ describe("xum_agents_* tools", () => {
 
     const writtenTarget = await fs.readFile(targetPath, "utf-8");
     expect(writtenTarget).toBe(newContent);
+  });
+
+  // Codex review: a sandboxed command can replace AGENTS.md with a link to a file that its sandbox
+  // keeps read-only (the MCP config, whose servers start outside the sandbox) or hides.
+  it("reads and writes project AGENTS.md only where a sandboxed command could", async () => {
+    using tempDir = new TestTempDir("mux-project-agents-sandbox");
+    const root = await fs.realpath(tempDir.path);
+    const projectRoot = path.join(root, "project");
+    const mcpConfig = path.join(projectRoot, ".xum", "mcp.jsonc");
+    const token = path.join(projectRoot, "hf-token");
+    await fs.mkdir(path.dirname(mcpConfig), { recursive: true });
+    await fs.mkdir(path.join(root, "tmp"));
+    await fs.writeFile(mcpConfig, "{}\n");
+    await fs.writeFile(token, "hf_secret");
+    const agentsPath = path.join(projectRoot, "AGENTS.md");
+    const runtime = new LocalRuntime(projectRoot);
+    stubSandboxHidingTokenPath(runtime, projectRoot, [mcpConfig]);
+    const config = {
+      ...createProjectXumAgentsToolConfig(root, path.join(root, "sessions"), projectRoot),
+      runtime,
+      runtimeTempDir: path.join(root, "tmp"),
+      secrets: { HF_TOKEN_PATH: token },
+    };
+    const write = () =>
+      createXumAgentsWriteTool(config).execute!(
+        { newContent: "evil", confirm: true },
+        mockToolCallOptions
+      ) as Promise<{ success: boolean }>;
+    const read = () =>
+      createXumAgentsReadTool(config).execute!({}, mockToolCallOptions) as Promise<{
+        success: boolean;
+        content?: string;
+      }>;
+
+    await fs.symlink(".xum/mcp.jsonc", agentsPath);
+    expect(await write()).toMatchObject({ success: false });
+    expect(await fs.readFile(mcpConfig, "utf-8")).toBe("{}\n");
+    await fs.rm(agentsPath);
+    await fs.symlink("hf-token", agentsPath);
+    const leaked = await read();
+    expect(leaked.success).toBe(false);
+    expect(JSON.stringify(leaked)).not.toContain("hf_secret");
+    await fs.rm(agentsPath);
+    expect(await write()).toMatchObject({ success: true });
+    expect(await read()).toMatchObject({ success: true, content: "evil" });
   });
 
   it("rejects dangling AGENTS.md symlinks for read and write", async () => {

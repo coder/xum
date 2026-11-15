@@ -1,10 +1,17 @@
 import { AgentDefinitionFrontmatterSchema } from "@/common/orpc/schemas";
+import { MAX_AGENT_DESCRIPTION_LENGTH } from "@/common/orpc/schemas/agentDefinition";
 import type { AgentDefinitionFrontmatter } from "@/common/types/agentDefinition";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
-import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
+import {
+  cutToCap,
+  formatZodIssues,
+  normalizeNewlines,
+  stripUtf8Bom,
+} from "@/node/utils/markdownFrontmatter";
 import YAML from "yaml";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  isForeignPluginAgentFormat,
   isReadonlyForeignPluginAgent,
   mapForeignPluginAgentFrontmatter,
 } from "./pluginAgentFormat";
@@ -20,10 +27,17 @@ export interface ParsedAgentDefinitionMarkdown {
   frontmatter: AgentDefinitionFrontmatter;
   body: string;
   /**
-   * A plugin agent that the Claude Code or Cursor mapping runs on Explore for `readonly: true`.
+   * A plugin agent that the Claude Code or Cursor mapping runs on Explore for `readonly: true` or a
+   * Claude read-only search list.
    * The schema strips the key, so the install review reads it here (agentFiles.ts).
    */
   mappedReadonly: boolean;
+  /**
+   * A plugin agent in Claude Code or Cursor format (the mapping ran). The body of such an agent
+   * names its plugin folder with `${CLAUDE_PLUGIN_ROOT}`; a Xum-format plugin agent body is
+   * never rewritten.
+   */
+  foreign: boolean;
 }
 
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
@@ -42,6 +56,30 @@ function mapFrontmatterForSource(
   } catch (err) {
     throw new AgentDefinitionParseError(getErrorMessage(err));
   }
+}
+
+/**
+ * Claude Code skips an agent file only for a missing name or description, a bad name or bad YAML,
+ * so an agent with a long description loads there. Cut it to the descriptor's cap instead of
+ * dropping the agent. Every read of an agent file parses here (discovery, the definition read and
+ * the plugin install review), so they cut alike. No agent writer validates through this parser: one
+ * added later must check the schema itself to stay strict.
+ */
+function cutLongDescription(frontmatter: Record<string, unknown>): Record<string, unknown> {
+  const { description } = frontmatter;
+  if (typeof description !== "string") return frontmatter;
+  return { ...frontmatter, description: cutToCap(description, MAX_AGENT_DESCRIPTION_LENGTH) };
+}
+
+function pluginFileFlags(
+  raw: Record<string, unknown>,
+  plugin: { agentId: string } | undefined
+): Pick<ParsedAgentDefinitionMarkdown, "mappedReadonly" | "foreign"> {
+  if (plugin === undefined) return { mappedReadonly: false, foreign: false };
+  return {
+    mappedReadonly: isReadonlyForeignPluginAgent(raw),
+    foreign: isForeignPluginAgentFormat(raw),
+  };
 }
 
 /**
@@ -77,6 +115,7 @@ export function parseAgentDefinitionMarkdown(input: {
   }
 
   const lines = content.split("\n");
+  // mutation-equivalent: split always returns a first line, so ?? and || agree
   if ((lines[0] ?? "").trim() !== "---") {
     throw new AgentDefinitionParseError(
       "Agent definition frontmatter start delimiter must be exactly '---'."
@@ -104,7 +143,7 @@ export function parseAgentDefinitionMarkdown(input: {
   assertObject(raw, "Agent definition YAML frontmatter must be a mapping/object.");
 
   const parsed = AgentDefinitionFrontmatterSchema.safeParse(
-    mapFrontmatterForSource(raw, input.plugin)
+    cutLongDescription(mapFrontmatterForSource(raw, input.plugin))
   );
   if (!parsed.success) {
     throw new AgentDefinitionParseError(
@@ -112,9 +151,5 @@ export function parseAgentDefinitionMarkdown(input: {
     );
   }
 
-  return {
-    frontmatter: parsed.data,
-    body,
-    mappedReadonly: input.plugin !== undefined && isReadonlyForeignPluginAgent(raw),
-  };
+  return { frontmatter: parsed.data, body, ...pluginFileFlags(raw, input.plugin) };
 }

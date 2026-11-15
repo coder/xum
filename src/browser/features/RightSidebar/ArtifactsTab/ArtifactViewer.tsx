@@ -143,7 +143,7 @@ export function ArtifactViewer(props: {
   /** Bumped by panel refreshes; renderers that read referenced files re-read them (canvas). */
   reloadToken?: number;
   /**
-   * Identifies the shown file version. Renderers keep view choices (the JSON mode) per key, so
+   * Identifies the shown file content. Renderers keep view choices (the JSON mode) per key, so
    * they survive remounts such as fullscreen or a sidebar tab switch.
    */
   viewKey?: string;

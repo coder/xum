@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
+import { renderedLineTops, textLineTops } from "@/browser/stories/helpers/renderedLines";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type {
@@ -18,7 +19,7 @@ import type {
 } from "@/common/orpc/schemas/agentPlugins";
 
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
-import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
+import { publishPluginsSectionIntent, type PluginsSectionIntent } from "./pluginsSectionIntents";
 
 /** 1x1 PNG: the backend sends logos as data URLs, never paths. */
 const LOGO_DATA_URL =
@@ -215,11 +216,33 @@ function pluginCardOf(element: HTMLElement): HTMLElement {
   return card;
 }
 
-const PluginsSectionStoryShell: FC<{ options: MockORPCClientOptions; children: ReactNode }> = (
-  props
-) => {
+/** The plain words of `element` (letters and a trailing punctuation mark) that span two lines. */
+function splitProseWords(element: HTMLElement): string[] {
+  const split: string[] = [];
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+    for (const match of (node.textContent ?? "").matchAll(/\S+/g)) {
+      if (!/^[A-Za-z]+[.,:;]?$/.test(match[0])) continue;
+      const range = document.createRange();
+      range.setStart(node, match.index);
+      range.setEnd(node, match.index + match[0].length);
+      if (renderedLineTops(range).size > 1) split.push(match[0]);
+    }
+  }
+  return split;
+}
+
+const PluginsSectionStoryShell: FC<{
+  options: MockORPCClientOptions;
+  /** A palette intent that arrived before the section mounted: buffered for its mount. */
+  intent?: PluginsSectionIntent;
+  children: ReactNode;
+}> = (props) => {
   const clientRef = useRef<APIClient | null>(null);
-  clientRef.current ??= createMockORPCClient(props.options);
+  if (clientRef.current === null) {
+    if (props.intent !== undefined) publishPluginsSectionIntent(props.intent);
+    clientRef.current = createMockORPCClient(props.options);
+  }
 
   return (
     <ThemeProvider>
@@ -337,15 +360,13 @@ export const InstalledPhoneViewport: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText("grill");
     await canvas.findByText("update available");
-    await canvas.findByRole("button", { name: /Update/ });
+    await canvas.findByRole("button", { name: /^Update$/ });
     await expectInterfaceAsText(canvasElement);
     // Max-length separator-free names must wrap instead of overflowing the
-    // card's right edge at phone width.
+    // card's right edge at phone width: checked in the sweep below, down to 320 px.
     const maxRow = await canvas.findByText(MAX_LENGTH_NAME);
     const card = maxRow.closest("div[class*='rounded-md']");
-    if (card instanceof HTMLElement && card.scrollWidth > card.clientWidth + 1) {
-      throw new Error("Max-length plugin row overflows its card at phone width");
-    }
+    if (!(card instanceof HTMLElement)) throw new Error("Max-length plugin card not found");
     const capability = await canvas.findByText(MAX_LENGTH_CAPABILITY);
     const capabilityCard = capability.closest("div[class*='rounded-md']");
     if (
@@ -359,6 +380,48 @@ export const InstalledPhoneViewport: Story = {
     const name = within(pluginCardOf(manage)).getByText("grill");
     if (Math.abs(manage.getBoundingClientRect().left - name.getBoundingClientRect().left) > 1) {
       throw new Error("Wrapped plugin actions are not flush with the card text");
+    }
+    // The skill and MCP counts are prose: they wrap at spaces, never inside a word. A word only
+    // splits when the screen's edge falls inside it, and the counts of this fixture fit a 320 px
+    // line, so sweep widths from below that up to 390 px, the width that the Pixel snapshot shows.
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (let width = 200; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      for (const counts of canvas.getAllByText(/skills imported/)) {
+        const split = splitProseWords(counts);
+        if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}px`);
+      }
+    }
+    // A path that fits a line moves to the next line whole, like a file name. The plugins folder
+    // of the intro and the locations of the rows are all shorter than a 320 px line.
+    const paths = [
+      await canvas.findByText("~/.mux/plugins"),
+      ...[MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM].map((item) => canvas.getByText(item.location)),
+    ];
+    // The commit id of the source line is a word too: the line wraps at spaces around it.
+    const commits = [MANAGED_ITEM, PINNED_ITEM, MAX_LENGTH_ITEM].map((item) => {
+      const commit = item.lockedSha?.slice(0, 12);
+      if (commit === undefined) throw new Error(`${item.name} has no locked commit`);
+      return { commit, line: canvas.getByText(new RegExp(` · ${commit}$`)) };
+    });
+    for (let width = 320; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      if (card.scrollWidth > card.clientWidth + 1) {
+        throw new Error(`Max-length plugin row overflows its card at ${width}px`);
+      }
+      for (const path of paths) {
+        const range = document.createRange();
+        range.selectNodeContents(path);
+        if (renderedLineTops(range).size !== 1) {
+          throw new Error(`${path.textContent} is split across lines at ${width}px`);
+        }
+      }
+      for (const { commit, line } of commits) {
+        if (textLineTops(line, commit).size !== 1) {
+          throw new Error(`Commit ${commit} is split across lines at ${width}px`);
+        }
+      }
     }
   },
 };
@@ -462,6 +525,7 @@ export const AddPluginConsentPreview: Story = {
             ],
             agents: ["grill-master.md"],
             readonlyAgents: [],
+            shellRemovedAgents: [],
             workflows: ["grill-report.js"],
             slashCommands: [{ name: "grill", description: "Grill the current plan" }],
             reviewedComponents: [
@@ -560,6 +624,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             mcpServers: [],
             agents: [],
             readonlyAgents: [],
+            shellRemovedAgents: [],
             workflows: [],
             slashCommands: [],
             reviewedComponents: [],
@@ -759,6 +824,128 @@ export const UpdateRequiresReviewPhoneViewport: Story = {
   },
 };
 
+const UPDATE_ALL_OPTIONS: MockORPCClientOptions = {
+  agentPlugins: {
+    items: [MANAGED_ITEM, PINNED_ITEM, MISSING_ITEM],
+    updateChecks: [
+      {
+        name: "grill",
+        status: "update-available",
+        remoteSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+      },
+      {
+        name: "deploy-tools",
+        status: "update-available",
+        remoteSha: "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4",
+      },
+      { name: "vanished", status: "up-to-date" },
+    ],
+  },
+};
+
+async function findUpdateAllHeader(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  const updateAll = await canvas.findByRole("button", { name: "Update all (2)" });
+  const check = canvas.getByRole("button", { name: "Check for updates" });
+  const add = canvas.getByRole("button", { name: "Add plugin" });
+  return { updateAll, check, add };
+}
+
+/**
+ * Out of Pixel snapshots (snapshot budget): InstalledWithUpdateStates and InstalledPhoneViewport
+ * already snapshot the header with the button, so the plays check the layout here.
+ */
+export const UpdateAllPending: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={UPDATE_ALL_OPTIONS}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const { updateAll, check, add } = await findUpdateAllHeader(canvasElement);
+    if (new Set([updateAll, check, add].map((b) => b.getBoundingClientRect().top)).size !== 1) {
+      throw new Error("Header buttons do not share one row at desktop width");
+    }
+  },
+};
+
+export const UpdateAllPendingPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: { layout: "fullscreen", pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={UPDATE_ALL_OPTIONS}>
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    const { updateAll, check, add } = await findUpdateAllHeader(canvasElement);
+    // 390 px is the iPhone width; sweep down to 320 px, the narrowest phone.
+    for (let width = 320; width <= 390; width += 10) {
+      wrapper.style.width = `${width}px`;
+      const edge = wrapper.getBoundingClientRect().right;
+      for (const button of [updateAll, check, add]) {
+        const box = button.getBoundingClientRect();
+        if (box.right > edge + 1 || box.left < wrapper.getBoundingClientRect().left - 1) {
+          throw new Error(`${button.textContent} leaves the section at ${width}px`);
+        }
+      }
+      if (wrapper.scrollWidth > wrapper.clientWidth + 1) {
+        throw new Error(`The section overflows horizontally at ${width}px`);
+      }
+    }
+  },
+};
+
+const UPDATE_ALL_REVIEWS = [
+  {
+    name: "grill",
+    fromSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    toSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+    changes: [{ summary: "adds skill 'grill-harder'" }],
+    warnings: [],
+  },
+  {
+    name: "deploy-tools",
+    fromSha: "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1",
+    toSha: "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4",
+    changes: [{ summary: "adds MCP server 'pager'", after: "node pager.js" }],
+    warnings: [],
+  },
+];
+
+export const UpdateAllReviewQueue: Story = {
+  // Out of Pixel snapshots (snapshot budget): the review panel is snapshotted by UpdateRequiresReview.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={UPDATE_ALL_OPTIONS}
+      intent={{ type: "review-updates", reviews: UPDATE_ALL_REVIEWS }}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(/adds skill 'grill-harder'/);
+    await expect(canvas.queryByText(/adds MCP server 'pager'/)).toBeNull();
+    await expect(canvas.getAllByRole("button", { name: /Apply update/ })).toHaveLength(1);
+
+    await userEvent.click(canvas.getByRole("button", { name: "Cancel" }));
+    await canvas.findByText(/adds MCP server 'pager'/);
+    await expect(canvas.queryByText(/adds skill 'grill-harder'/)).toBeNull();
+    await expect(canvas.getAllByRole("button", { name: /Apply update/ })).toHaveLength(1);
+  },
+};
+
 /** Settings hook review: a trusted hook, a changed one that needs review, and one Xum never runs. */
 export const HooksReview: Story = {
   // The three hook review stories stay out of Pixel snapshots: the repo-wide snapshot budget
@@ -809,6 +996,18 @@ export const HooksReviewPhoneViewport: Story = {
     const panel = (await canvas.findByText(/A hook runs only after you trust it/)).parentElement;
     if (panel instanceof HTMLElement && panel.scrollWidth > panel.clientWidth + 1) {
       throw new Error("Hook review panel overflows at phone width");
+    }
+    // The handler lines wrap at words, never inside one, down to a 320 px screen.
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (const width of ["390px", "320px"]) {
+      wrapper.style.width = width;
+      await waitFor(() => {
+        for (const line of canvas.getAllByText(/^MCP tool grill/)) {
+          const split = splitProseWords(line);
+          if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}`);
+        }
+      });
     }
   },
 };
@@ -1385,6 +1584,7 @@ const CLAUDE_REPO_PREVIEW: AgentPluginInstallPreview = {
   mcpServers: [{ serverName: "review-db", transport: "stdio", summary: "node ./bin/db.js" }],
   agents: ["reviewer.md"],
   readonlyAgents: [],
+  shellRemovedAgents: [],
   workflows: [],
   slashCommands: [],
   reviewedComponents: [],
@@ -1696,10 +1896,10 @@ function marketplaceOptions(listing = MARKETPLACE_LISTING): MockORPCClientOption
   };
 }
 
-async function openMarketplace(canvasElement: HTMLElement) {
+async function openMarketplace(canvasElement: HTMLElement, repo = "anthropics/skills") {
   const canvas = within(canvasElement);
   await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
-  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "anthropics/skills");
+  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), repo);
   await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
   await canvas.findByRole("group", { name: "Pick one plugin to install" });
   return canvas;
@@ -1774,6 +1974,62 @@ export const AddPluginMarketplacePhoneViewport: Story = {
     if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("The marketplace list overflows the card at phone width");
+    }
+  },
+};
+
+/** An entry name with hyphens that is longer than a phone line: its Preview label wraps at them. */
+const HYPHENATED_ENTRY_NAME = "design-readiness-orchestrator-with-weekly-status-reports";
+const HYPHENATED_NAME_LISTING: AgentPluginMarketplaceListing = {
+  ...MARKETPLACE_LISTING,
+  entries: [
+    { ...MARKETPLACE_LISTING.entries[0], name: HYPHENATED_ENTRY_NAME },
+    ...MARKETPLACE_LISTING.entries.slice(1),
+  ],
+};
+
+/**
+ * The "Preview <entry name>" action of a long entry name at phone width: the label wraps at its
+ * spaces and hyphens, so no part of the name is cut in two, and the button stays inside the card
+ * down to 320 px. Play-only: the marketplace story above snapshots the same panel (Pixel budget).
+ */
+export const AddPluginMarketplaceLongNamePhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={marketplaceOptions(HYPHENATED_NAME_LISTING)}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement);
+    const preview = await canvas.findByRole("button", { name: `Preview ${HYPHENATED_ENTRY_NAME}` });
+    const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (let width = 320; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      if (card.scrollWidth > card.clientWidth + 1) {
+        throw new Error(`The marketplace list overflows the card at ${width}px`);
+      }
+      if (preview.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
+        throw new Error(`The Preview button sticks out of the card at ${width}px`);
+      }
+      for (const part of ["Preview", ...HYPHENATED_ENTRY_NAME.split("-")]) {
+        if (textLineTops(preview, part).size !== 1) {
+          throw new Error(`${part} of the Preview button is split across lines at ${width}px`);
+        }
+      }
     }
   },
 };
@@ -1867,15 +2123,6 @@ function cursorMarketplaceOptions(): MockORPCClientOptions {
   };
 }
 
-async function openCursorMarketplace(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
-  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "cursor/plugins");
-  await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
-  await canvas.findByRole("group", { name: "Pick one plugin to install" });
-  return canvas;
-}
-
 /**
  * A repository with both marketplace files (cursor/plugins). pstack is in both: its row has a
  * Preview action per build, and each previews its own build. origin-apps' Cursor build is an npm
@@ -1888,7 +2135,7 @@ export const AddPluginCursorMarketplace: Story = {
     </PluginsSectionStoryShell>
   ),
   play: async ({ canvasElement }) => {
-    const canvas = await openCursorMarketplace(canvasElement);
+    const canvas = await openMarketplace(canvasElement, "cursor/plugins");
     await canvas.findByText(/Cursor and Claude Code marketplaces · 3 plugins/);
     await expect(canvas.getByRole("radio", { name: /pstack/ })).toBeChecked();
 
@@ -1937,13 +2184,149 @@ export const AddPluginCursorMarketplacePhoneViewport: Story = {
     </PluginsSectionStoryShell>
   ),
   play: async ({ canvasElement }) => {
-    const canvas = await openCursorMarketplace(canvasElement);
+    const canvas = await openMarketplace(canvasElement, "cursor/plugins");
     await canvas.findByRole("button", { name: "Preview Claude build" });
     const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
     const card = group.closest("div[class*='rounded-md']");
     if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("The merged marketplace list overflows the card at phone width");
+    }
+  },
+};
+
+const E2E_SOURCE = {
+  type: "git" as const,
+  url: "https://github.com/tester-army/e2e.git",
+  ref: "main",
+  refType: "branch" as const,
+};
+
+/**
+ * Shaped like tester-army/e2e: all three marketplace files list `e2e` from one folder, and the
+ * Agent Plugins file also lists a plugin that its policy withholds.
+ */
+const AGENTS_MARKETPLACE_LISTING: AgentPluginMarketplaceListing = {
+  name: "e2e",
+  description: "Skills for writing, running, and debugging e2e tests",
+  owner: "TesterArmy",
+  source: E2E_SOURCE,
+  lockedSha: "14dc946c40091496531451cf40e81eb407fe640e",
+  entries: [
+    {
+      name: "e2e",
+      description: "Write, run, and debug end-to-end tests for web and mobile apps with e2e.",
+      builds: [
+        { file: "cursor", sourceKind: "relative", source: "plugins/e2e", installable: true },
+        { file: "claude", sourceKind: "relative", source: "plugins/e2e", installable: true },
+        { file: "agents", sourceKind: "relative", source: "plugins/e2e", installable: true },
+      ],
+    },
+    {
+      name: "e2e-labs",
+      builds: [
+        { file: "cursor", sourceKind: "relative", source: "plugins/e2e-labs", installable: true },
+        {
+          file: "agents",
+          sourceKind: "relative",
+          source: "plugins/e2e-labs",
+          installable: false,
+          reason:
+            "The marketplace marks this plugin policy.installation NOT_AVAILABLE, so Xum does not install it.",
+        },
+      ],
+    },
+  ],
+  methods: [],
+  warnings: [],
+};
+
+function agentsMarketplaceOptions(): MockORPCClientOptions {
+  const method = { kind: "agent-plugin" as const };
+  return {
+    agentPlugins: {
+      items: [],
+      marketplace: AGENTS_MARKETPLACE_LISTING,
+      previewsByMethod: {
+        "agents-marketplace": {
+          ...SKILLS_PREVIEW,
+          source: { ...E2E_SOURCE, subpath: "plugins/e2e" },
+          method,
+          methods: [method],
+          skillsCliSkills: [],
+          manifest: { name: "e2e", description: "e2e, Agent Plugins build" },
+          targetPath: "~/.mux/plugins/e2e",
+        },
+      },
+    },
+  };
+}
+
+/**
+ * A repository with all three marketplace files (tester-army/e2e). The header names the three
+ * files, the first row has a Preview action per build, and the Agent Plugins build previews
+ * through the folder's own manifest. The second row's Agent Plugins build is withheld by policy.
+ */
+export const AddPluginAgentsMarketplace: Story = {
+  // The Pixel budget is at its cap: this story is checked by its play only.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={agentsMarketplaceOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement, "tester-army/e2e");
+    await canvas.findByText(/Cursor, Claude Code and Agent Plugins marketplaces · 2 plugins/);
+    await expect(canvas.getByRole("radio", { name: /^e2e\s/ })).toBeChecked();
+    for (const name of [
+      "Preview Cursor build",
+      "Preview Claude build",
+      "Preview Agent Plugins build",
+    ]) {
+      await expect(canvas.getByRole("button", { name })).toBeEnabled();
+    }
+
+    await userEvent.click(canvas.getByRole("radio", { name: /e2e-labs/ }));
+    await expect(canvas.getByRole("button", { name: "Preview Cursor build" })).toBeEnabled();
+    await expect(
+      canvas.getByRole("button", { name: "Preview Agent Plugins build" })
+    ).toBeDisabled();
+    await canvas.findByText(/policy\.installation NOT_AVAILABLE/);
+
+    await userEvent.click(canvas.getByRole("radio", { name: /^e2e\s/ }));
+    await userEvent.click(canvas.getByRole("button", { name: "Preview Agent Plugins build" }));
+    await canvas.findByText("e2e, Agent Plugins build");
+    await expect(canvas.getByText("Agent Plugin", { selector: "span" })).toBeVisible();
+  },
+};
+
+/** The three-file list at phone width: three build lines and three actions fit the card. */
+export const AddPluginAgentsMarketplacePhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    // The Pixel budget is at its cap: the play checks the phone layout instead.
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={agentsMarketplaceOptions()}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement, "tester-army/e2e");
+    await canvas.findByRole("button", { name: "Preview Agent Plugins build" });
+    const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("The three-file marketplace list overflows the card at phone width");
     }
   },
 };
@@ -1966,6 +2349,7 @@ const CURSOR_KIT_PREVIEW: AgentPluginInstallPreview = {
   ],
   agents: ["ci-watcher.md", "reviewer.md"],
   readonlyAgents: ["reviewer.md"],
+  shellRemovedAgents: [],
   notApplied: [
     { part: "field", name: "variables", reason: "not applied in Xum" },
     { part: "hook", name: "hooks", reason: "Cursor hooks run in a later Xum build" },
@@ -2043,6 +2427,137 @@ export const AddPluginCursorReviewPhoneViewport: Story = {
     if (!(card instanceof HTMLElement)) throw new Error("Consent preview card not found");
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("The not-applied list overflows the card at phone width");
+    }
+  },
+};
+
+const COMPONENT_FILES = {
+  agents: [
+    "bootstrap_orchestrator.md",
+    "codebase_details.md",
+    "comprehension.md",
+    "design_critic.md",
+    "implementation_readiness.md",
+    "design-review-orchestrator.md",
+  ],
+  workflows: ["weekly-release-notes.js", "implementation-readiness-report.js", "triage.js"],
+};
+
+/** A separator-free name longer than a phone line: it can only wrap inside its own box. */
+const LONG_FILE_NAME = "implementation_readiness_design_review_orchestrator_agent_v2.md";
+
+/** A valid slash command name with no separator and 63 of the 64 characters allowed. */
+const LONG_COMMAND_NAME = "implementationreadinessdesignrevieworchestratoragentsversiontwo";
+
+/** A configured plugins folder with one segment longer than a phone line. */
+const LONG_PLUGINS_DIRECTORY = `~/.mux/plugins/${"d".repeat(100)}`;
+
+/** A plugin whose agents and workflows have long file names, some with hyphens (break points). */
+const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
+  ...CLAUDE_REPO_PREVIEW,
+  method: { kind: "agent-plugin" },
+  methods: [{ kind: "agent-plugin" }],
+  skillsCliSkills: [],
+  manifest: { name: "review-kit", version: "1.4.0" },
+  mcpServers: [],
+  agents: [...COMPONENT_FILES.agents, LONG_FILE_NAME],
+  workflows: COMPONENT_FILES.workflows,
+  slashCommands: [
+    { name: "design-review-orchestrator", description: "Reviews a design." },
+    { name: LONG_COMMAND_NAME, description: "Runs the whole review." },
+  ],
+  codexHooks: [
+    {
+      key: "hooks/hooks.json#PreToolUse[0][0]",
+      hash: "4".repeat(64),
+      event: "PreToolUse",
+      handler: { type: "command", summary: "node ${CLAUDE_PLUGIN_ROOT}/hooks/check.js" },
+      status: "claude-plugin",
+      source: "hooks/hooks.json",
+    },
+  ],
+  reviewedComponents: [
+    { kind: "agents", name: "implementation_readiness_review.md", detail: "Reviews readiness." },
+    { kind: "workflows", name: "implementation-readiness-report.js", detail: "Writes a report." },
+    { kind: "agents", name: LONG_FILE_NAME, detail: "Orchestrates the review." },
+  ],
+};
+
+/**
+ * File names of agents, workflows and reviewed components, slash command names, the words of the
+ * hook list and the plugins folder at phone width: each name moves to the next line whole instead
+ * of splitting at the card's edge, a name longer than a line wraps inside its own box, and
+ * nothing sticks out of the screen, down to 320 px. Play-only: the other phone stories of this
+ * file snapshot the same panel (Pixel budget).
+ */
+export const AddPluginFileNamesPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [],
+          preview: COMPONENT_FILES_PREVIEW,
+          containerLocation: LONG_PLUGINS_DIRECTORY,
+        },
+      }}
+    >
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
+    await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "acme/review-kit");
+    await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
+    await canvas.findByText("Agents (7)");
+    const directory = await canvas.findByText(LONG_PLUGINS_DIRECTORY);
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    const names = [
+      ...COMPONENT_FILES.agents,
+      ...COMPONENT_FILES.workflows,
+      "implementation_readiness_review.md",
+      "/design-review-orchestrator",
+    ];
+    for (const width of ["390px", "320px"]) {
+      wrapper.style.width = width;
+      await waitFor(() => {
+        for (const name of names) {
+          for (const element of canvas.getAllByText(name)) {
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            if (renderedLineTops(range).size !== 1) {
+              throw new Error(`${name} is split across lines at ${width}`);
+            }
+          }
+        }
+        const hook = canvas
+          .getAllByRole("listitem")
+          .find((item) => item.textContent?.startsWith("PreToolUse"));
+        if (hook === undefined) throw new Error("The hook list item is missing");
+        const split = splitProseWords(hook);
+        if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}`);
+        const command = canvas.getByText(`/${LONG_COMMAND_NAME}`);
+        if (command.getBoundingClientRect().right > wrapper.getBoundingClientRect().right + 1) {
+          throw new Error(`The long slash command sticks out of the screen at ${width}`);
+        }
+        if (wrapper.scrollWidth > wrapper.clientWidth + 1) {
+          throw new Error(`The plugins section is wider than the screen at ${width}`);
+        }
+        if (directory.getBoundingClientRect().right > wrapper.getBoundingClientRect().right + 1) {
+          throw new Error(`The plugins folder sticks out of the screen at ${width}`);
+        }
+      });
     }
   },
 };

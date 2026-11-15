@@ -2,6 +2,13 @@ import * as path from "path";
 import type { Stats } from "node:fs";
 import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import { SkillNameSchema } from "@/common/orpc/schemas";
+import type { SkillName } from "@/common/types/agentSkill";
+import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import {
+  GLOBAL_WRITE_SANDBOX_ERROR,
+  sandboxBlocksGlobalWrites,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 
 /**
  * Local filesystem-only skill file utilities.
@@ -237,4 +244,19 @@ export const SKILL_FILENAME = "SKILL.md";
 /** Case-insensitive check whether a normalized relative path refers to the root SKILL.md file. */
 export function isSkillMarkdownRootFile(relativePath: string): boolean {
   return relativePath.toLowerCase() === SKILL_FILENAME.toLowerCase();
+}
+
+/**
+ * The skill name that a skill write or delete changes, or why it must not: a bad name, or a
+ * global skill that the agent sandbox keeps the agent from changing.
+ */
+export function parseSkillNameForChange(
+  name: string,
+  config: ToolConfiguration
+): { success: true; data: SkillName } | { success: false; error: string } {
+  const parsedName = SkillNameSchema.safeParse(name);
+  if (!parsedName.success) return { success: false, error: parsedName.error.message };
+  if (sandboxBlocksGlobalWrites(config))
+    return { success: false, error: GLOBAL_WRITE_SANDBOX_ERROR };
+  return { success: true, data: parsedName.data };
 }

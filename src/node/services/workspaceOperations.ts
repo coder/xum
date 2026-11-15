@@ -13,6 +13,7 @@ import {
 } from "@/node/utils/runtime/planLocation";
 import { InstallationIdentityError } from "@/node/config/installationIdentity";
 import { isRuntimeTransportError } from "@/node/runtime/Runtime";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import {
   WorkspaceGoalChildWorkspaceError,
   WorkspaceGoalTransitionError,
@@ -229,10 +230,16 @@ export async function removeWorkspace(
 ) {
   const result = await context.workspaceService.remove(input.workspaceId, input.options?.force, {
     acknowledgedDescendantIds: input.options?.acknowledgedDescendantIds,
+    acknowledgedUnknownProcessRecords: input.options?.acknowledgedUnknownProcessRecords,
   });
   return result.success
     ? { success: true as const, ...(result.warnings ? { warnings: result.warnings } : {}) }
-    : { success: false as const, error: result.error, descendants: result.descendants };
+    : {
+        success: false as const,
+        error: result.error,
+        descendants: result.descendants,
+        backgroundProcesses: result.backgroundProcesses,
+      };
 }
 
 export async function forkWorkspace(context: ORPCContext, input: ForkWorkspaceInput) {
@@ -287,6 +294,14 @@ export async function answerWorkspaceQuestion(
   return result.success
     ? { success: true as const, data: undefined }
     : { success: false as const, error: result.error };
+}
+
+export function answerWorkspaceSandboxApproval(
+  input: z.infer<typeof schemas.workspace.answerSandboxApproval.input>
+) {
+  return sandboxApprovalManager.answer(input.workspaceId, input.toolCallId, input.approved)
+    ? { success: true as const, data: undefined }
+    : { success: false as const, error: "No sandbox approval is pending for this tool call" };
 }
 
 export function answerDelegatedWorkspaceToolCall(

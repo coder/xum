@@ -6,7 +6,9 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers.js";
 import type {
   MemoryConsolidationRecordPayload,
+  MemoryConsolidationStatusPayload,
   MemoryFileInfo,
+  MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -108,31 +110,46 @@ const CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
   ops: [{ command: "delete", path: "/memories/project/duplicate.md", applied: true }],
 };
 
+const HARVEST_RECORD: MemoryHarvestRecordPayload = {
+  status: "completed",
+  startedAt: Date.now() - 45 * 60 * 1000,
+  completedAt: Date.now() - 44 * 60 * 1000,
+  attemptCount: 1,
+  boundaryKey: "summary-story",
+  compactionEpoch: 3,
+  acceptedCandidates: 2,
+  skippedCandidates: 1,
+  nextChunk: 1,
+  ops: [
+    { command: "create", path: "/memories/workspace/build.md", applied: true },
+    { command: "str_replace", path: "/memories/workspace/build.md", applied: true },
+    {
+      command: "create",
+      path: "/memories/global/build.md",
+      applied: false,
+      note: "Consolidation may not modify /memories/global/build.md",
+    },
+  ],
+};
+
+const DEFAULT_STATUS: MemoryConsolidationStatusPayload = {
+  workspaceRecord: null,
+  projectRecord: CONSOLIDATION_RECORD,
+  globalRecord: CONSOLIDATION_RECORD,
+  latestHarvestRecord: HARVEST_RECORD,
+  projectAvailable: true,
+};
+
 // The Memory tab lives in the narrow right sidebar, so pin the story to a
 // sidebar-like width (also exercises the ~375px mobile layout contract).
-function renderTab(width: string) {
+function renderTab(width: string, status: Partial<MemoryConsolidationStatusPayload> = {}) {
   return (
     <APIProvider
       client={createMockORPCClient({
         experiments: { [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true },
         memoryFiles: MEMORY_FILES,
         memoryFileContents: new Map([["/memories/global/preferences.md", PREFERENCES_CONTENT]]),
-        memoryConsolidationStatus: {
-          workspaceRecord: null,
-          projectRecord: CONSOLIDATION_RECORD,
-          globalRecord: CONSOLIDATION_RECORD,
-          latestHarvestRecord: {
-            status: "completed",
-            startedAt: Date.now() - 45 * 60 * 1000,
-            completedAt: Date.now() - 44 * 60 * 1000,
-            attemptCount: 1,
-            boundaryKey: "summary-story",
-            compactionEpoch: 3,
-            acceptedCandidates: 2,
-            skippedCandidates: 1,
-          },
-          projectAvailable: true,
-        },
+        memoryConsolidationStatus: { ...DEFAULT_STATUS, ...status },
       })}
     >
       <div className="border-border-light h-[480px] border" style={{ width }}>
@@ -155,7 +172,7 @@ export const List: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText("preferences.md");
     await canvas.findByText(/Project:/);
-    await canvas.findByText(/Harvest: completed/);
+    await canvas.findByText("Harvest: completed: 2 edits / 1 rejected");
     await canvas.findByText("scratch.md");
   },
 };
@@ -189,5 +206,52 @@ export const Editor: Story = {
     await waitFor(() => expect(within(document.body).queryByRole("tooltip")).toBeNull());
     await userEvent.hover(canvasElement);
     blurActiveElement();
+  },
+};
+
+// A completed run that read only part of its epoch says so at the end of the harvest line. On a
+// touch screen that note has no tooltip to fall back on, so a clipped line hides it.
+export const HarvestNoteAtPhoneWidth: Story = {
+  parameters: {
+    // The play assertion pins the wrap; a snapshot of the same tab adds budget, not coverage.
+    pixel: { exclude: true },
+  },
+  render: () =>
+    renderTab("375px", {
+      latestHarvestRecord: {
+        ...HARVEST_RECORD,
+        note: "edit budget spent: chunks 2-3 of 3 were not read",
+      },
+    }),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const line = await canvas.findByText(/^Harvest: completed/);
+    await expect(line.textContent).toContain("chunks 2-3 of 3 were not read");
+    // Clipped text has more content than box: scrollWidth passes clientWidth.
+    await expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
+    // Wrapped onto a second line, so it is taller than one 12px text line.
+    await expect(line.getBoundingClientRect().height).toBeGreaterThan(20);
+  },
+};
+
+// One organizer pass writes the same record to each scope it covers: each scope line counts its
+// own changes, and the run's cost and ceiling note sit on one line, not on all three.
+export const SharedRunAtPhoneWidth: Story = {
+  parameters: {
+    // The play assertion pins the wrap; a snapshot of the same tab adds budget, not coverage.
+    pixel: { exclude: true },
+  },
+  render: () => {
+    const run = {
+      ...CONSOLIDATION_RECORD,
+      spentUsd: 0.9,
+      note: "stopped at the cost ceiling after $0.90",
+    };
+    return renderTab("375px", { workspaceRecord: run, projectRecord: run, globalRecord: run });
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const line = await canvas.findByText(/^Run cost \(workspace, project, global\)/);
+    await expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
   },
 };

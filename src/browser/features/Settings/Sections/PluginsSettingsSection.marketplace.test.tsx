@@ -59,6 +59,7 @@ const remotePreview: AgentPluginInstallPreview = {
   mcpServers: [],
   agents: [],
   readonlyAgents: [],
+  shellRemovedAgents: [],
   workflows: [],
   slashCommands: [],
   reviewedComponents: [],

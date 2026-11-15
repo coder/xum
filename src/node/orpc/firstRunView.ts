@@ -57,8 +57,8 @@ export function firstRunViewHtml(gitDescribe: string): string {
   </style>
   <div class="h-full">
     <div class="bg-surface-primary h-full">
-      <div class="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
-        <div class="left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center gap-1 fixed top-[env(safe-area-inset-top)] left-[env(safe-area-inset-left)] z-[1050] h-8">
+      <div class="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-(--safe-area-top) pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
+        <div class="left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center gap-1 fixed top-(--safe-area-top) left-[env(safe-area-inset-left)] z-[1050] h-8">
           <button class="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium text-muted hover:text-foreground h-6 w-6 shrink-0 mobile-menu-btn"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-panel-left h-3.5 w-3.5"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M9 3v18"></path></svg></button>
         </div>
         <div class="mobile-overlay fixed inset-0 z-40 hidden before:absolute before:inset-0 before:bg-black/50 before:backdrop-blur-sm" data-pre="e"></div>
@@ -126,7 +126,7 @@ export function firstRunViewHtml(gitDescribe: string): string {
     </div>
   </div>
   <div data-modal-dialog-overlay="" class="fixed inset-0 z-[1500] before:absolute before:inset-0 before:bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"></div>
-  <div role="dialog" class="bg-dark border-border fixed top-[50%] left-[calc(50%_+_(env(safe-area-inset-left,0px)_-_env(safe-area-inset-right,0px))/2)] z-[1500] grid w-[calc((100%_-_env(safe-area-inset-left,0px)_-_env(safe-area-inset-right,0px))*0.9)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]" style="max-width: 500px">
+  <div role="dialog" class="bg-dark border-border fixed top-[50%] left-[calc(50%_+_(env(safe-area-inset-left,0px)_-_var(--safe-area-right))/2)] z-[1500] grid w-[calc((100%_-_env(safe-area-inset-left,0px)_-_var(--safe-area-right))*0.9)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]" style="max-width: 500px">
     <div class="flex flex-col space-y-1.5 text-left">
       <h2 class="text-foreground text-lg font-semibold leading-none tracking-tight">Choose your own AI providers</h2>
     </div>

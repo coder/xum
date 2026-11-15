@@ -1,5 +1,9 @@
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
 import { AgentResourceLimitsSchema } from "@/common/config/schemas/agentResourceLimits";
+import {
+  AgentSandboxConfigSchema,
+  salvageAgentSandbox,
+} from "@/common/config/schemas/agentSandbox";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
   AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
@@ -22,6 +26,7 @@ import { z } from "zod";
 import { ServiceTierSchema } from "../config/schemas/providersConfig";
 
 import { RuntimeEnablementIdSchema } from "./ids";
+import { IsolationChoiceSchema } from "./isolation";
 import { RuntimeEnablementOverridesSchema } from "./runtimeEnablement";
 
 export const WorktreeArchiveSnapshotProjectSchema = z.object({
@@ -398,6 +403,16 @@ export const WorkspaceConfigSchema = z.object({
   }),
 });
 
+/**
+ * One SSH+None directory the user trusted for a project. Matched exactly against the workspace's
+ * persisted runtimeConfig (host string, port, absolute projectDir); see sshDirectoryTrust.ts.
+ */
+export const TrustedSshDirectorySchema = z.object({
+  host: z.string().meta({ description: "SSH host exactly as the workspace runtime stores it" }),
+  port: z.number().optional().meta({ description: "SSH port; absent matches only an absent port" }),
+  projectDir: z.string().meta({ description: "Absolute project directory on the host" }),
+});
+
 export const ProjectConfigSchema = z.object({
   displayName: z.string().nullish().meta({
     description: "Custom display name for the project",
@@ -429,8 +444,18 @@ export const ProjectConfigSchema = z.object({
   runtimeOverridesEnabled: z.boolean().optional().meta({
     description: "Whether this project uses runtime overrides, even if no overrides are set",
   }),
+  defaultIsolation: IsolationChoiceSchema.optional().meta({
+    description:
+      "Default project × workspace isolation override for new workspaces in this project",
+  }),
+  /**
+   * Legacy mirror of `defaultIsolation` for downgrade compatibility: older builds only read this
+   * flat runtime id. Written as the nearest supported runtime on every save; read only as a
+   * migration fallback when `defaultIsolation` is absent or malformed.
+   */
   defaultRuntime: RuntimeEnablementIdSchema.optional().meta({
-    description: "Default runtime override for new workspaces in this project",
+    description:
+      "Legacy mirror of defaultIsolation (flat runtime id) kept so older builds can read it",
   }),
   projectKind: z.enum(["user", "system"]).optional().meta({
     description:
@@ -439,6 +464,15 @@ export const ProjectConfigSchema = z.object({
   trusted: z.boolean().optional().meta({
     description:
       "Whether the user has confirmed trust for this project. Untrusted projects cannot run hooks or user scripts.",
+  }),
+  // An SSH+None workspace runs in an existing host directory that is not the local project, so
+  // project trust alone cannot vouch for its contents. Each such directory needs its own trust,
+  // scoped to this project (the trust owner), and it counts only while the project itself is
+  // trusted: revoking project trust keeps these entries but they stop applying. Sparse (omitted
+  // when empty); older builds ignore it.
+  trustedSshDirectories: z.array(TrustedSshDirectorySchema).optional().meta({
+    description:
+      "SSH+None directories the user trusted for this project; they apply only while the project itself is trusted",
   }),
   customInstructions: z.string().optional().meta({
     description:
@@ -456,6 +490,12 @@ export const ProjectConfigSchema = z.object({
     description:
       "CPU and memory that the local agent commands of this project share (Linux cgroup v2), inside the limit that all projects share. Absent = no project limit.",
   }),
+  agentSandbox: AgentSandboxConfigSchema.optional()
+    .catch((ctx) => salvageAgentSandbox(ctx.input))
+    .meta({
+      description:
+        "macOS sandbox for the local agent commands of this project. Each field it sets overrides the global agentSandbox.",
+    }),
 });
 
 export type WorktreeArchiveSnapshotProject = z.infer<typeof WorktreeArchiveSnapshotProjectSchema>;

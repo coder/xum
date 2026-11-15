@@ -10,6 +10,7 @@ import {
   type McpAppViewRef,
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { installDom, stubNarrowViewport } from "../../../../../tests/ui/dom";
+import { bootFrameDocument, deliverFrameMessages } from "../ArtifactsTab/frameDocument.testHarness";
 import { APIProvider } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
@@ -19,50 +20,28 @@ import {
   AppViewTabTooltip,
   findOwnMaximizedAppPanel,
 } from "./AppViewTab";
+import { restoreHistoryPrototypeAfterEach } from "../ArtifactsTab/historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 /**
  * Run the view document's preamble (its first script) as the frame's document would: it opens
- * the document's channel to the host (mcpAppDocumentChannel.ts), whose open announcement comes
- * from the frame's window. Returns the view's `window.parent`, which posts over that channel.
- * `onMessage` gets every message the host sends the document.
+ * the document's channel to the host (frameDocumentChannel.ts), whose open announcement comes
+ * from the frame's window. `onMessage` gets every message the host sends the view.
  */
 function bootViewDocument(
   frame: HTMLIFrameElement,
-  onMessage: (message: { method?: string; params?: unknown }) => void,
-  /** Gets the document's window listeners (keydown, pagehide), by event type. */
-  listeners = new Map<string, (event: unknown) => void>()
-): { postMessage: (message: unknown, targetOrigin: string) => void } {
-  const doc = new window.DOMParser().parseFromString(frame.getAttribute("srcdoc")!, "text/html");
-  const preamble = doc.querySelector("script")?.textContent ?? "";
-  const documentWindow: Record<string, unknown> = {
-    parent: {
-      postMessage: (data: unknown, _origin: string, ports: unknown[] = []) => {
-        const event = new window.Event("message");
-        Object.defineProperty(event, "data", { value: data });
-        Object.defineProperty(event, "source", { value: frame.contentWindow });
-        Object.defineProperty(event, "ports", { value: ports });
-        act(() => {
-          window.dispatchEvent(event);
-        });
-      },
-    },
-    MessageEvent: class {
-      constructor(
-        readonly type: string,
-        readonly init: { data: { method?: string; params?: unknown } }
-      ) {}
-    },
-    dispatchEvent: (event: { init: { data: { method?: string; params?: unknown } } }) => {
-      onMessage(event.init.data);
-      return true;
-    },
-    addEventListener: (type: string, listener: (event: unknown) => void) =>
-      listeners.set(type, listener),
-    setTimeout: (callback: () => void, ms: number) => setTimeout(callback, ms),
+  onMessage: (message: { method?: string; params?: unknown }) => void = () => undefined
+) {
+  const document = bootFrameDocument(frame);
+  document.win.addEventListener("message", (event) => {
+    onMessage((event as unknown as { data: { method?: string; params?: unknown } }).data);
+  });
+  // The view's `window.parent`: the document's port to the host.
+  const parent = document.win.parent as unknown as {
+    postMessage: (message: unknown, targetOrigin: string) => void;
   };
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
-  (new Function("window", preamble) as (window: unknown) => void)(documentWindow);
-  return documentWindow.parent as { postMessage: (message: unknown, targetOrigin: string) => void };
+  return { document, parent };
 }
 
 describe("AppViewTabPanel", () => {
@@ -309,7 +288,7 @@ describe("AppViewTabPanel", () => {
         );
         const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
         const posted: Array<{ method?: string; params?: unknown }> = [];
-        const viewWindow = bootViewDocument(frame, (message) => posted.push(message));
+        const viewWindow = bootViewDocument(frame, (message) => posted.push(message)).parent;
         act(() => {
           viewWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" }, "*");
         });
@@ -432,18 +411,15 @@ describe("AppViewTabPanel", () => {
 
       // Focus inside the view's frame: its keys never reach the panel, so the frame forwards an
       // Escape the view did not handle.
-      const documentListeners = new Map<string, (event: unknown) => void>();
-      bootViewDocument(frame as HTMLIFrameElement, () => undefined, documentListeners);
+      const { win } = bootViewDocument(frame as HTMLIFrameElement).document;
       fireEvent.click(view.getByRole("button", { name: "Maximize view" }));
       expect(panel().className).toContain("fixed");
       await act(async () => {
-        documentListeners.get("keydown")?.({
-          key: "Escape",
-          shiftKey: false,
-          defaultPrevented: false,
-        });
+        win.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+        // The preamble reads defaultPrevented in a task; the port delivers after it.
         await new Promise((resolve) => setTimeout(resolve, 0));
       });
+      await deliverFrameMessages();
       expect(panel().className).not.toContain("fixed");
     });
   }

@@ -4025,10 +4025,13 @@ describe("AgentSession token-budget lifecycle", () => {
       const notification = h.requests[2].messages.find((row) =>
         text(row).includes("<system-file-update>")
       );
+      // A notice exists only when the copied snapshot kept its original baseline ("initial
+      // content"): a baseline that had moved to the edited content would see no change. The
+      // notice names the mentioned file and copies no content, and the unrelated read stays out.
       expect(notification).toBeDefined();
-      expect(text(notification!)).toContain("-initial content");
-      expect(text(notification!)).toContain("+changed content");
-      expect(text(notification!)).not.toContain("unrelated old context");
+      expect(text(notification!)).toContain("emergency-mentioned.txt");
+      expect(text(notification!)).not.toContain("changed content");
+      expect(text(notification!)).not.toContain("unrelated-read.txt");
     }
   );
 
@@ -4089,11 +4092,14 @@ describe("AgentSession token-budget lifecycle", () => {
     await h.session.waitForIdle();
     await fs.writeFile(mentioned, "changed content\n");
     expect((await h.session.sendMessage("Continue after edit", options)).success).toBe(true);
-    expect(
-      h.requests[1].messages.some(
-        (row) => row.metadata?.synthetic && text(row).includes("changed content")
-      )
-    ).toBe(true);
+    // The fresh window still tracks the mention, so the edit yields a notice. It names the file
+    // and copies no content (the row is user-role).
+    const notice = h.requests[1].messages.find(
+      (row) => row.metadata?.synthetic && text(row).includes("<system-file-update>")
+    );
+    expect(notice).toBeDefined();
+    expect(text(notice!)).toContain("mentioned.txt");
+    expect(text(notice!)).not.toContain("changed content");
   });
 
   test.each([

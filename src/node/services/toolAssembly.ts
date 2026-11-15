@@ -127,12 +127,15 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * caller from the workspace cwd/runtime pair the file tools use; only
    * honored in kernel mode with file_read bridged.
    * locks take refinement_rollback's rollback and target locks (phase 4: SessionLocks).
+   * blocksGlobalWrites says, at call time, whether the agent sandbox covers this workspace, so
+   * refinement_rollback refuses to restore global memory and global skills.
    */
   sandbox?: {
     workspaceId: string;
     sessionDir: string;
     kernelFileLoader?: KernelFileLoader;
     locks?: SessionLocks;
+    blocksGlobalWrites?: () => boolean;
   };
   /**
    * Capability grants for this assembly (registry-with-filters posture).

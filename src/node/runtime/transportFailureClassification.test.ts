@@ -120,11 +120,26 @@ describe("read failure vs positive absence", () => {
     ]);
   });
 
+  // uutils coreutils (the default coreutils since Ubuntu 25.10) appends the errno.
+  it("treats uutils diagnostics with an os error suffix as absence", async () => {
+    expect(
+      await classify(
+        "stat: cannot stat '/remote/AGENTS.md': No such file or directory (os error 2)"
+      )
+    ).toEqual([absent, absent]);
+    expect(
+      await classify("stat: cannot stat '/remote/AGENTS.md/x': Not a directory (os error 20)")
+    ).toEqual([absent, absent]);
+  });
+
   it("treats permission and other errors as read failures", async () => {
     expect(await classify("cat: /remote/AGENTS.md: Permission denied")).toEqual([
       unreadable,
       unreadable,
     ]);
+    expect(
+      await classify("stat: cannot stat '/remote/AGENTS.md': Permission denied (os error 13)")
+    ).toEqual([unreadable, unreadable]);
     // OpenSSH can warn about a missing identity file on a working connection:
     // that line must not turn the permission error into "missing".
     expect(

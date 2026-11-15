@@ -44,7 +44,10 @@ export const MemorySettingsEnabled: Story = {
     <SettingsSectionStory
       setup={() =>
         setupSettingsStory({
-          experiments: { [EXPERIMENT_IDS.MEMORY]: true },
+          experiments: {
+            [EXPERIMENT_IDS.MEMORY]: true,
+            [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
+          },
         })
       }
     >
@@ -57,6 +60,12 @@ export const MemorySettingsEnabled: Story = {
     // With Agent Memory enabled, the sub-experiment toggles render in the
     // nested panel under the parent row.
     await canvas.findByLabelText("Toggle Memory Consolidation");
+    // With consolidation on, its dream cost ceiling sits under it, empty until the user sets one.
+    await expect(await canvas.findByLabelText("Dream cost ceiling")).toHaveValue("");
+    // The edit limit shows the default 8 until the user saves another.
+    await expect(await canvas.findByLabelText("Dream edit limit")).toHaveValue("8");
+    // The run timeout shows the default 5 minutes until the user saves another.
+    await expect(await canvas.findByLabelText("Dream run timeout")).toHaveValue("5");
   },
 };
 

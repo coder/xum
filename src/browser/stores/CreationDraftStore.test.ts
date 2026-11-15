@@ -226,6 +226,48 @@ describe("CreationDraftStore", () => {
     expect(store.getDraftsByProject()[PROJECT_A]?.map((draft) => draft.draftId)).toEqual([id]);
   });
 
+  test("a text save updates the draft's row without a new list; a move relists it", async () => {
+    using tempDir = new TestTempDir("creation-store-row-text");
+    const harness = await createHarness(tempDir);
+    const { store } = harness;
+    await waitFor(() => store.getListState().status === "ready");
+    const id = store.create(PROJECT_A, null);
+    store.update(id, { text: "first" });
+    await store.flush(id);
+    const listed = store.getDraftsByProject();
+    let listNotifications = 0;
+    const unsubscribeList = store.subscribeList(() => listNotifications++);
+    let rowNotifications = 0;
+    const unsubscribeRow = store.subscribe(id, () => rowNotifications++);
+
+    // Typing saves after each pause: each save reaches the row, never the whole list (its
+    // subscribers re-render the whole sidebar and every WorkspaceContext consumer).
+    store.update(id, { text: "first draft text", manualName: "named" });
+    await store.flush(id);
+    expect(listNotifications).toBe(0);
+    expect(store.getDraftsByProject()).toBe(listed);
+    expect(rowNotifications).toBeGreaterThan(0);
+    expect(store.getSummary(id)).toMatchObject({
+      preview: "first draft text",
+      manualName: "named",
+    });
+
+    // A save that leaves the row as it was keeps the same row.
+    const row = store.getSummary(id);
+    store.update(id, { ai: { model: "openai:gpt-5" } });
+    await store.flush(id);
+    expect(store.getSummary(id)).toBe(row);
+
+    // Moving the draft changes where its row shows: that relists.
+    store.update(id, { projectPath: PROJECT_B, subProjectPath: null });
+    await store.flush(id);
+    expect(listNotifications).toBe(1);
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+    expect(store.getDraftsByProject()[PROJECT_B]?.map((draft) => draft.draftId)).toEqual([id]);
+    unsubscribeList();
+    unsubscribeRow();
+  });
+
   test("clearing a draft whose first save reply was lost still saves the clear", async () => {
     using tempDir = new TestTempDir("creation-store-lost-first");
     const harness = await createHarness(tempDir);

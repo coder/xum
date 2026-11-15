@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Clipper inside a paragraph</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      p {
+        font-size: 18px;
+        line-height: 1.4;
+      }
+      /* The paragraph is as wide as the column. The tag inside it is 90 px wide. */
+      .tag {
+        display: inline-block;
+        width: 90px;
+        overflow: hidden;
+        white-space: nowrap;
+        vertical-align: bottom;
+        padding: 0 4px;
+        background: #d6eaff;
+      }
+      .truncate {
+        text-overflow: ellipsis;
+      }
+      /* The usual screen-reader-only recipe, inside a paragraph that is shown. */
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Release notes</h1>
+      <p>Build output: <span id="cut-tag" class="tag">internal-build-identifier-2026-11-11</span> is ready.</p>
+      <p>Build output: <span id="ellipsis-tag" class="tag truncate">internal-build-identifier-2026-11-11</span> is ready.</p>
+      <p>Saved <span class="sr-only">your profile changes to the shared team workspace</span> just now.</p>
+    </main>
+  </body>
+</html>

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
 # Optionally wait for coder-agents-review to respond to a `/coder-agents-review` request.
 #
@@ -45,6 +48,9 @@ SKIP_FETCH_SYNC="${MUX_SKIP_FETCH_SYNC:-0}"
 # shellcheck source=./lib/coder_agents_review.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/coder_agents_review.sh"
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 # shellcheck source=./lib/branch_sync_guard.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/branch_sync_guard.sh"
@@ -144,7 +150,7 @@ fetch_all_comments_via_api() {
       return 1
     fi
 
-    page_comments=$(echo "$page_data" | jq -c '.data.repository.pullRequest.comments.nodes // []')
+    page_comments=$(reply_connection_nodes "$page_data" comments) || return 1
     all_comments=$(jq -cn --argjson existing "$all_comments" --argjson page "$page_comments" '$existing + $page')
     has_next=$(echo "$page_data" | jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage')
     end_cursor=$(echo "$page_data" | jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor // empty')
@@ -161,7 +167,7 @@ fetch_all_comments_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected comments hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected comments hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -204,7 +210,7 @@ fetch_all_reviews_via_api() {
       return 1
     fi
 
-    page_reviews=$(echo "$page_data" | jq -c '.data.repository.pullRequest.reviews.nodes // []')
+    page_reviews=$(reply_connection_nodes "$page_data" reviews) || return 1
     all_reviews=$(jq -cn --argjson existing "$all_reviews" --argjson page "$page_reviews" '$existing + $page')
     has_next=$(echo "$page_data" | jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage')
     end_cursor=$(echo "$page_data" | jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor // empty')
@@ -221,7 +227,7 @@ fetch_all_reviews_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected reviews hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected reviews hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -270,7 +276,7 @@ fetch_all_threads_via_api() {
       return 1
     fi
 
-    page_threads=$(echo "$page_data" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
+    page_threads=$(reply_connection_nodes "$page_data" reviewThreads) || return 1
     all_threads=$(jq -cn --argjson existing "$all_threads" --argjson page "$page_threads" '$existing + $page')
     has_next=$(echo "$page_data" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
     end_cursor=$(echo "$page_data" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')
@@ -287,7 +293,7 @@ fetch_all_threads_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -322,14 +328,14 @@ load_pr_data() {
       ;;
     OPEN) ;;
     *)
-      echo "❌ assertion failed: unexpected PR state '$pr_state' for PR #$PR_NUMBER" >&2
+      echo "❌ assertion failed: unexpected PR state in the GitHub reply for PR #$PR_NUMBER" >&2
       return 1
       ;;
   esac
 
-  COMMENTS_JSON=$(echo "$pr_data" | jq -c '.data.repository.pullRequest.comments.nodes // []')
-  REVIEWS_JSON=$(echo "$pr_data" | jq -c '.data.repository.pullRequest.reviews.nodes // []')
-  THREADS_JSON=$(echo "$pr_data" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
+  COMMENTS_JSON=$(reply_connection_nodes "$pr_data" comments) || return 1
+  REVIEWS_JSON=$(reply_connection_nodes "$pr_data" reviews) || return 1
+  THREADS_JSON=$(reply_connection_nodes "$pr_data" reviewThreads) || return 1
 
   comments_has_previous=$(echo "$pr_data" | jq -r '(.data.repository.pullRequest.comments.pageInfo.hasPreviousPage | if . == null then "unknown" else tostring end)')
   reviews_has_previous=$(echo "$pr_data" | jq -r '(.data.repository.pullRequest.reviews.pageInfo.hasPreviousPage | if . == null then "unknown" else tostring end)')
@@ -343,7 +349,7 @@ load_pr_data() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected comments hasPreviousPage value '$comments_has_previous'" >&2
+      echo "❌ assertion failed: unexpected comments hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
@@ -356,7 +362,7 @@ load_pr_data() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected reviews hasPreviousPage value '$reviews_has_previous'" >&2
+      echo "❌ assertion failed: unexpected reviews hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
@@ -369,7 +375,7 @@ load_pr_data() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected reviewThreads hasPreviousPage value '$threads_has_previous'" >&2
+      echo "❌ assertion failed: unexpected reviewThreads hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
@@ -404,7 +410,8 @@ classify_bot_text_response() {
     echo "Timestamp: $created_at"
   fi
   echo ""
-  echo "$body"
+  # The bot's text can quote PR code, so this gate points to the read instead of printing it.
+  echo "Read the response with: gh pr view $PR_NUMBER --comments"
   echo ""
   echo "Review the bot response, then reply inline or leave a PR comment summarizing each response before resolving/re-requesting review."
   return 1
@@ -487,7 +494,7 @@ check_coder_agents_status_once() {
     echo ""
     echo "❌ coder-agents-review has ${unresolved_count} unresolved review thread(s)."
     echo ""
-    coder_agents_print_unresolved_threads "$unresolved_threads"
+    echo "Read them with: ./scripts/check_coder_agents_review_comments.sh $PR_NUMBER"
     return 1
   fi
 
@@ -711,7 +718,7 @@ check_coder_agents_status_once() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected coder-agents-review state '$latest_review_state'" >&2
+      echo "❌ assertion failed: unexpected coder-agents-review state in the GitHub reply" >&2
       return 1
       ;;
   esac

@@ -227,3 +227,19 @@ export async function findChatActivityPanel(): Promise<HTMLElement> {
     return found;
   });
 }
+
+interface PaintHook {
+  __storybookAssertPaint?: () => Promise<void>;
+}
+
+/**
+ * Runs the test runner's pixel check (.storybook/test-runner.ts) now, before a screenshot or
+ * resize repairs a stale WebKit layout.
+ */
+export async function expectNoDiagramInkOutsideBox() {
+  const assertPaint = (window as Window & PaintHook).__storybookAssertPaint;
+  if (assertPaint) await assertPaint();
+  else if (navigator.userAgent.includes("StorybookTestRunner")) {
+    throw new Error("paint hook missing: .storybook/test-runner.ts did not register it");
+  }
+}

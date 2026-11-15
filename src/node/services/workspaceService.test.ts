@@ -48,6 +48,7 @@ import { log } from "@/node/services/log";
 import { MAX_PLAN_SNAPSHOT_BYTES } from "@/constants/planReview";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import { HistoryService } from "./historyService";
+import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 import { NESTED_COMPACTION_FOLLOW_UP_MESSAGE } from "@/common/utils/messages/pluginSendHookFields";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
@@ -1021,6 +1022,49 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
     expect(error).toContain("could not be sanitized");
     expect(error).toContain("mcp.local.jsonc");
+  });
+
+  test("sanitizes a new workspace beside an unrelated malformed legacy entry", async () => {
+    // Real services: the prune resolved the new workspace through the strict registry walk,
+    // which fails on another id-less legacy entry whose metadata.json does not parse, so every
+    // workspace creation on such a host aborted.
+    const config = harness.config;
+    const workspacePath = path.join(config.srcDir, "proj", "ws-new");
+    const overridesPath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    await fsPromises.mkdir(path.dirname(overridesPath), { recursive: true });
+    await fsPromises.writeFile(
+      overridesPath,
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+    const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+    await fsPromises.mkdir(legacyPath, { recursive: true });
+    const legacyEntry: unknown = {
+      path: legacyPath,
+      runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+    };
+    await saveWorkspaces(
+      config,
+      workspacePath,
+      [{ id: "ws-new", name: "ws-new", path: workspacePath, runtimeConfig: { type: "local" } }],
+      { extraProjects: [["/fake/legacy-project", { workspaces: [legacyEntry as never] }]] }
+    );
+    const sessionDir = path.join(config.sessionsDir, "old-branch");
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true })
+    ).rejects.toThrow();
+    harness.service.setWorkspaceMcpOverridesService(new WorkspaceMcpOverridesService(config));
+
+    const error = await harness.service.sanitizeMaterializedTaskWorkspace("ws-new", workspacePath, {
+      type: "local",
+    });
+    expect(error).toBeUndefined();
+    const sanitized = JSON.parse(await fsPromises.readFile(overridesPath, "utf8")) as {
+      enabledServers?: string[];
+    };
+    expect(sanitized.enabledServers).toEqual(["other"]);
   });
 
   test("an off-host workspace with an equal path string is not a sibling", async () => {

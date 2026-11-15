@@ -4,7 +4,6 @@ import {
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
   MCP_APP_WIDGET_STATE_MAX_BYTES,
 } from "@/common/utils/mcpApps";
-import { passesFrameGate } from "./artifactBridge";
 import {
   createMcpAppHost,
   MCP_APP_CONSENT_ARGS_MAX_BYTES,
@@ -115,14 +114,6 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
 }
 
 describe("MCP Apps host router", () => {
-  test("frame gate rejects other windows", () => {
-    const frame = Object.create(null) as Window;
-    const other = Object.create(null) as Window;
-    expect(passesFrameGate({ source: frame }, frame, () => true)).toBe(true);
-    expect(passesFrameGate({ source: other }, frame, () => true)).toBe(false);
-    expect(passesFrameGate({ source: frame }, frame, () => false)).toBe(false);
-  });
-
   test("initialize advertises only implemented capabilities and the granted CSP", async () => {
     const t = setup();
     await t.request(1, "ui/initialize", { appInfo: { name: "v" }, protocolVersion: "2026-01-26" });

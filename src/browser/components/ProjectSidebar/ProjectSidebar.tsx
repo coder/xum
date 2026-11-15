@@ -102,6 +102,7 @@ import {
 } from "./sidebarTaskGroups";
 import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
+import { confirmAndRemoveWorkspace } from "@/browser/utils/confirmAndRemoveWorkspace";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { useWorkspaceActionKeybinds } from "./useWorkspaceActionKeybinds";
@@ -150,6 +151,7 @@ import {
   SCRATCH_SIDEBAR_SECTION_ID,
 } from "@/common/constants/scratch";
 import type { CreationDraftSummary } from "@/common/orpc/schemas/drafts";
+import { useCreationDraftSummary } from "@/browser/stores/CreationDraftStore";
 import {
   MULTI_PROJECT_CONFIG_KEY,
   MULTI_PROJECT_SIDEBAR_SECTION_ID,
@@ -620,7 +622,10 @@ interface CoalescedWorkspaceListContext {
 }
 
 function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
-  const manualName = props.draft.manualName.trim();
+  // The listed row places it; its text is read here so a save while typing re-renders this row
+  // only, not the whole sidebar (CreationDraftStore.updateSummary).
+  const draft = useCreationDraftSummary(props.draft.draftId) ?? props.draft;
+  const manualName = draft.manualName.trim();
   return (
     <AgentListItem
       variant="draft"
@@ -634,7 +639,7 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
         draftId: props.draft.draftId,
         draftNumber: props.draftNumber,
         title: manualName.length > 0 ? manualName : "Draft",
-        promptPreview: props.draft.preview,
+        promptPreview: draft.preview,
         onOpen: props.onOpen,
         onDelete: props.onDelete,
       }}
@@ -1272,7 +1277,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       setRemovingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
 
       try {
-        const result = await removeWorkspace(workspaceId, { force: true });
+        const result = await confirmAndRemoveWorkspace({
+          removeWorkspace,
+          confirm: confirmDialog,
+          workspaceId,
+          options: { force: true },
+        });
         if (!result.success) {
           workspaceRemoveError.showError(
             workspaceId,
@@ -1294,7 +1304,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         });
       }
     },
-    [removeWorkspace, workspaceRemoveError, workspaceRemoveWarning]
+    [removeWorkspace, confirmDialog, workspaceRemoveError, workspaceRemoveWarning]
   );
 
   const handleRemoveSection = async (

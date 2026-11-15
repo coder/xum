@@ -340,7 +340,8 @@ export async function readArtifactOnRuntime(
       abortSignal,
       options
     ),
-    maxBytes
+    maxBytes,
+    options?.kind
   );
 }
 

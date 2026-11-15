@@ -1,5 +1,4 @@
 import { tool } from "ai";
-import { getArtifactKind } from "@/common/utils/artifactKind";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ArtifactShelfEntry } from "@/common/orpc/schemas/artifacts";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -15,9 +14,10 @@ import {
 } from "@/node/services/artifactStore";
 import {
   getArtifactId,
-  listArtifactIndexes,
+  listArtifactRecords,
   listStoredArtifactIds,
-} from "@/node/services/artifactVersionStore";
+  withPublishedKinds,
+} from "@/node/services/artifactRecordStore";
 import { summarizeArtifactState } from "@/node/services/artifactInteractions";
 
 /** State summaries read in parallel per batch (local session files). */
@@ -37,7 +37,6 @@ async function listShelfForTool(config: ToolConfiguration) {
     title: entry.title,
     kind: entry.kind,
     size: entry.size,
-    version: entry.version,
     source: { workspaceId: entry.sourceWorkspaceId, path: entry.sourcePath },
     pinnedBy: entry.pinnedBy,
     pinned: new Date(entry.pinnedAtMs).toISOString(),
@@ -83,23 +82,20 @@ export const createArtifactListTool: ToolFactory = (config) =>
               `${scratchDir.replace(/\/+$/, "")}/${ARTIFACTS_DIR_NAME}`,
               abortSignal
             );
-      // Latest published version per artifact (M4), so the model can refer to "v3".
-      const latestByPath = new Map<string, { version: number; label: string | null }>();
-      if (config.workspaceSessionDir != null) {
-        for (const index of await listArtifactIndexes(config.workspaceSessionDir)) {
-          const latest = index.versions.at(-1);
-          if (latest)
-            latestByPath.set(index.path, { version: latest.version, label: latest.label });
-        }
-      }
+      const records =
+        config.workspaceSessionDir != null
+          ? await listArtifactRecords(config.workspaceSessionDir)
+          : [];
+      const titleByPath = new Map(records.map((record) => [record.path, record.title]));
+      const entries = withPublishedKinds(listing.entries, records);
       // window.xum.setState of the artifact (M5b). Only sandboxed HTML/SVG can set state,
-      // and only artifacts with a stored directory (versions or state) can have any, so the rest
+      // and only artifacts with a stored directory (record or state) can have any, so the rest
       // skip the read. The reads run a bounded batch at a time instead of one by one.
       const stateByPath = new Map<string, Awaited<ReturnType<typeof summarizeArtifactState>>>();
       const sessionDir = config.workspaceSessionDir;
       if (sessionDir != null) {
         const storedIds = new Set(await listStoredArtifactIds(sessionDir));
-        const candidates = listing.entries.filter(
+        const candidates = entries.filter(
           (entry) =>
             (entry.kind === "html" || entry.kind === "svg") &&
             storedIds.has(getArtifactId(entry.path))
@@ -115,8 +111,8 @@ export const createArtifactListTool: ToolFactory = (config) =>
           });
         }
       }
-      const live = listing.entries.map((entry) => {
-        const latest = latestByPath.get(entry.path);
+      const artifacts = entries.map((entry) => {
+        const title = titleByPath.get(entry.path);
         const state = stateByPath.get(entry.path);
         return {
           path: entry.path,
@@ -124,7 +120,7 @@ export const createArtifactListTool: ToolFactory = (config) =>
           size: entry.size,
           // ISO timestamps read better for the model than epoch milliseconds.
           modified: new Date(entry.modifiedMs).toISOString(),
-          ...(latest ? { latestVersion: latest.version, latestLabel: latest.label } : {}),
+          ...(title != null ? { title } : {}),
           ...(state != null
             ? {
                 state: state.state,
@@ -133,26 +129,10 @@ export const createArtifactListTool: ToolFactory = (config) =>
             : {}),
         };
       });
-      // Deleted files whose versions are kept: the post-compaction index only gives a count,
-      // so this is where the model finds them again. A truncated listing may just not have
-      // reached a file, so nothing is called deleted then.
-      const livePaths = new Set(listing.entries.map((entry) => entry.path));
-      const deleted = listing.truncated
-        ? []
-        : [...latestByPath]
-            .filter(([path]) => !livePaths.has(path))
-            .sort(([a], [b]) => a.localeCompare(b))
-            .map(([path, latest]) => ({
-              path,
-              kind: getArtifactKind(path),
-              deleted: true as const,
-              latestVersion: latest.version,
-              latestLabel: latest.label,
-            }));
       return {
         success: true as const,
         dir: listing.dir,
-        artifacts: [...live, ...deleted],
+        artifacts,
         truncated: listing.truncated,
       };
     },

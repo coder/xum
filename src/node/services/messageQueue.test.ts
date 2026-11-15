@@ -2379,7 +2379,6 @@ describe("MessageQueue", () => {
       id: "i-1",
       artifactPath: "form.html",
       title: "Form",
-      version: 2,
       action: "send" as const,
       text: "Ship it",
     };

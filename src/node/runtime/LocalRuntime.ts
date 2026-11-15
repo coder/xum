@@ -37,6 +37,10 @@ export class LocalRuntime extends LocalBaseRuntime {
     return this.projectPath;
   }
 
+  protected override sandboxCheckoutRoot(): string {
+    return this.projectPath;
+  }
+
   /**
    * For LocalRuntime, the workspace path is always the project path itself.
    * The workspaceName parameter is ignored since there's only one workspace per project.

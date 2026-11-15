@@ -50,6 +50,7 @@ const model = "openai:gpt-5.2";
 
 interface Internals {
   attemptLedger: {
+    addAttemptSettlementListener: (taskId: string, listener: () => void) => void;
     ownedAttemptByTaskId: Map<string, { attemptId?: string }>;
     attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string }>;
     admittedSendsByTaskId: Map<string, Set<{ state: string; attemptId: string }>>;
@@ -59,6 +60,15 @@ interface Internals {
   };
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+  editWorkspaceEntry: (
+    workspaceId: string,
+    updater: (workspace: WorkspaceConfigEntry) => void,
+    options?: { allowMissing?: boolean }
+  ) => Promise<boolean>;
+  isPlanLikeTaskWorkspace: (entry: {
+    projectPath: string;
+    workspace: WorkspaceConfigEntry;
+  }) => Promise<boolean>;
   workspaceEventLocks: { withLock<T>(key: string, operation: () => Promise<T>): Promise<T> };
 }
 const internals = (service: TaskService) => service as unknown as Internals;
@@ -66,9 +76,19 @@ const internals = (service: TaskService) => service as unknown as Internals;
 function streamEndEvent(
   taskId: string,
   messageId: string,
-  options: { report?: string; finishReason?: string; agentId?: string }
+  options: { report?: string; finishReason?: string; agentId?: string; proposePlan?: boolean }
 ) {
   const parts: unknown[] = [];
+  if (options.proposePlan === true) {
+    parts.push({
+      type: "dynamic-tool",
+      toolCallId: `${messageId}-plan`,
+      toolName: "propose_plan",
+      input: { plan: "the plan" },
+      state: "output-available",
+      output: { success: true, planPath: "/tmp/does-not-exist.md" },
+    });
+  }
   if (options.report != null) {
     parts.push({
       type: "dynamic-tool",
@@ -156,7 +176,12 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       config,
       projectPath,
       [
-        projectWorkspace(projectPath, "root", rootId, { runtimeConfig: { type: "local" } }),
+        {
+          ...projectWorkspace(projectPath, "root", rootId, { runtimeConfig: { type: "local" } }),
+          // The root receives the reactivated child's terminal wake: its project-dir local
+          // runtime executes in the project root, like the child's below.
+          path: projectPath,
+        },
         {
           ...projectWorkspace(projectPath, childId, childId, {
             parentWorkspaceId: rootId,
@@ -263,7 +288,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     /** End the current stream the way StreamManager does: the event first, then the completion. */
     const endStream = (
       index: number,
-      options: { report?: string; finishReason?: string; agentId?: string },
+      options: { report?: string; finishReason?: string; agentId?: string; proposePlan?: boolean },
       completeTurn: boolean
     ) => {
       const event = streamEndEvent(childId, `assistant-${index + 1}`, options);
@@ -941,6 +966,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       );
       const stack = await createStack(childId, undefined, { workspaceGoalService: goals });
       const { taskService, svc, workspaceService, completions, sendOptions } = stack;
+      // Only the deferred stream end registers here (no Stop waits on this attempt).
+      const deferrals = spyOn(svc.attemptLedger, "addAttemptSettlementListener");
       try {
         expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
         const attemptA = entryOf(config, childId)!.taskAttemptId!;
@@ -952,11 +979,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
         ).toEqual(Ok(undefined));
         stack.endStream(0, {}, true);
-        await until(
-          () =>
-            svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome === "pending",
-          "deferred decision"
-        );
+        // The decision is registered pending at the event tick, before the handler runs: only the
+        // handler's deferral shows that this test reaches the deferred path (#7003).
+        await until(() => deferrals.mock.calls.length > 0, "deferred stream end");
         await yieldMacrotasks(30);
         expect(
           svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
@@ -1012,6 +1037,543 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     },
     20_000
   );
+
+  // The stream-end handler reads the row at its admission, then awaits (the event lock, history
+  // and plan reads) before it finalizes. Another backend's report for the same attempt can land in
+  // that gap, or the parent's wait can adopt it there: the handler then finds the attempt already
+  // reported and publishes nothing. Its decision must still refuse the held follow-up, never read
+  // as "the attempt continues" (#7003). The gate holds the handler in the gap, as a loaded host
+  // does by chance.
+  const REPORTED_AT = "2026-10-01T00:00:02.000Z";
+  async function editChildRow(
+    config: Config,
+    childId: string,
+    editRow: (row: WorkspaceConfigEntry) => void
+  ) {
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (workspace.id === childId) editRow(workspace);
+        }
+      }
+      return cfg;
+    });
+  }
+  /**
+   * Queues a follow-up behind a child's stream, ends the stream with its handler held after the
+   * admission read, lets `editRow` change the child's row in that gap, then releases the handler
+   * and waits for the follow-up's fate: dispatched (a second stream) or refused and held.
+   */
+  async function endStreamWithRowEditedInGap(
+    childId: string,
+    editRow: (row: WorkspaceConfigEntry) => void
+  ) {
+    const stack = await createStack(childId);
+    const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+    const inGap = Promise.withResolvers<void>();
+    const gap = Promise.withResolvers<void>();
+    const isPlanLike = svc.isPlanLikeTaskWorkspace.bind(taskService);
+    spyOn(svc, "isPlanLikeTaskWorkspace").mockImplementation(async (entry) => {
+      if (entry.workspace.id === childId) {
+        inGap.resolve();
+        await gap.promise;
+      }
+      return isPlanLike(entry);
+    });
+    const onCanceled = mock((_reason: string) => undefined);
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      stack.endStream(0, {}, true);
+      await inGap.promise;
+      await editChildRow(config, childId, editRow);
+      gap.resolve();
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
+      await yieldMacrotasks(10);
+      return { stack, onCanceled };
+    } catch (error) {
+      await stack.cleanup();
+      throw error;
+    } finally {
+      gap.resolve();
+    }
+  }
+
+  // The plan-like probe (isPlanLikeTaskWorkspace) reads agent definitions from the user's home,
+  // which takes seconds on a host with many skills. A send that arrives while a stream's decision
+  // waits is refused as stale, so the decision must not wait for the probe where its answer
+  // changes nothing: a stream with neither a final response nor a propose_plan result, and a
+  // reported row's final response (a reported row publishes no report, so the handler resolves
+  // `nonreport` whatever the answer).
+  async function endStreamWithPlanProbeBlocked(
+    childId: string,
+    options: {
+      row?: Partial<WorkspaceConfigEntry>;
+      /** Turns the row into this status once the stream runs (a Stop landing before the stream end). */
+      statusAtEnd?: WorkspaceConfigEntry["taskStatus"];
+      end: { finishReason?: string; proposePlan?: boolean };
+      queueFollowUp: boolean;
+    }
+  ) {
+    const stack = await createStack(childId, options.row);
+    const { taskService, svc, workspaceService, child, sendOptions } = stack;
+    const probe = Promise.withResolvers<void>();
+    const isPlanLike = svc.isPlanLikeTaskWorkspace.bind(taskService);
+    spyOn(svc, "isPlanLikeTaskWorkspace").mockImplementation(async (entry) => {
+      if (entry.workspace.id === childId) await probe.promise;
+      return isPlanLike(entry);
+    });
+    try {
+      // A row without a status of its own starts interrupted: turn it running. A reported and an
+      // awaiting_report row keep their status through the stream.
+      if (options.row?.taskStatus == null) {
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      }
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      await until(() => stack.completions.length === 1, "the continuation stream");
+      if (options.queueFollowUp) {
+        expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+          Ok(undefined)
+        );
+      }
+      if (options.statusAtEnd != null) {
+        await editChildRow(stack.config, childId, (row) => {
+          row.taskStatus = options.statusAtEnd;
+        });
+      }
+      // The row reads the status the case names when the stream ends (running by default).
+      expect(entryOf(stack.config, childId)?.taskStatus).toBe(
+        options.statusAtEnd ?? options.row?.taskStatus ?? "running"
+      );
+      stack.endStream(0, options.end, true);
+      if (!options.queueFollowUp) await until(() => !child.session.isBusy(), "session idle");
+      return { stack, probe };
+    } catch (error) {
+      probe.resolve();
+      await stack.cleanup();
+      throw error;
+    }
+  }
+  /** True when the follow-up dispatched (a second stream) while the probe was still blocked. */
+  const dispatchedWhileProbeBlocked = (stack: { completions: unknown[] }) =>
+    until(() => stack.completions.length > 1, "the follow-up dispatched").then(
+      () => true,
+      () => false
+    );
+  const REPORTED_ROW = { taskStatus: "reported", reportedAt: REPORTED_AT } as const;
+
+  test.each([
+    {
+      name: "a stream that stopped for tool calls on a reported row",
+      row: REPORTED_ROW,
+      end: { finishReason: "tool-calls" },
+    },
+    {
+      name: "a stream that stopped for tool calls on a running row",
+      row: undefined,
+      end: { finishReason: "tool-calls" },
+    },
+    { name: "a final response on a reported row", row: REPORTED_ROW, end: {} },
+  ])(
+    "$name runs the held follow-up without waiting for the plan-like probe",
+    async (c) => {
+      const { stack, probe } = await endStreamWithPlanProbeBlocked("holdprobe001", {
+        row: c.row,
+        end: c.end,
+        queueFollowUp: true,
+      });
+      try {
+        expect(await dispatchedWhileProbeBlocked(stack)).toBe(true);
+        expect(stack.heldTexts()).toEqual([]);
+      } finally {
+        probe.resolve();
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
+  test.each([
+    { name: "a stream that stopped for tool calls", end: { finishReason: "tool-calls" } },
+    { name: "a final response", end: {} },
+  ])(
+    "$name on a reported row does not refuse a direct send while the plan-like probe is blocked",
+    async (c) => {
+      const { stack, probe } = await endStreamWithPlanProbeBlocked("holdprobe002", {
+        row: REPORTED_ROW,
+        end: c.end,
+        queueFollowUp: false,
+      });
+      try {
+        expect(
+          await stack.workspaceService.sendMessage("holdprobe002", "direct", stack.sendOptions)
+        ).toEqual(Ok(undefined));
+        expect(await dispatchedWhileProbeBlocked(stack)).toBe(true);
+      } finally {
+        probe.resolve();
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
+  // The probe's answer decides whether a final response is the report (a plan-like task reports
+  // through propose_plan) and whether a propose_plan result starts the plan hand-off.
+  test.each([
+    {
+      name: "a final response on a running row",
+      row: undefined,
+      statusAtEnd: undefined,
+      end: {},
+    },
+    {
+      name: "a final response on an awaiting_report row",
+      row: { taskStatus: "awaiting_report" } as const,
+      statusAtEnd: undefined,
+      end: {},
+    },
+    {
+      name: "a final response on an interrupted row",
+      row: undefined,
+      statusAtEnd: "interrupted" as const,
+      end: {},
+    },
+    {
+      name: "a propose_plan result on a running row",
+      row: undefined,
+      statusAtEnd: undefined,
+      end: { finishReason: "tool-calls", proposePlan: true },
+    },
+    {
+      name: "a propose_plan result on a reported row",
+      row: REPORTED_ROW,
+      statusAtEnd: undefined,
+      end: { finishReason: "tool-calls", proposePlan: true },
+    },
+  ])(
+    "$name still waits for the plan-like probe",
+    async (c) => {
+      const { stack, probe } = await endStreamWithPlanProbeBlocked("holdprobe003", {
+        row: c.row,
+        statusAtEnd: c.statusAtEnd,
+        end: c.end,
+        queueFollowUp: true,
+      });
+      try {
+        // The probe has not answered: the follow-up stays held.
+        expect(await dispatchedWhileProbeBlocked(stack)).toBe(false);
+        expect(stack.workspaceService.hasQueuedMessages("holdprobe003")).toBe(true);
+      } finally {
+        probe.resolve();
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
+  // The handler resolves a reported task's decision `nonreport` whatever the probe says, and it
+  // does so before the cleanup of the reported task, so a direct send during that cleanup is
+  // admitted. A plan-like task's final response always resolved there.
+  test.each([{ agentId: "plan" }, { agentId: "explore" }])(
+    "a reported $agentId task accepts a direct send while its report cleanup waits",
+    async (c) => {
+      const childId = "holdplancleanup01";
+      const stack = await createStack(childId, {
+        ...REPORTED_ROW,
+        agentType: c.agentId,
+        agentId: c.agentId,
+      });
+      const { taskService, workspaceService, child, completions } = stack;
+      const options = { ...stack.sendOptions, agentId: c.agentId };
+      const cleanupEntered = Promise.withResolvers<void>();
+      const releaseCleanup = Promise.withResolvers<void>();
+      const internal = taskService as unknown as {
+        finalizeTerminationPhaseForReportedTask: (workspaceId: string) => Promise<void>;
+      };
+      const realCleanup = internal.finalizeTerminationPhaseForReportedTask.bind(taskService);
+      const cleanup = spyOn(internal, "finalizeTerminationPhaseForReportedTask").mockImplementation(
+        async (workspaceId) => {
+          cleanupEntered.resolve();
+          await releaseCleanup.promise;
+          await realCleanup(workspaceId);
+        }
+      );
+      try {
+        expect(await workspaceService.sendMessage(childId, "work", options)).toEqual(Ok(undefined));
+        await until(() => completions.length === 1, "the continuation stream");
+        stack.endStream(0, { agentId: c.agentId }, true);
+        await cleanupEntered.promise;
+        await until(() => !child.session.isBusy(), "session idle");
+        await yieldMacrotasks(3);
+        expect(await workspaceService.sendMessage(childId, "direct", options)).toEqual(
+          Ok(undefined)
+        );
+        await until(() => completions.length === 2, "the direct send dispatched");
+      } finally {
+        releaseCleanup.resolve();
+        cleanup.mockRestore();
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
+  test("a stream end that finds its attempt already reported by another writer refuses the held follow-up as indeterminate", async () => {
+    const { stack, onCanceled } = await endStreamWithRowEditedInGap("holdlatehandler01", (row) => {
+      row.taskStatus = "reported";
+      row.reportedAt = REPORTED_AT;
+    });
+    try {
+      // Never a new turn of the reported attempt.
+      expect(stack.completions).toHaveLength(1);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+      expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  // The report lands while the stream runs, before its end event: the row already reads reported
+  // when the decision is registered, yet the attempt began before that report.
+  test("a report of the attempt that landed before its stream's end event refuses the held follow-up as indeterminate", async () => {
+    const childId = "holdbeforeend001";
+    const stack = await createStack(childId);
+    const { config, taskService, workspaceService, completions, sendOptions } = stack;
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      const onCanceled = mock((_reason: string) => undefined);
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      await editChildRow(config, childId, (row) => {
+        row.taskStatus = "reported";
+        row.reportedAt = REPORTED_AT;
+      });
+      stack.endStream(0, {}, true);
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
+      await yieldMacrotasks(10);
+      expect(completions).toHaveLength(1);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  test("a report of another attempt landing in the gap is not this attempt's report: the held follow-up meets the stale-attempt gate", async () => {
+    const { stack, onCanceled } = await endStreamWithRowEditedInGap("holdlatehandler02", (row) => {
+      row.taskAttemptId = "att_00000000000000b7";
+      row.taskStatus = "reported";
+      row.reportedAt = REPORTED_AT;
+    });
+    try {
+      expect(stack.completions).toHaveLength(1);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(onCanceled.mock.calls).toEqual([[SEND_ADMISSION_STALE_MESSAGE]]);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  // Whether the row's report predates an attempt is decided by the CAS that publishes the attempt,
+  // never by a read after it: another backend can report the fresh attempt between the commit and
+  // the ownership that follows it, and a later read takes that report for the predecessor's. Each
+  // path that mints a fresh attempt on an unreported row gets the report in its own gap.
+  test.each(["reawakening", "reactivation"] as const)(
+    "a report of the fresh attempt that lands between the %s's CAS and its ownership refuses the held follow-up as indeterminate",
+    async (path) => {
+      const childId = path === "reawakening" ? "holdcasgap001" : "holdcasgap002";
+      const stack = await createStack(childId);
+      const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+      const seededAttemptId = entryOf(config, childId)!.taskAttemptId;
+      let landed = false;
+      const reportInGap = async () => {
+        if (landed || entryOf(config, childId)?.taskAttemptId === seededAttemptId) return;
+        landed = true;
+        await editChildRow(config, childId, (row) => {
+          row.taskStatus = "reported";
+          row.reportedAt = REPORTED_AT;
+        });
+      };
+      // Both paths commit their fresh attempt id through editWorkspaceEntry (the reawakening via
+      // editActiveWorkspaceEntry): the report lands right after that commit, before the ownership.
+      const edit = svc.editWorkspaceEntry.bind(taskService);
+      spyOn(svc, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+        const found = await edit(id, updater, options);
+        if (id === childId) await reportInGap();
+        return found;
+      });
+      try {
+        if (path === "reawakening") {
+          expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+          expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+            Ok(undefined)
+          );
+        } else {
+          expect(
+            await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
+          ).toMatchObject(Ok({ delivery: "reactivated" }));
+        }
+        expect(landed).toBe(true);
+        await until(() => completions.length === 1, "the continuation stream");
+        const onCanceled = mock((_reason: string) => undefined);
+        expect(
+          await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+        ).toEqual(Ok(undefined));
+        stack.endStream(0, {}, true);
+        await until(
+          () => completions.length > 1 || stack.heldTexts().length > 0,
+          "the follow-up dispatched or held"
+        );
+        await yieldMacrotasks(10);
+        // Never a new turn of the attempt that another backend reported.
+        expect(completions).toHaveLength(1);
+        expect(stack.heldTexts()).toEqual(["follow-up text"]);
+        expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+        expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
+  // A reactivated child keeps `taskStatus: reported` with a fresh attempt: its row reads reported
+  // from the first send on, so a reported row never means that its current attempt reported (the
+  // next test covers the interrupted row, the one shape that a report of the attempt replaces).
+  test("a follow-up queued during a reactivated child's stream still runs after it", async () => {
+    const childId = "holdreactivated01";
+    const stack = await createStack(childId, {
+      taskStatus: "reported",
+      reportedAt: REPORTED_AT,
+    });
+    const { workspaceService, completions, sendOptions } = stack;
+    try {
+      expect(await workspaceService.sendMessage(childId, "manual rescue", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      await until(() => completions.length === 1, "the continuation stream");
+      const onCanceled = mock((_reason: string) => undefined);
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      stack.endStream(0, {}, true);
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
+      expect(completions).toHaveLength(2);
+      expect(stack.heldTexts()).toEqual([]);
+      expect(onCanceled).not.toHaveBeenCalled();
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  // A reactivated child whose row reads `interrupted` and still carries a report inherits that
+  // report, and the row reads it from the first send on. Another backend's report of the fresh
+  // attempt turns the row `reported`: its status, not its report time, tells that report from the
+  // inherited one, so even a report time that equals the inherited one (the same millisecond, a
+  // clock that stands still) refuses the held follow-up. A `reported` row stays inherited:
+  // finalizeAgentTaskReport ends early on it, so no report of the fresh attempt is written onto it,
+  // and "a follow-up queued during a reactivated child's stream still runs after it" covers that row.
+  const REPORTED_AGAIN_AT = "2026-10-01T00:00:09.000Z";
+  test.each([
+    { name: "in the millisecond of the inherited one", reportedAt: REPORTED_AT },
+    { name: "later than the inherited one", reportedAt: REPORTED_AGAIN_AT },
+  ])(
+    "a report of the fresh attempt that another backend writes $name onto an interrupted row that carries a report refuses the held follow-up as indeterminate",
+    async (c) => {
+      const childId = "holdrereport001";
+      const stack = await createStack(childId, {
+        taskStatus: "interrupted",
+        reportedAt: REPORTED_AT,
+      });
+      const { config, taskService, workspaceService, completions, sendOptions } = stack;
+      try {
+        expect(
+          await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
+        ).toMatchObject(Ok({ delivery: "reactivated" }));
+        await until(() => completions.length === 1, "the continuation stream");
+        const onCanceled = mock((_reason: string) => undefined);
+        expect(
+          await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+        ).toEqual(Ok(undefined));
+        // The row kept the predecessor's report across the CAS and still reads it now.
+        expect(entryOf(config, childId)).toMatchObject({
+          taskStatus: "interrupted",
+          reportedAt: REPORTED_AT,
+        });
+        await editChildRow(config, childId, (row) => {
+          row.taskStatus = "reported";
+          row.reportedAt = c.reportedAt;
+        });
+        stack.endStream(0, {}, true);
+        await until(
+          () => completions.length > 1 || stack.heldTexts().length > 0,
+          "the follow-up dispatched or held"
+        );
+        await yieldMacrotasks(10);
+        // Never a new turn of the attempt that another backend reported.
+        expect(completions).toHaveLength(1);
+        expect(stack.heldTexts()).toEqual(["follow-up text"]);
+        expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+        expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
+  test("a follow-up queued during an interrupted reactivated child's stream still runs when its row keeps the report", async () => {
+    const childId = "holdinterrupted01";
+    const stack = await createStack(childId, {
+      taskStatus: "interrupted",
+      reportedAt: REPORTED_AT,
+    });
+    const { config, taskService, workspaceService, completions, sendOptions } = stack;
+    try {
+      expect(
+        await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
+      ).toMatchObject(Ok({ delivery: "reactivated" }));
+      await until(() => completions.length === 1, "the continuation stream");
+      expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(entryOf(config, childId)).toMatchObject({
+        taskStatus: "interrupted",
+        reportedAt: REPORTED_AT,
+      });
+      stack.endStream(0, {}, true);
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "dispatched or held"
+      );
+      // The inherited report says nothing about this attempt: its follow-up runs.
+      expect(completions).toHaveLength(2);
+      expect(stack.heldTexts()).toEqual([]);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 
   test("while the decision is pending no drain trigger dispatches the held entry and a direct send in preflight is refused; the hold never blocks the session", async () => {
     const childId = "holdtriggers001";
@@ -1367,6 +1929,38 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // The hold came from the decision alone: no ownership (settlement/receipt authority) granted.
       expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
       expect(entryOf(config, childId)?.taskAttemptId).toBe(redriven);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  test("an unowned re-drive whose attempt another backend reported during the stream refuses the held follow-up as indeterminate", async () => {
+    const childId = "holdredrive003";
+    const stack = await createStack(childId, { taskStatus: "running" });
+    const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+    try {
+      await taskService.recoverInterruptedTasks();
+      await until(() => completions.length === 1, "the re-drive's stream");
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
+      const onCanceled = mock((_reason: string) => undefined);
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      // Another backend reports the re-driven attempt while this stream runs: no start of the
+      // attempt is known here, so the row's report cannot be read as inherited.
+      await editChildRow(config, childId, (row) => {
+        row.taskStatus = "reported";
+        row.reportedAt = REPORTED_AT;
+      });
+      stack.endStream(0, {}, true);
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
+      await yieldMacrotasks(10);
+      expect(completions).toHaveLength(1);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
     } finally {
       await stack.cleanup();
     }

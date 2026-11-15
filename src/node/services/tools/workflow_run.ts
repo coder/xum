@@ -18,6 +18,7 @@ import {
   requireWorkspaceId,
 } from "./toolUtils";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import { toolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
 import {
   resolveWorkflowScript,
   type ResolvedWorkflowScript,
@@ -242,6 +243,7 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         projectTrusted: config.trusted === true,
         ...(skillCtx != null ? { skillStorageContext: skillCtx } : {}),
         runtimeFactory: toolRuntimeFactory(config),
+        sandboxGate: toolSandboxGate(config),
       });
       // Duplicate guard: a retried or replayed turn must not mint a second active run of the
       // same script. The admission gate serializes check + creation for one script identity.

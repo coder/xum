@@ -33,7 +33,7 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // +4 snapshots / +1 file: the Artifacts tab gallery (ArtifactsPanel.stories.tsx), consolidated
 // from 24 per-renderer variants to one phone and one laptop story in dark + light.
 // +6 snapshots / +1 file: Artifacts M4 chat cards (ArtifactToolCall.stories.tsx, phone + laptop
-// in dark + light) and the open version menu (ArtifactsPanel.stories.tsx, laptop dark + light).
+// in dark + light) and the open pin menu (ArtifactsPanel.stories.tsx, laptop dark + light).
 // +4 snapshots: Artifacts M5c Shelf group in the picker (ArtifactsPanel.stories.tsx, phone +
 // laptop in dark + light).
 // +4 snapshots / +1 file: Artifacts M5b messages sent from an artifact

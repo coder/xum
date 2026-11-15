@@ -46,6 +46,7 @@ import {
   projectPluginContainerPaths,
 } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
+import { lazyFileToolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
 
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
@@ -63,13 +64,21 @@ import {
   type ComponentConsent,
 } from "@/node/services/agentPlugins/componentConsent";
 import { ambiguousPluginAgentIds, pluginAgentIdOf } from "@/node/services/agentPlugins/agentFiles";
+import { expandPluginPlaceholders } from "@/node/services/agentPlugins/expansion";
+import {
+  describeWorkspaceRuntime,
+  isPluginPathUsableFrom,
+  toAgentBodyPath,
+} from "@/node/services/agentPlugins/pluginPathAvailability";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
 import {
   AgentDefinitionParseError,
   parseAgentDefinitionMarkdown,
+  type ParsedAgentDefinitionMarkdown,
 } from "./parseAgentDefinitionMarkdown";
+import { formatPluginAgentRefusal, PluginAgentRefusalError } from "./pluginAgentRefusal";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 
 export const MAX_INHERITANCE_DEPTH = 10;
@@ -206,6 +215,47 @@ interface AgentDefinitionScanCandidate {
    * and plugin reads of a host-local root that do not go through `runtime` (phase 5).
    */
   hostFs: PluginFs;
+}
+
+/**
+ * Whether a project agent file loads: a sandboxed command can replace one with a link to a file
+ * its sandbox hides, and the definition goes into the prompt, so it loads only where a command
+ * in `workspacePath` with the project's secrets (`sandboxEnv`) could read it (Codex review).
+ * Plugin folders are read-only to commands, and the global folder is in Xum's home.
+ */
+function projectAgentFileGate(
+  runtime: Runtime,
+  workspacePath: string,
+  sandboxEnv: NodeJS.ProcessEnv | undefined
+): (candidate: AgentDefinitionScanCandidate, filePath: string) => Promise<boolean> {
+  const gate = lazyFileToolSandboxGate(runtime, workspacePath, { env: sandboxEnv });
+  return async (candidate, filePath) => {
+    if (candidate.scope !== "project" || candidate.pluginRoot != null) return true;
+    try {
+      await gate(filePath, "read");
+      return true;
+    } catch (error) {
+      log.warn(`Skipping agent definition ${filePath}: ${getErrorMessage(error)}`);
+      return false;
+    }
+  };
+}
+
+/** Whether discovery reads `filePath`: a plugin agent inside its plugin, others past the gate. */
+async function discoveryReadsFile(
+  scan: AgentDefinitionScanCandidate,
+  filePath: string,
+  agentId: AgentId,
+  projectFileLoads: ReturnType<typeof projectAgentFileGate>
+): Promise<boolean> {
+  if (scan.pluginRoot == null) return projectFileLoads(scan, filePath);
+  const containment = await pluginAgentContainment({
+    pluginRoot: scan.pluginRoot,
+    filePath,
+    agentId,
+    pluginFs: candidateFs(scan),
+  });
+  return containment === "contained";
 }
 
 /** #6426: scan candidates for the plugin agents of a trusted remote checkout's snapshot. */
@@ -372,48 +422,74 @@ function withoutAmbiguousPluginAgents(
   return fileNames.filter((name) => !ambiguous.has(pluginAgentIdOf(name) ?? ""));
 }
 
+type PluginAgentFileLookup =
+  | { kind: "file"; path: string }
+  /** No file of this plugin claims the ID: the read goes on to the next candidate. */
+  | { kind: "absent" }
+  /** A file claims the ID but Xum refuses it: `ambiguous-file`, or a link out of the plugin. */
+  | { kind: "refused"; refusal: PluginAgentRefusalError };
+
 /**
  * The file the definition read of a plugin agent opens (#6629): the one file of its agents dir
  * that claims the ID, under its real name (`Helper.md` for ID `helper`), and contained in the
  * plugin. Discovery lists the same name, so both paths fingerprint the same bytes and file name.
- * Null when no single contained file claims the ID.
  */
-async function resolvePluginAgentFile(args: {
+export async function resolvePluginAgentFile(args: {
   pluginRoot: string;
+  pluginName: string;
   agentsDir: string;
   agentId: AgentId;
   /** A remote plugin's snapshot, else the host filesystem (the candidate's hostFs). */
   pluginFs: PluginFs;
-}): Promise<string | null> {
+}): Promise<PluginAgentFileLookup> {
   const names = await listAgentFiles(args.pluginFs, args.agentsDir);
   const ambiguous = warnAmbiguousPluginAgents(names);
-  const name = names.find((candidate) => pluginAgentIdOf(candidate) === args.agentId);
-  if (name === undefined || ambiguous.has(args.agentId)) return null;
-  const filePath = path.join(args.agentsDir, name);
-  return (await isPluginAgentContained({ ...args, filePath })) ? filePath : null;
+  const claimants = names.filter((candidate) => pluginAgentIdOf(candidate) === args.agentId);
+  if (claimants.length === 0) return { kind: "absent" };
+  if (ambiguous.has(args.agentId)) {
+    const detail = claimants.sort().join(", ");
+    return {
+      kind: "refused",
+      refusal: new PluginAgentRefusalError("ambiguous-file", args.agentId, args.pluginName, detail),
+    };
+  }
+  const filePath = path.join(args.agentsDir, claimants[0]);
+  const containment = await pluginAgentContainment({ ...args, filePath });
+  if (containment === "missing") return { kind: "absent" };
+  if (containment === "escapes") {
+    return {
+      kind: "refused",
+      refusal: new PluginAgentRefusalError(
+        "invalid-definition",
+        args.agentId,
+        args.pluginName,
+        "the agent file does not stay inside its plugin folder (a link leads out of it)"
+      ),
+    };
+  }
+  return { kind: "file", path: filePath };
 }
 
 /**
  * Agent Plugins: per-file realpath containment anchored at the canonical
  * plugin root, so a symlinked agents/<id>.md cannot escape the plugin.
  */
-async function isPluginAgentContained(args: {
+async function pluginAgentContainment(args: {
   pluginRoot: string;
   filePath: string;
   agentId: AgentId;
   /** A remote plugin's snapshot, else the host filesystem (the candidate's hostFs). */
   pluginFs: PluginFs;
-}): Promise<boolean> {
+}): Promise<"contained" | "missing" | "escapes"> {
   try {
     await args.pluginFs.ensureContained(args.pluginRoot, args.filePath);
-    return true;
+    return "contained";
   } catch (error) {
-    if (!hasErrorCode(error, "ENOENT")) {
-      log.warn(
-        `Plugin agent '${args.agentId}' at '${args.filePath}' escapes the plugin root: ${getErrorMessage(error)}`
-      );
-    }
-    return false;
+    if (hasErrorCode(error, "ENOENT")) return "missing";
+    log.warn(
+      `Plugin agent '${args.agentId}' at '${args.filePath}' escapes the plugin root: ${getErrorMessage(error)}`
+    );
+    return "escapes";
   }
 }
 
@@ -519,7 +595,8 @@ function parseSource(
 /**
  * Parse one agent file. A managed plugin agent must also match its review (#6629): discovery and
  * the definition read both parse through here, so an agent changed after its review neither lists
- * nor loads. It throws like an invalid definition, which both callers skip.
+ * nor loads. It throws like an invalid definition, which both callers skip. The definition read
+ * keeps the throw as the spawn error (`not-reviewed`) when no other scope has the ID.
  */
 function parseAgentFile(
   args: { content: string; byteSize: number; agentId: AgentId; filePath: string },
@@ -536,11 +613,76 @@ function parseAgentFile(
     frontmatter: parsed.frontmatter,
   };
   if (!isPluginAgentConsented(candidate.pluginConsent, consentInput)) {
-    throw new Error(
-      `Agent '${args.agentId}' of plugin '${candidate.pluginName ?? "?"}' has not been reviewed on this install. Open Settings → Plugins and select Review on the plugin.`
-    );
+    throw new PluginAgentRefusalError("not-reviewed", args.agentId, pluginNameOf(candidate), "");
   }
   return parsed;
+}
+
+function pluginNameOf(candidate: Pick<AgentDefinitionScanCandidate, "pluginName" | "pluginRoot">) {
+  // mutation-equivalent: a plugin candidate always has a non-empty name and root, so ?? and || agree
+  return candidate.pluginName ?? path.basename(candidate.pluginRoot ?? "?");
+}
+
+const PLUGIN_ROOT_PLACEHOLDER = "${CLAUDE_PLUGIN_ROOT}";
+
+/**
+ * A foreign plugin agent whose body names its plugin folder (`${CLAUDE_PLUGIN_ROOT}`) cannot do
+ * its job where the workspace cannot read that folder (RFC A2). Same rule as plugin skills'
+ * directory line. A Xum-format agent body is never rewritten, so it needs no folder; neither
+ * does an agent that never names it.
+ */
+function pluginFolderRefusal(args: {
+  parsed: Pick<ParsedAgentDefinitionMarkdown, "foreign" | "body">;
+  agentId: AgentId;
+  candidate: Pick<AgentDefinitionScanCandidate, "runtime" | "pluginName" | "pluginRoot">;
+  workspaceRuntime: Runtime;
+}): PluginAgentRefusalError | undefined {
+  if (!args.parsed.foreign || !args.parsed.body.includes(PLUGIN_ROOT_PLACEHOLDER)) {
+    return undefined;
+  }
+  if (isPluginPathUsableFrom(args.candidate.runtime, args.workspaceRuntime)) return undefined;
+  return new PluginAgentRefusalError(
+    "folder-unreachable",
+    args.agentId,
+    pluginNameOf(args.candidate),
+    describeWorkspaceRuntime(args.workspaceRuntime)
+  );
+}
+
+/**
+ * The body a plugin agent runs with: a foreign agent's `${CLAUDE_PLUGIN_ROOT}` becomes its plugin
+ * folder's path. This runs after the consent check on the text sent to the model, so it never
+ * changes the consent fingerprint (it covers the ID, file name and frontmatter, not the body).
+ * `${CLAUDE_SKILL_DIR}`, `${CLAUDE_PLUGIN_DATA}`, `${CURSOR_PLUGIN_ROOT}`, `${PLUGIN_ROOT}` and
+ * `${PLUGIN_DATA}` stay literal.
+ */
+function pluginAgentBody(args: {
+  parsed: ParsedAgentDefinitionMarkdown;
+  agentId: AgentId;
+  candidate: Pick<AgentDefinitionScanCandidate, "runtime" | "pluginName" | "pluginRoot">;
+  workspaceRuntime: Runtime;
+  refuseUnreachablePluginFolder: boolean;
+}): string {
+  const { parsed, candidate } = args;
+  if (!parsed.foreign) return parsed.body;
+  const refusal = pluginFolderRefusal(args);
+  if (refusal !== undefined) {
+    if (args.refuseUnreachablePluginFolder) throw refusal;
+    // A folder path that is not valid here would only mislead: keep the placeholder as written.
+    return parsed.body;
+  }
+  assert(candidate.pluginRoot != null, "a foreign agent file is read only from a plugin");
+  return expandPluginPlaceholders(parsed.body, {
+    CLAUDE_PLUGIN_ROOT: toAgentBodyPath(candidate.pluginRoot, candidate.runtime),
+  });
+}
+
+function unavailableFields(
+  refusal: PluginAgentRefusalError | undefined,
+  filePath: string
+): Pick<AgentDefinitionDescriptor, "unavailableReason" | "unavailablePath"> {
+  if (refusal === undefined) return {};
+  return { unavailableReason: formatPluginAgentRefusal(refusal), unavailablePath: filePath };
 }
 
 async function readAgentDescriptorFromFile(
@@ -552,7 +694,7 @@ async function readAgentDescriptorFromFile(
   /**
    * Plugin agents (host-local by construction): the consuming read must
    * revalidate containment + file identity through a bounded post-open
-   * handle. isPluginAgentContained ran BEFORE this call, and a managed
+   * handle. pluginAgentContainment ran BEFORE this call, and a managed
    * update promoted in between can replace agents/<id>.md (or an ancestor)
    * with an absolute symlink to an outside definition — staged validation
    * reads that as a capability removal, and the outside frontmatter would
@@ -561,7 +703,9 @@ async function readAgentDescriptorFromFile(
   pluginRoot: string | undefined,
   pluginConsent: ComponentConsent | undefined,
   /** The remote snapshot or the host filesystem of a plugin agent (see readPluginAgentFile). */
-  pluginFs: PluginFs
+  pluginFs: PluginFs,
+  /** The workspace's own runtime: `runtime` above is the one that read the file. */
+  workspaceRuntime: Runtime
 ): Promise<AgentDefinitionDescriptor | null> {
   let content: string;
   let byteSize: number;
@@ -615,6 +759,14 @@ async function readAgentDescriptorFromFile(
     );
 
     const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
+    // Listed, but not runnable here (RFC A2): the `task` list leaves it out, a direct spawn
+    // names the reason, and the composition inspector reports it.
+    const unavailable = pluginFolderRefusal({
+      parsed,
+      agentId,
+      candidate: { runtime, pluginName, pluginRoot },
+      workspaceRuntime,
+    });
 
     const descriptor: AgentDefinitionDescriptor = {
       id: agentId,
@@ -629,6 +781,7 @@ async function readAgentDescriptorFromFile(
       aiDefaults: parsed.frontmatter.ai,
       tools: parsed.frontmatter.tools,
       ...(pluginName !== undefined ? { pluginName } : {}),
+      ...unavailableFields(unavailable, filePath),
     };
 
     const validated = AgentDefinitionDescriptorSchema.safeParse(descriptor);
@@ -684,6 +837,8 @@ export async function discoverAgentDefinitions(
     projectPluginsTrusted?: boolean;
     /** Builds the host-local runtimes of the plugin and global scans. */
     runtimeFactory: RuntimeFactory;
+    /** See ReadAgentDefinitionOptions.sandboxEnv. */
+    sandboxEnv?: NodeJS.ProcessEnv;
   }
 ): Promise<AgentDefinitionDescriptor[]> {
   if (!workspacePath) {
@@ -698,6 +853,7 @@ export async function discoverAgentDefinitions(
 
   // Scan order encodes precedence: earlier roots win when ids collide.
   const scans = await buildScanCandidates(runtime, workspacePath, roots, options.runtimeFactory);
+  const projectFileLoads = projectAgentFileGate(runtime, workspacePath, options.sandboxEnv);
 
   for (const scan of scans) {
     let resolvedRoot: string;
@@ -727,15 +883,7 @@ export async function discoverAgentDefinitions(
 
       const filePath = scan.runtime.normalizePath(filename, resolvedRoot);
 
-      if (scan.pluginRoot != null) {
-        const contained = await isPluginAgentContained({
-          pluginRoot: scan.pluginRoot,
-          filePath,
-          agentId,
-          pluginFs: candidateFs(scan),
-        });
-        if (!contained) continue;
-      }
+      if (!(await discoveryReadsFile(scan, filePath, agentId, projectFileLoads))) continue;
 
       const descriptor = await readAgentDescriptorFromFile(
         scan.runtime,
@@ -745,12 +893,15 @@ export async function discoverAgentDefinitions(
         scan.pluginName,
         scan.pluginRoot,
         scan.pluginConsent,
-        candidateFs(scan)
+        candidateFs(scan),
+        runtime
       );
       if (!descriptor) continue;
 
       if (dedupeById) {
-        // First discovered descriptor wins because duplicates are skipped above.
+        // First discovered descriptor wins because duplicates are skipped above. An unavailable
+        // plugin agent keeps its place: it hides a lower scope's agent of that ID from the list,
+        // and a spawn of that ID is refused instead of starting the lower agent (A2, A4).
         byId.set(agentId, descriptor);
       } else {
         discovered.push(descriptor);
@@ -812,14 +963,19 @@ export async function discoverAgentDefinitions(
  */
 export class AgentDefinitionRequestCache {
   private readonly definitions = new Map<string, Promise<AgentDefinitionPackage>>();
-  /** Identity keys: distinct runtime, roots or runtime factory objects never share entries. */
+  /**
+   * Identity keys: distinct runtime, roots, runtime factory or sandbox env objects never share
+   * entries.
+   */
   private readonly objectIds = new WeakMap<
-    Runtime | AgentDefinitionsRoots | RuntimeFactory,
+    Runtime | AgentDefinitionsRoots | RuntimeFactory | NodeJS.ProcessEnv,
     number
   >();
   private nextObjectId = 1;
 
-  private objectId(value: Runtime | AgentDefinitionsRoots | RuntimeFactory): number {
+  private objectId(
+    value: Runtime | AgentDefinitionsRoots | RuntimeFactory | NodeJS.ProcessEnv
+  ): number {
     let id = this.objectIds.get(value);
     if (id == null) {
       id = this.nextObjectId++;
@@ -844,6 +1000,9 @@ export class AgentDefinitionRequestCache {
       // #6426: the default roots differ with trust (project plugin agents).
       options.projectPluginsTrusted === true,
       this.objectId(options.runtimeFactory),
+      options.refuseUnreachablePluginFolder === true,
+      // The sandbox gate skips a linked project file only with the project's secrets.
+      options.sandboxEnv != null ? this.objectId(options.sandboxEnv) : null,
     ]);
     let definition = this.definitions.get(key);
     if (definition == null) {
@@ -873,6 +1032,20 @@ export interface ReadAgentDefinitionOptions {
   projectPluginsTrusted?: boolean;
   /** Builds the host-local runtimes of the plugin and global scans. */
   runtimeFactory: RuntimeFactory;
+  /**
+   * Opt-in for a spawn by ID (the two `task` paths): a foreign plugin agent that names its plugin
+   * folder, which this workspace cannot read, ends the lookup with a `folder-unreachable`
+   * refusal. The agent keeps its ID, so no lower scope's agent starts in its place (A4). Other
+   * reads (the main chat, a base chain, settings) keep loading the agent with its placeholder
+   * as written, so an unreachable agent never breaks them. Applies to the agent read by ID, not
+   * to its bases.
+   */
+  refuseUnreachablePluginFolder?: boolean;
+  /**
+   * The project's secrets, for reads whose definition reaches the model. The agent sandbox hides
+   * the credential files they name, so a project agent file that links to one does not load.
+   */
+  sandboxEnv?: NodeJS.ProcessEnv;
 }
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
@@ -915,17 +1088,18 @@ function resolveAgentDefinitionsRoots(
 function pickInheritedReadOptions(
   options: Pick<
     ReadAgentDefinitionOptions,
-    "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory"
+    "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory" | "sandboxEnv"
   >
 ): Pick<
   ReadAgentDefinitionOptions,
-  "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory"
+  "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory" | "sandboxEnv"
 > {
   return {
     roots: options.roots,
     cache: options.cache,
     projectPluginsTrusted: options.projectPluginsTrusted,
     runtimeFactory: options.runtimeFactory,
+    sandboxEnv: options.sandboxEnv,
   };
 }
 
@@ -978,6 +1152,11 @@ async function loadAgentDefinition(
   );
 
   const abortSignal = options.abortSignal;
+  // A plugin candidate that fails to load (not-reviewed, ambiguous-file, invalid-definition) is
+  // skipped, as discovery skips it: a lower scope's agent of that ID starts. Its refusal is the
+  // spawn error only when no scope has the ID (A4).
+  const refusals: PluginAgentRefusalError[] = [];
+  const projectFileLoads = projectAgentFileGate(runtime, workspacePath, options.sandboxEnv);
   for (const candidate of candidates) {
     abortSignal?.throwIfAborted();
     if (skipScopes.has(candidate.scope)) {
@@ -994,76 +1173,26 @@ async function loadAgentDefinition(
       continue;
     }
 
-    let filePath = candidate.runtime.normalizePath(`${agentId}.md`, resolvedRoot);
-
-    if (candidate.pluginRoot != null) {
-      const pluginFile = await resolvePluginAgentFile({
-        pluginRoot: candidate.pluginRoot,
-        agentsDir: resolvedRoot,
-        agentId,
-        pluginFs: candidateFs(candidate),
-      });
-      if (pluginFile === null) continue;
-      filePath = pluginFile;
-    }
-
     try {
-      let content: string;
-      let byteSize: number;
-      if (candidate.pluginRoot != null) {
-        // Plugin agents: bounded post-open revalidation (containment + file
-        // identity) — see the pluginRoot doc on readAgentDescriptorFromFile.
-        // This frontmatter controls agent policy (runnable/base/tools), so a
-        // replacement symlink promoted after isPluginAgentContained must not
-        // have its outside target read here.
-        const result = await readPluginAgentFile(candidateFs(candidate), {
-          filePath,
-          pluginRoot: candidate.pluginRoot,
-          maxBytes: MAX_FILE_SIZE,
-          label: `plugin agent '${agentId}'`,
-        });
-        content = result.content;
-        byteSize = result.byteSize;
-      } else {
-        const stat = await candidate.runtime.stat(filePath, abortSignal);
-        if (stat.isDirectory) {
-          continue;
-        }
-
-        const sizeValidation = validateFileSize(stat);
-        if (sizeValidation) {
-          throw new Error(sizeValidation.error);
-        }
-
-        content = await readFileString(candidate.runtime, filePath, abortSignal);
-        byteSize = stat.size;
-      }
-      const parsed = parseAgentFile({ content, byteSize, agentId, filePath }, candidate);
-
-      const pkg: AgentDefinitionPackage = {
-        id: agentId,
-        scope: candidate.scope,
-        frontmatter: parsed.frontmatter,
-        body: parsed.body,
-        // Exact provenance for strict-send pinning; per-plugin candidate roots are
-        // unique per plugin, so root identity distinguishes file vs plugin sources.
-        source: candidate.root,
-      };
-
-      const validated = AgentDefinitionPackageSchema.safeParse(pkg);
-      if (!validated.success) {
-        throw new Error(
-          `Invalid agent definition package for '${agentId}' (${candidate.scope}): ${validated.error.message}`
-        );
-      }
-
-      return validated.data;
+      const pkg = await readCandidateDefinition({
+        candidate,
+        resolvedRoot,
+        agentId,
+        workspaceRuntime: runtime,
+        refuseUnreachablePluginFolder: options.refuseUnreachablePluginFolder === true,
+        abortSignal,
+        projectFileLoads,
+      });
+      if (pkg !== undefined) return pkg;
     } catch (error) {
       // An aborted or failed read (transport, permission) is not a missing
       // candidate: stop probing instead of falling through to a lower scope
       // (#4438, #4827). Parse and validation errors still skip the candidate.
       if (abortSignal?.aborted || isRuntimeReadFailure(error)) throw error;
-      continue;
+      const refusal = pluginAgentRefusalOf(error, candidate, agentId);
+      // The agent is listed here, so it must not hand its ID to a lower scope (A2, A4).
+      if (refusal?.reason === "folder-unreachable") throw refusal;
+      if (refusal !== undefined) refusals.push(refusal);
     }
   }
 
@@ -1080,7 +1209,115 @@ async function loadAgentDefinition(
     }
   }
 
+  if (refusals.length > 0) throw refusals[0];
   throw new Error(`Agent definition not found: ${agentId}`);
+}
+
+/**
+ * Undefined when the candidate has no such agent. Throws when it has one that cannot load.
+ */
+async function readCandidateDefinition(args: {
+  candidate: AgentDefinitionScanCandidate;
+  resolvedRoot: string;
+  agentId: AgentId;
+  workspaceRuntime: Runtime;
+  refuseUnreachablePluginFolder: boolean;
+  abortSignal: AbortSignal | undefined;
+  projectFileLoads: ReturnType<typeof projectAgentFileGate>;
+}): Promise<AgentDefinitionPackage | undefined> {
+  const { candidate, agentId, abortSignal } = args;
+  let filePath = candidate.runtime.normalizePath(`${agentId}.md`, args.resolvedRoot);
+
+  if (candidate.pluginRoot != null) {
+    const lookup = await resolvePluginAgentFile({
+      pluginRoot: candidate.pluginRoot,
+      pluginName: pluginNameOf(candidate),
+      agentsDir: args.resolvedRoot,
+      agentId,
+      pluginFs: candidateFs(candidate),
+    });
+    if (lookup.kind === "absent") return undefined;
+    if (lookup.kind === "refused") throw lookup.refusal;
+    filePath = lookup.path;
+  }
+
+  let content: string;
+  let byteSize: number;
+  if (candidate.pluginRoot != null) {
+    // Plugin agents: bounded post-open revalidation (containment + file
+    // identity) — see the pluginRoot doc on readAgentDescriptorFromFile.
+    // This frontmatter controls agent policy (runnable/base/tools), so a
+    // replacement symlink promoted after pluginAgentContainment must not
+    // have its outside target read here.
+    const result = await readPluginAgentFile(candidateFs(candidate), {
+      filePath,
+      pluginRoot: candidate.pluginRoot,
+      maxBytes: MAX_FILE_SIZE,
+      label: `plugin agent '${agentId}'`,
+    });
+    content = result.content;
+    byteSize = result.byteSize;
+  } else {
+    const stat = await candidate.runtime.stat(filePath, abortSignal);
+    if (stat.isDirectory) {
+      return undefined;
+    }
+
+    const sizeValidation = validateFileSize(stat);
+    if (sizeValidation) {
+      throw new Error(sizeValidation.error);
+    }
+    if (!(await args.projectFileLoads(candidate, filePath))) return undefined;
+
+    content = await readFileString(candidate.runtime, filePath, abortSignal);
+    byteSize = stat.size;
+  }
+  const parsed = parseAgentFile({ content, byteSize, agentId, filePath }, candidate);
+
+  const pkg: AgentDefinitionPackage = {
+    id: agentId,
+    scope: candidate.scope,
+    frontmatter: parsed.frontmatter,
+    body: pluginAgentBody({
+      parsed,
+      agentId,
+      candidate,
+      workspaceRuntime: args.workspaceRuntime,
+      refuseUnreachablePluginFolder: args.refuseUnreachablePluginFolder,
+    }),
+    // Exact provenance for strict-send pinning; per-plugin candidate roots are
+    // unique per plugin, so root identity distinguishes file vs plugin sources.
+    source: candidate.root,
+  };
+
+  const validated = AgentDefinitionPackageSchema.safeParse(pkg);
+  if (!validated.success) {
+    throw new Error(
+      `Invalid agent definition package for '${agentId}' (${candidate.scope}): ${validated.error.message}`
+    );
+  }
+
+  return validated.data;
+}
+
+/**
+ * Why a plugin candidate that failed to load is refused: a typed refusal as it is, any other
+ * failure of a plugin agent file (parse, mapping, read, containment) as `invalid-definition`.
+ * None for a non-plugin candidate, whose failures stay a skip.
+ */
+function pluginAgentRefusalOf(
+  error: unknown,
+  candidate: Pick<AgentDefinitionScanCandidate, "pluginName" | "pluginRoot">,
+  agentId: AgentId
+): PluginAgentRefusalError | undefined {
+  if (error instanceof PluginAgentRefusalError) return error;
+  if (candidate.pluginRoot == null) return undefined;
+  return new PluginAgentRefusalError(
+    "invalid-definition",
+    agentId,
+    pluginNameOf(candidate),
+    getErrorMessage(error)
+  );
 }
 
 /**
@@ -1105,6 +1342,8 @@ export async function resolveAgentBody(
     projectPluginsTrusted?: boolean;
     /** See ReadAgentDefinitionOptions.runtimeFactory. */
     runtimeFactory: RuntimeFactory;
+    /** See ReadAgentDefinitionOptions.sandboxEnv. */
+    sandboxEnv?: NodeJS.ProcessEnv;
   }
 ): Promise<string> {
   const visited = new Set<string>();
@@ -1259,7 +1498,9 @@ async function resolveAgentDefinitionWithAiChain(
   async function resolve(
     id: AgentId,
     depth: number,
-    skipScopesAbove?: AgentDefinitionScope
+    skipScopesAbove?: AgentDefinitionScope,
+    /** Set for the agent read by ID only: its bases keep loading an unreachable agent. */
+    refuseUnreachablePluginFolder?: boolean
   ): Promise<ResolvedAgentDefinitionWithAiChain> {
     if (depth > MAX_INHERITANCE_DEPTH) {
       throw new Error(
@@ -1270,6 +1511,7 @@ async function resolveAgentDefinitionWithAiChain(
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       ...baseReadOptions,
       skipScopesAbove,
+      refuseUnreachablePluginFolder,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -1313,7 +1555,7 @@ async function resolveAgentDefinitionWithAiChain(
     };
   }
 
-  return resolve(agentId, 0, options.skipScopesAbove);
+  return resolve(agentId, 0, options.skipScopesAbove, options.refuseUnreachablePluginFolder);
 }
 
 export async function resolveAgentFrontmatter(

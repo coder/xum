@@ -173,6 +173,31 @@ describe("WorkspaceService init cancellation", () => {
     expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toEqual([]);
   });
 
+  test("create() rejects SSH workspaces without isolation that name no project directory", async () => {
+    await using harness = await createWorkspaceServiceHarness();
+    const { config, service: workspaceService } = harness;
+    const projectPath = path.join(harness.rootDir, "proj");
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, { workspaces: [], trusted: true });
+      return cfg;
+    });
+    const generateStableId = spyOn(config, "generateStableId");
+
+    const result = await workspaceService.create(projectPath, "ws-branch", undefined, "title", {
+      type: "ssh",
+      host: "devbox",
+      srcBaseDir: "~/xum",
+      workspaceIsolation: "none",
+      projectDir: " ",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.success ? "" : result.error).toContain("project directory on the SSH host");
+    // Refused before any per-workspace state (id, runtime, SSH connection) exists.
+    expect(generateStableId).not.toHaveBeenCalled();
+    expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toEqual([]);
+  });
+
   test("create() rejects slash branches whose sanitized workspace name already exists", async () => {
     await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;

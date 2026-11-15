@@ -1,8 +1,13 @@
 import { tool } from "ai";
 import { z } from "zod";
-import type { ToolFactory } from "@/common/utils/tools/tools";
+import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { getErrorMessage } from "@/common/utils/errors";
+import {
+  assertFileToolSandboxAllows,
+  fileToolSandboxContext,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 import { log } from "@/node/services/log";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { RuntimeError, isRuntimeTransportError } from "@/node/runtime/Runtime";
@@ -12,6 +17,52 @@ import { setTodosForSessionDir, toolSessionFiles } from "./todo";
 // Schema for propose_plan - empty object (no input parameters)
 // Defined locally to avoid type inference issues with `as const` in TOOL_DEFINITIONS
 const proposePlanSchema = z.object({});
+
+/** The plan file's text, or the error that propose_plan returns. */
+async function readPlanFile(
+  config: ToolConfiguration,
+  planPath: string
+): Promise<{ content: string } | { error: string }> {
+  try {
+    // A sandboxed command can make the plan file a link, and the plan goes into the chat, so it
+    // is read only where the file tools could read it (Codex review).
+    await assertFileToolSandboxAllows(
+      config.runtime,
+      config.cwd,
+      config.runtime.normalizePath(planPath, config.cwd),
+      "read",
+      fileToolSandboxContext(config)
+    );
+  } catch (err) {
+    return { error: getErrorMessage(err) };
+  }
+
+  // Read plan file using workspace runtime (works for both local and SSH).
+  // requireRegularFile: a FIFO at the plan path would otherwise block this
+  // read (and a libuv worker) indefinitely; it lands in the RuntimeError
+  // branch below like any other unreadable plan.
+  try {
+    return {
+      content: await readFileString(config.runtime, planPath, undefined, {
+        requireRegularFile: true,
+      }),
+    };
+  } catch (err) {
+    // An unreachable runtime is not a missing plan (#4826): "write your plan"
+    // would invite the agent to overwrite a plan it simply could not reach.
+    if (isRuntimeTransportError(err)) {
+      return {
+        error: `Could not read the plan file at ${planPath} because the workspace runtime is unreachable: ${err.message}`,
+      };
+    }
+    if (err instanceof RuntimeError) {
+      return {
+        error: `No plan file found at ${planPath}. Please write your plan to this file before calling propose_plan.`,
+      };
+    }
+    throw err;
+  }
+}
 
 /**
  * Propose plan tool factory for AI assistant.
@@ -37,32 +88,9 @@ export const createProposePlanTool: ToolFactory = (config) => {
         };
       }
 
-      // Read plan file using workspace runtime (works for both local and SSH).
-      // requireRegularFile: a FIFO at the plan path would otherwise block this
-      // read (and a libuv worker) indefinitely; it lands in the RuntimeError
-      // branch below like any other unreadable plan.
-      let planContent: string;
-      try {
-        planContent = await readFileString(config.runtime, planPath, undefined, {
-          requireRegularFile: true,
-        });
-      } catch (err) {
-        // An unreachable runtime is not a missing plan (#4826): "write your plan"
-        // would invite the agent to overwrite a plan it simply could not reach.
-        if (isRuntimeTransportError(err)) {
-          return {
-            success: false as const,
-            error: `Could not read the plan file at ${planPath} because the workspace runtime is unreachable: ${err.message}`,
-          };
-        }
-        if (err instanceof RuntimeError) {
-          return {
-            success: false as const,
-            error: `No plan file found at ${planPath}. Please write your plan to this file before calling propose_plan.`,
-          };
-        }
-        throw err;
-      }
+      const read = await readPlanFile(config, planPath);
+      if ("error" in read) return { success: false as const, error: read.error };
+      const planContent = read.content;
 
       if (planContent === "") {
         return {

@@ -1080,7 +1080,12 @@ describe("Anthropic Fast mode pricing", () => {
   };
 
   test("prices the speed Anthropic reported at 2x across every token class", () => {
-    for (const model of ["anthropic:claude-opus-5-5", "anthropic:claude-opus-4-8"]) {
+    for (const model of [
+      "anthropic:claude-fable-5-2",
+      "anthropic:claude-mythos-5-2",
+      "anthropic:claude-opus-5-5",
+      "anthropic:claude-opus-4-8",
+    ]) {
       const standard = display(model, "standard");
       const fast = display(model, "fast");
       expect(total(standard)).toBe(total(display(model)));

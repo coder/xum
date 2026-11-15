@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
 # Wait for a PR to become merge-ready by enforcing the Codex + optional coder-agents-review + non-visual-review CI loop.
 # Usage: ./scripts/wait_pr_ready.sh <pr_number>
@@ -15,6 +18,11 @@ set -euo pipefail
 # It exits immediately on the first terminal failure and succeeds only when
 # all required and active optional gates report success. Pixel review
 # statuses are intentionally ignored by wait_pr_checks.sh.
+#
+# It prints no text from GitHub of its own and forwards each gate's output as it is. The gates
+# print counts and point to the explicit reads (check_codex_comments.sh <pr>,
+# check_coder_agents_review_comments.sh <pr>, gh pr view <pr> --json statusCheckRollup). Steps 5
+# and 6 run those two comment checks with --counts-only for the same reason.
 
 if [ $# -ne 1 ]; then
   echo "Usage: $0 <pr_number>" >&2
@@ -109,8 +117,8 @@ load_repo_context() {
   MUX_GH_REPO=$(echo "$repo_info" | jq -r '.name // empty')
 
   if [[ -z "$MUX_GH_OWNER" || -z "$MUX_GH_REPO" ]]; then
+    # No echo of the reply: it is text from GitHub.
     echo "❌ assertion failed: unable to parse repository owner/name from gh output" >&2
-    echo "$repo_info" >&2
     return 1
   fi
 }
@@ -239,7 +247,7 @@ while true; do
       *)
         echo ""
         echo ""
-        echo "❌ assertion failed: unable to classify PR state '$PR_STATE' for PR #$PR_NUMBER" >&2
+        echo "❌ assertion failed: unable to classify the state of PR #$PR_NUMBER" >&2
         exit 1
         ;;
     esac
@@ -292,7 +300,7 @@ while true; do
     fi
 
     if [ "$CODER_AGENTS_RC" -eq "$RC_PASSED" ]; then
-      if ! CODER_AGENTS_COMMENTS_OUT=$("$CHECK_CODER_AGENTS_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
+      if ! CODER_AGENTS_COMMENTS_OUT=$("$CHECK_CODER_AGENTS_COMMENTS_SCRIPT" "$PR_NUMBER" --counts-only 2>&1); then
         echo ""
         echo ""
         echo "❌ PR #$PR_NUMBER is not ready."
@@ -314,7 +322,7 @@ while true; do
       CODER_AGENTS_READY_SUMMARY="optional coder-agents-review gate skipped"
     fi
 
-    if CODEX_COMMENTS_OUT=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
+    if CODEX_COMMENTS_OUT=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" --counts-only 2>&1); then
       echo ""
       echo ""
       echo "🎉 PR #$PR_NUMBER is ready: Codex gate passed, ${CODER_AGENTS_READY_SUMMARY}, non-visual-review checks passed, and no unresolved Codex comments remain."

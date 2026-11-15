@@ -23,6 +23,8 @@ export function createRefinementRollbackTool(ctx: {
   sessionDir: string;
   /** The rollback and target locks (phase 4: SessionLocks). Absent: the Node layer. */
   locks?: SessionLocks;
+  /** Read at call time, like the memory tool: the agent sandbox covers this workspace. */
+  blocksGlobalWrites?: () => boolean;
 }): Tool {
   return tool({
     description: TOOL_DEFINITIONS.refinement_rollback.description,
@@ -34,6 +36,7 @@ export function createRefinementRollbackTool(ctx: {
       const result = await rollbackRefinement({
         sessionDir: ctx.sessionDir,
         locks: ctx.locks,
+        refuseGlobalWrites: ctx.blocksGlobalWrites?.() === true,
         id,
         reason,
         evidence: { toolName: "refinement_rollback", toolCallId, actor: "agent" },

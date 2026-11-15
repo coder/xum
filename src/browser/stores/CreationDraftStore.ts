@@ -315,6 +315,32 @@ function storedAfterSave(
   return { ...record, ...content };
 }
 
+/**
+ * Whether a summary change moves its sidebar row: it appears, changes project or section, or
+ * reorders. Its text (preview, name) reaches the row via useCreationDraftSummary instead: a new
+ * list re-renders every WorkspaceContext consumer and the whole sidebar, and a save lands after
+ * each pause in typing, so typing in a new chat stalled in proportion to the workspace count.
+ */
+function movesListedRow(
+  previous: CreationDraftSummary | undefined,
+  next: CreationDraftSummary
+): boolean {
+  return (
+    previous === undefined ||
+    previous.projectPath !== next.projectPath ||
+    previous.subProjectPath !== next.subProjectPath ||
+    previous.createdAt !== next.createdAt
+  );
+}
+
+function sameSummary(previous: CreationDraftSummary, next: CreationDraftSummary): boolean {
+  return (
+    !movesListedRow(previous, next) &&
+    previous.manualName === next.manualName &&
+    previous.preview === next.preview
+  );
+}
+
 /** A refused save wrote nothing; other failures may have (most often the reply was lost). */
 function noteMaybeSaved(
   entry: Entry,
@@ -386,7 +412,11 @@ export class CreationDraftStore {
     return () => this.listListeners.delete(listener);
   };
 
+  /** Which rows show where. A row's text can be newer than its listed one (getSummary). */
   getDraftsByProject = (): Record<string, CreationDraftSummary[]> => this.byProject;
+
+  /** A listed draft's latest row: its text follows saves without a new list (updateSummary). */
+  getSummary = (id: string): CreationDraftSummary | undefined => this.summaries.get(id);
 
   getListState = (): CreationDraftListState => this.listState;
 
@@ -454,6 +484,18 @@ export class CreationDraftStore {
       this.listState = { status: "ready" };
       this.recomputeList();
     });
+  }
+
+  /**
+   * A saved draft's row. Only a row that moves rebuilds the list (movesListedRow); a text change
+   * keeps the list (its rows keep their listed text) and reaches the row through `subscribe(id)`:
+   * save() notifies the draft's listeners when it lands.
+   */
+  private updateSummary(id: string, summary: CreationDraftSummary): void {
+    const previous = this.summaries.get(id);
+    if (previous && sameSummary(previous, summary)) return;
+    this.summaries.set(id, summary);
+    if (movesListedRow(previous, summary)) this.recomputeList();
   }
 
   private recomputeList(): void {
@@ -659,10 +701,8 @@ export class CreationDraftStore {
       entry.stored = record ? storedAfterSave(record, patch, entry.stored, draft) : draft;
       entry.saveError = null;
       if (this.entries.get(id) !== entry) return;
-      if (!this.deletedIds.has(id)) {
-        this.summaries.set(id, summarizeCreationDraft(entry.draft ?? draft));
-        this.recomputeList();
-      }
+      if (!this.deletedIds.has(id))
+        this.updateSummary(id, summarizeCreationDraft(entry.draft ?? draft));
     } catch (error) {
       entry.saving = false;
       // Before the check below: a delete that removed the entry waits for this save.
@@ -830,6 +870,15 @@ export function useCreationDraftField<K extends "projectPath" | "subProjectPath"
   return useSyncExternalStore(
     (listener) => s.subscribe(id, listener),
     () => s.getView(id).draft?.[key]
+  );
+}
+
+/** A listed draft's latest row; re-renders only when that row changes, not per keystroke. */
+export function useCreationDraftSummary(id: string): CreationDraftSummary | undefined {
+  const s = getCreationDraftStore();
+  return useSyncExternalStore(
+    (listener) => s.subscribe(id, listener),
+    () => s.getSummary(id)
   );
 }
 

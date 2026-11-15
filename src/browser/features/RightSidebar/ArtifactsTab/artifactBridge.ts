@@ -16,11 +16,15 @@ import {
   ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS,
   ARTIFACT_THEME_VARIABLES_MAX_COUNT,
 } from "./appStyleVariables";
+import { frameDocumentScript } from "./frameDocumentChannel";
 
 /**
  * postMessage bridge between the app and a sandboxed HTML/SVG artifact frame
  * (experiment: "artifacts"). Security-owned contract:
  *
+ * - Transport: the bridge script's first statements open the document's channel
+ *   (frameDocumentChannel.ts). Its one window message is the open announcement, which hands the
+ *   host the document's own MessagePort; every message below, both ways, goes over that port.
  * - Every message is an object `{ xumArtifact: 1, type, ... }`, validated with zod.
  * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F" | "C", shiftKey }`, so Escape and
  *   Shift+F can exit fullscreen while focus is inside the frame (the host never lets a frame
@@ -42,8 +46,7 @@ import {
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) sends at once only
  *   during a live user click or key in this frame, one message per click; any other send fills
  *   the host-owned confirm strip (SandboxedArtifactFrame.tsx); `{ type: "setState", state }`
- *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
- *   are capped.
+ *   (window.xum.setState) is persisted per artifact. Text and JSON sizes are capped.
  * - Frame -> host (M5b annotate): `{ type: "annotate", x, y, selector?, quote?, prefix?,
  *   suffix? }`, posted by the shim only while the host has annotate mode on; x/y are fractions of
  *   the frame size. The host also ignores it unless annotate mode is on.
@@ -70,11 +73,10 @@ import {
  *   `{ type: "annotate", enabled }` switches the shim's click-to-pin capture on or off (clicks
  *   are swallowed while it is on).
  * - The persisted `window.xum.state` is never posted: it is baked into the shim when the srcdoc
- *   is built (buildArtifactBridgeScript). Host posts must target "*" (opaque origin), and a frame
- *   that navigated itself keeps the same contentWindow, so a posted state could reach a remote
- *   page before the host notices the navigation.
- * - The host accepts a message only when `event.source` is the frame's contentWindow, the
- *   frame is under its rate limit, and the payload is schema-valid.
+ *   is built (buildArtifactBridgeScript), so the artifact has it before its first script runs.
+ * - The host accepts a message only over the port of the document it built (a page the frame
+ *   navigated to cannot reach it, even though it keeps the frame's window), under that
+ *   document's rate limit, and only when the payload is schema-valid.
  * - Never send auth tokens, paths or environment data into the frame.
  *
  * Both unions are discriminated on `type` so M5 can add `send` / `setState` variants without
@@ -82,9 +84,6 @@ import {
  */
 
 export const ARTIFACT_BRIDGE_VERSION = 1;
-
-/** Messages above this rate (per frame, per second) are dropped unparsed. */
-export const ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND = 20;
 
 const bridgeEnvelope = { xumArtifact: z.literal(ARTIFACT_BRIDGE_VERSION) };
 
@@ -319,61 +318,12 @@ export function artifactBackdropColor(color: string | null): string | null {
   return window.CSS.supports("color", color) ? color : null;
 }
 
-/**
- * Fixed-window limiter: allows `maxPerWindow` calls per `windowMs`. Every message from the
- * frame counts, valid or not, so a flood of junk cannot keep the parser busy.
- */
-export function createBridgeRateLimiter(
-  maxPerWindow = ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
-  windowMs = 1000,
-  now: () => number = Date.now
-): () => boolean {
-  let windowStart = now();
-  let count = 0;
-  return () => {
-    const current = now();
-    if (current - windowStart >= windowMs) {
-      windowStart = current;
-      count = 0;
-    }
-    count += 1;
-    return count <= maxPerWindow;
-  };
-}
-
-/**
- * The frame gate shared by the artifact bridge and the MCP Apps host: the event must come
- * from `frameWindow` (never another frame or the app itself) and be under the rate limit.
- */
-export function passesFrameGate(
-  event: Pick<MessageEvent, "source">,
-  frameWindow: Window | null | undefined,
-  allowMessage: () => boolean
-): boolean {
-  return frameWindow != null && event.source === frameWindow && allowMessage();
-}
-
-/**
- * Host-side acceptance check for one `message` event. Returns the parsed message, or null
- * when the event is not from `frameWindow`, is over the rate limit, or is not schema-valid.
- */
-export function acceptArtifactFrameMessage(
-  event: Pick<MessageEvent, "source" | "data">,
-  frameWindow: Window | null | undefined,
-  allowMessage: () => boolean
-): ArtifactFrameToHostMessage | null {
-  if (!passesFrameGate(event, frameWindow, allowMessage)) return null;
-  const parsed = ArtifactFrameToHostMessageSchema.safeParse(event.data);
-  return parsed.success ? parsed.data : null;
-}
-
-export function postArtifactTheme(
-  frameWindow: Window | null | undefined,
+/** The theme message the host sends at load and on theme change. */
+export function artifactThemeMessage(
   theme: ArtifactTheme,
   appearance?: ArtifactAppearance
-) {
-  if (frameWindow == null) return;
-  const message: ArtifactHostToFrameMessage = {
+): ArtifactHostToFrameMessage {
+  return {
     xumArtifact: ARTIFACT_BRIDGE_VERSION,
     type: "theme",
     theme,
@@ -381,20 +331,11 @@ export function postArtifactTheme(
       ? { themeName: appearance.themeName, variables: appearance.variables }
       : {}),
   };
-  // The sandboxed frame has an opaque origin ("null"), which cannot be named as a target
-  // origin, so "*" is required. The payload carries nothing sensitive by contract.
-  frameWindow.postMessage(message, "*");
 }
 
-/** Turn the shim's click-to-pin capture on or off (annotate mode). */
-export function postArtifactAnnotateMode(frameWindow: Window | null | undefined, enabled: boolean) {
-  if (frameWindow == null) return;
-  const message: ArtifactHostToFrameMessage = {
-    xumArtifact: ARTIFACT_BRIDGE_VERSION,
-    type: "annotate",
-    enabled,
-  };
-  frameWindow.postMessage(message, "*");
+/** Turns the shim's click-to-pin capture on or off (annotate mode). */
+export function artifactAnnotateModeMessage(enabled: boolean): ArtifactHostToFrameMessage {
+  return { xumArtifact: ARTIFACT_BRIDGE_VERSION, type: "annotate", enabled };
 }
 
 /**
@@ -419,7 +360,10 @@ export function postArtifactAnnotateMode(frameWindow: Window | null | undefined,
  * cannot block WebRTC: `connect-src 'none'` does not govern ICE, and Chromium ignores
  * `webrtc 'block'`, so without this an artifact could send data out through STUN/TURN to any
  * host. Running first means no artifact script can keep a reference, and `frame-src 'none'`
- * keeps it from reaching a fresh window's constructors through a child frame.
+ * keeps it from reaching a fresh window's constructors through a child frame. It then opens the
+ * document's channel (frameDocumentScript, with this document's `nonce`), still ahead of every
+ * artifact script, so only this document holds the port to the host. `host` sends over that
+ * port, and host messages arrive only from it (hostMessage), never as window messages.
  */
 /**
  * Shim-side spacing of `setState` posts. The host rate-limits every frame message (a hostile
@@ -431,13 +375,15 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
 
 /**
  * Frame script (a statement, run inside the bridge's IIFE and the MCP App preamble) that makes
- * in-page links (`<a href="#section">`) jump within the artifact instead of navigating away.
+ * in-page links (`<a href="#section">`) jump within the artifact instead of navigating away, and
+ * keeps hash routers working: the fragment follows the link, and `replaceState` takes a `#` URL.
  *
  * Why: a srcdoc frame resolves relative URLs against the parent page, so `#section` becomes
  * `<app URL>#section`: a cross-document navigation to the Xum app, not a fragment jump. The
  * navigation guard (frameNavigationGuard.tsx) then closes the artifact as "navigated away",
  * and the desktop app refuses the navigation (subframeNavigation.ts). CSP `base-uri 'none'`
- * rules out a `<base>` fix.
+ * rules out a `<base>` fix. The same base URL makes `replaceState(null, "", "#/route")` throw a
+ * SecurityError: it resolves to the app's URL, which cannot replace `about:srcdoc`.
  *
  * So a plain left click on a link for this document (`href`, or SVG `xlink:href`, no `download`,
  * no `target` other than `_self`) whose raw value starts with `#` is cancelled, and the script does the browser's fragment steps itself: the target is an id or
@@ -445,10 +391,23 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * decoding, else the top for `#` and `#top`. Closed `<details>` and `hidden="until-found"`
  * ancestors are revealed (#6219). The target is scrolled into view and focused, or, when it
  * cannot take focus, given `tabindex="-1"` until it loses focus, so the next Tab continues
- * after it. A native fragment navigation
+ * after it. When the fragment changed, it is set on the document's own URL (`about:srcdoc#/route`)
+ * with the original `History.prototype.replaceState` before the jump, and `popstate` then
+ * `hashchange` fire in a task after the click's other listeners, as the browser queues them, so
+ * a hash router sees the route. A click on the current fragment
+ * fires neither, though Chromium still fires `popstate` for it. A native fragment navigation
  * (`location.replace("about:srcdoc#x")`, `location.hash`, `<base href="about:srcdoc">`) would
- * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
- * guard must treat as leaving the document.
+ * do this for free, but WebKit fires the iframe's `load` event for it, and each such load costs
+ * a host check of the document (frameNavigationGuard.tsx). `replaceState` fires no load in
+ * WebKit or Chromium. It is not `pushState`: a pushed entry makes Back (history.back, or the
+ * browser's Back in Xum on the web) fire the frame's `load` event too, in WebKit always and in
+ * Chromium when Back returns to the srcdoc's first entry.
+ *
+ * `pushState` and `replaceState` are wrapped so that a string URL whose trimmed value starts
+ * with `#` resolves against the document's URL, not the app's. Other calls pass through. A
+ * `pushState` of the artifact's own still makes Back fire the frame's `load`, as its
+ * `location.hash` and absolute-URL entries already do: the navigation guard checks the document
+ * at each such load, and this script leaves the guard as it is.
  *
  * It decides when the click reaches window in the bubble phase, after the artifact's element
  * and document handlers, so one of those that calls preventDefault keeps the click. Window
@@ -457,9 +416,11 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * capture phase first. Known limit (#6219), where the click still leaves the document as
  * before: a handler that stops the click's propagation hides it from window.
  *
- * SECURITY AUDIT: it only cancels a navigation and scrolls, focuses or reveals (opens a
- * `<details>`, removes `hidden`) inside the document; it never navigates, so both navigation
- * guards stay as they are.
+ * SECURITY AUDIT: it only cancels a navigation, scrolls, focuses or reveals (opens a
+ * `<details>`, removes `hidden`) inside the document, replaces the document's own URL fragment
+ * (replaceState rejects any other URL) and fires `popstate` and `hashchange` at the window; it
+ * never navigates, so both navigation guards stay as they are. The wrapper only prepends the
+ * document's own URL to a `#` URL, which the absolute `about:srcdoc#...` URL already allowed.
  */
 export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
     var XLINK = "http://www.w3.org/1999/xlink";
@@ -567,12 +528,53 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
         }, { once: true });
       }
     }
+    function withoutFragment(url) {
+      var hash = url.indexOf("#");
+      return hash === -1 ? url : url.slice(0, hash);
+    }
+    var historyProto = window.History && window.History.prototype;
+    var nativeReplaceState = historyProto && historyProto.replaceState;
+    // A "#" URL names this document, but a srcdoc frame resolves it against the app's URL.
+    function inDocument(native) {
+      return function () {
+        var args = Array.prototype.slice.call(arguments);
+        var url = args[2];
+        if (typeof url === "string" && url.trim().charAt(0) === "#") {
+          args[2] = withoutFragment(window.location.href) + url.trim();
+        }
+        return native.apply(this, args);
+      };
+    }
+    if (historyProto) {
+      historyProto.pushState = inDocument(historyProto.pushState);
+      historyProto.replaceState = inDocument(nativeReplaceState);
+    }
+    // The original replaceState: the artifact can patch History.prototype.replaceState. It can throw:
+    // WebKit allows 100 calls in 30 s per frame, so then the link jumps and fires no event.
+    function replaceFragment(fragment) {
+      if (window.location.hash.slice(1) === fragment) return false;
+      try {
+        nativeReplaceState.call(window.history, null, "", withoutFragment(window.location.href) + "#" + fragment);
+      } catch (error) {
+        return false;
+      }
+      return true;
+    }
     window.addEventListener("click", function (event) {
       if (event.defaultPrevented) return;
       var fragment = fragmentOf(event);
       if (fragment === null) return;
       event.preventDefault();
+      var oldURL = window.location.href;
+      var changed = replaceFragment(fragment);
       jump(fragment);
+      if (!changed) return;
+      var newURL = window.location.href;
+      // A task after the click's other listeners, as the browser queues them.
+      window.setTimeout(function () {
+        window.dispatchEvent(new window.PopStateEvent("popstate", { state: null }));
+        window.dispatchEvent(new window.HashChangeEvent("hashchange", { oldURL: oldURL, newURL: newURL }));
+      }, 0);
     });
   })();`;
 
@@ -748,6 +750,8 @@ function sidebarKeyListener(forwardsViewSwitch: boolean): string {
 }
 
 export function buildArtifactBridgeScript(
+  /** This document's nonce: the host binds only the open announcement that carries it. */
+  nonce: string,
   initialTheme: ArtifactTheme,
   initialState: unknown = null,
   initialAppearance: ArtifactAppearance | null = null,
@@ -763,7 +767,9 @@ export function buildArtifactBridgeScript(
       try { delete window[name]; } catch (error) {}
     }
   });
-  var host = window.parent;
+  ${frameDocumentScript(nonce, "hostMessage")}
+  var send = frameDocument.send;
+  var host = { postMessage: function (message) { send(message); } };
   var theme = ${JSON.stringify(initialTheme)};
   var followColorScheme = ${JSON.stringify(followColorScheme)};
   var themeNames = ${JSON.stringify(ArtifactThemeNameSchema.options)};
@@ -882,9 +888,8 @@ export function buildArtifactBridgeScript(
   // that restyles its background later on its own keeps the old backdrop until the next theme
   // message. A task after load, so the artifact's own load handlers have styled the page.
   window.addEventListener("load", function () { setTimeout(settleBackdrop, 0); }, { once: true });
-  window.addEventListener("message", function (event) {
-    if (event.source !== host) return;
-    var data = event.data;
+  // A host message from the document's port (frameDocumentScript); checks never get here.
+  function hostMessage(data) {
     if (!data || typeof data !== "object" || data.xumArtifact !== ${ARTIFACT_BRIDGE_VERSION}) return;
     if (data.type === "theme" && (data.theme === "dark" || data.theme === "light")) {
       theme = data.theme;
@@ -895,7 +900,7 @@ export function buildArtifactBridgeScript(
     } else if (data.type === "annotate") {
       annotating = data.enabled === true;
     }
-  });
+  }
   // Annotate mode: clicks become pins (the artifact never sees them), with the selection if any.
   function clampFraction(value) { return value > 0 ? (value < 1 ? value : 1) : 0; }
   function selectorFor(element) {

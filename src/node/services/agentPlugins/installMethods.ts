@@ -8,9 +8,9 @@
  *   review, so the consent preview, receipts and updates treat it like any plugin.
  * - `claude-marketplace`: one entry of a Claude Code marketplace whose folder has no manifest.
  *   Xum writes a plugin.json from the entry (the Claude rule: the entry is the manifest).
- * - `cursor-marketplace`: one entry of a Cursor marketplace, for a preview only. The entry
- *   installs through its folder's own manifest; Xum writes none for it and refuses an entry
- *   whose folder has none.
+ * - `cursor-marketplace`, `agents-marketplace`: one entry of a Cursor or an Agent Plugins
+ *   marketplace, for a preview only. The entry installs through its folder's own manifest; Xum
+ *   writes none for it and refuses an entry whose folder has none.
  *
  * Xum never overwrites or shadows a root or Codex manifest: `skills` fits only without them. A
  * Claude or Cursor manifest does not block `skills`: the generated root plugin.json wins by
@@ -45,6 +45,7 @@ import {
 } from "./discovery";
 import { normalizeClaudeManifest } from "./claudeManifest";
 import {
+  MARKETPLACE_FILE_RULES,
   MARKETPLACE_RELATIVE_PATHS,
   entryAsManifest,
   entryDeclaresComponents,
@@ -284,6 +285,23 @@ async function entryExists(dir: string, relative: string): Promise<boolean> {
   return (await fsPromises.lstat(path.join(dir, relative)).catch(() => null)) !== null;
 }
 
+/**
+ * True when a folder has a plugin manifest of its own: the entries that make
+ * detectInstallMethods return an own-manifest method (agent-plugin, claude-plugin or
+ * cursor-plugin).
+ */
+export async function hasPluginManifest(dir: string): Promise<boolean> {
+  for (const relative of [
+    PLUGIN_MANIFEST_RELATIVE_PATH,
+    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH,
+  ]) {
+    if (await entryExists(dir, relative)) return true;
+  }
+  return false;
+}
+
 export interface DetectedInstallMethods {
   /** Every method that fits, in order: agent-plugin, claude-plugin or cursor-plugin, skills. */
   methods: AgentPluginInstallMethod[];
@@ -354,6 +372,7 @@ function sameInstallMethod(a: AgentPluginInstallMethod, b: AgentPluginInstallMet
       return b.kind === a.kind;
     case "claude-marketplace":
     case "cursor-marketplace":
+    case "agents-marketplace":
       return b.kind === a.kind && b.entry === a.entry;
   }
 }
@@ -516,8 +535,8 @@ export function isOwnManifestMethod(method: AgentPluginInstallMethod): boolean {
  * as the manifest, for a relative source only (an update must find the entry again in the same
  * repository); else Skills for a remote repository of SKILL.md files. A manifest plus entry
  * components is the Claude conflict for `strict: false`; with `strict` Xum uses only the
- * manifest and warns (Claude would merge them). A Cursor entry installs only through its own
- * manifest (Cursor plugin RFC, D23).
+ * manifest and warns (Claude would merge them). A Cursor or Agent Plugins entry installs only
+ * through its own manifest (Cursor plugin RFC, D23).
  */
 export function entryInstallMethods(
   detected: AgentPluginInstallMethod[],
@@ -525,9 +544,10 @@ export function entryInstallMethods(
 ): { methods: AgentPluginInstallMethod[]; warnings: string[] } {
   const name = ctx.entry.name;
   const own = detected.find(isOwnManifestMethod);
-  if (own === undefined && ctx.file === "cursor") {
+  const rules = MARKETPLACE_FILE_RULES[ctx.file];
+  if (own === undefined && !rules.entryIsManifest) {
     throw new Error(
-      `The Cursor marketplace entry '${name}' has no plugin manifest in its folder. Xum does not install it.`
+      `The ${AGENT_PLUGIN_INSTALL_METHOD_LABELS[rules.selector]} '${name}' has no plugin manifest in its folder. Xum does not install it.`
     );
   }
   if (own !== undefined) {
@@ -586,6 +606,25 @@ export function relativeEntryContext(
     );
   }
   return { file, entry, relative: true, rootSource: resolved.subpath === undefined };
+}
+
+/**
+ * The plugin a marketplace entry previews must carry the entry's name where the file says so:
+ * Codex refuses an Agent Plugins entry whose manifest names another plugin, and the user picked
+ * the entry by that name.
+ */
+export function assertEntryNamesPlugin(
+  ctx: MarketplaceEntryContext | undefined,
+  pluginName: string
+): void {
+  if (ctx === undefined || !MARKETPLACE_FILE_RULES[ctx.file].entryNamesPlugin) return;
+  // Exact, as in Codex. Xum compares the name it loads, so an entry whose manifest name Xum
+  // rewrites (a Claude `my_tool` loads as `my-tool`) is refused too: safer than a lossy mapping
+  // that could pair an entry with a differently named plugin.
+  if (pluginName === ctx.entry.name) return;
+  throw new Error(
+    `The ${AGENT_PLUGIN_INSTALL_METHOD_LABELS[MARKETPLACE_FILE_RULES[ctx.file].selector]} '${ctx.entry.name}' points to a plugin named '${pluginName}'. Xum installs it only under the name the marketplace lists.`
+  );
 }
 
 /** The error when a marketplace entry's folder fits no method. */

@@ -495,8 +495,8 @@ describe("attach_file tool", () => {
 });
 
 describe("attach_file in the artifacts folder", () => {
-  // Only the artifact tool makes versions: attaching an artifact shows it, nothing more.
-  it("stores no artifact version and names no artifact in ui_only", async () => {
+  // Only the artifact tool makes records: attaching an artifact shows it, nothing more.
+  it("stores no artifact record and names no artifact in ui_only", async () => {
     using dir = new TestTempDir("attach-file-artifact");
     const file = path.join(dir.path, "scratch/artifacts/report.md");
     await fs.mkdir(path.dirname(file), { recursive: true });

@@ -115,7 +115,12 @@ import {
   type PendingTaskStartWaiter,
   type PendingTaskWaiter,
 } from "@/node/services/taskWaiters";
-import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceDirTrusted,
+  isWorkspaceProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import {
@@ -125,6 +130,10 @@ import {
   resolveAgentDefinition,
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import {
+  formatPluginAgentRefusal,
+  PluginAgentRefusalError,
+} from "@/node/services/agentDefinitions/pluginAgentRefusal";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
@@ -189,6 +198,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   isDockerRuntime,
   isLocalProjectRuntime,
+  isSshSharedProjectDirRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeConfig,
@@ -424,9 +434,17 @@ function buildReportWaitRequest(
   return { taskId, options, timeoutMs, requestingWorkspaceId };
 }
 
-/** "refuse" is for model-driven task_remove (#4723); user-confirmed and automatic removals omit it. */
+/**
+ * What a model-driven task_remove does about a checkout holding unsaved work (#4723). Omitted for
+ * user-confirmed and automatic removals, which never refuse. Either value keeps the live-writer
+ * guards (background bash, an external editor or native terminal): they protect work someone is
+ * still changing. "refuse" also refuses unsaved work; "force" (the tool's `force` flag) deletes it
+ * and reports what it deleted on the removed result.
+ */
+export type LossyWorkPolicy = "refuse" | "force";
+
 export interface SubagentRemovalOptions {
-  lossyWorkPolicy?: "refuse";
+  lossyWorkPolicy?: LossyWorkPolicy;
   /** The caller holds the sub-agent's mutation gate (a parent removal gates its tree, #4477). */
   mutationGateHeld?: boolean;
   /** Receives what the forced removal left behind, for the parent removal's result (#5143). */
@@ -450,6 +468,17 @@ interface InactiveTaskRemoval {
   readonly entry: { projectPath: string; workspace: WorkspaceConfigEntry };
   readonly target: { taskId: string; workspaceId: string; displayName?: string };
   readonly options: SubagentRemovalOptions | undefined;
+  /** Set under the "force" policy when the removal deletes unsaved work: reported on the result. */
+  readonly forcedDeletion?: ForcedSubagentDeletion;
+}
+
+/** What a forced removal deletes, read under the locks right before the removal. */
+interface ForcedSubagentDeletion {
+  /** The lost work, as a phrase that completes "Deleted ...". */
+  lostWork: string;
+  /** The checkout and the branch, as sentences. */
+  where: string;
+  paths: string[];
 }
 
 /** The removal under the patch operation lock, with the patch artifact read there. */
@@ -471,9 +500,92 @@ function reportInactiveTaskRemoval(
     removal.options?.onRemovalWarnings?.(result.warnings);
   return Ok(
     result.success
-      ? { status: "removed", action: "remove", ...removal.target }
-      : { status: "error", action: "remove", ...removal.target, error: result.error }
+      ? {
+          status: "removed",
+          action: "remove",
+          ...removal.target,
+          ...forcedDeletionFields(removal.forcedDeletion, true, result.warnings),
+        }
+      : {
+          status: "error",
+          action: "remove",
+          ...removal.target,
+          error: result.error,
+          // The checkout may already be gone when the removal fails after deleting it.
+          ...forcedDeletionFields(removal.forcedDeletion, false),
+        }
   );
+}
+
+/**
+ * The deleted-work fields of a forced removal's result, or none when it found no unsaved work. The
+ * report must not claim a deletion that did not happen: a failed removal says "may have deleted"
+ * (it can fail after the checkout was deleted), and a removal the runtime only partly completed
+ * (forced removal succeeds then, with warnings) names what remains.
+ */
+function forcedDeletionFields(
+  forced: ForcedSubagentDeletion | undefined,
+  removed: boolean,
+  warnings: readonly WorkspaceRemoveWarning[] = []
+): { deletedWork?: string; paths?: string[] } {
+  if (forced == null) return {};
+  const lead = removed
+    ? `Deleted ${forced.lostWork}.`
+    : `The removal failed, and it may have deleted ${forced.lostWork}.`;
+  const leftovers =
+    warnings.length > 0
+      ? [
+          `Removal did not delete everything, so some of this work may remain: ${warnings.map((warning) => warning.description).join(" ")}`,
+        ]
+      : [];
+  return {
+    deletedWork: [lead, forced.where, ...leftovers].join(" "),
+    ...(forced.paths.length > 0 ? { paths: forced.paths } : {}),
+  };
+}
+
+/** What removing a sub-agent's checkout deletes: one finding, worded for the refusal and the report. */
+interface UnpreservedSubagentWorkDescription {
+  /** Before the removal: what it would delete, or that this could not be verified. */
+  summary: string;
+  /** The same finding as a phrase that completes "Deleted ...", for a forced removal's report. */
+  lostWork: string;
+  paths: string[];
+}
+
+/** The refusal task_remove returns by default, with the way to override it. */
+function lossyRefusalFields(lost: UnpreservedSubagentWorkDescription): {
+  error: string;
+  paths?: string[];
+} {
+  const guidance =
+    "By default this tool does not delete a sub-agent's unsaved work, and you must not delete that work yourself to get around it. " +
+    "If the user asked for cleanup, or the work is provably saved (pushed, merged, or in an applied patch), retry with force: true: it deletes this work and reports what it deleted. " +
+    "Otherwise leave the sub-agent in place and tell the user what it holds.";
+  return {
+    error: `${lost.summary} ${guidance}`,
+    ...(lost.paths.length > 0 ? { paths: lost.paths } : {}),
+  };
+}
+
+/**
+ * What the forced removal of this sub-agent deletes, for the removed result: the finding, the
+ * checkout and the branch. Every runtime that gets here forked the checkout with
+ * `newWorkspaceName: plan.workspaceName` (taskForkOptions), which each runtime's fork turns into
+ * the task branch of that name, and removal deletes the branch by that name. Project-dir
+ * checkouts have no branch to report but never reach this (they preserve the checkout).
+ */
+function describeForcedDeletion(
+  lost: UnpreservedSubagentWorkDescription,
+  ws: WorkspaceConfigEntry
+): ForcedSubagentDeletion {
+  const checkoutPath = coerceNonEmptyString(ws.path);
+  const branch = coerceNonEmptyString(ws.name);
+  const where = [
+    ...(checkoutPath != null ? [`Checkout: ${checkoutPath}.`] : []),
+    ...(branch != null ? [`Branch: ${branch}.`] : []),
+  ];
+  return { lostWork: lost.lostWork, where: where.join(" "), paths: lost.paths };
 }
 
 interface TaskParentAiMeta {
@@ -888,6 +1000,40 @@ export interface OwnedTaskAttempt {
    * the snapshot. False → this attempt can never produce a cross-process receipt.
    */
   receiptEligible: boolean;
+  /**
+   * The report the row still carried (`reported`, or `interrupted` with a report time) once the
+   * CAS that published this attempt had written it, else null. A reactivation keeps its
+   * predecessor's terminal status, and a reawakening of a settled reported task keeps it too, so
+   * the new attempt runs on a row that reads reported and that report says nothing about the
+   * attempt. A reawakening of an interrupted row sets it `running` in the same CAS: null then.
+   * A later report of the attempt is told from the inherited one by the row's status (see
+   * InheritedReport). In-memory only, read from that CAS (never from the row afterwards, where
+   * the report may be this attempt's own).
+   */
+  readonly inheritedReport: InheritedReport | null;
+}
+
+/** A completed report that a row already carried when the CAS that published an attempt wrote it. */
+export interface InheritedReport {
+  /**
+   * The row's status then. Only a row that read `interrupted` can be reported again: a report
+   * writes `reported`, finalizeAgentTaskReport ends early on a row that reads it, and an adopted
+   * artifact needs a row without a completed report. So a `reported` row's report is never
+   * replaced, and an `interrupted` row's is replaced exactly when the row reads `reported`. Known
+   * limit: a failure can turn a `reported` row `interrupted` (it keeps its report time), and
+   * another backend's report of the attempt then goes unseen, as the row reads `reported` again.
+   */
+  readonly taskStatus: "reported" | "interrupted";
+}
+
+/** The report `ws` carries now, or null. Read inside the CAS's config edit, on the row it writes. */
+function readInheritedReport(ws: WorkspaceConfigEntry): InheritedReport | null {
+  if (!hasCompletedAgentReport(ws)) return null;
+  assert(
+    ws.taskStatus === "reported" || ws.taskStatus === "interrupted",
+    "a completed report reads reported or interrupted"
+  );
+  return { taskStatus: ws.taskStatus };
 }
 
 /** In-process settlement ledger entry; see AttemptLedger.attemptSettlementByTaskId. */
@@ -982,6 +1128,8 @@ interface ReactivationPlan {
 /** What the identity CAS wrote: set inside its config edit, read after it. */
 interface ReactivationCommit {
   committedProven: boolean;
+  /** The completed report the row this CAS wrote still carries (OwnedTaskAttempt.inheritedReport). */
+  inheritedReport: InheritedReport | null;
   published: boolean;
 }
 
@@ -1096,6 +1244,13 @@ export interface StreamEndDecision {
   readonly attempt: OwnedTaskAttempt | undefined;
   readonly attemptId: string;
   readonly messageId: string;
+  /**
+   * The completed report the row carried when this attempt began (OwnedTaskAttempt.inheritedReport;
+   * always null for an attempt this process does not own, which has no publishing CAS to read).
+   * Only a report that is not this one contradicts a `nonreport` decision (see
+   * StreamEndLedger.resolveStreamEndDecision).
+   */
+  readonly inheritedReport: InheritedReport | null;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
   /**
    * The session's turn generation the stream ended in (undefined when none was live, or once it
@@ -2595,8 +2750,15 @@ interface ChildStreamEndContext extends StreamEndAdmission {
 /** A child stream end's context plus what it read once its workspace turn was finalized. */
 interface ChildStreamEndState extends ChildStreamEndContext {
   readonly status: WorkspaceConfigEntry["taskStatus"];
-  /** The stream's final report; always null for a plan-like task. */
+  /**
+   * The stream's final report; null for a plan-like task, and for a reported row, which publishes
+   * none.
+   */
   readonly reportArgs: Awaited<ReturnType<TaskService["resolveFinalAgentReportArgs"]>>;
+  /**
+   * Whether the task is plan-like. Not read (false) where no reader needs the answer: a stream
+   * with neither a final response nor a propose_plan result, and a reported row's final response.
+   */
   readonly isPlanLike: boolean;
   readonly proposePlanResult: ReturnType<TaskService["findProposePlanSuccessInParts"]>;
 }
@@ -4077,11 +4239,16 @@ export class TaskService implements AgentTaskIntegration {
     this.taskStopLatch.rebindCapturedTurn(workspaceId, previous, next);
   }
 
-  /** Tests call this; AttemptLedger owns the attempt identity. */
+  /**
+   * Tests call this; AttemptLedger owns the attempt identity. A reservation or launch begins on a
+   * row that has never reported (not yet written, `starting` or `running`), so it passes
+   * `inheritedReport: null`; only the reawakening and reactivation CAS can keep a completed row,
+   * and they pass what they wrote.
+   */
   private beginOwnedTaskAttempt(
     taskId: string,
     source: string,
-    identity: { attemptId: string | undefined; receiptEligible: boolean; abortSignal?: AbortSignal }
+    identity: Parameters<AttemptLedger["beginOwnedTaskAttempt"]>[2]
   ): OwnedTaskAttempt {
     return this.attemptLedger.beginOwnedTaskAttempt(taskId, source, identity);
   }
@@ -5246,7 +5413,12 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
     // #6426: one cached config load per call (not per candidate or per read).
-    const projectPluginsTrusted = isProjectTrusted(this.config, entry.projectPath);
+    // An SSH+None task runs in a host directory that also needs its own trust.
+    const projectPluginsTrusted = isWorkspaceProjectTrusted(this.config, {
+      kind: undefined,
+      projectPath: entry.projectPath,
+      runtimeConfig: entry.workspace.runtimeConfig,
+    });
 
     const workspacePath = coerceNonEmptyString(entry.workspace.path);
     const workspaceName = coerceNonEmptyString(entry.workspace.name) ?? entry.workspace.id;
@@ -6872,6 +7044,7 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
+            if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
                 runtime,
@@ -6929,6 +7102,7 @@ export class TaskService implements AgentTaskIntegration {
         resolveAgentDefinition(runtime, parentWorkspacePath, agentId, {
           projectPluginsTrusted,
           runtimeFactory: nodeRuntimeFactory,
+          refuseUnreachablePluginFolder: true,
         }),
         signal
       );
@@ -6955,6 +7129,9 @@ export class TaskService implements AgentTaskIntegration {
             error
           )
         );
+      }
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.createMany: ${formatPluginAgentRefusal(error)}`);
       }
       const hint = await this.describeRunnableAgents(reservation);
       return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
@@ -7421,6 +7598,7 @@ export class TaskService implements AgentTaskIntegration {
           this.beginOwnedTaskAttempt(plan.taskId, "reservation", {
             attemptId: plan.attemptId,
             receiptEligible: true,
+            inheritedReport: null,
             ...(run.signal != null ? { abortSignal: run.signal } : {}),
           }),
         ];
@@ -8449,6 +8627,7 @@ export class TaskService implements AgentTaskIntegration {
       this.beginOwnedTaskAttempt(plan.taskId, "launch", {
         attemptId: launchAttemptId,
         receiptEligible: launchReceiptEligible,
+        inheritedReport: null,
       });
     }
   }
@@ -8678,7 +8857,12 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     const secrets = await secretsToRecord(
-      this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+      secretsForWorkspace(
+        this.secretsStore,
+        this.config,
+        plan.parentMeta.projectPath,
+        plan.taskRuntimeConfig
+      )
     );
     // The sanitize and secrets awaits above leave a window in which the parent can cancel this
     // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
@@ -9233,6 +9417,7 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
+            if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
                 runtime,
@@ -9284,6 +9469,7 @@ export class TaskService implements AgentTaskIntegration {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
         projectPluginsTrusted,
         runtimeFactory: nodeRuntimeFactory,
+        refuseUnreachablePluginFolder: true,
       });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await this.describeRunnableTaskAgents(placement);
@@ -9306,6 +9492,10 @@ export class TaskService implements AgentTaskIntegration {
         return Err(
           formatRuntimeUnreachableError(`Task.create: could not verify agentId (${agentId})`, error)
         );
+      }
+      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.create: ${formatPluginAgentRefusal(error)}`);
       }
       const hint = await this.describeRunnableTaskAgents(placement);
       return Err(`Task.create: unknown agentId (${agentId}). ${hint}`);
@@ -9518,6 +9708,7 @@ export class TaskService implements AgentTaskIntegration {
     launch.launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
       attemptId: launch.attemptId,
       receiptEligible: true,
+      inheritedReport: null,
     });
     if (checkout.sourceRuntimeConfigUpdate != null) {
       // Ensure UI gets the updated runtimeConfig for the parent workspace.
@@ -9609,8 +9800,7 @@ export class TaskService implements AgentTaskIntegration {
       parentMetadata: plan.parentMeta,
       allowCreateFallback: true,
       ...(preferredTrunkBranch != null ? { preferredTrunkBranch } : {}),
-      trusted:
-        this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
+      trusted: this.taskInitTrusted(plan),
       multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
         EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
       ),
@@ -9742,7 +9932,12 @@ export class TaskService implements AgentTaskIntegration {
     // mutate the live parent workspace — skip it entirely.
     if (!plan.useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+        secretsForWorkspace(
+          this.secretsStore,
+          this.config,
+          plan.parentMeta.projectPath,
+          plan.taskRuntimeConfig
+        )
       );
       this.registerTaskBackgroundInit(plan, checkout, secrets);
     }
@@ -9789,6 +9984,23 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /** Starts a launched task's init in its own checkout (callers skip a shared parent checkout). */
+  /**
+   * Whether a task's init may run repo-controlled code (.xum/init, git hooks). A task forked from
+   * an SSH+None parent shares the parent's host directory, which project trust alone does not
+   * cover, so this is project trust AND that directory's trust (isWorkspaceDirTrusted). For every
+   * other parent runtime the directory check is true.
+   */
+  private taskInitTrusted(plan: {
+    readonly configProjectPath: string;
+    readonly parentRuntimeConfig: RuntimeConfig;
+  }): boolean {
+    const projects = this.config.loadConfigOrDefault().projects;
+    return (
+      (projects.get(plan.configProjectPath)?.trusted ?? false) &&
+      isWorkspaceDirTrusted(projects, plan.configProjectPath, plan.parentRuntimeConfig)
+    );
+  }
+
   private registerTaskBackgroundInit(
     plan: TaskLaunchSource,
     checkout: Omit<TaskLaunchCheckout, "forkedRuntimeConfig">,
@@ -9813,9 +10025,7 @@ export class TaskService implements AgentTaskIntegration {
           env,
           abortSignal: initAbortController.signal,
           skipInitHook: plan.skipInitHook,
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
-            false,
+          trusted: this.taskInitTrusted(plan),
         },
         plan.taskId,
         workspaceUseLeasesFor(this.config)
@@ -10501,7 +10711,11 @@ export class TaskService implements AgentTaskIntegration {
     plan: ReactivationPlan
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const { taskId } = plan.params;
-    const commit: ReactivationCommit = { committedProven: false, published: false };
+    const commit: ReactivationCommit = {
+      committedProven: false,
+      inheritedReport: null,
+      published: false,
+    };
     {
       // Critical section (see markInterruptedTaskRunning): the identity CAS, the row check and
       // the ownership install run under the global mutex every cascade's Phase A holds, so no
@@ -10582,6 +10796,9 @@ export class TaskService implements AgentTaskIntegration {
     }
     commit.committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
     if (!commit.committedProven) ws.taskAttemptUnproven = true;
+    // Read here, from the row this CAS wrote: after the commit, a report on the row may be
+    // another backend's report of the fresh attempt.
+    commit.inheritedReport = readInheritedReport(ws);
     commit.published = true;
   }
 
@@ -10631,6 +10848,7 @@ export class TaskService implements AgentTaskIntegration {
     this.beginOwnedTaskAttempt(taskId, "reactivation", {
       attemptId: reactivationAttemptId,
       receiptEligible: commit.committedProven,
+      inheritedReport: commit.inheritedReport,
     });
     // Live until createWorkspaceTurn returns; its send's admission is the evidence after that.
     this.attemptLedger.beginReawakening(taskId, reactivationAttemptId);
@@ -10742,6 +10960,7 @@ export class TaskService implements AgentTaskIntegration {
         isWorkspaceProjectTrustedIn(cfg.projects, {
           kind: workspace.kind,
           projectPath: entry.projectPath,
+          runtimeConfig: workspace.runtimeConfig,
         })
       );
     } catch (error) {
@@ -16749,7 +16968,7 @@ export class TaskService implements AgentTaskIntegration {
     // Only when removal deletes the checkout (see subagentRemovalPreservesCheckout): a preserved
     // checkout loses no files, and the sticky app marker would block its removal forever.
     const guardLiveWriters =
-      removal.options?.lossyWorkPolicy === "refuse" &&
+      removal.options?.lossyWorkPolicy != null &&
       !subagentRemovalPreservesCheckout(removal.entry.workspace);
     // The fresh background-process check first, as model-driven archive does: it refreshes exit
     // statuses (the hold's snapshot may still list an exited process) and sees crash orphans.
@@ -16796,29 +17015,34 @@ export class TaskService implements AgentTaskIntegration {
     removal: GuardedInactiveTaskRemoval
   ): Promise<Result<WorkspaceLifecycleResult, string>> {
     // Checked under the tree and patch-artifact locks, right before the tombstone and removal.
-    if (removal.options?.lossyWorkPolicy === "refuse") {
-      // An editor or native terminal opened earlier is not trackable, so it may still write.
-      if (
-        removal.guardLiveWriters &&
-        (await this.workspaceService.hasUntrackableExternalAppOpen(removal.taskId))
-      ) {
-        return Ok({
-          status: "error",
-          action: "remove",
-          ...removal.target,
-          error:
-            "An external editor or native terminal was opened in this sub-agent's checkout and may still write to it. Ask the user to remove the sub-agent.",
-        });
-      }
-      const refusal = await this.refuseLossySubagentRemoval(
-        removal.taskId,
-        removal.entry,
-        removal.patchArtifact ?? null
-      );
-      if (refusal != null)
-        return Ok({ status: "error", action: "remove", ...removal.target, ...refusal });
+    const policy = removal.options?.lossyWorkPolicy;
+    if (policy == null) return await this.refuseChangedWorkBeforeRemoval(removal);
+    // An editor or native terminal opened earlier is not trackable, so it may still write. The
+    // force policy keeps this guard: it is about work still changing, not about unsaved work.
+    if (
+      removal.guardLiveWriters &&
+      (await this.workspaceService.hasUntrackableExternalAppOpen(removal.taskId))
+    ) {
+      return Ok({
+        status: "error",
+        action: "remove",
+        ...removal.target,
+        error:
+          "An external editor or native terminal was opened in this sub-agent's checkout and may still write to it. Ask the user to remove the sub-agent.",
+      });
     }
-    return await this.refuseChangedWorkBeforeRemoval(removal);
+    const verdict = await this.settleLossySubagentRemoval(
+      removal.taskId,
+      removal.entry,
+      removal.patchArtifact ?? null,
+      policy
+    );
+    if (verdict?.kind === "refused") {
+      return Ok({ status: "error", action: "remove", ...removal.target, ...verdict.refusal });
+    }
+    return await this.refuseChangedWorkBeforeRemoval(
+      verdict?.kind === "forced" ? { ...removal, forcedDeletion: verdict.forcedDeletion } : removal
+    );
   }
 
   /** #5106: refuses when the work found under the locks differs from what the user confirmed. */
@@ -16872,29 +17096,31 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * #4723: a model's task_remove must not discard a child's unsaved work (the rule #3950 applies
-   * to peer archives). Returns the refusal fields, or null when removal loses nothing.
+   * #4723: a model's task_remove must not discard a child's unsaved work unless it set `force` (the
+   * rule #3950 applies to peer archives). Returns null when removal loses nothing, otherwise the
+   * refusal for the "refuse" policy or what the "force" policy deletes, for the removed result.
    */
-  private async refuseLossySubagentRemoval(
+  private async settleLossySubagentRemoval(
     taskId: string,
     entry: { projectPath: string; workspace: WorkspaceConfigEntry },
-    patchArtifact: SubagentGitPatchArtifact | null
-  ): Promise<{ error: string; paths?: string[] } | null> {
+    patchArtifact: SubagentGitPatchArtifact | null,
+    policy: LossyWorkPolicy
+  ): Promise<
+    | { kind: "refused"; refusal: ReturnType<typeof lossyRefusalFields> }
+    | { kind: "forced"; forcedDeletion: ForcedSubagentDeletion }
+    | null
+  > {
     const lost = await this.describeUnpreservedSubagentWork(taskId, entry, patchArtifact);
     if (lost == null) return null;
-    const guidance =
-      "This tool cannot approve losing a sub-agent's work, and you must not delete that work to get around it. " +
-      "Leave the sub-agent in place and tell the user what it holds; the user can save or clear it and ask you to retry, " +
-      "or remove the sub-agent themselves from the command palette (Remove Current Sub-agent or Remove Workspace), whose confirmation lists this work.";
-    return {
-      error: `${lost.summary} ${guidance}`,
-      ...(lost.paths.length > 0 ? { paths: lost.paths } : {}),
-    };
+    return policy === "refuse"
+      ? { kind: "refused", refusal: lossyRefusalFields(lost) }
+      : { kind: "forced", forcedDeletion: describeForcedDeletion(lost, entry.workspace) };
   }
 
   /**
    * What removing this sub-agent would permanently delete, or null when nothing. Shared by the
-   * model's refusal and the user's confirmation (#5106), so both report the same work.
+   * model's refusal, the model's forced removal report and the user's confirmation (#5106), so all
+   * report the same work.
    */
   private async describeUnpreservedSubagentWork(
     taskId: string,
@@ -16902,7 +17128,7 @@ export class TaskService implements AgentTaskIntegration {
     patchArtifact: SubagentGitPatchArtifact | null,
     /** Where the reader finds the paths: the model gets a `paths` field, the dialog a list. */
     pathsLocation = "listed in paths"
-  ): Promise<{ summary: string; paths: string[] } | null> {
+  ): Promise<UnpreservedSubagentWorkDescription | null> {
     const ws = entry.workspace;
     const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
     if (subagentRemovalPreservesCheckout(ws)) return null;
@@ -16945,6 +17171,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!check.success) {
       return {
         summary: `Cannot verify that removing this sub-agent keeps its work (${check.error}).`,
+        lostWork: `any unsaved work in its checkout, which could not be checked (${check.error})`,
         paths: [],
       };
     }
@@ -16968,8 +17195,10 @@ export class TaskService implements AgentTaskIntegration {
         : []),
     ];
     assert(lost.length > 0, "a lossy removal result must name what would be lost");
+    const lostWork = lost.join(" and ");
     return {
-      summary: `Removing this sub-agent would permanently delete ${lost.join(" and ")}.`,
+      summary: `Removing this sub-agent would permanently delete ${lostWork}.`,
+      lostWork,
       paths: work.paths,
     };
   }
@@ -18688,6 +18917,7 @@ export class TaskService implements AgentTaskIntegration {
           projectPluginsTrusted: isWorkspaceProjectTrustedIn(context.config.projects, {
             kind: parentEntry.workspace.kind,
             projectPath: parentEntry.projectPath,
+            runtimeConfig: context.parentRuntimeConfig,
           }),
           runtimeFactory: nodeRuntimeFactory,
         }
@@ -18856,7 +19086,7 @@ export class TaskService implements AgentTaskIntegration {
     const { taskId } = request;
     this.attemptLedger.publishAttemptRotation(taskId, launch.attemptId);
     if (this.attemptLedger.ownedAttempt(taskId)?.attemptId !== launch.attemptId) {
-      this.beginOwnedTaskAttempt(taskId, "launch", launch);
+      this.beginOwnedTaskAttempt(taskId, "launch", { ...launch, inheritedReport: null });
     }
     plans.push(this.buildQueuedTaskLaunchPlan(request, launch.attemptId, launchLease));
   }
@@ -19210,6 +19440,7 @@ export class TaskService implements AgentTaskIntegration {
     }
     let published = false;
     let committedProven = false;
+    let inheritedReport: InheritedReport | null = null;
     await this.editActiveWorkspaceEntry(
       workspaceId,
       (ws) => {
@@ -19229,6 +19460,9 @@ export class TaskService implements AgentTaskIntegration {
         // downgrade the proof; a proven admission never carries it.
         committedProven = plan.lineage.proven && ws.taskAttemptUnproven !== true;
         if (!committedProven) ws.taskAttemptUnproven = true;
+        // Read here, from the row this CAS wrote: after the commit, a report on the row may be
+        // another backend's report of the fresh attempt.
+        inheritedReport = readInheritedReport(ws);
         published = true;
       },
       { allowMissing: true }
@@ -19239,7 +19473,7 @@ export class TaskService implements AgentTaskIntegration {
       // and the row moved under this decision (another writer's resume, a stop, a claim).
       return { kind: "refused", message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE };
     }
-    return this.publishReawakenAttempt(plan, committedProven);
+    return this.publishReawakenAttempt(plan, committedProven, inheritedReport);
   }
 
   /**
@@ -19276,7 +19510,8 @@ export class TaskService implements AgentTaskIntegration {
   /** After the CAS: own the fresh attempt only if the durable row still names it. */
   private publishReawakenAttempt(
     plan: ReawakenPlan,
-    committedProven: boolean
+    committedProven: boolean,
+    inheritedReport: InheritedReport | null
   ): ReawakenRefusal | { kind: "committed" } {
     const { workspaceId, attemptId } = plan;
     // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).
@@ -19306,6 +19541,7 @@ export class TaskService implements AgentTaskIntegration {
     this.beginOwnedTaskAttempt(workspaceId, "reawaken", {
       attemptId,
       receiptEligible: committedProven,
+      inheritedReport,
     });
     // Live until the caller's send binds to it (its admission is the evidence after that).
     this.attemptLedger.beginReawakening(workspaceId, attemptId);
@@ -20267,13 +20503,26 @@ export class TaskService implements AgentTaskIntegration {
             acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
           })
         : null;
-    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+    const proposePlanResult = this.findProposePlanSuccessInParts(event.parts);
+    // The probe reads agent definitions from the user's home, which takes seconds on a host with
+    // many skills, and a send that arrives while the stream's decision waits is refused as stale.
+    // So the decision does not wait for it where its answer changes nothing: a stream with neither
+    // a final response nor a propose_plan result, and a reported row's final response. A reported
+    // row publishes no report, so the handler resolves its decision `nonreport` whatever the
+    // answer (the ledger can still turn that into `indeterminate`: see
+    // StreamEndLedger.resolveStreamEndDecision), and it does so before the cleanup of the
+    // reported task, as a plan-like task's final response always did.
+    // The answer still matters to a propose_plan result (the plan hand-off) and to a final
+    // response on any other row (a plan-like task's final response is no report).
+    const probeDecidesReport =
+      proposePlanResult != null || (finalAgentReportArgs != null && status !== "reported");
+    const isPlanLike = probeDecidesReport ? await this.isPlanLikeTaskWorkspace(entry) : false;
     const state: ChildStreamEndState = {
       ...ctx,
       status,
-      reportArgs: isPlanLike ? null : finalAgentReportArgs,
+      reportArgs: isPlanLike || status === "reported" ? null : finalAgentReportArgs,
       isPlanLike,
-      proposePlanResult: this.findProposePlanSuccessInParts(event.parts),
+      proposePlanResult,
     };
     this.decideNonreportBeforeContinuation(state);
     return this.settleInterruptedOrReportedChild(state);
@@ -24245,10 +24494,14 @@ export class TaskService implements AgentTaskIntegration {
 
 /**
  * Removal deletes no checkout for isolation "none" children (they share the parent's) or for
- * project-dir local runtimes (deleteWorkspace is a no-op there), so it cannot lose their files.
+ * project-dir runtimes, local or SSH+None (deleteWorkspace is a no-op there), so it cannot lose
+ * their files.
  */
 function subagentRemovalPreservesCheckout(ws: WorkspaceConfigEntry): boolean {
+  const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
   return (
-    ws.taskIsolation === "none" || isLocalProjectRuntime(ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG)
+    ws.taskIsolation === "none" ||
+    isLocalProjectRuntime(runtimeConfig) ||
+    isSshSharedProjectDirRuntime(runtimeConfig)
   );
 }
