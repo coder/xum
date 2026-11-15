@@ -105,19 +105,23 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
  * True only for a row the peer send path could have authored: assistant role, SYNTHETIC
  * provenance (the send path persists payload rows exclusively as synthetic pre-turn rows —
  * ordinary model output can carry corrupted-but-valid-looking metadata, never this marker),
- * VALID peer metadata, AND text that is exactly a well-formed envelope whose sender fields
- * MATCH the metadata (the send path writes both from the same values). A corrupted row
- * carrying just the discriminator, lookalike text, or an inconsistent metadata/envelope pair
+ * VALID peer metadata, AND a single text part that is exactly a well-formed envelope whose
+ * sender fields MATCH the metadata (the send path writes both from the same values). A corrupted
+ * row carrying just the discriminator, lookalike text, or an inconsistent metadata/envelope pair
  * — where the UI would attribute one sender while the provider reads another — must not
- * smuggle the exact wrapper past neutralization. Only TEXT parts are checked; tool parts are
- * never authentic envelopes.
+ * smuggle the exact wrapper past neutralization. Any other part shape is corrupted too: replayed
+ * in the user role, a row with no parts becomes an empty user message that fails every request,
+ * and its tool parts would be dropped.
  */
 function isAuthenticAgentPeerPayloadRow(msg: MuxMessage): boolean {
   if (msg.role !== "assistant" || msg.metadata?.synthetic !== true) return false;
   const meta = getValidAgentPeerMessageMeta(msg.metadata.muxMetadata);
+  const [part, ...rest] = msg.parts;
   return (
     meta != null &&
-    msg.parts.every((part) => part.type !== "text" || isEnvelopeFromSender(part.text, meta))
+    rest.length === 0 &&
+    part?.type === "text" &&
+    isEnvelopeFromSender(part.text, meta)
   );
 }
 
@@ -141,7 +145,7 @@ function isEnvelopeFromSender(text: string, meta: AgentPeerMessageMeta): boolean
  * models continue that pattern instead of acting on it. A woken recipient whose only prior
  * assistant turn was the payload echoed the envelope and stopped; a sender wrote the reply it was
  * waiting for as its own envelope, which the user then read as a delivery. In the user role the
- * payload merges with its adjacent trigger into one inbound message. Run AFTER
+ * payload reads as inbound, like the trigger that follows it. Run AFTER
  * neutralizeAgentEnvelopeLookalikesForProvider: it renames the wrapper in every other row, so
  * the exact wrapper in a user-role message is still server provenance, and the system prompt
  * classifies it as untrusted, non-user input.
