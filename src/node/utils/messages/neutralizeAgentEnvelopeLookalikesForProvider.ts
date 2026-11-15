@@ -1,4 +1,5 @@
 import {
+  formatAgentMessageEnvelope,
   getValidAgentPeerMessageMeta,
   neutralizeAgentEnvelopeLookalikes,
   parseAgentMessageEnvelope,
@@ -9,6 +10,7 @@ import {
   neutralizePlanReviewEnvelopeLookalikes,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { MuxMessage } from "@/common/types/message";
+import { parseFamilyMessageSender } from "@/node/services/agentPeerMessageBroker";
 import type {
   AssistantModelMessage,
   ModelMessage,
@@ -147,11 +149,35 @@ function isEnvelopeFromSender(text: string, meta: AgentPeerMessageMeta): boolean
 export function replayAgentPeerPayloadsAsUser(messages: MuxMessage[]): MuxMessage[] {
   let didChange = false;
   const result = messages.map((msg) => {
-    if (!isAuthenticAgentPeerPayloadRow(msg)) return msg;
-    didChange = true;
-    return { ...msg, role: "user" as const };
+    const replayed = isAuthenticAgentPeerPayloadRow(msg)
+      ? { ...msg, role: "user" as const }
+      : replayFamilyMessagePayloadAsUser(msg);
+    if (replayed !== msg) didChange = true;
+    return replayed;
   });
   return didChange ? result : messages;
+}
+
+/**
+ * Family-message payload rows (task_message_parent, task_message_sibling) have the same defect
+ * but no envelope, and in the user role the sender's bytes must not pass as user text. So the
+ * replay wraps the row in the peer envelope, attributed to the sender its server-written header
+ * names; the neutralizer has already renamed any wrapper inside the row. A row whose header does
+ * not parse stays in the assistant role.
+ */
+function replayFamilyMessagePayloadAsUser(msg: MuxMessage): MuxMessage {
+  if (msg.role !== "assistant" || msg.metadata?.synthetic !== true) return msg;
+  if (msg.metadata.muxMetadata?.type !== "family-message" || msg.parts.length !== 1) return msg;
+  const [part] = msg.parts;
+  if (part.type !== "text") return msg;
+  const sender = parseFamilyMessageSender(part.text);
+  if (sender == null) return msg;
+  const text = formatAgentMessageEnvelope({
+    from: sender.senderWorkspaceId,
+    relationship: sender.relationship,
+    message: part.text,
+  });
+  return { ...msg, role: "user", parts: [{ ...part, text }] };
 }
 
 /**

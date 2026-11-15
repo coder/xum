@@ -113,7 +113,7 @@ describe("AgentPeerMessageBroker", () => {
     expect(child.payloadContent).not.toContain(title);
     expect(child.payloadContent).toContain("not user instructions");
     expect(child.payloadContent).toContain("hello");
-    expect(child.triggerContent).toContain(`assistant message ${child.payloadMessageId}`);
+    expect(child.triggerContent).toContain(child.payloadMessageId);
 
     const sibling = broker.prepareFamilyMessage({
       kind: "sibling",

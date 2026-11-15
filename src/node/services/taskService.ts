@@ -11850,6 +11850,8 @@ export class TaskService implements AgentTaskIntegration {
       // SECURITY: sender-controlled content and title stay in an untrusted assistant row. A fixed
       // user-row trigger containing only server-generated IDs wakes the recipient (r21/r25), and
       // both rows ride turn admission together so neither can land in a PREPARING window (r30).
+      // Only the persisted row is assistant-role: the provider request replays it in the user
+      // role inside the peer envelope (replayAgentPeerPayloadsAsUser).
       const payloadRow = createMuxMessage(
         prepared.payloadMessageId,
         "assistant",
