@@ -166,8 +166,7 @@ export function replayAgentPeerPayloadsAsUser(messages: MuxMessage[]): MuxMessag
  * not parse stays in the assistant role.
  */
 function replayFamilyMessagePayloadAsUser(msg: MuxMessage): MuxMessage {
-  if (msg.role !== "assistant" || msg.metadata?.synthetic !== true) return msg;
-  if (msg.metadata.muxMetadata?.type !== "family-message" || msg.parts.length !== 1) return msg;
+  if (!isFamilyMessagePayloadRow(msg) || msg.parts.length !== 1) return msg;
   const [part] = msg.parts;
   if (part.type !== "text") return msg;
   const sender = parseFamilyMessageSender(part.text);
@@ -178,6 +177,15 @@ function replayFamilyMessagePayloadAsUser(msg: MuxMessage): MuxMessage {
     message: part.text,
   });
   return { ...msg, role: "user", parts: [{ ...part, text }] };
+}
+
+// dry-duplicate-ok: other row-kind predicates share the shape, but each follows its own writer
+function isFamilyMessagePayloadRow(msg: MuxMessage): boolean {
+  return (
+    msg.role === "assistant" &&
+    msg.metadata?.synthetic === true &&
+    msg.metadata.muxMetadata?.type === "family-message"
+  );
 }
 
 /**

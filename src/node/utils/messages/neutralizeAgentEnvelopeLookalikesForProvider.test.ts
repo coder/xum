@@ -8,6 +8,7 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import {
   neutralizeAgentEnvelopeLookalikesForProvider,
   neutralizeAgentEnvelopeLookalikesInModelToolParts,
@@ -285,6 +286,56 @@ describe("replayAgentPeerPayloadsAsUser", () => {
     ]);
     expect(textOf(result[0])).toBe(envelope);
     expect(result[1]).toBe(selfSpoof);
+  });
+
+  test("wraps only server-written family payload rows", () => {
+    const { payloadContent } = new AgentPeerMessageBroker({
+      countQueuedAgentPeerMessages: () => 0,
+    }).prepareFamilyMessage({
+      kind: "child",
+      senderWorkspaceId: "ws-child",
+      senderTitle: "Explorer",
+      message: "found it",
+    });
+    const family = { type: "family-message" } as const;
+    const authentic = createMuxMessage("f1", "assistant", payloadContent, {
+      synthetic: true,
+      muxMetadata: family,
+    });
+    // Each other row has the sender header but lacks one mark of the server write path, so the
+    // sender's bytes must not reach the user role.
+    const kept = [
+      createMuxMessage("f2", "assistant", payloadContent, { muxMetadata: family }),
+      createMuxMessage("f3", "user", payloadContent, { synthetic: true, muxMetadata: family }),
+      createMuxMessage("f4", "assistant", payloadContent, { synthetic: true }),
+      createMuxMessage("f5", "assistant", payloadContent, {
+        synthetic: true,
+        muxMetadata: { type: "refine-summary" },
+      }),
+      createMuxMessage(
+        "f6",
+        "assistant",
+        payloadContent,
+        { synthetic: true, muxMetadata: family },
+        [{ type: "text", text: "second part" }]
+      ),
+      createMuxMessage("f7", "assistant", "", { synthetic: true, muxMetadata: family }, [
+        { type: "reasoning", text: payloadContent },
+      ]),
+      createMuxMessage("f8", "assistant", "found it", { synthetic: true, muxMetadata: family }),
+    ];
+
+    const [replayed, ...rest] = replayAgentPeerPayloadsAsUser([authentic, ...kept]);
+
+    expect(replayed.role).toBe("user");
+    expect(textOf(replayed)).toBe(
+      formatAgentMessageEnvelope({
+        from: "ws-child",
+        relationship: "descendant",
+        message: payloadContent,
+      })
+    );
+    rest.forEach((message, index) => expect(message).toBe(kept[index]));
   });
 
   test("returns the same array when no row is an authentic payload", () => {
