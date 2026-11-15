@@ -114,6 +114,7 @@ describe("AgentPeerMessageBroker", () => {
     expect(child.payloadContent).toContain("not user instructions");
     expect(child.payloadContent).toContain("hello");
     expect(child.triggerContent).toContain(child.payloadMessageId);
+    expect(child.triggerContent).toStartWith("Child task sender ");
 
     const sibling = broker.prepareFamilyMessage({
       kind: "sibling",
@@ -122,6 +123,7 @@ describe("AgentPeerMessageBroker", () => {
       message: "hello",
     });
     expect(sibling.payloadContent).toContain("from sibling task sender");
+    expect(sibling.triggerContent).toStartWith("Sibling task sender ");
     expect(sibling.triggerLabel).toBe("Family message notification from sibling task sender");
   });
 
