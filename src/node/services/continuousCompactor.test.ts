@@ -1124,7 +1124,7 @@ describe("ContinuousCompactor", () => {
   });
 
   /** A signed committed Gemini call in the retained tail, and a signed call in the live step. */
-  async function observeSignedGeminiSwap(model: string) {
+  async function observeSignedGeminiSwap(model: string, capabilityModel?: string) {
     const answer = await seedLiveTurn(true, false, false, {
       google: { thoughtSignature: "sig-committed" },
     });
@@ -1157,7 +1157,7 @@ describe("ContinuousCompactor", () => {
         systemPrefix: [],
         cacheEnabled: false,
       });
-    const midStream = { ...context, model, phase: "mid-stream" as const };
+    const midStream = { ...context, model, capabilityModel, phase: "mid-stream" as const };
     await (
       await start(eagerPercent, midStream)
     ).job;
@@ -1215,7 +1215,11 @@ describe("ContinuousCompactor", () => {
   });
 
   it("ends a Gemini 4 Hydrogen turn instead of swapping the prefix its live signatures are bound to", async () => {
-    const { verdict, swap } = await observeSignedGeminiSwap("google:gemini-4-hydrogen");
+    // A custom entry mapped to Hydrogen: the selected model ID alone does not name it.
+    const { verdict, swap } = await observeSignedGeminiSwap(
+      "google:team-hydrogen",
+      "google:gemini-4-hydrogen"
+    );
     expect(verdict).toBe("applied");
     expect(swap).toBeUndefined();
     expect(fastApply).toHaveBeenCalledTimes(1);

@@ -33,6 +33,8 @@ import { log } from "./log";
 export interface ContinuousCompactionContext {
   enabled: boolean;
   model: string;
+  /** `model` with a custom entry's mappedToModel alias resolved (resolveModelForMetadata). */
+  capabilityModel?: string;
   contextWindowTokens: number;
   thresholdPercent: number;
   systemMessageTokens?: number;
@@ -51,11 +53,9 @@ type Verdict = "none" | "applied" | "fallback";
  * returns 400 for an active-turn call without one. So a Hydrogen turn takes the durable
  * fallback instead: it stops, applies the compaction and continues after a user turn.
  */
-function maySwapPrefix(context: { model: string; phase: Phase }): boolean {
-  return (
-    context.phase === "mid-stream" &&
-    !stripModelProviderPrefixes(context.model).startsWith("gemini-4-hydrogen")
-  );
+function maySwapPrefix(context: ContinuousCompactionContext & { phase: Phase }): boolean {
+  const model = stripModelProviderPrefixes(context.capabilityModel ?? context.model);
+  return context.phase === "mid-stream" && !model.startsWith("gemini-4-hydrogen");
 }
 
 interface StreamSnapshot {

@@ -3,6 +3,7 @@ import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types
 import type { MuxMessage, CompactionFollowUpRequest } from "@/common/types/message";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
@@ -166,6 +167,7 @@ export class ContinuousStrategy {
         !this.host.coordinator.editReserved &&
         !this.host.isWorkspaceArchivedOnDisk(),
       model,
+      capabilityModel: resolveModelForMetadata(model, providersConfig),
       contextWindowTokens:
         getEffectiveContextLimit(
           model,
