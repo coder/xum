@@ -47,7 +47,7 @@ export function LeftSidebarToggleBar(props: LeftSidebarToggleBarProps) {
       data-testid="left-sidebar-toggle-bar"
       className={cn(
         BAR_LAYOUT_CLASS,
-        "fixed top-[env(safe-area-inset-top)] left-[env(safe-area-inset-left)] z-[1050]",
+        "fixed top-(--safe-area-top) left-[env(safe-area-inset-left)] z-[1050]",
         isDesktop ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
       )}
     >
