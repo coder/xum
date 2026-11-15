@@ -30,18 +30,6 @@ import type { HistoryService } from "./historyService";
 import type { CompactionHandler } from "./compactionHandler";
 import { log } from "./log";
 
-/**
- * Gemini 4 Hydrogen binds each thought signature to the request prefix it followed and
- * returns 400 when a same-model replay changes that prefix (its Agent Platform guide;
- * Xum cannot send prefix_mismatch_behavior DROP). A mid-stream swap replaces the prefix
- * under the live steps, whose function calls must keep their signatures: Gemini also
- * returns 400 for an active-turn call without one. So a Hydrogen turn takes the durable
- * fallback instead: it stops, applies the compaction and continues after a user turn.
- */
-function bindsThoughtSignaturesToPrefix(model: string): boolean {
-  return stripModelProviderPrefixes(model).startsWith("gemini-4-hydrogen");
-}
-
 export interface ContinuousCompactionContext {
   enabled: boolean;
   model: string;
@@ -53,6 +41,23 @@ export interface ContinuousCompactionContext {
 
 type Phase = "on-send" | "mid-stream" | "stream-end";
 type Verdict = "none" | "applied" | "fallback";
+
+/**
+ * Whether this observation may swap the request prefix under the running turn.
+ * Gemini 4 Hydrogen binds each thought signature to the request prefix it followed and
+ * returns 400 when a same-model replay changes that prefix (its Agent Platform guide;
+ * Xum cannot send prefix_mismatch_behavior DROP). A mid-stream swap replaces the prefix
+ * under the live steps, whose function calls must keep their signatures: Gemini also
+ * returns 400 for an active-turn call without one. So a Hydrogen turn takes the durable
+ * fallback instead: it stops, applies the compaction and continues after a user turn.
+ */
+function maySwapPrefix(context: { model: string; phase: Phase }): boolean {
+  return (
+    context.phase === "mid-stream" &&
+    !stripModelProviderPrefixes(context.model).startsWith("gemini-4-hydrogen")
+  );
+}
+
 interface StreamSnapshot {
   messageId: string;
   parts: MuxMessage["parts"];
@@ -294,7 +299,7 @@ export class ContinuousCompactor {
       const staged = this.staged;
       const rows = await this.readSnapshot();
       if (rows && this.isValid(staged, rows) && this.wouldFit(staged, rows, context)) {
-        if (context.phase === "mid-stream" && (await this.activateSwap(staged, rows, context)))
+        if (maySwapPrefix(context) && (await this.activateSwap(staged, rows, context)))
           return "none";
         const applied =
           context.phase === "mid-stream"
@@ -533,8 +538,7 @@ export class ContinuousCompactor {
     if (
       this.swapAttempted === staged ||
       !this.deps.prepareSwap ||
-      !this.deps.streamManager.setPrefixSwap ||
-      bindsThoughtSignaturesToPrefix(context.model)
+      !this.deps.streamManager.setPrefixSwap
     )
       return false;
     this.swapAttempted = staged;
