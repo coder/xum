@@ -80,6 +80,19 @@ describe("stripPrefixBoundReplayFromTailCopy", () => {
     });
   });
 
+  it("removes a signature in the legacy vertex namespace", () => {
+    // Persisted rows are read with unchecked casts, so a copy can still carry this namespace.
+    const legacyOptions = { vertex: { thoughtSignature: "legacy-v" }, openai: { itemId: "rs_2" } };
+    const message: MuxMessage = {
+      id: "a2",
+      role: "assistant",
+      parts: [{ type: "reasoning", text: "legacy", providerOptions: legacyOptions }],
+    };
+    expect(stripPrefixBoundReplayFromTailCopy(message).parts).toEqual([
+      { type: "reasoning", text: "legacy", providerOptions: { openai: { itemId: "rs_2" } } },
+    ]);
+  });
+
   it("leaves rows without prefix-bound replay data unchanged", () => {
     const openaiRow: MuxMessage = {
       id: "a2",

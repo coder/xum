@@ -14,6 +14,10 @@ function withoutAnthropicReplayData(part: MuxPart): MuxPart {
     : rest;
 }
 
+// `vertex` is the Vertex SDK's legacy namespace: unchecked history can still hold it, and
+// request building replays it as googleVertex (sanitizeReasoningReplayMetadata).
+const GEMINI_SIGNATURE_NAMESPACES = ["google", "googleVertex", "vertex"] as const;
+
 function withoutGeminiThoughtSignatures(part: MuxPart): MuxPart {
   if (part.type === "dynamic-tool") {
     // A tool call's providerOptions hold only Gemini thought signatures (ToolCallReplayMetadata).
@@ -21,19 +25,15 @@ function withoutGeminiThoughtSignatures(part: MuxPart): MuxPart {
     const { providerOptions: _signatures, ...rest } = part;
     return rest;
   }
-  if (part.type !== "reasoning") return part;
-  const providerOptions = part.providerOptions;
-  if (
-    providerOptions === undefined ||
-    (providerOptions.google === undefined && providerOptions.googleVertex === undefined)
-  ) {
-    return part;
-  }
-  const { google: _google, googleVertex: _googleVertex, ...otherProviders } = providerOptions;
+  if (part.type !== "reasoning" || part.providerOptions === undefined) return part;
+  const providerOptions = { ...part.providerOptions };
+  const signed = GEMINI_SIGNATURE_NAMESPACES.filter((namespace) =>
+    Object.hasOwn(providerOptions, namespace)
+  );
+  if (signed.length === 0) return part;
+  for (const namespace of signed) Reflect.deleteProperty(providerOptions, namespace);
   const { providerOptions: _options, ...rest } = part;
-  return Object.keys(otherProviders).length > 0
-    ? { ...rest, providerOptions: otherProviders }
-    : rest;
+  return Object.keys(providerOptions).length > 0 ? { ...rest, providerOptions } : rest;
 }
 
 /**

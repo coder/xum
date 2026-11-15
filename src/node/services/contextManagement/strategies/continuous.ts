@@ -167,7 +167,7 @@ export class ContinuousStrategy {
         !this.host.coordinator.editReserved &&
         !this.host.isWorkspaceArchivedOnDisk(),
       model,
-      capabilityModel: resolveModelForMetadata(model, providersConfig),
+      capabilityModel: this.resolveCapabilityModel(model),
       contextWindowTokens:
         getEffectiveContextLimit(
           model,
@@ -180,6 +180,18 @@ export class ContinuousStrategy {
           ?.systemMessageTokens ?? this.host.state.systemMessageTokens,
       sendOptions: options,
     };
+  }
+
+  /**
+   * `model` with a mappedToModel alias resolved. The prefix swap guard reads it mid-stream, so
+   * the running request's config snapshot resolves it: an alias edited while the stream runs
+   * cannot hide the model that request was built for.
+   */
+  private resolveCapabilityModel(model: string): string {
+    return resolveModelForMetadata(
+      model,
+      this.host.state.stream?.providersConfig ?? this.host.state.providersConfig
+    );
   }
 
   /** Persisted threshold changed: drop a staged fold whose model now has a different threshold. */

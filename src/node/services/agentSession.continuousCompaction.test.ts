@@ -213,17 +213,29 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test("the compaction context resolves a mapped model alias for capability checks", async () => {
     const h = await setup();
-    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
+    const mapped: ProvidersConfigMap = {
       google: {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
         models: [{ id: "team-hydrogen", mappedToModel: "google:gemini-4-hydrogen" }],
       },
-    });
-    const context = continuous(h.session).getContinuousCompactionContext("google:team-hydrogen");
+    };
+    const liveConfig = spyOn(h.aiService, "getProvidersConfig").mockReturnValue(mapped);
+    const strategy = continuous(h.session);
+    const context = strategy.getContinuousCompactionContext("google:team-hydrogen");
     expect(context.model).toBe("google:team-hydrogen");
     expect(context.capabilityModel).toBe("google:gemini-4-hydrogen");
+    // The alias is removed while a request built with it streams: that request's snapshot decides.
+    internals(h.session).activeStreamContext = {
+      modelString: "google:team-hydrogen",
+      providersConfig: mapped,
+    };
+    liveConfig.mockReturnValue({});
+    expect(strategy.getContinuousCompactionContext("google:team-hydrogen").capabilityModel).toBe(
+      "google:gemini-4-hydrogen"
+    );
+    internals(h.session).activeStreamContext = undefined;
   });
 
   describe("eager compaction physical lifetime", () => {
