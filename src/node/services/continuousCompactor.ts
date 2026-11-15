@@ -21,6 +21,7 @@ import {
 import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { stripModelProviderPrefixes } from "@/common/types/thinking";
 import {
   isDurableContextBoundaryMarker,
   sliceMessagesFromLatestCompactionBoundary,
@@ -28,6 +29,18 @@ import {
 import type { HistoryService } from "./historyService";
 import type { CompactionHandler } from "./compactionHandler";
 import { log } from "./log";
+
+/**
+ * Gemini 4 Hydrogen binds each thought signature to the request prefix it followed and
+ * returns 400 when a same-model replay changes that prefix (its Agent Platform guide;
+ * Xum cannot send prefix_mismatch_behavior DROP). A mid-stream swap replaces the prefix
+ * under the live steps, whose function calls must keep their signatures: Gemini also
+ * returns 400 for an active-turn call without one. So a Hydrogen turn takes the durable
+ * fallback instead: it stops, applies the compaction and continues after a user turn.
+ */
+function bindsThoughtSignaturesToPrefix(model: string): boolean {
+  return stripModelProviderPrefixes(model).startsWith("gemini-4-hydrogen");
+}
 
 export interface ContinuousCompactionContext {
   enabled: boolean;
@@ -520,7 +533,8 @@ export class ContinuousCompactor {
     if (
       this.swapAttempted === staged ||
       !this.deps.prepareSwap ||
-      !this.deps.streamManager.setPrefixSwap
+      !this.deps.streamManager.setPrefixSwap ||
+      bindsThoughtSignaturesToPrefix(context.model)
     )
       return false;
     this.swapAttempted = staged;

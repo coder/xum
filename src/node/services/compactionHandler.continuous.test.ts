@@ -175,9 +175,7 @@ describe("continuous compaction provider replay", () => {
     );
     expect(answerCopy.metadata?.stepStartPartIndices).toEqual([0, 2]);
     expect(answerCopy.parts[0]).toEqual({ type: "reasoning", text: "plan" });
-    expect(answerCopy.parts[4]).toMatchObject({
-      providerOptions: { google: { thoughtSignature: "g" } },
-    });
+    expect(answerCopy.parts[4]).toEqual({ type: "reasoning", text: "gemini thought" });
     for (const part of answerCopy.parts) {
       if (part.type !== "reasoning") continue;
       expect(part.signature).toBeUndefined();
@@ -217,6 +215,70 @@ describe("continuous compaction provider replay", () => {
       message.role === "assistant" && typeof message.content !== "string" ? message.content : []
     );
     expect(assistantParts.some((part) => part.type === "tool-call")).toBe(true);
+  });
+
+  it("builds tail copies whose Gemini requests replay no thought signatures", async () => {
+    // Gemini 4 Hydrogen binds each thought signature to the prefix it followed. The summary
+    // replaced that prefix, so a replayed signature would fail the request (HTTP 400).
+    const handler = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir: path.join(store.tempDir, "pending"),
+      emitter: new EventEmitter(),
+    });
+    const prompt = createMuxMessage("recent-user", "user", "Verify the fix");
+    const answer = createMuxMessage("recent-answer", "assistant", "", {
+      stepStartPartIndices: [0],
+    });
+    answer.parts = [
+      {
+        type: "reasoning",
+        text: "plan",
+        providerOptions: { google: { thoughtSignature: "sig-thought" } },
+      },
+      {
+        type: "dynamic-tool",
+        toolCallId: "check",
+        toolName: "bash",
+        state: "output-available",
+        input: { script: "bun test", timeout_secs: 10 },
+        output: { success: true, output: "Tests passed" },
+        providerOptions: { google: { thoughtSignature: "sig-call" } },
+      },
+      { type: "text", text: "Done" },
+    ];
+    const { boundary, copies } = handler.buildContinuousCompactionRows({
+      messages: [],
+      text: "Summary",
+      model: "google:gemini-4-hydrogen",
+      tail: [prompt, answer],
+      systemMessageTokens: 0,
+      attachmentTokens: 0,
+    });
+    const toGemini = async (rows: MuxMessage[]) =>
+      JSON.stringify(
+        await prepareMessagesForProvider({
+          messagesWithSentinel: rows.map((row, index) => ({
+            ...row,
+            metadata: { ...row.metadata, historySequence: index },
+          })),
+          effectiveAgentId: "exec",
+          toolNamesForSentinel: [],
+          providerForMessages: "google",
+          effectiveThinkingLevel: "high",
+          modelString: "google:gemini-4-hydrogen",
+          workspaceId,
+          toolCallReplayNamespace: "google",
+        })
+      );
+    // Control: the original rows replay both signatures.
+    const original = await toGemini([prompt, answer]);
+    expect(original).toContain("sig-thought");
+    expect(original).toContain("sig-call");
+    const compacted = await toGemini([boundary, ...copies]);
+    expect(compacted).not.toContain("sig-");
+    expect(compacted).toContain('"toolCallId":"check"');
+    expect(compacted).toContain("Tests passed");
   });
 
   for (const provider of ["anthropic", "openai"]) {
