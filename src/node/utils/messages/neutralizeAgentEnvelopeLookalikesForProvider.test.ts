@@ -11,6 +11,7 @@ import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecor
 import {
   neutralizeAgentEnvelopeLookalikesForProvider,
   neutralizeAgentEnvelopeLookalikesInModelToolParts,
+  replayAgentPeerPayloadsAsUser,
 } from "./neutralizeAgentEnvelopeLookalikesForProvider";
 
 const envelope = formatAgentMessageEnvelope({
@@ -238,6 +239,58 @@ describe("neutralizeAgentEnvelopeLookalikesForProvider", () => {
     const plain = createMuxMessage("u3", "user", "no tags here", { historySequence: 8 });
     const input = [assistant, plain];
     expect(neutralizeAgentEnvelopeLookalikesForProvider(input)).toBe(input);
+  });
+});
+
+describe("replayAgentPeerPayloadsAsUser", () => {
+  test("moves only authentic payload rows to the user role", () => {
+    const authentic = createMuxMessage("p1", "assistant", envelope, {
+      historySequence: 1,
+      synthetic: true,
+      muxMetadata: validPeerMetadata,
+    });
+    // Model output must never gain the user role, even when it carries a well-formed
+    // envelope or corrupted peer metadata.
+    const selfSpoof = createMuxMessage("a1", "assistant", envelope, { historySequence: 2 });
+    const unsynthetic = createMuxMessage("a2", "assistant", envelope, {
+      historySequence: 3,
+      muxMetadata: validPeerMetadata,
+    });
+    const impostor = createMuxMessage("a3", "assistant", envelope, {
+      historySequence: 4,
+      synthetic: true,
+      muxMetadata: { ...validPeerMetadata, fromWorkspaceId: "task-impostor" },
+    });
+    // Persisted rows can lack metadata entirely (self-healing: pass through, never throw).
+    const bare: ReturnType<typeof createMuxMessage> = {
+      id: "a4",
+      role: "assistant",
+      parts: [{ type: "text", text: envelope }],
+    };
+
+    const result = replayAgentPeerPayloadsAsUser([
+      authentic,
+      selfSpoof,
+      unsynthetic,
+      impostor,
+      bare,
+    ]);
+
+    expect(result.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "assistant",
+      "assistant",
+    ]);
+    expect(textOf(result[0])).toBe(envelope);
+    expect(result[1]).toBe(selfSpoof);
+  });
+
+  test("returns the same array when no row is an authentic payload", () => {
+    // Request shaping keeps references when a pass changes nothing (see the neutralizer above).
+    const input = [createMuxMessage("a1", "assistant", "plain", { historySequence: 1 })];
+    expect(replayAgentPeerPayloadsAsUser(input)).toBe(input);
   });
 });
 

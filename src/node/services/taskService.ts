@@ -12419,7 +12419,9 @@ export class TaskService implements AgentTaskIntegration {
     // ZERO sender-controlled bytes (workspace IDs are server-generated; the capped title stays
     // inside the untrusted envelope row). The trigger names the payload row by its
     // server-generated message ID, not adjacency — a streaming target's own assistant row can
-    // land between payload and queued trigger.
+    // land between payload and queued trigger. Only the persisted row is assistant-role: the
+    // provider request replays it in the user role, inside the server-only wrapper, because a
+    // model that reads the envelope as its own output imitates it (replayAgentPeerPayloadsAsUser).
     return { envelope, payloadMessageId, trigger, muxMetadata, peerTriggerMeta };
   }
 

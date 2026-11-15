@@ -2,6 +2,7 @@ import {
   getValidAgentPeerMessageMeta,
   neutralizeAgentEnvelopeLookalikes,
   parseAgentMessageEnvelope,
+  type AgentPeerMessageMeta,
 } from "@/common/utils/agentMessageEnvelope";
 import {
   getAuthenticPlanReviewRecord,
@@ -43,30 +44,7 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
     if (msg.role !== "user" && msg.role !== "assistant") {
       return msg;
     }
-    // Exempt only rows the peer send path could have authored: assistant role, SYNTHETIC
-    // provenance (the send path persists payload rows exclusively as synthetic pre-turn rows —
-    // ordinary model output can carry corrupted-but-valid-looking metadata, never this marker),
-    // VALID peer metadata, AND text that is exactly a well-formed envelope whose sender fields
-    // MATCH the metadata (the send path writes both from the same values). A corrupted row
-    // carrying just the discriminator, lookalike text, or an inconsistent metadata/envelope pair
-    // — where the UI would attribute one sender while the provider reads another — must not
-    // smuggle the exact wrapper past neutralization. The exemption covers TEXT parts only; tool
-    // parts are never authentic envelopes.
-    const meta = getValidAgentPeerMessageMeta(msg.metadata?.muxMetadata);
-    const isAuthenticPeerRow =
-      msg.role === "assistant" &&
-      msg.metadata?.synthetic === true &&
-      meta != null &&
-      msg.parts.every((part) => {
-        if (part.type !== "text") return true;
-        const parsed = parseAgentMessageEnvelope(part.text);
-        return (
-          parsed != null &&
-          parsed.from === meta.fromWorkspaceId &&
-          parsed.relationship === meta.relationship &&
-          parsed.fromTitle === meta.fromTitle
-        );
-      });
+    const isAuthenticPeerRow = isAuthenticAgentPeerPayloadRow(msg);
 
     // Plan feedback is authentic only when the row's `plan-review` metadata and its single
     // envelope text part describe the same record (getAuthenticPlanReviewRecord); a row that
@@ -118,6 +96,61 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
     return { ...msg, parts: nextParts };
   });
 
+  return didChange ? result : messages;
+}
+
+/**
+ * True only for a row the peer send path could have authored: assistant role, SYNTHETIC
+ * provenance (the send path persists payload rows exclusively as synthetic pre-turn rows —
+ * ordinary model output can carry corrupted-but-valid-looking metadata, never this marker),
+ * VALID peer metadata, AND text that is exactly a well-formed envelope whose sender fields
+ * MATCH the metadata (the send path writes both from the same values). A corrupted row
+ * carrying just the discriminator, lookalike text, or an inconsistent metadata/envelope pair
+ * — where the UI would attribute one sender while the provider reads another — must not
+ * smuggle the exact wrapper past neutralization. Only TEXT parts are checked; tool parts are
+ * never authentic envelopes.
+ */
+function isAuthenticAgentPeerPayloadRow(msg: MuxMessage): boolean {
+  if (msg.role !== "assistant" || msg.metadata?.synthetic !== true) return false;
+  const meta = getValidAgentPeerMessageMeta(msg.metadata.muxMetadata);
+  return (
+    meta != null &&
+    msg.parts.every((part) => part.type !== "text" || isEnvelopeFromSender(part.text, meta))
+  );
+}
+
+function isEnvelopeFromSender(text: string, meta: AgentPeerMessageMeta): boolean {
+  const parsed = parseAgentMessageEnvelope(text);
+  return (
+    parsed != null &&
+    parsed.from === meta.fromWorkspaceId &&
+    parsed.relationship === meta.relationship &&
+    parsed.fromTitle === meta.fromTitle
+  );
+}
+
+/**
+ * Replay authentic peer payload rows to the model in the user role. Request-only: the persisted
+ * row stays assistant-role, so no user-row parsing (mentions, skills, commands) ever sees peer
+ * bytes, the UI card and pairing are unchanged, and the turn is still driven by the fixed
+ * zero-peer-byte trigger.
+ *
+ * Why: in the assistant role the model reads a peer's envelope as text it wrote itself, and
+ * models continue that pattern instead of acting on it. A woken recipient whose only prior
+ * assistant turn was the payload echoed the envelope and stopped; a sender wrote the reply it was
+ * waiting for as its own envelope, which the user then read as a delivery. In the user role the
+ * payload merges with its adjacent trigger into one inbound message. Run AFTER
+ * neutralizeAgentEnvelopeLookalikesForProvider: it renames the wrapper in every other row, so
+ * the exact wrapper in a user-role message is still server provenance, and the system prompt
+ * classifies it as untrusted, non-user input.
+ */
+export function replayAgentPeerPayloadsAsUser(messages: MuxMessage[]): MuxMessage[] {
+  let didChange = false;
+  const result = messages.map((msg) => {
+    if (!isAuthenticAgentPeerPayloadRow(msg)) return msg;
+    didChange = true;
+    return { ...msg, role: "user" as const };
+  });
   return didChange ? result : messages;
 }
 
