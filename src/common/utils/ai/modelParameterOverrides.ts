@@ -56,11 +56,12 @@ export function modelRejectsSamplingParameters(modelString: string): boolean {
 const PENALTY_CALL_SETTINGS = ["frequencyPenalty", "presencePenalty"] as const;
 
 /**
- * Gemini 4 Carbon returns HTTP 400 when frequency_penalty or presence_penalty is present
- * (Google's Carbon developer guide), so a wildcard penalty override would fail every request.
+ * Gemini 4 Carbon and Hydrogen return HTTP 400 when frequency_penalty or presence_penalty is
+ * present (Google's Carbon developer guide and Hydrogen's Agent Platform guide), so a
+ * wildcard penalty override would fail every request.
  */
 function modelRejectsPenaltyParameters(modelString: string): boolean {
-  return stripModelProviderPrefixes(modelString).startsWith("gemini-4-carbon");
+  return /^gemini-4-(?:carbon|hydrogen)/.test(stripModelProviderPrefixes(modelString));
 }
 
 function rejectedCallSettings(modelString: string): readonly string[] {

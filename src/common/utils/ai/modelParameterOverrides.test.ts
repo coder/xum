@@ -493,7 +493,7 @@ describe("resolveModelParameterOverrides", () => {
     }
   });
 
-  it("strips penalty parameters for Gemini 4 Carbon only", () => {
+  it("strips penalty parameters for Gemini 4 Carbon and Hydrogen only", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         seed: 42,
@@ -502,15 +502,17 @@ describe("resolveModelParameterOverrides", () => {
       },
     });
 
-    expect(
-      resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-carbon")
-    ).toEqual({ standard: { seed: 42 } });
+    for (const model of [
+      "google:gemini-4-carbon",
+      "google:gemini-4-hydrogen",
+      "google-vertex:gemini-4-hydrogen",
+    ]) {
+      expect(resolveModelParameterOverrides(providersConfig, "google", model)).toEqual({
+        standard: { seed: 42 },
+      });
+    }
     expect(
       resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-argon")
-    ).toEqual({ standard: { seed: 42, frequencyPenalty: 0.5, presencePenalty: 0.5 } });
-    // Hydrogen has no documented penalty rejection (unlike Carbon), so overrides pass through.
-    expect(
-      resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-hydrogen")
     ).toEqual({ standard: { seed: 42, frequencyPenalty: 0.5, presencePenalty: 0.5 } });
   });
 
