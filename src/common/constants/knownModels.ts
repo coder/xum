@@ -197,9 +197,9 @@ const MODEL_DEFINITIONS = {
     tokenizerOverride: "google/gemini-2.5-pro",
   },
   // Gemini 4 Hydrogen - GA on the free and paid Gemini API tiers in November 2026
-  // (stable ID `gemini-4-hydrogen`; default thinking high, native xhigh). `gemini-4`
-  // stays on Argon, which Google recommends for most work. See models-extra for limits
-  // and pricing.
+  // (stable ID `gemini-4-hydrogen`; default thinking high; its native xhigh waits on an
+  // @ai-sdk/google upgrade, see policy.ts). `gemini-4` stays on Argon, which Google
+  // recommends for most work. See models-extra for limits and pricing.
   GEMINI_4_HYDROGEN: {
     provider: "google",
     providerModelId: "gemini-4-hydrogen",
