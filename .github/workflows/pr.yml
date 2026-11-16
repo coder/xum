@@ -1338,6 +1338,10 @@ jobs:
     # Windows builds are slow - only run in merge queue and main pushes, not on every PR push
     if: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') }}
     runs-on: windows-latest
+    # Pushes to main sign with the EV key, whose service account (coder-ci)
+    # only trusts jobs in code-signing. Merge queue builds run the queued PR's
+    # code, so they get no environment and stay unsigned.
+    environment: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'code-signing' || '' }}
     permissions:
       contents: read
       id-token: write # GCP workload identity for Windows code signing
