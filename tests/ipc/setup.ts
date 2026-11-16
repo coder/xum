@@ -18,7 +18,13 @@ import type { OrpcSource } from "./helpers";
 import type { ORPCContext } from "../../src/node/orpc/context";
 import type { RuntimeConfig } from "../../src/common/types/runtime";
 import { createOrpcTestClient, type OrpcTestClient } from "./orpcTestClient";
-import { shouldRunIntegrationTests, validateApiKeys, getApiKey } from "../testUtils";
+import {
+  shouldRunIntegrationTests,
+  validateApiKeys,
+  getApiKey,
+  DUMMY_API_KEY,
+  DUMMY_PROVIDER_CONFIG,
+} from "../testUtils";
 
 export interface TestEnvironment {
   config: Config;
@@ -54,7 +60,9 @@ function createMockBrowserWindow(): BrowserWindow {
 /**
  * Create a test environment with temporary config and service container
  */
-export async function createTestEnvironment(): Promise<TestEnvironment> {
+export async function createTestEnvironment(
+  options: { seedDummyProviders?: boolean } = {}
+): Promise<TestEnvironment> {
   // Create temporary directory for test config
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-"));
 
@@ -66,10 +74,11 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   // are configured. For non-integration tests, seed a dummy provider so the UI can render.
   //
   // For integration tests (TEST_INTEGRATION=1), do NOT write dummy keys here (they would override
-  // real env-backed credentials used by tests like name generation).
+  // real env-backed credentials used by tests like name generation). They get one below, and only
+  // when the environment configures no provider.
   if (!shouldRunIntegrationTests()) {
     stores.providersConfigStore.saveProvidersConfig({
-      anthropic: { apiKey: "test-key-for-ui-tests" },
+      anthropic: { apiKey: DUMMY_API_KEY },
     });
   }
 
@@ -91,13 +100,33 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   const orpcContext: ORPCContext = services.toORPCContext();
   const orpc = createOrpcTestClient(orpcContext);
 
-  return {
+  const env: TestEnvironment = {
     config,
     services,
     mockWindow,
     tempDir,
     orpc,
   };
+
+  // CI has provider keys in the environment, so the UI finds configured providers and this seeds
+  // nothing. A run without keys has none: ProjectPage then shows its configure prompt instead of
+  // the creation composer, and compaction has no larger-context OpenAI model to suggest. Give
+  // that run both providers, on a dummy that cannot reach the API. It seeds only when nothing is
+  // configured: tests such as sendMessage.errors delete one provider's key and expect that
+  // provider unconfigured while another stays configured. A suite that needs one specific
+  // provider seeds it itself (getProviderConfigOrDummy).
+  if (
+    shouldRunIntegrationTests() &&
+    options.seedDummyProviders !== false &&
+    !Object.values(services.providerService.getConfig()).some((provider) => provider?.isConfigured)
+  ) {
+    await setupProviders(env, {
+      anthropic: DUMMY_PROVIDER_CONFIG,
+      openai: DUMMY_PROVIDER_CONFIG,
+    });
+  }
+
+  return env;
 }
 
 /**
@@ -321,7 +350,7 @@ export async function setupWorkspaceWithoutProvider(branchPrefix?: string): Prom
   // Create dedicated temp git repo for this test
   const tempGitRepo = await createTempGitRepo();
 
-  const env = await createTestEnvironment();
+  const env = await createTestEnvironment({ seedDummyProviders: false });
 
   // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty prefix falls back to the default
   const branchName = generateBranchName(branchPrefix || "noapi");

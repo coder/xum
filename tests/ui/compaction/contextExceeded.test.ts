@@ -8,7 +8,7 @@
 import "../dom";
 import { waitFor } from "@testing-library/react";
 
-import { shouldRunIntegrationTests } from "../../testUtils";
+import { DUMMY_PROVIDER_CONFIG, shouldRunIntegrationTests } from "../../testUtils";
 import {
   cleanupSharedRepo,
   createSharedRepo,
@@ -83,7 +83,7 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
     await withSharedWorkspace("openai", async ({ env, workspaceId, metadata }) => {
       const cleanupDom = installDom();
 
-      await setupProviders(env, { anthropic: { apiKey: "dummy" }, xai: { apiKey: "dummy" } });
+      await setupProviders(env, { anthropic: DUMMY_PROVIDER_CONFIG, xai: DUMMY_PROVIDER_CONFIG });
       await env.orpc.config.updateAgentAiDefaults({
         agentAiDefaults: { compact: { modelString: KNOWN_MODELS.HAIKU.id } },
       });

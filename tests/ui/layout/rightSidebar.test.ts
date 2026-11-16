@@ -14,14 +14,14 @@
 import "../dom";
 import { createEvent, fireEvent, waitFor, within } from "@testing-library/react";
 
-import { getApiKey, shouldRunIntegrationTests } from "../../testUtils";
+import { shouldRunIntegrationTests } from "../../testUtils";
 import {
   cleanupSharedRepo,
   createSharedRepo,
   getSharedEnv,
   getSharedRepoPath,
 } from "../../ipc/sendMessageTestHelpers";
-import { setupProviders, type TestEnvironment } from "../../ipc/setup";
+import type { TestEnvironment } from "../../ipc/setup";
 import { generateBranchName } from "../../ipc/helpers";
 import { detectDefaultTrunkBranch } from "../../../src/node/git";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -89,10 +89,8 @@ describeIntegration("RightSidebar (UI)", () => {
     env = getSharedEnv();
     const projectPath = getSharedRepoPath();
 
-    // These UI tests don't stream or send messages, but the app expects at least one configured provider.
-    await setupProviders(env, {
-      anthropic: { apiKey: getApiKey("ANTHROPIC_API_KEY") },
-    });
+    // These UI tests don't stream or send messages. The app expects a configured provider, and
+    // createTestEnvironment makes sure there is one (a dummy when the environment has no keys).
 
     const branchName = generateBranchName("test-right-sidebar");
     const trunkBranch = await detectDefaultTrunkBranch(projectPath);
@@ -379,9 +377,15 @@ describeIntegration("RightSidebar (UI)", () => {
 
     try {
       const launcher = await findSidebarPanel(sidebar, "-panel-new");
-      await waitFor(() => {
-        expect(within(launcher).getByRole("button", { name: "Browser" })).toBeTruthy();
-      });
+      // The launcher offers the tool once the app's config snapshot reads the experiment on. That
+      // snapshot is refetched after the render, and a loaded host takes longer than waitFor's 1 s
+      // default: this wait failed on main under CPU load. The Artifacts tests wait the same way.
+      await waitFor(
+        () => {
+          expect(within(launcher).getByRole("button", { name: "Browser" })).toBeTruthy();
+        },
+        { timeout: 10_000 }
+      );
       expect(sidebar.querySelector('[role="tab"][aria-controls*="browser"]')).toBeNull();
     } finally {
       await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });

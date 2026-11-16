@@ -10,6 +10,7 @@ import "../dom";
 import { waitFor } from "@testing-library/react";
 
 import { preloadTestModules, setupProviders, type TestEnvironment } from "../../ipc/setup";
+import { DUMMY_PROVIDER_CONFIG } from "../../testUtils";
 
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 
@@ -153,8 +154,9 @@ describe("Compaction UI (mock AI router)", () => {
       // Without such a provider the UI does not auto-compact: it shows the manual "Insert /compact"
       // button, and this test waits for a summary that never comes. The mock router never calls
       // the provider, so a dummy key is enough. Seeding it here keeps the test independent of an
-      // ambient OPENAI_API_KEY.
-      await setupProviders(app.env, { openai: { apiKey: "test-key-for-ui-tests" } });
+      // ambient OPENAI_API_KEY. The dummy config's loopback baseUrl keeps a stray request off
+      // api.openai.com.
+      await setupProviders(app.env, { openai: DUMMY_PROVIDER_CONFIG });
 
       const triggerMessage = "Trigger context error";
       const userDraft = "My draft message that should be preserved";
