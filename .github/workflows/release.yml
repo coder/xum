@@ -19,11 +19,18 @@ jobs:
   preflight:
     name: Validate release target
     runs-on: ubuntu-latest
+    outputs:
+      # The ref every build job checks out. Always a tag: desktop-builds signs
+      # in the code-signing environment, which is granted from the dispatch ref
+      # (main), so it must not check out an arbitrary branch or SHA.
+      ref: ${{ steps.target.outputs.ref }}
     steps:
       - name: Ensure release tag context
+        id: target
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "$RELEASE_TAG" ]; then
             echo "::error::RELEASE_TAG is empty. Ensure this workflow runs on a release event or refs/tags/* ref."
@@ -39,7 +46,22 @@ jobs:
             fi
           fi
 
-          echo "Publishing tag $RELEASE_TAG"
+          if [ -n "$INPUT_TAG" ]; then
+            if [[ ! "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+              echo "::error::tag input must be a release tag like v1.2.3, got '$INPUT_TAG'"
+              exit 1
+            fi
+            if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$INPUT_TAG" --silent; then
+              echo "::error::tag $INPUT_TAG does not exist"
+              exit 1
+            fi
+            ref="refs/tags/$INPUT_TAG"
+          else
+            ref="$GITHUB_REF"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+          echo "Publishing tag $RELEASE_TAG from $ref"
 
   desktop-builds:
     name: Build and Release Desktop Apps
@@ -49,7 +71,7 @@ jobs:
       id-token: write # GCP workload identity for Windows code signing
     uses: ./.github/workflows/_desktop-release.yml
     with:
-      ref: ${{ inputs.tag || github.ref }}
+      ref: ${{ needs.preflight.outputs.ref }}
       release_tag: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
     secrets: inherit # zizmor: ignore[secrets-inherit] -- reusable workflow needs platform signing secrets
 
@@ -62,7 +84,7 @@ jobs:
       packages: write # Push to GHCR
     uses: ./.github/workflows/_docker-release.yml
     with:
-      ref: ${{ inputs.tag || github.ref }}
+      ref: ${{ needs.preflight.outputs.ref }}
       version: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
       is_latest: true
 
@@ -76,7 +98,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.preflight.outputs.ref }}
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
