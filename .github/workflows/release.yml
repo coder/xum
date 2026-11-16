@@ -20,9 +20,10 @@ jobs:
     name: Validate release target
     runs-on: ubuntu-latest
     outputs:
-      # The ref every build job checks out. Always a tag: desktop-builds signs
-      # in the code-signing environment, which is granted from the dispatch ref
-      # (main), so it must not check out an arbitrary branch or SHA.
+      # The commit every build job checks out: the release tag's commit, which
+      # must be on main. desktop-builds signs in the code-signing environment,
+      # which is granted from the dispatch ref (main), and v* tags are not
+      # protected, so it must not build a commit that never reached main.
       ref: ${{ steps.target.outputs.ref }}
     steps:
       - name: Ensure release tag context
@@ -51,17 +52,25 @@ jobs:
               echo "::error::tag input must be a release tag like v1.2.3, got '$INPUT_TAG'"
               exit 1
             fi
-            if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$INPUT_TAG" --silent; then
-              echo "::error::tag $INPUT_TAG does not exist"
-              exit 1
-            fi
-            ref="refs/tags/$INPUT_TAG"
+            tag_ref="refs/tags/$INPUT_TAG"
           else
-            ref="$GITHUB_REF"
+            tag_ref="$GITHUB_REF"
           fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-          echo "Publishing tag $RELEASE_TAG from $ref"
+          # Pin the build to the tag's commit, so moving the tag mid-run has
+          # no effect, and require that commit to be on main.
+          if ! sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag_ref" --jq .sha); then
+            echo "::error::tag ${tag_ref#refs/tags/} does not exist"
+            exit 1
+          fi
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...main" --jq .status)
+          if [ "$status" != "ahead" ] && [ "$status" != "identical" ]; then
+            echo "::error::${tag_ref#refs/tags/} points at $sha, which is not on main"
+            exit 1
+          fi
+          echo "ref=$sha" >> "$GITHUB_OUTPUT"
+
+          echo "Publishing tag $RELEASE_TAG from $sha (${tag_ref#refs/tags/})"
 
   desktop-builds:
     name: Build and Release Desktop Apps
