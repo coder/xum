@@ -114,6 +114,7 @@ struct Chip<Label: View>: View {
     var body: some View {
         label
             .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(Color.xText)
             .padding(.horizontal, 12)
             .frame(height: 32)
             .background(selected ? Color.xAccentSoft : Color.xFill2, in: Capsule())

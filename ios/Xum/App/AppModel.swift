@@ -153,6 +153,16 @@ final class AppModel {
         return id
     }
 
+    func fork(_ sourceId: String, message: String, model: String, agentId: String, thinking: ThinkingLevel) async throws -> String {
+        guard let c = servers.currentClient else { throw APIError.unauthorized }
+        let res = try await c.call("workspace/fork", ["sourceWorkspaceId": .string(sourceId), "pendingAutoTitle": true])
+        guard let id = res["metadata"]?["id"]?.string else { throw APIError.http(0, res["error"]?.string ?? "Could not fork") }
+        try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message),
+                                                   "options": ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue)]])
+        await list?.refresh()
+        return id
+    }
+
     func createScratch(projectPath: String?, message: String, model: String, agentId: String, thinking: ThinkingLevel) async throws -> String {
         guard let c = servers.currentClient else { throw APIError.unauthorized }
         _ = projectPath

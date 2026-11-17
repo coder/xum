@@ -19,7 +19,8 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .center)
             }
         }
-        .listStyle(.plain)
+        .listStyle(.insetGrouped)
+        .listSectionSpacing(20)
         .scrollContentBackground(.hidden)
         .background(Color.xBg2.ignoresSafeArea())
         .navigationTitle("Settings")
@@ -35,16 +36,7 @@ struct SettingsView: View {
         content()
             .listRowInsets(EdgeInsets())
             .listRowSeparator(.hidden)
-            .listRowBackground(
-                UnevenRoundedRectangle(
-                    topLeadingRadius: first ? 26 : 0,
-                    bottomLeadingRadius: last ? 26 : 0,
-                    bottomTrailingRadius: last ? 26 : 0,
-                    topTrailingRadius: first ? 26 : 0,
-                    style: .continuous
-                )
-                .fill(Color.xCell)
-            )
+            .listRowBackground(Color.xCell)
             .overlay(alignment: .bottom) {
                 if !last { Rectangle().fill(Color.xSep).frame(height: 0.5).padding(.leading, 58) }
             }
@@ -106,7 +98,7 @@ struct SettingsView: View {
             switch state {
             case .online(let ms, let version):
                 StatusDot(color: .xOk)
-                Text("Connected · v\(version) · \(ms) ms")
+                Text("Connected · \(version) · \(ms) ms")
             case .checking:
                 StatusDot(color: .xText3)
                 Text("Checking…")
@@ -175,7 +167,7 @@ struct SettingsView: View {
                 .frame(minHeight: 52)
             }
         } header: {
-            SectionCaption(text: "This iPhone").padding(.leading, 20).textCase(nil)
+            SectionCaption(text: "This iPhone").textCase(nil)
         }
     }
 
@@ -218,7 +210,7 @@ struct SettingsView: View {
                 }
             }
         } header: {
-            SectionCaption(text: "On \(serverName)").padding(.leading, 20).textCase(nil)
+            SectionCaption(text: "On \(serverName)").textCase(nil)
         }
     }
 

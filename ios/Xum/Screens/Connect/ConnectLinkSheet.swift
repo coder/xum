@@ -76,9 +76,8 @@ struct ConnectLinkSheet: View {
                     Button { dismiss() } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 15, weight: .semibold))
-                            .frame(width: 44, height: 44)
+                            .foregroundStyle(Color.xText)
                     }
-                    .glassCapsule()
                 }
                 ToolbarItem(placement: .principal) {
                     Text("Connection Link").font(.system(size: 17, weight: .semibold))

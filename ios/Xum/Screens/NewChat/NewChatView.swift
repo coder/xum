@@ -18,7 +18,7 @@ struct NewChatView: View {
     @State private var sending = false
     @State private var error: String?
 
-    enum StartFrom: Hashable { case workspace, scratch }
+    enum StartFrom: Hashable { case workspace, scratch, fork }
 
     var body: some View {
         NavigationStack {
@@ -46,7 +46,7 @@ struct NewChatView: View {
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
             }
-            .background(Color.xBg.ignoresSafeArea())
+            .background(Color.xBg2.ignoresSafeArea())
             .navigationTitle("New Chat")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -54,7 +54,7 @@ struct NewChatView: View {
                     Button {
                         model.sheet = nil
                     } label: {
-                        Image(systemName: "xmark")
+                        Image(systemName: "xmark").foregroundStyle(Color.xText)
                     }
                     .accessibilityLabel("Close")
                 }
@@ -97,6 +97,7 @@ struct NewChatView: View {
                 }
                 Text(projectCaption)
                     .font(.xMono(13))
+                    .lineLimit(1).truncationMode(.middle)
                     .foregroundStyle(Color.xText2)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -109,8 +110,8 @@ struct NewChatView: View {
     /// `~/src/xum · devbox`: home dir abbreviated, then the server name.
     private var projectCaption: String {
         let path = selectedProject?.path ?? ""
-        let home = NSHomeDirectory()
-        let short = path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+        // The path is on the server, so abbreviate its home directory, not the phone's.
+        let short = path.replacingOccurrences(of: #"^/(Users|home)/[^/]+"#, with: "~", options: .regularExpression)
         var parts: [String] = []
         if !short.isEmpty { parts.append(short) }
         if let server = model.servers.current?.name, !server.isEmpty { parts.append(server) }
@@ -144,16 +145,19 @@ struct NewChatView: View {
                     }
                 }
                 separator
-                startRow(kind: nil, tile: NewChatTile.forkBlue, icon: "arrow.triangle.branch") {
+                startRow(kind: mostRecentWorkspace == nil ? nil : .fork, tile: NewChatTile.forkBlue, icon: "arrow.triangle.branch") {
                     HStack(spacing: 5) {
                         Text("Fork").font(.system(size: 16)).foregroundStyle(Color.xText)
                         if let name = mostRecentWorkspaceName {
-                            Text(name).font(.xMono(14.5, weight: .medium)).foregroundStyle(Color.xText2)
+                            Text(name).font(.xMono(14.5, weight: .medium)).foregroundStyle(Color.xText)
+                                .lineLimit(1).truncationMode(.middle)
                         }
                     }
-                } trailing: { EmptyView() }
-                .disabled(true)
-                .opacity(0.55)
+                } trailing: {
+                    if startFrom == .fork {
+                        Image(systemName: "checkmark").font(.system(size: 14, weight: .semibold)).foregroundStyle(Color.xAccent)
+                    }
+                }
                 separator
                 startRow(kind: nil, tile: NewChatTile.rust, icon: "cpu") {
                     HStack(spacing: 5) {
@@ -192,12 +196,13 @@ struct NewChatView: View {
     }
 
     /// Newest checkout of the selected project, for the (disabled) Fork row.
-    private var mostRecentWorkspaceName: String? {
+    private var mostRecentWorkspaceName: String? { mostRecentWorkspace?.displayName }
+
+    private var mostRecentWorkspace: Workspace? {
         guard let list = model.list, let path = selectedProject?.path else { return nil }
         return list.workspaces
             .filter { $0.projectPath == path && !$0.isScratch && $0.parentWorkspaceId == nil }
-            .max { (list.activity[$0.id]?.recency ?? $0.createdAt ?? .distantPast) < (list.activity[$1.id]?.recency ?? $1.createdAt ?? .distantPast) }?
-            .displayName
+            .max { (list.activity[$0.id]?.recency ?? $0.createdAt ?? .distantPast) < (list.activity[$1.id]?.recency ?? $1.createdAt ?? .distantPast) }
     }
 
     // MARK: Setup chips
@@ -216,7 +221,7 @@ struct NewChatView: View {
                 Chip {
                     HStack(spacing: 6) {
                         Image(systemName: "arrow.triangle.branch").font(.system(size: 12)).foregroundStyle(Color.xAccent)
-                        Text(runtime.label)
+                        Text(runtime.label).fixedSize()
                         Image(systemName: "chevron.down").font(.system(size: 11)).foregroundStyle(Color.xText2)
                     }
                 }
@@ -343,6 +348,11 @@ struct NewChatView: View {
     }
 
     private var sendButton: some View {
+        HStack(spacing: 14) {
+        Image(systemName: "paperclip")
+            .font(.system(size: 17))
+            .foregroundStyle(Color.xText2)
+            .accessibilityLabel("Attach")
         Button {
             Task { await send() }
         } label: {
@@ -355,6 +365,7 @@ struct NewChatView: View {
         .buttonStyle(.plain)
         .disabled(!canSend)
         .accessibilityLabel("Start")
+        }
     }
 
     private var canSend: Bool {
@@ -389,7 +400,9 @@ struct NewChatView: View {
         defer { sending = false }
         do {
             let id: String
-            if startFrom == .scratch {
+            if startFrom == .fork, let source = mostRecentWorkspace {
+                id = try await model.fork(source.id, message: message, model: modelId, agentId: agentId, thinking: thinking)
+            } else if startFrom == .scratch {
                 id = try await model.createScratch(projectPath: selectedProject?.path, message: message,
                                                    model: modelId, agentId: agentId, thinking: thinking)
             } else {

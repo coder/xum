@@ -73,9 +73,8 @@ struct ServersSheet: View {
                     Button { dismiss() } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 15, weight: .semibold))
-                            .frame(width: 44, height: 44)
+                            .foregroundStyle(Color.xText)
                     }
-                    .glassCapsule()
                 }
                 ToolbarItem(placement: .principal) {
                     Text("Servers").font(.system(size: 17, weight: .semibold))
@@ -91,9 +90,8 @@ struct ServersSheet: View {
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: 17, weight: .medium))
-                            .frame(width: 44, height: 44)
+                            .foregroundStyle(Color.xText)
                     }
-                    .glassCapsule()
                 }
             }
             .task { await model.servers.refreshAll() }
@@ -184,7 +182,7 @@ private struct CurrentServerCard: View {
                     .foregroundStyle(Color.xText)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                Text("Current")
+                Text("CURRENT")
                     .font(.xCaption)
                     .kerning(0.4)
                     .foregroundStyle(Color.xAccent)
