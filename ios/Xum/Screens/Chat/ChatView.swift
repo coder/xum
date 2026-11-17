@@ -28,6 +28,7 @@ struct ChatView: View {
         .background { Color.xBg.ignoresSafeArea() }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
+        .toolbar(.hidden, for: .tabBar)
         .onAppear(perform: attach)
         .sheet(item: $selectedTool) { tool in
             ToolDetailSheet(tool: tool) { prefill in
@@ -206,7 +207,7 @@ struct ChatView: View {
             }
             if let question = store.pendingQuestion {
                 QuestionCard(question: question) { answers in
-                    Task { try? await store.answer(toolCallId: question.toolCallId, answers: answers) }
+                    Task { try? await store.answer(question, answers: answers) }
                 }
             } else {
                 Composer(
@@ -290,9 +291,7 @@ struct ChatView: View {
                 .foregroundStyle(Color.xText)
                 .accessibilityLabel("More")
             }
-            .padding(.horizontal, 8)
-            .frame(height: 34)
-            .glassCapsule()
+
         }
     }
 

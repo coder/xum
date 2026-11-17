@@ -261,9 +261,10 @@ struct QuestionCard: View {
                     Text("Something else…")
                         .font(.system(size: 15))
                         .foregroundStyle(Color.xText2)
+                    Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 14)
-                .frame(minHeight: 44)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                 .background(Color.xFill2, in: RoundedRectangle(cornerRadius: 18))
                 .contentShape(Rectangle())
             }

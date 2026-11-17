@@ -168,7 +168,7 @@ struct ToolRow: View {
                 durationText
             }
         } else if let label = ToolMeta.trailingLabel(tool) {
-            Text(label).foregroundStyle(Color.xText3)
+            Text(label).font(.xMono(13)).foregroundStyle(Color.xText3)
         }
     }
 

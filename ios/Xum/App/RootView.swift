@@ -45,7 +45,7 @@ struct CompactRootView: View {
             Tab("Workspaces", systemImage: "folder", value: AppTab.workspaces) {
                 NavigationStack(path: $model.path) {
                     WorkspacesView()
-                        .navigationDestination(for: String.self) { ChatView(workspaceId: $0) }
+                        .navigationDestination(for: String.self) { ChatView(workspaceId: $0).id($0) }
                 }
             }
             Tab("Inbox", systemImage: "tray", value: AppTab.inbox) {

@@ -303,6 +303,14 @@ final class ChatStore {
                             model: meta?["model"]?.string, agentId: meta?["agentId"]?.string,
                             timestamp: date(meta?["timestamp"]), historySequence: meta?["historySequence"]?.int)
         if role == .assistant, let ctx = meta?["contextUsage"]?["inputTokens"]?.int { contextTokens = ctx }
+        // Persisted tool parts carry only their end time; each one started when the previous step
+        // ended (or the turn began), which gives rows and groups their durations.
+        var cursor = m.timestamp
+        for i in m.parts.indices {
+            guard case .tool(var t) = m.parts[i] else { continue }
+            if t.startedAt == nil, let c = cursor, let e = t.endedAt, e >= c { t.startedAt = c; m.parts[i] = .tool(t) }
+            if let e = t.endedAt { cursor = e }
+        }
         if m.parts.isEmpty, role == .assistant, messages.contains(where: { $0.id == id }) { return }
         if let existing = messages.first(where: { $0.id == id }) {
             m.isStreaming = existing.isStreaming && streamingMessageId == id

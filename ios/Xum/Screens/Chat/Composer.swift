@@ -68,6 +68,8 @@ struct Composer: View {
         Button { showPicker = true } label: {
             content()
                 .font(.system(size: 15, weight: .medium))
+                .lineLimit(1)
+                .fixedSize()
                 .padding(.horizontal, 12)
                 .frame(height: 32)
                 .background(Color.xFill2, in: Capsule())
@@ -80,22 +82,16 @@ struct Composer: View {
     private var contextChip: some View {
         HStack(spacing: 6) {
             ContextRing(fraction: contextFraction)
-            if let f = contextFraction {
-                Text("\(Int((f * 100).rounded()))%")
-                    .font(.xCaption)
-                    .foregroundStyle(Color.xText3)
-            }
         }
-        .padding(.horizontal, 8)
-        .frame(height: 32)
-        .background(Color.xFill2, in: Capsule())
+        .frame(width: 32, height: 32)
+        .background(Color.xFill2, in: Circle())
         .accessibilityLabel(contextFraction.map { "Context \(Int(($0 * 100).rounded()))% used" } ?? "Context usage")
     }
 
     private var attachButton: some View {
         Button { } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 16))
+            Image(systemName: "paperclip")
+                .font(.system(size: 17))
                 .frame(width: 34, height: 34)
                 .contentShape(Rectangle())
         }
