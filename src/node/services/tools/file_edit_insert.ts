@@ -1,3 +1,4 @@
+import { fileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { tool } from "ai";
 import type { FileEditInsertToolArgs, FileEditInsertToolResult } from "@/common/types/tools";
 import {
@@ -58,7 +59,13 @@ export const createFileEditInsertTool: ToolFactory = (config: ToolConfiguration)
           correctedPath,
           warning: pathWarning,
           resolvedPath,
-        } = resolvePathWithinCwd(path, config.cwd, config.runtime);
+        } = await resolvePathWithinCwd(
+          path,
+          config.cwd,
+          config.runtime,
+          "write",
+          fileToolSandboxContext(config)
+        );
         path = correctedPath;
 
         // Validate plan mode access restrictions

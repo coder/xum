@@ -26,8 +26,11 @@ export type PluginsSectionIntent =
   | { type: "review-components"; name: string }
   /** Open the uninstall confirmation for a managed plugin. */
   | { type: "confirm-uninstall"; name: string }
-  /** Show the in-place update review for a capability-changing update the palette previewed. */
-  | { type: "review-update"; review: AgentPluginUpdateReview }
+  /**
+   * Show the in-place update reviews of the capability-changing updates the palette previewed:
+   * the first opens, and each confirm or cancel opens the next.
+   */
+  | { type: "review-updates"; reviews: readonly AgentPluginUpdateReview[] }
   /** Backend plugin state changed outside the section (e.g. palette Update All); re-query. */
   | { type: "refresh" }
   /**

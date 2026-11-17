@@ -19,7 +19,7 @@ import type {
 } from "@/common/orpc/schemas/agentPlugins";
 
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
-import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
+import { publishPluginsSectionIntent, type PluginsSectionIntent } from "./pluginsSectionIntents";
 
 /** 1x1 PNG: the backend sends logos as data URLs, never paths. */
 const LOGO_DATA_URL =
@@ -232,11 +232,17 @@ function splitProseWords(element: HTMLElement): string[] {
   return split;
 }
 
-const PluginsSectionStoryShell: FC<{ options: MockORPCClientOptions; children: ReactNode }> = (
-  props
-) => {
+const PluginsSectionStoryShell: FC<{
+  options: MockORPCClientOptions;
+  /** A palette intent that arrived before the section mounted: buffered for its mount. */
+  intent?: PluginsSectionIntent;
+  children: ReactNode;
+}> = (props) => {
   const clientRef = useRef<APIClient | null>(null);
-  clientRef.current ??= createMockORPCClient(props.options);
+  if (clientRef.current === null) {
+    if (props.intent !== undefined) publishPluginsSectionIntent(props.intent);
+    clientRef.current = createMockORPCClient(props.options);
+  }
 
   return (
     <ThemeProvider>
@@ -354,7 +360,7 @@ export const InstalledPhoneViewport: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText("grill");
     await canvas.findByText("update available");
-    await canvas.findByRole("button", { name: /Update/ });
+    await canvas.findByRole("button", { name: /^Update$/ });
     await expectInterfaceAsText(canvasElement);
     // Max-length separator-free names must wrap instead of overflowing the
     // card's right edge at phone width: checked in the sweep below, down to 320 px.
@@ -815,6 +821,128 @@ export const UpdateRequiresReviewPhoneViewport: Story = {
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("Update review overflows its card at phone width");
     }
+  },
+};
+
+const UPDATE_ALL_OPTIONS: MockORPCClientOptions = {
+  agentPlugins: {
+    items: [MANAGED_ITEM, PINNED_ITEM, MISSING_ITEM],
+    updateChecks: [
+      {
+        name: "grill",
+        status: "update-available",
+        remoteSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+      },
+      {
+        name: "deploy-tools",
+        status: "update-available",
+        remoteSha: "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4",
+      },
+      { name: "vanished", status: "up-to-date" },
+    ],
+  },
+};
+
+async function findUpdateAllHeader(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  const updateAll = await canvas.findByRole("button", { name: "Update all (2)" });
+  const check = canvas.getByRole("button", { name: "Check for updates" });
+  const add = canvas.getByRole("button", { name: "Add plugin" });
+  return { updateAll, check, add };
+}
+
+/**
+ * Out of Pixel snapshots (snapshot budget): InstalledWithUpdateStates and InstalledPhoneViewport
+ * already snapshot the header with the button, so the plays check the layout here.
+ */
+export const UpdateAllPending: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={UPDATE_ALL_OPTIONS}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const { updateAll, check, add } = await findUpdateAllHeader(canvasElement);
+    if (new Set([updateAll, check, add].map((b) => b.getBoundingClientRect().top)).size !== 1) {
+      throw new Error("Header buttons do not share one row at desktop width");
+    }
+  },
+};
+
+export const UpdateAllPendingPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: { layout: "fullscreen", pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={UPDATE_ALL_OPTIONS}>
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    const { updateAll, check, add } = await findUpdateAllHeader(canvasElement);
+    // 390 px is the iPhone width; sweep down to 320 px, the narrowest phone.
+    for (let width = 320; width <= 390; width += 10) {
+      wrapper.style.width = `${width}px`;
+      const edge = wrapper.getBoundingClientRect().right;
+      for (const button of [updateAll, check, add]) {
+        const box = button.getBoundingClientRect();
+        if (box.right > edge + 1 || box.left < wrapper.getBoundingClientRect().left - 1) {
+          throw new Error(`${button.textContent} leaves the section at ${width}px`);
+        }
+      }
+      if (wrapper.scrollWidth > wrapper.clientWidth + 1) {
+        throw new Error(`The section overflows horizontally at ${width}px`);
+      }
+    }
+  },
+};
+
+const UPDATE_ALL_REVIEWS = [
+  {
+    name: "grill",
+    fromSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    toSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+    changes: [{ summary: "adds skill 'grill-harder'" }],
+    warnings: [],
+  },
+  {
+    name: "deploy-tools",
+    fromSha: "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1",
+    toSha: "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4",
+    changes: [{ summary: "adds MCP server 'pager'", after: "node pager.js" }],
+    warnings: [],
+  },
+];
+
+export const UpdateAllReviewQueue: Story = {
+  // Out of Pixel snapshots (snapshot budget): the review panel is snapshotted by UpdateRequiresReview.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={UPDATE_ALL_OPTIONS}
+      intent={{ type: "review-updates", reviews: UPDATE_ALL_REVIEWS }}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(/adds skill 'grill-harder'/);
+    await expect(canvas.queryByText(/adds MCP server 'pager'/)).toBeNull();
+    await expect(canvas.getAllByRole("button", { name: /Apply update/ })).toHaveLength(1);
+
+    await userEvent.click(canvas.getByRole("button", { name: "Cancel" }));
+    await canvas.findByText(/adds MCP server 'pager'/);
+    await expect(canvas.queryByText(/adds skill 'grill-harder'/)).toBeNull();
+    await expect(canvas.getAllByRole("button", { name: /Apply update/ })).toHaveLength(1);
   },
 };
 

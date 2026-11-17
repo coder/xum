@@ -86,7 +86,7 @@ test("an update reloads an open hook review", async () => {
   );
   fireEvent.click(await view.findByRole("button", { name: "Review hooks for grill" }));
   await view.findByText(/old_tool/);
-  fireEvent.click(await view.findByRole("button", { name: /^Update/ }));
+  fireEvent.click(await view.findByRole("button", { name: /^Update$/ }));
 
   // Wait for the new hook, then check the old one is gone. Do not poll
   // `expect(queryByText(/old_tool/)).toBeNull()`: each failing check makes Bun
@@ -383,7 +383,7 @@ test("the update review marks a bidi character in a warning", async () => {
       </TooltipProvider>
     </APIProvider>
   );
-  fireEvent.click(await view.findByRole("button", { name: /^Update/ }));
+  fireEvent.click(await view.findByRole("button", { name: /^Update$/ }));
 
   await view.findByText("plugin.json#hooks: '<U+202E>stop' must be an array of hooks; ignoring it");
   expect(view.container.textContent).not.toContain("\u202E");

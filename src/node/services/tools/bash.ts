@@ -28,6 +28,7 @@ import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { getToolEnvPath } from "@/node/services/hooks";
 import { isLocalBaseRuntime } from "@/node/runtime/Runtime";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
 import {
   combineGitNoRepoAutomationEnvs,
   gitHooksAllowed,
@@ -38,6 +39,12 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
+import {
+  requestSandboxApproval,
+  SANDBOX_APPROVAL_DENIED,
+  sandboxExecOptions,
+  withSandboxDenials,
+} from "./bashSandbox";
 import { skillFileBashHint } from "./skillFileHint";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
@@ -1055,7 +1062,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
     description: buildBashToolDescription(config.cwd, config.projects ?? []),
     inputSchema: TOOL_DEFINITIONS.bash.schema,
     execute: async (
-      { script, timeout_secs, run_in_background, display_name, monitor },
+      { script, timeout_secs, run_in_background, display_name, monitor, outside_sandbox_reason },
       { abortSignal, toolCallId }
     ): Promise<BashToolResult> => {
       // Validate script input
@@ -1147,6 +1154,24 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
+      // One wait for both paths. It comes before exec(), so timeout_secs does not count it.
+      // Stop denies. With no user to ask (xum run, ACP), the request is denied at once.
+      const approval = await requestSandboxApproval(
+        config,
+        toolCallId,
+        script,
+        outside_sandbox_reason,
+        abortSignal
+      );
+      if (approval === "denied") {
+        return withNotice({
+          success: false,
+          error: SANDBOX_APPROVAL_DENIED,
+          exitCode: -1,
+          wall_duration_ms: 0,
+        });
+      }
+
       if (run_in_background) {
         if (!config.workspaceId || !config.backgroundProcessManager || !config.runtime) {
           return withNotice({
@@ -1213,11 +1238,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           scriptWithEnv,
           {
             cwd: config.cwd,
-            env: { ...(config.xumEnv ?? {}), ...(config.secrets ?? {}), ...hooksEnv },
+            env: { ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets), ...hooksEnv },
+            ...sandboxExecOptions(approval),
             pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
-            ...(monitorConfig ? { monitor: monitorConfig } : {}),
+            monitor: monitorConfig,
             timeoutSecs: backgroundTimeoutSecs(timeout_secs),
           }
         );
@@ -1306,7 +1332,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        env: { ...config.xumEnv, ...config.secrets, ...hooksEnv, ...NON_INTERACTIVE_ENV_VARS },
+        env: {
+          ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets),
+          ...hooksEnv,
+          ...NON_INTERACTIVE_ENV_VARS,
+        },
+        ...sandboxExecOptions(approval),
         pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
@@ -1879,15 +1910,19 @@ File will be automatically cleaned up when stream ends.`;
 
       // Format result based on exit code and truncation state
       return withNotice(
-        formatResult(
-          exitCode,
-          lines,
-          truncated,
-          overflowReason,
-          wall_duration_ms,
-          config.overflow_policy ?? "tmpfile",
-          effectiveTimeout,
-          stoppedAtFileLimit
+        await withSandboxDenials(
+          formatResult(
+            exitCode,
+            lines,
+            truncated,
+            overflowReason,
+            wall_duration_ms,
+            config.overflow_policy ?? "tmpfile",
+            effectiveTimeout,
+            stoppedAtFileLimit
+          ),
+          execStream,
+          exitCode !== 0
         )
       );
     },

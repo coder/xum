@@ -89,6 +89,8 @@ export interface ResolveAgentOptions {
    * system-context assembly so one turn reads each definition once.
    */
   agentDefinitionCache?: AgentDefinitionRequestCache;
+  /** The project's secrets, for a turn whose agent reaches the model (ReadAgentDefinitionOptions). */
+  sandboxEnv?: NodeJS.ProcessEnv;
 }
 
 /** Result of agent resolution — all computed values needed by the stream pipeline. */
@@ -276,11 +278,13 @@ export async function resolveAgentForStream(
     emitError,
     agentDefinitionCache: cache,
     runtimeFactory,
+    sandboxEnv,
   } = opts;
 
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
   // #6426: project plugin agents load only in a trusted project. From the loaded config: no read.
   const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, metadata);
+  const readOptions = { cache, projectPluginsTrusted, runtimeFactory, sandboxEnv };
 
   // --- Agent ID resolution ---
   // Precedence:
@@ -355,7 +359,7 @@ export async function resolveAgentForStream(
           discovery.runtime,
           discovery.workspacePath,
           candidateAgentId,
-          { cache, projectPluginsTrusted, runtimeFactory }
+          readOptions
         );
         if (definition.scope === "project") {
           agentDefinition = definition;
@@ -396,11 +400,12 @@ export async function resolveAgentForStream(
       agentDiscoveryPaths: agentDiscoveryCandidates.map((candidate) => candidate.workspacePath),
       disableWorkspaceAgents,
     });
-    agentDefinition = await readAgentDefinition(agentDiscoveryRuntime, agentDiscoveryPath, "exec", {
-      cache,
-      projectPluginsTrusted,
-      runtimeFactory,
-    });
+    agentDefinition = await readAgentDefinition(
+      agentDiscoveryRuntime,
+      agentDiscoveryPath,
+      "exec",
+      readOptions
+    );
   }
 
   // Strict provenance pin: launch validation approved a specific definition, not just
@@ -444,10 +449,8 @@ export async function resolveAgentForStream(
         agentDiscoveryPath,
         agentDefinition.id,
         {
+          ...readOptions,
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
-          cache,
-          projectPluginsTrusted,
-          runtimeFactory,
         }
       );
 
@@ -500,7 +503,7 @@ export async function resolveAgentForStream(
           agentDiscoveryRuntime,
           agentDiscoveryPath,
           "exec",
-          { cache, projectPluginsTrusted, runtimeFactory }
+          readOptions
         );
         effectiveAgentId = agentDefinition.id;
       }
@@ -532,9 +535,7 @@ export async function resolveAgentForStream(
     agentId: agentDefinition.id,
     agentDefinition,
     workspaceId,
-    cache,
-    projectPluginsTrusted,
-    runtimeFactory,
+    ...readOptions,
   });
 
   // Strict chain pin: inheritance resolution reloads every base independently, so a
@@ -624,9 +625,7 @@ export async function resolveAgentForStream(
           agentDiscoveryPath,
           agentDefinition.id,
           {
-            cache,
-            projectPluginsTrusted,
-            runtimeFactory,
+            ...readOptions,
             skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
           }
         ).catch(() => undefined)
@@ -636,23 +635,22 @@ export async function resolveAgentForStream(
     const descriptors = await discoverAgentDefinitions(agentDiscoveryRuntime, agentDiscoveryPath, {
       projectPluginsTrusted,
       runtimeFactory,
+      sandboxEnv,
     }).catch(() => []);
     // Parallel, like sub-agent discovery: on SSH runtimes each read is a round trip.
     const policies = await Promise.all(
       descriptors.map(async (descriptor): Promise<SwitchableAgent | undefined> => {
         if (descriptor.id === agentDefinition.id) return undefined;
         try {
-          const readOptions = {
-            cache,
-            projectPluginsTrusted,
-            runtimeFactory,
+          const descriptorReadOptions = {
+            ...readOptions,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
           };
           const frontmatter = await resolveAgentFrontmatter(
             agentDiscoveryRuntime,
             agentDiscoveryPath,
             descriptor.id,
-            readOptions
+            descriptorReadOptions
           );
           // Same filter as the mode picker (listAgentDefinitions).
           if (
@@ -669,7 +667,7 @@ export async function resolveAgentForStream(
             agentDiscoveryRuntime,
             agentDiscoveryPath,
             descriptor.id,
-            readOptions
+            descriptorReadOptions
           );
           const chain = await resolveAgentInheritanceChain({
             runtime: agentDiscoveryRuntime,
@@ -677,9 +675,7 @@ export async function resolveAgentForStream(
             agentId: definition.id,
             agentDefinition: definition,
             workspaceId,
-            cache,
-            projectPluginsTrusted,
-            runtimeFactory,
+            ...readOptions,
           });
           const toolPolicy = composeForUnion(
             resolveToolPolicyForAgent({

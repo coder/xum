@@ -101,6 +101,7 @@ import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles
 import {
   assertEntryNamesPlugin,
   chooseStagedMethod,
+  hasPluginManifest,
   detectInstallMethods,
   generatesManifest,
   isOwnManifestMethod,
@@ -115,8 +116,10 @@ import {
   type SkillsPackageRoot,
 } from "./installMethods";
 import {
+  MARKETPLACE_FILE_RULES,
   MARKETPLACE_RELATIVE_PATHS,
   MAX_CLAUDE_MARKETPLACE_BYTES,
+  MAX_MARKETPLACE_PATH_FOLDERS,
   findMarketplaceEntry,
   marketplaceEntryRefOf,
   marketplaceListing,
@@ -1387,6 +1390,98 @@ function resolvePreviewRef(
   return parsedRef ?? (explicit.length > 0 ? explicit : undefined);
 }
 
+/**
+ * Why an entry folder cannot be read. A filesystem error's own message names the staging path,
+ * which the list must not show: name the error code instead.
+ */
+function folderErrorReason(error: unknown): string {
+  if (hasErrorCode(error, "ENOENT")) return "it does not exist";
+  if (hasErrorCode(error, "ENOTDIR")) return "it runs through a file";
+  const code = error != null && typeof error === "object" && "code" in error ? error.code : null;
+  return typeof code === "string" ? `Xum cannot read it (${code})` : getErrorMessage(error);
+}
+
+/**
+ * Why `subpath` is not a path of real folders, checked segment by segment as the preview checks
+ * it (narrowToSubpath, then extractSubpath), with lstat: a link is refused without being
+ * followed. Resolving a link costs time that grows with the square of its target's depth, so a
+ * link to a folder thousands of levels deep stalled a listing of 1,500 builds. A marketplace path
+ * has at most MAX_MARKETPLACE_PATH_FOLDERS folders, plus as many for metadata.pluginRoot.
+ */
+async function subpathNotAFolderReason(
+  stagedDir: string,
+  subpath: string | undefined
+): Promise<string | undefined> {
+  const segments = subpath === undefined ? [] : subpath.split("/");
+  assert(
+    segments.length <= 2 * MAX_MARKETPLACE_PATH_FOLDERS,
+    "subpathNotAFolderReason: marketplaceRelativePath caps every part of an entry path"
+  );
+  let folder = stagedDir;
+  for (const [index, segment] of segments.entries()) {
+    folder = path.join(folder, segment);
+    let stat: Awaited<ReturnType<typeof fsPromises.lstat>>;
+    try {
+      stat = await fsPromises.lstat(folder);
+    } catch (error) {
+      return folderErrorReason(error);
+    }
+    if (stat.isSymbolicLink()) return "it is a symbolic link or runs through one";
+    if (!stat.isDirectory()) {
+      return index === segments.length - 1 ? "it is a file" : "it runs through a file";
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The real folder at `subpath`, or why the preview would not stage it: missing, a file, a path
+ * through a file or a symbolic link (subpathNotAFolderReason), or escaping the repository. Exported
+ * for its test.
+ */
+export async function realEntryFolder(
+  stagedDir: string,
+  subpath: string | undefined
+): Promise<{ entryDir: string } | { why: string }> {
+  const notAFolder = await subpathNotAFolderReason(stagedDir, subpath);
+  if (notAFolder !== undefined) return { why: notAFolder };
+  try {
+    // No link is left on the path, so this realpath stays shallow.
+    return {
+      entryDir: await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? "")),
+    };
+  } catch (error) {
+    return { why: folderErrorReason(error) };
+  }
+}
+
+/**
+ * The folder of a relative marketplace build, or why the listing does not offer it: the preview
+ * would fail on a folder that realEntryFolder refuses, and on a Cursor or Agent Plugins folder
+ * without a plugin manifest of its own (entryInstallMethods). The reason names the folder, not
+ * the staging path.
+ */
+async function checkedEntryFolder(
+  stagedDir: string,
+  subpath: string | undefined,
+  file: MarketplaceFile
+): Promise<{ entryDir: string } | { reason: string }> {
+  const shown = subpath ?? ".";
+  const folder = await realEntryFolder(stagedDir, subpath);
+  if ("why" in folder) {
+    return { reason: `Xum cannot install the entry's folder '${shown}': ${folder.why}` };
+  }
+  if (
+    !MARKETPLACE_FILE_RULES[file].entryIsManifest &&
+    !(await hasPluginManifest(folder.entryDir))
+  ) {
+    return {
+      reason: `The entry's folder '${shown}' has no plugin manifest, so Xum cannot install it.`,
+    };
+  }
+  return folder;
+}
+
 /** The git source that preview returns and install persists. */
 function resolvedGitSource(
   url: string,
@@ -1423,6 +1518,34 @@ function subpathNotAFolder(
   );
 }
 
+/**
+ * Why a symbolic link of a staged tree must not be installed (assertStagedTreeWithinQuota): it
+ * does not resolve, a relative one leaves the staged root, or an absolute one reaches into the
+ * managed plugins directory. A link that resolves inside the staged root keeps its meaning.
+ */
+async function stagedLinkProblem(
+  entryPath: string,
+  relative: string,
+  rootReal: string,
+  withinContainer: (candidate: string) => boolean
+): Promise<string | undefined> {
+  const resolvedTarget = await fsPromises.realpath(entryPath).catch(() => undefined);
+  if (resolvedTarget === undefined) {
+    return `The repository ships a symbolic link that does not resolve (${relative}). Its target could appear at the install location AFTER the consent preview validated the tree, so unresolvable links are rejected.`;
+  }
+  if (resolvedTarget === rootReal || resolvedTarget.startsWith(rootReal + path.sep)) {
+    return undefined;
+  }
+  const rawTarget = await fsPromises.readlink(entryPath);
+  if (!path.isAbsolute(rawTarget)) {
+    return `The repository ships a relative symbolic link that escapes the plugin folder (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`;
+  }
+  if (withinContainer(path.resolve(rawTarget)) || withinContainer(resolvedTarget)) {
+    return `The repository ships an absolute symbolic link into the managed plugins directory (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`;
+  }
+  return undefined;
+}
+
 /** Max simultaneous `git ls-remote` processes during an update check. */
 const UPDATE_CHECK_CONCURRENCY = 4;
 
@@ -1435,6 +1558,13 @@ const UPDATE_CHECK_CONCURRENCY = 4;
  */
 const STAGED_TREE_MAX_BYTES = 100 * 1024 * 1024;
 const STAGED_TREE_MAX_FILES = 10_000;
+/**
+ * Folder levels below a staged checkout's root. Resolving a path costs time that grows with the
+ * square of its depth (glibc realpath), and the staging walk resolves every symbolic link, so a
+ * hostile repository of links into a folder chain thousands of levels deep stalled every preview
+ * and marketplace listing. Real plugin repositories nest a few levels.
+ */
+export const STAGED_TREE_MAX_DEPTH = 64;
 
 /**
  * Map with a bounded worker pool, preserving input order. Rejections
@@ -2634,6 +2764,46 @@ export class AgentPluginInstallService {
    */
   private async assertStagedTreeWithinQuota(dir: string): Promise<void> {
     const quota = this.stagingQuota();
+    let bytes = 0;
+    let entryCount = 0;
+    // Links are resolved only after the whole tree passed the size and depth limits, so a link
+    // into a too-deep folder chain is never followed.
+    const links: string[] = [];
+    const pending: Array<{ folder: string; depth: number }> = [{ folder: dir, depth: 0 }];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      assert(current !== undefined, "assertStagedTreeWithinQuota: queue underflow");
+      for (const entry of await fsPromises.readdir(current.folder, { withFileTypes: true })) {
+        if (entry.name === ".git" && current.folder === dir) {
+          continue;
+        }
+        const entryPath = path.join(current.folder, entry.name);
+        entryCount += 1;
+        if (entry.isDirectory()) {
+          if (current.depth + 1 > STAGED_TREE_MAX_DEPTH) {
+            throw new Error(
+              `The repository nests folders more than ${STAGED_TREE_MAX_DEPTH} levels deep, which Xum does not install.`
+            );
+          }
+          pending.push({ folder: entryPath, depth: current.depth + 1 });
+        } else if (entry.isFile()) {
+          const stat = await fsPromises.lstat(entryPath);
+          bytes += stat.size;
+        } else if (entry.isSymbolicLink()) {
+          links.push(entryPath);
+        }
+        if (entryCount > quota.maxFiles || bytes > quota.maxBytes) {
+          throw new Error(
+            `The repository is too large to install as a plugin (limit: ${quota.maxFiles} files, ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB).`
+          );
+        }
+      }
+    }
+    await this.assertStagedLinksStay(dir, links);
+  }
+
+  /** The symbolic-link half of assertStagedTreeWithinQuota (see its comment). */
+  private async assertStagedLinksStay(dir: string, links: string[]): Promise<void> {
     const rootReal = await fsPromises.realpath(dir);
     // Both forms of the container path: the raw-target check must catch the
     // guessable lexical path even when nothing exists there yet, and the
@@ -2645,55 +2815,14 @@ export class AgentPluginInstallService {
       [this.containerDir, containerReal].some(
         (container) => candidate === container || candidate.startsWith(container + path.sep)
       );
-    let bytes = 0;
-    let entryCount = 0;
-    const pending: string[] = [dir];
-    while (pending.length > 0) {
-      const current = pending.pop();
-      assert(current !== undefined, "assertStagedTreeWithinQuota: queue underflow");
-      for (const entry of await fsPromises.readdir(current, { withFileTypes: true })) {
-        if (entry.name === ".git" && current === dir) {
-          continue;
-        }
-        const entryPath = path.join(current, entry.name);
-        entryCount += 1;
-        if (entry.isDirectory()) {
-          pending.push(entryPath);
-        } else if (entry.isFile()) {
-          const stat = await fsPromises.lstat(entryPath);
-          bytes += stat.size;
-        } else if (entry.isSymbolicLink()) {
-          const relative = path.relative(dir, entryPath);
-          const resolvedTarget = await fsPromises.realpath(entryPath).catch(() => undefined);
-          if (resolvedTarget === undefined) {
-            throw new Error(
-              `The repository ships a symbolic link that does not resolve (${relative}). Its target could appear at the install location AFTER the consent preview validated the tree, so unresolvable links are rejected.`
-            );
-          }
-          const rawTarget = await fsPromises.readlink(entryPath);
-          const withinStagedRoot =
-            resolvedTarget === rootReal || resolvedTarget.startsWith(rootReal + path.sep);
-          if (!path.isAbsolute(rawTarget) && !withinStagedRoot) {
-            throw new Error(
-              `The repository ships a relative symbolic link that escapes the plugin folder (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
-            );
-          }
-          if (
-            path.isAbsolute(rawTarget) &&
-            !withinStagedRoot &&
-            (withinContainer(path.resolve(rawTarget)) || withinContainer(resolvedTarget))
-          ) {
-            throw new Error(
-              `The repository ships an absolute symbolic link into the managed plugins directory (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
-            );
-          }
-        }
-        if (entryCount > quota.maxFiles || bytes > quota.maxBytes) {
-          throw new Error(
-            `The repository is too large to install as a plugin (limit: ${quota.maxFiles} files, ${Math.floor(quota.maxBytes / (1024 * 1024))} MiB).`
-          );
-        }
-      }
+    for (const entryPath of links) {
+      const problem = await stagedLinkProblem(
+        entryPath,
+        path.relative(dir, entryPath),
+        rootReal,
+        withinContainer
+      );
+      if (problem !== undefined) throw new Error(problem);
     }
   }
 
@@ -3924,9 +4053,11 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * A relative build's skill count: the skills its preview accepts (collectSkills), not the
-   * paths its entry lists. An entry in another repository keeps the count of paths: Xum has not
-   * cloned it. Each build reads its own file's entry.
+   * A relative build as its preview would see it: its folder must exist inside the repository,
+   * a Cursor or Agent Plugins folder needs its own plugin manifest (the entry is never one), and
+   * the skill count is the skills its preview accepts (collectSkills), not the paths its entry
+   * lists. An entry in another repository keeps the count of paths: Xum has not cloned it. Each
+   * build reads its own file's entry.
    */
   private async withAcceptedSkillCount(
     stagedDir: string,
@@ -3938,26 +4069,13 @@ export class AgentPluginInstallService {
     /** Scans of this listing by folder, skills list and plugin name. */
     scans: Map<string, Promise<Set<string>>>
   ): Promise<AgentPluginMarketplaceBuild> {
-    if (build.skillCount === undefined || !build.installable || build.sourceKind !== "relative") {
-      return build;
-    }
+    if (!build.installable || build.sourceKind !== "relative") return build;
     const entry = findMarketplaceEntry(marketplace, name);
     const resolved = resolveEntrySource(marketplace, source.url, entry);
     assert(resolved.kind === "relative", "withAcceptedSkillCount: a relative entry resolves here");
-    const folder = path.join(stagedDir, resolved.subpath ?? "");
-    let entryDir: string;
-    try {
-      entryDir = await ensurePluginPathContained(stagedDir, folder);
-    } catch (error) {
-      // A missing or escaping folder would fail the entry's preview, so the listing does not
-      // offer it. The reason names the folder, not the staging path.
-      const why = hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error);
-      return {
-        ...build,
-        installable: false,
-        reason: `Xum cannot install the entry's folder '${resolved.subpath ?? "."}': ${why}`,
-      };
-    }
+    const folder = await checkedEntryFolder(stagedDir, resolved.subpath, build.file);
+    if ("reason" in folder) return { ...build, installable: false, reason: folder.reason };
+    if (build.skillCount === undefined) return build;
     let manifest: Record<string, unknown>;
     try {
       ({ manifest } = marketplaceManifest({
@@ -3970,8 +4088,19 @@ export class AgentPluginInstallService {
       // No plugin name fits the entry name: its own preview fails with the reason.
       return build;
     }
+    const scan = this.entrySkillScan(folder.entryDir, manifest, entry.name, scans);
+    return { ...build, skillCount: (await scan).size };
+  }
+
+  /** The accepted skills of an entry's folder under its manifest, one scan per shared key. */
+  private entrySkillScan(
+    entryDir: string,
+    manifest: Record<string, unknown>,
+    entryName: string,
+    scans: Map<string, Promise<Set<string>>>
+  ): Promise<Set<string>> {
     const declared = declaredSkills(manifest);
-    const pluginName = typeof manifest.name === "string" ? manifest.name : entry.name;
+    const pluginName = typeof manifest.name === "string" ? manifest.name : entryName;
     // The plugin name names only a skill at the plugin root itself (a declared "."), so
     // entries that share a folder and skills list share one scan otherwise.
     const namesRootSkill =
@@ -3983,7 +4112,7 @@ export class AgentPluginInstallService {
       scan = this.acceptedSkillNames(entryDir, { declared, pluginName });
       scans.set(key, scan);
     }
-    return { ...build, skillCount: (await scan).size };
+    return scan;
   }
 
   /**

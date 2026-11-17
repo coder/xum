@@ -1,6 +1,5 @@
 import * as fs from "fs";
 import * as path from "path";
-import * as os from "os";
 import { getXumHome } from "@/common/constants/paths";
 import { log } from "@/node/services/log";
 
@@ -31,6 +30,11 @@ exit 1
 
 let askpassPath: string | undefined;
 
+/** The folder that holds each session's prompt and answer files. */
+export function askpassSessionsRoot(): string {
+  return path.join(getXumHome(), "askpass");
+}
+
 function extractRequestId(filename: string): string | undefined {
   const match = /^prompt\.(.+)\.txt$/.exec(filename);
   return match?.[1];
@@ -48,7 +52,10 @@ function extractRequestId(filename: string): string | undefined {
  */
 async function writeResponseFile(responseFile: string, text: string): Promise<void> {
   const tempFile = `${responseFile}.tmp`;
-  await fs.promises.writeFile(tempFile, text);
+  // Exclusive create: the answer can be a password, and "wx" neither follows a link at the
+  // temp name nor writes into a file that is already there.
+  await fs.promises.rm(tempFile, { force: true });
+  await fs.promises.writeFile(tempFile, text, { flag: "wx", mode: 0o600 });
   await fs.promises.rename(tempFile, responseFile);
 }
 
@@ -124,7 +131,11 @@ export async function createAskpassSession(
   // Resolve script path before allocating temp resources.
   const scriptPath = await ensureAskpassScript();
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-askpass-"));
+  // Not in the temp folder: agent commands in the macOS sandbox can read and write it, so they
+  // could read an answer or plant a prompt there. The sandbox hides this folder (sandboxPaths.ts).
+  const root = askpassSessionsRoot();
+  await fs.promises.mkdir(root, { recursive: true, mode: 0o700 });
+  const dir = fs.mkdtempSync(path.join(root, "mux-askpass-"));
   const processed = new Set<string>();
   let closed = false;
 

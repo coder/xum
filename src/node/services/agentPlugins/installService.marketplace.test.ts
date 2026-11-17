@@ -18,7 +18,7 @@ import type {
 import { Config } from "@/node/config";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { discoverAgentPluginAt } from "./discovery";
-import { AgentPluginInstallService } from "./installService";
+import { AgentPluginInstallService, realEntryFolder } from "./installService";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   using proc = execFileAsync("git", [`-C`, cwd, ...args]);
@@ -301,12 +301,16 @@ describe("AgentPluginInstallService marketplaces", () => {
     );
   });
 
-  test("a relative entry whose folder is missing is listed as not installable", async () => {
+  test("a relative entry whose folder is missing is listed as not installable, with or without skills", async () => {
     await writeFiles(marketDir, {
       ".claude-plugin/marketplace.json": marketplace([
         DOCS,
         { name: "gone", source: "./plugins/gone", skills: ["./skills/x"] },
+        // No skills list, so no skill count: the folder check still runs.
+        { name: "gone-bare", source: "./plugins/gone-bare" },
+        { name: "a-file", source: "./notes.txt" },
       ]),
+      "notes.txt": "not a folder\n",
     });
     await commit(marketDir, "an entry without its folder");
     const listed = await service.previewSource({ input: marketDir });
@@ -316,31 +320,57 @@ describe("AgentPluginInstallService marketplaces", () => {
     ).toEqual([
       ["docs", true, undefined],
       ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
+      [
+        "gone-bare",
+        false,
+        "Xum cannot install the entry's folder 'plugins/gone-bare': it does not exist",
+      ],
+      ["a-file", false, "Xum cannot install the entry's folder 'notes.txt': it is a file"],
     ]);
   });
 
-  test("a skill that Xum rejects counts nowhere: not in the listing, not for the Skills CLI", async () => {
-    // Like anthropics/skills `claude-api`: a description over 1024 characters.
+  /** Adds an `api` entry whose SKILL.md is `apiSkill`, then lists it and previews it as Skills. */
+  async function listWithApiSkill(apiSkill: string) {
     await writeFiles(marketDir, {
       ".claude-plugin/marketplace.json": marketplace([
         DOCS,
         { name: "api", source: "./", strict: false, skills: ["./skills/api"] },
       ]),
-      "skills/api/SKILL.md": `---\nname: api\ndescription: ${"x".repeat(1025)}\n---\nBody\n`,
+      "skills/api/SKILL.md": apiSkill,
     });
     await commit(marketDir, "add api");
 
     const listed = await service.previewSource({ input: marketDir });
     if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
-    expect(singleBuildRows(listed.marketplace).map((row) => [row.name, row.skillCount])).toEqual([
+    const rows = singleBuildRows(listed.marketplace).map((row) => [row.name, row.skillCount]);
+    const asSkills = await service.preview({ input: marketDir, method: { kind: "skills" } });
+    return { rows, asSkills };
+  }
+
+  test("a skill that Xum rejects counts nowhere: not in the listing, not for the Skills CLI", async () => {
+    const { rows, asSkills } = await listWithApiSkill("---\nname: api\n---\nBody\n");
+
+    expect(rows).toEqual([
       ["docs", 2],
       ["api", 0],
     ]);
-
-    const asSkills = await service.preview({ input: marketDir, method: { kind: "skills" } });
     expect(asSkills.skills.map((skill) => skill.name)).toEqual(["art", "pdf", "xlsx"]);
     expect(asSkills.warnings.some((warning) => warning.includes("api"))).toBe(true);
     expect(asSkills.skillsCliSkills).toEqual(["art", "pdf", "xlsx"]);
+  });
+
+  test("a skill with a description over 1024 characters counts like any other, as anthropics/skills claude-api does", async () => {
+    const { rows, asSkills } = await listWithApiSkill(
+      `---\nname: api\ndescription: ${"x".repeat(1025)}\n---\nBody\n`
+    );
+
+    expect(rows).toEqual([
+      ["docs", 2],
+      ["api", 1],
+    ]);
+    expect(asSkills.skills.map((skill) => skill.name)).toEqual(["api", "art", "pdf", "xlsx"]);
+    expect(asSkills.warnings.some((warning) => warning.includes("api"))).toBe(false);
+    expect(asSkills.skillsCliSkills).toEqual(["api", "art", "pdf", "xlsx"]);
   });
 
   test("Skills installs the whole marketplace repository instead", async () => {
@@ -632,7 +662,8 @@ describe("AgentPluginInstallService marketplaces", () => {
         ],
       ],
       ["kit", undefined, [["cursor", "kit", true]]],
-      ["bare", undefined, [["cursor", "bare", true]]],
+      // Its folder has no manifest, and a Cursor entry is never one: the preview would refuse it.
+      ["bare", undefined, [["cursor", "bare", false]]],
       ["attio", undefined, [["cursor", "third_party/attio", true]]],
     ]);
   });
@@ -734,6 +765,129 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect((await service.list()).map((item) => item.name)).toEqual([]);
   }, 20_000);
 
+  test("a Cursor entry lists as installable with any manifest its preview reads; a missing folder, a file or a symlink does not", async () => {
+    await writeFiles(marketDir, {
+      ".cursor-plugin/marketplace.json": JSON.stringify({
+        name: "cursor-market",
+        plugins: [
+          { name: "rooted", source: "rooted" },
+          { name: "clauded", source: "clauded" },
+          { name: "gone", source: "plugins/gone" },
+          { name: "afile", source: "afile" },
+          { name: "linked", source: "linked" },
+          { name: "through", source: "through/inner" },
+          { name: "past-file", source: "afile/x" },
+          { name: "too-long", source: "x".repeat(300) },
+        ],
+      }),
+      afile: "not a folder\n",
+      "rooted/plugin.json": JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "rooted",
+      }),
+      "rooted/skills/a/SKILL.md": skillMd("a"),
+      "clauded/.claude-plugin/plugin.json": JSON.stringify({ name: "clauded" }),
+      "clauded/skills/b/SKILL.md": skillMd("b"),
+      "deep/inner/.cursor-plugin/plugin.json": JSON.stringify({ name: "through" }),
+    });
+    // The preview refuses a symlinked folder even when it holds a manifest (narrowToSubpath),
+    // and a folder reached through a symlinked parent.
+    await fsPromises.symlink("rooted", path.join(marketDir, "linked"));
+    await fsPromises.symlink("deep", path.join(marketDir, "through"));
+    await commit(marketDir, "Cursor entries with a root manifest, a Claude manifest and no folder");
+    const listing = await listMarketplace();
+    expect(
+      listing.entries.flatMap((entry) =>
+        entry.builds
+          .filter((build) => build.file === "cursor")
+          .map((build) => [entry.name, build.installable, build.reason])
+      )
+    ).toEqual([
+      ["rooted", true, undefined],
+      ["clauded", true, undefined],
+      ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
+      ["afile", false, "Xum cannot install the entry's folder 'afile': it is a file"],
+      [
+        "linked",
+        false,
+        "Xum cannot install the entry's folder 'linked': it is a symbolic link or runs through one",
+      ],
+      [
+        "through",
+        false,
+        "Xum cannot install the entry's folder 'through/inner': it is a symbolic link or runs through one",
+      ],
+      [
+        "past-file",
+        false,
+        "Xum cannot install the entry's folder 'afile/x': it runs through a file",
+      ],
+      // The error code, never the error's own text, which names the staging path.
+      [
+        "too-long",
+        false,
+        `Xum cannot install the entry's folder '${"x".repeat(300)}': Xum cannot read it (ENAMETOOLONG)`,
+      ],
+    ]);
+    // The listing offers what the preview installs, and refuses what it refuses.
+    expect((await previewCursorEntry("rooted")).method).toEqual({ kind: "agent-plugin" });
+    expect((await previewCursorEntry("clauded")).method).toEqual({ kind: "claude-plugin" });
+    await expect(previewCursorEntry("linked")).rejects.toThrow("is a symbolic link");
+    await expect(previewCursorEntry("through")).rejects.toThrow("is a symbolic link");
+    // One listing and four previews: over 20 s when several test files run at once.
+  }, 60_000);
+
+  test("an entry folder behind a link is refused without following the link", async () => {
+    // Following a link to a folder thousands of levels deep stalled the list: only lstat may
+    // touch a path that runs through one.
+    const staged = path.join(tmpRoot, "staged");
+    await fsPromises.mkdir(path.join(staged, "deep", "inner"), { recursive: true });
+    await fsPromises.symlink("deep", path.join(staged, "linked"));
+    await fsPromises.writeFile(path.join(staged, "afile"), "not a folder\n");
+    const realpath = spyOn(fsPromises, "realpath");
+    try {
+      expect(await realEntryFolder(staged, "linked/inner")).toEqual({
+        why: "it is a symbolic link or runs through one",
+      });
+      expect(await realEntryFolder(staged, "linked")).toEqual({
+        why: "it is a symbolic link or runs through one",
+      });
+      expect(await realEntryFolder(staged, "afile/x")).toEqual({ why: "it runs through a file" });
+      expect(await realEntryFolder(staged, "afile")).toEqual({ why: "it is a file" });
+      expect(await realEntryFolder(staged, "gone")).toEqual({ why: "it does not exist" });
+      expect(realpath).not.toHaveBeenCalled();
+      expect("entryDir" in (await realEntryFolder(staged, "deep/inner"))).toBe(true);
+    } finally {
+      realpath.mockRestore();
+    }
+  });
+
+  test("a Xum root behind a symbolic link does not make every entry folder look like a link", async () => {
+    // A linked home such as Fedora Silverblue's /home -> /var/home: the staging folder's path runs
+    // through a link, but the entry folders inside the clone do not.
+    await writeCursorMarketplace();
+    const realRoot = path.join(tmpRoot, "real-xum");
+    await fsPromises.mkdir(realRoot);
+    const linkedRoot = path.join(tmpRoot, "linked-xum");
+    await fsPromises.symlink(realRoot, linkedRoot);
+    const linkedService = new AgentPluginInstallService(new Config(linkedRoot), {});
+    const listed = await linkedService.previewSource({ input: marketDir });
+    if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+    expect(
+      listed.marketplace.entries.map((entry) => [
+        entry.name,
+        entry.builds.map((build) => build.installable),
+      ])
+    ).toEqual([
+      ["pstack", [true, true]],
+      ["kit", [true]],
+      ["bare", [false]],
+      ["attio", [true]],
+    ]);
+  }, 20_000);
+
+  // Four staging runs (preview, install, update review, update): 14 s at load 30 on a shared
+  // host, and over 20 s when four test files run at once.
   test("an installed Cursor entry lists its not-applied parts and updates by its folder", async () => {
     await writeCursorMarketplace();
     const variables: AgentPluginNotApplied = {
@@ -757,7 +911,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(await installedSkills("kit")).toEqual(["format", "lint"]);
     const updated = (await service.list()).find((item) => item.name === "kit");
     expect([updated?.lockedSha, updated?.source?.subpath]).toEqual([head, "kit"]);
-  }, 20_000);
+  }, 60_000);
 
   test("not-applied names show invisible characters as marks", async () => {
     await writeCursorMarketplace();
@@ -884,9 +1038,7 @@ describe("AgentPluginInstallService marketplaces", () => {
   // The catalog of anthropics/skills at its present scale: five entries that share "./" and list
   // 4, 12, 1, 1 and 1 skills. The names and lists follow its marketplace.json, the text is ours.
   // This test used to copy a local clone of that repository (445 files, 13 MB) and ran only on
-  // the one machine that had it, so CI skipped it. On the real data Xum counts 0 skills for
-  // `claude-api` (its description is over 1024 characters: see "a skill that Xum rejects counts
-  // nowhere"), and the generated skill has a short one, so it counts 1 here.
+  // the one machine that had it, so CI skipped it.
   test("a catalog shaped like anthropics/skills lists five entries; document-skills previews its four skills", async () => {
     const catalog: Record<string, string[]> = {
       "document-skills": ["xlsx", "docx", "pptx", "pdf"],
@@ -1051,10 +1203,13 @@ describe("AgentPluginInstallService marketplaces", () => {
     const rows = singleBuildRows(listing);
     expect(rows.map((row) => [row.name, row.installable])).toEqual([
       ["held", false],
-      ["bare", true],
+      ["bare", false],
     ]);
     expect(rows[0].reason).toContain("NOT_AVAILABLE");
-    expect(rows[1].reason).toBeUndefined();
+    // The listing refuses what the preview refuses below, with the folder named.
+    expect(rows[1].reason).toBe(
+      "The entry's folder 'plugins/bare' has no plugin manifest, so Xum cannot install it."
+    );
     await expect(previewAgentsEntry("held")).rejects.toThrow("NOT_AVAILABLE");
     await expect(previewAgentsEntry("bare")).rejects.toThrow(
       "The Agent Plugins marketplace entry 'bare' has no plugin manifest in its folder. Xum does not install it."

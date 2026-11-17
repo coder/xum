@@ -21,6 +21,32 @@ describe("claudeCommandSkillMarkdown", () => {
     expect(frontmatter["disable-model-invocation"]).toBe(true);
   });
 
+  // The description of a command without one is its first body line, cut to the description cap.
+  test.each([
+    ["a line over the cap", "a".repeat(1500), "a".repeat(1024)],
+    // The pair's first half is the 1024th unit: the cut must drop it, not leave it alone.
+    ["a surrogate pair at the cut", `${"a".repeat(1023)}😀tail`, "a".repeat(1023)],
+    ["a line at the cap", "a".repeat(1024), "a".repeat(1024)],
+  ])("cuts a first-line description for %s", (_case, line, expected) => {
+    const frontmatter = commandFrontmatter(`---\nargument-hint: x\n---\n${line}\n`);
+    expect(frontmatter.description).toBe(expected);
+  });
+
+  // Where a command's description comes from: its own, else its first body line, else its name.
+  test.each([
+    ["its own description", "---\ndescription: Own text\n---\nFirst line\n", "Own text"],
+    ["a one-character description", "---\ndescription: x\n---\nFirst line\n", "x"],
+    [
+      "the first body line when the description is blank",
+      '---\ndescription: "  "\n---\n\nFirst line\nSecond\n',
+      "First line",
+    ],
+    ["the first body line when the frontmatter is empty", "---\n---\nFirst line\n", "First line"],
+    ["the command name when there is no body", "---\n---\n", "Command /review"],
+  ])("takes the description from %s", (_source, content, expected) => {
+    expect(commandFrontmatter(content).description).toBe(expected);
+  });
+
   test("leaves a quoted hint and other bracketed keys alone", () => {
     const markdown = claudeCommandSkillMarkdown(
       "review",

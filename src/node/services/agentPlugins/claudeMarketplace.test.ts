@@ -312,6 +312,17 @@ describe("resolveEntrySource", () => {
     );
   });
 
+  test("a path at most 32 folders deep resolves; a deeper one is refused before any file is read", () => {
+    const deep = (folders: number) => `./${Array.from({ length: folders }, () => "a").join("/")}`;
+    expect(resolveOnly(deep(32))).toEqual({ kind: "relative", subpath: deep(32).slice(2) });
+    expect(resolveOnly(deep(33))).toBe(
+      "The path is 33 folders deep. A marketplace path can be at most 32 folders deep."
+    );
+    // Empty and "." parts are not folders.
+    expect(resolveOnly(`${deep(32)}/./`)).toEqual({ kind: "relative", subpath: deep(32).slice(2) });
+    expect(resolveOnly("./x", { metadata: { pluginRoot: deep(33) } })).toContain("33 folders deep");
+  });
+
   test("github, git-subdir and url name another repository; a sha pins the commit", () => {
     const sha = "a".repeat(40);
     expect(resolveOnly({ source: "github", repo: "acme/tool", ref: "v1" })).toEqual({
@@ -591,6 +602,10 @@ describe("the Agent Plugins marketplace file", () => {
     expect(resolveEntry({ source: { ...source, ref: " release-v2 ", sha: " " } })).toMatchObject({
       kind: "remote",
       ref: "release-v2",
+    });
+    const sha = "A".repeat(40);
+    expect(resolveEntry({ source: { ...source, sha: ` ${sha} ` } })).toMatchObject({
+      ref: sha.toLowerCase(),
     });
     expect(resolveEntry({ source: { ...source, ref: "", sha: "" } })).toMatchObject({
       kind: "remote",

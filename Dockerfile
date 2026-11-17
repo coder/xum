@@ -59,7 +59,7 @@ COPY Makefile fmt.mk ./
 COPY src/ src/
 COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
-COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/precompress-static.ts scripts/stamp-service-worker.ts scripts/build-row-tree-worker.ts scripts/
+COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/gen_layout_audit_script.ts scripts/precompress-static.ts scripts/stamp-service-worker.ts scripts/build-row-tree-worker.ts scripts/
 COPY scripts/perf/firstLoadJs.ts scripts/perf/
 COPY docs/ docs/
 COPY index.html terminal.html desktop.html vite.config.ts ./

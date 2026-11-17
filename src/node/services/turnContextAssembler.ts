@@ -46,6 +46,8 @@ import type { InstructionSources } from "@/common/types/instructions";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
+import { isValidProvider } from "@/common/constants/providers";
+import { resolveRequestProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import type { TaskSettings } from "@/common/types/tasks";
 import {
   isRuntimeReadFailure,
@@ -82,7 +84,14 @@ import {
   discoverAgentSkills,
   requireReachableSkills,
 } from "@/node/services/agentSkills/agentSkillsService";
-import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  resolveSkillStorageContext,
+  type SkillStorageContext,
+} from "@/node/services/agentSkills/skillStorageContext";
+import {
+  lazyFileToolSandboxGate,
+  type FileToolSandboxGate,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 import {
   buildSystemMessageFromSources,
   loadWorkspaceInstructionSources,
@@ -91,7 +100,7 @@ import {
 } from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
-import { log } from "./log";
+import { log, type Logger } from "./log";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   applyCacheControlToTools,
@@ -755,6 +764,22 @@ function combineSectionPlans(plans: Array<[keyof SystemSectionRecords, VolatileS
   };
 }
 
+/** The providerOptions namespace this request's client reads (see messagePipeline). */
+function requestProviderOptionsNamespace(
+  options: Pick<
+    AssemblePromptPayloadOptions,
+    "providerForMessages" | "modelString" | "providersConfig" | "routeProvider"
+  >
+): string {
+  const routeProvider = options.routeProvider;
+  return resolveRequestProviderOptionsNamespaceKey(
+    options.providerForMessages,
+    options.modelString,
+    options.providersConfig,
+    routeProvider != null && isValidProvider(routeProvider) ? routeProvider : undefined
+  );
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -805,6 +830,7 @@ export async function assemblePromptPayload(
     deferLoadingToolNames: options.tools
       ? collectDeferLoadingToolNames(options.tools)
       : options.deferLoadingToolNames,
+    toolCallReplayNamespace: requestProviderOptionsNamespace(options),
   });
   // Without a cached system row nothing is frozen (rowsSupported), so this is also the sent one.
   let system: Instructions | undefined = options.systemMessage;
@@ -1391,6 +1417,32 @@ export function removeMemoryGuidance(systemMessage: string, memoryToolAvailable:
   return result.replace(buildContextWindowGuidance(), "");
 }
 
+/** The skills index of the prompt; `sandboxGate` keeps out a project skill that commands cannot read. */
+function discoverPromptSkills(
+  skillCtx: SkillStorageContext,
+  sandboxGate: FileToolSandboxGate,
+  runtimeFactory: RuntimeFactory,
+  workspaceLog: Logger
+) {
+  return discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
+    roots: skillCtx.roots,
+    containment: skillCtx.containment,
+    runtimeFactory,
+    sandboxGate,
+  })
+    .then((discovery) => {
+      requireReachableSkills(discovery);
+      // Shadowed plugin skills join the index under `<plugin>:<skill>`.
+      return listInvocableSkills(discovery);
+    })
+    .catch((error: unknown) => {
+      // An unreachable host must fail the turn, not silently drop the skills index (#4438).
+      if (isRuntimeTransportError(error)) throw error;
+      workspaceLog.warn("Failed to discover agent skills for tool description", { error });
+      return undefined;
+    });
+}
+
 /**
  * Build the agent system prompt, system message, and discover available agents/skills.
  *
@@ -1428,11 +1480,13 @@ export async function buildStreamSystemContext(
 
   // #6426: project plugin agents load only in a trusted project. From the loaded config: no read.
   const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, metadata);
+  const sandboxEnv = opts.instructionHost?.sandboxEnv;
   const agentResolveOptions = {
     skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
     cache: opts.agentDefinitionCache,
     projectPluginsTrusted,
     runtimeFactory: opts.runtimeFactory,
+    sandboxEnv,
   };
   const skillCtx = resolveSkillStorageContext({
     runtime,
@@ -1494,24 +1548,15 @@ export async function buildStreamSystemContext(
           cache: opts.agentDefinitionCache,
           projectPluginsTrusted,
           runtimeFactory: opts.runtimeFactory,
+          sandboxEnv,
         }),
     // Discover available skills for tool description context
-    discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
-      roots: skillCtx.roots,
-      containment: skillCtx.containment,
-      runtimeFactory: opts.runtimeFactory,
-    })
-      .then((discovery) => {
-        requireReachableSkills(discovery);
-        // Shadowed plugin skills join the index under `<plugin>:<skill>`.
-        return listInvocableSkills(discovery);
-      })
-      .catch((error: unknown) => {
-        // An unreachable host must fail the turn, not silently drop the skills index (#4438).
-        if (isRuntimeTransportError(error)) throw error;
-        workspaceLog.warn("Failed to discover agent skills for tool description", { error });
-        return undefined;
-      }),
+    discoverPromptSkills(
+      skillCtx,
+      lazyFileToolSandboxGate(runtime, workspacePath, { env: sandboxEnv }),
+      opts.runtimeFactory,
+      workspaceLog
+    ),
     // Rebuilds within one turn pass the earlier snapshot, so the prompt and
     // tool-scoped instructions always come from a single read.
     opts.instructionSources ??
@@ -1622,6 +1667,8 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   projectPluginsTrusted?: boolean;
   /** Builds the host-local runtimes of the definition scans. */
   runtimeFactory: RuntimeFactory;
+  /** See ReadAgentDefinitionOptions.sandboxEnv. */
+  sandboxEnv?: NodeJS.ProcessEnv;
 }): Promise<Awaited<ReturnType<typeof discoverAgentDefinitions>>> {
   assert(args, "discoverAvailableSubagentsForToolContext: args is required");
   assert(args.runtime, "discoverAvailableSubagentsForToolContext: runtime is required");
@@ -1635,6 +1682,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
     roots: args.roots,
     projectPluginsTrusted: args.projectPluginsTrusted,
     runtimeFactory: args.runtimeFactory,
+    sandboxEnv: args.sandboxEnv,
   });
 
   let desktopAvailablePromise: Promise<boolean> | undefined;
@@ -1668,6 +1716,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
             cache: args.cache,
             projectPluginsTrusted: args.projectPluginsTrusted,
             runtimeFactory: args.runtimeFactory,
+            sandboxEnv: args.sandboxEnv,
           }
         );
 

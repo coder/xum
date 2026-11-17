@@ -40,6 +40,8 @@ interface ResolveAgentInheritanceChainOptions {
   projectPluginsTrusted?: boolean;
   /** Builds the host-local runtimes of the base-definition reads (ReadAgentDefinitionOptions). */
   runtimeFactory: RuntimeFactory;
+  /** See ReadAgentDefinitionOptions.sandboxEnv. */
+  sandboxEnv?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -101,6 +103,7 @@ export async function resolveAgentInheritanceChain(
         cache: options.cache,
         projectPluginsTrusted: options.projectPluginsTrusted,
         runtimeFactory: options.runtimeFactory,
+        sandboxEnv: options.sandboxEnv,
         ...(options.abortSignal != null ? { abortSignal: options.abortSignal } : {}),
       });
     } catch (error) {

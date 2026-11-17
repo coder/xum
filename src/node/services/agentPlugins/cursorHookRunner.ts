@@ -16,6 +16,7 @@ import assert from "node:assert";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { getErrorMessage } from "@/common/utils/errors";
+import { shellQuote } from "@/common/utils/shell";
 import {
   HOOK_INPUT_MAX_CHARS,
   PLUGIN_HOOK_ORDER_BASE,
@@ -30,7 +31,7 @@ import type {
   TurnStopContinueReason,
 } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
-import { resolvePathWithinCwd } from "@/node/services/tools/fileCommon";
+import { resolveFileToolPath } from "@/node/services/tools/fileCommon";
 import { isAgentToolsDisabled, isTerminalsDisabled } from "@/node/utils/agentToolsDisabled";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import type { PluginHookDefinition } from "./codexHooks";
@@ -201,7 +202,7 @@ function fileEditOf(ctx: ToolExecuteContext): { filePath: string; edits: unknown
     ctx.toolName === "file_edit_insert"
       ? { old_string: "", new_string: args.content }
       : { old_string: args.old_string, new_string: args.new_string };
-  const { resolvedPath } = resolvePathWithinCwd(args.path, ctx.host.cwd, ctx.host.runtime);
+  const { resolvedPath } = resolveFileToolPath(args.path, ctx.host.cwd, ctx.host.runtime);
   return { filePath: resolvedPath, edits: [edit] };
 }
 
@@ -307,10 +308,12 @@ async function startAndRead(
     return { kind: "failed", reason: `its input is over ${HOOK_INPUT_MAX_CHARS} characters` };
   }
   const seconds = effectiveHookTimeoutSeconds(handler.timeoutSeconds);
-  const exit = await execHook(handler.command, input, {
-    // Cursor runs stop from the workspace root, the rest from the
-    // plugin folder. The command is not rewritten (D17): `./x.sh` in stop looks in the workspace.
-    cwd: hook.event === "stop" ? call.workspaceRoot : registration.pluginRoot,
+  const exit = await execHook(hookScript(hook, handler.command, registration.pluginRoot), input, {
+    // The sandbox opens the exec folder for writes, and a global plugin's folder holds code that
+    // Xum runs outside it, so every hook starts in the workspace (hookScript()).
+    cwd: call.workspaceRoot,
+    // The transcript is in Xum's home folder, which the sandbox closes.
+    readPaths: [registration.transcriptPath],
     env: hookEnvironment(registration, call.workspaceRoot),
     seconds,
     abortSignal: call.abortSignal,
@@ -321,6 +324,14 @@ async function startAndRead(
   if (exit.kind === "failed") return exit;
   const failure = exitFailure(exit.exitCode, handler.command, seconds);
   return failure !== undefined ? { kind: "failed", reason: failure } : parseOutput(exit.stdout);
+}
+
+/**
+ * Cursor runs stop from the workspace root, the rest from the plugin folder. The command itself is
+ * not rewritten (D17): `./x.sh` in stop looks in the workspace.
+ */
+function hookScript(hook: PluginHookDefinition, command: string, pluginRoot: string): string {
+  return hook.event === "stop" ? command : `cd -- ${shellQuote(pluginRoot)} || exit 1\n${command}`;
 }
 
 function startBlocker(registration: CursorHookRegistration): string | undefined {
@@ -363,6 +374,7 @@ async function execHook(
   input: string,
   options: {
     cwd: string;
+    readPaths: string[];
     env: Record<string, string>;
     seconds: number;
     abortSignal: AbortSignal | undefined;
@@ -373,6 +385,7 @@ async function execHook(
   try {
     stream = await options.runtime.exec(command, {
       cwd: options.cwd,
+      sandboxReadPaths: options.readPaths,
       env: options.env,
       hostEnv: "minimal",
       timeout: options.seconds,

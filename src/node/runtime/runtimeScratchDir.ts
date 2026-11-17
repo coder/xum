@@ -351,6 +351,21 @@ export function buildScratchShellPrelude(spec: ScratchDirSpec): string | undefin
  */
 const SCRATCH_DIR_ENV_NAMES = Object.keys(withLegacyMuxEnvironmentAliases({ XUM_SCRATCH_DIR: "" }));
 
+/**
+ * An agent command's env: secrets override xumEnv, except the scratch dir names, which only
+ * xumEnv sets. The macOS agent sandbox opens $XUM_SCRATCH_DIR for writes like the workspace, so
+ * a secret of that name would open whatever folder it names.
+ */
+export function mergeSecretsOverXumEnv(
+  xumEnv: Record<string, string> | undefined,
+  secrets: Record<string, string> | undefined
+): Record<string, string> {
+  const allowedSecrets = Object.entries(secrets ?? {}).filter(
+    ([name]) => !SCRATCH_DIR_ENV_NAMES.includes(name)
+  );
+  return { ...xumEnv, ...Object.fromEntries(allowedSecrets) };
+}
+
 function exportScratchDir(quotedValue: string): string {
   return `export ${SCRATCH_DIR_ENV_NAMES.map((name) => `${name}=${quotedValue}`).join(" ")}`;
 }

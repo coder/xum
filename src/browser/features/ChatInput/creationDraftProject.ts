@@ -9,6 +9,7 @@ import {
 } from "@/common/types/runtime";
 import {
   DEFAULT_ISOLATION,
+  isolationEquals,
   nearestSupportedIsolation,
   resolveEnabledIsolation,
   type IsolationChoice,
@@ -53,6 +54,41 @@ export function projectDefaultIsolation(
     resolveEnabledIsolation(configured, projectRuntimeEnablement(project, globalEnablement)) ??
     nearestSupportedIsolation(configured)
   );
+}
+
+/** Whether `choice` is what new workspaces in the project already start with. */
+export function isProjectDefaultIsolation(
+  project: ProjectConfig | undefined,
+  globalDefault: IsolationChoice | null | undefined,
+  globalEnablement: RuntimeEnablement,
+  choice: IsolationChoice
+): boolean {
+  return isolationEquals(projectDefaultIsolation(project, globalDefault, globalEnablement), choice);
+}
+
+/**
+ * The config.updateRuntimeEnablement payload that makes `choice` the project's default, as the
+ * creation page's "Set as default" saves it. A project default is a Settings → Runtimes project
+ * override; a project without overrides inherits the global enabled isolations, so they are copied
+ * in: turning the override on to save a default must not re-enable what Settings turned off.
+ */
+export function projectDefaultIsolationUpdate(
+  projectPath: string,
+  project: ProjectConfig | undefined,
+  choice: IsolationChoice,
+  globalEnablement: RuntimeEnablement
+): {
+  projectPath: string;
+  defaultIsolation: IsolationChoice;
+  runtimeOverridesEnabled: true;
+  runtimeEnablement?: RuntimeEnablement;
+} {
+  return {
+    projectPath,
+    defaultIsolation: choice,
+    runtimeOverridesEnabled: true,
+    ...(hasProjectRuntimeOverrides(project) ? {} : { runtimeEnablement: { ...globalEnablement } }),
+  };
 }
 
 /** A project agent exists only in its project; built-in and global agents exist everywhere. */

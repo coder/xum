@@ -13,6 +13,7 @@ import type { ComponentConsent } from "@/node/services/agentPlugins/componentCon
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { createAgentSkillListTool } from "./agent_skill_list";
 import { MAX_FILE_SIZE } from "./fileCommon";
 import {
@@ -20,6 +21,7 @@ import {
   createWorkspaceSessionDir,
   mockToolCallOptions,
   RemotePathMappedRuntime,
+  stubSandboxHidingTokenPath,
   TEST_GLOBAL_WORKSPACE_ID as GLOBAL_WORKSPACE_ID,
   TestTempDir,
   TrueRemotePathMappedRuntime,
@@ -87,6 +89,43 @@ async function writePlugin(
 }
 
 describe("agent_skill_list", () => {
+  // Codex review: a command can replace a project SKILL.md with a link to a file that the agent
+  // sandbox hides, because a project secret names it.
+  it("skips a project skill whose SKILL.md the agent sandbox hides", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-list-sandbox");
+    const root = await fs.realpath(tempDir.path);
+    const workspace = path.join(root, "workspace");
+    const hidden = path.join(workspace, "private", "skill.md");
+    await writeSkill(path.join(workspace, ".xum", "skills"), "kept", { description: "Kept" });
+    await fs.mkdir(path.join(workspace, "private"));
+    await fs.mkdir(path.join(workspace, ".xum", "skills", "leak"));
+    await fs.mkdir(path.join(root, "tmp"));
+    await fs.writeFile(hidden, "---\nname: leak\ndescription: Hidden description\n---\nBody\n");
+    await fs.symlink(hidden, path.join(workspace, ".xum", "skills", "leak", "SKILL.md"));
+    const runtime = new LocalRuntime(workspace);
+    stubSandboxHidingTokenPath(runtime, workspace);
+    const tool = createAgentSkillListTool({
+      ...createTestToolConfig(workspace, {
+        runtime,
+        xumScope: {
+          type: "project",
+          xumHome: path.join(root, "xum-home"),
+          projectRoot: workspace,
+          projectStorageAuthority: "host-local",
+        },
+      }),
+      runtimeTempDir: path.join(root, "tmp"),
+      secrets: { HF_TOKEN_PATH: hidden },
+    });
+
+    const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const projectSkills = result.skills.filter((skill) => skill.scope === "project");
+    expect(projectSkills.map((skill) => skill.name)).toEqual(["kept"]);
+  });
+
   it("lists effective available skills across project and global scopes", async () => {
     using project = new TestTempDir("test-agent-skill-list-project");
     using xumHome = new TestTempDir("test-agent-skill-list-mux-home");

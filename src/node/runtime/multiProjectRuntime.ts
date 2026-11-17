@@ -21,6 +21,7 @@ import type {
   ReadFileOptions,
 } from "./Runtime";
 import { LocalRuntime } from "./LocalRuntime";
+import type { AgentSandboxPolicy, AgentSandboxPolicyInput } from "./sandbox/agentSandboxTargets";
 
 export interface MultiProjectRuntimeEntry {
   projectPath: string;
@@ -53,7 +54,7 @@ export class MultiProjectRuntime implements Runtime {
   constructor(
     private readonly containerManager: ContainerManager,
     private readonly projectRuntimes: MultiProjectRuntimeEntry[],
-    workspaceName: string
+    private readonly workspaceName: string
   ) {
     assert(projectRuntimes.length > 0, "MultiProjectRuntime requires at least one project runtime");
 
@@ -451,7 +452,37 @@ export class MultiProjectRuntime implements Runtime {
     return this.primaryRuntime.exec(command, {
       ...options,
       cwd: options.cwd || this.containerPath,
+      sandboxRoots: [...(options.sandboxRoots ?? []), ...this.checkoutPaths()],
+      sandboxProjectPaths: [...(options.sandboxProjectPaths ?? []), ...this.projectPaths()],
     });
+  }
+
+  /**
+   * The primary runtime's policy under the strictest setting of all projects, with every
+   * checkout open like the workspace.
+   */
+  agentSandboxPolicy(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null {
+    return (
+      this.primaryRuntime.agentSandboxPolicy?.({
+        ...input,
+        workspaceRoots: [...(input.workspaceRoots ?? []), ...this.checkoutPaths()],
+        otherProjectPaths: [...(input.otherProjectPaths ?? []), ...this.projectPaths()],
+      }) ?? null
+    );
+  }
+
+  private projectPaths(): string[] {
+    return this.projectRuntimes.map((entry) => entry.projectPath);
+  }
+
+  /**
+   * Each project's checkout, not the container's link to it: a sandboxed command may write the
+   * container, so it can point a link anywhere, and the next command's sandbox would open that.
+   */
+  private checkoutPaths(): string[] {
+    return this.projectRuntimes.map((entry) =>
+      entry.runtime.getWorkspacePath(entry.projectPath, this.workspaceName)
+    );
   }
 
   readFile(

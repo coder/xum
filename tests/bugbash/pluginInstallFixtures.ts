@@ -163,11 +163,9 @@ function plainSkills(): Files {
       "---\nname: merge-risk\ndescription: Rates the risk of merging a pull request\n" +
       'metadata:\n  version: "1.0"\n  credits:\n    skill: pr\n    author: Bug Bash\n---\n' +
       "Follow these steps.\n",
-    // Invalid: the description is longer than the 1024-character limit.
-    "skills/writing/too-long/SKILL.md": skillMd(
-      "too-long",
-      "This description is far too long. ".repeat(40).trim()
-    ),
+    // Invalid: no description. (A description over 1024 characters is not invalid: Xum cuts it.)
+    "skills/writing/no-description/SKILL.md":
+      "---\nname: no-description\n---\nFollow these steps.\n",
   };
 }
 

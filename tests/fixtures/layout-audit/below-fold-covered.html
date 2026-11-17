@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Covered text below the first screen</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      /* Taller than every audited viewport, so the section below it is reached only by scrolling. */
+      .spacer {
+        height: 2400px;
+      }
+      .stack {
+        position: relative;
+        padding: 18px;
+        border: 1px solid #aebbc4;
+      }
+      .stack p {
+        margin: 0;
+        padding: 18px;
+        font-size: 20px;
+        line-height: 1.3;
+      }
+      .cover {
+        position: absolute;
+        inset: 0;
+        background: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Order status</h1>
+      <div class="spacer"></div>
+      <section class="stack">
+        <p>Your payment failed. Update your billing details to keep your plan.</p>
+        <div class="cover"></div>
+      </section>
+    </main>
+  </body>
+</html>

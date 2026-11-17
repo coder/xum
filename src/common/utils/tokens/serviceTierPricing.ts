@@ -122,6 +122,11 @@ const fastShortOnly = (factor: number): TierFactor => ({ factor, longContext: fa
  * announced 2026-10-08 at $12 input / $60 output, also 6x). This factor also
  * prices models whose Ultrafast rate is not published instead of the lower
  * highest-published fallback, keeping the budget rule's "never under-count" promise.
+ *
+ * GPT-6.2 Astra and Sol list 6x from 2027-03-01 but 3x through 2027-02-28
+ * (Pacific). Xum prices them at the 6x list factor rather than adding
+ * date-dependent pricing, so it over-counts their Ultrafast cost 2x until then.
+ * https://developers.openai.com/api/docs/models/gpt-6.2-sol
  */
 const ULTRAFAST_SIX_BOTH_BANDS: TierFactor = { factor: 6, longContext: true };
 
@@ -148,6 +153,9 @@ const SERVICE_TIER_FACTORS: Readonly<
     ultrafast: ULTRAFAST_SIX_BOTH_BANDS,
   },
   "gpt-6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  // No Flex: the GPT-6.2 tiers are missing from the pricing page's Flex table.
+  "gpt-6.2-astra": { fast: DOUBLE_BOTH_BANDS, ultrafast: ULTRAFAST_SIX_BOTH_BANDS },
+  "gpt-6.2-sol": { fast: DOUBLE_BOTH_BANDS, ultrafast: ULTRAFAST_SIX_BOTH_BANDS },
   // Unsupported older models stay here: they remain routable as custom/persisted
   // strings and LiteLLM still prices their Standard rates, so dropping the factor
   // would bill a reported Fast/Flex response at Standard (under-counting budgets).

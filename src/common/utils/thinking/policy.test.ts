@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
 import {
   getThinkingPolicyForModel,
@@ -108,9 +109,18 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("low");
   });
 
-  test("gpt-6.1-sol follows Astra: 5 levels (no off), off and unset clamp to low", () => {
+  // GPT-6.2 model pages: "The API rejects requests that set reasoning effort to `none`."
+  test("gpt-6.1-sol, GPT-6.2 and their aliases follow Astra: 5 levels (no off), off and unset clamp to low", () => {
     const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
-    for (const id of ["openai:gpt-6.1-sol", "coder:openai/gpt-6.1-sol"]) {
+    for (const id of [
+      "openai:gpt-6.1-sol",
+      "coder:openai/gpt-6.1-sol",
+      "openai:gpt-6.2-sol",
+      "openai:gpt-6.2-astra",
+      "openrouter:openai/gpt-6.2-sol-2026-11-17",
+      KNOWN_MODELS.GPT.id,
+      KNOWN_MODELS.GPT_6_ASTRA.id,
+    ]) {
       expect(getThinkingPolicyForModel(id)).toEqual(fiveLevels);
       expect(enforceThinkingPolicy(id, "off")).toBe("low");
       expect(resolveEffectiveThinkingLevel(id, undefined)).toBe("low");
@@ -909,13 +919,21 @@ describe("GLM 5.3 thinking policy", () => {
     expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", "off")).toBe("low");
   });
 
+  test("recognizes self-hosted GLM 5.3 ids with deployment tags in any case", () => {
+    for (const model of [
+      "omlx:GLM-5.3-Flash-oQ4e-mtp",
+      "lmstudio:mlx-community/GLM-5.3-Flash-MLX-4bit",
+      "ollama:glm-5.3-flash:q4_K_M",
+      "vllm:zai-org/GLM-5.3-FP8",
+    ]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "high", "max"]);
+    }
+  });
+
   test("does not apply the GLM 5.3 policy to named variants", () => {
-    expect(getThinkingPolicyForModel("zai:glm-5.3-flashx")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
+    for (const model of ["zai:glm-5.3-flashx", "omlx:GLM-5.3-FlashX-4bit", "omlx:GLM-5.3-Air"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
+    }
   });
 });
 

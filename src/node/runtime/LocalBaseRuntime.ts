@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "child_process";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
@@ -36,7 +36,22 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
-import { hostChildEnv, mergeChildEnv, sanitizeXumChildEnv } from "./childProcessEnv";
+import { localExecEnv, stripSandboxedChildEnv } from "./childProcessEnv";
+import {
+  agentSandboxDenialsAfterExit,
+  wrapForAgentSandbox,
+  type AgentSandboxWrap,
+  type WrapForAgentSandboxOptions,
+} from "./sandbox/macosSandbox";
+import {
+  agentSandboxApplies,
+  agentSandboxSettingsFor,
+  anyAgentSandboxEnabled,
+  buildStrictestAgentSandboxPolicy,
+  type AgentSandboxPolicy,
+  type AgentSandboxPolicyInput,
+} from "./sandbox/agentSandboxTargets";
+import { isPathAtOrUnder, PROTECTED_BASH } from "./sandbox/sandboxPaths";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
 import {
@@ -213,6 +228,66 @@ function throwIfAbortedBeforeExec(signal: AbortSignal | undefined): void {
 }
 
 /**
+ * Spawns `bash -c script` through `start`, or sandbox-exec when `sandboxed` is set, and frees the
+ * sandbox registration when the process fails to start, and when it ends unless `keepNetwork`
+ * takes that over (ExecOptions.keepSandboxNetwork).
+ */
+function spawnWithSandbox<T extends ChildProcess>(
+  sandboxed: AgentSandboxWrap | null,
+  input: {
+    bashPath: string;
+    script: string;
+    env: NodeJS.ProcessEnv;
+    keepNetwork?: (release: () => void) => void;
+  },
+  start: (command: string, args: string[], env: NodeJS.ProcessEnv) => T
+): T {
+  if (sandboxed === null) return start(input.bashPath, ["-c", input.script], input.env);
+  let proc: T;
+  try {
+    // Only the keys srt and sandboxToolEnv() add go on top of Xum's own env, so srt cannot
+    // bring back a key that Xum strips.
+    proc = start(sandboxed.command, sandboxed.args, {
+      ...stripSandboxedChildEnv(input.env),
+      ...sandboxed.env,
+    });
+  } catch (error) {
+    sandboxed.dispose();
+    throw error;
+  }
+  proc.once("error", sandboxed.dispose);
+  if (input.keepNetwork === undefined) proc.once("exit", sandboxed.dispose);
+  else input.keepNetwork(sandboxed.dispose);
+  return proc;
+}
+
+function sandboxDenialsField(
+  sandboxed: AgentSandboxWrap | null
+): Pick<ExecStream, "sandboxDenials"> {
+  if (sandboxed === null) return {};
+  return {
+    sandboxDenials: (failed: boolean) => agentSandboxDenialsAfterExit(sandboxed.commandId, failed),
+  };
+}
+
+function killInitHook(proc: ChildProcess): void {
+  if (proc.pid !== undefined) {
+    killProcessTree(proc.pid);
+    return;
+  }
+  try {
+    proc.kill("SIGKILL");
+  } catch {
+    // ignore
+  }
+}
+
+// The PATH of Xum's own commands outside the agent sandbox: macOS System Integrity Protection
+// keeps these folders read-only, also for extraWritePaths. /usr/local/bin is not one of them
+// (Homebrew on Intel owns it).
+const SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
  *
  * Provides shared implementation for:
@@ -247,6 +322,63 @@ export abstract class LocalBaseRuntime implements Runtime {
     return undefined;
   }
 
+  /** This runtime's workspace checkout, when it is known. */
+  protected sandboxCheckoutRoot(): string | undefined {
+    return undefined;
+  }
+
+  /**
+   * `roots`, plus the checkout when the command works in it: the cwd of a workspace for a
+   * sub-project is a folder inside the checkout, and git and edits there need the rest of it.
+   */
+  private withCheckoutRoot(cwd: string, roots: readonly string[] | undefined): string[] {
+    const listed = [...(roots ?? [])];
+    const checkout = this.sandboxCheckoutRoot();
+    if (checkout === undefined) return listed;
+    const inCheckout = [cwd, ...listed].some((root) =>
+      isPathAtOrUnder(path.resolve(root), path.resolve(checkout))
+    );
+    return inCheckout ? [...listed, checkout] : listed;
+  }
+
+  /**
+   * The bash and the env of a call that opts out of an agent sandbox that applies: approved bash
+   * calls, MCP servers and Xum's own commands. Bash sources the file that BASH_ENV names before
+   * the script, and it defines the exported bash functions (`BASH_FUNC_git%%`) whatever BASH_ENV
+   * and PATH are, and either can run a file that a sandboxed command wrote in the workspace (Codex
+   * review), so no opt-out keeps them. Each runs PROTECTED_BASH, and Xum's fixed scripts also skip
+   * the inherited PATH, which can hold a folder that sandboxed commands write (an activated
+   * <workspace>/.venv/bin), so a planted `rm` or `bash` never runs unsandboxed. This holds while the sandbox is on for any project: a
+   * sandboxed command of one project can write those files for a call of another, and a runtime
+   * for a new worktree's path finds no project at all (Codex review).
+   */
+  private sandboxOptOut(
+    cwd: string,
+    options: ExecOptions
+  ): { bashPath: string; env: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv } {
+    const inherited = { bashPath: getBashPath(), env: (env: NodeJS.ProcessEnv) => env };
+    if (options.sandbox === undefined) return inherited;
+    if (
+      !this.sandboxOnAnywhere() &&
+      !agentSandboxApplies(this, { cwd, otherProjectPaths: options.sandboxProjectPaths })
+    ) {
+      return inherited;
+    }
+    const withoutBashStartup = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
+      ...Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("BASH_FUNC_"))),
+      BASH_ENV: "",
+    });
+    if (options.sandbox === "off") return { bashPath: PROTECTED_BASH, env: withoutBashStartup };
+    return {
+      bashPath: PROTECTED_BASH,
+      env: (env) => ({ ...withoutBashStartup(env), PATH: SYSTEM_PATH }),
+    };
+  }
+
+  private sandboxOnAnywhere(): boolean {
+    return this.location === "local" && process.platform === "darwin" && anyAgentSandboxEnabled();
+  }
+
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
     const startTime = performance.now();
 
@@ -266,8 +398,8 @@ export abstract class LocalBaseRuntime implements Runtime {
     // without this second check the process would start and run to its end after the abort.
     throwIfAbortedBeforeExec(options.abortSignal);
 
-    const bashPath = getBashPath();
-    const spawnCommand = bashPath;
+    const optOut = this.sandboxOptOut(cwd, options);
+    const bashPath = optOut.bashPath;
 
     // Match RemoteRuntime behavior: ensure non-interactive env vars are set inside the shell.
     //
@@ -285,40 +417,49 @@ export abstract class LocalBaseRuntime implements Runtime {
     const pathEnvPrelude = Object.entries(options.pathEnv ?? {})
       .map(([key, value]) => buildShellExport(key, path.resolve(cwd, expandTilde(value))))
       .join("\n");
-    const spawnArgs = [
-      "-c",
-      `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`,
-    ];
+    const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`;
 
-    const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     const callerEnv = options.env ?? {};
-    const mergedEnv = sanitizeXumChildEnv(mergeChildEnv(hostChildEnv(options.hostEnv), callerEnv), {
-      ...process.env,
-      ...callerEnv,
+    const { env: mergedEnv, path: effectivePath } = localExecEnv(callerEnv, options.hostEnv);
+    const childEnv = optOut.env({
+      ...mergedEnv,
+      ...NON_INTERACTIVE_ENV_VARS,
+      PATH: effectivePath,
     });
-    const basePath =
-      (options.env?.PATH && options.env.PATH.length > 0
-        ? mergedEnv.PATH
-        : (mergedEnv.PATH ?? mergedEnv.Path)) ?? defaultPath;
-    const effectivePath = basePath;
 
-    const childProcess = spawn(spawnCommand, spawnArgs, {
-      cwd,
-      env: {
-        ...mergedEnv,
-        ...NON_INTERACTIVE_ENV_VARS,
-        PATH: effectivePath,
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-      // CRITICAL: Spawn as detached process group leader to enable cleanup of background processes.
-      // When a bash script spawns background processes (e.g., `sleep 100 &`), we need to kill
-      // the entire process group (including all backgrounded children) via process.kill(-pid).
-      // NOTE: detached:true does NOT cause bash to wait for background jobs when using 'exit' event
-      // instead of 'close' event. The 'exit' event fires when bash exits, ignoring background children.
-      detached: true,
-      // Prevent console window from appearing on Windows (WSL bash spawns steal focus otherwise)
-      windowsHide: true,
+    // Null when the sandbox is off, not on macOS, or the caller opts out. Throws (and runs
+    // nothing) when the sandbox applies but cannot start: it never falls back to running
+    // unsandboxed.
+    const sandboxed = await this.wrapForSandbox(cwd, script, {
+      bashPath,
+      abortSignal: options.abortSignal,
+      optOut: options.sandbox !== undefined,
+      workspaceRoots: options.sandboxRoots,
+      readPaths: options.sandboxReadPaths,
+      scratchDir: callerEnv.XUM_SCRATCH_DIR,
+      pathEnv: effectivePath,
+      otherProjectPaths: options.sandboxProjectPaths,
+      env: childEnv,
     });
+
+    const childProcess = spawnWithSandbox(
+      sandboxed,
+      { bashPath, script, env: childEnv, keepNetwork: options.keepSandboxNetwork },
+      (spawnCommand, spawnArgs, env): ChildProcessWithoutNullStreams =>
+        spawn(spawnCommand, spawnArgs, {
+          cwd,
+          env,
+          stdio: ["pipe", "pipe", "pipe"],
+          // CRITICAL: Spawn as detached process group leader to enable cleanup of background processes.
+          // When a bash script spawns background processes (e.g., `sleep 100 &`), we need to kill
+          // the entire process group (including all backgrounded children) via process.kill(-pid).
+          // NOTE: detached:true does NOT cause bash to wait for background jobs when using 'exit' event
+          // instead of 'close' event. The 'exit' event fires when bash exits, ignoring background children.
+          detached: true,
+          // Prevent console window from appearing on Windows (WSL bash spawns steal focus otherwise)
+          windowsHide: true,
+        })
+    );
 
     const localProcess = getLocalProcessEvidence(childProcess.pid);
 
@@ -417,7 +558,68 @@ export abstract class LocalBaseRuntime implements Runtime {
       void exitCode.catch(() => undefined).finally(() => clearTimeout(timeoutHandle));
     }
 
-    return { stdout, stderr, stdin, exitCode, duration, localProcess };
+    return {
+      stdout,
+      stderr,
+      stdin,
+      exitCode,
+      duration,
+      localProcess,
+      ...sandboxDenialsField(sandboxed),
+    };
+  }
+
+  agentSandboxPolicy(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null {
+    // Devcontainer commands run in the container, which the macOS sandbox does not cover.
+    if (this.location !== "local" || process.platform !== "darwin") return null;
+    const settings = agentSandboxSettingsFor(
+      this.agentCgroupProjectPath(),
+      input.otherProjectPaths
+    );
+    if (settings === null) return null;
+    return buildStrictestAgentSandboxPolicy(settings, {
+      ...input,
+      workspaceRoots: this.withCheckoutRoot(input.cwd, input.workspaceRoots),
+    });
+  }
+
+  /** The sandboxed spawn of `script` in `cwd`, or null; see wrapForAgentSandbox(). */
+  protected async wrapForSandbox(
+    cwd: string,
+    script: string,
+    options: WrapForAgentSandboxOptions
+  ): Promise<AgentSandboxWrap | null> {
+    if (this.location !== "local") return null;
+    try {
+      const sandboxed = await wrapForAgentSandbox(this.agentCgroupProjectPath(), cwd, script, {
+        ...options,
+        workspaceRoots: this.withCheckoutRoot(cwd, options.workspaceRoots),
+      });
+      // Nothing spawns it, so nothing else frees its network list registration.
+      if (options.abortSignal?.aborted) sandboxed?.dispose();
+      throwIfAbortedBeforeExec(options.abortSignal);
+      return sandboxed;
+    } catch (error) {
+      if (error instanceof RuntimeErrorClass) throw error;
+      throwIfAbortedBeforeExec(options.abortSignal);
+      throw new RuntimeErrorClass(getErrorMessage(error), "exec", error);
+    }
+  }
+
+  /** wrapForSandbox() for the init hook, which logs a sandbox that cannot start and runs nothing. */
+  private async wrapInitHookForSandbox(
+    workspacePath: string,
+    script: string,
+    initLogger: InitLogger,
+    options: WrapForAgentSandboxOptions
+  ): Promise<{ ok: true; sandboxed: AgentSandboxWrap | null } | { ok: false }> {
+    try {
+      return { ok: true, sandboxed: await this.wrapForSandbox(workspacePath, script, options) };
+    } catch (error) {
+      initLogger.logStderr(`Error running init hook: ${getErrorMessage(error)}`);
+      initLogger.logComplete(options.abortSignal?.aborted ? EXIT_CODE_ABORTED : -1);
+      return { ok: false };
+    }
   }
 
   readFile(
@@ -647,38 +849,40 @@ export abstract class LocalBaseRuntime implements Runtime {
     }
 
     const loggers = createLineBufferedLoggers(initLogger);
+    const bashPath = getBashPath();
+    const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${shellQuote(hookPath)}`;
+    const hookEnv: NodeJS.ProcessEnv = { ...process.env, ...xumEnv };
+    // The init hook is agent-reachable (a repo file), so it runs in the sandbox like bash does.
+    const wrap = await this.wrapInitHookForSandbox(workspacePath, script, initLogger, {
+      bashPath,
+      abortSignal,
+      // No scratchDir: the init hook gets none from Xum, so an XUM_SCRATCH_DIR here is a secret.
+      pathEnv: hookEnv.PATH,
+      env: hookEnv,
+    });
+    if (!wrap.ok) return;
 
     return new Promise<void>((resolve) => {
-      const bashPath = getBashPath();
-      const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${shellQuote(hookPath)}`;
-      const proc = spawn(bashPath, ["-c", script], {
-        cwd: workspacePath,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          ...xumEnv,
-        },
-        // Prevent console window from appearing on Windows
-        windowsHide: true,
-        // Spawn as a detached process group leader so we can reliably cancel the hook.
-        detached: true,
-      });
+      const proc = spawnWithSandbox(
+        wrap.sandboxed,
+        { bashPath, script, env: hookEnv },
+        (command, args, env) =>
+          spawn(command, args, {
+            cwd: workspacePath,
+            stdio: ["ignore", "pipe", "pipe"],
+            env,
+            // Prevent console window from appearing on Windows
+            windowsHide: true,
+            // Spawn as a detached process group leader so we can reliably cancel the hook.
+            detached: true,
+          })
+      );
 
       let aborted = false;
 
       const onAbort = () => {
         aborted = true;
-
-        if (proc.pid !== undefined) {
-          killProcessTree(proc.pid);
-          return;
-        }
-
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // ignore
-        }
+        killInitHook(proc);
       };
 
       abortSignal?.addEventListener("abort", onAbort, { once: true });

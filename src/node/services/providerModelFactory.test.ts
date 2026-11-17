@@ -11,7 +11,7 @@ import {
   type Tool,
 } from "ai";
 import type { GoogleVertexProviderSettings } from "@ai-sdk/google-vertex";
-import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
+import type { Experimental_EvaluationModelV4, SharedV4ProviderOptions } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
 import { Cause, Effect, Exit, Option } from "effect";
@@ -1950,6 +1950,8 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
   it.each([
     ["gpt-6-astra", "responses", "ultrafast"],
     ["gpt-6.1-sol", "responses", "ultrafast"],
+    ["gpt-6.2-astra", "responses", "ultrafast"],
+    ["gpt-6.2-sol", "responses", "ultrafast"],
     // Ultrafast is model-gated: other models drop the tier instead of sending one
     // OpenAI rejects (and never fall back to the separately billed Fast tier).
     ["gpt-6-luna", "responses", undefined],
@@ -1984,6 +1986,40 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
       });
     }
   );
+
+  // OpenAI's pricing page has no Flex row for GPT-6.2, so a configured Flex tier is
+  // dropped (Standard) for it; the ids the aliases left keep Flex.
+  it.each([
+    ["gpt-6.2-sol", undefined],
+    ["gpt-6.2-astra", undefined],
+    ["gpt-6.2-sol-2026-11-17", undefined],
+    ["gpt-6.1-sol", "flex"],
+    ["gpt-6-astra", "flex"],
+    ["gpt-6-luna", "flex"],
+  ] as const)("sends the configured Flex tier for %s only when offered", async (model, tier) => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        openai: {
+          apiKey: "native-key",
+          baseUrl: "https://native.example.com/v1",
+          serviceTier: "flex",
+        },
+      });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(`openai:${model}`);
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls.length).toBe(1);
+        expect(parseSentBody(calls[0]).service_tier).toBe(tier);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
 });
 
 async function sendWithCyberKey(
@@ -4788,6 +4824,128 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
+  it("streams Gemini thoughts as reasoning through a google-typed Coder instance", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: { google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      // Gemini's OpenAI-compatible stream: thoughts inline in content, wrapped in
+      // <thought>...</thought> and marked with extra_content.google.thought.
+      const sse = (chunks: unknown[]) => {
+        const body = `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+        const cut = body.indexOf("<thought>") + "<tho".length;
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode(body.slice(0, cut)));
+              controller.enqueue(encoder.encode(body.slice(cut)));
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } }
+        );
+      };
+      const thought = (content: string) => ({
+        choices: [{ index: 0, delta: { content, extra_content: { google: { thought: true } } } }],
+      });
+      const responses = [
+        sse([
+          thought("<thought>Plan"),
+          thought(" the call"),
+          {
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      id: "call_a",
+                      type: "function",
+                      function: { name: "echo", arguments: JSON.stringify({ text: "a" }) },
+                      extra_content: { google: { thought_signature: "sig-a" } },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        ]),
+        sse([
+          thought("<thought>Check"),
+          { choices: [{ index: 0, delta: { content: "</thought>done" } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        ]),
+      ];
+      const requestBodies: Array<Record<string, unknown>> = [];
+      const fakeFetch = Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>);
+        const response = responses.shift();
+        return response ? Promise.resolve(response) : Promise.reject(new Error("unexpected"));
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const pinned = await factory.createModelWithPinnedOptions("google:gemini-4-carbon", {
+          thinkingLevel: "high",
+        });
+        if (!pinned.success) throw new Error(pinned.error.type);
+        const result = streamText({
+          model: pinned.data.model,
+          prompt: "echo a",
+          providerOptions: buildProviderOptions(
+            pinned.data.optionsModelString,
+            "high",
+            undefined,
+            undefined,
+            pinned.data.optionsMuxProviderOptions,
+            undefined,
+            undefined,
+            pinned.data.optionsProvidersConfig,
+            pinned.data.optionsRouteProvider
+          ) as SharedV4ProviderOptions,
+          tools: {
+            echo: tool({
+              inputSchema: jsonSchema<{ text: string }>({
+                type: "object",
+                properties: { text: { type: "string" } },
+                required: ["text"],
+              }),
+              execute: ({ text }) => Promise.resolve(text),
+            }),
+          },
+          stopWhen: stepCountIs(2),
+        });
+
+        expect(await result.text).toBe("done");
+        expect((await result.steps).map((step) => step.reasoningText)).toEqual([
+          "Plan the call",
+          "Check",
+        ]);
+        for (const body of requestBodies) {
+          expect(body).not.toHaveProperty("reasoning_effort");
+          // OpenAI-style streams carry token usage only when the request asks for it.
+          expect(body.stream_options).toEqual({ include_usage: true });
+          expect(body.extra_body).toEqual({
+            google: { thinking_config: { include_thoughts: true, thinking_level: "high" } },
+          });
+        }
+        const replayed = (requestBodies[1]?.messages as Array<Record<string, unknown>>).find(
+          (message) => message.role === "assistant"
+        );
+        expect(replayed).not.toHaveProperty("reasoning_content");
+        expect(replayed?.tool_calls).toMatchObject([
+          { id: "call_a", extra_content: { google: { thought_signature: "sig-a" } } },
+        ]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
   it("does not route a canonical model through Coder when its mapped instance is unknown", async () => {
     await withTempConfig(async (config, factory, oauth) => {
       saveCoderConfig(config, {
@@ -4931,7 +5089,7 @@ describe("ProviderModelFactory Coder", () => {
       expect(result.data.effectiveModelString).toBe("coder:google/gemini-3-pro");
       expect(result.data.canonicalModelString).toBe("coder:google/gemini-3-pro");
       expect(result.data.routeProvider).toBe("coder");
-      expect((result.data.model as { provider?: unknown }).provider).toBe("openai.chat");
+      expect((result.data.model as { provider?: unknown }).provider).toBe("coderGoogle.chat");
       // Message preparation and options namespaces key on the wire the
       // request speaks (google → OpenAI-compatible), not the "coder" prefix.
       expect(result.data.wireProviderName).toBe("openai");

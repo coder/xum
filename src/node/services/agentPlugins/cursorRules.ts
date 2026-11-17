@@ -13,6 +13,7 @@ import {
   rewrittenSkillMarkdown,
 } from "@/node/services/agentSkills/parseSkillMarkdown";
 import {
+  cutToCap,
   firstNonEmptyLine,
   normalizeNewlines,
   splitFrontmatter,
@@ -43,9 +44,10 @@ function parseRuleFrontmatter(yaml: string): Record<string, unknown> | undefined
 
 function ruleGlobs(value: unknown): string[] {
   const entries = Array.isArray(value) ? value : [value];
+  // Cut before trimming, so memory stays bounded when YAML aliases repeat a long glob.
   return entries
     .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => entry.slice(0, MAX_SKILL_DESCRIPTION_LENGTH).trim())
+    .map((entry) => cutToCap(entry, MAX_SKILL_DESCRIPTION_LENGTH).trim())
     .filter((entry) => entry.length > 0);
 }
 
@@ -77,7 +79,7 @@ function globsSuffix(globs: readonly string[]): string {
     if (suffix.length >= MAX_SKILL_DESCRIPTION_LENGTH) break;
     suffix += `${index > 0 ? ", " : ""}${glob}`;
   }
-  return suffix.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
+  return cutToCap(suffix, MAX_SKILL_DESCRIPTION_LENGTH);
 }
 
 function ruleSkillDescription(args: {
@@ -89,7 +91,7 @@ function ruleSkillDescription(args: {
   const base = args.description ?? firstNonEmptyLine(args.body) ?? `Cursor rule ${args.name}`;
   const suffix = globsSuffix(args.globs);
   const room = Math.max(0, MAX_SKILL_DESCRIPTION_LENGTH - suffix.length);
-  return `${base.slice(0, room)}${suffix}`.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
+  return `${cutToCap(base, room)}${suffix}`.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
 }
 
 /**

@@ -6,6 +6,8 @@ import {
   resolveSshDirectoryTrustNotice,
   applyResolvedProjectDir,
   saveSshDirectoryTrust,
+  sshDirectoryTrustRowCopy,
+  withResolvedRememberedProjectDir,
 } from "./sshDirectoryTrustState";
 
 const projectPath = "/repo/app";
@@ -75,7 +77,7 @@ describe("saveSshDirectoryTrust", () => {
   const request = { projectPath, host: "box", projectDir: "~/app", trusted: true };
 
   function depsReturning(result: Result<{ projectDir: string }, string>) {
-    const calls = { resolved: [] as string[], refreshed: 0 };
+    const calls = { resolved: [] as string[], remembered: [] as string[][], refreshed: 0 };
     return {
       calls,
       deps: {
@@ -91,6 +93,8 @@ describe("saveSshDirectoryTrust", () => {
           projectDir: "~/app",
           applyProjectDir: (dir: string) => calls.resolved.push(dir),
         }),
+        rememberResolvedProjectDir: (req: { host: string; projectDir: string }, resolved: string) =>
+          calls.remembered.push([req.host, req.projectDir, resolved]),
       },
     };
   }
@@ -105,8 +109,19 @@ describe("saveSshDirectoryTrust", () => {
       unsubscribe();
     }
     expect(calls.resolved).toEqual(["/home/me/app"]);
+    expect(calls.remembered).toEqual([]);
     expect(calls.refreshed).toBe(1);
     expect(published).toBe(1);
+  });
+
+  test("upgrades the remembered directory when the form moved on before the reply", async () => {
+    // Without this, coming back to "~/app" never matches the stored "/home/me/app" entry.
+    const { calls, deps } = depsReturning(Ok({ projectDir: "/home/me/app" }));
+    expect(
+      await saveSshDirectoryTrust({ ...deps, currentSelection: () => null }, request)
+    ).toBeNull();
+    expect(calls.resolved).toEqual([]);
+    expect(calls.remembered).toEqual([["box", "~/app", "/home/me/app"]]);
   });
 
   test("leaves an already-resolved directory alone", async () => {
@@ -128,6 +143,50 @@ describe("saveSshDirectoryTrust", () => {
       api: { setSshDirectoryTrust: () => Promise.reject(new Error("offline")) },
     };
     expect(await saveSshDirectoryTrust(failing, request)).toBe("offline");
+  });
+});
+
+describe("withResolvedRememberedProjectDir", () => {
+  const remembered = { ssh: { host: "box", projectDir: "~/app" } };
+
+  test("replaces the typed spelling with the resolved one, keeping the other options", () => {
+    expect(
+      withResolvedRememberedProjectDir(remembered, { host: "box", typed: "~/app" }, "/home/me/app")
+    ).toEqual({ ssh: { host: "box", projectDir: "/home/me/app" } });
+  });
+
+  test("leaves a directory the user has since replaced", () => {
+    expect(
+      withResolvedRememberedProjectDir(remembered, { host: "box", typed: "~/other" }, "/home/x")
+    ).toBeNull();
+    expect(
+      withResolvedRememberedProjectDir(remembered, { host: "box", typed: "~/app" }, "~/app")
+    ).toBeNull();
+  });
+
+  test("leaves the directory when the remembered host has changed", () => {
+    // A path resolved on host A must not be stored next to host B.
+    expect(
+      withResolvedRememberedProjectDir(remembered, { host: "other", typed: "~/app" }, "/home/a/app")
+    ).toBeNull();
+  });
+});
+
+describe("sshDirectoryTrustRowCopy", () => {
+  const base = { trusted: false, host: "devbox", projectDir: "~/app" } as const;
+
+  test("a trust that resolves the path on the host names the host while it runs", () => {
+    expect(sshDirectoryTrustRowCopy({ ...base, pending: "trust" }).detail).toContain("devbox");
+    expect(
+      sshDirectoryTrustRowCopy({ ...base, projectDir: "/srv/app", pending: "trust" }).detail
+    ).not.toContain("devbox");
+  });
+
+  test("idle and pending labels differ for each direction", () => {
+    const idleTrust = sshDirectoryTrustRowCopy({ ...base, pending: null }).action;
+    const idleUntrust = sshDirectoryTrustRowCopy({ ...base, trusted: true, pending: null }).action;
+    const untrusting = sshDirectoryTrustRowCopy({ ...base, trusted: true, pending: "untrust" });
+    expect(new Set([idleTrust, idleUntrust, untrusting.action]).size).toBe(3);
   });
 });
 

@@ -21,6 +21,7 @@ import { generateDiff } from "@/node/services/tools/fileCommon";
 import {
   hasErrorCode,
   isSkillMarkdownRootFile,
+  parseSkillNameForChange,
   resolveContainedSkillFilePath,
   resolveSkillFilePath,
   SKILL_FILENAME,
@@ -34,6 +35,8 @@ import {
   resolveSkillFilePathForRuntime,
 } from "./runtimeSkillPathUtils";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
+import { assertProjectFileReachable } from "@/node/services/agentSandbox/fileToolSandbox";
 
 interface AgentSkillWriteToolArgs {
   name: string;
@@ -243,11 +246,11 @@ function makeAgentSkillWriteTool(
       { name, filePath, content }: AgentSkillWriteToolArgs,
       { toolCallId }
     ): Promise<AgentSkillWriteToolResult> => {
-      const parsedName = SkillNameSchema.safeParse(name);
+      const parsedName = parseSkillNameForChange(name, config);
       if (!parsedName.success) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: parsedName.error,
         };
       }
 
@@ -259,6 +262,8 @@ function makeAgentSkillWriteTool(
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
         });
+        // The skill commands run in the sandbox with the environment of bash (Codex review).
+        const commandEnv = mergeSecretsOverXumEnv(config.xumEnv, config.secrets);
 
         // Legacy→canonical migration REWRITES the canonical skill dir, so a
         // host-local migration must hold the same per-root target lock as the
@@ -271,12 +276,12 @@ function makeAgentSkillWriteTool(
         const projectSkillDirs = getProjectSkillDirs(skillCtx, parsedName.data);
         if (projectSkillDirs != null) {
           if (skillCtx.kind === "project-runtime" || config.xumScope == null) {
-            await migrateLegacyProjectSkill(skillCtx, parsedName.data);
+            await migrateLegacyProjectSkill(skillCtx, parsedName.data, commandEnv);
           } else {
             await withTargetMutationLock(
               config.xumScope.xumHome,
               path.resolve(projectSkillDirs[0], ".."),
-              () => migrateLegacyProjectSkill(skillCtx, parsedName.data),
+              () => migrateLegacyProjectSkill(skillCtx, parsedName.data, commandEnv),
               config.sessionLocks
             );
           }
@@ -488,6 +493,9 @@ function makeAgentSkillWriteTool(
             normalizedRelativePath: SKILL_FILENAME,
           };
         }
+        // A project secret can name a file in the skill folder as a config that the sandbox keeps
+        // read-only, such as GIT_CONFIG_GLOBAL (Codex review). Legacy migration runs in the sandbox.
+        await assertProjectFileReachable(config, resolvedTarget.resolvedPath, "write");
 
         const writesSkillMarkdown = isSkillMarkdownRootFile(resolvedTarget.normalizedRelativePath);
         const contentToWrite = writesSkillMarkdown

@@ -31,6 +31,7 @@ import {
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
+import { toolCallReplayMetadataFrom } from "@/node/utils/messages/toolCallReplayMetadata";
 import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
@@ -55,6 +56,7 @@ interface ToolPart {
   toolCallId: string;
   toolName: string;
   providerExecuted?: boolean;
+  providerMetadata?: unknown;
 }
 
 /**
@@ -468,6 +470,7 @@ function foldToolCall(
 
   // IMPORTANT: Add tool part to streamInfo.parts immediately (not just on completion)
   // This ensures in-progress tool calls are saved to partial.json if stream is interrupted
+  const providerOptions = toolCallReplayMetadataFrom(part.providerMetadata);
   const toolPart = {
     type: "dynamic-tool" as const,
     toolCallId: part.toolCallId,
@@ -475,6 +478,7 @@ function foldToolCall(
     state: "input-available" as const,
     input: part.input,
     timestamp: stamp(cursor),
+    ...(providerOptions != null ? { providerOptions } : {}),
   };
   const intents: FoldIntent[] = [
     {

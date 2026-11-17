@@ -1,4 +1,9 @@
 import type { APIClient } from "@/browser/contexts/API";
+import {
+  readOptionField,
+  writeOptionField,
+  type RuntimeOptionDefaults,
+} from "@/browser/utils/runtimeOptionDefaults";
 import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import type { ProjectConfig } from "@/common/types/project";
 import { buildRuntimeConfig } from "@/common/types/runtime";
@@ -47,6 +52,48 @@ export function resolveSshDirectoryTrustNotice(input: {
   };
 }
 
+/** The trust change a row is saving, if any. */
+export type PendingSshDirectoryTrust = "trust" | "untrust" | null;
+
+/**
+ * What the trust row says: its status and its button's label. While a trust saves and the host
+ * must resolve the path (~ or relative) over SSH, which can take seconds, the status says so;
+ * otherwise the row would just sit there greyed out. The host goes in the status text, not the
+ * button, so a long host name cannot widen the button and reflow the row.
+ */
+export function sshDirectoryTrustRowCopy(input: {
+  trusted: boolean;
+  pending: PendingSshDirectoryTrust;
+  host: string;
+  projectDir: string;
+}): { title: string; detail: string; action: string } {
+  const status = input.trusted
+    ? { title: "Trusted directory", detail: "Hooks, MCP servers and project secrets run here." }
+    : {
+        title: "Untrusted directory",
+        detail: "Hooks, MCP servers and project secrets stay off until you trust it.",
+      };
+  const resolvesOnHost = input.pending === "trust" && !input.projectDir.startsWith("/");
+  const actions: Record<NonNullable<PendingSshDirectoryTrust> | "idle", string> = {
+    trust: "Trusting…",
+    untrust: "Untrusting…",
+    idle: input.trusted ? "Untrust" : "Trust directory",
+  };
+  return {
+    title: status.title,
+    detail: resolvesOnHost ? `Resolving ${input.projectDir} on ${input.host}…` : status.detail,
+    action: actions[input.pending ?? "idle"],
+  };
+}
+
+/** Identifies the directory a trust row is about, so its last error shows only for that one. */
+export function sshDirectoryTrustKey(
+  projectPath: string,
+  notice: Pick<SshDirectoryTrustNoticeState, "host" | "projectDir">
+): string {
+  return JSON.stringify([projectPath, notice.host, notice.projectDir]);
+}
+
 /** The SSH+None directory the creation form shows right now, and how to write a new path into it. */
 export interface SshDirectoryTrustSelection {
   projectPath: string;
@@ -77,6 +124,24 @@ export function applyResolvedProjectDir(
 }
 
 /**
+ * The remembered runtime options with the SSH directory `typed` replaced by its host-resolved
+ * spelling, or null when they no longer remember `typed` on `host` (the user has since used another
+ * directory or host). The host must match too: a path resolved on one host means nothing on
+ * another, and writing it next to a newer host would refill the field with a wrong directory.
+ */
+export function withResolvedRememberedProjectDir(
+  remembered: RuntimeOptionDefaults,
+  target: { host: string; typed: string },
+  resolved: string
+): RuntimeOptionDefaults | null {
+  const stillRemembered =
+    readOptionField(remembered, "ssh", "host", "").trim() === target.host &&
+    readOptionField(remembered, "ssh", "projectDir", "").trim() === target.typed;
+  if (!stillRemembered || resolved === target.typed) return null;
+  return writeOptionField(remembered, "ssh", "projectDir", resolved);
+}
+
+/**
  * Saves the user's trust choice for an SSH+None directory and refreshes what depends on it.
  * Returns the error to show, or null on success; never throws.
  *
@@ -90,6 +155,11 @@ export async function saveSshDirectoryTrust(
     refreshProjects: () => Promise<void>;
     /** Read after the request returns, so the write-back sees the latest selection. */
     currentSelection: () => SshDirectoryTrustSelection | null;
+    /** Replaces the project's remembered SSH directory with `resolved`, if it still holds the request's. */
+    rememberResolvedProjectDir: (
+      request: { projectPath: string; host: string; projectDir: string },
+      resolved: string
+    ) => void;
   },
   request: { projectPath: string; host: string; projectDir: string; trusted: boolean }
 ): Promise<string | null> {
@@ -98,7 +168,14 @@ export async function saveSshDirectoryTrust(
     if (!result.success) {
       return result.error;
     }
-    applyResolvedProjectDir(deps.currentSelection(), request, result.data.projectDir);
+    const resolved = result.data.projectDir;
+    if (!applyResolvedProjectDir(deps.currentSelection(), request, resolved)) {
+      // The form moved on before the reply (another isolation, project or page; resolving ~ over
+      // SSH can take seconds). The field the user comes back to fills from the remembered
+      // directory, so upgrade that one: left as "~/app" it would never match the stored
+      // "/home/me/app" entry and the directory would look untrusted for good.
+      deps.rememberResolvedProjectDir(request, resolved);
+    }
     publishProjectTrustChanged();
     await deps.refreshProjects();
     return null;

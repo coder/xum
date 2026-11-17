@@ -10,7 +10,11 @@
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isPlainObject } from "@/common/utils/isPlainObject";
-import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
+import {
+  REDACTION_LOOKAHEAD_CHARS,
+  redactSecretLike,
+  redactWithinCap,
+} from "@/node/services/memorySecretRedaction";
 
 const MEDIA_STUB = "[media]";
 const NESTED_OMITTED = "[nested data omitted]";
@@ -259,10 +263,12 @@ export function serializeToolValue(
 export function renderToolValue(value: unknown, maxChars: number): string {
   if (value === undefined) return NONE;
   // The redaction scans a lookahead past the cap, so a secret that starts inside the kept text is
-  // matched whole before the cut, and not left as a readable prefix.
+  // matched whole before the cut, and not left as a readable prefix. The cut is at the cap in the
+  // value's own characters (see `redactWithinCap`), so what redaction shortens never brings the
+  // lookahead into the kept text.
   const { text, complete } = serializeToolValue(value, maxChars + REDACTION_LOOKAHEAD_CHARS);
-  const redacted = redactSecretLike(text);
-  if (complete && text.length <= maxChars) return redacted;
+  if (complete && text.length <= maxChars) return redactSecretLike(text);
   const cutChars = `${text.length - maxChars}${complete ? "" : "+"}`;
-  return `${redacted.slice(0, maxChars)} [truncated ${cutChars} more chars for memory harvest]`;
+  const shown = redactWithinCap(text, maxChars, { cut: !complete }).slice(0, maxChars);
+  return `${shown} [truncated ${cutChars} more chars for memory harvest]`;
 }

@@ -13,11 +13,9 @@
  * React, the stores and the contexts with this test, and no global loader or config changes.
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import vm from "node:vm";
-import { transformSync } from "@babel/core";
 import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
@@ -27,7 +25,7 @@ import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
-import { reactCompilerConfig } from "@/vite/reactCompilerConfig";
+import { compileWithReactCompiler } from "../../../tests/ui/reactCompiledModule";
 import type { useDraftWorkspaceSettings as UseDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
 
 const HOOK_PATH = path.join(import.meta.dir, "useDraftWorkspaceSettings.ts");
@@ -36,25 +34,14 @@ const PROJECT_PATH = "/tmp/project";
 const BRANCHES = ["main"];
 
 function loadCompiledHook(): typeof UseDraftWorkspaceSettings {
-  const compiled = transformSync(readFileSync(HOOK_PATH, "utf8"), {
-    filename: HOOK_PATH,
-    babelrc: false,
-    configFile: false,
-    // Same module output as the repo's Jest Babel config, from declared dependencies only.
-    presets: [
-      ["@babel/preset-env", { targets: { node: "current" }, modules: "commonjs" }],
-      "@babel/preset-typescript",
-    ],
-    plugins: [["babel-plugin-react-compiler", reactCompilerConfig]],
-  });
-  assert(compiled?.code, "React Compiler produced no output for useDraftWorkspaceSettings.ts");
-
   const moduleExports: Record<string, unknown> = {};
   const compiledModule = { exports: moduleExports };
   // Evaluate the compiled source as a CommonJS module.
-  const evaluate = vm.compileFunction(compiled.code, ["require", "module", "exports"], {
-    filename: HOOK_PATH,
-  });
+  const evaluate = vm.compileFunction(
+    compileWithReactCompiler(HOOK_PATH),
+    ["require", "module", "exports"],
+    { filename: HOOK_PATH }
+  );
   Reflect.apply(evaluate, undefined, [createRequire(HOOK_PATH), compiledModule, moduleExports]);
 
   const hook = compiledModule.exports.useDraftWorkspaceSettings;

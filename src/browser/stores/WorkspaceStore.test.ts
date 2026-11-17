@@ -522,6 +522,21 @@ const bashOutputEvent = (
   ...overrides,
 });
 
+const sandboxApprovalEvent = (
+  workspaceId: string,
+  toolCallId: string,
+  pending: boolean,
+  timestamp: number
+): WorkspaceChatMessage => ({
+  type: "bash-sandbox-approval",
+  workspaceId,
+  toolCallId,
+  script: `script of ${toolCallId}`,
+  reason: `reason for ${toolCallId}`,
+  pending,
+  timestamp,
+});
+
 const toolCallEndEvent = (
   workspaceId: string,
   toolCallId: string,
@@ -8651,6 +8666,90 @@ describe("WorkspaceStore", () => {
       expect(live).not.toBeNull();
       if (!live) throw new Error("Expected buffered live output after caught-up");
       expect(live.stdout).toContain("buffered");
+    });
+  });
+  describe("bash-sandbox-approval events", () => {
+    it("keeps each waiting call until its wait ends, and names the newest one as latest", async () => {
+      const workspaceId = "sandbox-approval-workspace-1";
+
+      mockChatScript([
+        caughtUpEvent(),
+        Promise.resolve(),
+        sandboxApprovalEvent(workspaceId, "call-old", true, 1),
+        sandboxApprovalEvent(workspaceId, "call-new", true, 2),
+        sandboxApprovalEvent(workspaceId, "call-done", true, 3),
+        sandboxApprovalEvent(workspaceId, "call-done", false, 4),
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      expect(store.getBashSandboxApproval(workspaceId, "call-old")?.reason).toBe(
+        "reason for call-old"
+      );
+      expect(store.getBashSandboxApproval(workspaceId, "call-done")).toBeNull();
+      expect(store.getLatestBashSandboxApprovalToolCallId(workspaceId)).toBe("call-new");
+    });
+
+    // Every replay re-sends the calls still waiting (pending:true) before caught-up, so a
+    // reconnect shows exactly those; a call answered while disconnected sends nothing.
+    const approvalAfterReconnect = async (
+      workspaceId: string,
+      replayed: WorkspaceChatMessage[]
+    ) => {
+      const firstSubscription = createReleaseGate();
+      const subscriptions = mockChatReconnectScript((attempt, signal) =>
+        attempt === 1
+          ? [
+              createHistoryMessageEvent("history-1", 1),
+              fullCaughtUpEvent(),
+              Promise.resolve(),
+              streamStartEvent(workspaceId, "msg-sandbox", {
+                historySequence: 2,
+                startTime: 1_000,
+                model: "claude-3-5-sonnet-20241022",
+              }),
+              sandboxApprovalEvent(workspaceId, "call-wait", true, 1_001),
+              firstSubscription.wait,
+            ]
+          : [
+              createHistoryMessageEvent("history-1", 1),
+              ...replayed,
+              // The same stream still runs, so only the replayed approvals decide the card.
+              fullCaughtUpEvent(1, "history-1", { messageId: "msg-sandbox", lastTimestamp: 1_001 }),
+              Promise.resolve(),
+              () => waitForAbortSignal(signal),
+            ]
+      );
+      createAndAddWorkspace(store, workspaceId);
+      expect(
+        await waitUntil(() => store.getBashSandboxApproval(workspaceId, "call-wait") !== null)
+      ).toBe(true);
+      firstSubscription.release();
+      expect(await waitUntil(() => subscriptions() === 2)).toBe(true);
+      await tick(10);
+      return store.getBashSandboxApproval(workspaceId, "call-wait");
+    };
+
+    it("shows a waiting call that a replay re-sends", async () => {
+      const workspaceId = "sandbox-approval-workspace-2";
+      const approval = await approvalAfterReconnect(workspaceId, [
+        {
+          type: "bash-sandbox-approval",
+          workspaceId,
+          toolCallId: "call-wait",
+          script: "git push",
+          reason: "replayed reason",
+          pending: true,
+          timestamp: 1_001,
+        },
+      ]);
+      expect(approval?.reason).toBe("replayed reason");
+    });
+
+    it("drops a waiting call that a replay no longer re-sends", async () => {
+      const approval = await approvalAfterReconnect("sandbox-approval-workspace-3", []);
+      expect(approval).toBeNull();
     });
   });
   describe("workflow-run-attached events", () => {

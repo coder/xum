@@ -97,7 +97,7 @@ test("cursor-market lists pstack once with both builds, and a nested Cursor fold
   ]);
 });
 
-test("plain-skills installs as Skills only, without the skill whose description is too long", async () => {
+test("plain-skills installs as Skills only, without the skill that has no description", async () => {
   const skills = await pluginPreview("plain-skills");
   expect(skills.methods.map((method) => method.kind)).toEqual(["skills"]);
   expect(skills.skills.map((skill) => skill.name).sort()).toEqual([

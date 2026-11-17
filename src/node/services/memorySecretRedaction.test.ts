@@ -1,6 +1,138 @@
 import { describe, expect, it } from "bun:test";
+import { join } from "node:path";
 
-import { addsSecretLike, containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
+import {
+  addsSecretLike,
+  containsSecretLike,
+  REDACTION_LOOKAHEAD_CHARS,
+  redactSecretLike,
+  redactWithinCap,
+} from "./memorySecretRedaction";
+
+const MODULE_PATH = join(import.meta.dir, "memorySecretRedaction");
+const CHILD_TIMEOUT_MS = 20_000;
+const CHILD_TEST_TIMEOUT_MS = 2 * CHILD_TIMEOUT_MS;
+
+type GuardCall = ["containsSecretLike", string] | ["addsSecretLike", string, string];
+
+/**
+ * The answers of the guards, asked in a child process that is killed after `CHILD_TIMEOUT_MS`. A
+ * guard that never returns would hang this run: bun cannot stop a synchronous loop at a test's time
+ * limit. The child dies instead, and the assertions here fail.
+ */
+function answersFromChild(calls: GuardCall[]): unknown {
+  const script = `import * as guards from ${JSON.stringify(MODULE_PATH)};
+const calls = ${JSON.stringify(calls)};
+console.log(JSON.stringify(calls.map(([name, ...args]) => guards[name](...args))));`;
+  const child = Bun.spawnSync([process.execPath, "-e", script], {
+    timeout: CHILD_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  expect({ timedOut: child.exitedDueToTimeout ?? false, exitCode: child.exitCode }).toEqual({
+    timedOut: false,
+    exitCode: 0,
+  });
+  return JSON.parse(child.stdout.toString());
+}
+
+// The timing rows in this file compare CPU time, not wall-clock time. Wall-clock time also counts
+// the time other processes keep the CPU from this one, so a loaded host, or a second test run on
+// the same CPU, stretched a 66 ms scan past its 100 ms budget, and the mutation gate dropped the
+// whole file at its baseline. CPU time is the process's own, and it stayed within 7% when two runs
+// shared one CPU. A budget alone is not enough: the slowest linear scan takes about 90 ms, so a
+// budget low enough to catch a regression on the faster ones would fail it. Each row therefore
+// also runs its text at a half, a quarter and an eighth of its size, and checks how the cost per
+// character grows from each size to the next.
+//
+// A smaller text must keep the shape of the row. A slice of the text drops what the row ends with
+// (a quote after a backslash run, a trailing space that ends a run before the window's end, a dot
+// and the payload after it), so the cost of a regression that needs that ending shows at the full
+// size only and the growth check is blind to it. Every row therefore builds its text at each size
+// (`TextAt`, `repeated`), and no row is cut by a slice.
+//
+// One ratio against the first eighth does not work. Bun 1.4 runs a regex about 70 times cheaper
+// per character on a text shorter than some length (near 65,000 characters for the cookie rows,
+// near 35,000 for the escaped runs), so the eighth of a long text looks cheap and the whole text
+// 3 to 28 times costlier per character, with no quadratic scan involved: CI failed two rows on it
+// at 3.6 and 3.2. That jump sits at one size, so it hits one of the three doublings. A quadratic
+// scan hits all three, so the median of the three growths tells the two apart. The floor below
+// means a quadratic cost under about 13 ms at the full size passes unseen, and so does a cost that
+// grows at one doubling only, up to the ceiling.
+const SCAN_SIZE_DIVISORS = [8, 4, 2, 1];
+// Past this, a scan fails whatever its growth: the slowest linear scan takes about a third of it,
+// and the regressions this guards cost seconds.
+const SCAN_CPU_CEILING_MS = 300;
+// How much the cost per character grows when the text doubles: 1 for a linear scan (1.40 at most
+// over 780 measurements on Bun 1.4.3, 1.36 over 720 on Bun 1.3.14), 2 for a quadratic one.
+const SCAN_GROWTH_PER_DOUBLING_LIMIT = 1.6;
+// A cut that costs less than this is mostly timer and allocation noise. Bun 1.4 measured growths
+// up to 1.9 on linear scans with no floor, and up to 1.65 with a floor of 0.25.
+const SCAN_CPU_FLOOR_MS = 1;
+// Bun's default per-test timeout is 5 s of wall-clock time, and a row times CPU, so it must not be
+// the limit: a loaded host stretched the slowest rows to 4.8 s with four copies of this file on
+// one CPU. The ceiling and the growth limit are what fail a row.
+const SCAN_TEST_TIMEOUT_MS = 30_000;
+
+function cpuMilliseconds(run: () => void): number {
+  const before = process.cpuUsage();
+  run();
+  const used = process.cpuUsage(before);
+  return (used.user + used.system) / 1000;
+}
+
+/**
+ * The least CPU time of up to `runs` runs. One run can be slow for no fault of the scan: a 50 ms
+ * scan once measured 350 ms (the process's CPU time counts all its threads). So the runs stop
+ * early only when the first two are both past the ceiling, which a quadratic scan does every
+ * time, and a failing test does not repeat for long.
+ */
+function bestCpuMilliseconds(run: () => void, runs: number): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let attempt = 0; attempt < runs; attempt++) {
+    const cpuMs = cpuMilliseconds(run);
+    best = Math.min(best, cpuMs);
+    if (attempt >= 1 && best >= SCAN_CPU_CEILING_MS) break;
+  }
+  return best;
+}
+
+/** A row's text at a fraction of its full size (1 is the full text), in the row's own shape. */
+type TextAt = (fraction: number) => string;
+
+/** `head`, `count` repeats of `unit` and then `tail`, at a fraction of the repeats. */
+const repeated =
+  (unit: string, count: number, ends: { head?: string; tail?: string } = {}): TextAt =>
+  (fraction) =>
+    `${ends.head ?? ""}${unit.repeat(Math.round(count * fraction))}${ends.tail ?? ""}`;
+
+/** The CPU time of the whole text, and the median growth of the cost per character per doubling. */
+function measureScan(
+  scan: (text: string) => unknown,
+  textAt: TextAt
+): { fullMs: number; growth: number } {
+  const parts = SCAN_SIZE_DIVISORS.map((divisor) => textAt(1 / divisor));
+  const timesMs = parts.map((part, i) => {
+    scan(part);
+    return bestCpuMilliseconds(() => scan(part), SCAN_SIZE_DIVISORS[i] >= 4 ? 5 : 3);
+  });
+  // Each size is about twice the one before, and the cost per character grew by this much.
+  const growths = timesMs
+    .slice(1)
+    .map(
+      (next, i) =>
+        next / parts[i + 1].length / (Math.max(timesMs[i], SCAN_CPU_FLOOR_MS) / parts[i].length)
+    )
+    .sort((a, b) => a - b);
+  // Four sizes give three growths, so the middle one is the median.
+  return { fullMs: timesMs[timesMs.length - 1], growth: growths[Math.floor(growths.length / 2)] };
+}
+
+/** Fails when `scan` costs 300 ms or more on the text, or more than linear time as it grows. */
+function expectLinearScan(scan: (text: string) => unknown, textAt: TextAt): void {
+  const { fullMs, growth } = measureScan(scan, textAt);
+  expect(fullMs).toBeLessThan(SCAN_CPU_CEILING_MS);
+  expect(growth).toBeLessThan(SCAN_GROWTH_PER_DOUBLING_LIMIT);
+}
 
 describe("redactSecretLike", () => {
   const FAKE = {
@@ -1041,6 +1173,197 @@ describe("redactSecretLike", () => {
     ).toBe("https://h.example.com/p?sv=1&sig=[redacted]&sp=r#frag (see ?signature=[redacted])");
   });
 
+  // The harvest renderer and the guard run redaction over text that may hold the marker already. The
+  // value pattern stops before `]`: on the marker an earlier pass wrote, it read `[redacted` and wrote
+  // `[redacted]]`, one more `]` on every pass. The output no longer grows that `]`, and every shape
+  // below is stable on a second pass. Such a match is still reported to the write guard, as on main,
+  // so the guard refuses all of these: what stays readable behind the marker (`SEKRIT`) is a credential
+  // the redaction did not reach. Other second-pass changes (a key next to a marker) are main's.
+  it.each([
+    // Every value goes once, and the output is stable.
+    ["a request line", "GET /x?a=1&sig=SEKRIT2 HTTP/1.1", "GET /x?a=1&sig=[redacted] HTTP/1.1"],
+    [
+      "a JSON string",
+      '{"u": "https://h/p?X-Amz-Signature=SEKRIT4"}',
+      '{"u": "https://h/p?X-Amz-Signature=[redacted]"}',
+    ],
+    ["a bare parameter", "?sig=SEKRIT", "?sig=[redacted]"],
+    ["an XML-escaped ampersand", "?a=1&amp;signature=SEKRIT", "?a=1&amp;signature=[redacted]"],
+    ["a Google signature", "?X-Goog-Signature=SEKRIT", "?X-Goog-Signature=[redacted]"],
+    ["a value that an earlier pass redacted", "?sig=sk-ABCDEFGHIJKLMNOP", "?sig=[redacted]"],
+    ["a signature in square brackets", "[https://h/p?sig=SEKRIT]", "[https://h/p?sig=[redacted]]"],
+    [
+      "a signature in parentheses",
+      "(see https://h/p?sig=SEKRIT)",
+      "(see https://h/p?sig=[redacted])",
+    ],
+    // The marker is the head of the value: the passes read it as on main, and the output does not
+    // take the `]` that main wrote after it.
+    ["a value that is the marker already", "?sig=[redacted]", "?sig=[redacted]"],
+    ["a marker and a bracket", "?sig=[redacted]]", "?sig=[redacted]]"],
+    ["a value behind the marker", "?sig=[redacted]SEKRIT", "?sig=[redacted]SEKRIT"],
+    ["a value behind an upper-case marker", "?sig=[REDACTED]x", "?sig=[redacted]x"],
+    [
+      "a semicolon and a value behind the marker",
+      "https://x/?sig=[redacted];SEKRIT",
+      "https://x/?sig=[redacted];SEKRIT",
+    ],
+    [
+      "a PHP-escaped slash behind the head of a value",
+      String.raw`https:\/\/h\/p?signature=k\/SEKRITREST`,
+      String.raw`https:\/\/h\/p?signature=[redacted]\/SEKRITREST`,
+    ],
+    [
+      "an HTML entity behind the head of a value",
+      "https://h/p?sig=k&#43;SEKRITREST",
+      "https://h/p?sig=[redacted]&#43;SEKRITREST",
+    ],
+    [
+      "a key's marker with a tail, as the harvest renderer shows it",
+      "https://acct.blob.core.windows.net/c/b?sv=1&sig=sk-ABCDEFGHIJKL%2BSEKRITTAIL%3D",
+      "https://acct.blob.core.windows.net/c/b?sv=1&sig=[redacted]%2BSEKRITTAIL%3D",
+    ],
+  ])(
+    "redacts a signed URL's signature once, and the guard refuses it: %s",
+    (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+      expect(redacted).toBe(expected);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+      // The text as given, and as the harvest renderer shows it back to a model that writes it down.
+      for (const written of [text, redacted]) {
+        expect(containsSecretLike(written)).toBe(true);
+        expect(addsSecretLike("", written)).toBe(true);
+      }
+    }
+  );
+
+  // The collapse follows the `]` that main's passes add through the passes after the signed-URL
+  // pattern, and takes out only that one: a `]` the text had after a marker stays.
+  it("leaves a `]` after a marker that no signed-URL match wrote", () => {
+    const text = "user text [[redacted]] and [redacted]] keep";
+    expect(redactSecretLike(text)).toBe(text);
+    expect(redactSecretLike("x ?sig=[redacted]] y [redacted]]")).toBe(
+      "x ?sig=[redacted]] y [redacted]]"
+    );
+  });
+
+  // A header that only the cookie reader detects reads on past a `]`, so the reader still sees the
+  // extra `]` that the signed-URL pattern wrote, as on main: the redaction hides `SEKRIT` too, and
+  // the guard judges an edit of the tail as main's does.
+  it.each([
+    String.raw`a\tcookie": [?sig=sk-ABCDEFGHIJKLMNOP x], SEKRIT`,
+    String.raw`a\tcookie": [?sig=[redacted] x], SEKRIT`,
+  ])("hides a tail that the reader reads on past a marker: %s", (text) => {
+    const redacted = redactSecretLike(text);
+    expect(redacted).not.toContain("SEKRIT");
+    expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
+  it.each([
+    ['password="?sig=[redacted]"\n?sig=SEKRIT', 'password="?sig=SEKRIT"'],
+    [
+      String.raw`a\tcookie": [?sig=[redacted] x], AAA`,
+      String.raw`a\tcookie": [?sig=[redacted] x], SEKRIT`,
+    ],
+  ])("judges an edit as main's guard does: %j then %j", (previous, updated) => {
+    expect(addsSecretLike(previous, updated)).toBe(true);
+  });
+
+  // The `]` that a signed-URL match adds is followed through every pass after it. Each shape puts the
+  // edit of another pass in front of it, behind it, or right up to it. A position that a pass moved
+  // without reporting it deletes some other character, which these exact outputs show. `removeAt`
+  // asserts only when that character is no `]` with a `]` behind it. The last shape ends in `]]`,
+  // so a stale position that lands there is deleted without an assertion: only the output tells.
+  it.each([
+    [
+      "a key's value in front",
+      "password=hunter2 &sig=sk-ABCDEFGHIJKLMNOP",
+      "password=[redacted] &sig=[redacted]",
+    ],
+    [
+      "a key's value behind",
+      "?sig=sk-ABCDEFGHIJKLMNOP password=hunter2",
+      "?sig=[redacted] password=[redacted]",
+    ],
+    ["a key's value that ends at it", "password=?sig=sk-ABCDEFGHIJKLMNOP", "password=[redacted]]"],
+    [
+      "a key's value that takes the first of two",
+      "token=?sig=sk-ABCDEFGHIJKLMNOP ?sig=sk-QRSTUVWXYZABCDEF",
+      "token=[redacted]] ?sig=[redacted]",
+    ],
+    [
+      "a JWT in front",
+      "eyJhbGciOiJI.eyJzdWIiOiIx.c2lnbmF0 &sig=sk-ABCDEFGHIJKLMNOP",
+      "[redacted] &sig=[redacted]",
+    ],
+    [
+      "a signature in front, from the same pattern",
+      "?sig=abcdefg &sig=sk-ABCDEFGHIJKLMNOP",
+      "?sig=[redacted] &sig=[redacted]",
+    ],
+    [
+      "a signature behind, from the same pattern",
+      "?sig=sk-ABCDEFGHIJKLMNOP &sig=abcdefg",
+      "?sig=[redacted] &sig=[redacted]",
+    ],
+    [
+      "two markers",
+      "?sig=sk-ABCDEFGHIJKLMNOP ?sig=sk-QRSTUVWXYZABCDEF",
+      "?sig=[redacted] ?sig=[redacted]",
+    ],
+    [
+      "a header in front that only the reader reads",
+      String.raw`a\tCookie: v1` + "\n?sig=sk-ABCDEFGHIJKLMNOP",
+      String.raw`a\tCookie: [redacted]` + "\n?sig=[redacted]",
+    ],
+    [
+      "a header behind that only the reader reads",
+      "?sig=sk-ABCDEFGHIJKLMNOP\n" + String.raw`a\tCookie: v1`,
+      "?sig=[redacted]\n" + String.raw`a\tCookie: [redacted]`,
+    ],
+    [
+      "a reader's header in front, and a `]]` at the end of the text",
+      String.raw`a\tCookie: XXXXXXXXXXXXX` + "\n?sig=[redacted]x]]",
+      String.raw`a\tCookie: [redacted]` + "\n?sig=[redacted]x]]",
+    ],
+    // The reader's edit is the value without the blanks it leaves: `removed` ends where the value is
+    // cut, and `at` is where it starts. A bound that is off by one moves or loses the tracked `]`.
+    [
+      "a reader value that ends in blanks",
+      String.raw`a\tCookie: v1 ` + "\n?sig=[redacted]",
+      String.raw`a\tCookie: [redacted] ` + "\n?sig=[redacted]",
+    ],
+    [
+      "a reader list that ends at it",
+      String.raw`a\tcookie": [token=?sig=[redacted]`,
+      String.raw`a\tcookie": [redacted]]`,
+    ],
+  ])("follows the added bracket past another pass: %s", (_label, text, expected) => {
+    const redacted = redactSecretLike(text);
+    expect(redacted).toBe(expected);
+    expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
+  // Only the marker's own head is read back as the marker. A value that merely starts or ends like it
+  // is a value: its `]` stays as on main, and no tracked bracket is taken out.
+  it.each([
+    ["a value that goes on after the head", "?sig=[redactedX]", "?sig=[redacted]]"],
+    ["a value that has the head at its end", "?sig=abc[redacted]", "?sig=[redacted]]"],
+    ["a value that has the head in the middle", "?sig=abc[redactedX]", "?sig=[redacted]]"],
+  ])(
+    "leaves the bracket of a value that is not the marker's head: %s",
+    (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
+      expect(redactSecretLike(expected)).toBe(expected);
+    }
+  );
+
+  // A half marker is not the marker: a value that merely starts like it is still a value.
+  it("redacts a signature value that starts like the marker but is not it", () => {
+    expect(redactSecretLike("?sig=[redacted")).toBe("?sig=[redacted]");
+    expect(redactSecretLike("?sig=[redactedSEKRIT")).toBe("?sig=[redacted]");
+  });
+
   // `signature` is not a secret name: the memory-write guard reuses this detector, and a note
   // about a function signature or a signed commit must stay writable.
   it("leaves a signature or sig that is not a URL query parameter readable", () => {
@@ -1055,6 +1378,542 @@ describe("redactSecretLike", () => {
     expect(redactSecretLike(text)).toBe(text);
   });
 
+  // The write guards also refuse a value that goes on after a marker. The key pattern skips a value
+  // that starts with the marker, and the value patterns end a value at the marker's `]`, so what goes
+  // on stayed readable, and the guards accepted it. The guards read these tails in the output of the
+  // passes. The output is main's, byte for byte: a pass that rewrote it after the others could make a
+  // text that main redacts stably unstable. SEKRIT stands for a credential.
+  describe("a value that goes on after a marker", () => {
+    // [what is behind the marker, the text, what redaction writes for it (as main does)]
+    it.each([
+      [
+        "a value that starts with the marker",
+        "password=[redacted]SEKRIT",
+        "password=[redacted]SEKRIT",
+      ],
+      ["an upper-case marker", "password=[REDACTED]SEKRIT", "password=[REDACTED]SEKRIT"],
+      [
+        "a gap behind the separator",
+        "token: [redacted]SEKRIT next",
+        "token: [redacted]SEKRIT next",
+      ],
+      [
+        "a JSON pair",
+        '{"password":[redacted]SEKRIT,"user":"alice"}',
+        '{"password":[redacted]SEKRIT,"user":"alice"}',
+      ],
+      [
+        "a JSON pair inside an escaped string",
+        String.raw`{\"password\":[redacted]SEKRIT,\"user\":\"alice\"}`,
+        String.raw`{\"password\":[redacted]SEKRIT,\"user\":\"alice\"}`,
+      ],
+      [
+        "a value that an earlier pass cut in the middle",
+        "password=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT",
+        "password=[redacted]].SEKRIT",
+      ],
+      // Punctuation is part of the value, as it is when no marker is there (`password=abc!`).
+      [
+        "punctuation behind the marker",
+        "password=sk-ABCDEFGHIJKLMNOPQ!SEKRIT!",
+        "password=[redacted]!SEKRIT!",
+      ],
+      [
+        "markers inside the value",
+        "token=[redacted]SEKRIT[redacted]MORE",
+        "token=[redacted]SEKRIT[redacted]MORE",
+      ],
+      [
+        "the bracket that a pass left behind the marker",
+        "password=[redacted]]SEKRIT",
+        "password=[redacted]]SEKRIT",
+      ],
+      // The bracket that closes a list around the value is not part of it.
+      ["a closing bracket after the value", "[token=[redacted]SEKRIT]", "[token=[redacted]SEKRIT]"],
+      ["a bracket inside the value", "token=d]d]Z", "token=[redacted]]d]Z"],
+      [
+        "a bracket inside the tail",
+        "password=[redacted]SE[KRIT next",
+        "password=[redacted]SE[KRIT next",
+      ],
+      [
+        "a bracket right after the marker",
+        "password=[redacted][SEKRIT",
+        "password=[redacted][SEKRIT",
+      ],
+      [
+        "a delimiter that ends the value",
+        "password=[redacted]SEKRIT, user=alice; token=[redacted]SEKRIT&x=1",
+        "password=[redacted]SEKRIT, user=alice; token=[redacted]SEKRIT&x=1",
+      ],
+      // A key pair's value does not end at `<`, `>` or `#`, as a signed-URL value does.
+      [
+        "angle brackets and a hash",
+        "token=[redacted]SEKRIT<b>x#y next",
+        "token=[redacted]SEKRIT<b>x#y next",
+      ],
+      [
+        "a tail that starts at a hash",
+        "token=[redacted]#SEKRIT next",
+        "token=[redacted]#SEKRIT next",
+      ],
+      ["a tail of digits", "password=[redacted]4711", "password=[redacted]4711"],
+      [
+        "a pair behind the marker",
+        'password=[redacted]token="SEKRIT"',
+        "password=[redacted]token=[redacted]",
+      ],
+      [
+        "a cookie header behind the marker",
+        "password=[redacted]Cookie: sid=SEKRIT",
+        "password=[redacted]Cookie: [redacted]",
+      ],
+      [
+        "a signature behind a key that an earlier pass redacted",
+        "see https://h/x?sig=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT end",
+        "see https://h/x?sig=[redacted]].SEKRIT end",
+      ],
+      [
+        "a signature that starts with the marker",
+        "?sig=[redacted]SEKRIT&x=1",
+        "?sig=[redacted]SEKRIT&x=1",
+      ],
+      [
+        "a signature after an XML-escaped ampersand",
+        "?a=1&amp;signature=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT&amp;sp=r",
+        "?a=1&amp;signature=[redacted]].SEKRIT&amp;sp=r",
+      ],
+      [
+        "a signature in a JSON string",
+        '{"u": "https://h/p?X-Amz-Signature=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT"}',
+        '{"u": "https://h/p?X-Amz-Signature=[redacted]].SEKRIT"}',
+      ],
+      [
+        "a signature in parentheses",
+        "(see https://h/p?sig=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT)",
+        "(see https://h/p?sig=[redacted]].SEKRIT)",
+      ],
+      [
+        "two keys inside one signature",
+        "?sig=a.sk-AAAAAAAAAAAAAAAA.SEKRIT.sk-BBBBBBBBBBBBBBBB.MORE",
+        "?sig=[redacted]].SEKRIT.[redacted].MORE",
+      ],
+      // A signed-URL value ends at `<`, `>` and `#`, which a key pair's value does not end at.
+      [
+        "a signature that ends at an angle bracket and a hash",
+        "<https://h/p?sig=[redacted]SEKRIT><a>#frag",
+        "<https://h/p?sig=[redacted]SEKRIT><a>#frag",
+      ],
+      [
+        "a signature that ends at a hash",
+        "?sig=[redacted]SEKRIT#frag",
+        "?sig=[redacted]SEKRIT#frag",
+      ],
+      // A URL whose user holds a marker and a tail: the userinfo pattern takes none of it (it bounds
+      // its user at 64 characters), and the tail is the guards' to read.
+      [
+        "a long user in a URL",
+        `see https://token=[redacted]${"x".repeat(48)},:pw@db.example/x`,
+        `see https://token=[redacted]${"x".repeat(48)},:pw@db.example/x`,
+      ],
+    ])("refuses %s, and writes the text as main does", (_label, text, written) => {
+      expect(redactSecretLike(text)).toBe(written);
+      expect(containsSecretLike(text)).toBe(true);
+      expect(addsSecretLike("", text)).toBe(true);
+      // The guard reads the output too: a model that copies the text it was shown writes it again.
+      expect(containsSecretLike(written)).toBe(true);
+    });
+
+    // The inputs that made a text unstable when a pass rewrote the tail (a Cookie header behind it
+    // took another frame). Redaction writes main's text, which is stable.
+    it.each([
+      [
+        "a Cookie header in quotes behind a tail",
+        "token=[redacted]abc='Cookie: sid=1'",
+        "token=[redacted]abc='Cookie: [redacted]'",
+      ],
+      [
+        "a JSON-escaped Cookie header behind a bracket",
+        String.raw`ApiKey:D]Q:\\\"Cookie:SEKRIT\\\"`,
+        String.raw`ApiKey:[redacted]]Q:\\\"Cookie:[redacted]`,
+      ],
+    ])("writes main's stable text for %s", (_label, text, written) => {
+      expect(redactSecretLike(text)).toBe(written);
+      expect(redactSecretLike(written)).toBe(written);
+      expect(containsSecretLike(text)).toBe(true);
+    });
+
+    // The tail is any script's letters or digits: the readable word after a marker is a value there too.
+    it.each([
+      ["CJK letters", "password=[redacted]秘密"],
+      ["Cyrillic letters", "token=[redacted]пароль"],
+      ["one accented letter", "password=[redacted]é"],
+      ["a feminine ordinal indicator", "password=[redacted]ª"],
+      ["Arabic-Indic digits", "password=[redacted]٤٧١١"],
+      ["full-width digits", "password=[redacted]４７１１"],
+      ["a superscript digit", "password=[redacted]²"],
+      ["an astral letter", "password=[redacted]𝒜"],
+      ["an astral digit", "password=[redacted]𝟜"],
+      // The ends of the surrogate ranges: a pair starts at 0xd800 and ends at 0xdfff.
+      ["the first astral letter, a pair that starts at 0xd800", "password=[redacted]\u{10000}"],
+      ["a pair that starts at 0xd835 and ends at 0xdc00", "password=[redacted]\u{1D400}"],
+      ["the last mathematical digit, a pair that ends at 0xdfff", "password=[redacted]\u{1D7FF}"],
+      // A lone surrogate is one character that is no letter or digit and no end of a value. It does not
+      // join the character before it or after it in a pair, so the `]` before a letter still goes on.
+      ["a bracket, a lone low surrogate and a letter", "password=[redacted]]\udc00秘"],
+      ["a lone high surrogate, a bracket and a letter", "password=[redacted]\ud800]x"],
+      // A lone low surrogate does not join a character that is no high surrogate either: the letter
+      // before it stays a letter. (Bun 1.3.14 answers false to `/[\p{L}\p{N}]/u` for a letter in
+      // U+F900 to U+FBFF and a lone low surrogate after it, so a reader that paired them would miss it.)
+      ["a letter from U+F900 and a lone low surrogate", "password=[redacted]\uf900\udc00"],
+      ["punctuation before the letters", "token=[redacted]。秘密"],
+      ["letters after a full-width bracket", "token=[redacted]」秘密"],
+      ["a signature of CJK letters", "?sig=[redacted]秘密&x=1"],
+      ["a signature of Cyrillic letters", "?sig=[redacted]пароль#frag"],
+      ["a JSON pair of CJK letters", '{"password":[redacted]秘密,"user":"alice"}'],
+    ])("refuses a tail of %s", (_label, text) => {
+      expect(containsSecretLike(text)).toBe(true);
+      expect(addsSecretLike("", text)).toBe(true);
+    });
+
+    // One character decides: the first and the last of each ASCII class count, and the character next
+    // to each of them does not.
+    it.each(["0", "9", "a", "z", "A", "Z"])("refuses a tail of %s alone", (char) => {
+      expect(containsSecretLike(`password=[redacted]${char}`)).toBe(true);
+    });
+
+    it.each(["/", ":", "@", "[", "`", "{", "_", "-", "~"])("passes a tail of %s alone", (char) => {
+      expect(containsSecretLike(`password=[redacted]${char}`)).toBe(false);
+    });
+
+    // A `]` ends the tail when a value end or the end of the text follows it, and goes on when a value
+    // character does (`[redacted]]SEKRIT`): the `]` that ends it is no part of the tail.
+    it("ends a tail at a bracket that no value character follows", () => {
+      expect(addsSecretLike("password=[redacted]abc]", "password=[redacted]abc")).toBe(false);
+      expect(addsSecretLike("password=[redacted]abc] x", "password=[redacted]abc x")).toBe(false);
+      expect(addsSecretLike("password=[redacted]abc]d", "password=[redacted]abc")).toBe(true);
+    });
+
+    // An already-redacted value is no credential, and a note that quotes what the harvest showed
+    // must stay writable. A marker behind no key or parameter is prose.
+    it.each([
+      ["a key pair", "password=[redacted]"],
+      ["a gap and a word after it", "password: [redacted] next"],
+      ["a delimiter after it", "token: [redacted], user: bob"],
+      ["a JSON pair", '{"password":[redacted],"user":"alice"}'],
+      ["a bracket after it", "[token=[redacted]]"],
+      ["brackets after it", "password=[redacted]]]"],
+      ["a marker that follows no key", "the value is [redacted]xyz"],
+      ["a marker behind a name that is no secret", "user=[redacted]xyz"],
+      // A note that quotes what the harvest showed puts punctuation behind the marker. No letter or
+      // digit goes on after it, so there is no value to take.
+      ["a code span around the pair", "Deploy reads `GITHUB_TOKEN=[redacted]` from the vault."],
+      ["a full stop after it", "The CI password=[redacted]. Ask ops for access."],
+      ["a full-width full stop after it", "The CI password=[redacted]。 Ask ops for access."],
+      ["a full-width comma after it", "password=[redacted]，"],
+      ["an ellipsis after it", "password=[redacted]…"],
+      ["a closing quotation mark after it", "password=[redacted]»"],
+      ["an emoji after it", "password=[redacted]🔒"],
+      ["a combining mark after it", "password=[redacted]\u0301"],
+      ["punctuation only after it", "token=[redacted]..."],
+      ["markers only after it", "password=[redacted][redacted]"],
+      ["markers of any case only after it", "password=[REDACTED][Redacted][reDACTED]"],
+      ["an ideographic space and letters after it", "password=[redacted]\u3000秘密"],
+      ["a no-break space and letters after it", "password=[redacted]\u00a0秘密"],
+    ])("leaves %s that holds a marker with nothing readable after it", (_label, text) => {
+      expect(redactSecretLike(text)).toBe(text);
+      expect(containsSecretLike(text)).toBe(false);
+      expect(addsSecretLike("", text)).toBe(false);
+    });
+
+    // The scan reads one character at a time, and the Unicode check runs per character: a regex of
+    // the `u` flag over a tail this long fails silently in Bun.
+    it.each([
+      ["letters", `password=[redacted]${"a".repeat(100 * 1024)}`, true],
+      ["CJK letters", `password=[redacted]${"秘".repeat(50 * 1024)}`, true],
+      ["astral letters", `password=[redacted]${"𝒜".repeat(50 * 1024)}`, true],
+      [
+        "a long run of punctuation and a letter at the end",
+        `token=[redacted]${"。".repeat(100 * 1024)}秘`,
+        true,
+      ],
+      ["markers and a letter at the end", `token=${"[redacted]".repeat(10 * 1024)}x`, true],
+      ["a signature of letters", `?sig=[redacted]${"a".repeat(100 * 1024)}&x=1`, true],
+      ["a long run of punctuation", `password=[redacted]${"。".repeat(100 * 1024)}`, false],
+      ["a long run of dots", `password=[redacted]${".".repeat(100 * 1024)}`, false],
+      ["a long run of markers", `password=${"[redacted]".repeat(10 * 1024)}`, false],
+    ])("reads a tail of %s padded to 100 KiB", (_label, text, refused) => {
+      expect(text.length).toBeGreaterThan(50 * 1024);
+      expect(containsSecretLike(text)).toBe(refused);
+      expect(addsSecretLike("", text)).toBe(refused);
+    });
+
+    it("refuses an edit that adds or changes a tail, and passes one that leaves it as it was", () => {
+      const held = "notes\npassword=[redacted]SEKRIT\n";
+      expect(addsSecretLike(held, `${held}more notes\n`)).toBe(false);
+      expect(addsSecretLike(held, held.replace("SEKRIT", "OTHER"))).toBe(true);
+      expect(addsSecretLike(held, `${held}token=[redacted]SEKRIT\n`)).toBe(true);
+      expect(addsSecretLike("notes\n", held)).toBe(true);
+    });
+
+    // A marker that held no tail gets one.
+    it.each([
+      ["a key pair", "password=[redacted]", "password=[redacted]SEKRIT"],
+      ["a key pair behind a full stop", "password=[redacted].", "password=[redacted].SEKRIT"],
+      ["a key pair of a code span", "`API_KEY=[redacted]`", "`API_KEY=[redacted]秘密`"],
+      ["a signature", "?sig=[redacted]&x=1", "?sig=[redacted]SEKRIT&x=1"],
+      ["a signature behind a hash", "?sig=[redacted]#frag", "?sig=[redacted]пароль#frag"],
+    ])("refuses an edit that adds a tail to %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(true);
+      expect(addsSecretLike(updated, updated)).toBe(false);
+    });
+
+    // The passes write `[redacted]]` for a signature that holds a marker, and redactSecretLike takes the
+    // extra `]` out again. The guards read the text without it: punctuation behind it is no tail.
+    it("accepts an edit that puts punctuation behind a signature's marker", () => {
+      expect(addsSecretLike("?sig=[redacted]&x=1", "?sig=[redacted]。&x=1")).toBe(false);
+      expect(addsSecretLike("?sig=[redacted]&x=1", "?sig=[redacted]...&x=1")).toBe(false);
+    });
+
+    // The same tail, counted with its repeats: a second copy is a value the previous text lacks.
+    it("counts the tails of the previous text with their repeats", () => {
+      const once = "a password=[redacted]SEKRIT b";
+      const twice = `${once}\n${once}`;
+      expect(addsSecretLike(once, twice)).toBe(true);
+      expect(addsSecretLike(twice, once)).toBe(false);
+      expect(addsSecretLike(twice, twice)).toBe(false);
+    });
+
+    // The guard keeps each pass's values apart (see `RemovalSource`), and the tails apart from them: a
+    // tail that the previous text held does not excuse the same text when the cookie reader takes it
+    // out of the new one, and a value that the cookie reader took out of the previous text does not
+    // excuse the same text as a tail in the new one.
+    it("keeps the tails apart from the values of the other passes", () => {
+      expect(addsSecretLike("password=[redacted]SEKRIT", "Cookie: [redacted]SEKRIT")).toBe(true);
+      expect(addsSecretLike("Cookie: [redacted]SEKRIT", "password=[redacted]SEKRIT")).toBe(true);
+    });
+
+    // The start of a tail is read by two patterns, one for key pairs and one for signed-URL parameters.
+    // Each row puts a tail behind a marker that the previous text held bare.
+    it.each([
+      ["sig", "sig"],
+      ["signature", "signature"],
+      ["an upper-case parameter", "SIGNATURE"],
+      ["X-Amz-Signature", "X-Amz-Signature"],
+      ["an upper-case X-Amz-Signature", "X-AMZ-SIGNATURE"],
+      ["X-Goog-Signature", "X-Goog-Signature"],
+      ["a lower-case x-goog-signature", "x-goog-signature"],
+    ])("refuses an edit that adds a tail behind a %s parameter", (_label, param) => {
+      const held = `https://h/p?a=1&${param}=[redacted]&x=1`;
+      expect(addsSecretLike(held, `https://h/p?a=1&${param}=[redacted]SEKRIT&x=1`)).toBe(true);
+      expect(addsSecretLike(held, `https://h/p?a=1&${param}=[redacted]\u79d8\u5bc6&x=1`)).toBe(
+        true
+      );
+      expect(addsSecretLike(held, held)).toBe(false);
+    });
+
+    it.each([
+      [
+        "after a question mark",
+        "https://h/p?sig=[redacted]&x=1",
+        "https://h/p?sig=[redacted]SEKRIT&x=1",
+      ],
+      [
+        "after an ampersand",
+        "https://h/p?a=1&sig=[redacted]&x=1",
+        "https://h/p?a=1&sig=[redacted]SEKRIT&x=1",
+      ],
+      [
+        "after an XML-escaped ampersand",
+        "https://h/p?a=1&amp;sig=[redacted]&amp;x=1",
+        "https://h/p?a=1&amp;sig=[redacted]SEKRIT&amp;x=1",
+      ],
+      ["behind an upper-case marker", "?sig=[REDACTED]&x=1", "?sig=[REDACTED]SEKRIT&x=1"],
+      ["behind a mixed-case marker", "?sig=[Redacted]&x=1", "?sig=[Redacted]SEKRIT&x=1"],
+    ])("refuses an edit that adds a tail to a signature %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(true);
+      expect(addsSecretLike(updated, updated)).toBe(false);
+    });
+
+    // A signed-URL value starts in query position only, and a name that is no secret has no value start.
+    it.each([
+      ["a parameter outside query position", "sig=[redacted]", "sig=[redacted]SEKRIT"],
+      ["a comparison", "token === [redacted]", "token === [redacted]SEKRIT"],
+      ["a doubled equals sign", "password==[redacted]", "password==[redacted]SEKRIT"],
+    ])("accepts an edit that adds a word behind a marker after %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(false);
+      expect(containsSecretLike(updated)).toBe(false);
+    });
+
+    // The signed-URL start needs its marker. With the marker optional the start would match an empty
+    // string where a value ends, and the search, which resumes at the end of each tail, would stay
+    // there for good. A synchronous loop is out of reach of the test's time limit (bun waits for it),
+    // so these rows ask a child process that a time bound kills: the row fails instead of hanging the
+    // run. The text needs a marker somewhere else, since the scan starts only when a marker is in it.
+    it.each([
+      ["a signature name at the end of the text", "password=[redacted]x ?sig=", true],
+      ["a signature name before a delimiter", "note [redacted] https://h/p?sig=&a=1", false],
+      ["a signature name before a quote", 'note [redacted] "https://h/p?sig=" ok', false],
+    ])(
+      "ends in a child process on a signature with no value behind it: %s",
+      (_label, text, answer) => {
+        expect(answersFromChild([["containsSecretLike", text]])).toEqual([answer]);
+        expect(answersFromChild([["addsSecretLike", "", text]])).toEqual([answer]);
+      },
+      CHILD_TEST_TIMEOUT_MS
+    );
+
+    // Without a marker behind it a signature's value is main's to judge: the passes leave `]SEKRIT` as
+    // it is (a value stops at `]`), and a marker that stands elsewhere does not make it a tail.
+    it("reads no tail where a signature's value holds no marker", () => {
+      const text = "?sig=]SEKRIT password=[redacted]";
+      expect(containsSecretLike(text)).toBe(false);
+      expect(addsSecretLike("password=[redacted]", text)).toBe(false);
+      expect(addsSecretLike("", text)).toBe(false);
+    });
+
+    // The key's name, its quotes and the gaps around the separator are the key pattern's own.
+    it.each([
+      ["a name with a suffix", "AWS_SECRET_ACCESS_KEY=[redacted]SEKRIT"],
+      ["a name with a long suffix", "client_secret_basic_auth_method_x: [redacted]SEKRIT"],
+      ["a gap before the separator", "api_key = [redacted]SEKRIT"],
+      ["a gap before and after the separator", "password   :   [redacted]SEKRIT"],
+      ["a quoted key", '"password": [redacted]SEKRIT'],
+      ["a key in single quotes", "'password': [redacted]SEKRIT"],
+      ["a key and a bracket after its quote", 'os.environ["API_KEY"] = [redacted]SEKRIT'],
+      ["an escaped quote around the key", String.raw`{\"password\": [redacted]SEKRIT}`],
+    ])("refuses a tail behind %s", (_label, text) => {
+      expect(containsSecretLike(text)).toBe(true);
+      expect(addsSecretLike("", text)).toBe(true);
+      expect(addsSecretLike(text.replace("SEKRIT", ""), text)).toBe(true);
+    });
+
+    // A key pair's value does not end at `<`, `>` or `#`, and a signed-URL value does.
+    it.each(["<", ">", "#"])("refuses a key pair's tail that starts with %s", (char) => {
+      expect(containsSecretLike(`token=[redacted]${char}SEKRIT`)).toBe(true);
+      expect(addsSecretLike("token=[redacted]", `token=[redacted]${char}SEKRIT`)).toBe(true);
+    });
+
+    it.each(["<", ">", "#"])("ends a signature's tail at %s", (char) => {
+      expect(addsSecretLike(`?sig=[redacted]${char}x`, `?sig=[redacted]${char}SEKRIT`)).toBe(false);
+    });
+
+    // Each end of a value ends a tail at once: what follows it is prose, not the value.
+    it.each([" ", "\t", "\n", '"', "'", "\\", ",", ";", "&", "}", ")", "\u00a0", "\ufeff"])(
+      "ends a key pair's tail at %j",
+      (char) => {
+        const text = `password=[redacted]${char}SEKRIT`;
+        expect(containsSecretLike(text)).toBe(false);
+        expect(addsSecretLike("", text)).toBe(false);
+      }
+    );
+
+    it.each([
+      " ",
+      "\t",
+      "\n",
+      '"',
+      "'",
+      "\\",
+      ",",
+      ";",
+      "&",
+      "#",
+      "<",
+      ">",
+      "}",
+      ")",
+      "\u00a0",
+      "\ufeff",
+    ])("ends a signature's tail at %j", (char) => {
+      expect(addsSecretLike(`?sig=[redacted]${char}x`, `?sig=[redacted]${char}SEKRIT`)).toBe(false);
+    });
+
+    // A `]` ends a tail when another `]` follows it: the first of two is the end, as for a list.
+    it("ends a tail at a bracket that a bracket follows", () => {
+      expect(containsSecretLike("password=[redacted]]]SEKRIT")).toBe(false);
+      expect(addsSecretLike("?sig=[redacted]]]x", "?sig=[redacted]]]SEKRIT")).toBe(false);
+    });
+
+    // The passes' output of the previous and of the new text is what the tails are read in, not the
+    // text itself: a key's value that an earlier pass cut leaves a marker, and the tail behind it is
+    // the text after the cut.
+    it.each([
+      ["a key pair cut at a bracket", "password=abc]OLD", "password=abc]SEKRIT"],
+      [
+        "a signature whose value holds a key",
+        "?sig=abc.sk-ABCDEFGHIJKLMNOPQ.OLD end",
+        "?sig=abc.sk-ABCDEFGHIJKLMNOPQ.SEKRIT end",
+      ],
+    ])("refuses an edit that changes the tail behind %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(true);
+      expect(addsSecretLike(updated, updated)).toBe(false);
+      expect(addsSecretLike(previous, previous)).toBe(false);
+    });
+
+    // The extra `]` that the passes write behind a signature's marker is taken out before the tails are
+    // read, on both sides: `]OLD` and `SEKRIT` are the tails, not `]]OLD` and `]SEKRIT`.
+    it.each([
+      ["a tail behind a bare marker", "?sig=[redacted]&x=1", "?sig=[redacted]]SEKRIT&x=1"],
+      [
+        "a changed tail that starts with a bracket",
+        "?sig=[redacted]]OLD&x=1",
+        "?sig=[redacted]]SEKRIT&x=1",
+      ],
+      ["a bare marker that gains a tail", "?sig=[redacted]", "?sig=[redacted]SEKRIT"],
+    ])("reads a signature's tail without the added bracket: %s", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(true);
+      expect(addsSecretLike(updated, updated)).toBe(false);
+    });
+
+    // Tails compare as strings (see the risk named in the body), so a tail that a held signature has
+    // excuses the same string behind a key, once the added bracket is out of the signature's tail. The
+    // other way round main's own verdict refuses: the signature's value is a value that the previous
+    // text did not hold.
+    it("compares a held signature's tail with a key's tail as the same string", () => {
+      expect(addsSecretLike("?sig=[redacted]SEKRIT", "password=[redacted]SEKRIT")).toBe(false);
+      expect(addsSecretLike("password=[redacted]SEKRIT", "?sig=[redacted]SEKRIT")).toBe(true);
+    });
+
+    // Markers inside a tail are skipped whole (ten characters), and the tail goes on behind them.
+    it("reads a tail through a run of markers and a bracket", () => {
+      expect(containsSecretLike("password=[redacted][redacted]]SEKRIT")).toBe(true);
+      expect(
+        addsSecretLike("password=[redacted][redacted]", "password=[redacted][redacted]]SEKRIT")
+      ).toBe(true);
+      expect(containsSecretLike("password=[redacted][redacted][redacted]]SEKRIT")).toBe(true);
+      expect(containsSecretLike("password=[REDACTED][Redacted]]SEKRIT")).toBe(true);
+      expect(containsSecretLike("password=[redacted][redacted]]")).toBe(false);
+    });
+
+    // A tail swallows the keys that stand inside it, and the search for the next tail resumes after
+    // it: one tail, not one per key (a quadratic rescan took seconds at this size).
+    it("holds keys nested in one tail as one tail", () => {
+      const nested = "token=[redacted]password=[redacted]x";
+      // Two tails would make the held text excuse a lone `x`.
+      expect(addsSecretLike(nested, "password=[redacted]x")).toBe(true);
+      expect(addsSecretLike("password=[redacted]x", nested)).toBe(true);
+      expect(addsSecretLike(nested, nested)).toBe(false);
+    });
+
+    it(
+      "reads keys nested in one tail of 100 KiB in linear time",
+      () => {
+        const nested = repeated("password=[redacted]", 5_400, { tail: "x" });
+        const text = nested(1);
+        expect(text.length).toBeGreaterThan(100_000);
+        expect([containsSecretLike(text), addsSecretLike("", text)]).toEqual([true, true]);
+        containsSecretLike("warm up password=[redacted]x"); // keep a cold regex compile out of the timing
+        // A rescan of the tail from each key takes seconds here.
+        expectLinearScan((window) => {
+          containsSecretLike(window);
+          addsSecretLike("", window);
+        }, nested);
+      },
+      SCAN_TEST_TIMEOUT_MS
+    );
+  });
+
   it("keeps the userinfo's host readable", () => {
     expect(redactSecretLike("https://deploy:pw@git.example.com/org/repo")).toBe(
       "https://[redacted]@git.example.com/org/repo"
@@ -1065,89 +1924,344 @@ describe("redactSecretLike", () => {
   // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
   // JWT segment rescan to the end of the text from every occurrence (seconds per input).
   it.each([
-    ["token", "token".repeat(20_000)],
-    ["secret-", "secret-".repeat(14_000)],
-    ["authorization", "authorization".repeat(7_700)],
-    ["credential_", "credential_".repeat(9_000)],
-    ["api_key", "api_key".repeat(14_000)],
-    ["a JWT header after a dash", "eyJ-".repeat(25_000)],
-    ["a bare bracket assignment", 'password"]'.repeat(10_000)],
-    ["URL schemes with a short userinfo", "://a:".repeat(25_000)],
-    ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
-    ["account_key", "account_key".repeat(9_000)],
-    ["SharedAccessKey", "SharedAccessKey".repeat(6_600)],
-    ["shared_access_key_", "shared_access_key_".repeat(5_600)],
-    ["SharedAccessKeyName", "SharedAccessKeyName".repeat(5_200)],
-    ["bearer", "bearer".repeat(16_000)],
-    ["a PGP key header", "-----BEGIN PGP PRIVATE KEY BLOCK-----".repeat(3_000)],
-    ["a quoted value of backslashes", `token:"${"\\".repeat(100_000)}`],
-    ["a quoted value of escaped quotes", `token:"${'\\"'.repeat(50_000)}`],
+    ["token", repeated("token", 20_000)],
+    ["secret-", repeated("secret-", 14_000)],
+    ["authorization", repeated("authorization", 7_700)],
+    ["credential_", repeated("credential_", 9_000)],
+    ["api_key", repeated("api_key", 14_000)],
+    ["a JWT header after a dash", repeated("eyJ-", 25_000)],
+    ["a bare bracket assignment", repeated('password"]', 10_000)],
+    ["URL schemes with a short userinfo", repeated("://a:", 25_000)],
+    ["a keyword followed by whitespace", repeated(" ", 100_000, { head: "token", tail: "x" })],
+    ["account_key", repeated("account_key", 9_000)],
+    ["SharedAccessKey", repeated("SharedAccessKey", 6_600)],
+    ["shared_access_key_", repeated("shared_access_key_", 5_600)],
+    ["SharedAccessKeyName", repeated("SharedAccessKeyName", 5_200)],
+    ["bearer", repeated("bearer", 16_000)],
+    ["a PGP key header", repeated("-----BEGIN PGP PRIVATE KEY BLOCK-----", 3_000)],
+    ["a quoted value of backslashes", repeated("\\", 100_000, { head: 'token:"' })],
+    ["a quoted value of escaped quotes", repeated('\\"', 50_000, { head: 'token:"' })],
+    ["a long backslash run and one letter", repeated("\\", 100_000, { tail: "x" })],
     [
       "an escaped quoted value of backslash runs",
-      String.raw`token:\"` + String.raw`\\\"`.repeat(25_000),
+      repeated(String.raw`\\\"`, 25_000, { head: String.raw`token:\"` }),
     ],
-    ["a quoted value that ends in a backslash run", `token:"a${"\\".repeat(100_000)}`],
-    ["many opening quotes", 'token:"a'.repeat(12_000)],
-    ["a key followed by a long backslash run", `token${"\\".repeat(100_000)}"`],
-    ["a value opened by a long backslash run", `token:${"\\".repeat(100_000)}"a`],
+    ["a quoted value that ends in a backslash run", repeated("\\", 100_000, { head: 'token:"a' })],
+    ["many opening quotes", repeated('token:"a', 12_000)],
+    [
+      "a key followed by a long backslash run",
+      repeated("\\", 100_000, { head: "token", tail: '"' }),
+    ],
+    [
+      "a value opened by a long backslash run",
+      repeated("\\", 100_000, { head: "token:", tail: '"a' }),
+    ],
     [
       "a deep value of one long backslash run",
-      `token:${"\\".repeat(31)}"a${"\\".repeat(100_000)}"`,
+      repeated("\\", 100_000, { head: `token:${"\\".repeat(31)}"a`, tail: '"' }),
     ],
     [
       "a deep value of runs as long as its opener",
-      `token:${"\\".repeat(31)}"${`${"\\".repeat(31)}x`.repeat(3_000)}`,
+      repeated(`${"\\".repeat(31)}x`, 3_000, { head: `token:${"\\".repeat(31)}"` }),
     ],
     [
       "a deep value of runs just short of a doubled close",
-      `token:${"\\".repeat(31)}"${`${"\\".repeat(62)}x`.repeat(1_500)}`,
+      repeated(`${"\\".repeat(62)}x`, 1_500, { head: `token:${"\\".repeat(31)}"` }),
     ],
-    ["many deep openers", `token:${"\\".repeat(31)}"a`.repeat(2_500)],
-    ["many deep keys", `token${"\\".repeat(31)}"`.repeat(2_800)],
-    ["a signature parameter with a long value", `?sig=${"a".repeat(100_000)}`],
-    ["signature parameters with no value", "?sig=&signature=".repeat(20_000)],
-    ["a signature name with no equals sign", "&X-Amz-Signature".repeat(20_000)],
-    ["stacked signature prefixes", "?&amp;sig=".repeat(20_000)],
-    ["a cookie name with no colon", "Cookie".repeat(20_000)],
-    ["a cookie name and gap with no colon", `Set-Cookie${" ".repeat(100_000)}x`],
-    ["cookie names with a colon and no value", "Cookie:".repeat(20_000)],
-    ["cookie headers on one line", "Set-Cookie: a=b; ".repeat(10_000)],
-    ["a cookie value of backslashes", `Cookie: ${"\\".repeat(100_000)}x`],
-    ["a cookie value of escaped quotes", `Cookie: "${'\\"'.repeat(50_000)}`],
-    ["a cookie key followed by a long backslash run", `cookie${"\\".repeat(100_000)}"x`],
-    ["many cookie keys with a long backslash run", `cookie${"\\".repeat(31)}"`.repeat(2_800)],
-    ["cookie array openers with no close", `Cookie:[`.repeat(25_000)],
-    ["cookie names after escaped line breaks", String.raw`\nCookie`.repeat(15_000)],
-    ["a cookie colon and a long gap with no value", `Cookie:${" ".repeat(100_000)}`],
-    ["cookie colons and a gap with no value, line after line", "Cookie: \n".repeat(15_000)],
+    ["many deep openers", repeated(`token:${"\\".repeat(31)}"a`, 2_500)],
+    ["many deep keys", repeated(`token${"\\".repeat(31)}"`, 2_800)],
+    ["a signature parameter with a long value", repeated("a", 100_000, { head: "?sig=" })],
+    ["signature parameters with no value", repeated("?sig=&signature=", 20_000)],
+    ["a signature name with no equals sign", repeated("&X-Amz-Signature", 20_000)],
+    ["stacked signature prefixes", repeated("?&amp;sig=", 20_000)],
+    ["a cookie name with no colon", repeated("Cookie", 20_000)],
+    [
+      "a cookie name and gap with no colon",
+      repeated(" ", 100_000, { head: "Set-Cookie", tail: "x" }),
+    ],
+    ["cookie names with a colon and no value", repeated("Cookie:", 20_000)],
+    ["cookie headers on one line", repeated("Set-Cookie: a=b; ", 10_000)],
+    ["a cookie value of backslashes", repeated("\\", 100_000, { head: "Cookie: ", tail: "x" })],
+    ["a cookie value of escaped quotes", repeated('\\"', 50_000, { head: 'Cookie: "' })],
+    [
+      "a cookie key followed by a long backslash run",
+      repeated("\\", 100_000, { head: "cookie", tail: '"x' }),
+    ],
+    ["many cookie keys with a long backslash run", repeated(`cookie${"\\".repeat(31)}"`, 2_800)],
+    ["cookie array openers with no close", repeated("Cookie:[", 25_000)],
+    ["cookie names after escaped line breaks", repeated(String.raw`\nCookie`, 15_000)],
+    ["a cookie colon and a long gap with no value", repeated(" ", 100_000, { head: "Cookie:" })],
+    ["cookie colons and a gap with no value, line after line", repeated("Cookie: \n", 15_000)],
     [
       "cookie names behind an indent that is no line start",
-      `${" ".repeat(16)}Cookie`.repeat(5_900),
+      repeated(`${" ".repeat(16)}Cookie`, 5_900),
     ],
-    ["cookie names behind an indent and a marker", `\n${" ".repeat(16)}> Cookie`.repeat(5_000)],
-    ["cookie values that open with a redacted marker", 'Cookie: "[redacted]\n'.repeat(7_000)],
+    ["cookie names behind an indent and a marker", repeated(`\n${" ".repeat(16)}> Cookie`, 5_000)],
+    ["cookie values that open with a redacted marker", repeated('Cookie: "[redacted]\n', 7_000)],
     [
       "cookie values that open with a long gap and a marker",
-      `Cookie:${" ".repeat(40)}[redacted]\n`.repeat(2_500),
+      repeated(`Cookie:${" ".repeat(40)}[redacted]\n`, 2_500),
     ],
-    ["cookie names behind quotes and commas", `,Cookie`.repeat(14_000)],
-    ["unclosed quoted cookie list items", 'Cookie:["'.repeat(14_000)],
-    ["quoted cookie keys each followed by a value", '"cookie":"a"'.repeat(10_000)],
+    ["cookie names behind quotes and commas", repeated(",Cookie", 14_000)],
+    ["unclosed quoted cookie list items", repeated('Cookie:["', 14_000)],
+    ["quoted cookie keys each followed by a value", repeated('"cookie":"a"', 10_000)],
     [
       "cookie names behind escaped breaks of long runs",
-      `\\n${"\\".repeat(31)}nCookie`.repeat(2_500),
+      repeated(`\\n${"\\".repeat(31)}nCookie`, 2_500),
     ],
-    ["nested cookie list openers", `${"Cookie: [".repeat(10_000)}]`],
-  ])("scans %s in linear time", (_label, text) => {
-    redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
-    // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
-    // and with the cookie rule a pass costs about half of it, so one budget for both flaked.
-    for (const scan of [redactSecretLike, containsSecretLike]) {
-      const started = performance.now();
-      scan(text);
-      expect(performance.now() - started).toBeLessThan(100);
-    }
+    ["nested cookie list openers", repeated("Cookie: [", 10_000, { tail: "]" })],
+    ["a key and a run of markers", repeated("[redacted]", 5_000, { head: "token=", tail: "x" })],
+    ["a key and markers each with a tail", repeated("[redacted]x", 5_000, { head: "token=" })],
+    ["keys that each hold a marker and a tail", repeated("token=[redacted]x ", 4_000)],
+    [
+      "a key and a marker followed by brackets",
+      repeated("]x", 50_000, { head: "token=[redacted]" }),
+    ],
+    [
+      "a signature and a run of markers",
+      repeated("[redacted]]", 5_000, { head: "?sig=", tail: "x" }),
+    ],
+    ["keys and half markers", repeated("token=[redacted", 10_000)],
+    [
+      "a marker and a tail of 100 KiB of full-width punctuation",
+      repeated("。", 100 * 1024, { head: "token=[redacted]", tail: "秘" }),
+    ],
+    [
+      "a marker and a tail of 50 Ki astral letters",
+      repeated("𝒜", 50 * 1024, { head: "password=[redacted]" }),
+    ],
+  ])(
+    "scans %s in linear time",
+    (_label, textAt) => {
+      redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
+      // Each scan gets its own checks: `containsSecretLike` is a second pass of the same redaction.
+      for (const scan of [redactSecretLike, containsSecretLike]) expectLinearScan(scan, textAt);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
+});
+
+describe("redactWithinCap", () => {
+  const CAP = 100;
+  const KEY = `ghp_${"a1B2".repeat(5)}`;
+
+  /** A scan that cuts a window `tail` characters before its end. */
+  const cutBefore = (tail: number) => (window: string) =>
+    redactWithinCap(window, window.length - tail, { cut: true });
+
+  it("cuts text without a secret where redaction alone would, and reads the lookahead for none", () => {
+    const text = "lorem ".repeat(300);
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe(text.slice(0, CAP));
   });
+
+  it("returns the whole redaction of a text that fits under the cap", () => {
+    expect(redactWithinCap(`a ${KEY} b`, CAP, { cut: true })).toBe("a [redacted] b");
+  });
+
+  it("takes a secret that starts the text and crosses the cap whole", () => {
+    expect(redactWithinCap(`${KEY} tail`, 10, { cut: true })).toBe("[redacted]");
+  });
+
+  it("takes a secret that crosses the cap whole, and shows no part of it", () => {
+    const text = `${"x".repeat(CAP - 11)} ${KEY} tail`;
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe(`${"x".repeat(CAP - 11)} [redacted]`);
+  });
+
+  // A secret that starts at the first character past the cap is not in the kept text, so no marker
+  // for it is either: the first `cap` characters redacted alone are a prefix of the redacted whole,
+  // and a marker follows that prefix there.
+  it("shows no marker for a secret that starts right after the cap", () => {
+    const text = `${"x".repeat(CAP - 1)} ${KEY} tail`;
+    expect(text.indexOf(KEY)).toBe(CAP);
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe(text.slice(0, CAP));
+  });
+
+  // Cut at the cap, a `Cookie:` header has no value, and redaction gives it a marker. In the whole
+  // text a blank and a line break follow it, and the marker stands after them. The two differ at the
+  // cap, and no marker stands there in the whole: what is shown ends there, with none of the blank
+  // or the marker that lie past the cap.
+  it("ends where the first characters and the whole text differ, when no marker stands there", () => {
+    const header = `${"x".repeat(CAP - 8)} Cookie:`;
+    expect(header).toHaveLength(CAP);
+    const text = `${header} \nnext line of text past the cap`;
+    expect(redactSecretLike(header)).toBe(`${header}[redacted]`);
+    expect(redactSecretLike(text)).toStartWith(`${header} [redacted]\nnext`);
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe(header);
+  });
+
+  // A value that redaction shortens must not let what lies past the cap into the output.
+  it("shows no text from past the cap when redaction shortens the text before it", () => {
+    expect(
+      redactWithinCap(`password=${"z".repeat(300)} visible beyond the cap`, 50, { cut: true })
+    ).toBe("password=[redacted]");
+  });
+
+  // The window is the cap and its lookahead. Its end can cut a key: what is left is too short to
+  // match, so it shows as it is. Redaction shortens the window, so a cut of the output at the cap
+  // reached it.
+  it("shows nothing of the lookahead's end when redaction shortens the text by more than it", () => {
+    const window = `password=${"z".repeat(CAP + 512 - 21)} sk-QBNDZ8P3`;
+    expect(window).toHaveLength(CAP + 512);
+    expect(redactWithinCap(window, CAP, { cut: true })).toBe("password=[redacted]");
+  });
+
+  it("keeps a pair whose value goes past the cap redacted whole", () => {
+    const text = `password=${"z".repeat(600)}`;
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe("password=[redacted]");
+  });
+
+  // The JWT pattern needs both dots. A JWT whose first parts run past the window is not matched, and
+  // what lies inside the cap would stay readable. Made-up parts: `Q` is the header, `W` the payload.
+  describe("a JWT that the window ends inside", () => {
+    const HEADER = `eyJ${"Q".repeat(40)}`;
+    const jwt = (header: string, payload: string): string =>
+      `${header}.${payload}.${"X".repeat(86)}`;
+    const windowOf = (text: string): string => text.slice(0, CAP + REDACTION_LOOKAHEAD_CHARS);
+    const before = `${"z".repeat(CAP - 20)} `;
+
+    it.each([
+      ["a payload that runs past it", "eyJ" + "W".repeat(1_200), HEADER, " "],
+      ["a payload with no claim marker", "W".repeat(1_200), HEADER, " "],
+      [
+        "a header that runs past it, with no dot read yet",
+        "eyJ" + "W".repeat(40),
+        "eyJ" + "Q".repeat(1_200),
+        " ",
+      ],
+      ["a header glued behind a dot", "eyJ" + "W".repeat(1_200), HEADER, "."],
+    ])("stops at the start of %s", (_label, payload, header, glue) => {
+      const text = `${before.trimEnd()}${glue}${jwt(header, payload)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(
+        `${before.trimEnd()}${glue}`
+      );
+    });
+
+    // The JWT pattern's characters include `-`, `_` and digits in every part: a cut that misses
+    // one of them leaves the JWT's start readable. Made up.
+    it("stops at the start of a JWT with `-`, `_` and digits in its header and payload", () => {
+      const body = (length: number): string =>
+        "Fq7_Hx-L2Mo9".repeat(Math.ceil(length / 12)).slice(0, length);
+      const text = `${before}${jwt(`eyJ${body(40)}`, `eyJ${body(1_200)}`)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(before);
+    });
+
+    // Redaction before the JWT changes the text's length, so the JWT starts at another index in the
+    // redacted window than in the window itself. The cut is at its index in what is shown.
+    it("stops at the start of a JWT that a shortened secret comes before", () => {
+      const lead = `password=${"y".repeat(40)} `;
+      const filler = "z".repeat(CAP - 20 - lead.length);
+      const text = `${lead}${filler} ${jwt(HEADER, `eyJ${"W".repeat(1_200)}`)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(
+        `password=[redacted] ${filler} `
+      );
+    });
+
+    it("takes a JWT whose signature runs past the window whole, as a marker", () => {
+      const text = `${before}${HEADER}.eyJ${"W".repeat(100)}.${"X".repeat(1_200)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(`${before}[redacted]`);
+    });
+
+    it("takes a JWT that fits the window whole, and keeps what follows it up to the cap", () => {
+      const text = `${before}${jwt(HEADER, `eyJ${"W".repeat(100)}`)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(`${before}[redacted]`);
+    });
+
+    // Only a run that touches the window's end can be a JWT that goes on: a short one in the middle
+    // of the text is a JWT-like word that the pattern leaves alone.
+    it("keeps a JWT-like run that ends before the end of the window", () => {
+      const text = `see eyJabc.def in ${"z".repeat(CAP + 600)}`;
+
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(text.slice(0, CAP));
+    });
+
+    // A run with two dots is one the JWT pattern would take, if its parts were long enough. When it
+    // does not take it, a run that goes on past the window does not become a JWT either.
+    it("keeps a run with two dots that ends the window and that the JWT pattern leaves alone", () => {
+      const text = `${before}eyJab.cd.${"e".repeat(1_200)}`;
+
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(text.slice(0, CAP));
+    });
+
+    // A complete text has nothing past it: a run that ends it is not the start of a longer JWT, and
+    // the JWT pattern has already left it alone. Only a window cut from a longer text is cut there.
+    it("keeps a JWT-like run that ends a complete text, and cuts it in a cut window", () => {
+      const text = `${"x".repeat(80)} eyJ${"A".repeat(30)}`;
+
+      expect(redactWithinCap(text, CAP, { cut: false })).toBe(text.slice(0, CAP));
+      expect(redactWithinCap(text, CAP, { cut: true })).toBe(`${"x".repeat(80)} `);
+    });
+
+    it("leaves the output as it is for a JWT-like run that starts past the cap", () => {
+      const text = `${"z".repeat(CAP + 5)} ${jwt(HEADER, `eyJ${"W".repeat(1_200)}`)}`;
+
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe("z".repeat(CAP));
+    });
+
+    // Every prefix of a JWT that is longer than the cap shows nothing of it: it is a marker once the
+    // second part has its 8 characters and a second dot, and cut before it until then.
+    it("shows nothing of any prefix of a JWT", () => {
+      const whole = jwt(`eyJ${"Q".repeat(10)}`, `eyJ${"W".repeat(20)}`);
+      for (let length = 6; length <= whole.length; length++) {
+        const shown = redactWithinCap(whole.slice(0, length), 5, { cut: true });
+        expect([length, shown === "" || shown === "[redacted]"]).toEqual([length, true]);
+      }
+    });
+  });
+
+  // A run of JWT starts that never reaches the window's end: the search tries only a start that no
+  // JWT character comes before, so it reads the run once. Tried at every start it is quadratic:
+  // with no anchor, with a `\b` anchor (a dash before each start passes it), or with an anchor
+  // class that lacks the character before each start. That takes several seconds at these sizes,
+  // against a few milliseconds. A row fails at 300 ms of CPU or when the cost per character grows
+  // with the window (see `measureScan`), so a loaded test host does not fail it.
+  it.each([
+    ["JWT starts", repeated("eyJ", 30_000, { tail: " " })],
+    ["JWT starts with a dash after each", repeated("eyJ-", 32_000, { tail: " " })],
+    ["JWT starts with an underscore after each", repeated("eyJ_", 32_000, { tail: " " })],
+  ])(
+    "cuts a window of %s that miss its end in linear time",
+    (_label, textAt) => {
+      // Keep a cold regex compile out of the timing.
+      redactWithinCap("warm up eyJabc.def", 10, { cut: true });
+      expectLinearScan(cutBefore(REDACTION_LOOKAHEAD_CHARS), textAt);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
+
+  // The cut reads the redacted window once more. Its cost must not grow faster than the window: a
+  // quadratic scan of these shapes takes seconds at this size.
+  //
+  // The third item is the cap at the full size: about 1,000 characters before the window's end
+  // (29,000 of about 30,000), and the cap stays that far from the end at every size of the window.
+  // The row of one long header and one long payload is four times as long as the others (60,000
+  // characters in each part, the cap at 119,000 of 120,006). A payload pattern that backtracks then
+  // costs seconds, and the 300 ms ceiling catches it on every run. At 15,000 characters in each
+  // part it cost 190 to 290 ms, and the growth check caught it in 18 of 20 runs only.
+  it.each([
+    ["dots between JWT starts", repeated("eyJ.", 7_500), 29_000],
+    ["JWT starts with a dot after each", repeated("eyJabc.", 4_300), 29_000],
+    [
+      "one long header and one long payload",
+      (fraction: number) => {
+        const part = Math.round(60_000 * fraction);
+        return `eyJ${"a".repeat(part)}.${"b".repeat(part)} x`;
+      },
+      119_000,
+    ],
+    ["many long parts", repeated(`eyJ${"a".repeat(1_000)}.`, 30), 29_000],
+  ])(
+    "cuts the window of %s in linear time",
+    (_label, textAt, cap) => {
+      redactWithinCap("warm up eyJabc.def", 10, { cut: true }); // keep a cold regex compile out of the timing
+      expectLinearScan(cutBefore(textAt(1).length - cap), textAt);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
 });
 
 describe("containsSecretLike", () => {
@@ -1156,6 +2270,14 @@ describe("containsSecretLike", () => {
     expect(containsSecretLike(`key sk-${"k3J9".repeat(6)}`)).toBe(true);
     expect(containsSecretLike("The token budget resets each turn; max_tokens: 4096.")).toBe(false);
     expect(containsSecretLike("Auth uses a password manager and a bearer scheme.")).toBe(false);
+  });
+
+  // The passes still write `[redacted]]` after the head of a marker, and only the output drops that
+  // `]`, so the verdict is main's. A marker that the cookie rule puts back stays unflagged.
+  it("flags a marker that the signed-URL pattern reads", () => {
+    expect(containsSecretLike("?sig=[redacted]")).toBe(true);
+    expect(containsSecretLike("?sig=[redacted]]")).toBe(true);
+    expect(containsSecretLike("Cookie: [redacted]")).toBe(false);
   });
 });
 
@@ -1238,6 +2360,20 @@ describe("addsSecretLike", () => {
 
   it("flags an edit that swaps one credential for another, which keeps their count", () => {
     expect(addsSecretLike(`password: old-secret\nsk-\nABCDEFGHIJKLMNO\n`, `${KEY}\n`)).toBe(true);
+  });
+
+  it("flags a credential swapped for another of the same shape", () => {
+    expect(addsSecretLike("key sk-ABCDEFGHIJKLMNO\n", "key sk-PQRSTUVWXYZABCD\n")).toBe(true);
+  });
+
+  // A text that holds a tracked `]` reads its key/value pairs through another path: the guard must
+  // still tell one value from another there.
+  it("flags a key's value swapped for another beside a signed URL", () => {
+    const signed = "&sig=sk-ABCDEFGHIJKLMNOP";
+    expect(addsSecretLike(`password=hunter2 ${signed}`, `password=hunter3 ${signed}`)).toBe(true);
+    expect(addsSecretLike(`password=hunter2 ${signed}`, `password=hunter2 ${signed}\n`)).toBe(
+      false
+    );
   });
 
   it("flags a second copy of a credential the file held once", () => {

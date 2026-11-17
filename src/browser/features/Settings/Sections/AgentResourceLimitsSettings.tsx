@@ -23,6 +23,7 @@ import type {
 } from "@/common/orpc/schemas/agentResourceLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getProjectDisplayName, getTopLevelProjectEntries } from "@/common/utils/subProjects";
+import { followConfigValue } from "./followConfigValue";
 
 type LimitField = keyof AgentResourceLimits;
 
@@ -127,24 +128,6 @@ function withScope(view: LimitsView | null, scope: LimitsScope): LimitsView | nu
 
 function withDraft(view: LimitsView | null, field: LimitField, draft: string): LimitsView | null {
   return view && { ...view, drafts: { ...view.drafts, [field]: draft } };
-}
-
-/** Load the limits, and again after every config change, until `signal` aborts. */
-async function followAppliedLimits(
-  api: APIClient,
-  signal: AbortSignal,
-  onLoaded: (state: AgentResourceLimitsState) => void
-): Promise<void> {
-  const load = async () => {
-    const state = await api.agentResourceLimits.get();
-    if (!signal.aborted) onLoaded(state);
-  };
-  // Load only once the subscription is live, so a change made during the load loads again.
-  const changes = await api.config.onConfigChanged(undefined, { signal });
-  await load();
-  for await (const _ of changes) {
-    await load();
-  }
 }
 
 /** What applying the limits takes here, shown while none applies; nothing when they just apply. */
@@ -278,16 +261,21 @@ function useAgentResourceLimits() {
     }
     const controller = new AbortController();
     let loaded = false;
-    followAppliedLimits(api, controller.signal, (next) => {
-      // Each connection starts from the saved limits: an edit kept from before would look saved.
-      const reset = !loaded;
-      loaded = true;
-      setView((current) => withAppliedLimits(reset ? null : current, next));
-      if (reset) {
-        setError(null);
-        setFieldErrors([]);
+    followConfigValue(
+      api,
+      controller.signal,
+      (client) => client.agentResourceLimits.get(),
+      (next) => {
+        // Each connection starts from the saved limits: an edit kept from before would look saved.
+        const reset = !loaded;
+        loaded = true;
+        setView((current) => withAppliedLimits(reset ? null : current, next));
+        if (reset) {
+          setError(null);
+          setFieldErrors([]);
+        }
       }
-    }).catch((loadError: unknown) => {
+    ).catch((loadError: unknown) => {
       if (isStreamFailure(loadError, controller.signal)) {
         setError(`Failed to load agent resource limits: ${getErrorMessage(loadError)}`);
       }

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { MEMORY_DREAM_EDIT_LIMIT_MAX } from "@/common/constants/memory";
 import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
 import {
   UserPreferencesSchema,
@@ -150,6 +151,61 @@ describe("UserPreferencesSchema", () => {
           appearance: { vimEnabled: true },
         })
       ).toEqual({ appearance: { vimEnabled: true } });
+    }
+  });
+
+  test("keeps a whole dream edit limit, 0 included, and reads an invalid one as no limit saved", () => {
+    // 0 is the user's "unlimited"; it must survive the load, or an emptied field reads as 8.
+    for (const stored of [0, 1, 24, MEMORY_DREAM_EDIT_LIMIT_MAX]) {
+      expect(normalizeUserPreferences({ memory: { dreamEditLimit: stored } })).toEqual({
+        memory: { dreamEditLimit: stored },
+      });
+    }
+    // A whole limit over the safety cap (an older build saved it, or a hand edit) loads as the
+    // cap: dropping it would run at the default 8, far under what the user asked for.
+    for (const stored of [
+      MEMORY_DREAM_EDIT_LIMIT_MAX + 1,
+      50_000,
+      Number.MAX_SAFE_INTEGER,
+      2 ** 60,
+    ]) {
+      expect(normalizeUserPreferences({ memory: { dreamEditLimit: stored } })).toEqual({
+        memory: { dreamEditLimit: MEMORY_DREAM_EDIT_LIMIT_MAX },
+      });
+    }
+    // A save over the cap is refused, so only the load repairs one; a save of a negative or
+    // fractional limit is refused too (the load's repair would not catch a schema that took it).
+    for (const saved of [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, -1, 2.5]) {
+      expect(UserPreferencesSchema.safeParse({ memory: { dreamEditLimit: saved } }).success).toBe(
+        false
+      );
+    }
+    // A hand-edited value that is not a whole, non-negative number drops only itself, so the run
+    // uses the default and the other preferences stay.
+    for (const stored of [-1, 2.5, "8", null]) {
+      expect(
+        normalizeUserPreferences({
+          memory: { dreamEditLimit: stored, dreamCostCeilingUsd: 2 },
+          appearance: { vimEnabled: true },
+        })
+      ).toEqual({ memory: { dreamCostCeilingUsd: 2 }, appearance: { vimEnabled: true } });
+    }
+  });
+
+  test("keeps whole run timeout minutes, 0 and 24 hours included, and drops anything else", () => {
+    // 0 is "no timeout"; it must survive the load, or an off timeout reads as 5 minutes.
+    for (const stored of [0, 1, 1440]) {
+      expect(normalizeUserPreferences({ memory: { dreamRunTimeoutMinutes: stored } })).toEqual({
+        memory: { dreamRunTimeoutMinutes: stored },
+      });
+    }
+    // Past 24 hours a timer would overflow and cut the run at once; the run then uses 5 minutes.
+    for (const stored of [-1, 2.5, 1441, "5", null]) {
+      expect(
+        normalizeUserPreferences({
+          memory: { dreamRunTimeoutMinutes: stored, dreamEditLimit: 24 },
+        })
+      ).toEqual({ memory: { dreamEditLimit: 24 } });
     }
   });
 

@@ -35,6 +35,7 @@ import {
 } from "./discovery";
 import {
   AgentPluginInstallService,
+  STAGED_TREE_MAX_DEPTH,
   describeSignInChanges,
   signInResetUrls,
   withDiskQuotaWatchdog,
@@ -3472,6 +3473,27 @@ describe("AgentPluginInstallService", () => {
     expect(preview.warnings[0]).toMatch(/^skills\/poteto-mode: .*'Poteto Mode'.*'poteto-mode'/);
   });
 
+  test("preview lists a skill with a description over the cap, cut like runtime discovery", async () => {
+    // Runtime discovery loads such a skill with the description cut: the preview must
+    // promise it, not warn that it will not load.
+    const description = Array.from({ length: 1069 }, (_, i) =>
+      String.fromCharCode(97 + (i % 26))
+    ).join("");
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "long-desc"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "long-desc", "SKILL.md"),
+      `---\nname: long-desc\ndescription: ${description}\n---\n\nBody.\n`
+    );
+    await commitAll(remoteDir, "adds a skill with a long description");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["greet", "long-desc"]);
+    expect(preview.warnings).toEqual([]);
+    const listed = preview.skills.find((skill) => skill.name === "long-desc")?.description;
+    expect(listed).toHaveLength(1024);
+    expect(description.startsWith(listed ?? "")).toBe(true);
+  });
+
   test("preview and list show the interface; the logo is a contained data URL", async () => {
     // A 48×48 PNG header (OpenAI's smallest square logo): the check reads the size from IHDR.
     const png = pngHeader(48, 48);
@@ -5693,6 +5715,45 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("folders nested deeper than the staging limit are refused before any link is followed", async () => {
+    // Resolving a link into a folder chain thousands of levels deep costs time that grows with
+    // the square of its depth, so the walk checks depth first and resolves links last.
+    const chain = (levels: number) => Array.from({ length: levels }, () => "d").join("/");
+    await fsPromises.mkdir(path.join(remoteDir, "ok", chain(STAGED_TREE_MAX_DEPTH - 1)), {
+      recursive: true,
+    });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "ok", chain(STAGED_TREE_MAX_DEPTH - 1), "f"),
+      "x"
+    );
+    await commitAll(remoteDir, `folders ${STAGED_TREE_MAX_DEPTH} levels deep`);
+    expect((await service.preview({ input: remoteDir })).manifest.name).toBe("demo-plugin");
+
+    await fsPromises.mkdir(path.join(remoteDir, "deep", chain(STAGED_TREE_MAX_DEPTH)), {
+      recursive: true,
+    });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "deep", chain(STAGED_TREE_MAX_DEPTH), "f"),
+      "x"
+    );
+    await fsPromises.symlink(
+      path.join("deep", chain(STAGED_TREE_MAX_DEPTH)),
+      path.join(remoteDir, "a-link")
+    );
+    await commitAll(remoteDir, "a link into folders one level too deep");
+    const realpath = spyOn(fsPromises, "realpath");
+    try {
+      await expect(service.preview({ input: remoteDir })).rejects.toThrow(
+        `The repository nests folders more than ${STAGED_TREE_MAX_DEPTH} levels deep, which Xum does not install.`
+      );
+      const followed = realpath.mock.calls.filter(([target]) => String(target).endsWith("a-link"));
+      expect(followed).toEqual([]);
+    } finally {
+      realpath.mockRestore();
+    }
+    expect(await stagingLeftovers()).toEqual([]);
+  }, 60_000);
+
   test("consent preview discloses full env assignments, not just key names", async () => {
     // NODE_OPTIONS=--require=./payload.js changes what executes without
     // appearing in the argv; the consent card must show the value.
@@ -6710,6 +6771,21 @@ describe("AgentPluginInstallService", () => {
     await commitAll(remoteDir, "escaping-but-resolving hook link");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
       /escapes the plugin folder/
+    );
+  });
+
+  test("staged trees reject a relative symlink that escapes to a file outside the plugins directory", async () => {
+    // The relative-escape refusal must stand on its own: this link resolves,
+    // lands outside both the staged root and the managed plugins directory,
+    // so no other refusal in stagedLinkProblem catches it. Enough ".." reach
+    // the filesystem root from any staging folder up to 64 levels deep (".." at "/" stays at "/").
+    const outsideFile = path.join(await fsPromises.realpath(remoteDir), "outside.js");
+    await fsPromises.writeFile(outsideFile, "// outside the plugin\n");
+    const target = "../".repeat(64) + path.relative(path.parse(outsideFile).root, outsideFile);
+    await fsPromises.symlink(target, path.join(remoteDir, "hooks.js"));
+    await commitAll(remoteDir, "relative hook link that leaves every managed folder");
+    await expect(service.preview({ input: remoteDir })).rejects.toThrow(
+      /relative symbolic link that escapes the plugin folder/
     );
   });
 

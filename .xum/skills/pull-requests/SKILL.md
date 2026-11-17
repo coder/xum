@@ -139,6 +139,8 @@ PR bodies should generally follow this structure; omit sections that are N/A or 
   - Steps taken to prove the change works as intended
   - Avoid boilerplate like `ran tests`; include this section only for novel, change-specific steps
   - Do not include steps implied by passing PR checks
+- Screenshots
+  - Required when the PR changes UI: cropped, dark-theme shots of each main change (see the PR Workflow section of AGENTS.md for capture and hosting)
 - Risks
   - PRs that touch intricate logic must include an assessment of regression risk
   - Explain regression risk in terms of severity and affected product areas

@@ -1,5 +1,5 @@
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
-import { createElement, useState, useEffect, useCallback, useRef } from "react";
+import { createElement, useState, useEffect, useCallback, useReducer, useRef } from "react";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type {
   CoderWorkspaceConfig,
@@ -180,6 +180,14 @@ interface UseCreationWorkspaceReturn {
   branches: string[];
   /** Where listBranches stands: a failed list is not an empty (non-git) one (#6055). */
   branchLoad: BranchLoadStatus;
+  /** The repository's default branch as the backend recommends it; null until known. */
+  recommendedTrunk: string | null;
+  /** The branches committed to most recently, newest first. */
+  recentBranches: string[];
+  /** The repository's default branch (not the checked-out one); null when unknown. */
+  defaultBranch: string | null;
+  /** Loads the branch list again, after a failed load. */
+  reloadBranches: () => void;
   trunkBranch: string;
   setTrunkBranch: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -258,6 +266,11 @@ async function resolveCreationName(input: {
 }
 
 /** True for a real (non-blank) creation draft ID. */
+/** Reducer for a counter that only says "again": each dispatch is a new value. */
+function countUp(count: number): number {
+  return count + 1;
+}
+
 function isDraftId(draftId: string | null | undefined): draftId is string {
   return typeof draftId === "string" && draftId.trim().length > 0;
 }
@@ -339,6 +352,10 @@ export function useCreationWorkspace({
   const [branches, setBranches] = useState<string[]>([]);
   const [branchLoad, setBranchLoad] = useState<BranchLoadStatus>("loading");
   const [recommendedTrunk, setRecommendedTrunk] = useState<string | null>(null);
+  const [recentBranches, setRecentBranches] = useState<string[]>([]);
+  const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
+  // Bumped by "Retry" after a failed branch list: the load effect runs again.
+  const [branchReloads, reloadBranches] = useReducer(countUp, 0);
   const [toast, setToast] = useState<Toast | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [trustPrompt, setTrustPrompt] = useState<{
@@ -394,6 +411,8 @@ export function useCreationWorkspace({
         if (outcome.status === "loaded") {
           setBranches(outcome.branches);
           setRecommendedTrunk(outcome.recommendedTrunk);
+          setRecentBranches(outcome.recentBranches);
+          setDefaultBranch(outcome.defaultBranch);
         }
         setBranchLoad(outcome.status);
       }
@@ -411,7 +430,7 @@ export function useCreationWorkspace({
       mounted = false;
       cancelBranchLoad();
     };
-  }, [kind, projectPath, api]);
+  }, [kind, projectPath, api, branchReloads]);
 
   // Cleanup: resolve trust prompt on unmount so handleSend doesn't wedge
   useEffect(() => {
@@ -1058,6 +1077,10 @@ export function useCreationWorkspace({
   return {
     branches,
     branchLoad,
+    recommendedTrunk,
+    recentBranches,
+    defaultBranch,
+    reloadBranches,
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,
     selectedRuntime: settings.selectedRuntime,

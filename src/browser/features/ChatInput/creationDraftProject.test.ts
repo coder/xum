@@ -3,7 +3,12 @@ import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { ProjectConfig } from "@/common/types/project";
 import { DEFAULT_RUNTIME_ENABLEMENT, type ParsedRuntime } from "@/common/types/runtime";
-import { changeCreationDraftProject, projectDefaultIsolation } from "./creationDraftProject";
+import {
+  changeCreationDraftProject,
+  isProjectDefaultIsolation,
+  projectDefaultIsolation,
+  projectDefaultIsolationUpdate,
+} from "./creationDraftProject";
 
 const PROJECTS = new Map<string, ProjectConfig>([
   ["/projects/a", { workspaces: [] }],
@@ -74,5 +79,39 @@ describe("projectDefaultIsolation", () => {
       project: "local",
       workspace: "worktree",
     });
+  });
+});
+
+describe("projectDefaultIsolationUpdate", () => {
+  const sshNone = { project: "ssh", workspace: "none" } as const;
+  const noDocker = { ...DEFAULT_RUNTIME_ENABLEMENT, docker: false };
+
+  test("a project without overrides keeps the globally enabled isolations", () => {
+    // Saving the default turns the project override on; without the copy Docker would come back.
+    const update = projectDefaultIsolationUpdate("/p", { workspaces: [] }, sshNone, noDocker);
+    expect(update.runtimeEnablement).toEqual(noDocker);
+    const saved: ProjectConfig = {
+      workspaces: [],
+      runtimeOverridesEnabled: true,
+      runtimeEnablement: { docker: false },
+      defaultIsolation: update.defaultIsolation,
+    };
+    expect(isProjectDefaultIsolation(saved, null, DEFAULT_RUNTIME_ENABLEMENT, sshNone)).toBe(true);
+  });
+
+  test("a project with overrides keeps its own enabled isolations", () => {
+    const project: ProjectConfig = { workspaces: [], runtimeEnablement: { docker: false } };
+    expect(
+      projectDefaultIsolationUpdate("/p", project, sshNone, DEFAULT_RUNTIME_ENABLEMENT)
+    ).not.toHaveProperty("runtimeEnablement");
+  });
+
+  test("the inherited global default already counts as the project's default", () => {
+    expect(
+      isProjectDefaultIsolation({ workspaces: [] }, sshNone, DEFAULT_RUNTIME_ENABLEMENT, sshNone)
+    ).toBe(true);
+    expect(
+      isProjectDefaultIsolation({ workspaces: [] }, null, DEFAULT_RUNTIME_ENABLEMENT, sshNone)
+    ).toBe(false);
   });
 });

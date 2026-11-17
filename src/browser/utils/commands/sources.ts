@@ -37,6 +37,10 @@ import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations
 import { stopStream } from "@/browser/utils/stopStream";
 import { publishPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import {
+  summarizeUpdateAll,
+  updateAllPlugins,
+} from "@/browser/features/Settings/Sections/updateAllPlugins";
+import {
   openArtifactsTab,
   pinAndOpenArtifact,
 } from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
@@ -646,6 +650,49 @@ async function signOutPluginServersFromPalette(api: BuildSourcesParams["api"]): 
   await signOutPluginServersOrThrow(api).catch((error: unknown) =>
     showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) })
   );
+}
+
+/**
+ * A capability-changing update is not applied here: its review opens in the section, where the
+ * user confirms it.
+ */
+async function updateAllPluginsFromPalette(
+  api: BuildSourcesParams["api"],
+  openPluginsSettings: () => void
+): Promise<void> {
+  // The palette runs actions without a catch: a lost connection must still show an error.
+  await updateAllPluginsOrThrow(api, openPluginsSettings).catch((error: unknown) =>
+    showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) })
+  );
+}
+
+async function updateAllPluginsOrThrow(
+  api: BuildSourcesParams["api"],
+  openPluginsSettings: () => void
+): Promise<void> {
+  if (!api) return;
+  const checks = await api.agentPlugins.checkUpdates();
+  if (!checks.success) {
+    showCommandFeedbackToast({ type: "error", message: checks.error });
+    return;
+  }
+  const result = await updateAllPlugins(api, checks.data);
+  // A mounted section only re-queries from its own handlers, so tell it the state changed under
+  // it. This runs even when no update applied: the fresh check may have found moved tags or
+  // per-plugin errors the section should show. It goes before the reviews: without a mounted
+  // section only the latest intent is kept for the next mount.
+  publishPluginsSectionIntent({ type: "refresh" });
+  if (result.updated.length > 0) {
+    publishAgentPluginsMutated();
+  }
+  const summary = summarizeUpdateAll(result, true);
+  showCommandFeedbackToast({ type: summary.tone, message: summary.message });
+  if (result.reviews.length > 0) {
+    publishPluginsSectionIntent({ type: "review-updates", reviews: result.reviews });
+  }
+  if (result.reviews.length > 0 || result.tagMoved.length > 0 || result.checkFailures.length > 0) {
+    openPluginsSettings();
+  }
 }
 
 async function signOutPluginServersOrThrow(api: BuildSourcesParams["api"]): Promise<void> {
@@ -2608,82 +2655,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         subtitle: "Apply pending plugin updates",
         section: section.settings,
         keywords: ["plugin", "update", "upgrade", "all"],
-        run: async () => {
-          const api = p.api;
-          if (!api) return;
-          const checks = await api.agentPlugins.checkUpdates();
-          if (!checks.success) {
-            showCommandFeedbackToast({ type: "error", message: checks.error });
-            return;
-          }
-          // Moved tags are excluded from the bulk apply: tags are
-          // supposed to be immutable, so a moved tag warrants the
-          // section's per-plugin review — but it must never read as
-          // "up to date", so it stays in the summary below.
-          const updatable = checks.data.filter((check) => check.status === "update-available");
-          const tagMoved = checks.data
-            .filter((check) => check.status === "tag-moved")
-            .map((check) => check.name);
-          // Unreachable remotes are an unknown state, never "up to date" —
-          // and they must stay visible even when other updates succeed.
-          const checkFailures = checks.data
-            .filter((check) => check.status === "error")
-            .map((check) => check.name);
-
-          const updateFailures: string[] = [];
-          const updatedNames: string[] = [];
-          for (const check of updatable) {
-            const result = await api.agentPlugins.update({ name: check.name });
-            if (result.success) {
-              updatedNames.push(check.name);
-            } else {
-              updateFailures.push(`${check.name}: ${result.error}`);
-            }
-          }
-          // A mounted section only re-queries from its own handlers, so
-          // tell it the state changed under it. This runs even when no
-          // branch update applied: the fresh check may have discovered
-          // moved tags or per-plugin errors the section should show.
-          publishPluginsSectionIntent({ type: "refresh" });
-          if (updatedNames.length > 0) {
-            // Mounted composers cache contributed slash-command/skill
-            // descriptors; an update can change them without a remount.
-            publishAgentPluginsMutated();
-          }
-
-          const summary: string[] = [];
-          if (updatedNames.length > 0) {
-            summary.push(`Updated ${updatedNames.join(", ")}`);
-          }
-          if (updateFailures.length > 0) {
-            summary.push(`Update failed — ${updateFailures.join("; ")}`);
-          }
-          if (tagMoved.length > 0) {
-            summary.push(`Tag moved for ${tagMoved.join(", ")} — review in Settings → Plugins`);
-          }
-          if (checkFailures.length > 0) {
-            summary.push(`Update check failed for ${checkFailures.join(", ")}`);
-          }
-          if (summary.length === 0) {
-            showCommandFeedbackToast({
-              type: "success",
-              message: "All plugins are up to date.",
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            // Anything unexpected taints the toast: a partial success or
-            // a moved tag must not read as a verified all-clear.
-            type:
-              updateFailures.length > 0 || checkFailures.length > 0 || tagMoved.length > 0
-                ? "error"
-                : "success",
-            message: summary.join(". "),
-          });
-          if (tagMoved.length > 0 || checkFailures.length > 0) {
-            openSettings("plugins");
-          }
-        },
+        run: () => updateAllPluginsFromPalette(p.api, () => openSettings("plugins")),
       },
       {
         id: CommandIds.pluginsUpdateOne(),
@@ -2738,7 +2710,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               return;
             }
             if (preview.data.changes.length > 0) {
-              publishPluginsSectionIntent({ type: "review-update", review: preview.data });
+              publishPluginsSectionIntent({ type: "review-updates", reviews: [preview.data] });
               openSettings("plugins");
               return;
             }

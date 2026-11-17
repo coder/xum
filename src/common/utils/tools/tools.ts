@@ -198,6 +198,11 @@ export interface ToolConfiguration {
   backgroundProcessManager?: BackgroundProcessManager;
   /** Live session queue decision, shared with stream boundaries; never cached by process managers. */
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  /**
+   * True when no user can answer an approval card this turn (headless `xum run`, ACP), so a bash
+   * request to run outside the sandbox is denied at once instead of waiting forever.
+   */
+  noInteractiveUser?: boolean;
   /** When true, restrict edits to the plan file (plan agent behavior). */
   planFileOnly?: boolean;
   /** Plan file path - only this file can be edited when planFileOnly is true. */

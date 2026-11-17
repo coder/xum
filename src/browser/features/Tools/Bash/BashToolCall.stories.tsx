@@ -1,12 +1,14 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "storybook/test";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
+import { APIContext } from "@/browser/contexts/API";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { BashBackgroundListToolCall } from "@/browser/features/Tools/BashBackgroundListToolCall";
 import { BashBackgroundTerminateToolCall } from "@/browser/features/Tools/BashBackgroundTerminateToolCall";
 import { BashOutputToolCall } from "@/browser/features/Tools/BashOutputToolCall";
 import { BashToolCall } from "@/browser/features/Tools/BashToolCall";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { SandboxApprovalCard } from "@/browser/features/Tools/SandboxApprovalCard";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 
 const meta = {
   ...lightweightMeta,
@@ -419,5 +421,83 @@ export const HookBlockedPhone: Story = {
     await expect(reason.getBoundingClientRect().right).toBeLessThanOrEqual(
       frame.getBoundingClientRect().right + 1
     );
+  },
+};
+
+/** A command the sandbox blocked: the header badge and the footer name the first denial. */
+export const SandboxDenied: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <ToolStoryShell>
+      <BashToolCall
+        workspaceId={STORYBOOK_WORKSPACE_ID}
+        toolCallId="sandbox-denied"
+        args={{
+          script: "echo 'export PATH=$HOME/bin:$PATH' >> ~/.zshrc",
+          run_in_background: false,
+          timeout_secs: 10,
+          display_name: "Update shell profile",
+        }}
+        result={{
+          success: false,
+          output: "zsh: operation not permitted: /Users/me/.zshrc",
+          error: "Command exited with code 1",
+          exitCode: 1,
+          wall_duration_ms: 42,
+          sandboxDenials: ["write /Users/me/.zshrc"],
+        }}
+        status="failed"
+      />
+    </ToolStoryShell>
+  ),
+};
+
+/** The card shown while a call waits for the user; the buttons answer this call once. */
+function SandboxApprovalStory() {
+  const [answer, setAnswer] = useState<string>("none");
+  const api = {
+    workspace: {
+      answerSandboxApproval: (input: { approved: boolean }) => {
+        setAnswer(input.approved ? "run outside once" : "deny");
+        return Promise.resolve({ success: true, data: undefined });
+      },
+    },
+  };
+  return (
+    <APIContext.Provider
+      value={{
+        status: "connected",
+        api: api as never,
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }}
+    >
+      <ToolStoryShell>
+        <SandboxApprovalCard
+          approval={{
+            workspaceId: STORYBOOK_WORKSPACE_ID,
+            toolCallId: "sandbox-approval",
+            script: "git push origin HEAD",
+            reason: "git push over SSH needs the ssh-agent socket, which the sandbox closes.",
+            timestamp: 1,
+          }}
+          isLatest
+        />
+        <div className="text-muted text-xs" aria-live="polite">
+          Last answer: {answer}
+        </div>
+      </ToolStoryShell>
+    </APIContext.Provider>
+  );
+}
+
+export const SandboxApproval: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <SandboxApprovalStory />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /^Run outside once/ }));
+    await canvas.findByText("Last answer: run outside once");
   },
 };

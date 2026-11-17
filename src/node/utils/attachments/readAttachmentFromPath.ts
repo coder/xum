@@ -8,6 +8,7 @@ import {
   normalizeAttachmentMediaType,
 } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import type { FileStat, Runtime } from "@/node/runtime/Runtime";
+import type { FileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { resolvePathWithinCwd } from "@/node/services/tools/fileCommon";
 import {
   isRasterAttachmentMediaType,
@@ -24,6 +25,8 @@ export interface ReadAttachmentFromPathArgs {
   cwd: string;
   runtime: Runtime;
   abortSignal?: AbortSignal;
+  /** The workspace's additions to the agent sandbox policy (attach_file). */
+  sandbox?: FileToolSandboxContext;
 }
 
 export interface LoadedFileFromPath {
@@ -219,7 +222,13 @@ export async function readAttachFileFromPath(
     "attach_file requires a path"
   );
 
-  const { resolvedPath } = resolvePathWithinCwd(args.path, args.cwd, args.runtime);
+  const { resolvedPath } = await resolvePathWithinCwd(
+    args.path,
+    args.cwd,
+    args.runtime,
+    "read",
+    args.sandbox
+  );
   const fileStat = await statRegularFile(args, resolvedPath);
   const filename = getFallbackFilename(resolvedPath, args.filename);
   const mediaType = getSupportedAttachmentMediaType({

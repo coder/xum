@@ -108,9 +108,15 @@ export const CODEX_OAUTH_ALLOWED_MODELS = new Set<string>([
   // context-window overrides below), so the `luna` alias keeps working for
   // OAuth-only users.
   "gpt-6-luna",
-  // GPT-6.1 Sol (September 29, 2026): the Codex catalog's default model, so the
-  // promoted `gpt`/`sol` aliases keep working for OAuth-only users.
+  // GPT-6.1 Sol (September 29, 2026): the Codex catalog's default model when the
+  // `gpt`/`sol` aliases moved to it.
   "gpt-6.1-sol",
+  // GPT-6.2 Astra and Sol (November 17, 2026): OpenAI announced both in Codex on
+  // release day, and the `astra` and `gpt`/`sol` aliases now point at them, so
+  // without these entries OAuth-only users of those aliases fail with
+  // api_key_not_found.
+  "gpt-6.2-astra",
+  "gpt-6.2-sol",
 ]);
 
 /**
@@ -129,6 +135,12 @@ const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   "gpt-6-luna": 272_000,
   // GPT-6.1 Sol: https://github.com/openai/codex/blob/b1e72963c3b71a9265a551e54beff078384efed9/codex-rs/models-manager/models.json
   "gpt-6.1-sol": 272_000,
+  // GPT-6.2 Astra/Sol: ASSUMED, the one exception to the rule above. The catalog had
+  // no 6.2 row at c08843a5bd16de5524129b2f4270490447991984 (release day), so these
+  // copy the other GPT-6 rows' 272K. A cap below the real one only compacts
+  // earlier; replace them with the catalog's values once its rows land.
+  "gpt-6.2-astra": 272_000,
+  "gpt-6.2-sol": 272_000,
 };
 
 function normalizeCodexOauthModelId(modelId: string): string {

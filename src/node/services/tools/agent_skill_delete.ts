@@ -2,7 +2,6 @@ import * as path from "path";
 import { tool } from "ai";
 
 import { getCanonicalProjectMetadataRelativePath } from "@/common/compat/legacyMux";
-import { SkillNameSchema } from "@/common/orpc/schemas";
 import {
   REFINEMENT_CAPTURE_MAX_FILE_BYTES,
   REFINEMENT_CAPTURE_MAX_FILES,
@@ -34,11 +33,14 @@ import {
 import {
   hasErrorCode,
   isSkillMarkdownRootFile,
+  parseSkillNameForChange,
   resolveContainedSkillFilePath,
   SKILL_FILENAME,
   validateLocalSkillDirectory,
 } from "./skillFileUtils";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
+import { assertProjectFileReachable } from "@/node/services/agentSandbox/fileToolSandbox";
 
 interface AgentSkillDeleteToolArgs {
   name: string;
@@ -289,11 +291,11 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
         };
       }
 
-      const parsedName = SkillNameSchema.safeParse(name);
+      const parsedName = parseSkillNameForChange(name, config);
       if (!parsedName.success) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: parsedName.error,
         };
       }
 
@@ -304,6 +306,8 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
         });
+        // The skill commands run in the sandbox with the environment of bash (Codex review).
+        const commandEnv = mergeSecretsOverXumEnv(config.xumEnv, config.secrets);
 
         const targetMode = target ?? "file";
         const projectSkillDirs = getProjectSkillDirs(skillCtx, parsedName.data);
@@ -319,12 +323,12 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
         // never rollbackable).
         if (targetMode !== "skill" && projectSkillDirs != null) {
           if (skillCtx.kind === "project-runtime" || config.xumScope == null) {
-            await migrateLegacyProjectSkill(skillCtx, parsedName.data);
+            await migrateLegacyProjectSkill(skillCtx, parsedName.data, commandEnv);
           } else {
             await withTargetMutationLock(
               config.xumScope.xumHome,
               path.resolve(projectSkillDirs[0], ".."),
-              () => migrateLegacyProjectSkill(skillCtx, parsedName.data),
+              () => migrateLegacyProjectSkill(skillCtx, parsedName.data, commandEnv),
               config.sessionLocks
             );
           }
@@ -374,7 +378,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
             const result = await execBuffered(
               skillCtx.runtime,
               `rm -rf ${projectSkillDirs.map(quoteRuntimeProbePath).join(" ")}`,
-              { cwd: boundary, timeout: 10 }
+              { cwd: boundary, timeout: 10, env: commandEnv }
             );
             if (result.exitCode !== 0) {
               return { success: false, error: result.stderr.trim() || "Failed to delete skill" };
@@ -639,6 +643,8 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
         } catch (error) {
           return deleteFailure(error);
         }
+        // As in agent_skill_write. Whole skill deletes run rm in the sandbox.
+        await assertProjectFileReachable(config, targetPath, "write");
 
         // Stat → capture → unlink → journal run under the per-root mutation
         // lock shared with the rollback engine (targetMutationLocks.ts), so a
@@ -747,6 +753,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
             // manifest so stale duplicates cannot shadow the delete (upstream
             // .xum-canonical migration semantics).
             if (legacyManifestPath != null) {
+              await assertProjectFileReachable(config, legacyManifestPath, "write");
               await nodeHostFiles.promises.rm(legacyManifestPath, { force: true });
             }
             await nodeHostFiles.promises.unlink(targetPath);

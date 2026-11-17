@@ -15,7 +15,10 @@ import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
 import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
-import { STATUS_PAGE_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
+import {
+  LAYOUT_TURN_END_NUDGE,
+  STATUS_PAGE_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
 import { Ok } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
@@ -92,6 +95,8 @@ async function setup(
     whileStreaming?: (turn: number, h: AgentSessionHarness) => void;
     /** Every turn's status page earns the Agent interface view's turn-end nudge. */
     statusPageNeedsNudge?: boolean;
+    /** The turn-end layout audit: its answer for each call (the audit itself is not under test). */
+    layoutNudge?: NonNullable<AgentSessionAIService["layoutTurnEndNudge"]>;
     session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
   } = {}
 ) {
@@ -107,6 +112,7 @@ async function setup(
       ...(input.statusPageNeedsNudge === true
         ? { statusPageTurnEndNudge: () => Promise.resolve(STATUS_PAGE_TURN_END_NUDGE) }
         : {}),
+      ...(input.layoutNudge != null ? { layoutTurnEndNudge: input.layoutNudge } : {}),
       streamMessage: mock<AgentSessionAIService["streamMessage"]>((request) => {
         requests.push(request);
         const messageId = `a${++turns}`;
@@ -1502,6 +1508,236 @@ describe("status page turn-end nudge", () => {
     await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
     await settle(h);
 
+    expect(streams()).toBe(1);
+  });
+});
+
+describe("layout turn-end nudge", () => {
+  type LayoutCall = Parameters<NonNullable<AgentSessionAIService["layoutTurnEndNudge"]>>[1];
+
+  // A turn that wrote its TODO list and left an item open earns the TODO nudge.
+  const openTodos: TodoItem[] = [{ content: "Verify the fix", status: "in_progress" }];
+  const todoWriteThenReply = (): CompletedMessagePart[] => [
+    {
+      type: "dynamic-tool",
+      toolCallId: "todo-1",
+      toolName: "todo_write",
+      input: { todos: openTodos },
+      state: "output-available",
+      output: { success: true },
+    },
+    { type: "text", text: "Fixed." },
+  ];
+  async function writeTodos(h: AgentSessionHarness, todos: TodoItem[]): Promise<void> {
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(getTodoFilePath(sessionDir), JSON.stringify(todos));
+  }
+
+  /** An audit that finds a new issue every time, recording each call. */
+  function findsIssue(calls: LayoutCall[] = []) {
+    return (_workspace: string, input: LayoutCall) => {
+      calls.push(input);
+      return Promise.resolve(LAYOUT_TURN_END_NUDGE);
+    };
+  }
+
+  test("a turn whose pages earn it gets exactly one nudge per user turn", async () => {
+    const calls: LayoutCall[] = [];
+    const { h, streams } = await setup({ layoutNudge: findsIssue(calls) });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    // The nudged turn would earn it too: only the first stream of a user turn is audited.
+    expect(await userTexts(h)).toEqual(["fix the bug", LAYOUT_TURN_END_NUDGE]);
+    expect(streams()).toBe(2);
+    // The ended stream's message: AIService checks that this turn could publish.
+    expect(calls.map((call) => call.messageId)).toEqual(["a1"]);
+  });
+
+  test("a turn the audit finds nothing in is not nudged", async () => {
+    const { h, streams } = await setup({ layoutNudge: () => Promise.resolve(null) });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(streams()).toBe(1);
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
+  });
+
+  test("a machine turn is audited too, without the user-turn-only TODO nudge", async () => {
+    const calls: LayoutCall[] = [];
+    const { h } = await setup({
+      layoutNudge: findsIssue(calls),
+      parts: () => todoWriteThenReply(),
+    });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("a wake", options, {
+      acceptanceOrigin: "automatic",
+      synthetic: true,
+    });
+    await settle(h);
+
+    expect(calls).toHaveLength(1);
+    expect(await userTexts(h)).toEqual(["a wake", LAYOUT_TURN_END_NUDGE]);
+  });
+
+  test("rides one continuation with the other nudges, layout last", async () => {
+    const { h } = await setup({
+      layoutNudge: findsIssue(),
+      statusPageNeedsNudge: true,
+      parts: () => todoWriteThenReply(),
+    });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect((await userTexts(h))[1]).toBe(
+      `${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`
+    );
+  });
+
+  test("a plugin continuation carries the nudge once, and its own turns get none", async () => {
+    addConsumer(keepGoing);
+    const calls: LayoutCall[] = [];
+    const { h } = await setup({ layoutNudge: findsIssue(calls) });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect((await userTexts(h))[1]).toBe(
+      `Run the failing tests again.\n\n${LAYOUT_TURN_END_NUDGE}`
+    );
+    expect(calls).toHaveLength(1);
+  });
+
+  test.each([
+    { name: "a Plan mode turn", agentId: "plan" },
+    { name: "a turn a plugin halted", halt: true },
+    { name: "an xum run turn", session: { callerOwnsTurnEnd: true } },
+  ])("$name is not audited", async (row) => {
+    if (row.halt === true) addConsumer((ctx) => (ctx.halted = { pluginName: "guard" }));
+    const calls: LayoutCall[] = [];
+    const { h, streams } = await setup({ layoutNudge: findsIssue(calls), session: row.session });
+
+    await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
+    await settle(h);
+
+    expect(calls).toEqual([]);
+    expect(streams()).toBe(1);
+  });
+
+  test("a delegated workspace turn is not audited", async () => {
+    const calls: LayoutCall[] = [];
+    const { h, streams } = await setup({ layoutNudge: findsIssue(calls) });
+
+    await h.session.sendMessage("delegated work", {
+      ...options,
+      muxMetadata: {
+        type: "workspace-turn-task",
+        taskHandleId: "wst_delegated",
+        ownerWorkspaceId: "owner-workspace",
+        turnId: "turn-delegated",
+      },
+    });
+    await settle(h);
+
+    expect(calls).toEqual([]);
+    expect(streams()).toBe(1);
+  });
+
+  test("a sub-agent turn is not audited", async () => {
+    const history = await createTestHistoryService();
+    const projectPath = "/tmp/turn-stop-hooks-project";
+    await history.config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "turn-stop-hooks-project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+      parentWorkspaceId: "parent-workspace",
+    });
+    unregisters.push(() => void history.cleanup());
+    const calls: LayoutCall[] = [];
+    const { h, streams } = await setup({
+      layoutNudge: findsIssue(calls),
+      session: { config: history.config, historyService: history.historyService },
+    });
+
+    await h.session.sendMessage("sub-agent work", options);
+    await settle(h);
+
+    expect(calls).toEqual([]);
+    expect(streams()).toBe(1);
+  });
+
+  test("a hard Stop while the audit runs aborts it, and no continuation follows", async () => {
+    const auditRunning = Promise.withResolvers<void>();
+    let abortedAfterStop: boolean | undefined;
+    const { h, streams } = await setup({
+      layoutNudge: async (_workspace, input) => {
+        auditRunning.resolve();
+        // As a browser run does: it goes on until the Stop ends it (bounded, so a missing abort
+        // fails the assertion below instead of hanging the session).
+        await new Promise((resolve) => {
+          input.abortSignal.addEventListener("abort", resolve, { once: true });
+          setTimeout(resolve, 2_000);
+        });
+        abortedAfterStop = input.abortSignal.aborted;
+        // Even an audit that still answers must not continue a stopped turn.
+        return LAYOUT_TURN_END_NUDGE;
+      },
+    });
+
+    await h.session.sendMessage("fix the bug", options);
+    await auditRunning.promise;
+    await h.session.interruptStream();
+    await settle(h);
+
+    expect(abortedAfterStop).toBe(true);
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
+    expect(streams()).toBe(1);
+  });
+
+  test("a shutdown while the audit runs aborts it", async () => {
+    const auditRunning = Promise.withResolvers<void>();
+    const auditEnded = Promise.withResolvers<boolean>();
+    const { h } = await setup({
+      layoutNudge: async (_workspace, input) => {
+        auditRunning.resolve();
+        // A browser run must not delay teardown (bounded, so a missing abort fails the
+        // assertion below instead of hanging the session).
+        await new Promise((resolve) => {
+          input.abortSignal.addEventListener("abort", resolve, { once: true });
+          setTimeout(resolve, 2_000);
+        });
+        auditEnded.resolve(input.abortSignal.aborted);
+        return null;
+      },
+    });
+
+    await h.session.sendMessage("fix the bug", options);
+    await auditRunning.promise;
+    h.session.beginShutdown();
+
+    expect(await auditEnded.promise).toBe(true);
+  });
+
+  test("a Stop that finished while the turn's last event arrived ends the turn without a nudge", async () => {
+    let stopEpoch = 0;
+    const { h, streams } = await setup({
+      layoutNudge: findsIssue(),
+      whileStreaming: () => void stopEpoch++,
+      session: { getStopEpoch: () => stopEpoch },
+    });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
     expect(streams()).toBe(1);
   });
 });

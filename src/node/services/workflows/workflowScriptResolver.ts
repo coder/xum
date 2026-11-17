@@ -8,6 +8,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+import type { FileToolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
 import {
   discoverAgentPlugins,
   readPluginFileWithinRootCapped,
@@ -75,6 +76,12 @@ export interface ResolveWorkflowScriptInput {
   approvedCopiesReads?: ApprovedCopiesReads;
   /** Builds the host-local runtimes of a `skill://` path's skill read. */
   runtimeFactory: RuntimeFactory;
+  /**
+   * For a script that an agent names: a workspace or project skill script loads only where a
+   * sandboxed command could read it. A command can link one at a file that its sandbox hides, and
+   * the run evaluates the file (Codex review).
+   */
+  sandboxGate?: FileToolSandboxGate;
 }
 
 const SKILL_SCRIPT_PATH_PREFIX = "skill://";
@@ -166,6 +173,7 @@ function readWorkflowSkill(
       : { projectSearchRoot, projectPluginsTrusted: input.projectTrusted }),
     containment: workflowSkillContainment(input, projectSearchRoot),
     runtimeFactory: input.runtimeFactory,
+    sandboxGate: input.sandboxGate,
   });
 }
 
@@ -245,6 +253,10 @@ async function resolveSkillWorkflowScript(
       parsed.relativePath
     )
   ).resolvedPath;
+  // As resolveSkillFileTarget(): plugin folders are read-only to commands.
+  if (resolvedSkill.package.scope === "project" && resolvedSkill.pluginRoot == null) {
+    await input.sandboxGate?.(resolvedPath, "read");
+  }
 
   const stat = await skillRuntime.stat(resolvedPath);
   assertRegularJavaScriptFile(stat.isDirectory, parsed.relativePath);
@@ -632,6 +644,7 @@ async function resolveWorkspaceFileWorkflowScript(
       `Workflow script path resolves outside the workspace: ${getErrorMessage(error)}`
     );
   });
+  await input.sandboxGate?.(resolvedPath, "read");
 
   const stat = await input.runtime.stat(resolvedPath);
   assertRegularJavaScriptFile(stat.isDirectory, input.scriptPath);

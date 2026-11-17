@@ -12,6 +12,7 @@ import {
   publishArtifact,
   resolveArtifactToolPath,
 } from "@/node/services/artifactPublishOperations";
+import { checkArtifactLayout } from "@/node/services/layoutAudit/checkArtifactLayout";
 
 /**
  * `artifact` tool (Artifacts M4): publish a file from $XUM_SCRATCH_DIR/artifacts. The result
@@ -81,6 +82,17 @@ export const createArtifactTool: ToolFactory = (config) =>
           kind: published.kind,
           title: published.record.title,
           pin: published.record.pin,
+          // HTML only (undefined for other kinds); never fails the publish.
+          layout: await checkArtifactLayout({
+            kind: published.kind,
+            runtime: config.runtime,
+            cwd: config.cwd,
+            trusted: config.trusted,
+            location,
+            relPath,
+            sessionDir,
+            abortSignal,
+          }),
         };
       } catch (error) {
         return { success: false, error: `Publishing failed: ${getErrorMessage(error)}` };

@@ -565,6 +565,99 @@ async function assertBandOnlyRightReserve(page: StoryPage) {
   }
 }
 
+// The unfolded Duo's inner display in portrait, in pt. iOS reports an 82 pt top inset but draws only
+// a status ring at x 549..643, y 26..69, so the globals.css rule keyed on the Duo's 466x678 screen
+// lowers the shell's top inset to 25 and keeps the header's controls left of the ring.
+const DUO_INNER_PORTRAIT = { width: 669, height: 951 };
+const DUO_SCREEN = { width: 466, height: 678 };
+const DUO_INNER_INSETS = { top: 82, right: 0, bottom: 34, left: 0 };
+const DUO_INNER_TOP_PX = 25;
+const DUO_STATUS_RING_LEFT_PX = 549;
+
+async function measureTopStrip(page: StoryPage) {
+  // The header only exists once the story has laid out at the phone width.
+  await page.locator(".mobile-sticky-header").first().waitFor({ timeout: 5000 });
+  return page.evaluate(() => {
+    const header = document.querySelector(".mobile-sticky-header")!;
+    const controls = [...header.querySelectorAll("button, a[href]")]
+      .map((control) => control.getBoundingClientRect())
+      .filter((rect) => rect.width > 0);
+    return {
+      headerTop: Math.round(header.getBoundingClientRect().top),
+      shellPadding: getComputedStyle(document.querySelector(".mobile-layout")!).paddingTop,
+      rightmostControl: Math.round(Math.max(...controls.map((rect) => rect.right))),
+    };
+  });
+}
+
+/**
+ * The inner display reports the same 466x678 screen as the cover display, so only device metrics
+ * can reproduce it: Chromium's override sets the screen that `device-width` reads, and env() reads
+ * the inset override. Any other screen with the same viewport and inset keeps the full inset.
+ */
+async function assertDuoInnerPortraitTopStrip(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  const nextFrame = () =>
+    page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    );
+  const settle = async (screen: { width: number; height: number }, top: number) => {
+    // Chromium re-matches `device-width` only when the viewport changes too, as it always does on a
+    // device, so leave the viewport for a frame before swapping the screen under the same one.
+    await client.send("Emulation.clearDeviceMetricsOverride");
+    await nextFrame();
+    await client.send("Emulation.setDeviceMetricsOverride", {
+      ...DUO_INNER_PORTRAIT,
+      deviceScaleFactor: 1,
+      mobile: false,
+      screenWidth: screen.width,
+      screenHeight: screen.height,
+      screenOrientation: { type: "portraitPrimary", angle: 0 },
+    });
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { ...DUO_INNER_INSETS, top },
+    });
+    await page.waitForFunction(
+      (args) => innerWidth === args.width && screen.width === args.screenWidth,
+      { width: DUO_INNER_PORTRAIT.width, screenWidth: screen.width },
+      { timeout: 5000 }
+    );
+    await nextFrame();
+    return measureTopStrip(page);
+  };
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+
+    const duo = await settle(DUO_SCREEN, DUO_INNER_INSETS.top);
+    assert.equal(duo.headerTop, DUO_INNER_TOP_PX, "the Duo's header moves up beside the ring");
+    assert.equal(duo.shellPadding, `${DUO_INNER_TOP_PX}px`, "the shell clears only the top strip");
+    assert.ok(
+      duo.rightmostControl <= DUO_STATUS_RING_LEFT_PX,
+      `the header's controls stop left of the ring at x ${DUO_STATUS_RING_LEFT_PX}, not ${duo.rightmostControl}`
+    );
+
+    // A web clip that reports no top inset keeps none.
+    const noInset = await settle(DUO_SCREEN, 0);
+    assert.equal(noInset.headerTop, 0, "min() keeps a missing inset at 0");
+
+    const otherPhone = await settle(DUO_INNER_PORTRAIT, DUO_INNER_INSETS.top);
+    assert.equal(
+      otherPhone.headerTop,
+      DUO_INNER_INSETS.top,
+      "any other screen keeps the full inset"
+    );
+  } finally {
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { top: 0, right: 0, bottom: 0, left: 0 },
+    });
+    await client.send("Emulation.clearDeviceMetricsOverride");
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 const MENU_INSET_STORY = "components-projectpage--create-workspace-multiple-projects";
 // The iPhone Duo cover display draws its 21 px top inset as an opaque status band. A short
 // viewport (as when the software keyboard is up) leaves the project switcher too little room
@@ -574,9 +667,13 @@ const MENU_INSETS = { top: 21, right: SIDE_INSET_PX, bottom: 0, left: 0 };
 const RAISED_MENU_INSETS = { ...MENU_INSETS, top: 40 };
 const MENU_INSET_VIEWPORT = { width: SIDE_INSET_VIEWPORT.width, height: 220 };
 
-/** Waits until a Radix menu stops moving, then returns its top edge and side. */
+/**
+ * Waits until a Radix menu stops moving, then returns its top edge and side. The menu is the
+ * positioned Radix content: a Select's listbox itself, or the popover around a filterable list.
+ */
 async function settledMenuBox(menu: ReturnType<StoryPage["getByRole"]>) {
-  return menu.evaluate(async (element) => {
+  return menu.evaluate(async (listbox) => {
+    const element = listbox.closest("[data-side]") ?? listbox;
     const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
     let last = "";
     for (let i = 0; i < 60; i++) {
@@ -643,7 +740,7 @@ async function assertMenuClearsSafeArea(page: StoryPage) {
     // The insets come after the resize, with no resize of their own, as they can when a folding
     // phone switches displays.
     await setInsets(MENU_INSETS);
-    // A touch tap opens Radix Select on click; a hidden copy of the trigger can exist.
+    // A touch tap opens the project switcher on click; a hidden copy of the trigger can exist.
     await page.locator("[data-testid=project-selector]:visible").evaluate((el) => {
       (el as HTMLElement).click();
     });
@@ -1146,6 +1243,7 @@ const config: TestRunnerConfig = {
     if (context.id === DUO_BAND_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {
         await assertBandOnlyRightReserve(page);
+        await assertDuoInnerPortraitTopStrip(page);
       }
       return;
     }

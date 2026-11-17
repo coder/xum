@@ -62,6 +62,8 @@ import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
+import { lazyFileToolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
 import {
@@ -1382,6 +1384,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     options: StreamMessageOptions
   ): Promise<Result<PreparedStreamMessage, SendMessageError>>;
   getProvidersConfig(): ProvidersConfigMap | null;
+  /** AIService.getWorkspaceSandboxEnv. */
+  getWorkspaceSandboxEnv(metadata: WorkspaceMetadata): Promise<Record<string, string>>;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
   buildMemorySessionContext?(
     workspaceId: string,
@@ -1411,6 +1415,16 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   statusPageTurnEndNudge?(
     workspaceId: string,
     input: { messageId: string; parts: readonly CompletedMessagePart[] }
+  ): Promise<string | null>;
+  /** The layout nudge for HTML artifacts that are due for an audit, or null. Absent: never. */
+  layoutTurnEndNudge?(
+    workspaceId: string,
+    input: {
+      /** The ended turn's assistant message: a turn that cannot publish gets no nudge. */
+      messageId: string;
+      /** A user Stop (or a shutdown) ends the audit: no nudge is returned. */
+      abortSignal: AbortSignal;
+    }
   ): Promise<string | null>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
@@ -4536,6 +4550,16 @@ export class AgentSession {
     });
   }
 
+  /**
+   * A bash call waiting for a sandbox approval: its live event went out before this
+   * subscription, so without a replay the reloaded chat shows no card to answer.
+   */
+  private replayPendingSandboxApprovals(listener: (event: AgentSessionReplayEvent) => void): void {
+    for (const event of sandboxApprovalManager.pendingEvents(this.workspaceId)) {
+      listener({ workspaceId: this.workspaceId, message: event });
+    }
+  }
+
   private async emitHistoricalEvents(
     listener: (event: AgentSessionReplayEvent) => void,
     mode?: OnChatMode,
@@ -5103,6 +5127,8 @@ export class AgentSession {
       if (this.heldInputs.length > 0) {
         listener({ workspaceId: this.workspaceId, message: this.heldInputsChangedEvent() });
       }
+
+      this.replayPendingSandboxApprovals(listener);
 
       // Rehydrate auto-retry state on reconnect/reload so RetryBarrier keeps showing "Stop"
       // while a backend timer is armed, or the stop reason after auto-retry gave up.
@@ -12877,12 +12903,12 @@ export class AgentSession {
    * (Codex `decision: "block"`) queues its prompt as a new synthetic user row. Each hook continues
    * a user turn up to its own limit (runTurnStopHooks), and all of them together at most
    * MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN times. Xum's own nudges (needsTodoTurnEndNudge,
-   * statusPageTurnEndNudge) ride the same continuation and gates. Sub-agent turns skip the
-   * hooks: TaskService owns their stream end (Codex has SubagentStop for them). A delegated
-   * workspace turn (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager
-   * settles its handle from this stream end, and can remove a disposable workspace, while a slow
-   * hook still runs, so a continuation would arrive after the caller already got the turn as
-   * finished.
+   * statusPageTurnEndNudge, layoutTurnEndNudge) ride the same continuation and gates. Sub-agent
+   * turns skip the hooks: TaskService owns their stream end (Codex has SubagentStop for them). A
+   * delegated workspace turn (`workspace-turn-task`) skips them for the same reason:
+   * WorkspaceTurnManager settles its handle from this stream end, and can remove a disposable
+   * workspace, while a slow hook still runs, so a continuation would arrive after the caller
+   * already got the turn as finished.
    */
   private async runTurnStopHooks(
     payload: StreamEndEvent,
@@ -13026,7 +13052,10 @@ export class AgentSession {
     // A Stop that landed after the stream ended and before this point had nothing to abort. No
     // await sits between storing the controller and this check, so no Stop falls between them.
     if (this.stoppedSince(provenance.admissionStopEpoch)) hooksAbort.abort();
+    // A shutdown or dispose ends the hooks too: their processes must not delay teardown.
+    const abortSignal = AbortSignal.any([hooksAbort.signal, this.closingSignal]);
     let hookOutcome: TurnStopHookOutcome;
+    let nudges: string[];
     try {
       hookOutcome = (await this.aiService.runTurnStopHooks?.(this.workspaceId, {
         messageId: payload.messageId,
@@ -13034,24 +13063,29 @@ export class AgentSession {
         model: stopHookModel(payload, provenance),
         turnContinuations: this.stopHookContinuations,
         hookContinuations: this.stopHookCountsByKey,
-        // A shutdown or dispose ends the hooks too: their processes must not delay teardown.
-        abortSignal: AbortSignal.any([hooksAbort.signal, this.closingSignal]),
+        abortSignal,
       })) ?? { kind: "none" };
+      // Still under the Stop abort: the layout audit of the nudges runs a browser for seconds.
+      nudges = await this.readTurnEndNudges(hookOutcome, options, payload, provenance, abortSignal);
     } finally {
       if (this.turnStopHooksAbort === hooksAbort) this.turnStopHooksAbort = undefined;
     }
     return mergeTurnStopContinuation({
       hookReasons: hookOutcome.kind === "continue" ? hookOutcome.reasons : [],
-      nudges: await this.readTurnEndNudges(hookOutcome, options, payload, provenance),
+      nudges,
     });
   }
 
-  /** Xum's turn-end nudges for the continuation, TODO first (see readTurnStopContinuation). */
+  /**
+   * Xum's turn-end nudges for the continuation: TODO, then the status page, then layout (see
+   * readTurnStopContinuation). `abortSignal` is the turn.stop hooks' (a user Stop or a shutdown).
+   */
   private async readTurnEndNudges(
     hookOutcome: TurnStopHookOutcome,
     options: SendMessageOptions | undefined,
     payload: StreamEndEvent,
-    provenance: StopContinuationProvenance
+    provenance: StopContinuationProvenance,
+    abortSignal: AbortSignal
   ): Promise<string[]> {
     if (
       hookOutcome.kind === "halted" ||
@@ -13075,7 +13109,28 @@ export class AgentSession {
       parts: payload.parts,
     });
     if (statusPageNudge != null) nudges.push(statusPageNudge);
+    const layoutNudge = await this.readLayoutNudge(provenance, payload.messageId, abortSignal);
+    if (layoutNudge != null) nudges.push(layoutNudge);
     return nudges;
+  }
+
+  /**
+   * The layout nudge (see AgentSessionAIService.layoutTurnEndNudge). A machine turn can change a
+   * page as well as a user turn, so it is not limited to user-started turns. The audit runs a
+   * browser for seconds, so it is skipped when the turn's continuation would be dropped anyway
+   * (runTurnStopHooks).
+   */
+  private async readLayoutNudge(
+    provenance: StopContinuationProvenance,
+    messageId: string,
+    abortSignal: AbortSignal
+  ): Promise<string | null> {
+    if (provenance.externallyOwnedTurn) return null;
+    const nudge = await this.aiService.layoutTurnEndNudge?.(this.workspaceId, {
+      messageId,
+      abortSignal,
+    });
+    return nudge ?? null;
   }
 
   /** Records whether the sent message whose stream starts now began a user turn. */
@@ -13241,6 +13296,9 @@ export class AgentSession {
     });
     forward("bash-output", (payload) => {
       this.markActiveStreamHadAnyOutput();
+      this.emitChatEvent(payload);
+    });
+    forward("bash-sandbox-approval", (payload) => {
       this.emitChatEvent(payload);
     });
     forward("task-created", (payload) => {
@@ -16207,12 +16265,12 @@ export class AgentSession {
    * materialization and per-skill model routing so both resolve identically.
    */
   /** The skill-storage context a routing or materialization read uses (the sibling note reuses it). */
-  private buildSkillLookupContext(args: {
+  private async buildSkillLookupContext(args: {
     metadata: WorkspaceMetadata;
     runtime: Runtime;
     workspacePath: string;
     disableWorkspaceAgents: boolean | undefined;
-  }): SkillLookupContext {
+  }): Promise<SkillLookupContext> {
     // When workspace agents are disabled, resolve skills from the project path instead of
     // the worktree so skill invocation uses the same precedence/discovery root as the UI.
     const skillDiscoveryPath = args.disableWorkspaceAgents
@@ -16247,6 +16305,13 @@ export class AgentSession {
             runtimeFactory: this.aiService.runtimeFactory,
           })
         : null;
+    // The snapshot reaches the model, so a project skill loads only where a sandboxed command could
+    // read its SKILL.md, as in the skills index: a command can link it to a file that a project
+    // secret names (Codex review). Built here, so the routing gate's read and the snapshot read
+    // pass the same check.
+    const sandboxGate = lazyFileToolSandboxGate(args.runtime, args.workspacePath, {
+      env: await this.aiService.getWorkspaceSandboxEnv(args.metadata),
+    });
     return {
       runtime: skillCtx?.runtime ?? args.runtime,
       workspacePath: skillCtx?.workspacePath ?? skillDiscoveryPath,
@@ -16256,6 +16321,7 @@ export class AgentSession {
         // #6426: the default roots (no storage context) add project plugins only when trusted.
         projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, args.metadata),
         runtimeFactory: this.aiService.runtimeFactory,
+        sandboxGate,
       },
     };
   }
@@ -16266,9 +16332,10 @@ export class AgentSession {
     workspacePath: string;
     disableWorkspaceAgents: boolean | undefined;
   }): (lookupName: string) => Promise<Awaited<ReturnType<typeof readAgentSkill>>> {
-    const context = this.buildSkillLookupContext(args);
-    return (lookupName: string) =>
-      readAgentSkill(context.runtime, context.workspacePath, lookupName, context.options);
+    return async (lookupName: string) => {
+      const context = await this.buildSkillLookupContext(args);
+      return readAgentSkill(context.runtime, context.workspacePath, lookupName, context.options);
+    };
   }
 
   /**
@@ -17073,7 +17140,7 @@ export class AgentSession {
       let resolved: Awaited<ReturnType<typeof readAgentSkill>>;
       // The context readAgentSkill used — the same one the routing gate's read
       // used — so the sibling note discovers skills with the same precedence.
-      const lookupContext = this.buildSkillLookupContext({
+      const lookupContext = await this.buildSkillLookupContext({
         metadata,
         runtime,
         workspacePath,

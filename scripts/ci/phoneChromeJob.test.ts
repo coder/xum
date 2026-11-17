@@ -195,10 +195,27 @@ describe("the phone chrome check in pr.yml", () => {
     expect(await pathsThatMissTheJob(files)).toEqual([]);
   });
 
+  // The job also runs the HTML artifact layout audit over its fixture pages (make
+  // test-layout-audit-browser): the script it ships, the runner and one page.
+  const LAYOUT_AUDIT_FILES = [
+    "src/node/services/layoutAudit/layoutAuditPageScript.generated.ts",
+    "tests/layoutAudit/runFixtureAudit.ts",
+    "tests/fixtures/layout-audit/control-broken-overflow.html",
+  ];
+
+  test("starts when a PR changes the layout audit's script, its runner or a fixture page", async () => {
+    for (const file of LAYOUT_AUDIT_FILES) {
+      expect(await Bun.file(path.join(REPO, file)).exists()).toBe(true);
+    }
+
+    expect(await pathsThatMissTheJob(LAYOUT_AUDIT_FILES)).toEqual([]);
+  });
+
   test("keeps every filter entry tied to a file that only it covers", async () => {
     const patterns = await phoneChromePatterns();
     const files = [
       ...(await phonePageFiles()),
+      ...LAYOUT_AUDIT_FILES,
       ...(await readdir(path.join(REPO, "scripts/perf/fixtures/neutralSeed"))).map(
         (name) => `scripts/perf/fixtures/neutralSeed/${name}`
       ),

@@ -23,7 +23,9 @@ type RestartRule =
   /** One operation's progress stream (a clone): it is not restarted, the operation fails. */
   | "operation-stream"
   /** Reads the procedure only to check that the server supports it. */
-  | "capability-check";
+  | "capability-check"
+  /** A helper that opens the stream with its caller's client and signal; callers use effect-deps. */
+  | "caller-signal";
 
 const RESTART_RULES: Record<string, RestartRule> = {
   "src/browser/App.tsx": "effect-deps",
@@ -44,10 +46,10 @@ const RESTART_RULES: Record<string, RestartRule> = {
   "src/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore.ts": "effect-deps",
   "src/browser/features/RightSidebar/DevToolsTab/useDevToolsSubscription.ts": "effect-deps",
   "src/browser/features/RightSidebar/Workflows/useWorkflowRuns.ts": "effect-deps",
-  "src/browser/features/Settings/Sections/AgentResourceLimitsSettings.tsx": "effect-deps",
   "src/browser/features/Settings/Sections/BackupSection.tsx": "effect-deps",
   "src/browser/features/Settings/Sections/GeneralSection.tsx": "effect-deps",
   "src/browser/features/Settings/Sections/MCPSettingsSection.tsx": "effect-deps",
+  "src/browser/features/Settings/Sections/followConfigValue.ts": "caller-signal",
   "src/browser/features/Tools/WorkflowRunToolCall.tsx": "capability-check",
   "src/browser/features/desktop/useDesktopConnection.ts": "holder-backoff",
   "src/browser/hooks/useAutoModelRouting.ts": "effect-deps",
@@ -92,6 +94,10 @@ const RULE_SHAPES: Record<RestartRule, { describe: string; matches: (text: strin
   "capability-check": {
     describe: "a typeof check of the procedure",
     matches: (text) => /typeof [^\n]*=== "function"/.test(text),
+  },
+  "caller-signal": {
+    describe: "a function that takes the caller's api client and AbortSignal",
+    matches: (text) => /\bapi: APIClient\b/.test(text) && /\bsignal: AbortSignal\b/.test(text),
   },
 };
 

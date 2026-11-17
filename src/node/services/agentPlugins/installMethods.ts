@@ -285,6 +285,23 @@ async function entryExists(dir: string, relative: string): Promise<boolean> {
   return (await fsPromises.lstat(path.join(dir, relative)).catch(() => null)) !== null;
 }
 
+/**
+ * True when a folder has a plugin manifest of its own: the entries that make
+ * detectInstallMethods return an own-manifest method (agent-plugin, claude-plugin or
+ * cursor-plugin).
+ */
+export async function hasPluginManifest(dir: string): Promise<boolean> {
+  for (const relative of [
+    PLUGIN_MANIFEST_RELATIVE_PATH,
+    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH,
+  ]) {
+    if (await entryExists(dir, relative)) return true;
+  }
+  return false;
+}
+
 export interface DetectedInstallMethods {
   /** Every method that fits, in order: agent-plugin, claude-plugin or cursor-plugin, skills. */
   methods: AgentPluginInstallMethod[];

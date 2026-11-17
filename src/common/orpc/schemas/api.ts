@@ -300,6 +300,9 @@ export { perfCaptures } from "./perfCaptures";
 // Re-export agent resource limit schemas
 export { agentResourceLimits } from "./agentResourceLimits";
 
+// Re-export macOS agent sandbox schemas
+export { agentSandbox } from "./agentSandbox";
+
 // Re-export "Report slowness" bundle schemas
 export { perfReports } from "./perfReports";
 
@@ -938,6 +941,11 @@ export const projects = {
   listBranches: {
     input: z.object({ projectPath: z.string() }),
     output: BranchListResultSchema,
+  },
+  /** Host aliases from ~/.ssh/config, to suggest on the new-workspace page. */
+  listSshConfigHosts: {
+    input: z.void(),
+    output: z.object({ hosts: z.array(z.string()) }),
   },
   gitInit: {
     input: z.object({ projectPath: z.string() }),
@@ -2190,6 +2198,20 @@ export const workspace = {
         workspaceId: z.string(),
         toolCallId: z.string(),
         answers: z.record(z.string(), z.string()),
+      })
+      .strict(),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  /**
+   * Answers the sandbox approval card of one bash call: approved runs that one call outside the
+   * sandbox. Only the user calls it; sandboxed commands do not get the server token.
+   */
+  answerSandboxApproval: {
+    input: z
+      .object({
+        workspaceId: z.string(),
+        toolCallId: z.string(),
+        approved: z.boolean(),
       })
       .strict(),
     output: ResultSchema(z.void(), z.string()),
