@@ -129,9 +129,8 @@ final class AppModel {
         guard let c = servers.currentClient else { throw APIError.unauthorized }
         var body: [String: JSONValue] = ["projectPath": .string(projectPath)]
         if let trunk { body["trunkBranch"] = .string(trunk) }
-        if runtime == .local || runtime == .worktree {
-            body["runtimeConfig"] = ["type": .string(runtime.rawValue)]
-        }
+        // Worktree needs a server-side srcBaseDir, so omit it and let the project default apply.
+        if runtime == .local { body["runtimeConfig"] = ["type": "local"] }
         if runtime == .worktree {
             body["nameGeneration"] = ["message": .string(message), "candidates": [.string(model)]]
         }
