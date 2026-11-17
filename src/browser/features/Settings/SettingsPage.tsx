@@ -18,6 +18,7 @@ import {
   Lock,
   ArchiveRestore,
   ScrollText,
+  SquareTerminal,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { useSettings } from "@/browser/contexts/SettingsContext";
@@ -27,6 +28,7 @@ import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
+import { AgentRuntimeSection } from "./Sections/AgentRuntimeSection";
 import { HeartbeatSection } from "./Sections/HeartbeatSection";
 import { ProvidersSection } from "./Sections/ProvidersSection";
 import { ModelsSection } from "./Sections/ModelsSection";
@@ -59,6 +61,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Agents",
     icon: <Bot className="h-4 w-4" />,
     component: TasksSection,
+  },
+  {
+    id: "agent-runtime",
+    label: "Agent Runtime",
+    icon: <SquareTerminal className="h-4 w-4" />,
+    component: AgentRuntimeSection,
   },
   {
     id: "heartbeat",

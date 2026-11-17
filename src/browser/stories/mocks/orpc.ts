@@ -232,9 +232,9 @@ export interface MockORPCClientOptions {
   heartbeatDefaultIntervalMs?: number;
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
-  /** Agent resource limits and their status (Settings → Agents); off when omitted. */
+  /** Agent resource limits and their status (Settings → Agent Runtime); off when omitted. */
   agentResourceLimits?: AgentResourceLimitsState;
-  /** Agent sandbox setting and support (Settings → Agents); off and supported when omitted. */
+  /** Agent sandbox setting and support (Settings → Agent Runtime); off and supported if omitted. */
   agentSandbox?: AgentSandboxState;
   /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
   autoModelRouting?: AutoModelRoutingConfig;

@@ -1,11 +1,13 @@
 import { lightweightMeta } from "@/browser/stories/meta.js";
-import type { ComponentType } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { AgentSandboxSettings } from "./AgentSandboxSettings.js";
 import { TasksSection } from "./TasksSection.js";
-import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
+import {
+  PhoneWidthDecorator,
+  SettingsSectionStory,
+  setupSettingsStory,
+} from "./settingsStoryUtils.js";
 
 const meta: Meta = {
   ...lightweightMeta,
@@ -28,13 +30,6 @@ export const Tasks: Story = {
       setup={() =>
         setupSettingsStory({
           taskSettings: { maxParallelAgentTasks: 2, maxTaskNestingDepth: 4 },
-          agentResourceLimits: {
-            enabled: true,
-            limits: { cpuCores: 8, memoryGiB: 16 },
-            projects: {},
-            status: { state: "active", cgroup: "/xum/xum-agents" },
-            support: { state: "ready", cgroup: "/xum" },
-          },
           // Reuse this story because the Pixel snapshot budget has no headroom.
           experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           agentAiDefaults: {
@@ -66,17 +61,15 @@ export const Tasks: Story = {
       await expect(findAutoModelTriggers(canvasElement)).toHaveLength(2);
     });
 
-    await canvas.findByText(/Active: agents share 8 CPU cores and 16 GiB of memory/i);
-    await waitFor(async () => {
-      await expect(canvas.getByLabelText("CPU limit")).toHaveValue(8);
-      await expect(canvas.getByLabelText("Memory limit")).toHaveValue(16);
-    });
+    // The runtime cards live in Settings > Agent Runtime.
+    await expect(canvas.queryByRole("heading", { name: /Resource limits/i })).toBeNull();
+    await expect(canvas.queryByRole("heading", { name: /Agent sandbox/i })).toBeNull();
 
     await waitFor(() => {
-      // Task settings first, then the CPU and memory limits.
+      // Only the two task limits are number inputs.
       const inputs = canvas.queryAllByRole("spinbutton");
-      if (inputs.length !== 4) {
-        throw new Error(`Expected 4 number inputs, got ${inputs.length}`);
+      if (inputs.length !== 2) {
+        throw new Error(`Expected 2 number inputs, got ${inputs.length}`);
       }
       const maxParallelAgentTasks = (inputs[0] as HTMLInputElement).value;
       const maxTaskNestingDepth = (inputs[1] as HTMLInputElement).value;
@@ -94,20 +87,6 @@ export const Tasks: Story = {
     });
   },
 };
-
-// The test runner ignores viewport globals, so the decorator enforces Pixel's 390px phone width.
-const PHONE_VIEWPORT_WIDTH = 390;
-
-function PhoneWidthDecorator(Story: ComponentType) {
-  return (
-    <div
-      data-phone-frame
-      style={{ width: `min(100vw, ${PHONE_VIEWPORT_WIDTH}px)`, overflow: "hidden" }}
-    >
-      <Story />
-    </div>
-  );
-}
 
 // The snapshot budget has no headroom, so play assertions enforce the narrow layout.
 export const TasksPhone: Story = {
@@ -131,47 +110,5 @@ export const TasksPhone: Story = {
         await expect(reset.getBoundingClientRect().right).toBeLessThanOrEqual(frameRight + 1);
       }
     });
-  },
-};
-
-/** The agent sandbox section at phone width, with a project override and an edited host list. */
-export const AgentSandboxPhone: Story = {
-  render: () => (
-    <SettingsSectionStory
-      setup={() =>
-        setupSettingsStory({
-          agentSandbox: {
-            global: { enabled: true, network: "allowlist", allowedHosts: ["registry.npmjs.org"] },
-            projects: { "/home/user/projects/my-app": { enabled: false } },
-            support: { state: "supported" },
-          },
-        })
-      }
-    >
-      <AgentSandboxSettings />
-    </SettingsSectionStory>
-  ),
-  globals: { viewport: { value: "mobile1", isRotated: false } },
-  parameters: { pixel: { exclude: true } },
-  decorators: [PhoneWidthDecorator],
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const off = await canvas.findByRole("button", { name: "Off" });
-    await waitFor(() => expect(off).toHaveAttribute("aria-pressed", "true"));
-    await userEvent.click(canvas.getByRole("button", { name: "Global" }));
-    await waitFor(() =>
-      expect(canvas.getByRole("button", { name: "Global" })).toHaveAttribute("aria-pressed", "true")
-    );
-
-    await userEvent.click(canvas.getByRole("button", { name: "Edit hosts" }));
-    await canvas.findByLabelText("Allowed hosts, one per line");
-
-    const frame = canvasElement.querySelector("[data-phone-frame]");
-    if (!(frame instanceof HTMLElement)) throw new Error("Phone frame did not render");
-    const frameRight = frame.getBoundingClientRect().right;
-    for (const name of ["Off", "Use defaults", "Save hosts"]) {
-      const button = canvas.getByRole("button", { name });
-      await expect(button.getBoundingClientRect().right).toBeLessThanOrEqual(frameRight + 1);
-    }
   },
 };

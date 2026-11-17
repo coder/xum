@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ComponentType, ReactNode } from "react";
 import { useRef } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
@@ -46,6 +46,20 @@ function getStorybookRenderKey(): string | null {
   const storyId = params.get("id") ?? params.get("path");
   const viewportBucket = window.innerWidth <= 768 ? "narrow" : "wide";
   return storyId ? `${storyId}:${viewportBucket}` : viewportBucket;
+}
+
+// The test runner ignores viewport globals, so the decorator enforces Pixel's 390px phone width.
+const PHONE_VIEWPORT_WIDTH = 390;
+
+export function PhoneWidthDecorator(Story: ComponentType) {
+  return (
+    <div
+      data-phone-frame
+      style={{ width: `min(100vw, ${PHONE_VIEWPORT_WIDTH}px)`, overflow: "hidden" }}
+    >
+      <Story />
+    </div>
+  );
 }
 
 /**
