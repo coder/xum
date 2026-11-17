@@ -68,10 +68,14 @@ struct PendingQuestion: Hashable, Sendable {
     }
     var toolCallId: String
     var questions: [Question]
+    /// Non-blocking questions returned at once and take their answer as a normal message.
+    var answerByMessage: Bool
 
     init?(tool: ToolCall) {
-        guard tool.name == "ask_user_question", tool.output == nil, tool.state == .running,
-              let qs = tool.input["questions"]?.array else { return nil }
+        guard tool.name == "ask_user_question", let qs = tool.input["questions"]?.array else { return nil }
+        let async = tool.output?["ui_only"]?["ask_user_question"]?["answerDelivery"]?.string == "message"
+        guard async || (tool.output == nil && tool.state == .running) else { return nil }
+        answerByMessage = async
         toolCallId = tool.id
         questions = qs.compactMap { q in
             guard let text = q["question"]?.string else { return nil }
@@ -121,9 +125,16 @@ final class ChatStore {
         return []
     }
 
+    /// Tool call IDs answered by a later user message (`muxMetadata.askUserQuestionAnswer`).
+    private(set) var answeredQuestionIds: Set<String> = []
+
     var pendingQuestion: PendingQuestion? {
         for m in messages.reversed() {
-            for t in m.tools.reversed() { if let q = PendingQuestion(tool: t) { return q } }
+            // A user message after the question means the turn moved on.
+            if m.role == .user { return nil }
+            for t in m.tools.reversed() {
+                if let q = PendingQuestion(tool: t), !answeredQuestionIds.contains(q.toolCallId) { return q }
+            }
         }
         return nil
     }
@@ -169,6 +180,7 @@ final class ChatStore {
 
     private func resetForReplay() {
         messages = []
+        answeredQuestionIds = []
         caughtUp = false
         streamingMessageId = nil
     }
@@ -282,6 +294,9 @@ final class ChatStore {
         // marks them visible, matching the web UI.
         if roleS == "user", meta?["synthetic"]?.bool == true, meta?["uiVisible"]?.bool != true { return }
         if roleS == "user", let t = ev["parts"]?[0]?["text"]?.string, t.hasPrefix("<notification>") { return }
+        if let a = meta?["muxMetadata"]?["askUserQuestionAnswer"] {
+            for e in a.array ?? [a] { if let id = e["toolCallId"]?.string { answeredQuestionIds.insert(id) } }
+        }
         let role = ChatRole(rawValue: roleS) ?? .system
         guard role != .system else { return }
         var m = ChatMessage(id: id, role: role, parts: Self.parseParts(ev["parts"]?.array ?? [], messageId: id),
@@ -358,6 +373,19 @@ final class ChatStore {
 
     func interrupt() async throws {
         try await client.call("workspace/interruptStream", ["workspaceId": .string(workspaceId)])
+    }
+
+    func answer(_ q: PendingQuestion, answers: [String: String]) async throws {
+        guard q.answerByMessage else { return try await answer(toolCallId: q.toolCallId, answers: answers) }
+        let text = q.questions.map { "\($0.header.isEmpty ? $0.question : $0.header): \(answers[$0.question] ?? "Skipped")" }.joined(separator: "\n")
+        let model = lastModel ?? "anthropic:claude-opus-5-5"
+        let agent = messages.last(where: { $0.role == .assistant })?.agentId ?? "exec"
+        answeredQuestionIds.insert(q.toolCallId)
+        try await client.call("workspace/sendMessage", [
+            "workspaceId": .string(workspaceId), "message": .string(text),
+            "options": ["model": .string(model), "agentId": .string(agent), "sendId": .string("ios-" + UUID().uuidString),
+                        "muxMetadata": ["type": "normal", "askUserQuestionAnswer": ["toolCallId": .string(q.toolCallId), "answers": .object(answers.mapValues { .string($0) })]]],
+        ])
     }
 
     func answer(toolCallId: String, answers: [String: String]) async throws {
