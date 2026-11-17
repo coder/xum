@@ -83,10 +83,8 @@ struct ServerMenuButton: View {
                     .font(.system(size: 11, weight: .semibold))
             }
             .foregroundStyle(Color.xText)
-            .padding(.leading, 16)
-            .padding(.trailing, 12)
-            .frame(height: 44)
-            .glassCapsule()
+            .padding(.horizontal, 6)
+
         }
     }
 

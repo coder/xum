@@ -11,6 +11,15 @@ struct WorkspacesView: View {
             if let list = model.list {
                 if list.loaded {
                     if list.sections.isEmpty { emptyView } else { listView(list) }
+                } else if let err = list.error {
+                    ContentUnavailableView {
+                        Label("Can't reach \(model.servers.current?.name ?? "server")", systemImage: "wifi.exclamationmark")
+                    } description: {
+                        Text(err)
+                    } actions: {
+                        Button("Try Again") { Task { await list.refresh() } }.buttonStyle(.glass)
+                        Button("Switch Server") { model.sheet = .servers }
+                    }
                 } else {
                     ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -22,12 +31,12 @@ struct WorkspacesView: View {
         .navigationTitle("Workspaces")
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { ServerMenuButton() }
-            ToolbarItem(placement: .topBarTrailing) { trailingCapsule }
+            ToolbarItemGroup(placement: .topBarTrailing) { trailingCapsule.foregroundStyle(Color.xText) }
         }
     }
 
     private var trailingCapsule: some View {
-        HStack(spacing: 0) {
+        Group {
             Menu {
                 ForEach(WorkspaceFilter.allCases, id: \.self) { f in
                     Button {
@@ -38,20 +47,15 @@ struct WorkspacesView: View {
                 }
             } label: {
                 Image(systemName: "line.3.horizontal.decrease")
-                    .frame(width: 42, height: 44)
-                    .contentShape(Rectangle())
             }
             .accessibilityLabel("Filter workspaces")
             Button {
                 model.sheet = .newChat(projectPath: nil)
             } label: {
-                Image(systemName: "square.and.pencil")
-                    .frame(width: 42, height: 44)
-                    .contentShape(Rectangle())
+                Image(systemName: "plus")
             }
             .accessibilityLabel("New chat")
         }
-        .glassCapsule()
     }
 
     private var emptyView: some View {
@@ -76,7 +80,8 @@ struct WorkspacesView: View {
                             attention: list.attention[w.id],
                             isFirst: i == 0,
                             isLast: i == section.items.count - 1,
-                            selected: model.selectedWorkspaceId == w.id
+                            selected: model.selectedWorkspaceId == w.id,
+                            diff: list.diffStats[w.id]
                         )
                         row
                             .onTapGesture { model.open(w.id) }
@@ -90,12 +95,11 @@ struct WorkspacesView: View {
                     }
                 } header: {
                     SectionCaption(text: "\(section.title) · \(section.items.count)")
-                        .padding(.leading, 20)
                         .textCase(nil)
                 }
             }
         }
-        .listStyle(.plain)
+        .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
         .refreshable { await list.refresh() }
     }
@@ -154,22 +158,25 @@ struct StatusIcon: View {
     let streaming: Bool
     let attention: Attention?
     let todosDone: Bool
+    var scratch = false
 
     var body: some View {
         Group {
             if streaming {
-                Image(systemName: "circle.dotted")
+                Image(systemName: "arrow.triangle.2.circlepath")
                     .foregroundStyle(Color.xAccent)
-                    .symbolEffect(.variableColor.iterative, options: .repeating)
+                    .symbolEffect(.rotate, options: .repeating)
             } else if let attention {
                 switch attention {
                 case .question, .planReady:
-                    Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Color.xWarn)
+                    Image(systemName: "exclamationmark.circle").foregroundStyle(Color.xWarn)
                 case .error:
-                    Image(systemName: "xmark.octagon.fill").foregroundStyle(Color.xBad)
+                    Image(systemName: "xmark.circle").foregroundStyle(Color.xBad)
                 }
             } else if todosDone {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.xOk)
+                Image(systemName: "checkmark").foregroundStyle(Color.xOk)
+            } else if scratch {
+                Image(systemName: "bubble.left").foregroundStyle(Color.xText2)
             } else {
                 Image(systemName: "circle").foregroundStyle(Color.xText3)
             }
@@ -188,6 +195,7 @@ struct WorkspaceRow: View {
     let isFirst: Bool
     let isLast: Bool
     let selected: Bool
+    var diff: (added: Int, removed: Int)?
 
     private var waiting: Bool { attention?.isWaiting ?? false }
 
@@ -197,12 +205,13 @@ struct WorkspaceRow: View {
                 StatusIcon(
                     streaming: activity?.streaming == true,
                     attention: attention,
-                    todosDone: activity?.hasTodos == true && activity?.todoStatus != nil && activity?.streaming != true
+                    todosDone: ["✅", "✓", "✔️"].contains(activity?.statusLine?.emoji ?? ""),
+                    scratch: workspace.isScratch
                 )
                 VStack(alignment: .leading, spacing: 2) {
                     Text(workspace.displayName)
-                        .font(.xMono(15, weight: waiting ? .semibold : .medium))
-                        .foregroundStyle(waiting ? Color.xWarn : Color.xText)
+                        .font(workspace.isScratch ? .system(size: 16) : .xMono(15, weight: waiting ? .bold : .medium))
+                        .foregroundStyle(Color.xText)
                         .lineLimit(1)
                     statusLine
                 }
@@ -211,23 +220,22 @@ struct WorkspaceRow: View {
                     Text(RelativeTime.short(activity?.recency ?? workspace.createdAt))
                         .font(.system(size: 13))
                         .foregroundStyle(Color.xText3)
-                    if waiting { StatusDot(color: .xAccent) }
+                    if waiting {
+                        StatusDot(color: .xAccent)
+                    } else if let diff, diff.added + diff.removed > 0 {
+                        HStack(spacing: 4) {
+                            Text("+\(diff.added)").foregroundStyle(Color.xOk)
+                            Text("−\(diff.removed)").foregroundStyle(Color.xBad)
+                        }
+                        .font(.xMono(12, weight: .medium))
+                    }
                 }
             }
             .padding(.horizontal, 16)
             .frame(minHeight: workspace.isScratch ? 60 : 70)
-            if !isLast {
-                Rectangle().fill(Color.xSep).frame(height: 0.5).padding(.leading, 48)
-            }
         }
         .listRowInsets(EdgeInsets())
-        .listRowSeparator(.hidden)
-        .listRowBackground(
-            ZStack {
-                shape.fill(Color.xCell)
-                if selected { shape.fill(Color.xAccentSoft) }
-            }
-        )
+        .listRowBackground(ZStack { Color.xCell; if selected { Color.xAccentSoft } })
     }
 
     private var shape: some Shape {

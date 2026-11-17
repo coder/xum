@@ -8,6 +8,8 @@ final class WorkspaceListStore {
     private(set) var workspaces: [Workspace] = []
     private(set) var activity: [String: WorkspaceActivity] = [:]
     private(set) var attention: [String: Attention] = [:]
+    /// `+N −N` against the trunk, computed client side like the web GitStatusStore.
+    private(set) var diffStats: [String: (added: Int, removed: Int)] = [:]
     private(set) var loaded = false
     var error: String?
 
@@ -65,7 +67,10 @@ final class WorkspaceListStore {
             activity = act
             loaded = true
             error = nil
-            await scanAttention()
+            await withTaskGroup(of: Void.self) { g in
+                g.addTask { await self.scanAttention() }
+                g.addTask { await self.refreshDiffStats() }
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -132,6 +137,22 @@ final class WorkspaceListStore {
             attention[id] = .error(e)
         } else {
             attention[id] = nil
+        }
+    }
+
+    func refreshDiffStats() async {
+        let script = #"b=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo HEAD); { git diff --numstat "$b"; git ls-files --others --exclude-standard -z | xargs -0 -I{} sh -c 'printf "%s\t0\t{}\n" $(wc -l < "{}")'; } | awk '{a+=$1;d+=$2} END {print a+0, d+0}'"#
+        await withTaskGroup(of: (String, (Int, Int)?).self) { g in
+            for w in workspaces where !w.isScratch {
+                g.addTask {
+                    let r = try? await self.client.call("workspace/executeBash", ["workspaceId": .string(w.id), "script": .string(script), "options": ["timeout_secs": 10]])
+                    var out = ""
+                    if let o = r?["data"]?["output"]?.string { out = o } else if let o = r?["output"]?.string { out = o }
+                    let n = out.split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
+                    return (w.id, n.count == 2 ? (n[0], n[1]) : nil)
+                }
+            }
+            for await (id, v) in g { diffStats[id] = v.map { (added: $0.0, removed: $0.1) } }
         }
     }
 

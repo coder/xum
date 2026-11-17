@@ -2,7 +2,7 @@ import Foundation
 
 /// Lenient JSON tree for server payloads: tool args/results and chat events are untyped, and the
 /// server adds fields and event types over time, so decoding must never fail on shape.
-enum JSONValue: Codable, Hashable, Sendable {
+nonisolated enum JSONValue: Codable, Hashable, Sendable {
     case null
     case bool(Bool)
     case number(Double)
@@ -58,7 +58,7 @@ enum JSONValue: Codable, Hashable, Sendable {
     }
 }
 
-extension JSONValue: ExpressibleByStringLiteral, ExpressibleByDictionaryLiteral, ExpressibleByBooleanLiteral, ExpressibleByArrayLiteral, ExpressibleByIntegerLiteral {
+nonisolated extension JSONValue: ExpressibleByStringLiteral, ExpressibleByDictionaryLiteral, ExpressibleByBooleanLiteral, ExpressibleByArrayLiteral, ExpressibleByIntegerLiteral {
     init(stringLiteral value: String) { self = .string(value) }
     init(dictionaryLiteral elements: (String, JSONValue)...) { self = .object(Dictionary(elements, uniquingKeysWith: { $1 })) }
     init(booleanLiteral value: Bool) { self = .bool(value) }
