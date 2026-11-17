@@ -167,8 +167,8 @@ The built-in `openai` provider supports two wire formats:
 | `responses`       | Uses the OpenAI Responses API. This is the default and supports current OpenAI and Codex features.                                           |
 | `chatCompletions` | Uses `/v1/chat/completions`. Use this for OpenAI-API-shaped gateways that do not expose `/v1/responses`, such as Azure Government endpoints. |
 
-OpenAI documents that GPT-6 Astra only supports tool calling through the Responses API, so keep
-`responses` when using that model.
+OpenAI documents that GPT-6 Astra and the GPT-6.2 models only support tool calling through the
+Responses API, so keep `responses` when using them.
 
 Set the format in **Settings → Providers → OpenAI → Wire format**, or in
 `~/.xum/providers.jsonc`:
@@ -200,8 +200,10 @@ Palette. Cyber and Pro are mutually exclusive.
 
 Cyber appears only for models with a documented Daybreak value. GPT-6.1 Sol and GPT-6 Astra send
 `daybreak_blue`. OpenAI requires Daybreak Red approval for reduced refusals on these models, but
-they still take `daybreak_blue`. Cyber works only with the built-in OpenAI provider's API key on
-the `responses` wire format. A custom base URL on the built-in provider also receives the field.
+they still take `daybreak_blue`. OpenAI's guide lists no value for GPT-6.2 Sol or Astra, so Cyber
+does not appear for them or for the `gpt`, `sol`, and `astra` aliases; to use Cyber, pick
+`openai:gpt-6.1-sol` or `openai:gpt-6-astra`. Cyber works only with the built-in OpenAI
+provider's API key on the `responses` wire format. A custom base URL on the built-in provider also receives the field.
 Gateways, custom providers, Codex OAuth, and Chat Completions use standard safeguards.
 
 If OpenAI rejects the program, Xum shows OpenAI's message and does not retry:

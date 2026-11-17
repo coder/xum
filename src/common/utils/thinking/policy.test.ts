@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
 import {
   getThinkingPolicyForModel,
@@ -108,9 +109,18 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("low");
   });
 
-  test("gpt-6.1-sol follows Astra: 5 levels (no off), off and unset clamp to low", () => {
+  // GPT-6.2 model pages: "The API rejects requests that set reasoning effort to `none`."
+  test("gpt-6.1-sol, GPT-6.2 and their aliases follow Astra: 5 levels (no off), off and unset clamp to low", () => {
     const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
-    for (const id of ["openai:gpt-6.1-sol", "coder:openai/gpt-6.1-sol"]) {
+    for (const id of [
+      "openai:gpt-6.1-sol",
+      "coder:openai/gpt-6.1-sol",
+      "openai:gpt-6.2-sol",
+      "openai:gpt-6.2-astra",
+      "openrouter:openai/gpt-6.2-sol-2026-11-17",
+      KNOWN_MODELS.GPT.id,
+      KNOWN_MODELS.GPT_6_ASTRA.id,
+    ]) {
       expect(getThinkingPolicyForModel(id)).toEqual(fiveLevels);
       expect(enforceThinkingPolicy(id, "off")).toBe("low");
       expect(resolveEffectiveThinkingLevel(id, undefined)).toBe("low");

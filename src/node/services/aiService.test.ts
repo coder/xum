@@ -2715,7 +2715,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   it("preserves the chat speed across unsupported attempts and later live changes", async () => {
     using xumHome = new DisposableTempDir("ai-service-chat-speed-fallback");
     const sourceModel = KNOWN_MODELS.SONNET.id;
-    const fallbackModel = KNOWN_MODELS.GPT.id;
+    // Luna, because the live change below picks Flex, which GPT-6.2 does not offer.
+    const fallbackModel = KNOWN_MODELS.GPT_6_LUNA.id;
     await writeMainConfig(xumHome.path, {
       modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
     });
