@@ -9,6 +9,8 @@ enum AgentOption {
         ("explore", "Explore", .xExploreDot),
     ]
 
+    static let selectable: Set<String> = ["exec", "plan"]
+
     static func label(_ id: String) -> String { all.first { $0.id == id }?.label ?? id.capitalized }
     static func color(_ id: String) -> Color { all.first { $0.id == id }?.color ?? .xAccent }
 }
@@ -40,7 +42,11 @@ struct PickersPopover: View {
                 .padding(.init(top: 12, leading: 18, bottom: 8, trailing: 18))
             HStack(spacing: 6) {
                 ForEach(AgentOption.all, id: \.id) { a in
+                    // The server has no user-selectable Ask or Explore agent yet (docs/07), so
+                    // those pills show the design but stay disabled.
                     agentPill(a)
+                        .disabled(!AgentOption.selectable.contains(a.id))
+                        .opacity(AgentOption.selectable.contains(a.id) ? 1 : 0.45)
                 }
             }
             .padding(.horizontal, 12)
