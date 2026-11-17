@@ -35,6 +35,8 @@ final class AppModel {
     /// Regular layout sidebar visibility; the tool inspector hides the sidebar so the chat keeps
     /// its column (docs/04 §2, screen 01).
     var splitColumns: NavigationSplitViewVisibility = .all
+    /// Regular layout: the Settings page shown in the detail column while the Settings tab is open.
+    var settingsPage: SettingsPage? = .serverAccess
     /// Regular layout never shows an empty detail once the list loads: it falls back to the top row.
     var shownWorkspaceId: String? { selectedWorkspaceId ?? list?.sections.first?.items.first?.id }
 

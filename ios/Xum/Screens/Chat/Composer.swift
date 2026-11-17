@@ -27,8 +27,9 @@ struct Composer: View {
                 .padding(.horizontal, 8)
                 .focused($focused)
             HStack(spacing: 6) {
+                // Clipped, not clip-disabled: on narrow widths (Duo cover) the chips scroll under
+                // their own edge instead of drawing over the attach button.
                 ScrollView(.horizontal, showsIndicators: false) { chips }
-                    .scrollClipDisabled()
                     .layoutPriority(-1)
                 Spacer(minLength: 0)
                 attachButton

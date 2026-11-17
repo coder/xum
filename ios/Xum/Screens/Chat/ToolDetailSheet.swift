@@ -6,8 +6,11 @@ struct ToolDetailSheet: View {
     let tool: ToolCall
     /// Dismiss + prefill the composer ("Ask about these lines").
     var onAsk: (String) -> Void = { _ in }
+    /// Set when shown as the side panel, where there is no presentation to dismiss.
+    var onClose: (() -> Void)?
 
-    @Environment(\.dismiss) private var dismiss
+    @Environment(\.dismiss) private var dismissPresentation
+    private func dismiss() { if let onClose { onClose() } else { dismissPresentation() } }
     @State private var tab: Tab = .diff
 
     private enum Tab: String, CaseIterable {

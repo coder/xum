@@ -160,36 +160,131 @@ struct SecretsDetail: View {
 
 struct ServerAccessDetail: View {
     @Environment(AppModel.self) private var model
-    @State private var sessions: [(id: String, label: String)] = []
+    @State private var sessions: [ServerSession] = []
+    @State private var listen: String?
+    @State private var lan: Bool?
     @State private var failed = false
+
+    struct ServerSession: Identifiable {
+        let id: String
+        let label: String
+        let lastUsed: Date
+        let isCurrent: Bool
+    }
+
+    private var serverName: String { model.servers.current?.name ?? "the server" }
 
     var body: some View {
         List {
-            if failed {
-                Text("Could not load sessions.").font(.system(size: 14)).foregroundStyle(Color.xText2)
+            Section {
+            } footer: {
+                Text("Phones and browsers you pair can steer agents on \(serverName). Revoke one to sign it out.")
+                    .font(.system(size: 15))
+                    .foregroundStyle(Color.xText2)
+                    .textCase(nil)
             }
-            ForEach(sessions, id: \.id) { session in
-                Text(session.label).font(.system(size: 16)).foregroundStyle(Color.xText).padding(.vertical, 4)
-            }
-        }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .background(Color.xBg.ignoresSafeArea())
-        .navigationTitle("Server Access")
-        .navigationBarTitleDisplayMode(.inline)
-        .task {
-            guard let client = model.servers.currentClient, sessions.isEmpty else { return }
-            do {
-                let res = try await client.call("serverAuth/listSessions")
-                let raw = res.array ?? res["sessions"]?.array ?? []
-                sessions = raw.enumerated().compactMap { i, item in
-                    let fallback = "Session \(i + 1)"
-                    let label = item["userAgent"]?.string ?? item["client"]?.string
-                        ?? item["label"]?.string ?? item["ip"]?.string ?? fallback
-                    let id = item["id"]?.string ?? String(i)
-                    return (id, label)
+            Section {
+                thisDeviceRow
+                ForEach(sessions.filter { !$0.isCurrent }) { session in
+                    sessionRow(session)
                 }
-            } catch { failed = true }
+                if failed {
+                    Text("Could not load sessions.").font(.system(size: 14)).foregroundStyle(Color.xText2)
+                        .listRowBackground(Color.xCell)
+                }
+            } header: {
+                SectionCaption(text: "Sessions · \(sessions.filter { !$0.isCurrent }.count + 1)").textCase(nil)
+            }
+            Section {
+                LabeledContent("Listen on") {
+                    Text(listen ?? "…").font(.xMono(14)).foregroundStyle(Color.xText2)
+                }
+                .listRowBackground(Color.xCell)
+                LabeledContent("Allow LAN connections") {
+                    Text(lan.map { $0 ? "On" : "Off" } ?? "…").foregroundStyle(Color.xText2)
+                }
+                .listRowBackground(Color.xCell)
+            } header: {
+                SectionCaption(text: "Network").textCase(nil)
+            } footer: {
+                Text("Change the bind address in Xum on the computer.").font(.system(size: 13)).foregroundStyle(Color.xText3)
+            }
         }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(Color.xBg2.ignoresSafeArea())
+        .navigationTitle("Server Access")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                // Per-device pairing codes are not on the server yet (design docs/07): the button
+                // stays visible but disabled until that endpoint exists.
+                Button {} label: { Label("Pair Device", systemImage: "qrcode") }
+                    .disabled(true)
+            }
+        }
+        .task { await load() }
+    }
+
+    private var thisDeviceRow: some View {
+        HStack(spacing: 12) {
+            SettingsTileIcon(color: SettingsTile.slate, systemImage: "iphone")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(UIDevice.current.name).font(.system(size: 16)).foregroundStyle(Color.xText)
+                Text("This device · access token").font(.system(size: 13)).foregroundStyle(Color.xText2)
+            }
+            Spacer(minLength: 8)
+            StatusDot(color: .xOk)
+            Text("Now").font(.system(size: 14)).foregroundStyle(Color.xText2)
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(Color.xCell)
+    }
+
+    private func sessionRow(_ session: ServerSession) -> some View {
+        HStack(spacing: 12) {
+            SettingsTileIcon(color: SettingsTile.blue, systemImage: "globe")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(session.label).font(.system(size: 16)).foregroundStyle(Color.xText).lineLimit(1)
+                Text("last used \(RelativeTime.short(session.lastUsed))").font(.xMono(12)).foregroundStyle(Color.xText2)
+            }
+            Spacer(minLength: 8)
+            Button("Revoke") { Task { await revoke(session) } }
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.xBad)
+                .buttonStyle(.glass)
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(Color.xCell)
+    }
+
+    private func load() async {
+        guard let client = model.servers.currentClient else { return }
+        if let res = try? await client.call("serverAuth/listSessions") {
+            sessions = (res.array ?? []).compactMap { item in
+                guard let id = item["id"]?.string else { return nil }
+                let ms = item["lastUsedAtMs"]?.double ?? 0
+                return ServerSession(
+                    id: id,
+                    label: item["label"]?.string ?? "Browser",
+                    lastUsed: Date(timeIntervalSince1970: ms / 1000),
+                    isCurrent: item["isCurrent"]?.bool ?? false
+                )
+            }
+        } else {
+            failed = true
+        }
+        if let status = try? await client.call("server/getApiServerStatus") {
+            let host = status["bindHost"]?.string
+            let port = status["port"]?.double.map { String(Int($0)) } ?? ""
+            let lanURL = status["networkBaseUrls"]?.array?.first?.string.flatMap(URL.init(string:))
+            listen = lanURL.map { "\($0.host() ?? ""):\(port)" } ?? host.map { "\($0):\(port)" }
+            lan = host.map { $0 != "127.0.0.1" && $0 != "localhost" && $0 != "::1" }
+        }
+    }
+
+    private func revoke(_ session: ServerSession) async {
+        guard let client = model.servers.currentClient else { return }
+        _ = try? await client.call("serverAuth/revokeSession", ["sessionId": .string(session.id)])
+        sessions.removeAll { $0.id == session.id }
     }
 }

@@ -6,6 +6,7 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @AppStorage("xum.appearance") private var appearance = Appearance.system.rawValue
     @AppStorage("xum.requireFaceID") private var requireFaceID = false
+    @Environment(\.inSidebar) private var sidebar
     @State private var stats = ServerStats()
 
     var body: some View {
@@ -20,10 +21,11 @@ struct SettingsView: View {
             }
         }
         .listStyle(.insetGrouped)
-        .listSectionSpacing(20)
+        .listSectionSpacing(sidebar ? 12 : 20)
         .scrollContentBackground(.hidden)
         .background(Color.xBg2.ignoresSafeArea())
         .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(sidebar ? .large : .automatic)
         .task(id: model.servers.currentID) { await loadStats() }
     }
 
@@ -149,7 +151,9 @@ struct SettingsView: View {
                     SettingsTileIcon(color: SettingsTile.rust, systemImage: "bell")
                     Text("Notifications").font(.system(size: 16)).foregroundStyle(Color.xText)
                     Spacer(minLength: 8)
-                    Text("Done, needs you").font(.system(size: 16)).foregroundStyle(Color.xText2)
+                    if !sidebar {
+                        Text("Done, needs you").font(.system(size: 16)).foregroundStyle(Color.xText2)
+                    }
                 }
                 .padding(paddedRow)
                 .frame(minHeight: 52)
@@ -157,7 +161,7 @@ struct SettingsView: View {
             cellRow(last: true) {
                 HStack(spacing: 12) {
                     SettingsTileIcon(color: SettingsTile.green, systemImage: "faceid")
-                    Text("Require Face ID").font(.system(size: 16)).foregroundStyle(Color.xText)
+                    Text(sidebar ? "Face ID" : "Require Face ID").font(.system(size: 16)).foregroundStyle(Color.xText)
                     Spacer(minLength: 8)
                     Toggle("Require Face ID", isOn: $requireFaceID)
                         .labelsHidden()
@@ -176,35 +180,35 @@ struct SettingsView: View {
     private var serverSettingsSection: some View {
         Section {
             cellRow(first: true) {
-                NavigationLink { AgentListDetail() } label: {
+                pageLink(.agents) {
                     detailRow(tile: SettingsTile.purple, icon: "cpu", title: "Agents", value: stats.agentCount.map(String.init))
                 }
             }
             cellRow {
-                NavigationLink { ProviderListDetail() } label: {
+                pageLink(.providers) {
                     detailRow(tile: SettingsTile.blue, icon: "key", title: "Providers",
                               value: stats.configuredProviders.map(String.init))
                 }
             }
             cellRow {
-                NavigationLink { ModelListDetail() } label: {
+                pageLink(.models) {
                     detailRow(tile: SettingsTile.teal, icon: "square.stack.3d.up", title: "Models",
                               value: ModelName.display(model.defaultModel))
                 }
             }
             cellRow {
-                NavigationLink { MCPListDetail() } label: {
+                pageLink(.mcp) {
                     detailRow(tile: SettingsTile.violet, icon: "powerplug", title: "MCP Servers",
                               value: stats.mcpCount.map(String.init))
                 }
             }
             cellRow {
-                NavigationLink { SecretsDetail() } label: {
+                pageLink(.secrets) {
                     detailRow(tile: SettingsTile.rust, icon: "lock.fill", title: "Secrets", value: nil)
                 }
             }
             cellRow(last: true) {
-                NavigationLink { ServerAccessDetail() } label: {
+                pageLink(.serverAccess) {
                     detailRow(tile: SettingsTile.green, icon: "checkmark.shield", title: "Server Access",
                               value: stats.sessionCount.map { "\($0) sessions" })
                 }
@@ -214,13 +218,25 @@ struct SettingsView: View {
         }
     }
 
+    /// iPhone pushes the page; in the Duo sidebar the page opens in the detail column instead.
+    @ViewBuilder
+    private func pageLink<L: View>(_ page: SettingsPage, @ViewBuilder label: () -> L) -> some View {
+        if sidebar {
+            Button { model.settingsPage = page } label: { label() }
+                .buttonStyle(.plain)
+                .listRowBackground(model.settingsPage == page ? Color.xAccentSoft : Color.xCell)
+        } else {
+            NavigationLink { page.view } label: { label() }
+        }
+    }
+
     private func detailRow(tile: Color, icon: String, title: String, value: String?) -> some View {
         HStack(spacing: 12) {
             SettingsTileIcon(color: tile, systemImage: icon)
-            Text(title).font(.system(size: 16)).foregroundStyle(Color.xText)
+            Text(title).font(.system(size: 16)).foregroundStyle(Color.xText).lineLimit(1)
             Spacer(minLength: 8)
             if let value {
-                Text(value).font(.system(size: 16)).foregroundStyle(Color.xText2)
+                Text(value).font(.system(size: 16)).foregroundStyle(Color.xText2).lineLimit(1)
             }
         }
         .padding(paddedRow)
@@ -303,5 +319,20 @@ struct SettingsTileIcon: View {
             .foregroundStyle(.white)
             .frame(width: size, height: size)
             .background(RoundedRectangle(cornerRadius: radius, style: .continuous).fill(color))
+    }
+}
+/// Settings detail pages, shared by the iPhone push and the Duo detail column.
+enum SettingsPage: Hashable {
+    case agents, providers, models, mcp, secrets, serverAccess
+
+    @ViewBuilder var view: some View {
+        switch self {
+        case .agents: AgentListDetail()
+        case .providers: ProviderListDetail()
+        case .models: ModelListDetail()
+        case .mcp: MCPListDetail()
+        case .secrets: SecretsDetail()
+        case .serverAccess: ServerAccessDetail()
+        }
     }
 }

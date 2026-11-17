@@ -16,37 +16,58 @@ struct ChatView: View {
     @State private var seeded = false
 
     private var workspace: Workspace? { model.list?.workspace(workspaceId) }
+    private var pendingQuestion: PendingQuestion? { store?.pendingQuestion }
     private var serverName: String { model.servers.current?.name ?? "" }
 
     var body: some View {
-        Group {
-            if let store {
-                chat(store)
-            } else {
-                Color.xBg
+        HStack(spacing: 0) {
+            Group {
+                if let store {
+                    chat(store)
+                } else {
+                    Color.xBg
+                }
             }
+            .background { Color.xBg.ignoresSafeArea() }
+            if sizeClass == .regular, selectedTool != nil || pendingQuestion != nil { sidePanel }
         }
-        .background { Color.xBg.ignoresSafeArea() }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .toolbar(.hidden, for: .tabBar)
         .onAppear(perform: attach)
-        // Regular width (iPhone Duo inner display): the tool detail is a persistent inspector
+        // Regular width (iPhone Duo inner display): the tool detail is a persistent side panel
         // beside the chat instead of a modal sheet; tapping another row swaps its content.
         .sheet(item: sizeClass == .regular ? .constant(nil) : $selectedTool) { tool in
             ToolDetailSheet(tool: tool) { prefill in
                 draft = prefill
             }
         }
-        .inspector(isPresented: Binding(get: { sizeClass == .regular && selectedTool != nil }, set: { if !$0 { selectedTool = nil } })) {
+        .task(id: pendingQuestion?.toolCallId) {
+            if sizeClass == .regular, pendingQuestion != nil { withAnimation { model.splitColumns = .detailOnly } }
+        }
+    }
+
+    /// A plain column rather than `.inspector`: an open inspector turns into a sheet when the
+    /// Duo folds, and that sheet stayed on the outer display, empty, after the split view went away.
+    @ViewBuilder private var sidePanel: some View {
+        Group {
+            // A pending question takes the panel (read the plan while answering); a tapped tool
+            // row replaces it until the panel is closed.
             if let tool = selectedTool {
-                ToolDetailSheet(tool: tool) { prefill in
-                    draft = prefill
+                ToolDetailSheet(tool: tool, onAsk: { draft = $0 }, onClose: { selectedTool = nil })
+                    .id(tool.id)
+            } else if let question = pendingQuestion, let store {
+                QuestionCard(question: question, panel: true) { answers in
+                    Task { try? await store.answer(question, answers: answers) }
                 }
-                .id(tool.id)
-                .inspectorColumnWidth(min: 360, ideal: 400, max: 440)
+                .id(question.toolCallId)
+                .padding(.top, 8)
             }
         }
+        .frame(width: 410)
+        .frame(maxHeight: .infinity)
+        .background { Color.xBg2.ignoresSafeArea() }
+        .transition(.move(edge: .trailing))
     }
 
     // MARK: - Setup
@@ -230,7 +251,7 @@ struct ChatView: View {
                 TodoPill(todos: store.todos, isStreaming: store.isStreaming)
                     .padding(.horizontal, 12)
             }
-            if let question = store.pendingQuestion {
+            if let question = store.pendingQuestion, sizeClass != .regular {
                 QuestionCard(question: question) { answers in
                     Task { try? await store.answer(question, answers: answers) }
                 }

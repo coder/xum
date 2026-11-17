@@ -60,6 +60,11 @@ struct CompactRootView: View {
             }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
+        // Folding keeps the open workspace (docs/04 §1): the split view tracks it in
+        // selectedWorkspaceId, and tearing down the old stack may have emptied the path.
+        .onAppear {
+            if model.path.isEmpty, let id = model.selectedWorkspaceId { model.path = [id] }
+        }
     }
 }
 
@@ -103,7 +108,9 @@ struct RegularRootView: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let id = model.shownWorkspaceId {
+        if model.tab == .settings, let page = model.settingsPage {
+            NavigationStack { page.view }.id(page)
+        } else if let id = model.shownWorkspaceId {
             ChatView(workspaceId: id).id(id)
         } else {
             ContentUnavailableView("Pick a workspace", systemImage: "folder", description: Text("Its chat opens here."))

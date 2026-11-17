@@ -134,6 +134,9 @@ struct PlanCard: View {
 /// question ("" for skipped) and submits them all at the end.
 struct QuestionCard: View {
     let question: PendingQuestion
+    /// Full-height side panel on the Duo inner display (docs/04 screen 02): larger question, a
+    /// preview of the next one, Skip / Next pinned to the bottom.
+    var panel = false
     var onSubmit: ([String: String]) -> Void = { _ in }
 
     @State private var index = 0
@@ -158,9 +161,10 @@ struct QuestionCard: View {
                     .foregroundStyle(Color.xText3)
             }
             Text(q.question)
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: panel ? 22 : 17, weight: .semibold))
                 .foregroundStyle(Color.xText)
-                .padding(.top, 8)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, panel ? 12 : 8)
             VStack(spacing: 8) {
                 ForEach(q.options.indices, id: \.self) { i in
                     optionRow(i)
@@ -168,6 +172,19 @@ struct QuestionCard: View {
                 customRow
             }
             .padding(.top, 12)
+            if panel {
+                if !isLast {
+                    Divider().padding(.top, 16)
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text("NEXT").font(.xCaption).kerning(0.4).foregroundStyle(Color.xText3)
+                        Text(question.questions[index + 1].question)
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color.xText2)
+                    }
+                    .padding(.top, 14)
+                }
+                Spacer(minLength: 16)
+            }
             HStack(spacing: 10) {
                 Button(action: skip) {
                     Text("Skip")
@@ -190,7 +207,14 @@ struct QuestionCard: View {
             .padding(.top, 14)
         }
         .padding(.init(top: 18, leading: 16, bottom: 14, trailing: 16))
-        .glassRect(28)
+        .modifier(QuestionChrome(panel: panel))
+    }
+
+    private struct QuestionChrome: ViewModifier {
+        let panel: Bool
+        func body(content: Content) -> some View {
+            if panel { content.frame(maxHeight: .infinity, alignment: .top) } else { content.glassRect(28) }
+        }
     }
 
     private func defaultSelection(_ i: Int) -> Int {
