@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
   ArchiveRestore,
   Blocks,
@@ -616,6 +617,8 @@ export const SETTING_DEFINITIONS = {
     description: "Credential for the Auto model and thinking routing evaluation.",
     keywords: ["typesafe", "auto routing"],
     experiment: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+    // The API-key editor mounts only while the TypeSafe card is expanded.
+    expandProvider: TYPESAFE_PROVIDER_KEY,
   },
   "anthropic-cache-ttl": providerField(
     "anthropic",

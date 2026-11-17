@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getSettingsSections } from "./SettingsPage";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
   SETTING_DEFINITIONS,
   SETTINGS_SECTION_META,
@@ -166,6 +167,13 @@ describe("searchSettings", () => {
     const result = search("service tier").find((r) => r.entry.id === "setting:openai-service-tier");
     expect(result?.entry.expandProvider).toBe("openai");
     expect(result?.entry.anchorId).toBe("provider:openai");
+  });
+
+  test("the evaluation key result expands the TypeSafe card that holds the field", () => {
+    const result = search("evaluation api key", {
+      experiments: [EXPERIMENT_IDS.AUTO_MODEL_ROUTING],
+    }).find((r) => r.entry.id === "setting:evaluation-credential");
+    expect(result?.entry.expandProvider).toBe(TYPESAFE_PROVIDER_KEY);
   });
 
   test("a sub-experiment falls back to its parent experiment's row", () => {
