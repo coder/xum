@@ -63,20 +63,84 @@ struct CompactRootView: View {
     }
 }
 
-/// iPhone Duo inner display (and any regular width): workspaces beside the chat.
+/// iPhone Duo inner display (and any regular width): the sidebar owns navigation, with the tab
+/// bar turned into a segmented capsule at its bottom (docs/04 §1); the detail stays clean.
 struct RegularRootView: View {
     @Environment(AppModel.self) private var model
+    @State private var columns: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationSplitView {
-            WorkspacesView()
-                .navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 380)
+        NavigationSplitView(columnVisibility: $columns) {
+            NavigationStack {
+                sidebarContent
+                    .safeAreaInset(edge: .bottom) { SidebarTabs().padding(.horizontal, 12).padding(.bottom, 8) }
+            }
+            .navigationSplitViewColumnWidth(min: 290, ideal: 320, max: 360)
         } detail: {
-            if let id = model.selectedWorkspaceId {
-                NavigationStack { ChatView(workspaceId: id).id(id) }
-            } else {
-                ContentUnavailableView("Pick a workspace", systemImage: "square.stack.3d.up", description: Text("Its chat opens here."))
+            NavigationStack {
+                detail
             }
         }
+        .navigationSplitViewStyle(.balanced)
+    }
+
+    @ViewBuilder private var sidebarContent: some View {
+        switch model.tab {
+        case .inbox: InboxView()
+        case .settings: SettingsView()
+        case .search: SearchView()
+        case .workspaces: WorkspacesView()
+        }
+    }
+
+    @ViewBuilder private var detail: some View {
+        if let id = model.selectedWorkspaceId {
+            ChatView(workspaceId: id).id(id)
+        } else {
+            ContentUnavailableView("Pick a workspace", systemImage: "folder", description: Text("Its chat opens here."))
+        }
+    }
+}
+
+/// Sidebar tabs (`.sbtabs`): 48 high capsule on `fill2`; the selected tab is raised with its label,
+/// the others are icon only.
+struct SidebarTabs: View {
+    @Environment(AppModel.self) private var model
+
+    private let tabs: [(AppTab, String, String)] = [
+        (.workspaces, "Workspaces", "folder"), (.inbox, "Inbox", "tray"), (.settings, "Settings", "gearshape"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(tabs, id: \.0) { tab, label, icon in
+                let selected = model.tab == tab
+                Button {
+                    model.tab = tab
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: icon)
+                        if selected { Text(label).font(.system(size: 14, weight: .semibold)) }
+                    }
+                    .foregroundStyle(selected ? Color.xAccent : Color.xText2)
+                    .frame(maxWidth: selected ? .infinity : 52, minHeight: 40)
+                    .background(selected ? Color.xRaised : .clear, in: Capsule())
+                    .overlay(alignment: .topTrailing) {
+                        if tab == .inbox, let n = model.list?.waitingCount, n > 0 {
+                            Text("\(n)").font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
+                                .frame(minWidth: 17, minHeight: 17).background(Color.xAccentFill, in: Capsule())
+                                .offset(x: -6, y: 2)
+                        }
+                    }
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(label)
+            }
+        }
+        .padding(4)
+        .frame(height: 48)
+        .background(Color.xFill2, in: Capsule())
+        .glassEffect(.regular, in: .capsule)
     }
 }

@@ -6,6 +6,7 @@ struct ChatView: View {
     let workspaceId: String
 
     @Environment(AppModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var store: ChatStore?
     @State private var draft = ""
     @State private var agent = "exec"
@@ -30,9 +31,20 @@ struct ChatView: View {
         .toolbar { toolbarContent }
         .toolbar(.hidden, for: .tabBar)
         .onAppear(perform: attach)
-        .sheet(item: $selectedTool) { tool in
+        // Regular width (iPhone Duo inner display): the tool detail is a persistent inspector
+        // beside the chat instead of a modal sheet; tapping another row swaps its content.
+        .sheet(item: sizeClass == .regular ? .constant(nil) : $selectedTool) { tool in
             ToolDetailSheet(tool: tool) { prefill in
                 draft = prefill
+            }
+        }
+        .inspector(isPresented: Binding(get: { sizeClass == .regular && selectedTool != nil }, set: { if !$0 { selectedTool = nil } })) {
+            if let tool = selectedTool {
+                ToolDetailSheet(tool: tool) { prefill in
+                    draft = prefill
+                }
+                .id(tool.id)
+                .inspectorColumnWidth(min: 360, ideal: 400, max: 440)
             }
         }
     }
