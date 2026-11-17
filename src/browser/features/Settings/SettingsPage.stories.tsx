@@ -314,5 +314,13 @@ export const SearchSettings: AppStory = {
     await userEvent.keyboard("{Escape}");
     await expect(search).toHaveValue("");
     await expect(getSettingsDialog()).toBe(dialog);
+
+    // A result inside a collapsed disclosure opens it, so the form's fields are on screen.
+    await userEvent.keyboard("add mcp server{Enter}");
+    await waitFor(() => {
+      const mark = dialog.querySelector('[data-setting-id="mcp-add-server"]');
+      if (!mark?.closest("details")?.open) throw new Error("Add server form is collapsed");
+    });
+    await expect(dialog.querySelector("#server-name")).toBeVisible();
   },
 };

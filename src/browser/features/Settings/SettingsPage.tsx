@@ -30,13 +30,17 @@ import { RemoteConnectionSection } from "./Sections/RemoteConnectionSection";
 import { KeybindsSection } from "./Sections/KeybindsSection";
 import { SecuritySection } from "./Sections/SecuritySection";
 import { BackupSection } from "./Sections/BackupSection";
-import { SettingsFocusContext, type SettingsFocusTarget } from "./Components/SettingsLayout";
+import {
+  SettingsFocusContext,
+  SettingsOpenSettingContext,
+  type SettingsFocusTarget,
+} from "./Components/SettingsLayout";
 import {
   SettingsSearchResults,
   settingsSearchResultDomId,
 } from "./Components/SettingsSearchResults";
 import { SettingsContentHeader, SettingsNav, SettingsSearchField } from "./Components/SettingsNav";
-import { SETTINGS_SECTION_META } from "./settingsRegistry";
+import { SETTINGS_SECTION_META, SETTING_DEFINITIONS, type SettingId } from "./settingsRegistry";
 import type { SettingsSearchResult } from "./settingsSearch";
 import { useSettingsSearch, type SettingsSearchState } from "./useSettingsSearch";
 import type { SettingsSection } from "./types";
@@ -128,19 +132,37 @@ function useSettingsRedirect(memoryEnabled: boolean, remoteConnectionAvailable: 
   }, [isOpen, activeSection, setActiveSection, memoryEnabled, remoteConnectionAvailable]);
 }
 
+type MobileViewChoice = { view: "list" | "section"; section: string } | null;
+
+/**
+ * Whether phones show the section list. The user's pick holds only for the section it was made
+ * on: browser Back to another entry (the sectionless one a plain open made) falls back to that
+ * entry's own default, the list for a plain open and the section for a deep link.
+ */
+export function isMobileListOpen(
+  choice: MobileViewChoice,
+  activeSection: string,
+  openedWithoutSection: boolean
+): boolean {
+  const view = choice?.section === activeSection ? choice.view : null;
+  return (view ?? (openedWithoutSection ? "list" : "section")) === "list";
+}
+
 /**
  * Phones show one column: the section list (with search) or a section with a back button.
  * Until the user picks, a plain open starts on the list and a deep link on its section.
  */
 function useMobileSettingsView() {
-  const { openedWithoutSection, registerOnClose } = useSettings();
-  const [view, setView] = useState<"list" | "section" | null>(null);
+  const { openedWithoutSection, activeSection, registerOnClose } = useSettings();
+  // The user's pick holds only for the section it was made on: browser Back to another entry
+  // (the sectionless one a plain open made) falls back to that entry's own default.
+  const [choice, setChoice] = useState<{ view: "list" | "section"; section: string } | null>(null);
   // Each open decides afresh.
-  useEffect(() => registerOnClose(() => setView(null)), [registerOnClose]);
+  useEffect(() => registerOnClose(() => setChoice(null)), [registerOnClose]);
   return {
-    listOpen: (view ?? (openedWithoutSection ? "list" : "section")) === "list",
-    showList: () => setView("list"),
-    showSection: () => setView("section"),
+    listOpen: isMobileListOpen(choice, activeSection, openedWithoutSection),
+    showList: () => setChoice({ view: "list", section: activeSection }),
+    showSection: (section: string) => setChoice({ view: "section", section }),
   };
 }
 
@@ -244,6 +266,7 @@ function SettingsContentColumn(props: {
   search: SettingsSearchState;
   results: React.ReactNode;
   focusedSetting: SettingsFocusTarget | null;
+  onOpenSetting: (id: SettingId) => void;
   onBack: (() => void) | null;
   onReturnToSetup: (() => void) | null;
   /** The list column (and its title) is off screen: the dialog still needs its name. */
@@ -274,9 +297,11 @@ function SettingsContentColumn(props: {
           {props.search.searching ? (
             props.results
           ) : (
-            <SettingsFocusContext.Provider value={props.focusedSetting}>
-              <SectionComponent />
-            </SettingsFocusContext.Provider>
+            <SettingsOpenSettingContext.Provider value={props.onOpenSetting}>
+              <SettingsFocusContext.Provider value={props.focusedSetting}>
+                <SectionComponent />
+              </SettingsFocusContext.Provider>
+            </SettingsOpenSettingContext.Provider>
           )}
         </div>
       </div>
@@ -292,19 +317,25 @@ function useSettingsActions(
   searchInputRef: React.RefObject<HTMLInputElement>
 ) {
   const { open, activeSection, setActiveSection } = useSettings();
-  const leaveSearch = () => {
+  const leaveSearch = (sectionId: string) => {
     search.setQuery("");
-    mobile.showSection();
+    mobile.showSection(sectionId);
   };
   const openSection = (sectionId: string) => {
-    leaveSearch();
+    leaveSearch(sectionId);
     setFocusedSetting(null);
     setActiveSection(sectionId);
   };
+  const openSetting = (id: SettingId) => {
+    const sectionId = SETTING_DEFINITIONS[id].section;
+    leaveSearch(sectionId);
+    setFocusedSetting({ id });
+    if (sectionId !== activeSection) setActiveSection(sectionId);
+  };
   const openResult = (result: SettingsSearchResult) => {
-    leaveSearch();
-    setFocusedSetting(focusTargetOf(result));
     const { sectionId, expandProvider } = result.entry;
+    leaveSearch(expandProvider ? "providers" : sectionId);
+    setFocusedSetting(focusTargetOf(result));
     // A provider result uses the same deep link the onboarding and model pickers use: open
     // Providers with that card expanded.
     if (expandProvider) open("providers", { expandProvider });
@@ -323,7 +354,7 @@ function useSettingsActions(
       searchInputRef.current?.select();
     });
   };
-  return { openSection, openResult, focusSearch };
+  return { openSection, openSetting, openResult, focusSearch };
 }
 
 // The caller owns the focus-return hook: this page is lazy-loaded and first mounts already open,
@@ -395,6 +426,7 @@ export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFoc
             search={search}
             results={results}
             focusedSetting={focusedSetting}
+            onOpenSetting={actions.openSetting}
             onBack={narrow ? mobile.showList : null}
             titleHidden={!showList}
             onReturnToSetup={onboardingPause.paused ? close : null}

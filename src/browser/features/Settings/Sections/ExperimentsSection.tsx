@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { SettingsAnchor } from "../Components/SettingsLayout";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { SettingsAnchor, SettingsOpenSettingContext } from "../Components/SettingsLayout";
 import { experimentAnchorId } from "../settingsRegistry";
 import { AlertTriangle, Info } from "lucide-react";
 import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -28,7 +28,12 @@ import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useOptionalSettings } from "@/browser/contexts/SettingsContext";
-import { SETTINGS_SECTION_META, subExperimentsOf } from "../settingsRegistry";
+import {
+  SETTINGS_SECTION_META,
+  SETTING_DEFINITIONS,
+  subExperimentsOf,
+  type SettingId,
+} from "../settingsRegistry";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
@@ -706,22 +711,29 @@ export function ConfigurableBindUrlControls() {
  * Experiments only turns features on and off. Options of an enabled experiment live in the
  * section they belong to; this row links there.
  */
-const EXPERIMENT_CONFIG_SECTIONS: Partial<Record<ExperimentId, string>> = {
-  [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: "server-access",
-  [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: "memory",
-  [EXPERIMENT_IDS.ARTIFACTS]: "sandbox",
-  [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: "models",
+// The first control of each experiment's moved configuration: the link scrolls to it, since it
+// can sit far down its section (Auto routing is below the model lists).
+const EXPERIMENT_CONFIG_SETTINGS: Partial<Record<ExperimentId, SettingId>> = {
+  [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: "lan-bind",
+  [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: "dream-cost-ceiling",
+  [EXPERIMENT_IDS.ARTIFACTS]: "artifacts-cdn",
+  [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: "auto-routing",
 };
 
 function ExperimentConfigLink(props: { experimentId: ExperimentId }) {
   const enabled = useExperimentValue(props.experimentId);
   const settings = useOptionalSettings();
-  const sectionId = EXPERIMENT_CONFIG_SECTIONS[props.experimentId];
+  const openSetting = useContext(SettingsOpenSettingContext);
+  const settingId = EXPERIMENT_CONFIG_SETTINGS[props.experimentId];
+  if (!enabled || !settingId) return null;
+  const sectionId = SETTING_DEFINITIONS[settingId].section;
   const section = SETTINGS_SECTION_META.find((meta) => meta.id === sectionId);
-  if (!enabled || !section || !settings) return null;
+  // Outside the page (a lone section story) there is no row focus to hand over: open the section.
+  if (!section || (!openSetting && !settings)) return null;
+  const open = () => (openSetting ? openSetting(settingId) : settings?.setActiveSection(sectionId));
   return (
     <div className="pb-3">
-      <Button variant="link" size="xs" onClick={() => settings.setActiveSection(section.id)}>
+      <Button variant="link" size="xs" onClick={open}>
         Configure in {section.label}
       </Button>
     </div>

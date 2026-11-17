@@ -17,6 +17,23 @@ export interface SettingsFocusTarget {
 /** The row a search result opened: it scrolls into view and stays highlighted. */
 export const SettingsFocusContext = createContext<SettingsFocusTarget | null>(null);
 
+/**
+ * Opens a setting from inside a section (an experiment's "Configure in" link) the way a search
+ * result opens it: switch section, then scroll to and highlight the row. Null outside the page.
+ */
+export const SettingsOpenSettingContext = createContext<((id: SettingId) => void) | null>(null);
+
+/**
+ * A target inside a closed disclosure (the MCP "Add server" form) is in the DOM but not on
+ * screen: open its disclosures so the result shows the fields, not a collapsed summary.
+ */
+function openEnclosingDetails(element: HTMLElement) {
+  for (let details = element.closest("details"); details; ) {
+    details.open = true;
+    details = details.parentElement?.closest("details") ?? null;
+  }
+}
+
 /** True when `hiddenId` names a search target that is not on screen (its parent hides it). */
 function isHiddenTarget(element: HTMLElement, hiddenId: string | null): boolean {
   if (hiddenId == null) return false;
@@ -38,6 +55,12 @@ function scrollBoxOf(element: HTMLElement): HTMLElement | null {
   return element.hasAttribute("data-setting-mark") ? element.parentElement : element;
 }
 
+/** Brings the target (or the parent standing in for it) on screen. */
+function revealSearchTarget(element: HTMLElement, direct: boolean, showFallback: boolean) {
+  if (direct) openEnclosingDetails(element);
+  if (direct || showFallback) scrollBoxOf(element)?.scrollIntoView?.({ block: "center" });
+}
+
 function useSearchFocus<T extends HTMLElement>(id: string) {
   const { direct, fallbackFor } = resolveSearchTarget(useContext(SettingsFocusContext), id);
   const [fallbackFocused, setFallbackFocused] = useState(false);
@@ -50,7 +73,7 @@ function useSearchFocus<T extends HTMLElement>(id: string) {
     if (!element) return;
     const showFallback = isHiddenTarget(element, fallbackFor);
     setFallbackFocused(showFallback);
-    if (direct || showFallback) scrollBoxOf(element)?.scrollIntoView?.({ block: "center" });
+    revealSearchTarget(element, direct, showFallback);
   }, [direct, fallbackFor]);
   return { ref, focused: direct || (fallbackFor != null && fallbackFocused) };
 }

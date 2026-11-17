@@ -62,6 +62,7 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { ExperimentsSection, PortableDesktopExperimentWarning } from "./ExperimentsSection";
 import { MemoryConsolidationGroup } from "./MemorySection";
+import { SettingsOpenSettingContext } from "../Components/SettingsLayout";
 
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
@@ -254,6 +255,20 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(view.getByLabelText("Toggle Memory Consolidation")).toBeTruthy();
     expect(view.queryByLabelText("Dream cost ceiling")).toBeNull();
     expect(view.queryByText("Bind host")).toBeNull();
+  });
+
+  test("Configure links open the moved configuration's first row, not just its section", () => {
+    experimentEnabled = false;
+    experimentValues = { [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: true };
+    const openSetting = mock((_id: string) => undefined);
+    const view = render(
+      <SettingsOpenSettingContext.Provider value={openSetting}>
+        <ExperimentsSection />
+      </SettingsOpenSettingContext.Provider>,
+      { wrapper: ApiWrapper }
+    );
+    fireEvent.click(view.getByRole("button", { name: "Configure in Server access" }));
+    expect(openSetting).toHaveBeenCalledWith("lan-bind");
   });
 
   test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {
