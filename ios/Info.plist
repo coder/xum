@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the pairing code shown by Xum on your computer.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Scan a pairing code from a screenshot.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<!-- Xum servers are usually plain HTTP on a LAN or tailnet address. -->
