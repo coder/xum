@@ -120,6 +120,14 @@ final class AppModel {
             }
             return
         }
+        #if DEBUG
+        // Simulator automation: `xum://connect?url=…&token=…&auto=1` saves without the sheet.
+        if url.scheme == "xum", URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains(where: { $0.name == "auto" }) == true,
+           let link = ConnectionLink.parse(raw) {
+            addServer(link, name: URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "name" })?.value ?? link.suggestedName, version: nil)
+            return
+        }
+        #endif
         if ConnectionLink.parse(raw) != nil { sheet = .connectLink(prefill: raw) }
     }
 
