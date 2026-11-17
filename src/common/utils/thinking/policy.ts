@@ -92,8 +92,9 @@ function isGeminiLowMediumHighModelName(modelName: string): boolean {
  * Returns the thinking policy for a given model.
  *
  * Rules:
- * - openai:gpt-6-astra / openai:gpt-6.1-sol → ["low", "medium", "high", "xhigh", "max"]
- *   (native max; the API rejects "none", so reasoning cannot be disabled)
+ * - openai:gpt-6.2-astra / gpt-6.2-sol / gpt-6-astra / gpt-6.1-sol → ["low", "medium",
+ *   "high", "xhigh", "max"] (native max; the API rejects "none", so reasoning cannot be
+ *   disabled)
  * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
  * - openai:gpt-5.6 / -sol / -terra / -luna → ["off", "low", "medium", "high", "xhigh", "max"]
  * - Gemini 3.8 Flash / Gemini 4 Argon / Carbon → ["low", "medium", "high"] (no minimal, so no "off")
@@ -108,7 +109,7 @@ function isGeminiLowMediumHighModelName(modelName: string): boolean {
  * Does NOT match unannounced variants like gpt-6-astra-mini.
  *
  * Pass `providersConfig` so configured aliases (`mappedToModel`, e.g.
- * `openai:team-sol` -> `openai:gpt-6.1-sol`) resolve to their capability model
+ * `openai:team-sol` -> `openai:gpt-6.2-sol`) resolve to their capability model
  * before rule matching — matching how `buildProviderOptions` /
  * `openaiProModeAvailable` detect capabilities. Without it, mapped aliases fall
  * through to the default 4-level policy and clamping strips levels (e.g. native

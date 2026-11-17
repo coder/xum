@@ -795,7 +795,7 @@ export function buildProviderOptions(
       : (routeProvider ?? origin);
 
   // Fast mode follows the actual route/wire, not capability aliases or thinking.
-  // Ultrafast is additionally model-gated; unsupported models drop the tier.
+  // Ultrafast (and Flex on GPT-6.2) is additionally model-gated; unsupported models drop the tier.
   const requestedServiceTier = muxProviderOptions?.openai?.serviceTier;
   const serviceTierRouteOptions = {
     providersConfig,
@@ -939,7 +939,7 @@ export function buildProviderOptions(
     // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
     // capabilityModel so mapped aliases (mappedToModel) inherit their target's
     // native effort. GPT-6 Luna and GPT-5.6 "off" must be explicit "none" because
-    // omission defaults to medium; Astra and GPT-6.1 Sol instead clamp "off" to "low".
+    // omission defaults to medium; the other GPT-6 tiers instead clamp "off" to "low".
 
     // Xum always sends the latest conversation history explicitly. OpenAI's
     // previous_response_id is an alternative state-management path, not an additive one.

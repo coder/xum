@@ -19,7 +19,7 @@ import { createAppHarness } from "../harness";
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 const SOL_MODEL = KNOWN_MODELS.GPT.id;
-// Every supported GPT built-in (GPT-6 Astra/Luna, GPT-6.1 Sol) supports Pro mode, so the
+// Every supported GPT built-in (GPT-6.2 Astra/Sol, GPT-6 Luna) supports Pro mode, so the
 // hidden case uses a custom direct OpenAI model that can still exercise the fast-mode row.
 const NON_PRO_PROVIDER_MODEL_ID = "some-custom-model";
 const NON_PRO_MODEL = `openai:${NON_PRO_PROVIDER_MODEL_ID}`;

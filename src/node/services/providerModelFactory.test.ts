@@ -1950,6 +1950,8 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
   it.each([
     ["gpt-6-astra", "responses", "ultrafast"],
     ["gpt-6.1-sol", "responses", "ultrafast"],
+    ["gpt-6.2-astra", "responses", "ultrafast"],
+    ["gpt-6.2-sol", "responses", "ultrafast"],
     // Ultrafast is model-gated: other models drop the tier instead of sending one
     // OpenAI rejects (and never fall back to the separately billed Fast tier).
     ["gpt-6-luna", "responses", undefined],
@@ -1984,6 +1986,40 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
       });
     }
   );
+
+  // OpenAI's pricing page has no Flex row for GPT-6.2, so a configured Flex tier is
+  // dropped (Standard) for it; the ids the aliases left keep Flex.
+  it.each([
+    ["gpt-6.2-sol", undefined],
+    ["gpt-6.2-astra", undefined],
+    ["gpt-6.2-sol-2026-11-17", undefined],
+    ["gpt-6.1-sol", "flex"],
+    ["gpt-6-astra", "flex"],
+    ["gpt-6-luna", "flex"],
+  ] as const)("sends the configured Flex tier for %s only when offered", async (model, tier) => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        openai: {
+          apiKey: "native-key",
+          baseUrl: "https://native.example.com/v1",
+          serviceTier: "flex",
+        },
+      });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(`openai:${model}`);
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls.length).toBe(1);
+        expect(parseSentBody(calls[0]).service_tier).toBe(tier);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
 });
 
 async function sendWithCyberKey(

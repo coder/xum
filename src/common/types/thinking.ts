@@ -270,33 +270,62 @@ export function anthropicSupportsNativeXhigh(modelString: string): boolean {
   );
 }
 
-/**
- * GPT-6 Astra matcher (released September 3, 2026 under the API id
- * `gpt-6-astra`; there is no bare `gpt-6` alias). Accepts only the bare id or a
- * dated snapshot (`-YYYY-MM-DD` / `-YYYYMMDD`, e.g. gpt-6-astra-2026-09-30) and
- * is anchored so any other qualifier, named (`gpt-6-astra-mini`) or numeric
- * (`gpt-6-astra-2-mini`, `gpt-6-astra-2026-preview`), stays outside it. A false
- * match would apply Astra's reasoning surface (native `max`, no `none`) to a
- * model that may reject it.
- */
-export function isGpt6AstraModel(modelString: string): boolean {
-  const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^gpt-6-astra(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+/** What OpenAI documents for one supported GPT model id. */
+interface OpenAIGptTier {
+  /**
+   * The API returns HTTP 400 for `reasoning.effort: "none"` and lists no
+   * `minimal`, so reasoning cannot be turned off (see openaiRejectsDisabledReasoning).
+   */
+  readonly rejectsNoneEffort: boolean;
+  /** OpenAI serves `service_tier: "ultrafast"` (https://developers.openai.com/api/docs/guides/ultrafast-mode). */
+  readonly ultrafast: boolean;
+  /** The Flex table of https://developers.openai.com/api/docs/pricing lists the model. */
+  readonly flex: boolean;
 }
 
 /**
- * GPT-6.1 Sol matcher (released September 29, 2026 as `gpt-6.1-sol`). Anchored
- * like isGpt6AstraModel. Unlike GPT-6 Sol (no longer supported), it shares
- * Astra's reasoning surface: low through max, no `none`/`minimal`, and no Chat
- * Completions tool calling.
+ * The supported OpenAI GPT tiers, keyed by API id. Older GPT models are not built
+ * in. Every tier has the native "max" reasoning effort, Pro reasoning mode on the
+ * same model id, and explicit prompt-cache breakpoints (GPT-5.6 and later). GPT-6
+ * Astra and GPT-6.1 Sol keep their rows after the aliases moved to GPT-6.2: they
+ * stay usable as custom model strings.
  */
-export function isGpt61SolModel(modelString: string): boolean {
-  const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^gpt-6\.1-sol(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+const OPENAI_GPT_TIERS: Readonly<Record<string, OpenAIGptTier>> = {
+  // GPT-6 Astra (September 3, 2026). https://developers.openai.com/api/docs/models/gpt-6-astra
+  "gpt-6-astra": { rejectsNoneEffort: true, ultrafast: true, flex: true },
+  // GPT-6 Luna (September 22, 2026) takes `none` through `max`; Chat Completions
+  // function calls require `none` (see isGpt6LunaModel).
+  "gpt-6-luna": { rejectsNoneEffort: false, ultrafast: false, flex: true },
+  // GPT-6.1 Sol (September 29, 2026; Ultrafast since 2026-10-08). Unlike GPT-6 Sol
+  // (no longer supported) it shares Astra's reasoning surface.
+  "gpt-6.1-sol": { rejectsNoneEffort: true, ultrafast: true, flex: true },
+  // GPT-6.2 Astra and Sol (November 17, 2026). Both reject `none`. Neither is in the
+  // pricing page's Flex table (the model pages list Standard, Batch, Fast and
+  // Ultrafast), so Xum drops a Flex tier for them instead of sending it.
+  // https://developers.openai.com/api/docs/models/gpt-6.2-astra
+  // https://developers.openai.com/api/docs/models/gpt-6.2-sol
+  "gpt-6.2-astra": { rejectsNoneEffort: true, ultrafast: true, flex: false },
+  "gpt-6.2-sol": { rejectsNoneEffort: true, ultrafast: true, flex: false },
+};
+
+/**
+ * The OpenAI GPT tier a model string names, or undefined. Accepts provider and
+ * gateway prefixes and a dated snapshot suffix (`-YYYY-MM-DD` / `-YYYYMMDD`,
+ * e.g. gpt-6-astra-2026-09-30). Any other qualifier, named (`gpt-6-astra-mini`)
+ * or numeric (`gpt-6-astra-2-mini`, `gpt-6-astra-2026-preview`), stays outside
+ * it: a false match would apply a reasoning surface (native `max`, no `none`)
+ * to a model that may reject it.
+ */
+export function openaiGptTier(modelString: string): OpenAIGptTier | undefined {
+  const modelId = stripModelProviderPrefixes(modelString).replace(
+    /-(?:\d{4}-\d{2}-\d{2}|\d{8})$/,
+    ""
+  );
+  return Object.hasOwn(OPENAI_GPT_TIERS, modelId) ? OPENAI_GPT_TIERS[modelId] : undefined;
 }
 
 /**
- * GPT-6 Luna matcher (released September 22, 2026). Unlike Astra and GPT-6.1 Sol it
+ * GPT-6 Luna matcher (released September 22, 2026). Unlike the other GPT tiers it
  * supports `none` through `max`; Chat Completions function calls require `none`.
  */
 export function isGpt6LunaModel(modelString: string): boolean {
@@ -304,16 +333,9 @@ export function isGpt6LunaModel(modelString: string): boolean {
   return /^gpt-6-luna(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
 }
 
-/**
- * The supported OpenAI GPT tiers: GPT-6 Astra, GPT-6.1 Sol, and GPT-6 Luna. Older
- * GPT models are not built in. Every tier has the native "max" reasoning effort,
- * Pro reasoning mode on the same model id, and explicit prompt-cache breakpoints.
- * Unannounced variants (e.g. `gpt-6-astra-mini`) stay outside it.
- */
+/** Whether the model is one of the supported OpenAI GPT tiers (see OPENAI_GPT_TIERS). */
 export function isGpt6FamilyModel(modelString: string): boolean {
-  return (
-    isGpt6AstraModel(modelString) || isGpt61SolModel(modelString) || isGpt6LunaModel(modelString)
-  );
+  return openaiGptTier(modelString) !== undefined;
 }
 
 /**
@@ -321,7 +343,7 @@ export function isGpt6FamilyModel(modelString: string): boolean {
  * `gpt-5.6-luna`, plus dated snapshots). GPT-5.6 is no longer a built-in model
  * (#5258), but the Settings → Models catalogue still offers it, and OpenAI serves
  * `none` through native `max` and Pro mode on the whole family. Anchored like
- * isGpt6AstraModel so `gpt-5.6-cyber` (a separate Daybreak model with an unknown
+ * openaiGptTier so `gpt-5.6-cyber` (a separate Daybreak model with an unknown
  * reasoning surface) and unannounced variants (`gpt-5.6-sol-mini`, `gpt-5.61`)
  * stay outside it.
  */
@@ -332,9 +354,9 @@ function isGpt56FamilyModel(modelString: string): boolean {
 
 /**
  * Whether the given OpenAI model supports the native "max" reasoning effort
- * (every GPT-6 tier and the GPT-5.6 family). Astra and GPT-6.1 Sol reject `none`
- * (see openaiRejectsDisabledReasoning); Luna and GPT-5.6 support none through
- * max. Pro mode is independent of that effort ladder.
+ * (every GPT-6 tier and the GPT-5.6 family). Every GPT-6 tier but Luna rejects
+ * `none` (see openaiRejectsDisabledReasoning); Luna and GPT-5.6 support none
+ * through max. Pro mode is independent of that effort ladder.
  */
 export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
   return isGpt6FamilyModel(modelString) || isGpt56FamilyModel(modelString);
@@ -344,12 +366,13 @@ export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
  * Whether the given OpenAI model rejects `reasoning.effort: "none"`.
  *
  * GPT-6 Astra returns HTTP 400 for `none` and lists no `minimal`; reasoning
- * cannot be turned off. GPT-6.1 Sol's model page likewise rejects both.
- * OpenAI's migration guidance for callers of either value is to send `low`, so
- * the thinking policy drops "off" and clamps it to "low".
+ * cannot be turned off. The GPT-6.1 Sol and GPT-6.2 model pages likewise reject
+ * `none` (see OPENAI_GPT_TIERS). OpenAI's migration guidance for callers of
+ * either value is to send `low`, so the thinking policy drops "off" and clamps
+ * it to "low".
  */
 export function openaiRejectsDisabledReasoning(modelString: string): boolean {
-  return isGpt6AstraModel(modelString) || isGpt61SolModel(modelString);
+  return openaiGptTier(modelString)?.rejectsNoneEffort === true;
 }
 
 /**
@@ -550,7 +573,7 @@ export const OPENAI_REASONING_EFFORT: Record<ThinkingLevel, string | undefined> 
  * effort-less request echoed `effort: medium`), which would silently ignore the
  * user's off selection.
  *
- * GPT-6 Astra and GPT-6.1 Sol reject "none" with a 400 (see
+ * Every GPT-6 tier but Luna rejects "none" with a 400 (see
  * openaiRejectsDisabledReasoning). The thinking policy already excludes "off" for
  * them; a stray "off" clamps to "low" here so a caller bypassing policy cannot
  * trigger the error.

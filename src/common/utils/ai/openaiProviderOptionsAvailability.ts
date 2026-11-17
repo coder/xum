@@ -12,7 +12,7 @@ import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
-import { isGpt61SolModel, isGpt6AstraModel } from "@/common/types/thinking";
+import { openaiGptTier } from "@/common/types/thinking";
 
 export interface OpenAIDirectProviderOptionsAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
@@ -62,28 +62,33 @@ export function resolveProviderOptionsRoute(
 }
 
 /**
- * Whether the model accepts the given OpenAI service tier. Every tier but
- * Ultrafast is route-gated only (see openaiServiceTierAvailable).
+ * Whether the model accepts the given OpenAI service tier. Other tiers are
+ * route-gated only (see openaiServiceTierAvailable).
  *
- * Ultrafast (`service_tier: "ultrafast"`, launched at DevDay 2026-09-29, billed
- * at 6x Standard) is model-gated: among the supported models OpenAI serves it
- * for GPT-6 Astra and, since 2026-10-08, GPT-6.1 Sol (GPT-5.6 Sol preview access
- * is no longer supported). Callers drop the tier for other models (Standard or
- * the project default) instead of switching to Fast, which is a different paid
- * tier. Ultrafast is also Responses-only: the Chat Completions service_tier enum
- * has no "ultrafast" and rejects it with a 400 (see ultrafastWireAccepted).
- * https://developers.openai.com/api/docs/guides/ultrafast-mode
+ * Ultrafast (`service_tier: "ultrafast"`, launched at DevDay 2026-09-29) is
+ * model-gated: among the supported models OpenAI serves it only for the GPT
+ * tiers OPENAI_GPT_TIERS marks (GPT-5.6 Sol preview access is no longer
+ * supported). Ultrafast is also Responses-only: the Chat Completions
+ * service_tier enum has no "ultrafast" and rejects it with a 400 (see
+ * ultrafastWireAccepted). https://developers.openai.com/api/docs/guides/ultrafast-mode
+ *
+ * Flex is dropped only for a GPT tier that OpenAI does not offer it on (GPT-6.2);
+ * other models, custom ids included, keep the route-only gate.
+ *
+ * Callers drop a refused tier (Standard or the project default) instead of
+ * switching to another paid tier.
  */
 export function openaiModelSupportsServiceTier(
   modelString: string,
   serviceTier: string,
   options?: OpenAIDirectProviderOptionsAvailability
 ): boolean {
-  if (serviceTier !== "ultrafast") return true;
-  if (!ultrafastWireAccepted(modelString, options)) return false;
+  if (serviceTier !== "ultrafast" && serviceTier !== "flex") return true;
+  if (serviceTier === "ultrafast" && !ultrafastWireAccepted(modelString, options)) return false;
   // Resolve mapped aliases and Coder gateway identities to the upstream model.
   const capabilityModel = resolveModelForMetadata(modelString, options?.providersConfig ?? null);
-  return isGpt6AstraModel(capabilityModel) || isGpt61SolModel(capabilityModel);
+  const tier = openaiGptTier(capabilityModel);
+  return serviceTier === "ultrafast" ? tier?.ultrafast === true : tier?.flex !== false;
 }
 
 /**
