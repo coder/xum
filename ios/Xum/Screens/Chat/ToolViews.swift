@@ -32,8 +32,8 @@ enum ToolMeta {
 
     static func editCounts(_ t: ToolCall) -> (added: Int, removed: Int)? {
         guard t.name.hasPrefix("file_edit") || t.name.hasPrefix("file_write") || t.name == "write" else { return nil }
-        let added = ChatFormat.lineCount(t.input["new_string"]?.string ?? t.input["content"]?.string)
-        let removed = ChatFormat.lineCount(t.input["old_string"]?.string)
+        let (added, removed) = Diff.counts(Diff.build(old: t.input["old_string"]?.string ?? "",
+                                                      new: t.input["new_string"]?.string ?? t.input["content"]?.string ?? ""))
         if added == 0, removed == 0 { return nil }
         return (added, removed)
     }

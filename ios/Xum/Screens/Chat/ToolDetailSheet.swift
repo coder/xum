@@ -78,8 +78,9 @@ struct ToolDetailSheet: View {
         HStack {
             Button { dismiss() } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 14, weight: .semibold))
-                    .frame(width: 36, height: 36)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.xText)
+                    .frame(width: 44, height: 44)
             }
             .glassCircle()
             .accessibilityLabel("Close")
@@ -94,8 +95,9 @@ struct ToolDetailSheet: View {
             Spacer(minLength: 8)
             ShareLink(item: shareText) {
                 Image(systemName: "square.and.arrow.up")
-                    .font(.system(size: 14))
-                    .frame(width: 36, height: 36)
+                    .font(.system(size: 17))
+                    .foregroundStyle(Color.xText)
+                    .frame(width: 44, height: 44)
             }
             .glassCircle()
             .accessibilityLabel("Share")
@@ -158,34 +160,39 @@ struct ToolDetailSheet: View {
     }
 
     private var diffView: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 0) {
-                    Text("@@").font(.xMono(11.5)).foregroundStyle(Color.xThink)
-                        .frame(height: 22)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                ForEach(Array(diff.enumerated()), id: \.offset) { _, line in
-                    diffRow(line)
-                }
+        VStack(alignment: .leading, spacing: 0) {
+            Text(Diff.hunkHeader(diff))
+                .font(.xMono(12))
+                .foregroundStyle(Color.xThink)
+                .padding(.leading, 46)
+                .frame(height: 26)
+            ForEach(Array(diff.enumerated()), id: \.offset) { _, line in
+                diffRow(line)
             }
-            .background(Color.xCodeBg, in: RoundedRectangle(cornerRadius: 18))
-            .padding(.vertical, 8)
         }
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.xCodeBg, in: RoundedRectangle(cornerRadius: 18))
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .padding(.vertical, 8)
     }
 
     private func diffRow(_ line: DiffLine) -> some View {
         HStack(spacing: 0) {
-            Text(line.oldNumber.map(String.init) ?? "")
-                .frame(width: 26, alignment: .trailing)
-                .padding(.trailing, 6)
-            Text(line.sign)
+            Text(line.newNumber.map(String.init) ?? "")
+                .foregroundStyle(Color.xText3)
+                .frame(width: 28, alignment: .trailing)
+                .padding(.trailing, 4)
+            Text(line.kind == .context ? "" : line.sign)
+                .foregroundStyle(line.kind == .add ? Color.xOk : Color.xBad)
                 .frame(width: 14)
-            Text(line.text.isEmpty ? " " : line.text)
-                .frame(minWidth: 320, maxWidth: .infinity, alignment: .leading)
+            Text(Syntax.highlight(line.text.isEmpty ? " " : line.text))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .font(.xMono(11.5))
-        .frame(height: 19)
+        .font(.xMono(13))
+        .frame(height: 22)
         .foregroundStyle(Color.xText)
         .background(rowBackground(line.kind))
     }
@@ -332,7 +339,35 @@ extension DiffLine: CustomStringConvertible {
     var description: String { sign + " " + text }
 }
 
+/// Minimal highlighting for diff lines: keywords in accent, string literals in `code`.
+enum Syntax {
+    static let keywords: Set<String> = ["export", "function", "return", "const", "let", "var", "if", "else", "new", "throw",
+                                        "async", "await", "import", "from", "class", "func", "struct", "for", "while", "null",
+                                        "true", "false", "type", "interface"]
+    static func highlight(_ line: String) -> AttributedString {
+        var out = AttributedString(line)
+        for m in line.matches(of: /"[^"]*"|'[^']*'|`[^`]*`/) {
+            if let r = Range(m.range, in: out) { out[r].foregroundColor = Color.xCode }
+        }
+        for m in line.matches(of: /\b[A-Za-z]+\b/) where keywords.contains(String(m.output)) {
+            if let r = Range(m.range, in: out), out[r].foregroundColor == nil { out[r].foregroundColor = Color.xAccent }
+        }
+        return out
+    }
+}
+
 enum Diff {
+    static func counts(_ lines: [DiffLine]) -> (added: Int, removed: Int) {
+        (lines.filter { $0.kind == .add }.count, lines.filter { $0.kind == .del }.count)
+    }
+
+    /// `@@ -12,9 +12,12 @@` for the whole edit.
+    static func hunkHeader(_ lines: [DiffLine]) -> String {
+        let old = lines.filter { $0.kind != .add }.count
+        let new = lines.filter { $0.kind != .del }.count
+        return "@@ -1,\(old) +1,\(new) @@"
+    }
+
     /// Line diff (LCS) between two strings; huge inputs fall back to plain removals + additions.
     static func build(old: String, new: String) -> [DiffLine] {
         var a = old.isEmpty ? [] : old.components(separatedBy: "\n")
