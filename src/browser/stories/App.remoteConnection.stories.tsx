@@ -83,15 +83,17 @@ function setupRemoteSettings() {
  * Open a settings section from the nav. On phones an open section hides the nav behind an
  * "All settings" back button, so go back to the list first.
  */
-async function openSettingsSection(canvas: ReturnType<typeof within>, name: string) {
+async function openSettingsSection(dialog: HTMLElement, name: string) {
+  const canvas = within(dialog);
   const back = canvas.queryByRole("button", { name: "All settings" });
   if (back) await userEvent.click(back);
   await userEvent.click(await canvas.findByRole("button", { name }));
 }
 
 async function openRemoteSettings(canvasElement: HTMLElement) {
-  const canvas = within(await openSettingsDialog(canvasElement));
-  await openSettingsSection(canvas, "Remote connection");
+  const dialog = await openSettingsDialog(canvasElement);
+  const canvas = within(dialog);
+  await openSettingsSection(dialog, "Remote connection");
   return within(await canvas.findByRole("region", { name: "Remote connection" }));
 }
 
@@ -146,9 +148,9 @@ async function exerciseConnection(canvasElement: HTMLElement) {
   await waitFor(() => expect(remote.bridge.disconnect).toHaveBeenCalledTimes(1));
   await expect(disconnect).toBeDisabled();
 
-  await openSettingsSection(canvas, "Appearance");
+  await openSettingsSection(getSettingsDialog(), "Appearance");
   await expect(remote.listeners.size).toBe(0);
-  await openSettingsSection(canvas, "Remote connection");
+  await openSettingsSection(getSettingsDialog(), "Remote connection");
   const restored = within(await canvas.findByRole("region", { name: "Remote connection" }));
   await expect(restored.getByRole("textbox", { name: "Server URL" })).toHaveValue(SERVER_URL);
   await expect(remote.bridge.connect).toHaveBeenCalledTimes(2);
