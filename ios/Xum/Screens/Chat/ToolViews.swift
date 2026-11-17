@@ -94,7 +94,7 @@ struct ToolGroupCard: View {
             Image(systemName: "chevron.right")
                 .font(.system(size: 10, weight: .semibold))
                 .rotationEffect(.degrees(expanded ? 90 : 0))
-            Text("\(tools.count) steps").fontWeight(.medium)
+            Text(tools.count == 1 ? "1 step" : "\(tools.count) steps").fontWeight(.medium)
             if let span { Text("· " + ChatFormat.duration(span)).foregroundStyle(Color.xText3) }
             Spacer(minLength: 8)
             statusLabel

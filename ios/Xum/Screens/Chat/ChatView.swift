@@ -134,6 +134,7 @@ struct ChatView: View {
     private func bodyElements(_ m: ChatMessage) -> [BodyElement] {
         var out: [BodyElement] = []
         var run: [ToolCall] = []
+        var thinkingIndex: Int?
         func flush() {
             var group: [ToolCall] = []
             func pushGroup() {
@@ -159,15 +160,24 @@ struct ChatView: View {
                 if !run.isEmpty { flush() }
                 if !t.isEmpty { out.append(BodyElement(id: part.id, kind: .text(t))) }
             case .reasoning(_, let t):
-                if !run.isEmpty { flush() }
-                if !t.isEmpty {
-                    out.append(BodyElement(id: part.id, kind: .reasoning(t, live: m.isStreaming && m.reasoningEndedAt == nil)))
+                // All of a turn's reasoning shows as one Thinking block where it first began, so
+                // tool calls separated only by more thinking stay in one group (as designed).
+                guard !t.isEmpty else { continue }
+                if let i = thinkingIndex, case .reasoning(let prev, _) = out[i].kind {
+                    out[i] = BodyElement(id: out[i].id, kind: .reasoning(prev + "\n\n" + t, live: false))
+                } else {
+                    if !run.isEmpty { flush() }
+                    thinkingIndex = out.count
+                    out.append(BodyElement(id: part.id, kind: .reasoning(t, live: false)))
                 }
             case .tool(let t):
                 run.append(t)
             }
         }
         if !run.isEmpty { flush() }
+        if let i = thinkingIndex, m.isStreaming, case .reasoning? = m.parts.last, case .reasoning(let t, _) = out[i].kind {
+            out[i] = BodyElement(id: out[i].id, kind: .reasoning(t, live: true))
+        }
         return out
     }
 

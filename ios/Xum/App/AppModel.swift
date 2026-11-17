@@ -101,6 +101,11 @@ final class AppModel {
             open(id)
             return
         }
+        if url.scheme == "xum", url.host() == "server",
+           let s = servers.servers.first(where: { $0.name == url.lastPathComponent }) {
+            switchServer(s.id)
+            return
+        }
         if url.scheme == "xum", url.host() == "sheet" {
             switch url.lastPathComponent {
             case "servers": sheet = .servers

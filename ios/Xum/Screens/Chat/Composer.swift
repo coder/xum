@@ -27,7 +27,9 @@ struct Composer: View {
                 .padding(.horizontal, 8)
                 .focused($focused)
             HStack(spacing: 6) {
-                chips
+                ScrollView(.horizontal, showsIndicators: false) { chips }
+                    .scrollClipDisabled()
+                    .layoutPriority(-1)
                 Spacer(minLength: 0)
                 attachButton
                 sendStopButton

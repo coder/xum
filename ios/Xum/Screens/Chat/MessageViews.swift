@@ -209,7 +209,7 @@ struct ThinkingBlock: View {
     }
 
     @ViewBuilder private var durationLabel: some View {
-        if let startedAt {
+        if let startedAt, isStreaming || (endedAt ?? Date()).timeIntervalSince(startedAt) >= 1 {
             let end = isStreaming ? Date() : (endedAt ?? Date())
             Text("· " + ChatFormat.duration(end.timeIntervalSince(startedAt)))
                 .font(.system(size: 13))

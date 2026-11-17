@@ -135,6 +135,10 @@ enum ModelName {
             "gemini-3.1-pro": "Gemini 3.1 Pro",
         ]
         if let k = known[model] { return k }
+        // Local quantized builds (`GLM-5.3-Flash-oQ4e-mtp`): keep the family and size.
+        if let r = model.range(of: #"-(o?Q\d.*|mtp|gguf|mlx.*)$"#, options: [.regularExpression, .caseInsensitive]) {
+            return display(String(model[..<r.lowerBound]))
+        }
         var s = model.replacingOccurrences(of: "claude-", with: "")
         if let slash = s.lastIndex(of: "/") { s = String(s[s.index(after: slash)...]) }
         return s.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
