@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SettingsAnchor } from "../Components/SettingsLayout";
+import { providerAnchorId } from "../settingsRegistry";
 import {
   Check,
   ChevronDown,
@@ -1845,6 +1847,11 @@ export function ProvidersSection() {
                   key={provider}
                   className="border-border-medium bg-background-secondary overflow-hidden rounded-md border"
                 >
+                  {/* Scroll target for a settings search result; the expanded card is the
+                      highlight, so the anchor itself takes no space. */}
+                  <SettingsAnchor id={providerAnchorId(provider)} className="h-0">
+                    {null}
+                  </SettingsAnchor>
                   {/* Provider header */}
                   <Button
                     variant="ghost"

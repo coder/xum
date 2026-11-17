@@ -17,6 +17,18 @@ describe("SettingsPage", () => {
     });
   });
 
+  test("every section in the registry has a component, gated ones included", () => {
+    expect(() => getSettingsSections(true, true)).not.toThrow();
+  });
+
+  test("keeps the existing route ids so old deep links still open their section", () => {
+    const ids = getSettingsSections(true, true).map((section) => section.id);
+    for (const id of ["general", "tasks", "runtimes", "security", "server-access", "providers"]) {
+      expect(ids).toContain(id);
+      expect(getSettingsSectionRedirect(id, true, true)).toBeNull();
+    }
+  });
+
   test.each(["governor", "layouts"])("replaces the removed %s route with General", (section) => {
     expect(getSettingsSectionRedirect(section, false)).toEqual({
       section: "general",

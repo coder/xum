@@ -51,6 +51,12 @@ interface SettingsContextValue {
 
   /** One-shot hint for InstructionsSection to pre-select a project. */
   instructionsProjectPath: string | null;
+
+  /**
+   * True when Settings was opened without naming a section (the settings button, the shortcut).
+   * Phones then start on the section list; a deep link starts on its section.
+   */
+  openedWithoutSection: boolean;
   setInstructionsProjectPath: (path: string | null) => void;
 }
 
@@ -71,6 +77,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
   const [runtimesProjectPath, setRuntimesProjectPath] = useState<string | null>(null);
   const [secretsProjectPath, setSecretsProjectPath] = useState<string | null>(null);
   const [instructionsProjectPath, setInstructionsProjectPath] = useState<string | null>(null);
+  const [openedWithoutSection, setOpenedWithoutSection] = useState(false);
 
   const closeCallbacksRef = useRef(new Set<() => void>());
 
@@ -80,6 +87,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
   const open = useCallback(
     (section?: string, options?: OpenSettingsOptions) => {
       const nextSection = section ?? DEFAULT_SECTION;
+      setOpenedWithoutSection(section == null);
       if (nextSection === "providers") {
         setProvidersExpandedProvider(options?.expandProvider ?? null);
         setProvidersStartCoderLogin(options?.startCoderLogin ?? false);
@@ -179,6 +187,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       setSecretsProjectPath,
       instructionsProjectPath,
       setInstructionsProjectPath,
+      openedWithoutSection,
     }),
     [
       isOpen,
@@ -192,6 +201,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       runtimesProjectPath,
       secretsProjectPath,
       instructionsProjectPath,
+      openedWithoutSection,
     ]
   );
 

@@ -1675,3 +1675,14 @@ html[data-renderer-inactive] *::after {
     min-width: 0 !important;
   }
 }
+
+/* Settings dialog surfaces. The rest of the app sits on the surface tokens (sidebar, main pane),
+   while settings sections were written against the older gray background tokens and looked gray
+   inside the dialog. Remapping those tokens for the dialog's subtree gives every section,
+   converted to the shared settings layout or not, the same surfaces in every theme. */
+.settings-surfaces {
+  --color-background: var(--color-surface-primary);
+  --color-background-secondary: var(--color-surface-secondary);
+  --color-modal-bg: var(--color-surface-secondary);
+  --color-hover: var(--color-surface-tertiary);
+}

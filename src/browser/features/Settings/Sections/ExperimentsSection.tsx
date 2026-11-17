@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SettingsAnchor } from "../Components/SettingsLayout";
+import { experimentAnchorId } from "../settingsRegistry";
 import { AlertTriangle, Info } from "lucide-react";
 import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
@@ -86,7 +88,11 @@ function ExperimentRow(props: ExperimentRowProps) {
   );
 
   return (
-    <div className="flex items-center justify-between py-3">
+    // Anchored so a settings search result for this experiment scrolls to it.
+    <SettingsAnchor
+      id={experimentAnchorId(experimentId)}
+      className="-mx-2 flex items-center justify-between rounded-md px-2 py-3"
+    >
       <div className="flex-1 pr-4">
         <div className="text-foreground text-sm font-medium">{props.name}</div>
         <div className="text-muted mt-0.5 text-xs">{props.description}</div>
@@ -104,7 +110,7 @@ function ExperimentRow(props: ExperimentRowProps) {
         aria-label={`Toggle ${props.name}`}
         title={availabilityMessage ?? undefined}
       />
-    </div>
+    </SettingsAnchor>
   );
 }
 

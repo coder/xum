@@ -587,6 +587,7 @@ function installProjectSidebarTestDoubles() {
     setSecretsProjectPath: () => undefined,
     instructionsProjectPath: null,
     setInstructionsProjectPath: () => undefined,
+    openedWithoutSection: false,
   }));
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>

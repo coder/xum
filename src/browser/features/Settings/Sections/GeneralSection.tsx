@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import { useRef } from "react";
 import { useTheme, THEME_OPTIONS, type ThemePreference } from "@/browser/contexts/ThemeContext";
 import {
   Select,
@@ -7,7 +7,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import {
   saveConfigOptimistically,
@@ -15,104 +14,22 @@ import {
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
-import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
-import { isConnectionLostError } from "@/browser/contexts/connectionLink";
-import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import assert from "@/common/utils/assert";
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { useLiveAPI } from "@/browser/contexts/API";
 import {
-  DEFAULT_TERMINAL_BADGE_CONFIG,
-  DEFAULT_TERMINAL_FONT_CONFIG,
-  TERMINAL_BADGE_POSITIONS,
   BASH_COLLAPSED_SUMMARY_MODES,
   TRANSCRIPT_DENSITIES,
   normalizeBashCollapsedSummaryMode,
-  normalizeEditorConfig,
-  normalizeTerminalBadgeConfig,
-  normalizeTerminalFontConfig,
   normalizeTranscriptDensity,
   type BashCollapsedSummaryMode,
   type TranscriptDensity,
-  type EditorConfig,
-  type EditorType,
   type LaunchBehavior,
-  type TerminalBadgeConfig,
-  type TerminalBadgePosition,
-  type TerminalFontConfig,
 } from "@/common/constants/storage";
 import {
-  appendTerminalIconFallback,
-  getPrimaryFontFamily,
-  isFontFamilyAvailableInBrowser,
-  isGenericFontFamily,
-} from "@/browser/terminal/terminalFontFamily";
-import {
-  DEFAULT_CODER_ARCHIVE_BEHAVIOR,
-  isCoderWorkspaceArchiveBehavior,
-  type CoderWorkspaceArchiveBehavior,
-} from "@/common/config/coderArchiveBehavior";
-import {
-  DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
-  isWorktreeArchiveBehavior,
-  type WorktreeArchiveBehavior,
-} from "@/common/config/worktreeArchiveBehavior";
-
-function getTerminalFontAvailabilityWarning(config: TerminalFontConfig): string | undefined {
-  if (typeof document === "undefined") {
-    return undefined;
-  }
-
-  const primary = getPrimaryFontFamily(config.fontFamily);
-  if (!primary) {
-    return undefined;
-  }
-
-  const normalizedPrimary = primary.trim();
-  if (!normalizedPrimary) {
-    return undefined;
-  }
-
-  // Geist Mono is bundled via @font-face. Treat it as always available so we don't show a
-  // false-negative warning before the webfont finishes loading.
-  if (normalizedPrimary.toLowerCase() === "geist mono") {
-    return undefined;
-  }
-
-  if (isGenericFontFamily(normalizedPrimary)) {
-    return undefined;
-  }
-
-  const primaryAvailable = isFontFamilyAvailableInBrowser(normalizedPrimary, config.fontSize);
-  if (!primaryAvailable) {
-    if (normalizedPrimary.endsWith("Nerd Font") && !normalizedPrimary.endsWith("Nerd Font Mono")) {
-      const monoCandidate = `${normalizedPrimary} Mono`;
-      if (isFontFamilyAvailableInBrowser(monoCandidate, config.fontSize)) {
-        return `Font "${normalizedPrimary}" not found. Try "${monoCandidate}".`;
-      }
-    }
-
-    return `Font "${normalizedPrimary}" not found in this browser.`;
-  }
-
-  return undefined;
-}
-
-const COMPACTION_STRATEGIES = [
-  { value: "summarize", label: "Summarize" },
-  { value: "continuous", label: "Continuous" },
-  { value: "token-budget", label: "Token Budget" },
-] as const;
-type CompactionStrategy = (typeof COMPACTION_STRATEGIES)[number]["value"];
-
-const EDITOR_OPTIONS: Array<{ value: EditorType; label: string }> = [
-  { value: "vscode", label: "VS Code" },
-  { value: "cursor", label: "Cursor" },
-  { value: "zed", label: "Zed" },
-  { value: "custom", label: "Custom" },
-];
+  SETTING_SELECT_TRIGGER_CLASS,
+  SettingRow,
+  SettingsGroup,
+} from "../Components/SettingsLayout";
 
 // Keep the legacy "dashboard" storage value for backwards compatibility even
 // though the dedicated landing page has been removed. It now means "open the
@@ -139,96 +56,15 @@ const TRANSCRIPT_DENSITY_OPTIONS = TRANSCRIPT_DENSITIES.map((value) => ({
   value,
   label: TRANSCRIPT_DENSITY_LABELS[value],
 }));
-const TERMINAL_BADGE_POSITION_LABELS: Record<TerminalBadgePosition, string> = {
-  "top-left": "Top left",
-  "top-right": "Top right",
-  "bottom-left": "Bottom left",
-  "bottom-right": "Bottom right",
-};
-const TERMINAL_BADGE_POSITION_OPTIONS = TERMINAL_BADGE_POSITIONS.map((value) => ({
-  value,
-  label: TERMINAL_BADGE_POSITION_LABELS[value],
-}));
-const ARCHIVE_BEHAVIOR_OPTIONS = [
-  { value: "keep", label: "Keep running" },
-  { value: "stop", label: "Stop workspace" },
-  { value: "delete", label: "Delete workspace" },
-] as const;
-const WORKTREE_ARCHIVE_BEHAVIOR_OPTIONS: Array<{
-  value: WorktreeArchiveBehavior;
-  label: string;
-}> = [
-  { value: "keep", label: "Keep checkout" },
-  { value: "delete", label: "Delete checkout" },
-  { value: "snapshot", label: "Snapshot and delete" },
-];
 
-// Browser mode: window.api is not set (only exists in Electron via preload). Read it when
-// used rather than at module evaluation, so the answer never depends on which environment
-// happened to import this module first (e.g. an earlier test file in the same process).
-function isBrowserMode(): boolean {
-  return typeof window !== "undefined" && !window.api;
-}
-
-// The strategy is two experiment flags. Whole selections run one at a time, across Settings
-// remounts too, so rapid choices cannot interleave their writes and leave both flags on.
-let compactionStrategyWrites: Promise<void> = Promise.resolve();
-
+/**
+ * Appearance (route id "general", kept for deep links). General used to hold nine unrelated
+ * groups; terminal/editor, compaction, keep-awake, archiving and the project folder now live in
+ * the sections they belong to (Terminal & editor, Agents, Runtimes).
+ */
 export function GeneralSection() {
   const { themePreference, setTheme } = useTheme();
-  const { api } = useAPI();
-  // Offline, the loaded values stay on screen, but the controls that write to the server directly
-  // are disabled: their write could not reach it, and the control must not look saved.
   const liveApi = useLiveAPI();
-  const offline = liveApi == null;
-  const telemetry = useTelemetry();
-  const [continuousCompaction, setContinuousCompaction] = useExperiment(
-    EXPERIMENT_IDS.CONTINUOUS_COMPACTION
-  );
-  const [tokenBudget, setTokenBudget] = useExperiment(EXPERIMENT_IDS.TOKEN_BUDGET);
-  const ptc = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-  const rlm = useExperimentValue(EXPERIMENT_IDS.RLM);
-  // Token Budget keeps its checkpoint in agent memory, so it is offered only with Agent Memory on.
-  const memory = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  // Preserve legacy both-enabled precedence without rewriting preferences on load. A saved Token
-  // Budget preference without memory shows the effective strategy and stays saved.
-  const compactionStrategy: CompactionStrategy = continuousCompaction
-    ? "continuous"
-    : tokenBudget && memory
-      ? "token-budget"
-      : "summarize";
-  const compactionStrategies = COMPACTION_STRATEGIES.filter(
-    (strategy) => memory || strategy.value !== "token-budget"
-  );
-  const tokenBudgetInactive = compactionStrategy === "token-budget" && ptc && rlm;
-  const [compactionOpen, setCompactionOpen] = useState(false);
-  const sameStrategyActivation = useRef<CompactionStrategy | null>(null);
-  const markCompactionActivation = (value: CompactionStrategy) => {
-    if (value !== compactionStrategy) return;
-    // Radix omits onValueChange for an unchanged value. Only normalize if its
-    // activation also closes the menu, not on Escape or a typeahead-only Space.
-    sameStrategyActivation.current = value;
-    queueMicrotask(() => {
-      sameStrategyActivation.current = null;
-    });
-  };
-  const handleCompactionStrategyChange = (value: string) => {
-    assert(
-      value === "summarize" || value === "continuous" || value === "token-budget",
-      `Unexpected compaction strategy: ${value}`
-    );
-    // Off before on; a pair left both on still resolves to continuous.
-    const persist = async () => {
-      if (value !== "token-budget") await setTokenBudget(false);
-      if (value !== "continuous") await setContinuousCompaction(false);
-      if (value === "token-budget") await setTokenBudget(true);
-      if (value === "continuous") await setContinuousCompaction(true);
-    };
-    compactionStrategyWrites = compactionStrategyWrites.then(persist).catch(() => undefined);
-    // Retain the override events previously emitted by the individual experiment switches.
-    telemetry.experimentOverridden(EXPERIMENT_IDS.CONTINUOUS_COMPACTION, value === "continuous");
-    telemetry.experimentOverridden(EXPERIMENT_IDS.TOKEN_BUDGET, value === "token-budget");
-  };
   const launchBehavior = useUserPreferences(
     (preferences) => preferences.navigation?.launchBehavior ?? "dashboard"
   );
@@ -242,208 +78,8 @@ export function GeneralSection() {
   const sidebarHideSubAgents =
     useUserPreferences((preferences) => preferences.ui?.sidebarHideSubAgents) ?? false;
   const [transcriptDensity, setTranscriptDensity] = useTranscriptDensity();
-  const rawTerminalFontConfig = useUserPreferences(
-    (preferences) => preferences.appearance?.terminalFontConfig
-  );
-  const terminalFontConfig = normalizeTerminalFontConfig(rawTerminalFontConfig);
-  const terminalFontWarning = getTerminalFontAvailabilityWarning(terminalFontConfig);
-
-  const terminalFontPreviewFamily = appendTerminalIconFallback(terminalFontConfig.fontFamily);
-  const terminalFontPreviewText = [
-    String.fromCodePoint(0xf024b), // md-folder
-    String.fromCodePoint(0xf0214), // md-file
-    String.fromCodePoint(0xf02a2), // md-git
-    String.fromCodePoint(0xea85), // cod-terminal
-    String.fromCodePoint(0xe725), // dev-git_branch
-    String.fromCodePoint(0xf135), // fa-rocket
-  ].join(" ");
-
-  const rawTerminalBadgeConfig = useUserPreferences(
-    (preferences) => preferences.appearance?.terminalBadgeConfig
-  );
-  const terminalBadgeConfig = normalizeTerminalBadgeConfig(rawTerminalBadgeConfig);
-
-  const rawEditorConfig = useUserPreferences((preferences) => preferences.appearance?.editorConfig);
-  const editorConfig = normalizeEditorConfig(rawEditorConfig);
-  const [sshHost, setSshHost] = useState<string>("");
-  const [sshHostLoaded, setSshHostLoaded] = useState(false);
-  const sshHostEditRef = useRef(0);
-  const [defaultProjectDir, setDefaultProjectDir] = useState("");
-  const [cloneDirLoaded, setCloneDirLoaded] = useState(false);
-  // Track whether the initial load succeeded to prevent saving empty string
-  // (which would clear the config) when the initial fetch failed.
-  const [cloneDirLoadedOk, setCloneDirLoadedOk] = useState(false);
-
-  // Backend config: default to the safest archive behavior until config finishes loading.
-  const [archiveBehavior, setArchiveBehavior] = useState<CoderWorkspaceArchiveBehavior>(
-    DEFAULT_CODER_ARCHIVE_BEHAVIOR
-  );
-  const [worktreeArchiveBehavior, setWorktreeArchiveBehavior] = useState<WorktreeArchiveBehavior>(
-    DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR
-  );
-  const [archiveSettingsLoaded, setArchiveSettingsLoaded] = useState(false);
   const chatTranscriptFullWidth = useChatTranscriptFullWidth();
-  const [llmDebugLogs, setLlmDebugLogs] = useState(false);
-  const [keepScreenAwake, setKeepScreenAwake] = useState(false);
-  const archiveBehaviorLoadNonceRef = useRef(0);
-  const archiveBehaviorRef = useRef<CoderWorkspaceArchiveBehavior>(DEFAULT_CODER_ARCHIVE_BEHAVIOR);
-  const worktreeArchiveBehaviorRef = useRef<WorktreeArchiveBehavior>(
-    DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR
-  );
-
-  const llmDebugLogsLoadNonceRef = useRef(0);
-  const keepScreenAwakeLoadNonceRef = useRef(0);
-  const keepScreenAwakeSavedRef = useRef(false);
-  // Local saves still in flight; an external refresh must not replace the user's newest choice.
-  const keepScreenAwakePendingWritesRef = useRef(0);
-  // An external config change arrived while local saves were pending; replay it once they settle
-  // so a later value accepted by the backend (e.g. from the palette command) is not lost.
-  const keepScreenAwakeRefreshDeferredRef = useRef(false);
-  const keepScreenAwakeRefreshRef = useRef<(() => Promise<void>) | null>(null);
-
-  // updateCoderPrefs writes config.json on the backend. Serialize (and coalesce) updates so rapid
-  // selections can't race and persist a stale value via out-of-order writes.
-  const archiveBehaviorUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
   const chatTranscriptFullWidthUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
-  const llmDebugLogsUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
-  const keepScreenAwakeUpdateChainRef = useRef<Promise<void>>(Promise.resolve());
-  const archiveBehaviorPendingUpdateRef = useRef<CoderWorkspaceArchiveBehavior | undefined>(
-    undefined
-  );
-  const worktreeArchiveBehaviorPendingUpdateRef = useRef<WorktreeArchiveBehavior | undefined>(
-    undefined
-  );
-
-  useEffect(() => {
-    if (!api) {
-      return;
-    }
-
-    // The two archive selects are written together, so they stay disabled (showing the kept
-    // values) until this read answers: a change before it would send a stale value for the other.
-    setArchiveSettingsLoaded(false);
-    const archiveBehaviorNonce = ++archiveBehaviorLoadNonceRef.current;
-    const llmDebugLogsNonce = ++llmDebugLogsLoadNonceRef.current;
-    const keepScreenAwakeNonce = ++keepScreenAwakeLoadNonceRef.current;
-
-    void api.config
-      .getConfig()
-      .then((cfg) => {
-        // If the user changed the setting while this request was in flight, keep the UI selection.
-        if (archiveBehaviorNonce === archiveBehaviorLoadNonceRef.current) {
-          const nextArchiveBehavior = isCoderWorkspaceArchiveBehavior(
-            cfg.coderWorkspaceArchiveBehavior
-          )
-            ? cfg.coderWorkspaceArchiveBehavior
-            : DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-          setArchiveBehavior(nextArchiveBehavior);
-          archiveBehaviorRef.current = nextArchiveBehavior;
-
-          const nextWorktreeArchiveBehavior = isWorktreeArchiveBehavior(cfg.worktreeArchiveBehavior)
-            ? cfg.worktreeArchiveBehavior
-            : DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR;
-          setWorktreeArchiveBehavior(nextWorktreeArchiveBehavior);
-          worktreeArchiveBehaviorRef.current = nextWorktreeArchiveBehavior;
-          setArchiveSettingsLoaded(true);
-        }
-
-        // Use independent nonces so debug toggles do not discard archive updates.
-        if (llmDebugLogsNonce === llmDebugLogsLoadNonceRef.current) {
-          setLlmDebugLogs(cfg.llmDebugLogs === true);
-        }
-
-        if (keepScreenAwakeNonce === keepScreenAwakeLoadNonceRef.current) {
-          keepScreenAwakeSavedRef.current = cfg.keepScreenAwake === true;
-          setKeepScreenAwake(keepScreenAwakeSavedRef.current);
-        }
-      })
-      .catch((error: unknown) => {
-        // A lost connection is no read failure: the reconnect reads again. The defaults must
-        // not become editable (and saved) in the meantime.
-        if (isConnectionLostError(error)) return;
-        if (archiveBehaviorNonce === archiveBehaviorLoadNonceRef.current) {
-          // Fall back to the safe defaults already in state so the controls can recover after a
-          // config read failure and the next user change can persist a fresh value.
-          setArchiveSettingsLoaded(true);
-        }
-      });
-  }, [api]);
-
-  const archiveControlsDisabled =
-    offline || !api?.config?.updateCoderPrefs || !archiveSettingsLoaded;
-
-  const queueArchiveBehaviorUpdate = useCallback(() => {
-    if (!api?.config?.updateCoderPrefs || !archiveSettingsLoaded) {
-      return;
-    }
-
-    archiveBehaviorUpdateChainRef.current = archiveBehaviorUpdateChainRef.current
-      .then(async () => {
-        // Drain pending refs so changes that happen while updateCoderPrefs is in-flight always
-        // schedule another serialized write with the latest combined preferences.
-        for (;;) {
-          const pendingArchiveBehavior = archiveBehaviorPendingUpdateRef.current;
-          const pendingWorktreeArchiveBehavior = worktreeArchiveBehaviorPendingUpdateRef.current;
-          if (
-            pendingArchiveBehavior === undefined &&
-            pendingWorktreeArchiveBehavior === undefined
-          ) {
-            return;
-          }
-
-          // Clear before awaiting so rapid changes coalesce into a new pending value.
-          archiveBehaviorPendingUpdateRef.current = undefined;
-          worktreeArchiveBehaviorPendingUpdateRef.current = undefined;
-
-          try {
-            await api.config.updateCoderPrefs({
-              coderWorkspaceArchiveBehavior: pendingArchiveBehavior ?? archiveBehaviorRef.current,
-              worktreeArchiveBehavior:
-                pendingWorktreeArchiveBehavior ?? worktreeArchiveBehaviorRef.current,
-            });
-          } catch {
-            // Best-effort only. Swallow errors so the queue doesn't get stuck.
-          }
-        }
-      })
-      .catch(() => {
-        // Best-effort only.
-      });
-  }, [api, archiveSettingsLoaded]);
-
-  const handleArchiveBehaviorChange = useCallback(
-    (behavior: CoderWorkspaceArchiveBehavior) => {
-      if (!archiveSettingsLoaded || !api?.config?.updateCoderPrefs) {
-        return;
-      }
-
-      // Invalidate any in-flight initial load so it doesn't overwrite the user's selection.
-      archiveBehaviorLoadNonceRef.current++;
-      setArchiveBehavior(behavior);
-      archiveBehaviorRef.current = behavior;
-
-      archiveBehaviorPendingUpdateRef.current = behavior;
-      queueArchiveBehaviorUpdate();
-    },
-    [api, archiveSettingsLoaded, queueArchiveBehaviorUpdate]
-  );
-
-  const handleWorktreeArchiveBehaviorChange = useCallback(
-    (behavior: WorktreeArchiveBehavior) => {
-      if (!archiveSettingsLoaded || !api?.config?.updateCoderPrefs) {
-        return;
-      }
-
-      // Invalidate any in-flight archive config load so it does not overwrite the user's choice.
-      archiveBehaviorLoadNonceRef.current++;
-      setWorktreeArchiveBehavior(behavior);
-      worktreeArchiveBehaviorRef.current = behavior;
-
-      worktreeArchiveBehaviorPendingUpdateRef.current = behavior;
-      queueArchiveBehaviorUpdate();
-    },
-    [api, archiveSettingsLoaded, queueArchiveBehaviorUpdate]
-  );
 
   const handleChatTranscriptFullWidthChange = (checked: boolean) => {
     saveConfigOptimistically(liveApi, { chatTranscriptFullWidth: checked }, (client) => {
@@ -456,862 +92,128 @@ export function GeneralSection() {
     });
   };
 
-  const handleLlmDebugLogsChange = (checked: boolean) => {
-    // Invalidate any in-flight debug-log load so it doesn't overwrite the user's selection.
-    llmDebugLogsLoadNonceRef.current++;
-    setLlmDebugLogs(checked);
-    window.dispatchEvent(
-      createCustomEvent(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, {
-        enabled: checked,
-      })
-    );
-
-    if (!api?.config?.updateLlmDebugLogs) {
-      return;
-    }
-
-    // Serialize writes so rapid toggles always persist the last user choice.
-    llmDebugLogsUpdateChainRef.current = llmDebugLogsUpdateChainRef.current
-      .catch(() => {
-        // Best-effort only.
-      })
-      .then(() => api.config.updateLlmDebugLogs({ enabled: checked }))
-      .then(() => {
-        // Coerce the chain back to Promise<void>.
-      })
-      .catch(() => {
-        // Best-effort persistence.
-      });
-  };
-
-  const handleKeepScreenAwakeChange = (checked: boolean) => {
-    if (!api) {
-      return;
-    }
-    // Invalidate any in-flight config load so it does not overwrite the user's selection.
-    const nonce = ++keepScreenAwakeLoadNonceRef.current;
-    setKeepScreenAwake(checked);
-
-    // Serialize writes, but only roll back the latest selection when persistence fails.
-    keepScreenAwakePendingWritesRef.current++;
-    keepScreenAwakeUpdateChainRef.current = keepScreenAwakeUpdateChainRef.current
-      .then(async () => {
-        await api.config.updateKeepScreenAwake({ enabled: checked });
-        keepScreenAwakeSavedRef.current = checked;
-      })
-      .catch(() => {
-        if (nonce === keepScreenAwakeLoadNonceRef.current) {
-          setKeepScreenAwake(keepScreenAwakeSavedRef.current);
-        }
-      })
-      .finally(() => {
-        keepScreenAwakePendingWritesRef.current--;
-        assert(
-          keepScreenAwakePendingWritesRef.current >= 0,
-          "keep-awake pending write count went negative"
-        );
-        if (
-          keepScreenAwakePendingWritesRef.current === 0 &&
-          keepScreenAwakeRefreshDeferredRef.current
-        ) {
-          keepScreenAwakeRefreshDeferredRef.current = false;
-          return keepScreenAwakeRefreshRef.current?.().catch(() => {
-            // Best-effort: keep the last known value and wait for the next change.
-          });
-        }
-      });
-  };
-
-  // The setting can also change outside this section (the "Toggle Keep Screen Awake" palette
-  // command runs while Settings is open), so follow config changes instead of showing a stale
-  // switch whose next click would rewrite the current value rather than toggle it.
-  useEffect(() => {
-    const onConfigChanged = api?.config?.onConfigChanged;
-    if (!api || onConfigChanged == null) {
-      return;
-    }
-    const abortController = new AbortController();
-    const signal = abortController.signal;
-
-    const refresh = async () => {
-      // Defer while our own saves are in flight: disk may still hold an older value. The last
-      // save to settle replays this refresh, so a newer external value still wins.
-      if (keepScreenAwakePendingWritesRef.current > 0) {
-        keepScreenAwakeRefreshDeferredRef.current = true;
-        return;
-      }
-      const nonce = keepScreenAwakeLoadNonceRef.current;
-      const cfg = await api.config.getConfig();
-      if (signal.aborted) {
-        return;
-      }
-      if (
-        nonce !== keepScreenAwakeLoadNonceRef.current ||
-        keepScreenAwakePendingWritesRef.current > 0
-      ) {
-        // A local click started a save during the read; re-read once it settles.
-        keepScreenAwakeRefreshDeferredRef.current = true;
-        return;
-      }
-      keepScreenAwakeSavedRef.current = cfg.keepScreenAwake === true;
-      setKeepScreenAwake(keepScreenAwakeSavedRef.current);
-    };
-    keepScreenAwakeRefreshRef.current = refresh;
-
-    let iterator: AsyncIterator<unknown> | null = null;
-    const listen = async () => {
-      try {
-        iterator = await onConfigChanged(undefined, { signal });
-        if (signal.aborted) {
-          await iterator.return?.();
-          return;
-        }
-        for (;;) {
-          const event = await iterator.next();
-          if (event.done || signal.aborted) {
-            return;
-          }
-          await refresh().catch(() => {
-            // Best-effort: keep the last known value and wait for the next change.
-          });
-        }
-      } catch {
-        // Subscription cancellation is expected during unmount/API reconnects.
-      }
-    };
-    // Settles on its own once aborted; errors are handled inside listen().
-    void listen();
-
-    return () => {
-      abortController.abort();
-      void iterator?.return?.();
-      if (keepScreenAwakeRefreshRef.current === refresh) {
-        keepScreenAwakeRefreshRef.current = null;
-      }
-    };
-  }, [api]);
-
-  // Load SSH host from server on mount (browser mode only)
-  useEffect(() => {
-    if (isBrowserMode() && api) {
-      void api.server.getSshHost().then((host) => {
-        setSshHost(host ?? "");
-        setSshHostLoaded(true);
-      });
-    }
-  }, [api]);
-
-  useEffect(() => {
-    if (!api) {
-      return;
-    }
-
-    void api.projects
-      .getDefaultProjectDir()
-      .then((dir) => {
-        setDefaultProjectDir(dir);
-        setCloneDirLoaded(true);
-        setCloneDirLoadedOk(true);
-      })
-      .catch(() => {
-        // Best-effort only. Keep the input editable if load fails,
-        // but don't mark as successfully loaded to prevent clearing config on blur.
-        setCloneDirLoaded(true);
-      });
-  }, [api]);
-
-  // Config objects are written whole: a merge patch keeps omitted fields, so a partial object
-  // over a missing server value would fail the schema.
-  const setEditorConfig = (next: EditorConfig) => {
-    updateUserPreferences({
-      appearance: {
-        editorConfig: { editor: next.editor, customCommand: next.customCommand ?? null },
-      },
-    });
-  };
-  const setTerminalBadgeConfig = (next: TerminalBadgeConfig) => {
-    updateUserPreferences({ appearance: { terminalBadgeConfig: next } });
-  };
-
-  const handleEditorChange = (editor: EditorType) => {
-    setEditorConfig({ ...editorConfig, editor });
-  };
-
-  // Font fields are patched one at a time so a concurrent edit of the other field survives.
-  const handleTerminalFontFamilyChange = (fontFamily: string) => {
-    updateUserPreferences({
-      appearance: { terminalFontConfig: { fontFamily: fontFamily.trim() ? fontFamily : null } },
-    });
-  };
-
-  const handleTerminalFontSizeChange = (rawValue: string) => {
-    const parsed = Number(rawValue);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      return;
-    }
-
-    updateUserPreferences({ appearance: { terminalFontConfig: { fontSize: parsed } } });
-  };
-  const handleCustomCommandChange = (customCommand: string) => {
-    setEditorConfig({
-      ...editorConfig,
-      customCommand: customCommand.trim() ? customCommand : undefined,
-    });
-  };
-
-  const handleTerminalBadgeEnabledChange = (enabled: boolean) => {
-    setTerminalBadgeConfig({ ...terminalBadgeConfig, enabled });
-  };
-
-  const handleTerminalBadgeTemplateChange = (template: string) => {
-    setTerminalBadgeConfig({ ...terminalBadgeConfig, template });
-  };
-
-  const handleTerminalBadgePositionChange = (position: TerminalBadgePosition) => {
-    setTerminalBadgeConfig({ ...terminalBadgeConfig, position });
-  };
-
-  const handleTerminalBadgeOpacityChange = (rawValue: string) => {
-    const parsed = Number(rawValue);
-    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
-      return;
-    }
-
-    setTerminalBadgeConfig({ ...terminalBadgeConfig, opacity: parsed / 100 });
-  };
-
-  const handleTerminalBadgeFontSizeChange = (rawValue: string) => {
-    const parsed = Number(rawValue);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      return;
-    }
-
-    setTerminalBadgeConfig({ ...terminalBadgeConfig, fontSize: parsed });
-  };
-
-  const handleSshHostChange = useCallback(
-    (value: string) => {
-      const edit = ++sshHostEditRef.current;
-      setSshHost(value);
-      if (!api) return;
-      // Save to server (debounced effect would be better, but keeping it simple)
-      api.server.setSshHost({ sshHost: value || null }).catch(async () => {
-        // A rejected save leaves the backend on its old host (#4748): show that instead of the
-        // unsaved value, unless the user has typed again since.
-        const saved = await api.server.getSshHost().catch(() => undefined);
-        if (saved !== undefined && edit === sshHostEditRef.current) {
-          setSshHost(saved ?? "");
-        }
-      });
-    },
-    [api]
-  );
-
-  const handleCloneDirBlur = useCallback(() => {
-    // Only persist once the initial load has completed (success or failure).
-    // After a failed load, allow saves only if the user has actively typed
-    // a non-empty value, so we never silently clear a configured directory.
-    if (!cloneDirLoaded || !api) {
-      return;
-    }
-
-    const trimmedProjectDir = defaultProjectDir.trim();
-    if (!cloneDirLoadedOk && !trimmedProjectDir) {
-      return;
-    }
-
-    void api.projects
-      .setDefaultProjectDir({ path: defaultProjectDir })
-      .then(() => {
-        // A successful save means subsequent clears are safe, even if the
-        // initial getDefaultProjectDir() request failed earlier in this session.
-        setCloneDirLoadedOk(true);
-      })
-      .catch(() => {
-        // Best-effort save: keep current UI state on failure.
-      });
-  }, [api, cloneDirLoaded, cloneDirLoadedOk, defaultProjectDir]);
-
   return (
-    <div className="space-y-6">
-      <div>
-        <h3 className="text-foreground mb-4 text-sm font-medium">Appearance</h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Theme</div>
-              <div className="text-muted text-xs">Choose your preferred theme</div>
-            </div>
-            <Select
-              value={themePreference}
-              onValueChange={(value) => setTheme(value as ThemePreference)}
-            >
-              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {THEME_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Launch behavior</div>
-              <div className="text-muted text-xs">What to show when Xum starts</div>
-            </div>
-            <Select
-              value={launchBehavior}
-              onValueChange={(value) =>
-                updateUserPreferences({ navigation: { launchBehavior: value as LaunchBehavior } })
-              }
-            >
-              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {LAUNCH_BEHAVIOR_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-      </div>
-
-      <div className="border-border-light border-t pt-6">
-        <h3 className="text-foreground mb-4 text-sm font-medium">Sidebar</h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Flat chat list</div>
-              <div className="text-muted text-xs">
-                Show all chats in a single list with project avatars instead of project folders.
-              </div>
-            </div>
-            <Switch
-              checked={sidebarFlatMode}
-              onCheckedChange={(checked) =>
-                updateUserPreferences({ ui: { sidebarFlatMode: checked } })
-              }
-              aria-label="Toggle flat chat list"
-            />
-          </div>
-
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Group sidebar workspaces by age</div>
-              <div className="text-muted text-xs">
-                Collect older workspaces under collapsible &quot;Older than X days&quot; sections.
-                When off, all workspaces are listed together.
-              </div>
-            </div>
-            <Switch
-              checked={sidebarAgeGrouping}
-              onCheckedChange={(checked) =>
-                updateUserPreferences({ ui: { sidebarAgeGrouping: checked } })
-              }
-              aria-label="Toggle sidebar workspace age grouping"
-            />
-          </div>
-
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Hide sub-agents in the sidebar</div>
-              <div className="text-muted text-xs">
-                Show only top-level workspaces. Parents summarize hidden sub-agent and workflow
-                activity in their status line.
-              </div>
-            </div>
-            <Switch
-              checked={sidebarHideSubAgents}
-              onCheckedChange={(checked) =>
-                updateUserPreferences({ ui: { sidebarHideSubAgents: checked } })
-              }
-              aria-label="Toggle hiding sub-agents in the sidebar"
-            />
-          </div>
-        </div>
-      </div>
-
-      <div className="border-border-light border-t pt-6">
-        <h3 className="text-foreground mb-4 text-sm font-medium">Transcript</h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Full-width chat transcript</div>
-              <div className="text-muted text-xs">
-                Let messages use the full chat pane instead of the default readable column.
-              </div>
-            </div>
-            <Switch
-              checked={chatTranscriptFullWidth}
-              onCheckedChange={handleChatTranscriptFullWidthChange}
-              aria-label="Toggle full-width chat transcript"
-            />
-          </div>
-
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Transcript density</div>
-              <div className="text-muted text-xs">
-                Control how much detail the transcript shows. Hyper collapses completed work into
-                expandable summaries.
-              </div>
-            </div>
-            <Select
-              value={transcriptDensity}
-              onValueChange={(value) => setTranscriptDensity(normalizeTranscriptDensity(value))}
-            >
-              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {TRANSCRIPT_DENSITY_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Collapsed bash summaries</div>
-              <div className="text-muted text-xs">
-                Choose whether collapsed bash tools show the raw command, the model&apos;s intent,
-                or both.
-              </div>
-            </div>
-            <Select
-              value={bashCollapsedSummaryMode}
-              onValueChange={(value) =>
-                updateUserPreferences({
-                  appearance: { bashCollapsedSummaryMode: value as BashCollapsedSummaryMode },
-                })
-              }
-            >
-              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {BASH_COLLAPSED_SUMMARY_MODE_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-      </div>
-
-      <div className="border-border-light border-t pt-6">
-        <h3 className="text-foreground mb-4 text-sm font-medium">Compaction</h3>
-        <div className="flex items-center justify-between gap-4">
-          <div className="min-w-0 flex-1">
-            <div className="text-foreground text-sm">Compaction strategy</div>
-            <div className="text-muted text-xs">How to manage context as conversations grow.</div>
-          </div>
+    <div className="space-y-8">
+      <SettingsGroup title="Theme & startup">
+        <SettingRow id="theme">
           <Select
-            value={compactionStrategy}
-            onValueChange={handleCompactionStrategyChange}
-            open={compactionOpen}
-            onOpenChange={(open) => {
-              setCompactionOpen(open);
-              const activated = sameStrategyActivation.current;
-              sameStrategyActivation.current = null;
-              if (!open && activated) handleCompactionStrategyChange(activated);
-            }}
+            value={themePreference}
+            onValueChange={(value) => setTheme(value as ThemePreference)}
           >
-            <SelectTrigger
-              aria-label="Compaction strategy"
-              aria-describedby={tokenBudgetInactive ? "token-budget-inactive" : undefined}
-              className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto shrink-0 cursor-pointer rounded-md border px-3 text-sm transition-colors"
-            >
+            <SelectTrigger aria-label="Theme" className={SETTING_SELECT_TRIGGER_CLASS}>
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {compactionStrategies.map((strategy) => (
-                <SelectItem
-                  key={strategy.value}
-                  value={strategy.value}
-                  onPointerUp={() => markCompactionActivation(strategy.value)}
-                  onClick={() => markCompactionActivation(strategy.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      markCompactionActivation(strategy.value);
-                    }
-                  }}
-                >
-                  {strategy.label}
+              {THEME_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
-        </div>
-        {tokenBudgetInactive && (
-          <div id="token-budget-inactive" role="status" className="text-warning mt-2 text-xs">
-            Token Budget is saved but inactive while Programmatic Tool Calling and RLM Mode are both
-            enabled. Disable either in Experiments to use it.
-          </div>
-        )}
-      </div>
+        </SettingRow>
 
-      <div className="border-border-light border-t pt-6">
-        <h3 className="text-foreground mb-4 text-sm font-medium">Terminal</h3>
-        <div className="space-y-4">
-          {/* flex-wrap + label minimum: at phone width the fixed-width input moves below
-              the label instead of running past the screen edge. */}
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="min-w-48 flex-1">
-              <div className="text-foreground text-sm">Terminal Font</div>
-              {terminalFontWarning ? (
-                <div className="text-warning text-xs">{terminalFontWarning}</div>
-              ) : null}
-              <div className="text-muted text-xs">Set this to a monospace font you like.</div>
-              <div className="text-muted text-xs">
-                Preview:{" "}
-                <span className="text-foreground" style={{ fontFamily: terminalFontPreviewFamily }}>
-                  {terminalFontPreviewText}
-                </span>
-              </div>
-            </div>
-            <div className="flex max-w-full min-w-0 flex-col items-end gap-2">
-              <Input
-                // Stored value: a cleared field stays empty instead of snapping back to the default.
-                value={rawTerminalFontConfig?.fontFamily ?? ""}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                  handleTerminalFontFamilyChange(e.target.value)
-                }
-                placeholder={DEFAULT_TERMINAL_FONT_CONFIG.fontFamily}
-                className="border-border-medium bg-background-secondary h-9 w-80 max-w-full"
-              />
-            </div>
-          </div>
+        <SettingRow id="launch-behavior">
+          <Select
+            value={launchBehavior}
+            onValueChange={(value) =>
+              updateUserPreferences({ navigation: { launchBehavior: value as LaunchBehavior } })
+            }
+          >
+            <SelectTrigger aria-label="Launch behavior" className={SETTING_SELECT_TRIGGER_CLASS}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {LAUNCH_BEHAVIOR_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingRow>
+      </SettingsGroup>
 
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Terminal Font Size</div>
-              <div className="text-muted text-xs">Font size for the integrated terminal</div>
-            </div>
-            <Input
-              type="number"
-              value={terminalFontConfig.fontSize}
-              min={6}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                handleTerminalFontSizeChange(e.target.value)
-              }
-              className="border-border-medium bg-background-secondary h-9 w-28"
-            />
-          </div>
+      <SettingsGroup title="Sidebar">
+        <SettingRow id="sidebar-flat">
+          <Switch
+            checked={sidebarFlatMode}
+            onCheckedChange={(checked) =>
+              updateUserPreferences({ ui: { sidebarFlatMode: checked } })
+            }
+            aria-label="Toggle flat chat list"
+          />
+        </SettingRow>
+        <SettingRow id="sidebar-age-grouping">
+          <Switch
+            checked={sidebarAgeGrouping}
+            onCheckedChange={(checked) =>
+              updateUserPreferences({ ui: { sidebarAgeGrouping: checked } })
+            }
+            aria-label="Toggle sidebar workspace age grouping"
+          />
+        </SettingRow>
+        <SettingRow id="sidebar-hide-sub-agents">
+          <Switch
+            checked={sidebarHideSubAgents}
+            onCheckedChange={(checked) =>
+              updateUserPreferences({ ui: { sidebarHideSubAgents: checked } })
+            }
+            aria-label="Toggle hiding sub-agents in the sidebar"
+          />
+        </SettingRow>
+      </SettingsGroup>
 
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Terminal Badge</div>
-              <div className="text-muted text-xs">
-                Show a scroll-fixed workspace/tab watermark over the terminal
-              </div>
-            </div>
-            <Switch
-              checked={terminalBadgeConfig.enabled}
-              onCheckedChange={handleTerminalBadgeEnabledChange}
-              aria-label="Toggle Terminal Badge"
-            />
-          </div>
-
-          {terminalBadgeConfig.enabled && (
-            <>
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div className="flex-1">
-                  <div className="text-foreground text-sm">Terminal Badge Template</div>
-                  <div className="text-muted text-xs">
-                    Tokens: {"{workspace}"}, {"{tab}"}, {"{project}"}, {"{index}"}
-                  </div>
-                  <div className="text-muted text-xs">
-                    {"{tab}"} follows the tab label (shell titles); {"{index}"} is the stable tab
-                    number
-                  </div>
-                </div>
-                <Input
-                  value={terminalBadgeConfig.template}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                    handleTerminalBadgeTemplateChange(e.target.value)
-                  }
-                  placeholder={DEFAULT_TERMINAL_BADGE_CONFIG.template}
-                  aria-label="Terminal Badge Template"
-                  className="border-border-medium bg-background-secondary h-9 w-80 max-w-full"
-                />
-              </div>
-
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1">
-                  <div className="text-foreground text-sm">Terminal Badge Position</div>
-                  <div className="text-muted text-xs">
-                    Corner of the terminal to pin the badge to
-                  </div>
-                </div>
-                <Select
-                  value={terminalBadgeConfig.position}
-                  onValueChange={(value) =>
-                    handleTerminalBadgePositionChange(value as TerminalBadgePosition)
-                  }
-                >
-                  <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {TERMINAL_BADGE_POSITION_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>
-                        {option.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1">
-                  <div className="text-foreground text-sm">Terminal Badge Opacity</div>
-                  <div className="text-muted text-xs">Percent (1-100)</div>
-                </div>
-                <Input
-                  type="number"
-                  value={Math.round(terminalBadgeConfig.opacity * 100)}
-                  min={1}
-                  max={100}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                    handleTerminalBadgeOpacityChange(e.target.value)
-                  }
-                  aria-label="Terminal Badge Opacity"
-                  className="border-border-medium bg-background-secondary h-9 w-28"
-                />
-              </div>
-
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1">
-                  <div className="text-foreground text-sm">Terminal Badge Font Size</div>
-                  <div className="text-muted text-xs">Font size for the badge text</div>
-                </div>
-                <Input
-                  type="number"
-                  value={terminalBadgeConfig.fontSize}
-                  min={6}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                    handleTerminalBadgeFontSizeChange(e.target.value)
-                  }
-                  aria-label="Terminal Badge Font Size"
-                  className="border-border-medium bg-background-secondary h-9 w-28"
-                />
-              </div>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* The sleep blocker lives in the Electron main process, so browser mode (including
-          `xum server` and desktop server windows) has nothing to toggle. */}
-      {!isBrowserMode() && (
-        <div className="border-border-light border-t pt-6">
-          <h3 className="text-foreground mb-4 text-sm font-medium">System</h3>
-          <div className="space-y-4">
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex-1">
-                <div className="text-foreground text-sm">
-                  Keep screen awake while agents are working
-                </div>
-                <div className="text-muted mt-0.5 text-xs">
-                  {/* Electron's display-sleep blocker does not guarantee the OS lock policy is
-                      suppressed, so only promise display/system sleep. */}
-                  Prevents display and system sleep while any chat is streaming or waiting on
-                  background bash or workflow activity. Released as soon as all agents are idle.
-                </div>
-              </div>
-              <Switch
-                checked={keepScreenAwake}
-                onCheckedChange={handleKeepScreenAwakeChange}
-                disabled={offline}
-                aria-label="Toggle keep screen awake while agents are working"
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
-      <div className="border-border-light border-t pt-6">
-        <h3 className="text-foreground mb-4 text-sm font-medium">Archiving</h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Coder workspace on archive</div>
-              <div className="text-muted text-xs">
-                Action to take on dedicated Coder workspaces when archiving a chat. Delete is
-                permanent.
-              </div>
-            </div>
-            <Select
-              value={archiveBehavior}
-              onValueChange={(value) =>
-                handleArchiveBehaviorChange(value as CoderWorkspaceArchiveBehavior)
-              }
-              disabled={archiveControlsDisabled}
+      <SettingsGroup title="Transcript">
+        <SettingRow id="transcript-full-width">
+          <Switch
+            checked={chatTranscriptFullWidth}
+            onCheckedChange={handleChatTranscriptFullWidthChange}
+            aria-label="Toggle full-width chat transcript"
+          />
+        </SettingRow>
+        <SettingRow id="transcript-density">
+          <Select
+            value={transcriptDensity}
+            onValueChange={(value) => setTranscriptDensity(normalizeTranscriptDensity(value))}
+          >
+            <SelectTrigger aria-label="Transcript density" className={SETTING_SELECT_TRIGGER_CLASS}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {TRANSCRIPT_DENSITY_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingRow>
+        <SettingRow id="bash-collapsed-summaries">
+          <Select
+            value={bashCollapsedSummaryMode}
+            onValueChange={(value) =>
+              updateUserPreferences({
+                appearance: { bashCollapsedSummaryMode: value as BashCollapsedSummaryMode },
+              })
+            }
+          >
+            <SelectTrigger
+              aria-label="Collapsed bash summaries"
+              className={SETTING_SELECT_TRIGGER_CLASS}
             >
-              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Worktree archive behavior</div>
-              <div className="text-muted text-xs">
-                Control whether archived xum-managed worktrees stay on disk, are deleted, or are
-                snapshotted so they can be restored on unarchive.
-              </div>
-            </div>
-            <Select
-              value={worktreeArchiveBehavior}
-              onValueChange={(value) =>
-                handleWorktreeArchiveBehaviorChange(value as WorktreeArchiveBehavior)
-              }
-              disabled={archiveControlsDisabled}
-            >
-              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {WORKTREE_ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-      </div>
-
-      <div className="border-border-light border-t pt-6">
-        <h3 className="text-foreground mb-4 text-sm font-medium">Editor & debugging</h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-foreground text-sm">Editor</div>
-              <div className="text-muted text-xs">Editor to open files in</div>
-            </div>
-            <Select value={editorConfig.editor} onValueChange={handleEditorChange}>
-              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {EDITOR_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {editorConfig.editor === "custom" && (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-foreground text-sm">Custom Command</div>
-                  <div className="text-muted text-xs">Command to run (path will be appended)</div>
-                </div>
-                <Input
-                  value={editorConfig.customCommand ?? ""}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                    handleCustomCommandChange(e.target.value)
-                  }
-                  placeholder="e.g., nvim"
-                  className="border-border-medium bg-background-secondary h-9 w-40"
-                />
-              </div>
-              {isBrowserMode() && (
-                <div className="text-warning text-xs">
-                  Custom editors are not supported in browser mode. Use VS Code or Cursor instead.
-                </div>
-              )}
-            </div>
-          )}
-
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-foreground text-sm">API Debug Logs</div>
-              <div className="text-muted mt-0.5 text-xs">
-                Record the full input and output of every AI API call
-              </div>
-            </div>
-            <Switch
-              checked={llmDebugLogs}
-              onCheckedChange={handleLlmDebugLogsChange}
-              disabled={offline}
-              aria-label="Toggle API Debug Logs"
-            />
-          </div>
-
-          {isBrowserMode() && sshHostLoaded && (
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-foreground text-sm">SSH Host</div>
-                <div className="text-muted text-xs">
-                  SSH hostname for &apos;Open in Editor&apos; deep links
-                </div>
-              </div>
-              <Input
-                value={sshHost}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                  handleSshHostChange(e.target.value)
-                }
-                placeholder={window.location.hostname}
-                disabled={offline}
-                className="border-border-medium bg-background-secondary h-9 w-40"
-              />
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="border-border-light border-t pt-6">
-        <h3 className="text-foreground mb-4 text-sm font-medium">Projects</h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Default project directory</div>
-              <div className="text-muted text-xs">
-                Parent folder for new projects and cloned repositories
-              </div>
-            </div>
-            <Input
-              value={defaultProjectDir}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                setDefaultProjectDir(e.target.value)
-              }
-              onBlur={handleCloneDirBlur}
-              placeholder="~/.xum/projects"
-              disabled={!cloneDirLoaded || offline}
-              className="border-border-medium bg-background-secondary h-9 w-80"
-            />
-          </div>
-        </div>
-      </div>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {BASH_COLLAPSED_SUMMARY_MODE_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingRow>
+      </SettingsGroup>
     </div>
   );
 }

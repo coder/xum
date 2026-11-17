@@ -81,7 +81,7 @@ function setupRemoteSettings() {
 
 async function openRemoteSettings(canvasElement: HTMLElement) {
   const canvas = within(await openSettingsDialog(canvasElement));
-  await userEvent.click(await canvas.findByRole("button", { name: "Remote Connection" }));
+  await userEvent.click(await canvas.findByRole("button", { name: "Remote connection" }));
   return within(await canvas.findByRole("region", { name: "Remote connection" }));
 }
 
@@ -136,9 +136,9 @@ async function exerciseConnection(canvasElement: HTMLElement) {
   await waitFor(() => expect(remote.bridge.disconnect).toHaveBeenCalledTimes(1));
   await expect(disconnect).toBeDisabled();
 
-  await userEvent.click(canvas.getByRole("button", { name: "General" }));
+  await userEvent.click(canvas.getByRole("button", { name: "Appearance" }));
   await expect(remote.listeners.size).toBe(0);
-  await userEvent.click(canvas.getByRole("button", { name: "Remote Connection" }));
+  await userEvent.click(canvas.getByRole("button", { name: "Remote connection" }));
   const restored = within(await canvas.findByRole("region", { name: "Remote connection" }));
   await expect(restored.getByRole("textbox", { name: "Server URL" })).toHaveValue(SERVER_URL);
   await expect(remote.bridge.connect).toHaveBeenCalledTimes(2);
@@ -298,8 +298,8 @@ export const BrowserWithoutBridge: AppStory = {
     const canvas = within(await openSettingsDialog(canvasElement));
     // Settings can mount while AppLoader's fade-in still makes the button invisible.
     await waitFor(() =>
-      expect(canvas.getByRole("button", { name: "Server Access" })).toBeVisible()
+      expect(canvas.getByRole("button", { name: "Server access" })).toBeVisible()
     );
-    await expect(canvas.queryByRole("button", { name: "Remote Connection" })).toBeNull();
+    await expect(canvas.queryByRole("button", { name: "Remote connection" })).toBeNull();
   },
 };

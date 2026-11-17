@@ -20,6 +20,11 @@ import { useExperiment } from "@/browser/hooks/useExperiments";
 import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
 import { GeneralSection } from "./GeneralSection";
+import { TerminalEditorSection } from "./TerminalEditorSection";
+import { CompactionStrategySetting } from "./CompactionStrategySetting";
+import { KeepScreenAwakeSetting } from "./KeepScreenAwakeSetting";
+import { ArchiveBehaviorSettings } from "./ArchiveBehaviorSettings";
+import { DefaultProjectDirSetting } from "./DefaultProjectDirSetting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { DEFAULT_TERMINAL_FONT_CONFIG } from "@/common/constants/storage";
@@ -33,6 +38,23 @@ import {
 } from "@/common/config/worktreeArchiveBehavior";
 
 type MockConfig = TestClientConfig;
+
+/**
+ * Everything General used to render. The settings split moved these into the sections they
+ * belong to (Terminal & editor, Agents, Runtimes); these behavior tests still cover all of them.
+ */
+function FormerGeneralSettings() {
+  return (
+    <>
+      <GeneralSection />
+      <TerminalEditorSection />
+      <CompactionStrategySetting />
+      <KeepScreenAwakeSetting />
+      <ArchiveBehaviorSettings />
+      <DefaultProjectDirSetting />
+    </>
+  );
+}
 
 type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
 
@@ -405,7 +427,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <FormerGeneralSettings />
         {options.children}
       </TestProviders>
     );
@@ -661,7 +683,7 @@ describe("GeneralSection", () => {
   test("persists flat chat list mode from the Sidebar group", async () => {
     const setup = renderGeneralSection();
     const sidebarHeading = setup.view.getByRole("heading", { name: "Sidebar" });
-    const sidebarGroup = sidebarHeading.parentElement;
+    const sidebarGroup = sidebarHeading.closest("section");
     expect(sidebarGroup).not.toBeNull();
     const toggle = within(sidebarGroup!).getByLabelText("Toggle flat chat list");
 
@@ -956,7 +978,7 @@ describe("GeneralSection", () => {
       const view = render(
         <harness.Wrapper>
           <ThemeProvider forcedTheme="dark">
-            <GeneralSection />
+            <FormerGeneralSettings />
           </ThemeProvider>
         </harness.Wrapper>
       );
@@ -991,7 +1013,7 @@ describe("GeneralSection", () => {
       const view = render(
         <harness.Wrapper>
           <ThemeProvider forcedTheme="dark">
-            <GeneralSection />
+            <FormerGeneralSettings />
           </ThemeProvider>
         </harness.Wrapper>
       );
@@ -1077,7 +1099,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <FormerGeneralSettings />
       </TestProviders>
     );
 
@@ -1129,7 +1151,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <FormerGeneralSettings />
       </TestProviders>
     );
 
@@ -1172,7 +1194,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <FormerGeneralSettings />
       </TestProviders>
     );
 

@@ -64,8 +64,9 @@ import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
-import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
-import { AgentSandboxSettings } from "./AgentSandboxSettings";
+import { SettingRow, SettingsGroup } from "../Components/SettingsLayout";
+import { CompactionStrategySetting } from "./CompactionStrategySetting";
+import { KeepScreenAwakeSetting } from "./KeepScreenAwakeSetting";
 import { TaskLimitInput } from "./TaskLimitInput";
 
 const INHERIT = "__inherit__";
@@ -1326,96 +1327,85 @@ export function TasksSection() {
     // Offline every control is disabled: an edit kept only in this section's state is lost when
     // the user leaves the section before the reconnect. Until a load answers, too: the autosave
     // does not track an edit made then, so the answer would replace it.
-    <fieldset disabled={areControlsLocked(liveApi == null, loaded)} className="min-w-0 space-y-6">
-      <div>
-        <h3 className="text-foreground mb-4 text-sm font-medium">Task Settings</h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Default new-workspace agent</div>
-              <div className="text-muted text-xs">New chats start with this agent.</div>
-            </div>
-            <Select
-              value={newWorkspaceDefaultAgentId}
-              onValueChange={setNewWorkspaceDefaultAgentId}
+    <fieldset disabled={areControlsLocked(liveApi == null, loaded)} className="min-w-0 space-y-8">
+      <SettingsGroup title="Tasks">
+        <SettingRow id="default-agent">
+          <Select value={newWorkspaceDefaultAgentId} onValueChange={setNewWorkspaceDefaultAgentId}>
+            <SelectTrigger
+              aria-label="Default new-workspace agent"
+              className="border-border-medium bg-surface-primary h-9 w-56"
             >
-              <SelectTrigger className="border-border-medium bg-background-secondary h-9 w-56">
-                <SelectValue placeholder="Select agent" />
-              </SelectTrigger>
-              <SelectContent>
-                {newWorkspaceDefaultAgentOptions.map((option) => (
-                  <SelectItem key={option.id} value={option.id}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+              <SelectValue placeholder="Select agent" />
+            </SelectTrigger>
+            <SelectContent>
+              {newWorkspaceDefaultAgentOptions.map((option) => (
+                <SelectItem key={option.id} value={option.id}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingRow>
 
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Max Parallel Agent Tasks</div>
-              <div className="text-muted text-xs">
-                Default {TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default}, range{" "}
-                {TASK_SETTINGS_LIMITS.maxParallelAgentTasks.min}–
-                {TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
-              </div>
+        <SettingRow
+          id="max-parallel-tasks"
+          hint={
+            <div className="text-muted text-xs">
+              Default {TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default}, range{" "}
+              {TASK_SETTINGS_LIMITS.maxParallelAgentTasks.min}–
+              {TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
             </div>
-            <TaskLimitInput
-              label="Max Parallel Agent Tasks"
-              value={taskSettings.maxParallelAgentTasks}
-              min={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.min}
-              max={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
-              onCommit={setMaxParallelAgentTasks}
-            />
-          </div>
+          }
+        >
+          <TaskLimitInput
+            label="Max Parallel Agent Tasks"
+            value={taskSettings.maxParallelAgentTasks}
+            min={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.min}
+            max={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
+            onCommit={setMaxParallelAgentTasks}
+          />
+        </SettingRow>
 
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">Max Task Nesting Depth</div>
-              <div className="text-muted text-xs">
-                Default {TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default}, range{" "}
-                {TASK_SETTINGS_LIMITS.maxTaskNestingDepth.min}–
-                {TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
-              </div>
+        <SettingRow
+          id="max-nesting-depth"
+          hint={
+            <div className="text-muted text-xs">
+              Default {TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default}, range{" "}
+              {TASK_SETTINGS_LIMITS.maxTaskNestingDepth.min}–
+              {TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
             </div>
-            <TaskLimitInput
-              label="Max Task Nesting Depth"
-              value={taskSettings.maxTaskNestingDepth}
-              min={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.min}
-              max={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
-              onCommit={setMaxTaskNestingDepth}
-            />
-          </div>
+          }
+        >
+          <TaskLimitInput
+            label="Max Task Nesting Depth"
+            value={taskSettings.maxTaskNestingDepth}
+            min={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.min}
+            max={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
+            onCommit={setMaxTaskNestingDepth}
+          />
+        </SettingRow>
 
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
-              <div className="text-foreground text-sm">
-                Plan: Implement replaces conversation with plan
-              </div>
-              <div className="text-muted text-xs">
-                When enabled, clicking Implement on a plan proposal clears previous messages and
-                shows the plan before switching to Exec.
-              </div>
-            </div>
-            <Switch
-              checked={taskSettings.proposePlanImplementReplacesChatHistory ?? false}
-              onCheckedChange={setProposePlanImplementReplacesChatHistory}
-              aria-label="Toggle plan Implement replaces conversation with plan"
-            />
-          </div>
-        </div>
+        <SettingRow id="plan-implement-replaces">
+          <Switch
+            checked={taskSettings.proposePlanImplementReplacesChatHistory ?? false}
+            onCheckedChange={setProposePlanImplementReplacesChatHistory}
+            aria-label="Toggle plan Implement replaces conversation with plan"
+          />
+        </SettingRow>
+      </SettingsGroup>
+      {saveError ? <div className="text-danger-light text-xs">{saveError}</div> : null}
 
-        {saveError ? <div className="text-danger-light mt-4 text-xs">{saveError}</div> : null}
-      </div>
+      <SettingsGroup title="Context">
+        <CompactionStrategySetting />
+      </SettingsGroup>
 
-      <AgentResourceLimitsSettings />
+      <KeepScreenAwakeSetting />
 
-      <AgentSandboxSettings />
-
-      <div>
-        <h3 className="text-foreground mb-1 text-sm font-medium">Agent Defaults</h3>
-        <div className="text-muted text-xs">
+      <div className="px-1">
+        <h3 className="text-muted text-[11px] font-medium tracking-wider uppercase">
+          Agent defaults
+        </h3>
+        <div className="text-muted mt-1 text-xs">
           Defaults apply globally. Changing model/reasoning in a workspace creates a workspace
           override.
         </div>
@@ -1429,14 +1419,14 @@ export function TasksSection() {
 
       {uiAgents.length > 0 ? (
         <div>
-          <h4 className="text-foreground mb-3 text-sm font-medium">UI agents</h4>
+          <h4 className="text-foreground mb-3 px-1 text-sm font-medium">UI agents</h4>
           <div className="space-y-4">{uiAgents.map(renderAgentDefaults)}</div>
         </div>
       ) : null}
 
       {subagents.length > 0 || execSubagentAgent ? (
         <div>
-          <h4 className="text-foreground mb-3 text-sm font-medium">Sub-agents</h4>
+          <h4 className="text-foreground mb-3 px-1 text-sm font-medium">Sub-agents</h4>
           <div className="space-y-4">
             {execSubagentAgent ? renderExecSubagentDefaults(execSubagentAgent) : null}
             {subagents.map(renderAgentDefaults)}
@@ -1446,14 +1436,14 @@ export function TasksSection() {
 
       {internalAgents.length > 0 ? (
         <div>
-          <h4 className="text-foreground mb-3 text-sm font-medium">Internal</h4>
+          <h4 className="text-foreground mb-3 px-1 text-sm font-medium">Internal</h4>
           <div className="space-y-4">{internalAgents.map(renderAgentDefaults)}</div>
         </div>
       ) : null}
 
       {unknownAgentIds.length > 0 ? (
         <div>
-          <h4 className="text-foreground mb-3 text-sm font-medium">Unknown agents</h4>
+          <h4 className="text-foreground mb-3 px-1 text-sm font-medium">Unknown agents</h4>
           <div className="space-y-4">{unknownAgentIds.map(renderUnknownAgentDefaults)}</div>
         </div>
       ) : null}

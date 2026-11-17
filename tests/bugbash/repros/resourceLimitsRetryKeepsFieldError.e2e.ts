@@ -20,7 +20,7 @@ test(
     await browser.locator('[data-testid="settings-button"]').tap();
     const settings = screen.getByRole("dialog", "Settings");
     await expect(settings).toBeVisible({ timeout: 15_000 });
-    await settings.getByRole("button", "Agents").tap();
+    await settings.getByRole("button", "Sandbox & limits").tap();
 
     const toggle = settings.getByRole("switch", "Resource limits");
     const cpu = settings.getByRole("spinbutton", "CPU limit");
