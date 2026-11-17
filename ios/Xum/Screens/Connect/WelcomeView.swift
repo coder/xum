@@ -19,16 +19,24 @@ struct WelcomeView: View {
                 }
                 .padding(16)
             } else {
-                welcomeColumn
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 24)
-                    .padding(.top, 24)
-                    .padding(.bottom, 16)
+                // The Duo outer screen is short; scroll rather than truncate when the column won't fit.
+                ViewThatFits(in: .vertical) {
+                    compactColumn
+                    ScrollView { compactColumn }
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.xBg2)
         .onAppear(perform: checkClipboard)
+    }
+
+    private var compactColumn: some View {
+        welcomeColumn
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
+            .padding(.bottom, 16)
     }
 
     private var welcomeColumn: some View {
@@ -37,11 +45,13 @@ struct WelcomeView: View {
             Text("Connect to your Xum server")
                 .font(.xLargeTitle)
                 .foregroundStyle(Color.xText)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 36)
             Text("Agents run on your computer or dev box. This app steers them over your network, and nothing runs on the phone.")
                 .font(.system(size: 16))
                 .foregroundStyle(Color.xText2)
                 .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 10)
             steps
                 .padding(.top, 28)
@@ -86,8 +96,12 @@ struct WelcomeView: View {
             content
                 .font(.system(size: 16))
                 .foregroundStyle(Color.xText)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 16)
+        .padding(.vertical, 8)
         .frame(minHeight: 58)
     }
 

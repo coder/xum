@@ -56,6 +56,8 @@ enum ToolMeta {
 /// One collapsible group card for the consecutive tool calls of a message.
 struct ToolGroupCard: View {
     let tools: [ToolCall]
+    /// The tool shown in the regular-width inspector, highlighted in `accentSoft`.
+    var inspectedId: String?
     var onTap: (ToolCall) -> Void = { _ in }
 
     @State private var expanded = true
@@ -79,6 +81,10 @@ struct ToolGroupCard: View {
                 VStack(spacing: 0) {
                     ForEach(tools) { tool in
                         ToolRow(tool: tool) { onTap(tool) }
+                            .background(
+                                tool.id == inspectedId ? Color.xAccentSoft : .clear,
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            )
                     }
                 }
                 .padding(.bottom, 6)

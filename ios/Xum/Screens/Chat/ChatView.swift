@@ -200,7 +200,10 @@ struct ChatView: View {
         case .reasoning(let text, let live):
             ThinkingBlock(text: text, startedAt: m.reasoningStartedAt, endedAt: m.reasoningEndedAt, isStreaming: live)
         case .tools(let tools):
-            ToolGroupCard(tools: tools) { selectedTool = $0 }
+            ToolGroupCard(tools: tools, inspectedId: sizeClass == .regular ? selectedTool?.id : nil) { tool in
+                if sizeClass == .regular { withAnimation { model.splitColumns = .detailOnly } }
+                selectedTool = tool
+            }
         case .plan(let tool):
             PlanCard(
                 tool: tool,

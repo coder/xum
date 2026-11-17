@@ -4,6 +4,7 @@ import SwiftUI
 /// New chat capsule, swipe-to-archive and pull to refresh.
 struct WorkspacesView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.inSidebar) private var sidebar
     @State private var filter: WorkspaceFilter = .all
 
     var body: some View {
@@ -29,6 +30,7 @@ struct WorkspacesView: View {
         }
         .background(Color.xBg2.ignoresSafeArea())
         .navigationTitle("Workspaces")
+        .navigationBarTitleDisplayMode(sidebar ? .large : .automatic)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { ServerMenuButton() }
             ToolbarItemGroup(placement: .topBarTrailing) { trailingCapsule.foregroundStyle(Color.xText) }
@@ -69,29 +71,16 @@ struct WorkspacesView: View {
         }
     }
 
-    private func listView(_ list: WorkspaceListStore) -> some View {
+    @ViewBuilder private func listView(_ list: WorkspaceListStore) -> some View {
+        if sidebar { listBody(list).listStyle(.plain) } else { listBody(list).listStyle(.insetGrouped) }
+    }
+
+    private func listBody(_ list: WorkspaceListStore) -> some View {
         List {
             ForEach(filteredSections(list), id: \.title) { section in
                 Section {
                     ForEach(Array(section.items.enumerated()), id: \.element.id) { i, w in
-                        let row = WorkspaceRow(
-                            workspace: w,
-                            activity: list.activity[w.id],
-                            attention: list.attention[w.id],
-                            isFirst: i == 0,
-                            isLast: i == section.items.count - 1,
-                            selected: model.selectedWorkspaceId == w.id,
-                            diff: list.diffStats[w.id]
-                        )
-                        row
-                            .onTapGesture { model.open(w.id) }
-                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                Button(role: .destructive) {
-                                    Task { await archive(w, in: list) }
-                                } label: {
-                                    Label("Archive", systemImage: "archivebox")
-                                }
-                            }
+                        row(w, index: i, count: section.items.count, list: list)
                     }
                 } header: {
                     SectionCaption(text: "\(section.title) · \(section.items.count)")
@@ -99,9 +88,30 @@ struct WorkspacesView: View {
                 }
             }
         }
-        .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
         .refreshable { await list.refresh() }
+    }
+
+    private func row(_ w: Workspace, index i: Int, count: Int, list: WorkspaceListStore) -> some View {
+        let selected = sidebar && model.shownWorkspaceId == w.id
+        return WorkspaceRow(
+            workspace: w,
+            activity: list.activity[w.id],
+            attention: list.attention[w.id],
+            isFirst: i == 0,
+            isLast: i == count - 1,
+            selected: selected,
+            diff: list.diffStats[w.id],
+            sidebar: sidebar
+        )
+        .onTapGesture { model.open(w.id) }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(role: .destructive) {
+                Task { await archive(w, in: list) }
+            } label: {
+                Label("Archive", systemImage: "archivebox")
+            }
+        }
     }
 
     private func filteredSections(_ list: WorkspaceListStore) -> [(title: String, projectPath: String?, items: [Workspace])] {
@@ -196,6 +206,7 @@ struct WorkspaceRow: View {
     let isLast: Bool
     let selected: Bool
     var diff: (added: Int, removed: Int)?
+    var sidebar = false
 
     private var waiting: Bool { attention?.isWaiting ?? false }
 
@@ -211,7 +222,7 @@ struct WorkspaceRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(workspace.displayName)
                         .font(workspace.isScratch ? .system(size: 16) : .xMono(15, weight: waiting ? .bold : .medium))
-                        .foregroundStyle(Color.xText)
+                        .foregroundStyle(selected ? Color.xAccent : Color.xText)
                         .lineLimit(1)
                     statusLine
                 }
@@ -231,11 +242,22 @@ struct WorkspaceRow: View {
                     }
                 }
             }
-            .padding(.horizontal, 16)
-            .frame(minHeight: workspace.isScratch ? 60 : 70)
+            .padding(.horizontal, sidebar ? 12 : 16)
+            .frame(minHeight: sidebar ? 52 : (workspace.isScratch ? 60 : 70))
         }
-        .listRowInsets(EdgeInsets())
-        .listRowBackground(ZStack { Color.xCell; if selected { Color.xAccentSoft } })
+        .listRowInsets(sidebar ? EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8) : EdgeInsets())
+        .listRowSeparator(sidebar ? .hidden : .automatic)
+        .listRowBackground(background)
+    }
+
+    @ViewBuilder private var background: some View {
+        if sidebar {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(selected ? Color.xAccentSoft : .clear)
+                .padding(.horizontal, 8)
+        } else {
+            ZStack { Color.xCell; if selected { Color.xAccentSoft } }
+        }
     }
 
     private var shape: some Shape {

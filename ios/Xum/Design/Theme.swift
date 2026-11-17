@@ -3,7 +3,9 @@ import UIKit
 
 /// Colour tokens from the design package (docs/02-design-system.md §2). Views read these,
 /// never raw hex values.
-extension Color {
+/// Dynamic colors resolve on SwiftUI's async render thread, so these must not be MainActor
+/// isolated (the default here); an isolated provider closure traps in `dispatch_assert_queue`.
+nonisolated extension Color {
     static let xBg = dyn(light: 0xFFFFFF, dark: (9, 11, 11))
     static let xBg2 = dyn(light: 0xF4F4F5, dark: (9, 11, 11))
     static let xCell = dyn(light: 0xFFFFFF, dark: 0x18181B)
@@ -52,7 +54,7 @@ extension Color {
     }
 }
 
-extension UIColor {
+nonisolated extension UIColor {
     convenience init(hex: Int) {
         self.init(red: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255, blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
     }

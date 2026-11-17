@@ -32,6 +32,11 @@ final class AppModel {
     var path: [String] = []
     /// Regular layout: the selected workspace beside the list.
     var selectedWorkspaceId: String?
+    /// Regular layout sidebar visibility; the tool inspector hides the sidebar so the chat keeps
+    /// its column (docs/04 §2, screen 01).
+    var splitColumns: NavigationSplitViewVisibility = .all
+    /// Regular layout never shows an empty detail once the list loads: it falls back to the top row.
+    var shownWorkspaceId: String? { selectedWorkspaceId ?? list?.sections.first?.items.first?.id }
 
     /// Composer defaults (the server stores per-workspace settings; these seed new chats).
     var defaultModel = "anthropic:claude-opus-5-5"

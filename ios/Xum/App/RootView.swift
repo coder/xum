@@ -67,19 +67,28 @@ struct CompactRootView: View {
 /// bar turned into a segmented capsule at its bottom (docs/04 §1); the detail stays clean.
 struct RegularRootView: View {
     @Environment(AppModel.self) private var model
-    @State private var columns: NavigationSplitViewVisibility = .all
-
     var body: some View {
-        NavigationSplitView(columnVisibility: $columns) {
+        @Bindable var model = model
+        NavigationSplitView(columnVisibility: $model.splitColumns) {
             NavigationStack {
                 sidebarContent
+                    .toolbar(removing: .sidebarToggle)
+                    .environment(\.inSidebar, true)
                     .safeAreaInset(edge: .bottom) { SidebarTabs().padding(.horizontal, 12).padding(.bottom, 8) }
             }
             .navigationSplitViewColumnWidth(min: 290, ideal: 320, max: 360)
         } detail: {
-            NavigationStack {
-                detail
-            }
+            detail
+                .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        Button {
+                            withAnimation { model.splitColumns = model.splitColumns == .detailOnly ? .all : .detailOnly }
+                        } label: {
+                            Image(systemName: "sidebar.left")
+                        }
+                        .accessibilityLabel(model.splitColumns == .detailOnly ? "Show sidebar" : "Hide sidebar")
+                    }
+                }
         }
         .navigationSplitViewStyle(.balanced)
     }
@@ -94,7 +103,7 @@ struct RegularRootView: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let id = model.selectedWorkspaceId {
+        if let id = model.shownWorkspaceId {
             ChatView(workspaceId: id).id(id)
         } else {
             ContentUnavailableView("Pick a workspace", systemImage: "folder", description: Text("Its chat opens here."))
@@ -143,4 +152,10 @@ struct SidebarTabs: View {
         .background(Color.xFill2, in: Capsule())
         .glassEffect(.regular, in: .capsule)
     }
+}
+
+extension EnvironmentValues {
+    /// The split view's sidebar column reports a compact size class, so screens shown there
+    /// (Workspaces) read this to switch to the sidebar row style.
+    @Entry var inSidebar = false
 }
