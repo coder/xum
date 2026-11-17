@@ -32,6 +32,7 @@ struct Composer: View {
                 ScrollView(.horizontal, showsIndicators: false) { chips }
                     .layoutPriority(-1)
                 Spacer(minLength: 0)
+                contextChip
                 attachButton
                 sendStopButton
             }
@@ -46,7 +47,7 @@ struct Composer: View {
     }
 
     private var chips: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             chip {
                 HStack(spacing: 6) {
                     StatusDot(color: AgentOption.color(agent), size: 8)
@@ -63,7 +64,6 @@ struct Composer: View {
                 }
             }
             chip { Text(thinking.chip) }
-            contextChip
         }
     }
 
@@ -73,7 +73,7 @@ struct Composer: View {
                 .font(.system(size: 15, weight: .medium))
                 .lineLimit(1)
                 .fixedSize()
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 9)
                 .frame(height: 32)
                 .background(Color.xFill2, in: Capsule())
                 .contentShape(Capsule())
@@ -95,7 +95,7 @@ struct Composer: View {
         Button { } label: {
             Image(systemName: "paperclip")
                 .font(.system(size: 17))
-                .frame(width: 34, height: 34)
+                .frame(width: 30, height: 34)
                 .contentShape(Rectangle())
         }
         .foregroundStyle(Color.xText2)
