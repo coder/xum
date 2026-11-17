@@ -10,7 +10,12 @@ import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStor
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { NO_RUNNABLE_PLAN_MESSAGE, runLatestPlanAction } from "@/browser/utils/latestPlanAction";
 import { openInEditor } from "@/browser/utils/openInEditor";
-import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  isCommandPaletteTarget,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { getPlanTabScrollTopKey } from "@/common/constants/storage";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TAB_ICONS } from "./Tabs/tabIcons";
@@ -145,12 +150,15 @@ function PlanTabBody(props: PlanTabProps) {
     if (hasPlan) void copyToClipboard(content ?? "");
   };
 
-  // Opened by its shortcut: take focus so the single-key shortcuts below work at once.
+  // Opened by its shortcut: take focus so the single-key shortcuts below work at once. Never
+  // from the command palette, which renders no modal dialog but keeps its keystrokes: checked
+  // here, where focus moves, so every way of requesting it (the open shortcut, a Ctrl/Cmd+1-9
+  // tab switch, the Stats row) is covered.
   const panelRef = useRef<HTMLDivElement>(null);
   const { autoFocus, onAutoFocusConsumed } = props;
   useEffect(() => {
     if (autoFocus !== true) return;
-    panelRef.current?.focus();
+    if (!isCommandPaletteTarget(document.activeElement)) panelRef.current?.focus();
     onAutoFocusConsumed?.();
   }, [autoFocus, onAutoFocusConsumed]);
 

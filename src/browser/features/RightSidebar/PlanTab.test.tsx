@@ -349,6 +349,30 @@ describe("PlanTab", () => {
     expect(consumed).toHaveBeenCalledTimes(1);
   });
 
+  test("leaves focus in the command palette when asked to take it", async () => {
+    mockApi = { workspace: { getPlanContent: mock(() => Promise.resolve(planResult("# Plan"))) } };
+    const palette = document.createElement("div");
+    palette.setAttribute("cmdk-root", "");
+    const paletteInput = document.createElement("input");
+    palette.append(paletteInput);
+    document.body.append(palette);
+    paletteInput.focus();
+    try {
+      const consumed = mock(() => undefined);
+      const view = renderWithApi(
+        <PlanTab workspaceId="workspace-1" autoFocus onAutoFocusConsumed={consumed} />
+      );
+      await waitFor(() => {
+        expect(view.getByTestId("plan-markdown-core").textContent).toContain("# Plan");
+      });
+      // The request is consumed, so the panel does not take focus later either.
+      expect(consumed).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(paletteInput);
+    } finally {
+      palette.remove();
+    }
+  });
+
   test("renders API-unavailable state when not connected", async () => {
     mockApi = null;
 
