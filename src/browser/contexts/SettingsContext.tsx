@@ -68,6 +68,11 @@ export function useSettings(): SettingsContextValue {
   return ctx;
 }
 
+/** For components that can also render outside Settings (stories, isolated tests). */
+export function useOptionalSettings(): SettingsContextValue | null {
+  return useContext(SettingsContext);
+}
+
 const DEFAULT_SECTION = "general";
 
 export function SettingsProvider(props: { children: ReactNode }) {
@@ -77,7 +82,6 @@ export function SettingsProvider(props: { children: ReactNode }) {
   const [runtimesProjectPath, setRuntimesProjectPath] = useState<string | null>(null);
   const [secretsProjectPath, setSecretsProjectPath] = useState<string | null>(null);
   const [instructionsProjectPath, setInstructionsProjectPath] = useState<string | null>(null);
-  const [openedWithoutSection, setOpenedWithoutSection] = useState(false);
 
   const closeCallbacksRef = useRef(new Set<() => void>());
 
@@ -87,7 +91,6 @@ export function SettingsProvider(props: { children: ReactNode }) {
   const open = useCallback(
     (section?: string, options?: OpenSettingsOptions) => {
       const nextSection = section ?? DEFAULT_SECTION;
-      setOpenedWithoutSection(section == null);
       if (nextSection === "providers") {
         setProvidersExpandedProvider(options?.expandProvider ?? null);
         setProvidersStartCoderLogin(options?.startCoderLogin ?? false);
@@ -110,7 +113,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       } else {
         setInstructionsProjectPath(null);
       }
-      router.navigateToSettings(nextSection);
+      router.navigateToSettings(nextSection, { sectionless: section == null });
     },
     [router]
   );
@@ -187,7 +190,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       setSecretsProjectPath,
       instructionsProjectPath,
       setInstructionsProjectPath,
-      openedWithoutSection,
+      openedWithoutSection: router.currentSettingsSectionless,
     }),
     [
       isOpen,
@@ -201,7 +204,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       runtimesProjectPath,
       secretsProjectPath,
       instructionsProjectPath,
-      openedWithoutSection,
+      router.currentSettingsSectionless,
     ]
   );
 

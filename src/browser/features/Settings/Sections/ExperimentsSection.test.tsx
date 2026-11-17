@@ -61,6 +61,7 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { ExperimentsSection, PortableDesktopExperimentWarning } from "./ExperimentsSection";
+import { MemoryConsolidationGroup } from "./MemorySection";
 
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
@@ -221,25 +222,39 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(experimentValues[EXPERIMENT_IDS.MEMORY_CONSOLIDATION]).toBe(true);
   });
 
+  // The dream limits moved from under Memory Consolidation in Experiments to Settings → Memory.
   test.each(["Dream cost ceiling", "Dream edit limit", "Dream run timeout"])(
-    "shows the %s field under Memory Consolidation only while that experiment is on",
+    "shows the %s field in Memory only while Memory Consolidation is on",
     (label) => {
       experimentEnabled = false;
       experimentValues = {
         [EXPERIMENT_IDS.MEMORY]: true,
         [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: false,
       };
-      const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+      const view = render(<MemoryConsolidationGroup />, { wrapper: ApiWrapper });
       expect(view.queryByLabelText(label)).toBeNull();
 
       experimentValues = {
         [EXPERIMENT_IDS.MEMORY]: true,
         [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
       };
-      view.rerender(<ExperimentsSection />);
+      view.rerender(<MemoryConsolidationGroup />);
       expect(view.getByLabelText(label)).toBeTruthy();
     }
   );
+
+  test("Experiments keeps only the switches of experiments whose options moved", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.MEMORY]: true,
+      [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
+      [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: true,
+    };
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+    expect(view.getByLabelText("Toggle Memory Consolidation")).toBeTruthy();
+    expect(view.queryByLabelText("Dream cost ceiling")).toBeNull();
+    expect(view.queryByText("Bind host")).toBeNull();
+  });
 
   test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {
     experimentEnabled = false;

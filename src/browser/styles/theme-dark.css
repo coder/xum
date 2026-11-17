@@ -190,7 +190,9 @@
     /* Status */
     --color-interrupted: hsl(0 0% 53%);
     --color-backgrounded: hsl(200 70% 55%); /* cyan-ish blue for backgrounded processes */
-    --color-review-accent: hsl(210 100% 65%); /* sky blue — distinct from amber/yellow warning states */
+    --color-review-accent: hsl(
+      210 100% 65%
+    ); /* sky blue — distinct from amber/yellow warning states */
     --color-git-dirty: hsl(38 92% 50%);
     --color-error: hsl(0 70% 50%);
     --color-error-bg: hsl(0 32% 18%);
@@ -225,7 +227,7 @@
     --color-border-subtle: hsl(0 0% 40%); /* #666 - subtle border */
     --color-border-gray: hsl(240 1% 31%); /* #4e4e52 - gray border */
 
-    --color-dark: #1D1D1D; /* dark backgrounds */
+    --color-dark: #1d1d1d; /* dark backgrounds */
     --color-darker: hsl(0 0% 8.6%); /* #161616 - darker backgrounds */
     --color-hover: hsl(0 0% 16.5%); /* #2a2a2b - hover states */
     --color-bg-medium: hsl(0 0% 27%); /* #454545 - medium bg */
@@ -240,9 +242,17 @@
       theme's palette rather than introducing a fixed dark popover. */
     --color-tooltip-bg: color-mix(in srgb, var(--color-modal-bg) 88%, var(--color-background) 12%);
     --color-tooltip-border: color-mix(in srgb, var(--color-foreground) 16%, transparent);
-    --color-tooltip-foreground: color-mix(in srgb, var(--color-foreground) 92%, var(--color-content-primary) 8%);
-    --shadow-tooltip: 0 12px 30px hsl(0 0% 0% / 0.28), 0 3px 10px hsl(0 0% 0% / 0.2), inset 0 1px 0 hsl(0 0% 100% / 0.04);
-    --color-inline-code-dark-bg: hsl(0 0% 18%); /* #2d2d30 - always dark, for inline code that should stay dark in all themes */
+    --color-tooltip-foreground: color-mix(
+      in srgb,
+      var(--color-foreground) 92%,
+      var(--color-content-primary) 8%
+    );
+    --shadow-tooltip:
+      0 12px 30px hsl(0 0% 0% / 0.28), 0 3px 10px hsl(0 0% 0% / 0.2),
+      inset 0 1px 0 hsl(0 0% 100% / 0.04);
+    --color-inline-code-dark-bg: hsl(
+      0 0% 18%
+    ); /* #2d2d30 - always dark, for inline code that should stay dark in all themes */
 
     --color-accent: hsl(207 100% 40%); /* #007acc - VS Code blue */
     --color-accent-hover: hsl(207 100% 45%); /* #1177bb - accent hover */
@@ -304,7 +314,9 @@
 
     /* Toast and notification backgrounds */
     /* Use solid colors to avoid transparency bleed from underlying elements */
-    --color-toast-success-bg: hsl(207 42% 18%); /* solid approximation of #0e639c @ 13% on dark bg */
+    --color-toast-success-bg: hsl(
+      207 42% 18%
+    ); /* solid approximation of #0e639c @ 13% on dark bg */
     --color-toast-success-text: hsl(207 100% 60%); /* #3794ff */
     --color-toast-error-bg: hsl(5 35% 20%); /* solid approximation of #f14836 @ 15% on dark bg */
     --color-toast-error-text: hsl(5 89% 60%); /* #f14836 */
@@ -367,4 +379,22 @@
   --font-monospace:
     "Monaco", "Menlo", "Geist Mono", "Ubuntu Mono", "Consolas", "Courier New", monospace,
     "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+}
+
+/* Settings dialog surfaces. Defined here (shared with the VS Code webview, which can import
+   Settings code) rather than in globals.css. The rest of the app sits on the surface tokens
+   (sidebar, main pane), while settings sections were written against the older gray background
+   tokens and looked gray inside the dialog. Remapping those tokens for the dialog's subtree gives every section,
+   converted to the shared settings layout or not, the same surfaces in every theme. */
+.settings-surfaces {
+  --color-background: var(--color-surface-primary);
+  --color-background-secondary: var(--color-surface-secondary);
+  --color-modal-bg: var(--color-surface-secondary);
+  --color-hover: var(--color-surface-tertiary);
+}
+
+/* Settings search: the row or block a result opened (SettingsAnchor, SettingsMark). */
+[data-search-focused="true"] {
+  background-color: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 60%, transparent);
 }

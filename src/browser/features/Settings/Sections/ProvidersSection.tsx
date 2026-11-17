@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { SettingsAnchor } from "../Components/SettingsLayout";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { providerAnchorId } from "../settingsRegistry";
 import {
   Check,
@@ -575,6 +575,7 @@ function GatewayRoutePriorityList({
 
   return (
     <div className="border-border-medium bg-background-secondary/50 space-y-2 rounded-md border px-3 py-2">
+      <SettingsMark id="provider-route-priority" />
       <div>
         <div className="text-foreground text-xs font-medium">Route priority</div>
         <div className="text-muted text-xs">Drag to choose gateway order for auto routing.</div>
@@ -1849,9 +1850,7 @@ export function ProvidersSection() {
                 >
                   {/* Scroll target for a settings search result; the expanded card is the
                       highlight, so the anchor itself takes no space. */}
-                  <SettingsAnchor id={providerAnchorId(provider)} className="h-0">
-                    {null}
-                  </SettingsAnchor>
+                  <SettingsMark id={providerAnchorId(provider)} />
                   {/* Provider header */}
                   <Button
                     variant="ghost"
@@ -3031,6 +3030,7 @@ export function ProvidersSection() {
                       overflows the button. */}
                   <div className="min-w-0">
                     <div className="text-foreground text-xs font-medium">Add a custom provider</div>
+                    <SettingsMark id="custom-provider-add" />
                     <div className="text-muted text-xs">
                       Add providers that use OpenAI Chat Completions, OpenAI Responses, or Anthropic
                       Messages.
@@ -3201,6 +3201,7 @@ export function ProvidersSection() {
       {showTypeSafeProvider && (
         <div className="space-y-2">
           <div className="text-muted text-xs font-medium tracking-wide uppercase">Evaluation</div>
+          <SettingsMark id="evaluation-credential" />
           <TypeSafeProviderCard
             expanded={expandedProvider === TYPESAFE_PROVIDER_KEY}
             onToggle={() => handleToggleProvider(TYPESAFE_PROVIDER_KEY)}
@@ -3210,6 +3211,7 @@ export function ProvidersSection() {
 
       <div className="space-y-2 pt-2">
         <div className="text-muted text-xs font-medium tracking-wide uppercase">Bash commands</div>
+        <SettingsMark id="bash-ai-calls" />
         <ConfigSwitchSetting
           title="Count AI calls from bash commands"
           description={

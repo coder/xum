@@ -276,6 +276,8 @@ export const PhoneFullScreen: AppStory = {
 // Search: Ctrl+F focuses the field, every query word must match, arrows move the active result
 // and Enter opens its section with the matching row highlighted. Escape clears, then closes.
 export const SearchSettings: AppStory = {
+  // An interaction contract: the snapshot budget goes to the section and phone stories.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
   play: async ({ canvasElement }) => {
     const dialog = await openSettingsDialog(canvasElement);

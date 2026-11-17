@@ -103,10 +103,15 @@ export function SettingsSearchResults(props: {
   onHover: (index: number) => void;
 }) {
   if (props.groups.length === 0) {
+    // The combobox stays expanded while a query is typed, so its listbox stays in the DOM (empty)
+    // and the empty state is announced as a status.
     return (
-      <div className="text-content-secondary px-1 py-6 text-sm">
-        No settings match &ldquo;{props.query.trim()}&rdquo;.
-      </div>
+      <>
+        <div id={SETTINGS_SEARCH_LISTBOX_ID} role="listbox" aria-label="Settings search results" />
+        <div role="status" className="text-content-secondary px-1 py-6 text-sm">
+          No settings match &ldquo;{props.query.trim()}&rdquo;.
+        </div>
+      </>
     );
   }
 

@@ -88,7 +88,6 @@
   list-style-type: decimal;
 }
 
-
 .markdown-content.user-message-markdown ul,
 .markdown-content.user-message-markdown ol {
   margin: 0;
@@ -102,7 +101,6 @@
   padding: 0 0 4px 0;
   display: list-item;
 }
-
 
 .markdown-content code {
   background: rgba(0, 0, 0, 0);
@@ -408,7 +406,6 @@ span.search-highlight {
   transition: opacity 0.2s;
 }
 
-
 .code-run-button {
   position: absolute;
   bottom: 8px;
@@ -447,7 +444,6 @@ span.search-highlight {
   transform: translateY(-50%);
   padding: 2px 4px;
 }
-
 
 .code-block-single-line .code-run-button .copy-icon {
   width: 12px;

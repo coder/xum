@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import {
   ArchiveRestore,
   Blocks,
@@ -302,7 +303,27 @@ export interface SettingDefinition {
   parent?: string;
   /** Platform where the row exists at all; search hides it elsewhere. */
   platform?: "desktop" | "browser";
+  /** Experiment that must be on for the row to exist; search hides it otherwise. */
+  experiment?: ExperimentId;
+  /** Provider whose card holds the field: search opens Providers with that card expanded. */
+  expandProvider?: string;
+  /** `data-setting-id` to scroll to when it is not the definition's own id (a provider card). */
+  anchor?: string;
 }
+
+const providerField = (
+  provider: string,
+  label: string,
+  description: string,
+  keywords: readonly string[] = []
+): SettingDefinition => ({
+  section: "providers",
+  label,
+  description,
+  keywords: [provider, ...keywords],
+  expandProvider: provider,
+  anchor: `provider:${provider}`,
+});
 
 /**
  * Settings rendered by SettingRow, keyed by id. Labels keep their existing wording so muscle
@@ -493,9 +514,346 @@ export const SETTING_DEFINITIONS = {
     description: "Parent folder for new projects and cloned repositories",
     keywords: ["clone", "folder", "path", "projects"],
   },
+
+  // Fields inside sections that keep their own layout: each block carries a SettingsMark with
+  // the same id, so search scrolls to it and highlights it.
+  "runtime-scope": {
+    section: "runtimes",
+    label: "Runtime scope",
+    description: "Manage runtimes globally or per project.",
+    keywords: ["project override", "override project settings"],
+  },
+  "default-isolation": {
+    section: "runtimes",
+    label: "Default isolation",
+    description: "Where new workspaces run, and how they are isolated.",
+    keywords: ["local", "ssh", "coder", "worktree", "docker", "dev container", "new workspace"],
+  },
+  "project-isolation": {
+    section: "runtimes",
+    label: "Project isolation",
+    description: "Where workspaces run: SSH hosts and Coder workspaces.",
+    keywords: ["ssh", "remote host", "coder workspace", "template"],
+  },
+  "workspace-isolation": {
+    section: "runtimes",
+    label: "Workspace isolation",
+    description: "How each workspace is separated: none, worktree, Docker or dev container.",
+    keywords: ["worktree", "docker", "container", "devcontainer", "dev container", "image"],
+  },
+  "agent-sandbox": {
+    section: "sandbox",
+    label: "Run agent commands in a sandbox",
+    description: "macOS only. Writes stay in the workspace; credentials stay hidden.",
+    keywords: ["sandbox", "network", "allowed hosts", "loopback", "any host", "seatbelt"],
+  },
+  "resource-limits": {
+    section: "sandbox",
+    label: "Resource limits",
+    description: "CPU and memory that all local agent commands share (Linux, cgroup v2).",
+    keywords: ["cpu limit", "memory limit", "cores", "gib", "cgroup"],
+  },
+  "artifacts-cdn": {
+    section: "sandbox",
+    label: "Allow CDN assets in artifacts",
+    description:
+      "HTML and SVG artifacts run in a sandbox whose content policy blocks network requests, except scripts, styles and fonts from a few public CDNs (cdnjs, unpkg, jsDelivr, jQuery, Tailwind) and Google Fonts. Turn this off to block every CDN.",
+    keywords: ["artifacts", "content security policy", "csp", "scripts", "fonts"],
+    experiment: EXPERIMENT_IDS.ARTIFACTS,
+  },
+  "agent-defaults": {
+    section: "tasks",
+    label: "Agent defaults",
+    description: "Model, reasoning and prompt cache per agent.",
+    keywords: ["model", "reasoning", "thinking", "prompt cache", "exec", "plan", "sub-agents"],
+  },
+  "heartbeat-enable": {
+    section: "heartbeat",
+    label: "Let agents set up their own heartbeats",
+    description: "Give agents a heartbeat tool to schedule recurring follow-ups.",
+    keywords: ["heartbeat tool", "recurring", "follow-up"],
+  },
+  "heartbeat-interval": {
+    section: "heartbeat",
+    label: "Default heartbeat interval",
+    description: "Minutes between heartbeats for workspaces without their own interval.",
+    keywords: ["minutes", "threshold"],
+  },
+  "heartbeat-prompt": {
+    section: "heartbeat",
+    label: "Default heartbeat prompt",
+    description: "Used when a workspace does not set its own heartbeat message.",
+    keywords: ["message"],
+  },
+  "custom-instructions": {
+    section: "instructions",
+    label: "Custom instructions",
+    description: "Appended to the system prompt of every workspace in the selected project.",
+    keywords: ["system prompt", "rules", "AGENTS.md", "project"],
+  },
+  "provider-route-priority": {
+    section: "providers",
+    label: "Gateway route priority",
+    description: "Drag to choose gateway order for auto routing.",
+    keywords: ["gateway", "order", "routing"],
+  },
+  "custom-provider-add": {
+    section: "providers",
+    label: "Add a custom provider",
+    description:
+      "Providers that use OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages.",
+    keywords: ["openai compatible", "base url", "api format", "self-hosted"],
+  },
+  "bash-ai-calls": {
+    section: "providers",
+    label: "Count AI calls from bash commands",
+    description: "Include model calls made by agent shell commands in usage and costs.",
+    keywords: ["costs", "usage", "proxy", "billing"],
+  },
+  "evaluation-credential": {
+    section: "providers",
+    label: "Evaluation API key",
+    description: "Credential for the Auto model and thinking routing evaluation.",
+    keywords: ["typesafe", "auto routing"],
+    experiment: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+  },
+  "anthropic-cache-ttl": providerField(
+    "anthropic",
+    "Prompt cache TTL",
+    "How long Anthropic keeps cached prompts.",
+    ["1 hour", "5 minutes"]
+  ),
+  "anthropic-beta": providerField(
+    "anthropic",
+    "Anthropic beta features",
+    "Opt in to beta features."
+  ),
+  "openai-oauth": providerField(
+    "openai",
+    "ChatGPT (Codex) OAuth",
+    "Sign in with ChatGPT to use your plan.",
+    ["login", "codex", "chatgpt"]
+  ),
+  "openai-default-auth": providerField(
+    "openai",
+    "Default auth",
+    "Use ChatGPT OAuth or the OpenAI API key when both are set."
+  ),
+  "openai-service-tier": providerField("openai", "Service tier", "OpenAI service tier.", [
+    "flex",
+    "priority",
+  ]),
+  "openai-wire-format": providerField("openai", "Wire format", "Responses or Chat Completions.", [
+    "responses",
+    "chat completions",
+  ]),
+  "openai-websocket": providerField(
+    "openai",
+    "WebSocket transport",
+    "Use OpenAI's Responses WebSocket transport (experimental)."
+  ),
+  "openai-cyber": providerField("openai", "Enable cyber model", "Show a Cyber thinking option."),
+  "openai-response-storage": providerField(
+    "openai",
+    "Response storage",
+    "Whether OpenAI stores responses.",
+    ["store"]
+  ),
+  "xai-processing-mode": providerField("xai", "Processing mode", "Standard or fast (priority).", [
+    "grok",
+  ]),
+  "copilot-login": providerField(
+    "github-copilot",
+    "GitHub Copilot login",
+    "Sign in to GitHub Copilot.",
+    ["copilot", "oauth"]
+  ),
+  "coder-login": providerField("coder", "Coder login", "Connect Xum to your Coder deployment.", [
+    "deployment url",
+    "oauth",
+  ]),
+  "coder-model-routing": providerField(
+    "coder",
+    "Coder model routing",
+    "Which Coder provider native models use when route priority picks Coder."
+  ),
+  "bedrock-credentials": providerField(
+    "bedrock",
+    "Bedrock credentials",
+    "Region, AWS profile, bearer token or access keys.",
+    ["aws", "region", "profile", "access key"]
+  ),
+  "vertex-credentials": providerField(
+    "google-vertex",
+    "Vertex AI credentials",
+    "Project, location and service account key file.",
+    ["gcp", "service account", "location"]
+  ),
+  "models-filter": {
+    section: "models",
+    label: "Filter models",
+    description: "Find a model in the custom and built-in lists.",
+    keywords: ["search"],
+  },
+  "custom-models": {
+    section: "models",
+    label: "Custom models",
+    description: "Add a model by id, set its context window, route and minimum thinking.",
+    keywords: ["add model", "model id", "context window", "1m context", "default model", "hide"],
+  },
+  "built-in-models": {
+    section: "models",
+    label: "Built-in models",
+    description: "Show, hide or set the default among the built-in models.",
+    keywords: ["default model", "hide model", "context window", "min thinking"],
+  },
+  "model-fallbacks": {
+    section: "models",
+    label: "Model fallbacks",
+    description: "When a model refuses to respond, retry the turn with other models in order.",
+    keywords: ["refuses", "retry", "fallback chain"],
+  },
+  "auto-routing": {
+    section: "models",
+    label: "Auto routing tiers",
+    description: "Evaluation model and the difficulty tiers Auto picks between.",
+    keywords: ["evaluation model", "difficulty", "tiers", "classify", "auto"],
+    experiment: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+  },
+  "mcp-tool-search": {
+    section: "mcp",
+    label: "Tool search",
+    description: "Defer MCP tool definitions until the model discovers them.",
+    keywords: ["tool_catalog_search", "deferred loading"],
+  },
+  "mcp-servers": {
+    section: "mcp",
+    label: "MCP servers",
+    description: "Enable, test, edit or remove configured servers; OAuth and tool allowlists.",
+    keywords: ["oauth", "allowlist", "tools", "view domains"],
+  },
+  "mcp-add-server": {
+    section: "mcp",
+    label: "Add MCP server",
+    description: "Name, transport (stdio, HTTP, SSE), command or URL, headers.",
+    keywords: ["stdio", "http", "sse", "transport", "headers", "command", "url"],
+  },
+  "claude-design": {
+    section: "mcp",
+    label: "Claude Design",
+    description: "Reuse Claude Code credentials read-only for Claude Design.",
+    keywords: ["keychain", "credentials"],
+    experiment: EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+  },
+  "plugins-installed": {
+    section: "plugins",
+    label: "Installed plugins",
+    description: "Add, update, review components and hooks, or uninstall plugins.",
+    keywords: ["add plugin", "install", "update all", "check for updates", "uninstall", "hooks"],
+  },
+  "secrets-editor": {
+    section: "secrets",
+    label: "Secrets",
+    description: "Add secrets globally or per project, and choose which are injected.",
+    keywords: ["add secret", "inject", "environment variables", "env", "global", "project"],
+  },
+  "project-trust": {
+    section: "security",
+    label: "Trusted projects",
+    description: "Trusted projects can run hooks and scripts from the repository.",
+    keywords: ["trust", "revoke trust", "hooks", "scripts"],
+  },
+  "server-sessions": {
+    section: "server-access",
+    label: "Server access sessions",
+    description: "Browser sessions signed in to this server; revoke the ones you no longer trust.",
+    keywords: ["revoke", "log out", "devices", "revoke other sessions"],
+  },
+  "lan-bind": {
+    section: "server-access",
+    label: "LAN / VPN access",
+    description: "Bind host, port and web UI for the API server.",
+    keywords: ["bind host", "port", "tailscale", "0.0.0.0", "web ui", "auth token", "network"],
+    experiment: EXPERIMENT_IDS.CONFIGURABLE_BIND_URL,
+  },
+  "remote-server-url": {
+    section: "remote-connection",
+    label: "Remote server URL",
+    description: "Open a remote Xum server in a separate window.",
+    keywords: ["connect", "disconnect"],
+  },
+  "global-memories": {
+    section: "memory",
+    label: "Global memories",
+    description: "Memory files the agent shares across every project and workspace.",
+    keywords: ["memory files"],
+  },
+  "dream-cost-ceiling": {
+    section: "memory",
+    label: "Dream cost ceiling",
+    description: "Spending limit for a memory consolidation run.",
+    keywords: ["consolidation", "usd", "cost"],
+    experiment: EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+  },
+  "dream-edit-limit": {
+    section: "memory",
+    label: "Dream edit limit",
+    description: "Most memory edits one consolidation run may make.",
+    keywords: ["consolidation", "edits"],
+    experiment: EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+  },
+  "dream-run-timeout": {
+    section: "memory",
+    label: "Dream run timeout",
+    description: "Minutes a consolidation run may take.",
+    keywords: ["consolidation", "minutes"],
+    experiment: EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+  },
+  "backup-repository": {
+    section: "backup",
+    label: "Backup repository",
+    description: "Repository URL, branch and subdirectory the backup writes to.",
+    keywords: ["repository url", "branch", "subdirectory", "git", "dotfiles"],
+  },
+  "backup-contents": {
+    section: "backup",
+    label: "What to back up and restore",
+    description: "Instructions, agents, skills, memory, preferences, plugins, MCP and projects.",
+    keywords: ["instructions", "skills", "plugins", "mcp", "projects", "preferences"],
+  },
+  "backup-access": {
+    section: "backup",
+    label: "Backup repository access",
+    description: "Check that this machine can reach the backup repository.",
+    keywords: ["validate", "ssh", "credentials"],
+  },
+  "backup-preview": {
+    section: "backup",
+    label: "Preview backup changes",
+    description: "Review what a backup would write and what a restore would change.",
+    keywords: ["preview", "back up now", "restore"],
+  },
 } as const satisfies Record<string, SettingDefinition>;
 
 export type SettingId = keyof typeof SETTING_DEFINITIONS;
+
+/**
+ * Sub-experiments and the parent row they render under (they are no-ops while it is off). Order
+ * is the order they list in. Search falls back to the parent row when a child is hidden.
+ */
+export const SUB_EXPERIMENT_PARENTS: Partial<Record<ExperimentId, ExperimentId>> = {
+  [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: EXPERIMENT_IDS.MEMORY,
+  [EXPERIMENT_IDS.RLM]: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+  [EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE]: EXPERIMENT_IDS.ARTIFACTS,
+  // Lists under Agent interface view, which itself hides with Artifacts: fall back to Artifacts.
+  [EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT]: EXPERIMENT_IDS.ARTIFACTS,
+};
+
+export function subExperimentsOf(parent: ExperimentId): readonly ExperimentId[] {
+  return (Object.keys(SUB_EXPERIMENT_PARENTS) as ExperimentId[]).filter(
+    (child) => SUB_EXPERIMENT_PARENTS[child] === parent
+  );
+}
 
 /** `data-setting-id` of rows that are not SettingRows, so search can scroll to them. */
 export const experimentAnchorId = (experimentId: string) => `experiment:${experimentId}`;

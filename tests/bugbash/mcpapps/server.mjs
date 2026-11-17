@@ -109,7 +109,9 @@ function handleRequest(id, method, params) {
     // the classic initialize handshake.
     case "initialize": {
       const ext = params?.capabilities?.extensions?.["io.modelcontextprotocol/ui"];
-      log(`initialize from ${params?.clientInfo?.name ?? "?"}; MCP Apps announced: ${ext ? "yes" : "NO"}`);
+      log(
+        `initialize from ${params?.clientInfo?.name ?? "?"}; MCP Apps announced: ${ext ? "yes" : "NO"}`
+      );
       return reply(id, {
         protocolVersion: params?.protocolVersion ?? "2025-11-25",
         capabilities: { tools: {}, resources: {} },
@@ -128,7 +130,10 @@ function handleRequest(id, method, params) {
         return reply(id, result);
       } catch (error) {
         // Tool errors go back as a result so the agent can read them.
-        return reply(id, { isError: true, content: [{ type: "text", text: String(error.message) }] });
+        return reply(id, {
+          isError: true,
+          content: [{ type: "text", text: String(error.message) }],
+        });
       }
     }
     case "resources/list":

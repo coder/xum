@@ -1,10 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import {
+  formatProviderDisplayName,
+  getProviderIdsForUi,
+} from "@/common/utils/providers/customProviders";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { settingsSearchResultDomId } from "./Components/SettingsSearchResults";
 import {
   buildSettingsSearchIndex,
   groupSettingsSearchResults,
   searchSettings,
+  type SettingsSearchContext,
   type SettingsSearchResult,
 } from "./settingsSearch";
 import type { SettingsSectionMeta } from "./settingsRegistry";
@@ -18,10 +25,26 @@ function countBySection(results: readonly SettingsSearchResult[]): Map<string, n
 }
 
 /** Query, grouped results and the keyboard-active result of the settings search. */
+/** Experiments, platform and the provider list that decide which settings exist right now. */
+function useSearchContext(platform: "desktop" | "browser"): SettingsSearchContext {
+  const store = getAppConfigStore();
+  const experiments = useSyncExternalStore(store.subscribe, () => store.getSnapshot()?.experiments);
+  const { config } = useProvidersConfig();
+  return {
+    platform,
+    isExperimentEnabled: (experimentId) => experiments?.[experimentId] === true,
+    providers: getProviderIdsForUi(config).map((id) => ({
+      id,
+      label: formatProviderDisplayName(id, config?.[id]),
+    })),
+  };
+}
+
 export function useSettingsSearch(
   sections: readonly SettingsSectionMeta[],
   platform: "desktop" | "browser"
 ) {
+  const context = useSearchContext(platform);
   const { registerOnClose } = useSettings();
   const [query, setQueryState] = useState("");
   const [activeResultIndex, setActiveResultIndex] = useState(0);
@@ -29,7 +52,7 @@ export function useSettingsSearch(
   useEffect(() => registerOnClose(() => setQueryState("")), [registerOnClose]);
   const searching = query.trim().length > 0;
   const groups = groupSettingsSearchResults(
-    searchSettings(buildSettingsSearchIndex(sections, platform), sections, query)
+    searchSettings(buildSettingsSearchIndex(sections, context), sections, query)
   );
   // Keyboard order is render order (grouped by section), not raw score order.
   const ordered = groups.flatMap((group) => group.results);

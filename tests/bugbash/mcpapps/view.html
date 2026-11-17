@@ -18,32 +18,71 @@
       body {
         margin: 0;
         padding: 12px;
-        font: 13px/1.4 system-ui, sans-serif;
+        font:
+          13px/1.4 system-ui,
+          sans-serif;
         background: var(--color-background-primary);
         color: var(--color-text-primary);
       }
-      h1 { font-size: 15px; margin: 0 0 8px; }
-      .dice { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 8px;
+      }
+      .dice {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 8px 0;
+      }
       .die {
-        width: 36px; height: 36px; display: grid; place-items: center;
-        border: 1px solid var(--color-border-primary); border-radius: 6px;
-        background: var(--color-background-secondary); font-weight: 600; font-size: 16px;
-      }
-      .muted { color: var(--color-text-secondary); }
-      .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
-      button {
-        font: inherit; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+        width: 36px;
+        height: 36px;
+        display: grid;
+        place-items: center;
         border: 1px solid var(--color-border-primary);
-        background: var(--color-background-secondary); color: var(--color-text-primary);
+        border-radius: 6px;
+        background: var(--color-background-secondary);
+        font-weight: 600;
+        font-size: 16px;
       }
-      button:hover { border-color: var(--color-text-info); }
+      .muted {
+        color: var(--color-text-secondary);
+      }
+      .buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 10px 0;
+      }
+      button {
+        font: inherit;
+        padding: 4px 10px;
+        border-radius: 4px;
+        cursor: pointer;
+        border: 1px solid var(--color-border-primary);
+        background: var(--color-background-secondary);
+        color: var(--color-text-primary);
+      }
+      button:hover {
+        border-color: var(--color-text-info);
+      }
       #log {
-        margin: 0; padding: 6px; max-height: 160px; overflow: auto; font: 11px/1.4 monospace;
-        border: 1px solid var(--color-border-primary); border-radius: 4px;
-        background: var(--color-background-secondary); white-space: pre-wrap;
+        margin: 0;
+        padding: 6px;
+        max-height: 160px;
+        overflow: auto;
+        font: 11px/1.4 monospace;
+        border: 1px solid var(--color-border-primary);
+        border-radius: 4px;
+        background: var(--color-background-secondary);
+        white-space: pre-wrap;
       }
-      .err { color: var(--color-text-danger); }
-      .ok { color: var(--color-text-success); }
+      .err {
+        color: var(--color-text-danger);
+      }
+      .ok {
+        color: var(--color-text-success);
+      }
     </style>
   </head>
   <body>
@@ -52,7 +91,9 @@
     <div class="dice" id="dice"></div>
     <div class="buttons">
       <button id="reroll" title="roll_dice is app-only: no prompt">Re-roll (app-only tool)</button>
-      <button id="time" title="get_server_time is model-visible: Xum asks you">Server time (asks you)</button>
+      <button id="time" title="get_server_time is model-visible: Xum asks you">
+        Server time (asks you)
+      </button>
       <button id="message">Put result in composer</button>
       <button id="link">Open MCP Apps spec</button>
     </div>
@@ -129,7 +170,8 @@
               label: typeof args.label === "string" && args.label ? args.label : state.label,
             };
             $("title").textContent = state.label;
-            $("summary").textContent = `${state.count}d${state.sides}: waiting for the tool result…`;
+            $("summary").textContent =
+              `${state.count}d${state.sides}: waiting for the tool result…`;
             return;
           }
           case "ui/notifications/tool-result":
@@ -145,7 +187,11 @@
             return post({ jsonrpc: "2.0", id: msg.id, result: {} });
           default:
             if (msg.id !== undefined) {
-              post({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Not supported" } });
+              post({
+                jsonrpc: "2.0",
+                id: msg.id,
+                error: { code: -32601, message: "Not supported" },
+              });
             }
         }
       });
@@ -171,7 +217,10 @@
       $("time").onclick = () =>
         run("get_server_time", async () => {
           const result = await request("tools/call", { name: "get_server_time", arguments: {} });
-          log(`server time ${result.structuredContent.iso} (${result.structuredContent.timeZone})`, "ok");
+          log(
+            `server time ${result.structuredContent.iso} (${result.structuredContent.timeZone})`,
+            "ok"
+          );
         });
 
       $("message").onclick = () =>
@@ -188,7 +237,9 @@
 
       $("link").onclick = () =>
         run("ui/open-link", async () => {
-          await request("ui/open-link", { url: "https://github.com/modelcontextprotocol/ext-apps" });
+          await request("ui/open-link", {
+            url: "https://github.com/modelcontextprotocol/ext-apps",
+          });
           log("link opened", "ok");
         });
 
@@ -204,7 +255,10 @@
           appCapabilities: {},
         });
         applyContext(init.hostContext);
-        log(`connected to ${init.hostInfo?.name} (${init.hostContext?.platform}, ${init.hostContext?.theme})`, "ok");
+        log(
+          `connected to ${init.hostInfo?.name} (${init.hostContext?.platform}, ${init.hostContext?.theme})`,
+          "ok"
+        );
         notify("ui/notifications/initialized", {});
       });
     </script>

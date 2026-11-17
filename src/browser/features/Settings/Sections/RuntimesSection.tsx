@@ -71,6 +71,7 @@ import {
   SETTINGS_CARD_CLASS,
   SETTINGS_GROUP_CARD_CLASS,
   SETTINGS_GROUP_HEADING_CLASS,
+  SettingsMark,
 } from "../Components/SettingsLayout";
 
 type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
@@ -111,11 +112,14 @@ const WORKSPACE_ISOLATION_ROWS: RuntimeRow[] = WORKSPACE_ISOLATIONS.map((workspa
 const ISOLATION_ROW_GROUPS = [
   {
     title: "Project isolation",
+    // Settings search target (settingsRegistry).
+    markId: "project-isolation",
     description: "Where workspaces run. Local is always available.",
     rows: PROJECT_ISOLATION_ROWS,
   },
   {
     title: "Workspace isolation",
+    markId: "workspace-isolation",
     description: "How each workspace is separated from the others.",
     rows: WORKSPACE_ISOLATION_ROWS,
   },
@@ -599,6 +603,7 @@ export function RuntimesSection() {
   return (
     <div className="space-y-8">
       <div className={cn(SETTINGS_CARD_CLASS, "space-y-4")}>
+        <SettingsMark id="runtime-scope" />
         <div className="flex items-center justify-between gap-4">
           <div>
             <div className="text-foreground text-sm">Scope</div>
@@ -651,6 +656,7 @@ export function RuntimesSection() {
             defaultIsolationDisabled && "opacity-60"
           )}
         >
+          <SettingsMark id="default-isolation" />
           <div>
             <div className="text-foreground text-sm">Default isolation</div>
             <div className="text-muted text-xs">
@@ -724,6 +730,7 @@ export function RuntimesSection() {
 
         {ISOLATION_ROW_GROUPS.map((group) => (
           <section key={group.title} className="space-y-2 pt-4">
+            <SettingsMark id={group.markId} />
             <div className="px-1">
               <h3 className={SETTINGS_GROUP_HEADING_CLASS}>{group.title}</h3>
               <div className="text-muted mt-1 text-xs">{group.description}</div>

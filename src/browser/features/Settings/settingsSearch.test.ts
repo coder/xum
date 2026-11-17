@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { getSettingsSections } from "./SettingsPage";
-import { SETTING_DEFINITIONS, SETTINGS_SECTION_META } from "./settingsRegistry";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import {
+  SETTING_DEFINITIONS,
+  SETTINGS_SECTION_META,
+  experimentAnchorId,
+  type SettingDefinition,
+} from "./settingsRegistry";
 import {
   buildSettingsSearchIndex,
   groupSettingsSearchResults,
@@ -8,18 +16,52 @@ import {
   splitHighlights,
 } from "./settingsSearch";
 
-function search(
-  query: string,
-  options: { memory?: boolean; platform?: "desktop" | "browser" } = {}
-) {
+interface SearchOptions {
+  memory?: boolean;
+  platform?: "desktop" | "browser";
+  experiments?: ExperimentId[];
+  providers?: Array<{ id: string; label: string }>;
+}
+
+function search(query: string, options: SearchOptions = {}) {
   const sections = getSettingsSections(options.memory ?? false, false);
-  const index = buildSettingsSearchIndex(sections, options.platform ?? "desktop");
+  const enabled = new Set(options.experiments ?? []);
+  const index = buildSettingsSearchIndex(sections, {
+    platform: options.platform ?? "desktop",
+    isExperimentEnabled: (id) => enabled.has(id),
+    providers: options.providers ?? [{ id: "anthropic", label: "Anthropic" }],
+  });
   return searchSettings(index, sections, query);
 }
 
 const ids = (results: ReturnType<typeof search>) => results.map((result) => result.entry.id);
 
+/** Every Settings source file, read once: the registry test checks ids against them. */
+function settingsSources(): string {
+  const root = join(import.meta.dir);
+  const files = readdirSync(root, { recursive: true, encoding: "utf8" }).filter(
+    (file) => /\.tsx?$/.test(file) && !/\.(test|stories)\.tsx?$/.test(file)
+  );
+  return files.map((file) => readFileSync(join(root, file), "utf8")).join("\n");
+}
+
 describe("settings registry", () => {
+  test("every setting search can open has a row or mark to scroll to", () => {
+    const sources = settingsSources();
+    const definitions: Record<string, SettingDefinition> = SETTING_DEFINITIONS;
+    const missing = Object.entries(definitions)
+      // Provider fields scroll to their provider's card, which marks itself by provider id.
+      .filter(([, definition]) => definition.anchor == null)
+      .map(([id]) => id)
+      .filter(
+        (id) =>
+          !new RegExp(
+            `(SettingRow|SettingsMark|SettingsAnchor)\\s+id="${id}"|markId: "${id}"`
+          ).test(sources)
+      );
+    expect(missing).toEqual([]);
+  });
+
   test("every setting row belongs to a section the nav can show", () => {
     const sectionIds = new Set(SETTINGS_SECTION_META.map((section) => section.id));
     for (const [id, definition] of Object.entries(SETTING_DEFINITIONS)) {
@@ -28,7 +70,7 @@ describe("settings registry", () => {
   });
 
   test("a sub-option's parent is a setting in the same section", () => {
-    const definitions: Record<string, { section: string; parent?: string }> = SETTING_DEFINITIONS;
+    const definitions: Record<string, SettingDefinition> = SETTING_DEFINITIONS;
     for (const [id, definition] of Object.entries(definitions)) {
       if (!definition.parent) continue;
       expect({ id, parentSection: definitions[definition.parent]?.section }).toEqual({
@@ -90,7 +132,7 @@ describe("searchSettings", () => {
   });
 
   test("a provider name opens Providers with that provider expanded", () => {
-    const result = search("anthropic").find((r) => r.entry.kind === "provider");
+    const result = search("anthropic").find((r) => r.entry.id === "provider:anthropic");
     expect(result?.entry.sectionId).toBe("providers");
     expect(result?.entry.expandProvider).toBe("anthropic");
   });
@@ -101,6 +143,36 @@ describe("searchSettings", () => {
     const firstShortcut = results.findIndex((r) => r.entry.kind === "keybind");
     expect(firstShortcut).toBeGreaterThan(-1);
     expect(firstSetting).toBeLessThan(firstShortcut);
+  });
+
+  test("settings of an experiment appear only while it is on", () => {
+    expect(ids(search("tailscale"))).not.toContain("setting:lan-bind");
+    expect(
+      ids(search("tailscale", { experiments: [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL] }))
+    ).toContain("setting:lan-bind");
+  });
+
+  test("a configured custom provider is searchable by its display name", () => {
+    const result = search("my gateway", {
+      providers: [
+        { id: "anthropic", label: "Anthropic" },
+        { id: "corp-llm", label: "My Gateway" },
+      ],
+    }).find((r) => r.entry.kind === "provider");
+    expect(result?.entry.expandProvider).toBe("corp-llm");
+  });
+
+  test("a field inside a provider card opens that provider expanded", () => {
+    const result = search("service tier").find((r) => r.entry.id === "setting:openai-service-tier");
+    expect(result?.entry.expandProvider).toBe("openai");
+    expect(result?.entry.anchorId).toBe("provider:openai");
+  });
+
+  test("a sub-experiment falls back to its parent experiment's row", () => {
+    const result = search("memory consolidation").find(
+      (r) => r.entry.id === `experiment:${EXPERIMENT_IDS.MEMORY_CONSOLIDATION}`
+    );
+    expect(result?.entry.fallbackAnchorId).toBe(experimentAnchorId(EXPERIMENT_IDS.MEMORY));
   });
 
   test("experiments and shortcuts are searchable", () => {

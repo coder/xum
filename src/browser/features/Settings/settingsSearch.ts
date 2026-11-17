@@ -1,5 +1,4 @@
-import { EXPERIMENTS } from "@/common/constants/experiments";
-import { PROVIDER_DISPLAY_NAMES, SUPPORTED_PROVIDERS } from "@/common/constants/providers";
+import { EXPERIMENTS, type ExperimentId } from "@/common/constants/experiments";
 import { KEYBINDS, formatKeybind, isKeybindDeprecated } from "@/browser/utils/ui/keybinds";
 import { KEYBIND_GROUPS, KEYBIND_LABELS } from "./Sections/KeybindsSection";
 import {
@@ -8,6 +7,7 @@ import {
   experimentAnchorId,
   keybindAnchorId,
   providerAnchorId,
+  SUB_EXPERIMENT_PARENTS,
   type SettingDefinition,
   type SettingsSectionMeta,
 } from "./settingsRegistry";
@@ -49,14 +49,27 @@ function sectionEntries(sections: readonly SettingsSectionMeta[]): SettingsSearc
   }));
 }
 
+/** What decides which settings exist here, beyond which sections are visible. */
+export interface SettingsSearchContext {
+  platform: "desktop" | "browser";
+  isExperimentEnabled: (experimentId: ExperimentId) => boolean;
+  /** The providers the Providers section lists (built-in, then configured custom ones). */
+  providers: ReadonlyArray<{ id: string; label: string }>;
+}
+
+function isDefinitionListed(definition: SettingDefinition, context: SettingsSearchContext) {
+  if ((definition.platform ?? context.platform) !== context.platform) return false;
+  return definition.experiment == null || context.isExperimentEnabled(definition.experiment);
+}
+
 function settingEntries(
   visible: ReadonlySet<string>,
-  platform: "desktop" | "browser"
+  context: SettingsSearchContext
 ): SettingsSearchEntry[] {
   const definitions: Array<[string, SettingDefinition]> = Object.entries(SETTING_DEFINITIONS);
   return definitions
     .filter(([, definition]) => visible.has(definition.section))
-    .filter(([, definition]) => (definition.platform ?? platform) === platform)
+    .filter(([, definition]) => isDefinitionListed(definition, context))
     .map(([id, definition]) => ({
       id: `setting:${id}`,
       kind: "setting",
@@ -64,36 +77,45 @@ function settingEntries(
       label: definition.label,
       description: definition.description,
       keywords: definition.keywords,
-      anchorId: id,
+      anchorId: definition.anchor ?? id,
       fallbackAnchorId: definition.parent,
+      expandProvider: definition.expandProvider,
     }));
 }
 
-/** One result per provider; it opens Providers with that provider's card expanded. */
-function providerEntries(): SettingsSearchEntry[] {
-  return SUPPORTED_PROVIDERS.map((provider) => ({
-    id: `provider:${provider}`,
+/** One result per listed provider; it opens Providers with that provider's card expanded. */
+function providerEntries(context: SettingsSearchContext): SettingsSearchEntry[] {
+  return context.providers.map((provider) => ({
+    id: `provider:${provider.id}`,
     kind: "provider",
     sectionId: "providers",
-    label: PROVIDER_DISPLAY_NAMES[provider],
+    label: provider.label,
     description: "API key, endpoint and provider options",
-    keywords: ["provider", "api key", provider],
-    anchorId: providerAnchorId(provider),
-    expandProvider: provider,
+    keywords: ["provider", "api key", provider.id],
+    anchorId: providerAnchorId(provider.id),
+    expandProvider: provider.id,
   }));
 }
 
+/**
+ * A sub-experiment renders only while its parent is on: its result falls back to the parent row,
+ * so opening it always lands on a visible control.
+ */
 function experimentEntries(): SettingsSearchEntry[] {
   return Object.values(EXPERIMENTS)
     .filter((experiment) => experiment.showInSettings !== false)
-    .map((experiment) => ({
-      id: `experiment:${experiment.id}`,
-      kind: "experiment",
-      sectionId: "experiments",
-      label: experiment.name,
-      description: experiment.description,
-      anchorId: experimentAnchorId(experiment.id),
-    }));
+    .map((experiment) => {
+      const parent = SUB_EXPERIMENT_PARENTS[experiment.id];
+      return {
+        id: `experiment:${experiment.id}`,
+        kind: "experiment",
+        sectionId: "experiments",
+        label: experiment.name,
+        description: experiment.description,
+        anchorId: experimentAnchorId(experiment.id),
+        fallbackAnchorId: parent ? experimentAnchorId(parent) : undefined,
+      };
+    });
 }
 
 /** Only the shortcuts the Keybinds section lists, so a result always has a row to land on. */
@@ -114,7 +136,9 @@ function keybindEntries(): SettingsSearchEntry[] {
 }
 
 /** Sections whose rows come from another registry rather than SETTING_DEFINITIONS. */
-const SECTION_ENTRY_SOURCES: Partial<Record<string, () => SettingsSearchEntry[]>> = {
+const SECTION_ENTRY_SOURCES: Partial<
+  Record<string, (context: SettingsSearchContext) => SettingsSearchEntry[]>
+> = {
   providers: providerEntries,
   experiments: experimentEntries,
   keybinds: keybindEntries,
@@ -127,13 +151,13 @@ const SECTION_ENTRY_SOURCES: Partial<Record<string, () => SettingsSearchEntry[]>
  */
 export function buildSettingsSearchIndex(
   sections: readonly SettingsSectionMeta[],
-  platform: "desktop" | "browser"
+  context: SettingsSearchContext
 ): SettingsSearchEntry[] {
   const visible = new Set(sections.map((section) => section.id));
   return [
     ...sectionEntries(sections),
-    ...settingEntries(visible, platform),
-    ...sections.flatMap((section) => SECTION_ENTRY_SOURCES[section.id]?.() ?? []),
+    ...settingEntries(visible, context),
+    ...sections.flatMap((section) => SECTION_ENTRY_SOURCES[section.id]?.(context) ?? []),
   ];
 }
 

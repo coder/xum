@@ -564,6 +564,7 @@ function installProjectSidebarTestDoubles() {
     usesBrowserHistory: false,
     currentWorkspaceId: null,
     currentSettingsSection: null,
+    currentSettingsSectionless: false,
     currentProjectId: null,
     currentProjectPathFromState: null,
     pendingSectionId: null,

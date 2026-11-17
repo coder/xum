@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { EXPERIMENT_IDS, EXPERIMENTS } from "@/common/constants/experiments";
 import {
   ArrowDownToLine,
@@ -2185,6 +2186,7 @@ export const PluginsSettingsSection: React.FC = () => {
       </div>
 
       <div>
+        <SettingsMark id="plugins-installed" />
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-foreground text-sm font-medium">Installed plugins</h3>
           <div className="flex flex-wrap gap-2">

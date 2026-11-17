@@ -1,5 +1,4 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
-import { cn } from "@/common/lib/utils";
 import { SETTING_DEFINITIONS, type SettingId } from "../settingsRegistry";
 
 /**
@@ -34,10 +33,15 @@ function resolveSearchTarget(target: SettingsFocusTarget | null, id: string) {
   return { direct: target.id === id, fallbackFor: target.fallbackId === id ? target.id : null };
 }
 
-function useSearchFocus(id: string) {
+/** A mark has no box of its own: the block it marks is what scrolls into view. */
+function scrollBoxOf(element: HTMLElement): HTMLElement | null {
+  return element.hasAttribute("data-setting-mark") ? element.parentElement : element;
+}
+
+function useSearchFocus<T extends HTMLElement>(id: string) {
   const { direct, fallbackFor } = resolveSearchTarget(useContext(SettingsFocusContext), id);
   const [fallbackFocused, setFallbackFocused] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+  const ref = useRef<T>(null);
   // The row mounts after the section switch a search result triggers, so it scrolls itself into
   // view once it exists (a DOM sync, not derived state). A parent can only tell whether its
   // hidden sub-option rendered by looking at the committed DOM.
@@ -46,23 +50,41 @@ function useSearchFocus(id: string) {
     if (!element) return;
     const showFallback = isHiddenTarget(element, fallbackFor);
     setFallbackFocused(showFallback);
-    if (direct || showFallback) element.scrollIntoView?.({ block: "center" });
+    if (direct || showFallback) scrollBoxOf(element)?.scrollIntoView?.({ block: "center" });
   }, [direct, fallbackFor]);
   return { ref, focused: direct || (fallbackFor != null && fallbackFocused) };
 }
 
 export function SettingsAnchor(props: { id: string; className?: string; children: ReactNode }) {
-  const { ref, focused } = useSearchFocus(props.id);
+  const { ref, focused } = useSearchFocus<HTMLDivElement>(props.id);
   return (
     <div
       ref={ref}
       data-setting-id={props.id}
       data-search-focused={focused ? "true" : undefined}
-      className={cn(props.className, focused && "bg-accent/10 ring-accent/60 ring-1 ring-inset")}
+      className={props.className}
     >
       {props.children}
     </div>
   );
+}
+
+/**
+ * Search target inside a block that is not a SettingRow (a provider card, a section heading, a
+ * form). It renders no box: when search opens it, the block that contains it scrolls into view
+ * and gets the same highlight as a row. One line per block, so sections keep their own markup.
+ */
+export function SettingsMark(props: { id: string }) {
+  const { ref, focused } = useSearchFocus<HTMLSpanElement>(props.id);
+  // The highlight belongs on the marked block, which this component does not render; React does
+  // not manage this attribute on it, so setting it here does not fight a render.
+  useEffect(() => {
+    const block = ref.current?.parentElement;
+    if (!focused || !block) return;
+    block.setAttribute("data-search-focused", "true");
+    return () => block.removeAttribute("data-search-focused");
+  }, [focused, ref]);
+  return <span ref={ref} data-setting-id={props.id} data-setting-mark="" hidden />;
 }
 
 /** The bordered, divided card under a group heading (also used by search results). */

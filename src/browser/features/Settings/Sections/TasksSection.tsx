@@ -64,7 +64,7 @@ import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
-import { SettingRow, SettingsGroup } from "../Components/SettingsLayout";
+import { SettingRow, SettingsGroup, SettingsMark } from "../Components/SettingsLayout";
 import { CompactionStrategySetting } from "./CompactionStrategySetting";
 import { KeepScreenAwakeSetting } from "./KeepScreenAwakeSetting";
 import { TaskLimitInput } from "./TaskLimitInput";
@@ -1402,6 +1402,7 @@ export function TasksSection() {
       <KeepScreenAwakeSetting />
 
       <div className="px-1">
+        <SettingsMark id="agent-defaults" />
         <h3 className="text-muted text-[11px] font-medium tracking-wider uppercase">
           Agent defaults
         </h3>
