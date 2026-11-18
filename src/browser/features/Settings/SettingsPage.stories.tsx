@@ -286,8 +286,20 @@ export const SearchSettings: AppStory = {
     const settings = within(dialog);
     const search = settings.getByRole("combobox", { name: "Search settings" });
     await userEvent.click(settings.getByRole("navigation", { name: "Settings sections" }));
+    // The open section stays mounted (hidden) under the results, so its unsaved drafts survive a
+    // search the user clears again.
+    const sectionRow = await waitFor(() => {
+      const row = dialog.querySelector('[data-setting-id="theme"]');
+      if (!row) throw new Error("Appearance is not open");
+      return row;
+    });
     await userEvent.keyboard("{Control>}f{/Control}");
     await waitFor(() => expect(search).toHaveFocus());
+    await userEvent.keyboard("theme");
+    await expect(sectionRow).not.toBeVisible();
+    await userEvent.keyboard("{Escape}");
+    await expect(sectionRow).toBeVisible();
+    await expect(sectionRow.isConnected).toBe(true);
 
     await userEvent.keyboard("badge size");
     const results = await settings.findByRole("listbox", { name: "Settings search results" });

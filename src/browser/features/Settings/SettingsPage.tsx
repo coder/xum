@@ -5,7 +5,7 @@ import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
-import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
+import { useBelowMdViewport } from "@/browser/hooks/useNarrowViewport";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -278,15 +278,16 @@ function SettingsContentColumn(props: {
               </Button>
             </div>
           ) : null}
-          {props.search.searching ? (
-            props.results
-          ) : (
+          {props.search.searching ? props.results : null}
+          {/* Hidden, not unmounted, while results show: a section's unsaved draft (a Backup URL,
+              an MCP server form) must survive a search the user clears again. */}
+          <div className={props.search.searching ? "hidden" : "flex flex-1 flex-col"}>
             <SettingsOpenSettingContext.Provider value={props.onOpenSetting}>
               <SettingsFocusContext.Provider value={props.focusedSetting}>
                 <SectionComponent />
               </SettingsFocusContext.Provider>
             </SettingsOpenSettingContext.Provider>
-          )}
+          </div>
         </div>
       </div>
     </div>
@@ -349,7 +350,9 @@ export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFoc
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const environment = getSettingsEnvironment();
   const remoteConnectionAvailable = environment.remoteConnectionAvailable;
-  const narrow = useNarrowViewport();
+  // The dialog shell switches between sheet and centered dialog with `md:`; the one-column phone
+  // flow must switch at the same width, or 768px would get the phone flow in the desktop shell.
+  const narrow = useBelowMdViewport();
   const sections = getSettingsSections(memoryEnabled, remoteConnectionAvailable);
   const search = useSettingsSearch(sections, environment.platform);
   const mobile = useMobileSettingsView(narrow);
