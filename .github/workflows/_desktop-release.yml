@@ -125,10 +125,11 @@ jobs:
       - name: Build application
         run: bun run build
 
-      - name: Package and publish for Linux
-        run: bun x electron-builder --linux --publish always ${ELECTRON_ZIP_DIR:+-c.electronDist="$ELECTRON_ZIP_DIR"}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # --publish never: the upload step below attaches every asset. electron-builder would
+      # publish to the tag v<version>, but nightly tags have no v prefix, and a tag rule
+      # stops this workflow's token from creating v* tags.
+      - name: Package for Linux
+        run: bun x electron-builder --linux --publish never ${ELECTRON_ZIP_DIR:+-c.electronDist="$ELECTRON_ZIP_DIR"}
 
       - name: Create legacy mux artifact aliases
         run: ./scripts/create-legacy-mux-artifact-aliases.sh
@@ -137,7 +138,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Same electron-builder 2-hour staleness workaround as macOS.
+          # electron-builder does not publish (--publish never above): this step uploads every
+          # asset, with --clobber so reruns replace them.
           gh release upload "$RELEASE_TAG" \
             release/xum-*.AppImage \
             release/mux-*.AppImage \
@@ -259,15 +261,15 @@ jobs:
           gcp_workload_id_provider: ${{ vars.GCP_WORKLOAD_ID_PROVIDER }}
           gcp_service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
-      - name: Package and publish for Windows (.exe)
+      # --publish never, as on Linux: the upload step below attaches every asset.
+      - name: Package for Windows (.exe)
         # This step runs in PowerShell: pass the zip directory (ELECTRON_ZIP_DIR, from setup-xum) on.
         # The argument is an array: splatting a string passes its characters one by one.
         run: |
           $extra = @()
           if ($env:ELECTRON_ZIP_DIR) { $extra = @("-c.electronDist=$env:ELECTRON_ZIP_DIR") }
-          bun x electron-builder --win --publish always @extra
+          bun x electron-builder --win --publish never @extra
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # EV signing environment variables (used by custom sign script if configured)
           EV_KEYSTORE: ${{ vars.EV_KEYSTORE }}
           EV_KEY: ${{ vars.EV_KEY }}
@@ -283,7 +285,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Same electron-builder 2-hour staleness workaround as macOS.
+          # electron-builder does not publish (--publish never above): this step uploads every
+          # asset, with --clobber so reruns replace them.
           gh release upload "$RELEASE_TAG" \
             release/xum-*.exe \
             release/xum-*.exe.blockmap \
