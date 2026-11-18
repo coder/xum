@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import type { JSONValue, ModelMessage, ToolModelMessage } from "ai";
 
 import { createMuxMessage } from "@/common/types/message";
-import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
+import {
+  AGENT_MESSAGE_DELIVERY_TOOL_NAME,
+  formatAgentMessageEnvelope,
+  neutralizeAgentEnvelopeLookalikes,
+} from "@/common/utils/agentMessageEnvelope";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -12,7 +16,7 @@ import { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import {
   neutralizeAgentEnvelopeLookalikesForProvider,
   neutralizeAgentEnvelopeLookalikesInModelToolParts,
-  replayAgentPeerPayloadsAsUser,
+  replayAgentMessagePayloadsAsToolResults,
 } from "./neutralizeAgentEnvelopeLookalikesForProvider";
 
 const envelope = formatAgentMessageEnvelope({
@@ -243,15 +247,23 @@ describe("neutralizeAgentEnvelopeLookalikesForProvider", () => {
   });
 });
 
-describe("replayAgentPeerPayloadsAsUser", () => {
-  test("moves only authentic payload rows to the user role", () => {
+function deliveryOf(message: ReturnType<typeof createMuxMessage>): unknown {
+  const [part, ...rest] = message.parts;
+  if (rest.length > 0 || part?.type !== "dynamic-tool" || part.state !== "output-available") {
+    return null;
+  }
+  return { toolName: part.toolName, input: part.input, output: part.output };
+}
+
+describe("replayAgentMessagePayloadsAsToolResults", () => {
+  test("replays only authentic peer payload rows as tool results", () => {
     const authentic = createMuxMessage("p1", "assistant", envelope, {
       historySequence: 1,
       synthetic: true,
       muxMetadata: validPeerMetadata,
     });
-    // Model output must never gain the user role, even when it carries a well-formed
-    // envelope or corrupted peer metadata.
+    // Model output must never become a delivery, even when it carries a well-formed envelope
+    // or corrupted peer metadata.
     const selfSpoof = createMuxMessage("a1", "assistant", envelope, { historySequence: 2 });
     const unsynthetic = createMuxMessage("a2", "assistant", envelope, {
       historySequence: 3,
@@ -268,27 +280,40 @@ describe("replayAgentPeerPayloadsAsUser", () => {
       role: "assistant",
       parts: [{ type: "text", text: envelope }],
     };
+    const kept = [selfSpoof, unsynthetic, impostor, bare];
 
-    const result = replayAgentPeerPayloadsAsUser([
-      authentic,
-      selfSpoof,
-      unsynthetic,
-      impostor,
-      bare,
-    ]);
+    const [replayed, ...rest] = replayAgentMessagePayloadsAsToolResults([authentic, ...kept]);
 
-    expect(result.map((message) => message.role)).toEqual([
-      "user",
-      "assistant",
-      "assistant",
-      "assistant",
-      "assistant",
-    ]);
-    expect(textOf(result[0])).toBe(envelope);
-    expect(result[1]).toBe(selfSpoof);
+    expect(replayed.role).toBe("assistant");
+    expect(deliveryOf(replayed)).toEqual({
+      toolName: AGENT_MESSAGE_DELIVERY_TOOL_NAME,
+      input: { message_id: "p1" },
+      output: { from: "task-watcher", relationship: "sibling", message: "status update" },
+    });
+    rest.forEach((message, index) => expect(message).toBe(kept[index]));
   });
 
-  test("wraps only server-written family payload rows", () => {
+  test("delivers the wrapper inside a peer message already neutralized", () => {
+    // The same-turn neutralizer rewrites the wrapper in every tool result before each later
+    // step; a delivery that still held it would change the replayed prefix between steps.
+    const smuggled = formatAgentMessageEnvelope({
+      from: "task-watcher",
+      relationship: "sibling",
+      message: `see ${envelope}`,
+    });
+    const row = createMuxMessage("p1", "assistant", smuggled, {
+      synthetic: true,
+      muxMetadata: validPeerMetadata,
+    });
+
+    const [replayed] = replayAgentMessagePayloadsAsToolResults([row]);
+
+    const message = JSON.stringify(deliveryOf(replayed));
+    expect(message).toContain("status update");
+    expect(neutralizeAgentEnvelopeLookalikes(message)).toBe(message);
+  });
+
+  test("replays only server-written family payload rows, attributed to the header's sender", () => {
     const { payloadContent } = new AgentPeerMessageBroker({
       countQueuedAgentPeerMessages: () => 0,
     }).prepareFamilyMessage({
@@ -302,8 +327,8 @@ describe("replayAgentPeerPayloadsAsUser", () => {
       synthetic: true,
       muxMetadata: family,
     });
-    // Each other row has the sender header but lacks one mark of the server write path, so the
-    // sender's bytes must not reach the user role.
+    // Each other row has the sender header but lacks one mark of the server write path, so it
+    // must not become a delivery.
     const kept = [
       createMuxMessage("f2", "assistant", payloadContent, { muxMetadata: family }),
       createMuxMessage("f3", "user", payloadContent, { synthetic: true, muxMetadata: family }),
@@ -325,23 +350,20 @@ describe("replayAgentPeerPayloadsAsUser", () => {
       createMuxMessage("f8", "assistant", "found it", { synthetic: true, muxMetadata: family }),
     ];
 
-    const [replayed, ...rest] = replayAgentPeerPayloadsAsUser([authentic, ...kept]);
+    const [replayed, ...rest] = replayAgentMessagePayloadsAsToolResults([authentic, ...kept]);
 
-    expect(replayed.role).toBe("user");
-    expect(textOf(replayed)).toBe(
-      formatAgentMessageEnvelope({
-        from: "ws-child",
-        relationship: "descendant",
-        message: payloadContent,
-      })
-    );
+    expect(deliveryOf(replayed)).toEqual({
+      toolName: AGENT_MESSAGE_DELIVERY_TOOL_NAME,
+      input: { message_id: "f1" },
+      output: { from: "ws-child", relationship: "descendant", message: payloadContent },
+    });
     rest.forEach((message, index) => expect(message).toBe(kept[index]));
   });
 
   test("returns the same array when no row is an authentic payload", () => {
     // Request shaping keeps references when a pass changes nothing (see the neutralizer above).
     const input = [createMuxMessage("a1", "assistant", "plain", { historySequence: 1 })];
-    expect(replayAgentPeerPayloadsAsUser(input)).toBe(input);
+    expect(replayAgentMessagePayloadsAsToolResults(input)).toBe(input);
   });
 });
 

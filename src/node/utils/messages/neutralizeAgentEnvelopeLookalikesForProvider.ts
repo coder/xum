@@ -1,15 +1,16 @@
 import {
-  formatAgentMessageEnvelope,
+  AGENT_MESSAGE_DELIVERY_TOOL_NAME,
   getValidAgentPeerMessageMeta,
   neutralizeAgentEnvelopeLookalikes,
   parseAgentMessageEnvelope,
+  type AgentMessageEnvelope,
   type AgentPeerMessageMeta,
 } from "@/common/utils/agentMessageEnvelope";
 import {
   getAuthenticPlanReviewRecord,
   neutralizePlanReviewEnvelopeLookalikes,
 } from "@/common/utils/planReview/planReviewEnvelope";
-import type { MuxMessage } from "@/common/types/message";
+import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import { parseFamilyMessageSender } from "@/node/services/agentPeerMessageBroker";
 import type {
   AssistantModelMessage,
@@ -109,9 +110,8 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
  * sender fields MATCH the metadata (the send path writes both from the same values). A corrupted
  * row carrying just the discriminator, lookalike text, or an inconsistent metadata/envelope pair
  * — where the UI would attribute one sender while the provider reads another — must not
- * smuggle the exact wrapper past neutralization. Any other part shape is corrupted too: replayed
- * in the user role, a row with no parts becomes an empty user message that fails every request,
- * and its tool parts would be dropped.
+ * smuggle the exact wrapper past neutralization. Any other part shape is corrupted too: the
+ * tool-result replay keeps exactly one part, so extra parts would be dropped silently.
  */
 function isAuthenticAgentPeerPayloadRow(msg: MuxMessage): boolean {
   if (msg.role !== "assistant" || msg.metadata?.synthetic !== true) return false;
@@ -136,51 +136,60 @@ function isEnvelopeFromSender(text: string, meta: AgentPeerMessageMeta): boolean
 }
 
 /**
- * Replay authentic peer payload rows to the model in the user role. Request-only: the persisted
- * row stays assistant-role, so no user-row parsing (mentions, skills, commands) ever sees peer
- * bytes, the UI card and pairing are unchanged, and the turn is still driven by the fixed
- * zero-peer-byte trigger.
+ * Replay authentic agent-message payload rows (peer and family messages) to the model as the
+ * result of a `receive_agent_message` call that Xum makes. Request-only: the persisted row, the
+ * transcript card and the fixed zero-peer-byte trigger stay as they are.
  *
- * Why: in the assistant role the model reads a peer's envelope as text it wrote itself, and
- * models continue that pattern instead of acting on it. A woken recipient whose only prior
- * assistant turn was the payload echoed the envelope and stopped; a sender wrote the reply it was
- * waiting for as its own envelope, which the user then read as a delivery. In the user role the
- * payload reads as inbound, like the trigger that follows it. Run AFTER
- * neutralizeAgentEnvelopeLookalikesForProvider: it renames the wrapper in every other row, so
- * the exact wrapper in a user-role message is still server provenance, and the system prompt
- * classifies it as untrusted, non-user input.
+ * Why: as assistant text, the model reads another agent's message as text it wrote itself and
+ * continues that pattern: a sender waiting for replies wrote the next reply as its own envelope
+ * (GLM-5.3-Flash: 5 of 8 runs; a line saying Xum inserted the row did not help, 4 of 8, and the
+ * model copied the line too), which the user then read as a delivery. The user role stops that
+ * but gives the sender's bytes the user's authority. A tool result is the channel models are
+ * trained to read as external data they did not write, with no user authority (0 of 8). The
+ * model cannot produce one: calling the tool itself only gets the SDK's unavailable-tool error,
+ * after which the model reported that it was still waiting (16 of 16).
+ *
+ * The result is a JSON object, not the wrapper text: the role and tool name mark provenance, and
+ * the same-turn neutralizer (neutralizeAgentEnvelopeLookalikesInModelToolParts) rewrites the
+ * wrapper in every tool result before each later step, which would change the replayed prefix.
+ * Neutralizing the fields here keeps them identical across steps.
  */
-export function replayAgentPeerPayloadsAsUser(messages: MuxMessage[]): MuxMessage[] {
+export function replayAgentMessagePayloadsAsToolResults(messages: MuxMessage[]): MuxMessage[] {
   let didChange = false;
   const result = messages.map((msg) => {
-    const replayed = isAuthenticAgentPeerPayloadRow(msg)
-      ? { ...msg, role: "user" as const }
-      : replayFamilyMessagePayloadAsUser(msg);
-    if (replayed !== msg) didChange = true;
-    return replayed;
+    const delivery = readAgentMessageDelivery(msg);
+    if (delivery == null) return msg;
+    didChange = true;
+    const toolPart: MuxToolPart = {
+      type: "dynamic-tool",
+      // Provider tool-call IDs allow only [A-Za-z0-9_-] (Anthropic); row IDs are generated but
+      // come from persisted history.
+      toolCallId: `agent-message-${msg.id.replace(/[^A-Za-z0-9_-]/g, "_")}`,
+      toolName: AGENT_MESSAGE_DELIVERY_TOOL_NAME,
+      state: "output-available",
+      input: { message_id: msg.id },
+      output: neutralizeStringsDeep(delivery),
+    };
+    return { ...msg, parts: [toolPart] };
   });
   return didChange ? result : messages;
 }
 
-/**
- * Family-message payload rows (task_message_parent, task_message_sibling) have the same defect
- * but no envelope, and in the user role the sender's bytes must not pass as user text. So the
- * replay wraps the row in the peer envelope, attributed to the sender its server-written header
- * names; the neutralizer has already renamed any wrapper inside the row. A row whose header does
- * not parse stays in the assistant role.
- */
-function replayFamilyMessagePayloadAsUser(msg: MuxMessage): MuxMessage {
-  if (!isFamilyMessagePayloadRow(msg) || msg.parts.length !== 1) return msg;
+/** The delivery an authentic payload row carries; null for every other row. */
+function readAgentMessageDelivery(msg: MuxMessage): AgentMessageEnvelope | null {
+  if (isAuthenticAgentPeerPayloadRow(msg)) {
+    const [part] = msg.parts;
+    return part.type === "text" ? parseAgentMessageEnvelope(part.text) : null;
+  }
+  // Family-message rows (task_message_parent, task_message_sibling) have no envelope: the
+  // sender comes from the header the server writes before the sender's bytes. A row whose
+  // header does not parse stays an assistant row.
+  if (!isFamilyMessagePayloadRow(msg) || msg.parts.length !== 1) return null;
   const [part] = msg.parts;
-  if (part.type !== "text") return msg;
+  if (part.type !== "text") return null;
   const sender = parseFamilyMessageSender(part.text);
-  if (sender == null) return msg;
-  const text = formatAgentMessageEnvelope({
-    from: sender.senderWorkspaceId,
-    relationship: sender.relationship,
-    message: part.text,
-  });
-  return { ...msg, role: "user", parts: [{ ...part, text }] };
+  if (sender == null) return null;
+  return { from: sender.senderWorkspaceId, relationship: sender.relationship, message: part.text };
 }
 
 // dry-duplicate-ok: other row-kind predicates share the shape, but each follows its own writer
