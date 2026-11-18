@@ -238,7 +238,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       vimEnabled={vimEnabled}
       className={className}
       onCancel={handleCancel}
-      onConfigureCompaction={() => openSettings("tasks")}
+      onConfigureCompaction={() => openSettings("behavior")}
       activity={activity}
       showModelName={showModelName}
     />

@@ -56,8 +56,8 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
 
 async function openCompactionSettings(canvasElement: HTMLElement) {
   const canvas = within(await openSettingsDialog(canvasElement));
-  // Compaction is agent context behavior: it lives in Settings → Agents.
-  await userEvent.click(await canvas.findByRole("button", { name: "Agents" }));
+  // Compaction is agent context behavior: it lives in Settings → Behavior.
+  await userEvent.click(await canvas.findByRole("button", { name: "Behavior" }));
   const trigger = await canvas.findByRole("combobox", { name: "Compaction strategy" });
   trigger.scrollIntoView({ block: "center" });
   return trigger;

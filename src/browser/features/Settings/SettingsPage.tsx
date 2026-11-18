@@ -12,7 +12,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TerminalEditorSection } from "./Sections/TerminalEditorSection";
-import { TasksSection } from "./Sections/TasksSection";
+import { AgentBehaviorSection, AgentDefaultsSection } from "./Sections/TasksSection";
 import { HeartbeatSection } from "./Sections/HeartbeatSection";
 import { ProvidersSection } from "./Sections/ProvidersSection";
 import { ModelsSection } from "./Sections/ModelsSection";
@@ -51,7 +51,8 @@ const SECTION_COMPONENTS: Record<string, React.ComponentType> = {
   general: GeneralSection,
   terminal: TerminalEditorSection,
   keybinds: KeybindsSection,
-  tasks: TasksSection,
+  behavior: AgentBehaviorSection,
+  tasks: AgentDefaultsSection,
   heartbeat: HeartbeatSection,
   instructions: InstructionsSection,
   memory: MemorySection,

@@ -16,6 +16,7 @@ const BASE_SECTION_LABELS = [
   "Appearance",
   "Terminal & editor",
   "Keybinds",
+  "Behavior",
   "Agents",
   "Heartbeats",
   "Providers",
@@ -35,7 +36,8 @@ type BaseSectionLabel = (typeof BASE_SECTION_LABELS)[number];
 const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   Appearance: /Theme/i,
   "Terminal & editor": /Terminal Font/i,
-  Agents: /Max Parallel Agent Tasks/i,
+  Behavior: /Max Parallel Agent Tasks/i,
+  Agents: /Agent defaults/i,
   Heartbeats: /Default interval/i,
   Providers: /Configure API keys and endpoints for AI providers|API Key/i,
   Models: /Custom Models|Built-in Models/i,

@@ -584,7 +584,12 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
   );
 }
 
-export function TasksSection() {
+/**
+ * Task settings and agent defaults load and autosave together (one saveConfig payload), so both
+ * sections mount this component and differ only in what they render: `behavior` is the task,
+ * context and system rows (the Behavior section), `agents` the per-agent model defaults.
+ */
+export function TasksSection(props: { part: "behavior" | "agents" }) {
   const { api } = useAPI();
   // The autosave sends only through a live client. Offline it keeps the change pending and says
   // so: the reload after the reconnect keeps a pending change, and the autosave sends it then.
@@ -1328,9 +1333,66 @@ export function TasksSection() {
     // the user leaves the section before the reconnect. Until a load answers, too: the autosave
     // does not track an edit made then, so the answer would replace it.
     <fieldset disabled={areControlsLocked(liveApi == null, loaded)} className="min-w-0 space-y-8">
+      {props.part === "behavior" ? (
+        <AgentBehaviorGroups
+          defaultAgentId={newWorkspaceDefaultAgentId}
+          defaultAgentOptions={newWorkspaceDefaultAgentOptions}
+          onDefaultAgentChange={setNewWorkspaceDefaultAgentId}
+          taskSettings={taskSettings}
+          onMaxParallelAgentTasksChange={setMaxParallelAgentTasks}
+          onMaxTaskNestingDepthChange={setMaxTaskNestingDepth}
+          onPlanImplementReplacesChange={setProposePlanImplementReplacesChatHistory}
+          saveError={saveError}
+        />
+      ) : (
+        <AgentDefaultsGroups
+          loadFailed={agentsLoadFailed}
+          loaded={agentsLoaded}
+          uiAgents={uiAgents}
+          subagents={subagents}
+          execSubagentAgent={execSubagentAgent}
+          internalAgents={internalAgents}
+          unknownAgentIds={unknownAgentIds}
+          renderAgentDefaults={renderAgentDefaults}
+          renderExecSubagentDefaults={renderExecSubagentDefaults}
+          renderUnknownAgentDefaults={renderUnknownAgentDefaults}
+          saveError={saveError}
+        />
+      )}
+    </fieldset>
+  );
+}
+
+function SaveError(props: { error: string | null }) {
+  return props.error ? <div className="text-danger-light text-xs">{props.error}</div> : null;
+}
+
+/** Settings → Behavior. */
+export function AgentBehaviorSection() {
+  return <TasksSection part="behavior" />;
+}
+
+/** Settings → Agents (route id `tasks`, kept so existing deep links still land here). */
+export function AgentDefaultsSection() {
+  return <TasksSection part="agents" />;
+}
+
+/** The Behavior section: default agent, task limits, plan handoff, compaction, screen awake. */
+function AgentBehaviorGroups(props: {
+  defaultAgentId: string;
+  defaultAgentOptions: ReadonlyArray<{ id: string; label: string }>;
+  onDefaultAgentChange: (agentId: string) => void;
+  taskSettings: TaskSettings;
+  onMaxParallelAgentTasksChange: (value: number) => void;
+  onMaxTaskNestingDepthChange: (value: number) => void;
+  onPlanImplementReplacesChange: (value: boolean) => void;
+  saveError: string | null;
+}) {
+  return (
+    <>
       <SettingsGroup title="Tasks">
         <SettingRow id="default-agent">
-          <Select value={newWorkspaceDefaultAgentId} onValueChange={setNewWorkspaceDefaultAgentId}>
+          <Select value={props.defaultAgentId} onValueChange={props.onDefaultAgentChange}>
             <SelectTrigger
               aria-label="Default new-workspace agent"
               className="border-border-medium bg-surface-primary h-9 w-56"
@@ -1338,7 +1400,7 @@ export function TasksSection() {
               <SelectValue placeholder="Select agent" />
             </SelectTrigger>
             <SelectContent>
-              {newWorkspaceDefaultAgentOptions.map((option) => (
+              {props.defaultAgentOptions.map((option) => (
                 <SelectItem key={option.id} value={option.id}>
                   {option.label}
                 </SelectItem>
@@ -1359,10 +1421,10 @@ export function TasksSection() {
         >
           <TaskLimitInput
             label="Max Parallel Agent Tasks"
-            value={taskSettings.maxParallelAgentTasks}
+            value={props.taskSettings.maxParallelAgentTasks}
             min={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.min}
             max={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
-            onCommit={setMaxParallelAgentTasks}
+            onCommit={props.onMaxParallelAgentTasksChange}
           />
         </SettingRow>
 
@@ -1378,29 +1440,61 @@ export function TasksSection() {
         >
           <TaskLimitInput
             label="Max Task Nesting Depth"
-            value={taskSettings.maxTaskNestingDepth}
+            value={props.taskSettings.maxTaskNestingDepth}
             min={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.min}
             max={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
-            onCommit={setMaxTaskNestingDepth}
+            onCommit={props.onMaxTaskNestingDepthChange}
           />
         </SettingRow>
 
         <SettingRow id="plan-implement-replaces">
           <Switch
-            checked={taskSettings.proposePlanImplementReplacesChatHistory ?? false}
-            onCheckedChange={setProposePlanImplementReplacesChatHistory}
+            checked={props.taskSettings.proposePlanImplementReplacesChatHistory ?? false}
+            onCheckedChange={props.onPlanImplementReplacesChange}
             aria-label="Toggle plan Implement replaces conversation with plan"
           />
         </SettingRow>
       </SettingsGroup>
-      {saveError ? <div className="text-danger-light text-xs">{saveError}</div> : null}
+      <SaveError error={props.saveError} />
 
       <SettingsGroup title="Context">
         <CompactionStrategySetting />
       </SettingsGroup>
 
       <KeepScreenAwakeSetting />
+    </>
+  );
+}
 
+function AgentDefaultsList(props: { title: string; children: React.ReactNode[] }) {
+  if (props.children.length === 0) return null;
+  return (
+    <div>
+      <h4 className="text-foreground mb-3 px-1 text-sm font-medium">{props.title}</h4>
+      <div className="space-y-4">{props.children}</div>
+    </div>
+  );
+}
+
+/** The Agents section: model, reasoning and prompt cache defaults per agent. */
+function AgentDefaultsGroups(props: {
+  loadFailed: boolean;
+  loaded: boolean;
+  uiAgents: AgentDefinitionDescriptor[];
+  subagents: AgentDefinitionDescriptor[];
+  execSubagentAgent: AgentDefinitionDescriptor | undefined;
+  internalAgents: AgentDefinitionDescriptor[];
+  unknownAgentIds: string[];
+  renderAgentDefaults: (agent: AgentDefinitionDescriptor) => React.ReactNode;
+  renderExecSubagentDefaults: (agent: AgentDefinitionDescriptor) => React.ReactNode;
+  renderUnknownAgentDefaults: (agentId: string) => React.ReactNode;
+  saveError: string | null;
+}) {
+  const execSubagent = props.execSubagentAgent
+    ? [props.renderExecSubagentDefaults(props.execSubagentAgent)]
+    : [];
+  return (
+    <>
       <div className="px-1">
         <SettingsMark id="agent-defaults" />
         <h3 className="text-muted text-[11px] font-medium tracking-wider uppercase">
@@ -1410,44 +1504,27 @@ export function TasksSection() {
           Defaults apply globally. Changing model/reasoning in a workspace creates a workspace
           override.
         </div>
-        {agentsLoadFailed ? (
+        {props.loadFailed ? (
           <div className="text-danger-light mt-3 text-xs">
             Failed to load agent definitions for this workspace.
           </div>
         ) : null}
-        {!agentsLoaded ? <div className="text-muted mt-3 text-xs">Loading agents…</div> : null}
+        {!props.loaded ? <div className="text-muted mt-3 text-xs">Loading agents…</div> : null}
       </div>
+      <SaveError error={props.saveError} />
 
-      {uiAgents.length > 0 ? (
-        <div>
-          <h4 className="text-foreground mb-3 px-1 text-sm font-medium">UI agents</h4>
-          <div className="space-y-4">{uiAgents.map(renderAgentDefaults)}</div>
-        </div>
-      ) : null}
-
-      {subagents.length > 0 || execSubagentAgent ? (
-        <div>
-          <h4 className="text-foreground mb-3 px-1 text-sm font-medium">Sub-agents</h4>
-          <div className="space-y-4">
-            {execSubagentAgent ? renderExecSubagentDefaults(execSubagentAgent) : null}
-            {subagents.map(renderAgentDefaults)}
-          </div>
-        </div>
-      ) : null}
-
-      {internalAgents.length > 0 ? (
-        <div>
-          <h4 className="text-foreground mb-3 px-1 text-sm font-medium">Internal</h4>
-          <div className="space-y-4">{internalAgents.map(renderAgentDefaults)}</div>
-        </div>
-      ) : null}
-
-      {unknownAgentIds.length > 0 ? (
-        <div>
-          <h4 className="text-foreground mb-3 px-1 text-sm font-medium">Unknown agents</h4>
-          <div className="space-y-4">{unknownAgentIds.map(renderUnknownAgentDefaults)}</div>
-        </div>
-      ) : null}
-    </fieldset>
+      <AgentDefaultsList title="UI agents">
+        {props.uiAgents.map(props.renderAgentDefaults)}
+      </AgentDefaultsList>
+      <AgentDefaultsList title="Sub-agents">
+        {[...execSubagent, ...props.subagents.map(props.renderAgentDefaults)]}
+      </AgentDefaultsList>
+      <AgentDefaultsList title="Internal">
+        {props.internalAgents.map(props.renderAgentDefaults)}
+      </AgentDefaultsList>
+      <AgentDefaultsList title="Unknown agents">
+        {props.unknownAgentIds.map(props.renderUnknownAgentDefaults)}
+      </AgentDefaultsList>
+    </>
   );
 }

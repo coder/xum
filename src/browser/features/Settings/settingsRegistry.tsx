@@ -20,6 +20,7 @@ import {
   Shield,
   ShieldCheck,
   ShieldHalf,
+  SlidersHorizontal,
   SquareTerminal,
 } from "lucide-react";
 
@@ -85,13 +86,20 @@ export const SETTINGS_SECTION_META: readonly SettingsSectionMeta[] = [
     keywords: ["keyboard", "shortcuts", "hotkeys"],
   },
   {
+    id: "behavior",
+    label: "Behavior",
+    group: "agents",
+    icon: icon(SlidersHorizontal),
+    description: "Default agent, task limits, plan handoff, context compaction and screen sleep.",
+    keywords: ["tasks", "parallel", "nesting", "compaction", "context", "sleep"],
+  },
+  {
     id: "tasks",
     label: "Agents",
     group: "agents",
     icon: icon(Bot),
-    description: "Task limits, context compaction and per-agent model defaults.",
+    description: "Model, reasoning and prompt cache defaults per agent.",
     keywords: [
-      "tasks",
       "sub-agents",
       "agent defaults",
       "model",
@@ -457,38 +465,38 @@ export const SETTING_DEFINITIONS = {
 
   // Agents
   "default-agent": {
-    section: "tasks",
+    section: "behavior",
     label: "Default new-workspace agent",
     description: "New chats start with this agent.",
     keywords: ["exec", "plan", "new chat"],
   },
   "max-parallel-tasks": {
-    section: "tasks",
+    section: "behavior",
     label: "Max Parallel Agent Tasks",
     description: "How many agent tasks can run at once.",
     keywords: ["concurrency", "sub-agents", "parallel"],
   },
   "max-nesting-depth": {
-    section: "tasks",
+    section: "behavior",
     label: "Max Task Nesting Depth",
     description: "How deep agent tasks can spawn their own tasks.",
     keywords: ["sub-agents", "depth", "nested"],
   },
   "plan-implement-replaces": {
-    section: "tasks",
+    section: "behavior",
     label: "Plan: Implement replaces conversation with plan",
     description:
       "When enabled, clicking Implement on a plan proposal clears previous messages and shows the plan before switching to Exec.",
     keywords: ["propose plan", "clear history"],
   },
   "compaction-strategy": {
-    section: "tasks",
+    section: "behavior",
     label: "Compaction strategy",
     description: "How to manage context as conversations grow.",
     keywords: ["context", "summarize", "continuous", "token budget", "compact"],
   },
   "keep-screen-awake": {
-    section: "tasks",
+    section: "behavior",
     platform: "desktop",
     label: "Keep screen awake while agents are working",
     description:

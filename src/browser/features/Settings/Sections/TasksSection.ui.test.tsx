@@ -172,6 +172,8 @@ interface RenderTasksSectionOptions {
   minThinkingLevelByModel?: TestClientConfig["minThinkingLevelByModel"];
   /** Settings over the project page: the agents come from the project, with no workspace. */
   projectPageOnly?: boolean;
+  /** Which of the two sections built on TasksSection to render (default: Agents). */
+  part?: "behavior" | "agents";
 }
 
 function renderTasksSection(options: RenderTasksSectionOptions = {}) {
@@ -209,7 +211,7 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   // later files.
   const view = render(
     <APIProvider client={createTestApiClient(apiMock)}>
-      <TasksSection />
+      <TasksSection part={options.part ?? "agents"} />
     </APIProvider>
   );
   return { ...view, getConfig, saveConfig };
@@ -1004,7 +1006,7 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
     const harness = createConnectionHarness(mode, () => apiMock ?? {});
     const view = render(
       <harness.Wrapper>
-        <TasksSection />
+        <TasksSection part="agents" />
       </harness.Wrapper>
     );
     await waitFor(() => expect(view.queryByText("Loading agents…") === null).toBe(true));
@@ -1023,7 +1025,7 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
     const harness = createConnectionHarness(mode, () => apiMock ?? {});
     const view = render(
       <harness.Wrapper>
-        <TasksSection />
+        <TasksSection part="behavior" />
       </harness.Wrapper>
     );
     await waitFor(() => expect(maxParallelInput(view).value).toBe("3"));
@@ -1056,7 +1058,7 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
     const harness = createConnectionHarness(mode, () => apiMock ?? {});
     const view = render(
       <harness.Wrapper>
-        <TasksSection />
+        <TasksSection part="behavior" />
       </harness.Wrapper>
     );
     await waitFor(() => expect(maxParallelInput(view).value).toBe("3"));
@@ -1151,7 +1153,7 @@ describe("TasksSection limit inputs", () => {
     });
 
   test("Max Parallel Agent Tasks keeps the typed text and never saves a cleared field as 1", async () => {
-    const view = renderTasksSection();
+    const view = renderTasksSection({ part: "behavior" });
     const label = "Max Parallel Agent Tasks";
     await waitFor(() => expect(limitInput(view, label).value).toBe("32"));
 
@@ -1185,7 +1187,7 @@ describe("TasksSection limit inputs", () => {
   });
 
   test("Max Task Nesting Depth keeps the typed text and reverts an empty field on blur", async () => {
-    const view = renderTasksSection();
+    const view = renderTasksSection({ part: "behavior" });
     const label = "Max Task Nesting Depth";
     await waitFor(() => expect(limitInput(view, label).value).toBe("5"));
 
