@@ -183,6 +183,19 @@ interface FieldConfig {
   optional?: boolean;
 }
 
+// Search marks for credential blocks built from getProviderFields: the first field carries it.
+const PROVIDER_FIELD_MARKS = [
+  { provider: "bedrock", fieldKey: "region", markId: "bedrock-credentials" },
+  { provider: "google-vertex", fieldKey: "project", markId: "vertex-credentials" },
+] as const;
+
+function ProviderFieldMark(props: { provider: string; fieldKey: string }) {
+  const mark = PROVIDER_FIELD_MARKS.find(
+    (entry) => entry.provider === props.provider && entry.fieldKey === props.fieldKey
+  );
+  return mark ? <SettingsMark id={mark.markId} /> : null;
+}
+
 function isCustomProviderInfo(
   providerInfo: ProviderConfigInfo | undefined
 ): providerInfo is ProviderConfigInfo & {
@@ -1952,6 +1965,7 @@ export function ProvidersSection() {
 
                       {provider === "github-copilot" && (
                         <div className="space-y-2">
+                          <SettingsMark id="copilot-login" />
                           <div>
                             <label className="text-foreground block text-xs font-medium">
                               Authentication
@@ -2057,6 +2071,7 @@ export function ProvidersSection() {
 
                         return (
                           <div key={fieldConfig.key}>
+                            <ProviderFieldMark provider={provider} fieldKey={fieldConfig.key} />
                             <label className="text-muted mb-1 block text-xs">
                               {fieldConfig.label}
                               {fieldConfig.optional && (
@@ -2179,6 +2194,7 @@ export function ProvidersSection() {
                           custom config and has no OAuth flow. */}
                       {provider === "coder" && !isCustom && (
                         <div className="space-y-2">
+                          <SettingsMark id="coder-login" />
                           <div>
                             <label className="text-foreground block text-xs font-medium">
                               Authentication
@@ -2311,6 +2327,7 @@ export function ProvidersSection() {
                       {provider === "anthropic" && (
                         <>
                           <div className="border-border-light border-t pt-3">
+                            <SettingsMark id="anthropic-cache-ttl" />
                             <div className="mb-1 flex items-center gap-1">
                               <label className="text-muted block text-xs">Prompt cache TTL</label>
                               <TooltipProvider>
@@ -2365,6 +2382,7 @@ export function ProvidersSection() {
                           </div>
 
                           <div className="border-border-light border-t pt-3">
+                            <SettingsMark id="anthropic-beta" />
                             <div className="mb-1 flex items-center gap-1">
                               <label className="text-muted block text-xs">Beta features</label>
                               <TooltipProvider>
@@ -2425,6 +2443,7 @@ export function ProvidersSection() {
                           return (
                             <div className="border-border-light space-y-3 border-t pt-3">
                               <div>
+                                <SettingsMark id="openai-oauth" />
                                 <label className="text-foreground block text-xs font-medium">
                                   ChatGPT (Codex) OAuth
                                 </label>
@@ -2544,6 +2563,7 @@ export function ProvidersSection() {
                               )}
 
                               <div className="border-border-light space-y-2 border-t pt-3">
+                                <SettingsMark id="openai-default-auth" />
                                 <div>
                                   <label className="text-muted block text-xs">
                                     Default auth (when both are set)
@@ -2607,6 +2627,7 @@ export function ProvidersSection() {
                               </div>
 
                               <div className="border-border-light border-t pt-3">
+                                <SettingsMark id="openai-service-tier" />
                                 <div className="mb-1 flex items-center gap-1">
                                   <label className="text-muted block text-xs">Service tier</label>
                                   <TooltipProvider>
@@ -2688,6 +2709,7 @@ export function ProvidersSection() {
                               </div>
 
                               <div className="border-border-light border-t pt-3">
+                                <SettingsMark id="openai-wire-format" />
                                 <div className="mb-1 flex items-center gap-1">
                                   <label className="text-muted block text-xs">Wire format</label>
                                   <TooltipProvider>
@@ -2741,6 +2763,7 @@ export function ProvidersSection() {
                               </div>
                               {openAIWebSocketTransportVisible && (
                                 <div className="border-border-light border-t pt-3">
+                                  <SettingsMark id="openai-websocket" />
                                   <div className="flex items-center justify-between gap-3">
                                     <div>
                                       <label className="text-foreground block text-xs font-medium">
@@ -2777,6 +2800,7 @@ export function ProvidersSection() {
                               )}
 
                               <div className="border-border-light border-t pt-3">
+                                <SettingsMark id="openai-cyber" />
                                 <div className="flex items-center justify-between gap-3">
                                   <div>
                                     <label className="text-foreground block text-xs font-medium">
@@ -2823,6 +2847,7 @@ export function ProvidersSection() {
                               </div>
 
                               <div className="border-border-light border-t pt-3">
+                                <SettingsMark id="openai-response-storage" />
                                 <div className="mb-1 flex items-center gap-1">
                                   <label className="text-muted block text-xs">
                                     Response storage
@@ -2896,6 +2921,7 @@ export function ProvidersSection() {
 
                       {provider === "xai" && (
                         <div className="border-border-light border-t pt-3">
+                          <SettingsMark id="xai-processing-mode" />
                           <div className="mb-1 flex items-center gap-1">
                             <label className="text-muted block text-xs">Processing mode</label>
                             <TooltipProvider>

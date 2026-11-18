@@ -4,6 +4,7 @@ import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   formatProviderDisplayName,
   getProviderIdsForUi,
+  isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { settingsSearchResultDomId } from "./Components/SettingsSearchResults";
@@ -37,6 +38,12 @@ function useSearchContext(platform: "desktop" | "browser"): SettingsSearchContex
       id,
       label: formatProviderDisplayName(id, config?.[id]),
     })),
+    // Same test the Providers section uses to render a custom card instead of the built-in one.
+    customProviderIds: new Set(
+      Object.entries(config ?? {})
+        .filter(([, info]) => info?.isCustom === true && isCustomProviderConfig(info))
+        .map(([id]) => id)
+    ),
   };
 }
 

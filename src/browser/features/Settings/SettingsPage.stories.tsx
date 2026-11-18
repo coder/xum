@@ -322,5 +322,17 @@ export const SearchSettings: AppStory = {
       if (!mark?.closest("details")?.open) throw new Error("Add server form is collapsed");
     });
     await expect(dialog.querySelector("#server-name")).toBeVisible();
+
+    // A field inside a provider card expands the card and lands on the field, not the header.
+    await userEvent.click(search);
+    await userEvent.keyboard("response storage{Enter}");
+    await waitFor(() => {
+      const block = dialog.querySelector(
+        '[data-setting-id="openai-response-storage"]'
+      )?.parentElement;
+      if (block?.getAttribute("data-search-focused") !== "true") {
+        throw new Error("Response storage is not highlighted");
+      }
+    });
   },
 };

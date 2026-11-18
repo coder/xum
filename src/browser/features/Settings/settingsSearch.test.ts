@@ -22,6 +22,7 @@ interface SearchOptions {
   platform?: "desktop" | "browser";
   experiments?: ExperimentId[];
   providers?: Array<{ id: string; label: string }>;
+  customProviderIds?: string[];
 }
 
 function search(query: string, options: SearchOptions = {}) {
@@ -31,6 +32,7 @@ function search(query: string, options: SearchOptions = {}) {
     platform: options.platform ?? "desktop",
     isExperimentEnabled: (id) => enabled.has(id),
     providers: options.providers ?? [{ id: "anthropic", label: "Anthropic" }],
+    customProviderIds: new Set(options.customProviderIds ?? []),
   });
   return searchSettings(index, sections, query);
 }
@@ -166,7 +168,22 @@ describe("searchSettings", () => {
   test("a field inside a provider card opens that provider expanded", () => {
     const result = search("service tier").find((r) => r.entry.id === "setting:openai-service-tier");
     expect(result?.entry.expandProvider).toBe("openai");
-    expect(result?.entry.anchorId).toBe("provider:openai");
+    // The field's own mark is the target; the card stands in while the card hides the field.
+    expect(result?.entry.anchorId).toBe("openai-service-tier");
+    expect(result?.entry.fallbackAnchorId).toBe("provider:openai");
+  });
+
+  test("a custom provider shadowing a built-in drops the built-in's fields", () => {
+    const shadowed = { customProviderIds: ["openai", TYPESAFE_PROVIDER_KEY] };
+    expect(ids(search("chatgpt oauth"))).toContain("setting:openai-oauth");
+    expect(ids(search("chatgpt oauth", shadowed))).not.toContain("setting:openai-oauth");
+    const evaluation = { experiments: [EXPERIMENT_IDS.AUTO_MODEL_ROUTING] };
+    expect(ids(search("evaluation api key", evaluation))).toContain(
+      "setting:evaluation-credential"
+    );
+    expect(ids(search("evaluation api key", { ...evaluation, ...shadowed }))).not.toContain(
+      "setting:evaluation-credential"
+    );
   });
 
   test("the evaluation key result expands the TypeSafe card that holds the field", () => {

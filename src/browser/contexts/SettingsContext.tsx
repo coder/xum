@@ -28,7 +28,11 @@ interface SettingsContextValue {
   activeSection: string;
   open: (section?: string, options?: OpenSettingsOptions) => void;
   close: () => void;
-  setActiveSection: (section: string, options?: { replace?: boolean }) => void;
+  /** `sectionless` marks the entry as the section list (phones show the list for it). */
+  setActiveSection: (
+    section: string,
+    options?: { replace?: boolean; sectionless?: boolean }
+  ) => void;
 
   /** Subscribe to settings close events. Returns an unsubscribe function. */
   registerOnClose: (callback: () => void) => () => void;
@@ -152,7 +156,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
   }, [router]);
 
   const setActiveSection = useCallback(
-    (section: string, options?: { replace?: boolean }) => {
+    (section: string, options?: { replace?: boolean; sectionless?: boolean }) => {
       if (section !== "providers") {
         setProvidersExpandedProvider(null);
         setProvidersStartCoderLogin(false);

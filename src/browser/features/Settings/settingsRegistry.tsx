@@ -322,8 +322,10 @@ const providerField = (
   label,
   description,
   keywords: [provider, ...keywords],
+  // The field's own mark is the target: it mounts once the card expands and scrolls itself into
+  // view. A field the card hides right now (WebSocket under Chat Completions) falls back to the
+  // card (see settingsSearch).
   expandProvider: provider,
-  anchor: `provider:${provider}`,
 });
 
 /**

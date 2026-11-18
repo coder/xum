@@ -132,37 +132,20 @@ function useSettingsRedirect(memoryEnabled: boolean, remoteConnectionAvailable: 
   }, [isOpen, activeSection, setActiveSection, memoryEnabled, remoteConnectionAvailable]);
 }
 
-type MobileViewChoice = { view: "list" | "section"; section: string } | null;
-
 /**
- * Whether phones show the section list. The user's pick holds only for the section it was made
- * on: browser Back to another entry (the sectionless one a plain open made) falls back to that
- * entry's own default, the list for a plain open and the section for a deep link.
+ * Phones show one column: the section list (with search) or a section with a back button. The
+ * history entry decides which: a plain open's entry (and the back button's) shows the list and
+ * every section entry shows its section, so browser Back and Forward restore what that entry
+ * showed. No local view state, so nothing can fall out of step with history.
  */
-export function isMobileListOpen(
-  choice: MobileViewChoice,
-  activeSection: string,
-  openedWithoutSection: boolean
-): boolean {
-  const view = choice?.section === activeSection ? choice.view : null;
-  return (view ?? (openedWithoutSection ? "list" : "section")) === "list";
-}
-
-/**
- * Phones show one column: the section list (with search) or a section with a back button.
- * Until the user picks, a plain open starts on the list and a deep link on its section.
- */
-function useMobileSettingsView() {
-  const { openedWithoutSection, activeSection, registerOnClose } = useSettings();
-  // The user's pick holds only for the section it was made on: browser Back to another entry
-  // (the sectionless one a plain open made) falls back to that entry's own default.
-  const [choice, setChoice] = useState<{ view: "list" | "section"; section: string } | null>(null);
-  // Each open decides afresh.
-  useEffect(() => registerOnClose(() => setChoice(null)), [registerOnClose]);
+function useMobileSettingsView(narrow: boolean) {
+  const { openedWithoutSection, activeSection, setActiveSection } = useSettings();
   return {
-    listOpen: isMobileListOpen(choice, activeSection, openedWithoutSection),
-    showList: () => setChoice({ view: "list", section: activeSection }),
-    showSection: (section: string) => setChoice({ view: "section", section }),
+    listOpen: openedWithoutSection,
+    // Wider screens show the list beside every section: only phones push a list entry.
+    showList: () => {
+      if (narrow && !openedWithoutSection) setActiveSection(activeSection, { sectionless: true });
+    },
   };
 }
 
@@ -316,30 +299,30 @@ function useSettingsActions(
   setFocusedSetting: (target: SettingsFocusTarget | null) => void,
   searchInputRef: React.RefObject<HTMLInputElement>
 ) {
-  const { open, activeSection, setActiveSection } = useSettings();
-  const leaveSearch = (sectionId: string) => {
-    search.setQuery("");
-    mobile.showSection(sectionId);
+  const { open, activeSection, openedWithoutSection, setActiveSection } = useSettings();
+  // A plain open's list entry must give way to a section entry even for the section it already
+  // names, or a phone would stay on the list.
+  const goToSection = (sectionId: string) => {
+    if (sectionId !== activeSection || openedWithoutSection) setActiveSection(sectionId);
   };
   const openSection = (sectionId: string) => {
-    leaveSearch(sectionId);
+    search.setQuery("");
     setFocusedSetting(null);
     setActiveSection(sectionId);
   };
   const openSetting = (id: SettingId) => {
-    const sectionId = SETTING_DEFINITIONS[id].section;
-    leaveSearch(sectionId);
+    search.setQuery("");
     setFocusedSetting({ id });
-    if (sectionId !== activeSection) setActiveSection(sectionId);
+    goToSection(SETTING_DEFINITIONS[id].section);
   };
   const openResult = (result: SettingsSearchResult) => {
     const { sectionId, expandProvider } = result.entry;
-    leaveSearch(expandProvider ? "providers" : sectionId);
+    search.setQuery("");
     setFocusedSetting(focusTargetOf(result));
     // A provider result uses the same deep link the onboarding and model pickers use: open
     // Providers with that card expanded.
     if (expandProvider) open("providers", { expandProvider });
-    else if (sectionId !== activeSection) setActiveSection(sectionId);
+    else goToSection(sectionId);
   };
   const focusSearch = (e: React.KeyboardEvent) => {
     if (!matchesKeybind(e, KEYBINDS.FOCUS_SETTINGS_SEARCH)) return;
@@ -368,7 +351,7 @@ export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFoc
   const narrow = useNarrowViewport();
   const sections = getSettingsSections(memoryEnabled, remoteConnectionAvailable);
   const search = useSettingsSearch(sections, environment.platform);
-  const mobile = useMobileSettingsView();
+  const mobile = useMobileSettingsView(narrow);
   // The row a search result opened: it scrolls into view and stays highlighted until the user
   // moves on (another section or another search).
   const [focusedSetting, setFocusedSetting] = useState<SettingsFocusTarget | null>(null);

@@ -55,11 +55,25 @@ export interface SettingsSearchContext {
   isExperimentEnabled: (experimentId: ExperimentId) => boolean;
   /** The providers the Providers section lists (built-in, then configured custom ones). */
   providers: ReadonlyArray<{ id: string; label: string }>;
+  /**
+   * Configured custom providers. One whose id shadows a built-in (a legacy `openai`, `typesafe`)
+   * renders as a custom card without the built-in's fields, so those fields are not listed.
+   */
+  customProviderIds: ReadonlySet<string>;
 }
 
 function isDefinitionListed(definition: SettingDefinition, context: SettingsSearchContext) {
   if ((definition.platform ?? context.platform) !== context.platform) return false;
+  if (definition.expandProvider && context.customProviderIds.has(definition.expandProvider)) {
+    return false;
+  }
   return definition.experiment == null || context.isExperimentEnabled(definition.experiment);
+}
+
+/** A hidden sub-option highlights its parent row; a hidden provider field, its provider card. */
+function fallbackAnchorOf(definition: SettingDefinition): string | undefined {
+  if (definition.parent) return definition.parent;
+  return definition.expandProvider ? providerAnchorId(definition.expandProvider) : undefined;
 }
 
 function settingEntries(
@@ -78,7 +92,7 @@ function settingEntries(
       description: definition.description,
       keywords: definition.keywords,
       anchorId: definition.anchor ?? id,
-      fallbackAnchorId: definition.parent,
+      fallbackAnchorId: fallbackAnchorOf(definition),
       expandProvider: definition.expandProvider,
     }));
 }

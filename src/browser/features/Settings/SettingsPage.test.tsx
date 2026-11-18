@@ -1,22 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-import { getSettingsSectionRedirect, getSettingsSections, isMobileListOpen } from "./SettingsPage";
+import { getSettingsSectionRedirect, getSettingsSections } from "./SettingsPage";
 
 describe("SettingsPage", () => {
-  test("phones keep the list/section pick only on the section it was made on", () => {
-    // Plain open lands on the list; a deep link on its section.
-    expect(isMobileListOpen(null, "general", true)).toBe(true);
-    expect(isMobileListOpen(null, "providers", false)).toBe(false);
-    // Picking Providers from the list, then browser Back to the sectionless entry: the list again.
-    const picked = { view: "section" as const, section: "providers" };
-    expect(isMobileListOpen(picked, "providers", false)).toBe(false);
-    expect(isMobileListOpen(picked, "general", true)).toBe(true);
-    // The back button on the open section shows the list over it.
-    expect(isMobileListOpen({ view: "list", section: "providers" }, "providers", false)).toBe(true);
-    // Choosing the section the plain open already shows still leaves the list.
-    expect(isMobileListOpen({ view: "section", section: "general" }, "general", true)).toBe(false);
-  });
-
   test("keeps Goals out of settings navigation", () => {
     const ids = getSettingsSections(true).map((section) => section.id);
 
