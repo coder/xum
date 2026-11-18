@@ -19,6 +19,7 @@ interface Stat {
 // The function is internal to app-builder-lib, so its type declarations leave it out.
 interface FileMatcherModule {
   getNodeModuleFileMatcher(
+    this: void,
     appDir: string,
     destination: string,
     macroExpander: (pattern: string) => string,
