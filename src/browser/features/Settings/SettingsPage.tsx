@@ -255,10 +255,17 @@ function SettingsContentColumn(props: {
   onReturnToSetup: (() => void) | null;
   /** The list column (and its title) is off screen: the dialog still needs its name. */
   titleHidden: boolean;
+  /** Phones show the list over it: hidden, not unmounted, so the section keeps its drafts. */
+  hidden: boolean;
 }) {
   const SectionComponent = props.section.component;
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+    <div
+      className={cn(
+        "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
+        props.hidden && "hidden"
+      )}
+    >
       {props.titleHidden ? <DialogTitle className="sr-only">Settings</DialogTitle> : null}
       <SettingsContentHeader
         section={props.section}
@@ -419,18 +426,18 @@ export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFoc
             onOpenSection={actions.openSection}
           />
         ) : null}
-        {narrow && showList ? null : (
-          <SettingsContentColumn
-            section={currentSection}
-            search={search}
-            results={results}
-            focusedSetting={focusedSetting}
-            onOpenSetting={actions.openSetting}
-            onBack={narrow ? mobile.showList : null}
-            titleHidden={!showList}
-            onReturnToSetup={onboardingPause.paused ? close : null}
-          />
-        )}
+        <SettingsContentColumn
+          section={currentSection}
+          search={search}
+          // Phones show the results in the list column; one listbox keeps its ids unique.
+          results={narrow ? null : results}
+          focusedSetting={focusedSetting}
+          onOpenSetting={actions.openSetting}
+          onBack={narrow ? mobile.showList : null}
+          titleHidden={!showList}
+          hidden={narrow && showList}
+          onReturnToSetup={onboardingPause.paused ? close : null}
+        />
 
         {/* One close button for both layouts: it sits in the top-right header row either way.
             Touch screens force buttons to a 44px minimum (globals.css), so a 24px box offset by

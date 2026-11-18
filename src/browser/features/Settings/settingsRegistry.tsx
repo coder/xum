@@ -310,6 +310,12 @@ export interface SettingDefinition {
    * opens a hidden row, the parent is highlighted instead.
    */
   parent?: string;
+  /**
+   * Only the built-in provider card renders this control: a custom provider that shadows the
+   * built-in id (a legacy `coder`, `bedrock`, `typesafe`) renders its own card without it, so
+   * search drops the row then. The Anthropic, OpenAI, xAI and Copilot blocks render on either.
+   */
+  builtInCardOnly?: true;
   /** Platform where the row exists at all; search hides it elsewhere. */
   platform?: "desktop" | "browser";
   /** Experiment that must be on for the row to exist; search hides it otherwise. */
@@ -568,7 +574,7 @@ export const SETTING_DEFINITIONS = {
     section: "sandbox",
     label: "Allow CDN assets in artifacts",
     description:
-      "HTML and SVG artifacts run in a sandbox whose content policy blocks network requests, except scripts, styles and fonts from a few public CDNs (cdnjs, unpkg, jsDelivr, jQuery, Tailwind) and Google Fonts. Turn this off to block every CDN.",
+      "HTML and SVG artifacts run in a sandbox whose content policy blocks network requests, except scripts, styles and fonts from a few public CDNs (cdnjs, unpkg, jsDelivr, jQuery, Tailwind) and Google Fonts. This is not a full network block: a hostile artifact could still leak data, for example through WebRTC or the paths of those CDN requests. Turn this off to block every CDN.",
     keywords: ["artifacts", "content security policy", "csp", "scripts", "fonts"],
     experiment: EXPERIMENT_IDS.ARTIFACTS,
   },
@@ -627,6 +633,7 @@ export const SETTING_DEFINITIONS = {
     description: "Credential for the Auto model and thinking routing evaluation.",
     keywords: ["typesafe", "auto routing"],
     experiment: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+    builtInCardOnly: true,
     // The API-key editor mounts only while the TypeSafe card is expanded.
     expandProvider: TYPESAFE_PROVIDER_KEY,
   },
@@ -681,27 +688,39 @@ export const SETTING_DEFINITIONS = {
     "Sign in to GitHub Copilot.",
     ["copilot", "oauth"]
   ),
-  "coder-login": providerField("coder", "Coder login", "Connect Xum to your Coder deployment.", [
-    "deployment url",
-    "oauth",
-  ]),
-  "coder-model-routing": providerField(
-    "coder",
-    "Coder model routing",
-    "Which Coder provider native models use when route priority picks Coder."
-  ),
-  "bedrock-credentials": providerField(
-    "bedrock",
-    "Bedrock credentials",
-    "Region, AWS profile, bearer token or access keys.",
-    ["aws", "region", "profile", "access key"]
-  ),
-  "vertex-credentials": providerField(
-    "google-vertex",
-    "Vertex AI credentials",
-    "Project, location and service account key file.",
-    ["gcp", "service account", "location"]
-  ),
+  "coder-login": {
+    ...providerField("coder", "Coder login", "Connect Xum to your Coder deployment.", [
+      "deployment url",
+      "oauth",
+    ]),
+    builtInCardOnly: true,
+  },
+  "coder-model-routing": {
+    ...providerField(
+      "coder",
+      "Coder model routing",
+      "Which Coder provider native models use when route priority picks Coder."
+    ),
+    builtInCardOnly: true,
+  },
+  "bedrock-credentials": {
+    ...providerField(
+      "bedrock",
+      "Bedrock credentials",
+      "Region, AWS profile, bearer token or access keys.",
+      ["aws", "region", "profile", "access key"]
+    ),
+    builtInCardOnly: true,
+  },
+  "vertex-credentials": {
+    ...providerField(
+      "google-vertex",
+      "Vertex AI credentials",
+      "Project, location and service account key file.",
+      ["gcp", "service account", "location"]
+    ),
+    builtInCardOnly: true,
+  },
   "models-filter": {
     section: "models",
     label: "Filter models",

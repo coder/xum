@@ -56,17 +56,21 @@ export interface SettingsSearchContext {
   /** The providers the Providers section lists (built-in, then configured custom ones). */
   providers: ReadonlyArray<{ id: string; label: string }>;
   /**
-   * Configured custom providers. One whose id shadows a built-in (a legacy `openai`, `typesafe`)
-   * renders as a custom card without the built-in's fields, so those fields are not listed.
+   * Configured custom providers. One whose id shadows a built-in renders its own card, which
+   * lacks the built-in card's `builtInCardOnly` rows, so those rows are not listed.
    */
   customProviderIds: ReadonlySet<string>;
 }
 
+/** The row is on a built-in card that a custom provider with the same id replaces. */
+function isOnHiddenBuiltInCard(definition: SettingDefinition, context: SettingsSearchContext) {
+  const provider = definition.builtInCardOnly ? definition.expandProvider : undefined;
+  return provider != null && context.customProviderIds.has(provider);
+}
+
 function isDefinitionListed(definition: SettingDefinition, context: SettingsSearchContext) {
   if ((definition.platform ?? context.platform) !== context.platform) return false;
-  if (definition.expandProvider && context.customProviderIds.has(definition.expandProvider)) {
-    return false;
-  }
+  if (isOnHiddenBuiltInCard(definition, context)) return false;
   return definition.experiment == null || context.isExperimentEnabled(definition.experiment);
 }
 

@@ -173,10 +173,13 @@ describe("searchSettings", () => {
     expect(result?.entry.fallbackAnchorId).toBe("provider:openai");
   });
 
-  test("a custom provider shadowing a built-in drops the built-in's fields", () => {
-    const shadowed = { customProviderIds: ["openai", TYPESAFE_PROVIDER_KEY] };
-    expect(ids(search("chatgpt oauth"))).toContain("setting:openai-oauth");
-    expect(ids(search("chatgpt oauth", shadowed))).not.toContain("setting:openai-oauth");
+  test("a custom provider shadowing a built-in drops only the rows its card lacks", () => {
+    const shadowed = { customProviderIds: ["openai", "coder", TYPESAFE_PROVIDER_KEY] };
+    // The OpenAI block renders on a custom `openai` card too, so its rows stay searchable.
+    expect(ids(search("chatgpt oauth", shadowed))).toContain("setting:openai-oauth");
+    // Coder login renders only on the built-in Coder card.
+    expect(ids(search("coder login"))).toContain("setting:coder-login");
+    expect(ids(search("coder login", shadowed))).not.toContain("setting:coder-login");
     const evaluation = { experiments: [EXPERIMENT_IDS.AUTO_MODEL_ROUTING] };
     expect(ids(search("evaluation api key", evaluation))).toContain(
       "setting:evaluation-credential"
