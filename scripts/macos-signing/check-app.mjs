@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Checks, on macOS with Apple's own tools, the signature that sign-app.mjs made on Linux with
-// rcodesign: every Mach-O has the hardened runtime, and the executables (and only they) have the
-// entitlements. A file that sign-app.mjs gave no settings would still be signed, and would fail
-// only on a user's machine, so the build checks each file here.
+// rcodesign: every Mach-O has a signature that verifies and the hardened runtime, and the
+// executables (and only they) have the entitlements. A file that sign-app.mjs gave no settings
+// would still be signed, and would fail only on a user's machine, so the build checks each file
+// here.
 //
 // Usage: node scripts/macos-signing/check-app.mjs <app> <entitlements.plist> [--requirement <text>]
 //
@@ -63,6 +64,13 @@ if (machOs.length === 0) failures.push(`no Mach-O file under ${app}`);
 
 for (const machO of machOs) {
   const file = path.join(app, machO.path);
+  // `codesign -d` only shows a signature, and the release check's `--verify --deep` does not
+  // reach code in Contents/Resources (the unpacked native modules), so each file is verified.
+  const verified = run("codesign", ["--verify", "--strict", "--verbose=2", file]);
+  if (verified.status !== 0) {
+    failures.push(`${machO.path}: the signature does not verify\n${verified.output.trim()}`);
+    continue;
+  }
   const info = run("codesign", ["-d", "--verbose=2", file]);
   if (info.status !== 0) {
     failures.push(`${machO.path}: codesign cannot read a signature\n${info.output.trim()}`);
@@ -103,7 +111,9 @@ if (requirement !== null && failures.length === 0) {
     const result = run("xcrun", ["stapler", "validate", "-v", app]);
     if (result.status === 0) break;
     if (result.status !== STAPLE_TICKET_NOT_READY || attempt === STAPLE_ATTEMPTS) {
-      failures.push(`the stapled ticket failed validation (code ${result.status})\n${result.output.trim()}`);
+      failures.push(
+        `the stapled ticket failed validation (code ${result.status})\n${result.output.trim()}`
+      );
       break;
     }
     console.log(`stapler validate got no answer from Apple (attempt ${attempt}); waiting`);
