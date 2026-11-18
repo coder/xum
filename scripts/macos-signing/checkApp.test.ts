@@ -29,6 +29,8 @@ let app: string;
 interface Signature {
   flags?: string;
   entitlements?: string;
+  // The stub's per-file `codesign --verify` fails, as for a corrupt signature.
+  invalid?: boolean;
 }
 
 function machO(fileType: number): Buffer {
@@ -53,6 +55,7 @@ async function put(relative: string, fileType: number, signature: Signature): Pr
     ].join("\n")
   );
   await writeFile(`${file}.entitlements`, signature.entitlements ?? "");
+  if (signature.invalid) await writeFile(`${file}.invalid`, "");
 }
 
 beforeEach(async () => {
@@ -65,6 +68,7 @@ beforeEach(async () => {
 case "$*" in
   "-d --verbose=2 "*) cat "$file.info" >&2 ;;
   "-d --entitlements - --xml "*) cat "$file.entitlements" ;;
+  "--verify --strict --verbose=2 "*) [ ! -e "$file.invalid" ] || { echo "$file: invalid signature" >&2; exit 1; } ;;
   *) echo "codesign $*" >> "${work}/runs"; exit "\${CODESIGN_VERIFY_EXIT:-0}" ;;
 esac`
   );
@@ -169,6 +173,18 @@ test("fails a library that has entitlements", async () => {
   expect(result.stderr).toContain("libextra.dylib: entitlements are");
 });
 
+test("fails a Mach-O whose signature does not verify, in Contents/Resources too", async () => {
+  await putGoodApp();
+  await put("Contents/Resources/app.asar.unpacked/native.node", 6, { invalid: true });
+
+  const result = await check();
+
+  expect(result.exitCode).toBe(1);
+  expect(result.stderr).toContain(
+    "Contents/Resources/app.asar.unpacked/native.node: the signature does not verify"
+  );
+});
+
 test("for a release, asks codesign, Gatekeeper and the stapler about the app", async () => {
   await putGoodApp();
 
@@ -211,7 +227,9 @@ test("waits and asks the stapler again only while Apple's ticket service gives n
 test("stops asking the stapler after five answers of no ticket", async () => {
   await putGoodApp();
 
-  const result = await check(["--requirement", REQUIREMENT], { STAPLER_EXITS: "68 68 68 68 68 68" });
+  const result = await check(["--requirement", REQUIREMENT], {
+    STAPLER_EXITS: "68 68 68 68 68 68",
+  });
 
   expect(result.exitCode).toBe(1);
   expect(result.runs.filter((run) => run.startsWith("xcrun"))).toHaveLength(5);
