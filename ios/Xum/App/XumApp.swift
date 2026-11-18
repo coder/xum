@@ -12,6 +12,7 @@ struct XumApp: App {
                 .tint(Color.xAccent)
                 .xumAppearance(Appearance(rawValue: appearance) ?? .system)
                 .onOpenURL { model.handle(url: $0) }
+                .background(HorizontalStatusBar().frame(width: 0, height: 0))
         }
     }
 }
