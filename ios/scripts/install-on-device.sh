@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the Xum iOS app for a connected iPhone and install it.
 #
+#   ios/scripts/install-on-device.sh                # team read from your signing certificate
 #   TEAM_ID=ABCDE12345 ios/scripts/install-on-device.sh
 #
 # TEAM_ID is your Apple developer team (a free Personal Team works; its installs expire after
@@ -9,7 +10,14 @@
 # phone must be paired, unlocked and in Developer Mode.
 set -euo pipefail
 
-: "${TEAM_ID:?set TEAM_ID to your Apple team ID (Xcode > Settings > Accounts > your team)}"
+# Without TEAM_ID, use the team (the OU field) of the first Apple Development certificate in the
+# keychain; Xcode creates one when you add your Apple ID and click Manage Certificates > +.
+if [ -z "${TEAM_ID:-}" ]; then
+  TEAM_ID="$(security find-certificate -c "Apple Development" -p 2>/dev/null |
+    openssl x509 -noout -subject -nameopt multiline 2>/dev/null |
+    awk -F' = ' '/organizationalUnitName/ {print $2; exit}' || true)"
+fi
+: "${TEAM_ID:?no Apple Development certificate found: add your Apple ID in Xcode > Settings > Accounts, or set TEAM_ID}"
 BUNDLE_ID="${BUNDLE_ID:-dev.${TEAM_ID}.xum}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
