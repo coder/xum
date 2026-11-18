@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
+import { providerAnchorId } from "../settingsRegistry";
 import {
   Check,
   ChevronDown,
@@ -179,6 +181,19 @@ interface FieldConfig {
   placeholder: string;
   type: "secret" | "text";
   optional?: boolean;
+}
+
+// Search marks for credential blocks built from getProviderFields: the first field carries it.
+const PROVIDER_FIELD_MARKS = [
+  { provider: "bedrock", fieldKey: "region", markId: "bedrock-credentials" },
+  { provider: "google-vertex", fieldKey: "project", markId: "vertex-credentials" },
+] as const;
+
+function ProviderFieldMark(props: { provider: string; fieldKey: string }) {
+  const mark = PROVIDER_FIELD_MARKS.find(
+    (entry) => entry.provider === props.provider && entry.fieldKey === props.fieldKey
+  );
+  return mark ? <SettingsMark id={mark.markId} /> : null;
 }
 
 function isCustomProviderInfo(
@@ -573,6 +588,7 @@ function GatewayRoutePriorityList({
 
   return (
     <div className="border-border-medium bg-background-secondary/50 space-y-2 rounded-md border px-3 py-2">
+      <SettingsMark id="provider-route-priority" />
       <div>
         <div className="text-foreground text-xs font-medium">Route priority</div>
         <div className="text-muted text-xs">Drag to choose gateway order for auto routing.</div>
@@ -1845,6 +1861,9 @@ export function ProvidersSection() {
                   key={provider}
                   className="border-border-medium bg-background-secondary overflow-hidden rounded-md border"
                 >
+                  {/* Scroll target for a settings search result; the expanded card is the
+                      highlight, so the anchor itself takes no space. */}
+                  <SettingsMark id={providerAnchorId(provider)} />
                   {/* Provider header */}
                   <Button
                     variant="ghost"
@@ -1946,6 +1965,7 @@ export function ProvidersSection() {
 
                       {provider === "github-copilot" && (
                         <div className="space-y-2">
+                          <SettingsMark id="copilot-login" />
                           <div>
                             <label className="text-foreground block text-xs font-medium">
                               Authentication
@@ -2051,6 +2071,7 @@ export function ProvidersSection() {
 
                         return (
                           <div key={fieldConfig.key}>
+                            <ProviderFieldMark provider={provider} fieldKey={fieldConfig.key} />
                             <label className="text-muted mb-1 block text-xs">
                               {fieldConfig.label}
                               {fieldConfig.optional && (
@@ -2173,6 +2194,7 @@ export function ProvidersSection() {
                           custom config and has no OAuth flow. */}
                       {provider === "coder" && !isCustom && (
                         <div className="space-y-2">
+                          <SettingsMark id="coder-login" />
                           <div>
                             <label className="text-foreground block text-xs font-medium">
                               Authentication
@@ -2305,6 +2327,7 @@ export function ProvidersSection() {
                       {provider === "anthropic" && (
                         <>
                           <div className="border-border-light border-t pt-3">
+                            <SettingsMark id="anthropic-cache-ttl" />
                             <div className="mb-1 flex items-center gap-1">
                               <label className="text-muted block text-xs">Prompt cache TTL</label>
                               <TooltipProvider>
@@ -2359,6 +2382,7 @@ export function ProvidersSection() {
                           </div>
 
                           <div className="border-border-light border-t pt-3">
+                            <SettingsMark id="anthropic-beta" />
                             <div className="mb-1 flex items-center gap-1">
                               <label className="text-muted block text-xs">Beta features</label>
                               <TooltipProvider>
@@ -2419,6 +2443,7 @@ export function ProvidersSection() {
                           return (
                             <div className="border-border-light space-y-3 border-t pt-3">
                               <div>
+                                <SettingsMark id="openai-oauth" />
                                 <label className="text-foreground block text-xs font-medium">
                                   ChatGPT (Codex) OAuth
                                 </label>
@@ -2538,6 +2563,7 @@ export function ProvidersSection() {
                               )}
 
                               <div className="border-border-light space-y-2 border-t pt-3">
+                                <SettingsMark id="openai-default-auth" />
                                 <div>
                                   <label className="text-muted block text-xs">
                                     Default auth (when both are set)
@@ -2601,6 +2627,7 @@ export function ProvidersSection() {
                               </div>
 
                               <div className="border-border-light border-t pt-3">
+                                <SettingsMark id="openai-service-tier" />
                                 <div className="mb-1 flex items-center gap-1">
                                   <label className="text-muted block text-xs">Service tier</label>
                                   <TooltipProvider>
@@ -2682,6 +2709,7 @@ export function ProvidersSection() {
                               </div>
 
                               <div className="border-border-light border-t pt-3">
+                                <SettingsMark id="openai-wire-format" />
                                 <div className="mb-1 flex items-center gap-1">
                                   <label className="text-muted block text-xs">Wire format</label>
                                   <TooltipProvider>
@@ -2735,6 +2763,7 @@ export function ProvidersSection() {
                               </div>
                               {openAIWebSocketTransportVisible && (
                                 <div className="border-border-light border-t pt-3">
+                                  <SettingsMark id="openai-websocket" />
                                   <div className="flex items-center justify-between gap-3">
                                     <div>
                                       <label className="text-foreground block text-xs font-medium">
@@ -2771,6 +2800,7 @@ export function ProvidersSection() {
                               )}
 
                               <div className="border-border-light border-t pt-3">
+                                <SettingsMark id="openai-cyber" />
                                 <div className="flex items-center justify-between gap-3">
                                   <div>
                                     <label className="text-foreground block text-xs font-medium">
@@ -2817,6 +2847,7 @@ export function ProvidersSection() {
                               </div>
 
                               <div className="border-border-light border-t pt-3">
+                                <SettingsMark id="openai-response-storage" />
                                 <div className="mb-1 flex items-center gap-1">
                                   <label className="text-muted block text-xs">
                                     Response storage
@@ -2890,6 +2921,7 @@ export function ProvidersSection() {
 
                       {provider === "xai" && (
                         <div className="border-border-light border-t pt-3">
+                          <SettingsMark id="xai-processing-mode" />
                           <div className="mb-1 flex items-center gap-1">
                             <label className="text-muted block text-xs">Processing mode</label>
                             <TooltipProvider>
@@ -3024,6 +3056,7 @@ export function ProvidersSection() {
                       overflows the button. */}
                   <div className="min-w-0">
                     <div className="text-foreground text-xs font-medium">Add a custom provider</div>
+                    <SettingsMark id="custom-provider-add" />
                     <div className="text-muted text-xs">
                       Add providers that use OpenAI Chat Completions, OpenAI Responses, or Anthropic
                       Messages.
@@ -3194,6 +3227,7 @@ export function ProvidersSection() {
       {showTypeSafeProvider && (
         <div className="space-y-2">
           <div className="text-muted text-xs font-medium tracking-wide uppercase">Evaluation</div>
+          <SettingsMark id="evaluation-credential" />
           <TypeSafeProviderCard
             expanded={expandedProvider === TYPESAFE_PROVIDER_KEY}
             onToggle={() => handleToggleProvider(TYPESAFE_PROVIDER_KEY)}
@@ -3203,6 +3237,7 @@ export function ProvidersSection() {
 
       <div className="space-y-2 pt-2">
         <div className="text-muted text-xs font-medium tracking-wide uppercase">Bash commands</div>
+        <SettingsMark id="bash-ai-calls" />
         <ConfigSwitchSetting
           title="Count AI calls from bash commands"
           description={

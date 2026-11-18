@@ -1,10 +1,12 @@
 import { KEYBINDS, formatKeybind, isKeybindDeprecated } from "@/browser/utils/ui/keybinds";
+import { SettingsAnchor, SettingsGroup } from "../Components/SettingsLayout";
+import { keybindAnchorId } from "../settingsRegistry";
 
 /**
  * Human-readable labels for keybind IDs.
  * Derived from the comments in keybinds.ts.
  */
-const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
+export const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   TOGGLE_AGENT: "Open agent picker",
   CYCLE_AGENT: "Cycle agent",
   SEND_MESSAGE: "Send message",
@@ -58,6 +60,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   CONFIGURE_HEARTBEAT: "Configure heartbeat",
   CONFIGURE_UNRELATED_MESSAGING: "Configure messages from other workspaces",
   OPEN_COMMAND_PALETTE: "Command palette",
+  FOCUS_SETTINGS_SEARCH: "Search settings",
   OPEN_COMMAND_PALETTE_ACTIONS: "Command palette (alternate)",
   TOGGLE_THINKING: "Toggle thinking",
   INCREASE_THINKING: "Increase thinking level",
@@ -176,7 +179,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
 };
 
 /** Groups for organizing keybinds in the UI */
-const KEYBIND_GROUPS: Array<{
+export const KEYBIND_GROUPS: Array<{
   label: string;
   keys: Array<keyof typeof KEYBINDS>;
 }> = [
@@ -187,6 +190,7 @@ const KEYBIND_GROUPS: Array<{
       "CYCLE_AGENT",
       "OPEN_COMMAND_PALETTE",
       "OPEN_SETTINGS",
+      "FOCUS_SETTINGS_SEARCH",
       "OPEN_ANALYTICS",
       "OPEN_SERVER_WINDOW",
       "REPORT_SLOWNESS",
@@ -377,26 +381,24 @@ export function KeybindsSection() {
   })).filter((group) => group.keys.length > 0);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       {visibleKeybindGroups.map((group) => (
-        <div key={group.label}>
-          <h3 className="text-foreground mb-3 text-sm font-medium">{group.label}</h3>
-          <div className="space-y-1">
-            {group.keys.map((key) => (
-              <div
-                key={key}
-                className="flex items-center justify-between rounded px-2 py-1.5 text-sm"
-              >
-                <span className="text-muted">{KEYBIND_LABELS[key]}</span>
-                <kbd className="bg-background-secondary text-foreground border-border-medium rounded border px-2 py-0.5 font-mono text-xs">
-                  {[key, ...(KEYBIND_DISPLAY_ALTERNATES[key] ?? [])]
-                    .map((keybindId) => formatKeybind(KEYBINDS[keybindId]))
-                    .join(" / ")}
-                </kbd>
-              </div>
-            ))}
-          </div>
-        </div>
+        <SettingsGroup key={group.label} title={group.label}>
+          {group.keys.map((key) => (
+            <SettingsAnchor
+              key={key}
+              id={keybindAnchorId(key)}
+              className="flex items-center justify-between gap-4 px-4 py-2 text-sm"
+            >
+              <span className="text-content-primary">{KEYBIND_LABELS[key]}</span>
+              <kbd className="bg-surface-primary text-content-primary border-border-medium shrink-0 rounded border px-2 py-0.5 font-mono text-xs">
+                {[key, ...(KEYBIND_DISPLAY_ALTERNATES[key] ?? [])]
+                  .map((keybindId) => formatKeybind(KEYBINDS[keybindId]))
+                  .join(" / ")}
+              </kbd>
+            </SettingsAnchor>
+          ))}
+        </SettingsGroup>
       ))}
     </div>
   );

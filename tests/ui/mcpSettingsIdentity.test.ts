@@ -177,7 +177,7 @@ describeIntegration("MCP settings server identity", () => {
     await expectBadge(canvas, SERVER, true);
 
     // Leaving and re-entering the section restores the cached count only.
-    fireEvent.click(canvas.getAllByRole("button", { name: "General" })[0]);
+    fireEvent.click(canvas.getAllByRole("button", { name: "Appearance" })[0]);
     await waitFor(() => {
       if (canvas.queryByRole("switch", { name: `Toggle ${SERVER} enabled` }))
         throw new Error("MCP section still shown");

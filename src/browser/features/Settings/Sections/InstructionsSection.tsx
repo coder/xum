@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import type { ProjectConfig } from "@/common/types/project";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
@@ -129,6 +130,7 @@ export const InstructionsSection: React.FC = () => {
         <p className="text-muted text-xs">Add a project to configure its instructions.</p>
       ) : (
         <div>
+          <SettingsMark id="custom-instructions" />
           <label htmlFor="project-custom-instructions" className="block">
             <div className="text-foreground text-sm font-medium">Custom instructions</div>
           </label>

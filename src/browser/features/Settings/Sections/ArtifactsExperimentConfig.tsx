@@ -1,30 +1,30 @@
 import { Switch } from "@/browser/components/Switch/Switch";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { SettingRow, SettingsGroup } from "../Components/SettingsLayout";
 
-/** Per-user settings for the Artifacts experiment, shown under its row in Experiments. */
+/**
+ * Sandbox & limits → Artifacts: what artifact sandboxes may load. Moved from under the Artifacts
+ * row in Experiments (which now only turns the feature on) to sit with the other sandbox policy.
+ */
 export function ArtifactsExperimentConfig() {
+  const enabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   // Same default as SandboxedArtifactFrame and McpAppFrame.
   const allowCdn =
     useUserPreferences((preferences) => preferences.ui?.artifactsAllowCdnScripts) ?? true;
+  if (!enabled) return null;
   return (
-    <div className="bg-background-secondary flex items-center justify-between gap-4 px-4 py-3">
-      <div className="flex-1">
-        <div className="text-foreground text-sm">Allow CDN assets in artifacts</div>
-        <div className="text-muted text-xs">
-          HTML and SVG artifacts run in a sandbox whose content policy blocks network requests,
-          except scripts, styles and fonts from a few public CDNs (cdnjs, unpkg, jsDelivr, jQuery,
-          Tailwind) and Google Fonts. This is not a full network block: a hostile artifact could
-          still leak data, for example through WebRTC or the paths of those CDN requests. Turn this
-          off to block every CDN.
-        </div>
-      </div>
-      <Switch
-        checked={allowCdn}
-        onCheckedChange={(checked) =>
-          updateUserPreferences({ ui: { artifactsAllowCdnScripts: checked } })
-        }
-        aria-label="Toggle CDN assets in artifacts"
-      />
-    </div>
+    <SettingsGroup title="Artifacts" description="Shown while the Artifacts experiment is on.">
+      <SettingRow id="artifacts-cdn">
+        <Switch
+          checked={allowCdn}
+          onCheckedChange={(checked) =>
+            updateUserPreferences({ ui: { artifactsAllowCdnScripts: checked } })
+          }
+          aria-label="Toggle CDN assets in artifacts"
+        />
+      </SettingRow>
+    </SettingsGroup>
   );
 }

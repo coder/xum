@@ -1,4 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
+import {
+  SETTINGS_GROUP_HEADING_CLASS,
+  SettingsAnchor,
+  SettingsMark,
+} from "../Components/SettingsLayout";
+import { ConfigurableBindUrlControls } from "./ExperimentsSection";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Button } from "@/browser/components/Button/Button";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
@@ -164,6 +172,7 @@ export function ServerAccessSection() {
   return (
     <div className="space-y-4">
       <div>
+        <SettingsMark id="server-sessions" />
         <h3 className="text-foreground text-sm font-medium">Server access sessions</h3>
         <p className="text-muted mt-1 text-xs">
           Manage browser sessions for this server. Revoke devices you no longer trust.
@@ -219,6 +228,29 @@ export function ServerAccessSection() {
           Current session last active {formatRelativeTime(currentSession.lastUsedAtMs)}.
         </p>
       ) : null}
+
+      <LanAccessGroup />
     </div>
+  );
+}
+/** Server access → LAN / VPN access: shown while "Expose API server on LAN/VPN" is on. */
+export function LanAccessGroup() {
+  const enabled = useExperimentValue(EXPERIMENT_IDS.CONFIGURABLE_BIND_URL);
+  if (!enabled) return null;
+  return (
+    <section className="space-y-2 pt-4">
+      <div className="px-1">
+        <h3 className={SETTINGS_GROUP_HEADING_CLASS}>LAN / VPN access</h3>
+        <div className="text-content-secondary mt-1 text-xs">
+          Bind host, port and web UI for the API server (experimental).
+        </div>
+      </div>
+      <SettingsAnchor
+        id="lan-bind"
+        className="border-border-light overflow-hidden rounded-lg border"
+      >
+        <ConfigurableBindUrlControls />
+      </SettingsAnchor>
+    </section>
   );
 }

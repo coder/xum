@@ -98,7 +98,7 @@ test("remote connection isolates the page and returns to the same local renderer
   });
   expect(localProjects.length).toBeGreaterThan(0);
   await ui.settings.open();
-  await page.getByRole("button", { name: "Remote Connection", exact: true }).click();
+  await page.getByRole("button", { name: "Remote connection", exact: true }).click();
   const localWindow = await app.browserWindow(page);
   const localRenderer = await page.evaluateHandle(() => document.documentElement);
   const url = remoteServer.url + "/?token=e2e-private-token";
@@ -234,7 +234,7 @@ test("Coder path-mounted servers retain their URL and isolate sibling sessions",
   remoteServer,
 }) => {
   await ui.settings.open();
-  await page.getByRole("button", { name: "Remote Connection", exact: true }).click();
+  await page.getByRole("button", { name: "Remote connection", exact: true }).click();
   const firstServerUrl = remoteServer.url + "/@alice/first/apps/xum";
   const secondServerUrl = remoteServer.url + "/@alice/second/apps/xum";
   const connections = [

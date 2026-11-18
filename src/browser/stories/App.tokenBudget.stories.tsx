@@ -325,6 +325,7 @@ export const ExperimentSettings: AppStory = {
   ),
   play: async ({ canvasElement }) => {
     const settings = within(await openSettingsDialog(canvasElement));
+    await userEvent.click(await settings.findByRole("button", { name: "Behavior" }));
     const strategy = await settings.findByRole("combobox", { name: "Compaction strategy" });
     strategy.scrollIntoView({ block: "center" });
     await expect(strategy).toHaveTextContent("Token Budget");

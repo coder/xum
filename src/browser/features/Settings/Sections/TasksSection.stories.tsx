@@ -4,7 +4,8 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { AgentSandboxSettings } from "./AgentSandboxSettings.js";
-import { TasksSection } from "./TasksSection.js";
+import { SandboxSection } from "./SandboxSection.js";
+import { AgentBehaviorSection, AgentDefaultsSection, TasksSection } from "./TasksSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
 const meta: Meta = {
@@ -44,7 +45,12 @@ export const Tasks: Story = {
         })
       }
     >
-      <TasksSection />
+      {/* Behavior and Agents share TasksSection; one story covers both (snapshot budget). */}
+      <AgentBehaviorSection />
+      <AgentDefaultsSection />
+      {/* Resource limits moved to Sandbox & limits; rendered here too so this one story (the
+          snapshot budget has no headroom) keeps covering them. */}
+      <SandboxSection />
     </SettingsSectionStory>
   ),
   play: async ({ canvasElement }) => {

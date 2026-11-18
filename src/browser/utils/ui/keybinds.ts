@@ -722,6 +722,10 @@ export const KEYBINDS = {
   // macOS: Cmd+, Win/Linux: Ctrl+,
   OPEN_SETTINGS: { key: ",", ctrl: true },
 
+  /** Focus the search field in Settings (only while Settings is open) */
+  // macOS: Cmd+F, Win/Linux: Ctrl+F
+  FOCUS_SETTINGS_SEARCH: { key: "f", ctrl: true },
+
   /** Open a window for the xum server running on this Xum root (desktop only, #4846) */
   // macOS: Cmd+Shift+O, Win/Linux: Ctrl+Shift+O
   OPEN_SERVER_WINDOW: { key: "O", ctrl: true, shift: true },

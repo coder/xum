@@ -3,7 +3,7 @@ title: Token-Budget Context Windows
 description: Start fresh context windows without automatic summaries and retrieve earlier work on demand
 ---
 
-Select **Token Budget** from **Compaction strategy** in **Settings → General** to replace usage-triggered automatic summaries with fresh context windows. The default strategy is **Summarize**.
+Select **Token Budget** from **Compaction strategy** in **Settings → Behavior** to replace usage-triggered automatic summaries with fresh context windows. The default strategy is **Summarize**.
 
 Token Budget requires the **Agent Memory** experiment, because the agent keeps its checkpoint in memory. Without Agent Memory, the option is hidden and automatic summaries apply. A saved Token Budget choice stays saved and takes effect again when Agent Memory is turned on.
 

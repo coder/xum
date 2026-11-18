@@ -7,7 +7,7 @@ Agents that run in parallel on one machine can use all of its CPU and memory, wh
 
 ## Set the limits
 
-In **Settings → Agents → Resource limits**, turn on the switch. Then enter a **CPU limit** in cores (fractions such as `2.5` work) and a **Memory limit** in GiB. An empty field means no limit. The value saves when you leave the field.
+In **Settings → Sandbox & limits → Resource limits**, turn on the switch. Then enter a **CPU limit** in cores (fractions such as `2.5` work) and a **Memory limit** in GiB. An empty field means no limit. The value saves when you leave the field.
 
 The line under the fields shows the result:
 
@@ -24,7 +24,7 @@ To stop the limits for a while, turn off the switch. The limits stop at once, al
 
 A project can get its own CPU and memory limit inside the limit that all projects share. For example, all projects together get 28 cores and 64 GiB, and the project `pharos` gets at most 14 cores and 32 GiB of that. The other projects get only the shared limit.
 
-1. In **Settings → Agents → Resource limits**, set the limit for all projects, or leave it empty.
+1. In **Settings → Sandbox & limits → Resource limits**, set the limit for all projects, or leave it empty.
 2. In **Project**, select the project.
 3. Enter its **CPU limit** and **Memory limit**. An empty field means that the project has no limit of its own for that resource.
 

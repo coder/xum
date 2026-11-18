@@ -3,7 +3,9 @@ import { expect, waitFor, within } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { AutoModelRoutingGroup } from "./AutoModelRoutingExperimentConfig.js";
 import { ExperimentsSection } from "./ExperimentsSection.js";
+import { MemoryConsolidationGroup } from "./MemorySection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
 const meta: Meta = {
@@ -52,6 +54,8 @@ export const MemorySettingsEnabled: Story = {
       }
     >
       <ExperimentsSection />
+      {/* The dream limits moved to Settings → Memory; shown here next to the switch they follow. */}
+      <MemoryConsolidationGroup />
     </SettingsSectionStory>
   ),
   play: async ({ canvasElement }) => {
@@ -60,7 +64,7 @@ export const MemorySettingsEnabled: Story = {
     // With Agent Memory enabled, the sub-experiment toggles render in the
     // nested panel under the parent row.
     await canvas.findByLabelText("Toggle Memory Consolidation");
-    // With consolidation on, its dream cost ceiling sits under it, empty until the user sets one.
+    // With consolidation on, the Memory group shows its dream cost ceiling, empty until set.
     await expect(await canvas.findByLabelText("Dream cost ceiling")).toHaveValue("");
     // The edit limit shows the default 8 until the user saves another.
     await expect(await canvas.findByLabelText("Dream edit limit")).toHaveValue("8");
@@ -103,13 +107,14 @@ export const AutoModelRoutingEnabled: Story = {
         })
       }
     >
-      <ExperimentsSection />
+      {/* The tier editor moved from under its Experiments row to Settings → Models. */}
+      <AutoModelRoutingGroup />
     </SettingsSectionStory>
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
 
-    // The nested panel renders the evaluation model field, the default tier rows, and the
+    // The Auto routing group renders the evaluation model field, the default tier rows, and the
     // preview control.
     await canvas.findByLabelText("Evaluation model");
     await canvas.findByLabelText("Tier 4 description");

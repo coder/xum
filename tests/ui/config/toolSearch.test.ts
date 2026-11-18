@@ -17,7 +17,7 @@ describeIntegration("Tool search setting", () => {
     try {
       const canvas = await openSettingsDialog(app.view.container);
       const openMcp = async () => {
-        fireEvent.click(await canvas.findByRole("button", { name: "General" }));
+        fireEvent.click(await canvas.findByRole("button", { name: "Appearance" }));
         fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
         const toggle = await canvas.findByRole("switch", { name: "Toggle MCP tool search" });
         await waitFor(() => expect(toggle.hasAttribute("disabled")).toBe(false));

@@ -1,4 +1,5 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
 import {
   McpAppViewDomainsLoadError,
@@ -1424,21 +1425,28 @@ export const MCPSettingsSection: React.FC = () => {
         </p>
       </div>
 
-      <ToolSearchSetting />
+      <div>
+        <SettingsMark id="mcp-tool-search" />
+        <ToolSearchSetting />
+      </div>
 
       {design.enabled && (
-        <ClaudeDesignCard
-          onChange={refresh}
-          conflict={Boolean(
-            servers[CLAUDE_DESIGN_SERVER_NAME] &&
-            (servers[CLAUDE_DESIGN_SERVER_NAME].transport === "stdio" ||
-              !("managed" in servers[CLAUDE_DESIGN_SERVER_NAME]))
-          )}
-        />
+        <div>
+          <SettingsMark id="claude-design" />
+          <ClaudeDesignCard
+            onChange={refresh}
+            conflict={Boolean(
+              servers[CLAUDE_DESIGN_SERVER_NAME] &&
+              (servers[CLAUDE_DESIGN_SERVER_NAME].transport === "stdio" ||
+                !("managed" in servers[CLAUDE_DESIGN_SERVER_NAME]))
+            )}
+          />
+        </div>
       )}
 
       {/* MCP Servers */}
       <div>
+        <SettingsMark id="mcp-servers" />
         <h3 className="text-foreground mb-4 text-sm font-medium">MCP Servers</h3>
 
         {error && (
@@ -1778,6 +1786,7 @@ export const MCPSettingsSection: React.FC = () => {
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
             Add server
           </summary>
+          <SettingsMark id="mcp-add-server" />
           <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
             <div>
               <label htmlFor="server-name" className="text-content-secondary mb-1 block text-xs">

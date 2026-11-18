@@ -238,6 +238,8 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       vimEnabled={vimEnabled}
       className={className}
       onCancel={handleCancel}
+      // The hint shows while no compaction model is set; that model is on the Compact card in
+      // Agents (route id `tasks`), not in Behavior with the compaction strategy.
       onConfigureCompaction={() => openSettings("tasks")}
       activity={activity}
       showModelName={showModelName}
