@@ -18,13 +18,16 @@ function providersWithOpenAI(overrides: Partial<ProviderConfigInfo>): ProvidersC
 }
 
 describe("getEffectiveContextLimit", () => {
-  test.each(["gpt-6.1-sol", "gpt-6-luna"])("reserves output capacity for %s", (model) => {
-    for (const id of [`openai:${model}`, `coder:openai/${model}`]) {
-      expect(getEffectiveContextLimit(id, false, null)).toBe(922000);
-      expect(getEffectiveContextLimit(id, true, null)).toBe(922000);
-      expect(getModelStats(id)?.max_output_tokens).toBe(128000);
+  test.each(["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-luna"])(
+    "reserves output capacity for %s",
+    (model) => {
+      for (const id of [`openai:${model}`, `coder:openai/${model}`]) {
+        expect(getEffectiveContextLimit(id, false, null)).toBe(922000);
+        expect(getEffectiveContextLimit(id, true, null)).toBe(922000);
+        expect(getModelStats(id)?.max_output_tokens).toBe(128000);
+      }
     }
-  });
+  );
 
   test("uses mapped model metadata for context limits", () => {
     const config: ProvidersConfigMap = {
@@ -105,8 +108,11 @@ describe("getEffectiveContextLimit", () => {
     expect(limit).toBe(272_000);
   });
 
-  test("caps GPT-6.1 Sol and GPT-6 Luna at each tier's Codex OAuth context window", () => {
+  test("caps each GPT tier at its Codex OAuth context window", () => {
     const contextLimits = {
+      // GPT-6.2: assumed from the other GPT-6 rows until the Codex catalog lists it.
+      "gpt-6.2-sol": 272_000,
+      "gpt-6.2-astra": 272_000,
       "gpt-6.1-sol": 272_000,
       "gpt-6-luna": 272_000,
     } as const;

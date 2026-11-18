@@ -652,7 +652,7 @@ function createOpenAIModelWithPreservedOptions(
   const model = createModel(baseFetch);
   // @ai-sdk/openai (through at least 4.0.72) allowlists GPT-6 reasoning efforts
   // without "none" and silently strips it, but Luna accepts "none" and OpenAI
-  // requires it for Chat Completions function calling (Astra and GPT-6.1 Sol
+  // requires it for Chat Completions function calling (the other GPT-6 tiers
   // genuinely reject it, and Xum never requests it there). Without this, Chat
   // agent turns fail and Responses "off" silently runs at the API default effort. This lives in Xum
   // runtime code rather than a bun patch because npm installs of the published
@@ -2187,7 +2187,8 @@ export class ProviderModelFactory {
         if (
           serviceTier.success &&
           serviceTierAvailable &&
-          // Ultrafast is model-gated: drop it rather than send a tier the model rejects.
+          // Ultrafast (and Flex on GPT-6.2) is model-gated: drop it rather than send a
+          // tier the model rejects.
           openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierRouteOptions)
         ) {
           serviceTierDefault = {

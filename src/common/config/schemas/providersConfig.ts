@@ -9,7 +9,8 @@ export const CacheTtlSchema = z.enum(["5m", "1h"]);
 /** Anthropic request speed; "fast" opts into Fast mode (see anthropicFastMode.ts). */
 export const AnthropicSpeedSchema = z.enum(["standard", "fast"]);
 // "ultrafast" is OpenAI's model-gated premium tier (DevDay 2026-09-29); requests for
-// models without it drop the tier (see openaiModelSupportsServiceTier).
+// models without it drop the tier, as GPT-6.2 requests do for "flex" (see
+// openaiModelSupportsServiceTier).
 export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority", "ultrafast"]);
 export type ServiceTier = z.infer<typeof ServiceTierSchema>;
 // Fast mode remembers the tier it replaced, so toggling Fast off from Ultrafast restores it.

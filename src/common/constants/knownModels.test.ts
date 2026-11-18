@@ -67,6 +67,8 @@ describe("Known Models Integration", () => {
     ["anthropic:claude-haiku-4-5", "anthropic/claude-3.5-haiku"],
     ["anthropic:claude-fable-5-1", "anthropic/claude-opus-4.5"],
     ["anthropic:claude-mythos-5-1", "anthropic/claude-opus-4.5"],
+    ["openai:gpt-6.1-sol", "openai/gpt-5"],
+    ["openai:gpt-6-astra", "openai/gpt-5"],
   ])("retired id %s keeps its tokenizer override", (modelId, tokenizer) => {
     expect(TOKENIZER_MODEL_OVERRIDES[modelId]).toBe(tokenizer);
   });

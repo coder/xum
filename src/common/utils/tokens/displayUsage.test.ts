@@ -230,7 +230,13 @@ describe("createDisplayUsage", () => {
   });
 
   describe("tiered long-context pricing", () => {
+    // Standard $/1M input, cached input and output as published on each model page, e.g.
+    // https://developers.openai.com/api/docs/models/gpt-6.2-astra (retrieved 2026-11-17):
+    // 30-minute cache writes at 1.25x input; above 272K input, input and cache rates
+    // double and output costs 1.5x for the full request.
     test.each([
+      ["openai:gpt-6.2-sol", 2, 0.1, 10],
+      ["openai:gpt-6.2-astra", 8, 0.4, 40],
       ["openai:gpt-6.1-sol", 2, 0.1, 10],
       ["openai:gpt-6-luna", 0.1, 0.01, 0.5],
     ] as const)(
@@ -1035,6 +1041,20 @@ describe("OpenAI service-tier pricing (#4352)", () => {
         expect(cost(model, inputTokens, "ultrafast")).toBeCloseTo(6 * cost(model, inputTokens), 9);
       }
       expect(cost(model, 100_000, "ultrafast")).toBeGreaterThan(cost(model, 100_000, "fast"));
+    }
+  });
+
+  // https://developers.openai.com/api/docs/models/gpt-6.2-sol: "Fast mode costs twice the
+  // Standard rate for the same context length"; Ultrafast is 3x through 2027-02-28 and 6x
+  // after. Xum prices the 6x list rate (never under-count), and GPT-6.2 has no Flex rate.
+  test("prices GPT-6.2 Fast at 2x and Ultrafast at 6x in both bands, Flex at Standard", () => {
+    for (const model of ["openai:gpt-6.2-sol", "openai:gpt-6.2-astra"]) {
+      for (const inputTokens of [100_000, 300_000]) {
+        const standard = cost(model, inputTokens);
+        expect(cost(model, inputTokens, "priority")).toBeCloseTo(2 * standard, 9);
+        expect(cost(model, inputTokens, "ultrafast")).toBeCloseTo(6 * standard, 9);
+        expect(cost(model, inputTokens, "flex")).toBe(standard);
+      }
     }
   });
 

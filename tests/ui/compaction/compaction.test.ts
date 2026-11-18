@@ -149,12 +149,13 @@ describe("Compaction UI (mock AI router)", () => {
     try {
       // The UI auto-compacts into the largest-context model of a configured provider (see
       // getHigherContextCompactionSuggestion), and a model qualifies only with a larger context
-      // than the default model's (OpenAI, Google, Moonshot AI, Meta and Z.ai each list one).
+      // than the default model's (Google, Moonshot AI, Meta and Z.ai each list one; no OpenAI
+      // built-in does since GPT-6.2 Astra's 922K input cap replaced GPT-6 Astra's 1.05M).
       // Without such a provider the UI does not auto-compact: it shows the manual "Insert /compact"
       // button, and this test waits for a summary that never comes. The mock router never calls
       // the provider, so a dummy key is enough. Seeding it here keeps the test independent of an
-      // ambient OPENAI_API_KEY.
-      await setupProviders(app.env, { openai: { apiKey: "test-key-for-ui-tests" } });
+      // ambient provider key.
+      await setupProviders(app.env, { google: { apiKey: "test-key-for-ui-tests" } });
 
       const triggerMessage = "Trigger context error";
       const userDraft = "My draft message that should be preserved";
