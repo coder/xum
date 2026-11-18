@@ -307,7 +307,8 @@
     },
     "afterSign": "scripts/notarize-mac.js",
     "files": [
-      "dist/**/*"
+      "dist/**/*",
+      "!node_modules/electron/dist{,/**/*}"
     ],
     "asarUnpack": [
       "dist/**/*.wasm",
