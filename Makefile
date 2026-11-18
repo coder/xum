@@ -1014,6 +1014,7 @@ check-mac-signature: ## Check the signature of the unpacked macOS app (MAC_ARCH=
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
 	@app_bundle="$(MAC_APP_BUNDLE)"; \
+	[ -n "$$app_bundle" ] || { echo "install-mac-arm64: cannot resolve the app bundle name" >&2; exit 1; }; \
 	echo "Installing $$app_bundle to /Applications..."; \
 	rm -rf "/Applications/$$app_bundle"; \
 	cp -R "$(MAC_APP_DIR_arm64)/$$app_bundle" /Applications/; \
