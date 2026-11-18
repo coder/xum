@@ -15,6 +15,7 @@ export default {
 const BASE_SECTION_LABELS = [
   "General",
   "Agents",
+  "Agent Runtime",
   "Heartbeats",
   "Providers",
   "Models",
@@ -33,6 +34,7 @@ type BaseSectionLabel = (typeof BASE_SECTION_LABELS)[number];
 const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   General: /Theme/i,
   Agents: /Max Parallel Agent Tasks/i,
+  "Agent Runtime": /Resource limits|Agent sandbox/i,
   Heartbeats: /Default interval/i,
   Providers: /Configure API keys and endpoints for AI providers|API Key/i,
   Models: /Custom Models|Built-in Models/i,

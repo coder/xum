@@ -64,8 +64,6 @@ import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
-import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
-import { AgentSandboxSettings } from "./AgentSandboxSettings";
 import { TaskLimitInput } from "./TaskLimitInput";
 
 const INHERIT = "__inherit__";
@@ -1408,10 +1406,6 @@ export function TasksSection() {
 
         {saveError ? <div className="text-danger-light mt-4 text-xs">{saveError}</div> : null}
       </div>
-
-      <AgentResourceLimitsSettings />
-
-      <AgentSandboxSettings />
 
       <div>
         <h3 className="text-foreground mb-1 text-sm font-medium">Agent Defaults</h3>

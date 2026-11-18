@@ -24,9 +24,15 @@ describe("SettingsPage", () => {
     });
   });
 
-  test("always shows Heartbeats after Agents without redirecting its route", () => {
+  test("always shows Agent Runtime and Heartbeats after Agents without redirecting them", () => {
     const ids = getSettingsSections(false).map((section) => section.id);
-    expect(ids.indexOf("heartbeat")).toBe(ids.indexOf("tasks") + 1);
+    const agentsIndex = ids.indexOf("tasks");
+    expect(ids.slice(agentsIndex, agentsIndex + 3)).toEqual([
+      "tasks",
+      "agent-runtime",
+      "heartbeat",
+    ]);
+    expect(getSettingsSectionRedirect("agent-runtime", false)).toBeNull();
     expect(getSettingsSectionRedirect("heartbeat", false)).toBeNull();
   });
 

@@ -15,7 +15,6 @@ import {
   type TestClientConfig,
 } from "@/browser/testUtils";
 import * as WorkspaceModule from "@/browser/contexts/WorkspaceContext";
-import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ModelsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
@@ -51,7 +50,6 @@ let pendingProjectMock: string | null = null;
 // Snapshot real exports before Bun replaces their live bindings for this suite.
 restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...WorkspaceModule }],
-  ["@/browser/contexts/ProjectContext", { ...ProjectContextModule }],
   ["@/browser/hooks/useExperiments", { ...ExperimentsModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...ModelsModule }],
   ["@/browser/components/Tooltip/Tooltip", { ...tooltipModule }],
@@ -64,12 +62,6 @@ void mock.module("@/browser/contexts/WorkspaceContext", () => ({
     selectedWorkspace: selectedWorkspaceMock,
     pendingNewWorkspaceProject: pendingProjectMock,
   }),
-}));
-
-// The resource limits section lists projects; these tests have none.
-void mock.module("@/browser/contexts/ProjectContext", () => ({
-  ...ProjectContextModule,
-  useProjectContext: () => ({ userProjects: new Map() }),
 }));
 
 void mock.module("@/browser/hooks/useExperiments", () => ({

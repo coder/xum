@@ -462,8 +462,8 @@ function ScopePicker(props: {
 }
 
 /**
- * Settings > Agents: the CPU and memory limit that all local agent processes share, and the limit
- * of single projects inside it.
+ * Settings > Agent Runtime: the CPU and memory limit that all local agent processes share, and
+ * the limit of single projects inside it.
  */
 export function AgentResourceLimitsSettings() {
   const {

@@ -372,7 +372,7 @@ function controlsState(state: AgentSandboxState | null, busy: boolean) {
 }
 
 /**
- * Settings > Agents: runs local agent commands in the macOS sandbox. The backend answers
+ * Settings > Agent Runtime: runs local agent commands in the macOS sandbox. The backend answers
  * whether it can, since the browser can run on another OS than the backend.
  */
 export function AgentSandboxSettings() {
