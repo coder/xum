@@ -25,8 +25,9 @@ TIMESTAMP=$(date -u -j -f %s "$BUILD_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
   || date -u -d "@$BUILD_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
 
 if [ -n "${RELEASE_TAG:-}" ]; then
-  # CI release: use the authoritative tag, never dirty
-  GIT_DESCRIBE="$RELEASE_TAG"
+  # CI release: use the authoritative tag, never dirty. Nightly tags have no v
+  # prefix, so add it: the stamp keeps the form that stable builds use.
+  GIT_DESCRIBE="v${RELEASE_TAG#v}"
   echo "Release build: using RELEASE_TAG=${RELEASE_TAG}"
 else
   # Local/dev build: use git describe with dirty detection
