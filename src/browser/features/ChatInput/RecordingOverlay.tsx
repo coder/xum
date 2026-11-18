@@ -47,22 +47,24 @@ export const RecordingOverlay: React.FC<RecordingOverlayProps> = (props) => {
   const isRequesting = props.state === "requesting";
 
   // Status text for non-recording states
-  const statusText = isRequesting ? "Requesting microphone..." : "Transcribing...";
+  const statusText = isRequesting ? "Requesting microphone..." : "Transcribing… Click to cancel";
 
   // For recording state, we use inline styles with the agent color
   // For other states (requesting/transcribing), use amber classes
   const containerClasses = cn(
-    "mb-1 flex w-full flex-col items-center justify-center gap-1 rounded-md border px-3 py-2 transition-all focus:outline-none",
-    isRecording ? "cursor-pointer" : "cursor-wait border-amber-500 bg-amber-500/10"
+    "mb-1 flex w-full flex-col items-center justify-center gap-1 rounded-md border px-3 py-2 transition-all focus:outline-none cursor-pointer disabled:cursor-wait",
+    !isRecording && "border-amber-500 bg-amber-500/10"
   );
 
   return (
     <button
       type="button"
-      onClick={isRecording ? props.onStop : undefined}
-      disabled={!isRecording}
+      onClick={props.onStop}
+      disabled={isRequesting}
       className={containerClasses}
-      aria-label={isRecording ? "Stop recording" : statusText}
+      aria-label={
+        isRecording ? "Stop recording" : isRequesting ? statusText : "Cancel transcription"
+      }
       style={
         isRecording
           ? {

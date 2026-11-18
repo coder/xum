@@ -705,6 +705,8 @@ export const STATS_CONTAINER_SUB_TAB_KEY = "statsContainer:subTab";
 export const MERMAID_DIAGRAM_ZOOM_KEY = "mermaid-diagram-zoom";
 export const ROSETTA_BANNER_DISMISSED_KEY = "rosettaBannerDismissedAt";
 export const WINDOWS_TOOLCHAIN_BANNER_DISMISSED_KEY = "windowsToolchainBannerDismissedAt";
+// Voice models and downloads belong to this device, not the connected backend.
+export const VOICE_MODEL_KEY = "voiceModel";
 export const REMOTE_CONNECTION_URL_KEY = "remoteConnectionUrl";
 
 /** Left sidebar expansion maps (Record<string, boolean>, global). */
@@ -931,6 +933,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // no budget (0).
   globalKey(LEGACY_RIGHT_SIDEBAR_COLLAPSED_KEY, "ui", 0),
   globalKey(RIGHT_SIDEBAR_WIDTH_KEY, "ui", 16),
+  globalKey(VOICE_MODEL_KEY, "ui", 64),
   globalKey(REMOTE_CONNECTION_URL_KEY, "ui", 2048),
   // Server tokens have no length limit elsewhere; a token kept only in memory would log the user
   // out on reload.

@@ -45,7 +45,7 @@ export const VoiceInputButton: React.FC<VoiceInputButtonProps> = (props) => {
     : props.state === "recording"
       ? "Stop recording"
       : props.state === "transcribing"
-        ? "Transcribing..."
+        ? "Cancel transcription"
         : "Voice input";
 
   const isRecording = props.state === "recording";
@@ -64,7 +64,7 @@ export const VoiceInputButton: React.FC<VoiceInputButtonProps> = (props) => {
         <button
           type="button"
           onClick={props.onToggle}
-          disabled={(props.disabled ?? false) || isTranscribing || isDisabled}
+          disabled={(props.disabled ?? false) || isDisabled}
           aria-label={label}
           aria-pressed={isRecording}
           className={cn(
@@ -87,9 +87,9 @@ export const VoiceInputButton: React.FC<VoiceInputButtonProps> = (props) => {
           </>
         ) : notConfigured ? (
           <>
-            Voice input requires an enabled OpenAI provider with an API key.
+            Select a downloaded local model or configure OpenAI.
             <br />
-            Configure in Settings → Providers.
+            Open Settings → Voice.
           </>
         ) : (
           <>
