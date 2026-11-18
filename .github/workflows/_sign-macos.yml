@@ -1,0 +1,278 @@
+name: Sign macOS App (Reusable)
+
+# Signs the macOS apps of one run on Linux, with rcodesign: the release key is in a cloud key
+# service, which rcodesign reaches and Apple's codesign does not. A macOS job of the caller
+# builds each app unsigned and uploads it as `macos-app-unsigned-<arch>`. This workflow uploads
+# the signed app as `macos-app-signed-<arch>`, and a macOS job of the caller packages it.
+#
+# Each handover carries a sha256, because every job of a run can upload an artifact: a job
+# accepts only the file that the job before it made.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref the apps were built from (default: the caller's commit)"
+        required: false
+        type: string
+        default: ""
+      certificate:
+        description: "developer-id (the release certificate; also notarizes) or throwaway (a certificate made in the job, for builds that are not released)"
+        required: true
+        type: string
+      sha256-x64:
+        description: "sha256 of macos-app-unsigned-x64.tar"
+        required: true
+        type: string
+      sha256-arm64:
+        description: "sha256 of macos-app-unsigned-arm64.tar"
+        required: true
+        type: string
+    outputs:
+      sha256-x64:
+        description: "sha256 of macos-app-signed-x64.tar"
+        value: ${{ jobs.sign.outputs.sha256-x64 }}
+      sha256-arm64:
+        description: "sha256 of macos-app-signed-arm64.tar"
+        value: ${{ jobs.sign.outputs.sha256-arm64 }}
+
+permissions: {}
+
+jobs:
+  # Builds the signing tool in a job that holds no credentials, so nothing that the build
+  # downloads runs next to the signing identity. It is built in every run and handed over as an
+  # artifact, not cached: any workflow run on a branch can write that branch's caches.
+  rcodesign:
+    name: Build rcodesign
+    runs-on: ubuntu-22.04
+    outputs:
+      sha256: ${{ steps.checksum.outputs.sha256 }}
+    steps:
+      - name: Build rcodesign
+        uses: coder/coder-desktop-macos/.github/actions/install-rcodesign@bff0687ff171436ebd008c03645cb5dcf968db58
+
+      - name: Record checksum
+        id: checksum
+        run: |
+          set -euo pipefail
+          echo "sha256=$(sha256sum /tmp/rcodesign-bin/rcodesign | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload rcodesign
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: rcodesign
+          path: /tmp/rcodesign-bin/rcodesign
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+
+  sign:
+    name: ${{ matrix.arch }}
+    needs: rcodesign
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    runs-on: ubuntu-22.04
+    # The release key answers only to this file on main, in this environment, which only main
+    # and v* tags may use. A throwaway certificate needs neither.
+    environment: ${{ inputs.certificate == 'developer-id' && 'code-signing' || '' }}
+    permissions:
+      contents: read
+      id-token: write # Google Cloud workload identity, for the release key
+    outputs:
+      # Each matrix job sets only the output of its own arch.
+      sha256-x64: ${{ steps.checksum.outputs.sha256-x64 }}
+      sha256-arm64: ${{ steps.checksum.outputs.sha256-arm64 }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      CERTIFICATE: ${{ inputs.certificate }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # The release key signs whatever this job is given, and a v* tag can point at any commit.
+      # So both commits must be on main: the one whose workflows built the app, and the one
+      # whose scripts sign it here.
+      - name: Refuse a commit that is not on main
+        if: inputs.certificate == 'developer-id'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for sha in "$GITHUB_SHA" "$(git rev-parse HEAD)"; do
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...main" --jq .status)"
+            if [[ "$status" != "ahead" && "$status" != "identical" ]]; then
+              echo "::error::$sha is not on main"
+              exit 1
+            fi
+          done
+
+      # Tools first, before any credential is on disk.
+      - name: Download rcodesign
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rcodesign
+          path: ${{ runner.temp }}/rcodesign
+
+      - name: Install rcodesign
+        env:
+          SHA256: ${{ needs.rcodesign.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::No checksum from the rcodesign job."; exit 1; }
+          sha256sum -c <<<"$SHA256  $RUNNER_TEMP/rcodesign/rcodesign"
+          sudo install -m 0755 "$RUNNER_TEMP/rcodesign/rcodesign" /usr/bin/rcodesign
+          rcodesign --version
+
+      - name: Set up the Cloud KMS PKCS#11 library
+        if: inputs.certificate == 'developer-id'
+        env:
+          KMS_KEY_RING: ${{ secrets.MACOS_SIGNING_KMS_KEY_RING }}
+        run: |
+          set -euo pipefail
+          : "${KMS_KEY_RING:?the code-signing environment has no MACOS_SIGNING_KMS_KEY_RING secret}"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/libkmsp11.tar.gz" \
+            https://github.com/GoogleCloudPlatform/kms-integrations/releases/download/pkcs11-v1.9/libkmsp11-1.9-linux-amd64.tar.gz
+          sha256sum -c <<<"5397f965073cd5d1e2c43e5148f102f31a7c835902f97eb41c7c9c0f1b876a40  $RUNNER_TEMP/libkmsp11.tar.gz"
+          sudo tar -xzf "$RUNNER_TEMP/libkmsp11.tar.gz" -C /usr/local/lib --strip-components=1 \
+            libkmsp11-1.9-linux-amd64/libkmsp11.so
+
+          # The library refuses a configuration file that others can write.
+          install -m 600 /dev/null "$RUNNER_TEMP/kmsp11.yaml"
+          printf -- '---\ntokens:\n  - key_ring: "%s"\n' "$KMS_KEY_RING" > "$RUNNER_TEMP/kmsp11.yaml"
+
+      # Before anything slow, so a wrong secret fails in seconds and says which one.
+      - name: Write the certificate and the notarization key
+        if: inputs.certificate == 'developer-id'
+        env:
+          CERTIFICATE_PEM: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PEM }}
+          AC_APIKEY_P8_BASE64: ${{ secrets.AC_APIKEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null "$RUNNER_TEMP/certificate.pem"
+          install -m 600 /dev/null "$RUNNER_TEMP/notary-key.p8"
+          printf '%s\n' "$CERTIFICATE_PEM" > "$RUNNER_TEMP/certificate.pem"
+          # The certificate is public; the log records which one signed.
+          if ! openssl x509 -in "$RUNNER_TEMP/certificate.pem" -noout -subject -serial -enddate; then
+            echo "::error::The MACOS_SIGNING_CERTIFICATE_PEM secret is not a PEM certificate. It is the certificate text itself, not base64 of it."
+            exit 1
+          fi
+          # A pasted value often carries a line break or a space, which base64 refuses.
+          if ! tr -d '[:space:]' <<<"$AC_APIKEY_P8_BASE64" | base64 -d > "$RUNNER_TEMP/notary-key.p8" ||
+            ! openssl pkey -in "$RUNNER_TEMP/notary-key.p8" -noout; then
+            echo "::error::The AC_APIKEY_P8_BASE64 secret is not the base64 of an AuthKey .p8 file."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        id: gcloud_auth
+        if: inputs.certificate == 'developer-id'
+        uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.8
+        with:
+          workload_identity_provider: ${{ secrets.MACOS_SIGNING_WORKLOAD_ID_PROVIDER }}
+          service_account: ${{ secrets.MACOS_SIGNING_SERVICE_ACCOUNT }}
+
+      # No Mac trusts this certificate, so the app it signs is good only for the checks of this
+      # run. They prove the signing steps on a pull request, before the release key runs them.
+      - name: Make a throwaway certificate
+        if: inputs.certificate == 'throwaway'
+        run: |
+          set -euo pipefail
+          rcodesign generate-self-signed-certificate \
+            --profile developer-id-application \
+            --team-id XUMTHROWAW \
+            --person-name "Xum CI throwaway" \
+            --pem-filename "$RUNNER_TEMP/throwaway" > /dev/null
+
+      - name: Download the unsigned app
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-app-unsigned-${{ matrix.arch }}
+          path: ${{ runner.temp }}/unsigned
+
+      - name: Check the unsigned app
+        env:
+          SHA256: ${{ inputs[format('sha256-{0}', matrix.arch)] }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::No checksum from the build job."; exit 1; }
+          sha256sum -c <<<"$SHA256  $RUNNER_TEMP/unsigned/macos-app-unsigned-$ARCH.tar"
+
+      - name: Sign
+        env:
+          KMS_PKCS11_CONFIG: ${{ runner.temp }}/kmsp11.yaml
+          KMS_KEY: ${{ secrets.MACOS_SIGNING_KMS_KEY }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.gcloud_auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          case "$CERTIFICATE" in
+            developer-id)
+              : "${KMS_KEY:?the code-signing environment has no MACOS_SIGNING_KMS_KEY secret}"
+              key_options=(
+                --pkcs11-library /usr/local/lib/libkmsp11.so
+                --pkcs11-key-label "$KMS_KEY"
+                --pkcs11-certificate-file "$RUNNER_TEMP/certificate.pem"
+              )
+              ;;
+            throwaway)
+              key_options=(--pem-file "$RUNNER_TEMP/throwaway.crt" --pem-file "$RUNNER_TEMP/throwaway.key")
+              ;;
+            *)
+              echo "::error::certificate must be developer-id or throwaway, not '$CERTIFICATE'"
+              exit 1
+              ;;
+          esac
+
+          # Each try signs a fresh copy, so a try that failed part way leaves nothing behind.
+          # A try can fail without a fault in the app: the key service or Apple's timestamp
+          # server gives no answer.
+          sign() {
+            rm -rf "$RUNNER_TEMP/app" && mkdir -p "$RUNNER_TEMP/app" &&
+              tar -C "$RUNNER_TEMP/app" -xf "$RUNNER_TEMP/unsigned/macos-app-unsigned-$ARCH.tar" &&
+              node scripts/macos-signing/sign-app.mjs "$RUNNER_TEMP"/app/*.app build/entitlements.mac.plist "${key_options[@]}"
+          }
+          for attempt in 1 2 3; do
+            if sign; then break; fi
+            if [[ "$attempt" == 3 ]]; then
+              echo "::error::Signing failed 3 times."
+              exit 1
+            fi
+            sleep 30
+          done
+
+      # Apple's ticket service often has no ticket yet when the notary service accepts the app
+      # (#6901), so only the staple is retried: another submission would meet the same delay.
+      - name: Notarize and staple
+        if: inputs.certificate == 'developer-id'
+        env:
+          AC_APIKEY_ISSUER_ID: ${{ secrets.AC_APIKEY_ISSUER_ID }}
+          AC_APIKEY_ID: ${{ secrets.AC_APIKEY_ID }}
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null "$RUNNER_TEMP/notary-key.json"
+          rcodesign encode-app-store-connect-api-key "$AC_APIKEY_ISSUER_ID" "$AC_APIKEY_ID" \
+            "$RUNNER_TEMP/notary-key.p8" > "$RUNNER_TEMP/notary-key.json"
+          rcodesign notary-submit --api-key-file "$RUNNER_TEMP/notary-key.json" \
+            --wait --max-wait-seconds 1800 "$RUNNER_TEMP"/app/*.app
+          ./scripts/retry.sh 5 30 rcodesign staple "$RUNNER_TEMP"/app/*.app
+
+      - name: Pack the signed app
+        id: checksum
+        run: |
+          set -euo pipefail
+          app=("$RUNNER_TEMP"/app/*.app)
+          tar -C "$RUNNER_TEMP/app" -cf "$RUNNER_TEMP/macos-app-signed-$ARCH.tar" "$(basename "${app[0]}")"
+          echo "sha256-$ARCH=$(sha256sum "$RUNNER_TEMP/macos-app-signed-$ARCH.tar" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the signed app
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: macos-app-signed-${{ matrix.arch }}
+          path: ${{ runner.temp }}/macos-app-signed-${{ matrix.arch }}.tar
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
