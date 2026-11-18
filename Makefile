@@ -153,6 +153,7 @@ include fmt.mk
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-host-proof test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
+.PHONY: dist-mac-app-x64 dist-mac-app-arm64 package-mac-x64 package-mac-arm64 package-mac check-mac-signature
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit test-storybook-paint-fixtures storybook-budget
@@ -917,6 +918,16 @@ ensure-mac-sharp-runtime-deps: node_modules/.installed
 # the call builds, or electron-builder looks for an unpacked Electron there and fails.
 ELECTRON_DIST_FLAG = $(if $(ELECTRON_ZIP_DIR),-c.electronDist="$(ELECTRON_ZIP_DIR)")
 
+# electron-updater skips an update when os.release() (the Darwin version) is below the
+# yml's minimumSystemVersion. Electron 44 needs macOS 13 (Darwin 22), so macOS 12 users
+# stay on the last release that still runs there instead of updating to one that won't start.
+define stamp-mac-minimum-system-version
+@for f in release/*-mac.yml; do \
+	[ -f "$$f" ] || continue; \
+	grep -q '^minimumSystemVersion:' "$$f" || echo 'minimumSystemVersion: 22.0.0' >> "$$f"; \
+done
+endef
+
 dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@if [ -n "$$CSC_LINK" ]; then \
@@ -928,13 +939,7 @@ dist-mac: build ## Build macOS distributables (x64 + arm64)
 		bun x electron-builder --mac --arm64 --publish never $(ELECTRON_DIST_FLAG) & pid2=$$! ; \
 		wait $$pid1 && wait $$pid2; \
 	fi
-	@# electron-updater skips an update when os.release() (the Darwin version) is below the
-	@# yml's minimumSystemVersion. Electron 44 needs macOS 13 (Darwin 22), so macOS 12 users
-	@# stay on the last release that still runs there instead of updating to one that won't start.
-	@for f in release/*-mac.yml; do \
-		[ -f "$$f" ] || continue; \
-		grep -q '^minimumSystemVersion:' "$$f" || echo 'minimumSystemVersion: 22.0.0' >> "$$f"; \
-	done
+	$(stamp-mac-minimum-system-version)
 	@echo "✅ Both architectures built successfully"
 
 # MAC_TARGETS narrows electron-builder's mac targets (e.g. MAC_TARGETS=dmg); empty keeps
@@ -951,11 +956,65 @@ dist-mac-arm64: build ## Build macOS arm64 distributable only
 	@echo "Building macOS arm64..."
 	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
+# CI builds, signs and packages the macOS app in three jobs, because the signing key is in a
+# cloud key service that the signing tool reaches from Linux (.github/workflows/_sign-macos.yml):
+#   1. macOS: dist-mac-app-<arch> builds the unsigned app in MAC_APP_DIR_<arch>.
+#   2. Linux: scripts/macos-signing/sign-app.mjs signs it.
+#   3. macOS: package-mac-<arch> (or package-mac, for a release) packages the signed app.
+MAC_APP_DIR_x64 := release/mac
+MAC_APP_DIR_arm64 := release/mac-arm64
+MAC_APP_BUNDLE = $(shell bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')
+
+# The zip is not used. electron-builder writes Contents/Resources/app-update.yml, which
+# electron-updater reads in the packaged app, only when it builds an update target, so a `--dir`
+# build would give an app that cannot update. `store` makes the unused zip cheap.
+#
+# The app travels between the jobs as a tar, because an artifact upload does not keep the
+# symlinks of the frameworks. The tar holds no macOS metadata: macOS tar would add an AppleDouble
+# `._name` entry for each file with extended attributes, Linux tar would extract those as real
+# files, and the signature would seal files that macOS tar folds away again.
+dist-mac-app-x64 dist-mac-app-arm64: dist-mac-app-%: build ## Build the unsigned macOS app only (x64 or arm64)
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
+	@CSC_IDENTITY_AUTO_DISCOVERY=false bun x electron-builder --mac zip --$* -c.compression=store --publish never $(ELECTRON_DIST_FLAG)
+	@COPYFILE_DISABLE=1 tar --no-xattrs -C "$(MAC_APP_DIR_$*)" -cf "release/macos-app-unsigned-$*.tar" "$(MAC_APP_BUNDLE)"
+
+# `--prepackaged` packages the app as it is: electron-builder does not build, sign or change it,
+# so the dmg and the zip hold the signature and the notarization ticket of the signing job.
+# MAC_PACKAGE_DIR is where the packages go.
+MAC_PACKAGE_DIR ?= release
+package-mac-x64 package-mac-arm64: package-mac-%: node_modules/.installed ## Package the signed macOS app of release/macos-app-signed-<arch>.tar
+	@rm -rf "$(MAC_APP_DIR_$*)" && mkdir -p "$(MAC_APP_DIR_$*)"
+	@tar -C "$(MAC_APP_DIR_$*)" -xf "release/macos-app-signed-$*.tar"
+	@bun x electron-builder --mac $(MAC_TARGETS) --$* --prepackaged "$(MAC_APP_DIR_$*)/$(MAC_APP_BUNDLE)" \
+		-c.directories.output="$(MAC_PACKAGE_DIR)" --publish never
+
+# One run packages one app, and each run writes an update file that lists only its own
+# architecture, so a release merges the two files (scripts/macos-signing/mergeUpdateInfo.ts).
+package-mac: node_modules/.installed ## Package the signed macOS apps of both architectures as one release
+	@for arch in x64 arm64; do \
+		$(MAKE) --no-print-directory "package-mac-$$arch" MAC_PACKAGE_DIR="release/package-$$arch" || exit 1; \
+	done
+	@bun scripts/macos-signing/mergeUpdateInfo.ts release/package-x64 release/package-arm64 release
+	@mv release/package-x64/xum-* release/package-arm64/xum-* release/
+	$(stamp-mac-minimum-system-version)
+
+# The designated requirement of the released app (v0.32.2). The updater of an installed app
+# refuses an update that does not satisfy the installed app's requirement, so a release that
+# meets this text is one that installed apps accept. The last part is the Apple team.
+MAC_RELEASE_REQUIREMENT := identifier "com.mux.app" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "4399GN35BJ"
+
+# MAC_CERTIFICATE=developer-id also checks what only a release has: the requirement above,
+# Gatekeeper and the notarization ticket. Pull request builds sign with a throwaway certificate.
+check-mac-signature: ## Check the signature of the unpacked macOS app (MAC_ARCH=x64|arm64, MAC_CERTIFICATE=developer-id|throwaway)
+	@[ -n "$(MAC_APP_DIR_$(MAC_ARCH))" ] || { echo "check-mac-signature: set MAC_ARCH to x64 or arm64" >&2; exit 2; }
+	@node scripts/macos-signing/check-app.mjs "$(MAC_APP_DIR_$(MAC_ARCH))/$(MAC_APP_BUNDLE)" build/entitlements.mac.plist \
+		$(if $(filter developer-id,$(MAC_CERTIFICATE)),--requirement '$(MAC_RELEASE_REQUIREMENT)')
+
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
-	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
+	@app_bundle="$(MAC_APP_BUNDLE)"; \
 	echo "Installing $$app_bundle to /Applications..."; \
 	rm -rf "/Applications/$$app_bundle"; \
-	cp -R "release/mac-arm64/$$app_bundle" /Applications/; \
+	cp -R "$(MAC_APP_DIR_arm64)/$$app_bundle" /Applications/; \
 	echo "Installed $$app_bundle to /Applications"
 
 dist-win: build ## Build Windows distributable
