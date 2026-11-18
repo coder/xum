@@ -31,6 +31,9 @@ jobs:
       sha256-arm64: ${{ steps.checksum.outputs.sha256-arm64 }}
     env:
       NODE_OPTIONS: --max-old-space-size=4096
+      # scripts/generate-version.sh stamps the release tag, not a git describe that the version
+      # patch below would mark -dirty.
+      RELEASE_TAG: ${{ inputs.release_tag }}
       VERSION_OVERRIDE: ${{ inputs.version_override }}
     steps:
       - name: Checkout code
