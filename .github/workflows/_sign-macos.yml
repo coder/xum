@@ -175,6 +175,8 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.MACOS_SIGNING_WORKLOAD_ID_PROVIDER }}
           service_account: ${{ secrets.MACOS_SIGNING_SERVICE_ACCOUNT }}
+          # Only the Sign step gets the credentials (by the output below), not every later step.
+          export_environment_variables: false
 
       # No Mac trusts this certificate, so the app it signs is good only for the checks of this
       # run. They prove the signing steps on a pull request, before the release key runs them.
