@@ -75,10 +75,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # electron-builder's --publish always silently skips uploads when the
-          # release was created >2 hours ago (its internal staleness check),
-          # which breaks reruns. Force-upload all macOS assets with --clobber
-          # so reruns reliably attach artifacts to the release.
+          # electron-builder does not publish in any job of this workflow: it would publish to
+          # the tag v<version>, and its uploads skip a release created over 2 hours ago, which
+          # breaks reruns. Upload every macOS asset with --clobber so reruns replace them.
           gh release upload "$RELEASE_TAG" \
             release/xum-*.dmg \
             release/xum-*.dmg.blockmap \
@@ -151,9 +150,9 @@ jobs:
     # Native arm64 runner required for node-pty and duckdb native modules.
     # Falls back to GitHub's hosted arm64 runner for forks.
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-arm-16' || 'ubuntu-24.04-arm' }}
-    # Depends on x64 job to ensure the release exists and latest-linux.yml
-    # is published first. The arm64 job only uploads the AppImage artifact
-    # to avoid overwriting the auto-update manifest.
+    # Runs after the x64 job, which uploads the update manifest (latest-linux.yml or
+    # nightly-linux.yml). The arm64 job only uploads the AppImage, so it never
+    # overwrites that manifest.
     needs: [build-linux]
     permissions:
       contents: write # Upload release assets
