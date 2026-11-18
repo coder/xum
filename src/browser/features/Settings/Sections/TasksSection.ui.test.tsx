@@ -319,6 +319,20 @@ describe("TasksSection Exec subagent defaults", () => {
     expect("subagentAiDefaults" in payload).toBe(false);
   });
 
+  // Behavior and Agents each load their own copy of both fields: sending the other section's
+  // copy would revert that section's newer edit.
+  test("Agents saves only agent defaults, not its loaded copy of task settings", async () => {
+    const view = renderTasksSection();
+    await view.findByText("Explore");
+    fireEvent.click(
+      within(getAgentCardByName(view, "Explore")).getByRole("switch", {
+        name: "Toggle explore enabled",
+      })
+    );
+    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
+    expect(Object.keys(getLatestSavePayload(view.saveConfig))).toEqual(["agentAiDefaults"]);
+  });
+
   test("pagehide saves a change made inside the autosave delay, once (#7157)", async () => {
     // Record which pagehide listeners come and go; the real methods still run. Wrapped by hand
     // and restored from their descriptors: bun's spyOn on the happy-dom window broke later
@@ -1207,6 +1221,15 @@ describe("TasksSection limit inputs", () => {
     await waitFor(() => expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).toContain(2));
     await waitPastAutosave();
     expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).not.toContain(1);
+  });
+
+  test("Behavior saves only task settings, not its loaded copy of agent defaults", async () => {
+    const view = renderTasksSection({ part: "behavior" });
+    const label = "Max Parallel Agent Tasks";
+    await waitFor(() => expect(limitInput(view, label).value).toBe("32"));
+    type(view, label, "12");
+    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
+    expect(Object.keys(getLatestSavePayload(view.saveConfig))).toEqual(["taskSettings"]);
   });
 });
 

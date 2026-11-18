@@ -170,7 +170,29 @@ interface TasksSectionSavePayload {
   agentAiDefaults: AgentAiDefaults;
 }
 
+type TasksSectionPart = "behavior" | "agents";
+
+/**
+ * Behavior and Agents each mount their own TasksSection, so each holds a copy of the other's
+ * config from its own load. Sending only the owned field keeps a stale copy from overwriting the
+ * other section's newer edit (the backend leaves an absent field unchanged).
+ */
+function ownedSavePayload(
+  part: TasksSectionPart,
+  payload: TasksSectionSavePayload
+): { taskSettings: TaskSettings } | { agentAiDefaults: AgentAiDefaults } {
+  return part === "behavior"
+    ? { taskSettings: payload.taskSettings }
+    : { agentAiDefaults: payload.agentAiDefaults };
+}
+
+/** Only Agents edits agent defaults; Behavior must not publish its loaded copy of them. */
+function ownedOptimisticConfig(part: TasksSectionPart, agentAiDefaults: AgentAiDefaults) {
+  return part === "agents" ? { agentAiDefaults } : {};
+}
+
 interface PendingSaveFlushProps {
+  part: TasksSectionPart;
   /** Null until the config loaded: a flush before that would save defaults over the config. */
   api: ReturnType<typeof useAPI>["api"];
   saveTimerRef: { current: ReturnType<typeof setTimeout> | null };
@@ -182,7 +204,7 @@ function usePendingSaveFlush(props: PendingSaveFlushProps): void {
   // Flush any pending debounced save on unmount and on pagehide so changes aren't lost: a
   // reload does not unmount React, so a change made in the last 400 ms was lost (#7157).
   // Best effort: the page can go away before the request leaves.
-  const { api, saveTimerRef, savingRef, pendingSaveRef } = props;
+  const { part, api, saveTimerRef, savingRef, pendingSaveRef } = props;
   useEffect(() => {
     if (!api) return;
 
@@ -196,7 +218,7 @@ function usePendingSaveFlush(props: PendingSaveFlushProps): void {
       pendingSaveRef.current = null;
       savingRef.current = true;
       void api.config
-        .saveConfig(payload)
+        .saveConfig(ownedSavePayload(part, payload))
         .catch(() => undefined)
         .finally(() => {
           savingRef.current = false;
@@ -213,7 +235,7 @@ function usePendingSaveFlush(props: PendingSaveFlushProps): void {
       const payload = pendingSaveRef.current;
       if (!payload) return;
       pendingSaveRef.current = null;
-      void api.config.saveConfig(payload).catch(() => undefined);
+      void api.config.saveConfig(ownedSavePayload(part, payload)).catch(() => undefined);
     };
     window.addEventListener("pagehide", onPageHide);
 
@@ -221,7 +243,7 @@ function usePendingSaveFlush(props: PendingSaveFlushProps): void {
       window.removeEventListener("pagehide", onPageHide);
       flushPendingSave();
     };
-  }, [api, saveTimerRef, savingRef, pendingSaveRef]);
+  }, [part, api, saveTimerRef, savingRef, pendingSaveRef]);
 }
 
 function renderPolicySummary(agent: AgentDefinitionDescriptor): React.ReactNode {
@@ -589,7 +611,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
  * sections mount this component and differ only in what they render: `behavior` is the task,
  * context and system rows (the Behavior section), `agents` the per-agent model defaults.
  */
-export function TasksSection(props: { part: "behavior" | "agents" }) {
+export function TasksSection(props: { part: TasksSectionPart }) {
   const { api } = useAPI();
   // The autosave sends only through a live client. Offline it keeps the change pending and says
   // so: the reload after the reconnect keeps a pending change, and the autosave sends it then.
@@ -768,7 +790,7 @@ export function TasksSection(props: { part: "behavior" | "agents" }) {
     }
 
     // Readers of the shared store see the edit before the debounced save lands.
-    getAppConfigStore().updateOptimistically({ agentAiDefaults });
+    getAppConfigStore().updateOptimistically(ownedOptimisticConfig(props.part, agentAiDefaults));
 
     clearSaveTimer(saveTimerRef);
 
@@ -786,7 +808,7 @@ export function TasksSection(props: { part: "behavior" | "agents" }) {
         pendingSaveRef.current = null;
         savingRef.current = true;
         void client.config
-          .saveConfig(payload)
+          .saveConfig(ownedSavePayload(props.part, payload))
           .then(() => {
             const previousAgentDefaults = lastSyncedAgentAiDefaultsRef.current;
             const agentDefaultsChanged =
@@ -842,9 +864,10 @@ export function TasksSection(props: { part: "behavior" | "agents" }) {
     return () => {
       clearSaveTimer(saveTimerRef);
     };
-  }, [liveApi, agentAiDefaults, loaded, loadFailed, taskSettings]);
+  }, [liveApi, agentAiDefaults, loaded, loadFailed, taskSettings, props.part]);
 
   usePendingSaveFlush({
+    part: props.part,
     api: loaded && !loadFailed ? api : null,
     saveTimerRef,
     savingRef,
