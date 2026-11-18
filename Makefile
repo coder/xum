@@ -1007,6 +1007,8 @@ MAC_RELEASE_REQUIREMENT := identifier "com.mux.app" and anchor apple generic and
 # Gatekeeper and the notarization ticket. Pull request builds sign with a throwaway certificate.
 check-mac-signature: ## Check the signature of the unpacked macOS app (MAC_ARCH=x64|arm64, MAC_CERTIFICATE=developer-id|throwaway)
 	@[ -n "$(MAC_APP_DIR_$(MAC_ARCH))" ] || { echo "check-mac-signature: set MAC_ARCH to x64 or arm64" >&2; exit 2; }
+	@# An unset or misspelled mode must not skip the release checks as if it were throwaway.
+	@case "$(MAC_CERTIFICATE)" in developer-id|throwaway) ;; *) echo "check-mac-signature: set MAC_CERTIFICATE to developer-id or throwaway" >&2; exit 2 ;; esac
 	@node scripts/macos-signing/check-app.mjs "$(MAC_APP_DIR_$(MAC_ARCH))/$(MAC_APP_BUNDLE)" build/entitlements.mac.plist \
 		$(if $(filter developer-id,$(MAC_CERTIFICATE)),--requirement '$(MAC_RELEASE_REQUIREMENT)')
 
