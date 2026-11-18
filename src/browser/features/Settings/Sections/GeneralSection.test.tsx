@@ -27,7 +27,10 @@ import { ArchiveBehaviorSettings } from "./ArchiveBehaviorSettings";
 import { DefaultProjectDirSetting } from "./DefaultProjectDirSetting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import { DEFAULT_TERMINAL_FONT_CONFIG } from "@/common/constants/storage";
+import {
+  DEFAULT_TERMINAL_BADGE_CONFIG,
+  DEFAULT_TERMINAL_FONT_CONFIG,
+} from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
   type CoderWorkspaceArchiveBehavior,
@@ -725,6 +728,46 @@ describe("GeneralSection", () => {
 
     expect(setup.config.userPreferences?.appearance?.terminalFontConfig).toEqual({ fontSize: 16 });
     expect((input as HTMLInputElement).value).toBe("");
+  });
+
+  // A number field fires on every keystroke: only a positive, in-range value may be saved, so
+  // an empty, zero or out-of-range intermediate value keeps the stored one.
+  test("terminal number fields save only positive in-range values", async () => {
+    const setup = renderGeneralSection();
+    await settleMountLoads(setup);
+    setup.config.userPreferences = {
+      appearance: {
+        terminalFontConfig: { fontFamily: "Menlo", fontSize: 16 },
+        terminalBadgeConfig: { ...DEFAULT_TERMINAL_BADGE_CONFIG, enabled: true, opacity: 0.5 },
+      },
+    };
+    await act(() => getAppConfigStore().refresh());
+    // happy-dom's change event does not reach React's handler for these number fields: call the
+    // field's own onChange, as TasksSection.ui.test does for its limit inputs.
+    const change = async (label: string, value: string) => {
+      const input = setup.view.getByLabelText(label);
+      const propsKey = Object.keys(input).find((key) => key.startsWith("__reactProps"));
+      const props = (propsKey ? (input as unknown as Record<string, unknown>)[propsKey] : null) as {
+        onChange?: (event: { target: { value: string } }) => void;
+      } | null;
+      if (!props?.onChange) throw new Error(`${label} exposes no onChange handler`);
+      const onChange = props.onChange;
+      act(() => onChange({ target: { value } }));
+      await act(() => flushUserPreferences());
+    };
+    const appearance = () => setup.config.userPreferences?.appearance;
+
+    await change("Terminal Font Size", "0");
+    await change("Terminal Font Size", "");
+    expect(appearance()?.terminalFontConfig?.fontSize).toBe(16);
+    await change("Terminal Font Size", "18");
+    expect(appearance()?.terminalFontConfig?.fontSize).toBe(18);
+
+    // Opacity is a percentage: above 100 is rejected, 80 saves as 0.8.
+    await change("Terminal Badge Opacity", "150");
+    expect(appearance()?.terminalBadgeConfig?.opacity).toBe(0.5);
+    await change("Terminal Badge Opacity", "80");
+    expect(appearance()?.terminalBadgeConfig?.opacity).toBe(0.8);
   });
 
   test("loads the SSH host setting in browser mode", async () => {

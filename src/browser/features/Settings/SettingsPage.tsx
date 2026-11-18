@@ -294,6 +294,29 @@ function SettingsContentColumn(props: {
   );
 }
 
+/**
+ * The search shortcut inside the dialog: show the list (phones) and focus and select the search
+ * field once it is on screen. Returns whether the key was the shortcut.
+ */
+export function handleFocusSearchKey(
+  e: React.KeyboardEvent,
+  showList: () => void,
+  searchInputRef: React.RefObject<HTMLInputElement | null>
+): boolean {
+  if (!matchesKeybind(e, KEYBINDS.FOCUS_SETTINGS_SEARCH)) return false;
+  // Settings is modal: keep the shortcut from also reaching window listeners behind it (the
+  // review panel binds the same chord to its own search).
+  e.preventDefault();
+  stopKeyboardPropagation(e);
+  showList();
+  // On phones the field mounts with the list; focus once it is on screen.
+  requestAnimationFrame(() => {
+    searchInputRef.current?.focus();
+    searchInputRef.current?.select();
+  });
+  return true;
+}
+
 /** Opening sections and results, and the shortcut that focuses the search field. */
 function useSettingsActions(
   search: SettingsSearchState,
@@ -326,19 +349,8 @@ function useSettingsActions(
     if (expandProvider) open("providers", { expandProvider });
     else goToSection(sectionId);
   };
-  const focusSearch = (e: React.KeyboardEvent) => {
-    if (!matchesKeybind(e, KEYBINDS.FOCUS_SETTINGS_SEARCH)) return;
-    // Settings is modal: keep the shortcut from also reaching window listeners behind it (the
-    // review panel binds the same chord to its own search).
-    e.preventDefault();
-    stopKeyboardPropagation(e);
-    mobile.showList();
-    // On phones the field mounts with the list; focus once it is on screen.
-    requestAnimationFrame(() => {
-      searchInputRef.current?.focus();
-      searchInputRef.current?.select();
-    });
-  };
+  const focusSearch = (e: React.KeyboardEvent) =>
+    handleFocusSearchKey(e, mobile.showList, searchInputRef);
   return { openSection, openSetting, openResult, focusSearch };
 }
 
