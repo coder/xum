@@ -34,6 +34,14 @@ enum ChatPart: Hashable, Sendable, Identifiable {
 
 enum ChatRole: String, Sendable { case user, assistant, system }
 
+/// Compaction rows: the `/compact` request (a user row whose text is the long summarization
+/// prompt) and the summary that replaces the history before it.
+enum CompactionKind: Hashable, Sendable {
+    case request(command: String)
+    /// `source` is the server's `compacted` value: "user", "idle", "heartbeat" (or "auto").
+    case summary(source: String)
+}
+
 struct ChatMessage: Identifiable, Hashable, Sendable {
     var id: String
     var role: ChatRole
@@ -45,6 +53,7 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
     var isStreaming = false
     var reasoningStartedAt: Date?
     var reasoningEndedAt: Date?
+    var compaction: CompactionKind?
 
     var text: String {
         parts.compactMap { if case .text(_, let t) = $0 { return t }; return nil }.joined()
@@ -101,6 +110,10 @@ final class ChatStore {
     private(set) var lastError: String?
     private(set) var contextTokens: Int?
     private(set) var hasQueued = false
+    /// Rows exist before the oldest loaded one (an earlier compaction epoch).
+    private(set) var hasOlder = false
+    private(set) var loadingOlder = false
+    private(set) var autoCompacting = false
     var connectionError: String?
 
     private var client: APIClient
@@ -182,6 +195,7 @@ final class ChatStore {
         messages = []
         answeredQuestionIds = []
         caughtUp = false
+        hasOlder = false
         streamingMessageId = nil
     }
 
@@ -198,11 +212,25 @@ final class ChatStore {
             for m in ev["messages"]?.array ?? [] { apply(m) }
         case "caught-up":
             caughtUp = true
+            // Servers send hasOlderHistory only to windowed clients; otherwise the replay holds
+            // the active epoch, and rows before a compaction boundary are older pages.
+            if let older = ev["hasOlderHistory"]?.bool {
+                hasOlder = older
+            } else if let first = messages.first {
+                hasOlder = (first.historySequence ?? 0) > 0
+            }
+        case "auto-compaction-triggered":
+            autoCompacting = true
+        case "auto-compaction-completed":
+            autoCompacting = false
         case "stream-start":
             guard let id = ev["messageId"]?.string else { return }
             var m = ChatMessage(id: id, role: .assistant, parts: [], model: ev["model"]?.string, agentId: ev["agentId"]?.string,
                                 timestamp: date(ev["startTime"]), historySequence: ev["historySequence"]?.int)
             m.isStreaming = true
+            if m.agentId == "compact" || ev["mode"]?.string == "compact" {
+                m.compaction = .summary(source: autoCompacting ? "auto" : "user")
+            }
             upsert(m)
             streamingMessageId = id
             lastError = nil
@@ -288,21 +316,44 @@ final class ChatStore {
     }
 
     private func upsertPersisted(_ ev: JSONValue) {
-        guard let id = ev["id"]?.string, let roleS = ev["role"]?.string else { return }
+        guard let m = persistedMessage(ev) else { return }
+        if m.parts.isEmpty, m.role == .assistant, messages.contains(where: { $0.id == m.id }) { return }
+        var merged = m
+        if let existing = messages.first(where: { $0.id == m.id }) {
+            merged.isStreaming = existing.isStreaming && streamingMessageId == m.id
+            merged.reasoningStartedAt = existing.reasoningStartedAt
+            merged.reasoningEndedAt = existing.reasoningEndedAt
+        }
+        upsert(merged)
+    }
+
+    /// One persisted history row as a chat message; nil for rows the UI hides.
+    private func persistedMessage(_ ev: JSONValue) -> ChatMessage? {
+        guard let id = ev["id"]?.string, let roleS = ev["role"]?.string else { return nil }
         let meta = ev["metadata"]
         // Synthetic user rows (TODO nudges, system notifications) are not shown unless the server
         // marks them visible, matching the web UI.
-        if roleS == "user", meta?["synthetic"]?.bool == true, meta?["uiVisible"]?.bool != true { return }
-        if roleS == "user", let t = ev["parts"]?[0]?["text"]?.string, t.hasPrefix("<notification>") { return }
+        let muxType = meta?["muxMetadata"]?["type"]?.string
+        let isCompactionRequest = roleS == "user" && muxType == "compaction-request"
+        if roleS == "user", !isCompactionRequest, meta?["synthetic"]?.bool == true, meta?["uiVisible"]?.bool != true { return nil }
+        if roleS == "user", let t = ev["parts"]?[0]?["text"]?.string, t.hasPrefix("<notification>") { return nil }
         if let a = meta?["muxMetadata"]?["askUserQuestionAnswer"] {
             for e in a.array ?? [a] { if let id = e["toolCallId"]?.string { answeredQuestionIds.insert(id) } }
         }
         let role = ChatRole(rawValue: roleS) ?? .system
-        guard role != .system else { return }
+        guard role != .system else { return nil }
         var m = ChatMessage(id: id, role: role, parts: Self.parseParts(ev["parts"]?.array ?? [], messageId: id),
                             model: meta?["model"]?.string, agentId: meta?["agentId"]?.string,
                             timestamp: date(meta?["timestamp"]), historySequence: meta?["historySequence"]?.int)
         if role == .assistant, let ctx = meta?["contextUsage"]?["inputTokens"]?.int { contextTokens = ctx }
+        if isCompactionRequest {
+            let raw = meta?["muxMetadata"]?["commandPrefix"]?.string ?? meta?["muxMetadata"]?["rawCommand"]?.string
+            m.compaction = .request(command: raw.map(ChatFormat.firstLine) ?? "/compact")
+        } else if role == .assistant, let c = meta?["compacted"], c.bool != false, !c.isNull {
+            m.compaction = .summary(source: c.string ?? "user")
+        } else if role == .assistant, muxType == "compaction-summary" {
+            m.compaction = .summary(source: "user")
+        }
         // Persisted tool parts carry only their end time; each one started when the previous step
         // ended (or the turn began), which gives rows and groups their durations.
         var cursor = m.timestamp
@@ -311,13 +362,26 @@ final class ChatStore {
             if t.startedAt == nil, let c = cursor, let e = t.endedAt, e >= c { t.startedAt = c; m.parts[i] = .tool(t) }
             if let e = t.endedAt { cursor = e }
         }
-        if m.parts.isEmpty, role == .assistant, messages.contains(where: { $0.id == id }) { return }
-        if let existing = messages.first(where: { $0.id == id }) {
-            m.isStreaming = existing.isStreaming && streamingMessageId == id
-            m.reasoningStartedAt = existing.reasoningStartedAt
-            m.reasoningEndedAt = existing.reasoningEndedAt
+        return m
+    }
+
+    /// Prepends the page of history before the oldest loaded row (`workspace.history.loadMore`).
+    func loadOlder() async {
+        guard hasOlder, !loadingOlder, let first = messages.first, let seq = first.historySequence else { return }
+        loadingOlder = true
+        defer { loadingOlder = false }
+        do {
+            let res = try await client.call("workspace/history/loadMore", [
+                "workspaceId": .string(workspaceId),
+                "cursor": ["beforeHistorySequence": .number(Double(seq)), "beforeMessageId": .string(first.id)],
+            ])
+            let known = Set(messages.map(\.id))
+            let older = (res["messages"]?.array ?? []).compactMap(persistedMessage).filter { !known.contains($0.id) }
+            messages.insert(contentsOf: older, at: 0)
+            hasOlder = res["hasOlder"]?.bool ?? false
+        } catch {
+            lastError = error.localizedDescription
         }
-        upsert(m)
     }
 
     private func upsert(_ m: ChatMessage) {

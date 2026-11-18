@@ -14,6 +14,12 @@ struct ChatView: View {
     @State private var thinking: ThinkingLevel = .medium
     @State private var selectedTool: ToolCall?
     @State private var seeded = false
+    @State private var scrollPosition = ScrollPosition(edge: .bottom)
+    @State private var followBottom = true
+    @State private var lastAtBottom = true
+    @State private var userScrolling = false
+    @State private var showInfo = false
+    @State private var info: WorkspaceInfoStore?
 
     private var workspace: Workspace? { model.list?.workspace(workspaceId) }
     private var pendingQuestion: PendingQuestion? { store?.pendingQuestion }
@@ -29,7 +35,7 @@ struct ChatView: View {
                 }
             }
             .background { Color.xBg.ignoresSafeArea() }
-            if sizeClass == .regular, selectedTool != nil || pendingQuestion != nil { sidePanel }
+            if sizeClass == .regular, showInfo || selectedTool != nil || pendingQuestion != nil { sidePanel }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
@@ -40,6 +46,13 @@ struct ChatView: View {
         .sheet(item: sizeClass == .regular ? .constant(nil) : $selectedTool) { tool in
             ToolDetailSheet(tool: tool) { prefill in
                 draft = prefill
+            }
+        }
+        .sheet(isPresented: sizeClass == .regular ? .constant(false) : $showInfo) {
+            if let info {
+                WorkspaceInfoView(store: info, chat: store) { showInfo = false }
+                    .presentationDetents([.medium, .large])
+                    .presentationBackground(Color.xBg2)
             }
         }
         .task(id: pendingQuestion?.toolCallId) {
@@ -53,7 +66,9 @@ struct ChatView: View {
         Group {
             // A pending question takes the panel (read the plan while answering); a tapped tool
             // row replaces it until the panel is closed.
-            if let tool = selectedTool {
+            if showInfo, let info {
+                WorkspaceInfoView(store: info, chat: store) { withAnimation { showInfo = false } }
+            } else if let tool = selectedTool {
                 ToolDetailSheet(tool: tool, onAsk: { draft = $0 }, onClose: { selectedTool = nil })
                     .id(tool.id)
             } else if let question = pendingQuestion, let store {
@@ -76,6 +91,7 @@ struct ChatView: View {
         guard !seeded else { return }
         seeded = true
         store = model.chatStore(workspaceId)
+        info = model.servers.currentClient.map { WorkspaceInfoStore(workspaceId: workspaceId, client: $0) }
         seedSettings()
     }
 
@@ -100,6 +116,9 @@ struct ChatView: View {
             if let error = store.lastError {
                 banner(error, tint: .xBad, icon: "exclamationmark.triangle")
             }
+            if store.autoCompacting {
+                banner("Compacting the conversation to free up context", tint: .xAccent, icon: "arrow.down.right.and.arrow.up.left")
+            }
             if let connection = store.connectionError {
                 banner(connection, tint: .xWarn, icon: "wifi.exclamationmark")
             }
@@ -108,37 +127,62 @@ struct ChatView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) { bottomArea(store) }
     }
 
+    /// Following the stream: while the user is at the bottom, content growth keeps the bottom
+    /// edge in place (the `.sizeChanges` anchor), with no animated scroll per delta. Scrolling up
+    /// stops following; only the user's own scroll gestures change that, never content growth.
     private func messages(_ store: ChatStore) -> some View {
-        ScrollViewReader { proxy in
+        ZStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
+                    if store.hasOlder {
+                        LoadOlderButton(loading: store.loadingOlder) { loadOlder(store) }
+                    }
                     ForEach(store.messages) { message in
                         messageRow(message, store: store)
                     }
-                    Color.clear.frame(height: 1).id("chat-bottom")
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
                 .padding(.bottom, 8)
             }
+            .scrollPosition($scrollPosition)
             .defaultScrollAnchor(.bottom)
-            .onChange(of: autoscrollKey(store)) { _, _ in
-                withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("chat-bottom", anchor: .bottom) }
+            .defaultScrollAnchor(followBottom ? .bottom : .top, for: .sizeChanges)
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                geo.contentOffset.y + geo.containerSize.height >= geo.contentSize.height - 48
+            } action: { _, atBottom in
+                lastAtBottom = atBottom
+                if userScrolling { followBottom = atBottom }
+            }
+            .onScrollPhaseChange { _, phase in
+                userScrolling = phase == .interacting || phase == .decelerating
+                if phase == .idle { followBottom = lastAtBottom }
+            }
+            .onChange(of: store.messages.last(where: { $0.role == .user })?.id) { _, _ in
+                // The user's own new message always brings the stream back into view.
+                followBottom = true
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+            // Replaying a long transcript lays out in several passes; showing it only once the
+            // server has caught up avoids watching the list jump to the bottom.
+            .opacity(store.caughtUp ? 1 : 0)
+            if !store.caughtUp {
+                ProgressView().controlSize(.regular)
             }
         }
     }
 
-    /// Content signature that changes while a message streams, so the list follows the stream.
-    private func autoscrollKey(_ store: ChatStore) -> Int {
-        var key = store.messages.count
-        if let last = store.messages.last {
-            key = key &* 31 &+ last.parts.count &+ last.text.count % 997 &+ (last.isStreaming ? 1 : 0)
-        }
-        return key
+    private func loadOlder(_ store: ChatStore) {
+        followBottom = false
+        Task { await store.loadOlder() }
     }
 
     @ViewBuilder private func messageRow(_ m: ChatMessage, store: ChatStore) -> some View {
-        if m.role == .user {
+        if case .request(let command)? = m.compaction {
+            CompactionRequestMarker(command: command)
+        } else if case .summary(let source)? = m.compaction {
+            CompactionCard(message: m, source: source)
+        } else if m.role == .user {
             if !m.text.isEmpty { UserBubble(text: m.text) }
         } else {
             VStack(alignment: .leading, spacing: 10) {
@@ -223,6 +267,7 @@ struct ChatView: View {
         case .tools(let tools):
             ToolGroupCard(tools: tools, inspectedId: sizeClass == .regular ? selectedTool?.id : nil) { tool in
                 if sizeClass == .regular { withAnimation { model.splitColumns = .detailOnly } }
+                showInfo = false
                 selectedTool = tool
             }
         case .plan(let tool):
@@ -311,15 +356,19 @@ struct ChatView: View {
         }
         ToolbarItem(placement: .topBarTrailing) {
             HStack(spacing: 2) {
-                Button { } label: {
-                    Image(systemName: "terminal")
+                Button {
+                    withAnimation {
+                        if sizeClass == .regular, !showInfo { model.splitColumns = .detailOnly }
+                        showInfo.toggle()
+                    }
+                } label: {
+                    Image(systemName: "sidebar.right")
                         .font(.system(size: 14))
                         .frame(width: 32, height: 32)
                         .contentShape(Rectangle())
                 }
-                .foregroundStyle(Color.xText2)
-                .disabled(true)
-                .accessibilityLabel("Terminal")
+                .foregroundStyle(showInfo ? Color.xAccent : Color.xText)
+                .accessibilityLabel("Workspace info")
                 Menu {
                     Button("Copy workspace name") {
                         UIPasteboard.general.string = workspace?.displayName ?? workspaceId
