@@ -417,6 +417,8 @@ describe("make dist-*: the zip directory reaches every electron-builder call", (
     ["dist-mac", 3],
     ["dist-mac-x64", 1],
     ["dist-mac-arm64", 1],
+    ["dist-mac-app-x64", 1],
+    ["dist-mac-app-arm64", 1],
     ["dist-win", 1],
     ["dist-linux", 1],
     ["dist-linux-arm64", 1],
