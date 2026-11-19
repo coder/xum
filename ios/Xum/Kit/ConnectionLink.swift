@@ -25,25 +25,18 @@ struct ConnectionLink: Equatable, Sendable {
     /// device), or a Tailscale address (WireGuard encrypts the tailnet). Anything else is plain
     /// HTTP that anyone on the network path can read, and the token lets its holder run commands
     /// on the server.
-    var isProtectedTransport: Bool {
+    var isProtectedTransport: Bool { protectedTransport(tailnetUp: Tailnet.isUp) }
+
+    /// `tailnetUp`: this device has a Tailscale address on a VPN tunnel. A 100.64.0.0/10 address
+    /// alone can be ordinary RFC 6598 carrier NAT, so it counts only then.
+    func protectedTransport(tailnetUp: Bool) -> Bool {
         if baseURL.scheme?.lowercased() == "https" { return true }
         let h = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        if h == "localhost" || h.hasSuffix(".ts.net") { return true }
+        if h == "localhost" { return true }
+        if h.hasSuffix(".ts.net") { return tailnetUp }
         // Only literal addresses count: a hostname such as `127.attacker.example` resolves anywhere.
-        var v4 = in_addr()
-        if inet_pton(AF_INET, h, &v4) == 1 {
-            let b = withUnsafeBytes(of: &v4) { Array($0) }
-            // Loopback 127.0.0.0/8, or Tailscale's 100.64.0.0/10.
-            return b[0] == 127 || (b[0] == 100 && b[1] & 0xC0 == 64)
-        }
-        var v6 = in6_addr()
-        if inet_pton(AF_INET6, h, &v6) == 1 {
-            let b = withUnsafeBytes(of: &v6) { Array($0) }
-            if b[0..<15].allSatisfy({ $0 == 0 }) && b[15] == 1 { return true }
-            // Tailscale's IPv6 range, fd7a:115c:a1e0::/48.
-            return Array(b[0..<6]) == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
-        }
-        return false
+        guard let ip = IPAddress(h) else { return false }
+        return ip.isLoopback || (ip.isTailscale && tailnetUp)
     }
 
     static func parse(_ raw: String) -> ConnectionLink? {
@@ -67,5 +60,57 @@ struct ConnectionLink: Equatable, Sendable {
         base.path = path.isEmpty ? "/" : path + "/"
         guard let url = base.url else { return nil }
         return ConnectionLink(baseURL: url, token: token)
+    }
+}
+
+/// A literal IPv4 or IPv6 address.
+struct IPAddress {
+    let bytes: [UInt8]
+
+    init?(_ text: String) {
+        var v4 = in_addr()
+        var v6 = in6_addr()
+        if inet_pton(AF_INET, text, &v4) == 1 {
+            bytes = withUnsafeBytes(of: &v4) { Array($0) }
+        } else if inet_pton(AF_INET6, text, &v6) == 1 {
+            bytes = withUnsafeBytes(of: &v6) { Array($0) }
+        } else {
+            return nil
+        }
+    }
+
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    /// 127.0.0.0/8 or ::1.
+    var isLoopback: Bool {
+        bytes.count == 4 ? bytes[0] == 127 : bytes[0..<15].allSatisfy { $0 == 0 } && bytes[15] == 1
+    }
+
+    /// Tailscale's ranges: 100.64.0.0/10 and fd7a:115c:a1e0::/48.
+    var isTailscale: Bool {
+        bytes.count == 4 ? bytes[0] == 100 && bytes[1] & 0xC0 == 64 : Array(bytes[0..<6]) == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
+    }
+}
+
+/// Whether Tailscale is connected on this device: a `utun` tunnel holds a Tailscale address.
+/// Carrier NAT puts 100.64.0.0/10 on the cellular or Wi-Fi interface, never on a tunnel.
+enum Tailnet {
+    static var isUp: Bool {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0 else { return false }
+        defer { freeifaddrs(head) }
+        var p = head
+        while let ifa = p {
+            defer { p = ifa.pointee.ifa_next }
+            guard String(cString: ifa.pointee.ifa_name).hasPrefix("utun"), let sa = ifa.pointee.ifa_addr else { continue }
+            if sa.pointee.sa_family == UInt8(AF_INET) {
+                let a = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                if IPAddress(bytes: withUnsafeBytes(of: a) { Array($0) }).isTailscale { return true }
+            } else if sa.pointee.sa_family == UInt8(AF_INET6) {
+                let a = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
+                if IPAddress(bytes: withUnsafeBytes(of: a) { Array($0) }).isTailscale { return true }
+            }
+        }
+        return false
     }
 }

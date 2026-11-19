@@ -55,11 +55,26 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
     var reasoningStartedAt: Date?
     var reasoningEndedAt: Date?
     var compaction: CompactionKind?
+    /// `file` parts (attachments, review images): shown by name, their data is not loaded.
+    var files: [AttachedFile] = []
 
     var text: String {
         parts.compactMap { if case .text(_, let t) = $0 { return t }; return nil }.joined()
     }
     var tools: [ToolCall] { parts.compactMap { if case .tool(let t) = $0 { return t }; return nil } }
+}
+
+struct AttachedFile: Hashable, Sendable {
+    var name: String
+    var mediaType: String
+}
+
+extension AttachedFile {
+    init?(part: JSONValue) {
+        guard part["type"]?.string == "file" else { return nil }
+        mediaType = part["mediaType"]?.string ?? ""
+        name = part["filename"]?.string ?? (mediaType.hasPrefix("image/") ? "Image" : "File")
+    }
 }
 
 struct TodoItem: Hashable, Sendable {
@@ -189,9 +204,10 @@ final class ChatStore {
         return nil
     }
 
-    /// The last proposed plan, when it is the newest assistant output (so the card shows Implement).
+    /// The last proposed plan, when it is the newest output and no message answered it yet (so
+    /// the card shows Implement).
     var latestPlanToolId: String? {
-        guard let last = messages.last(where: { $0.role == .assistant }) else { return nil }
+        guard let last = messages.last(where: { $0.role != .system }), last.role == .assistant else { return nil }
         // A failed call saved no plan, so there is nothing to implement.
         guard let plan = last.tools.last(where: { $0.name == "propose_plan" }), plan.state == .done else { return nil }
         return plan.id
@@ -432,6 +448,7 @@ final class ChatStore {
         var m = ChatMessage(id: id, role: role, parts: Self.parseParts(ev["parts"]?.array ?? [], messageId: id),
                             model: meta?["model"]?.string, agentId: meta?["agentId"]?.string,
                             timestamp: date(meta?["timestamp"]), historySequence: meta?["historySequence"]?.int)
+        m.files = (ev["parts"]?.array ?? []).compactMap(AttachedFile.init(part:))
         if role == .assistant, let ctx = meta?["contextUsage"]?["inputTokens"]?.int { contextTokens = ctx }
         if isCompactionRequest {
             let raw = meta?["muxMetadata"]?["commandPrefix"]?.string ?? meta?["muxMetadata"]?["rawCommand"]?.string
@@ -578,8 +595,7 @@ final class ChatStore {
     func answer(_ q: PendingQuestion, answers: [String: String]) async throws {
         guard q.answerByMessage else { return try await answer(toolCallId: q.toolCallId, answers: answers) }
         let text = q.questions.map { "\($0.header.isEmpty ? $0.question : $0.header): \(answers[$0.question] ?? "Skipped")" }.joined(separator: "\n")
-        let model = lastModel ?? "anthropic:claude-opus-5-5"
-        let agent = messages.last(where: { $0.role == .assistant })?.agentId ?? "exec"
+        let (model, agent) = turnOptions
         answeredQuestionIds.insert(q.toolCallId)
         do {
             try await client.call("workspace/sendMessage", [
@@ -594,6 +610,11 @@ final class ChatStore {
         }
     }
 
+    /// The model and agent of the turn being answered.
+    private var turnOptions: (model: String, agent: String) {
+        (lastModel ?? "anthropic:claude-opus-5-5", messages.last(where: { $0.role == .assistant })?.agentId ?? "exec")
+    }
+
     func answer(toolCallId: String, answers: [String: String]) async throws {
         do {
             try await client.call("workspace/answerAskUserQuestion", [
@@ -603,6 +624,18 @@ final class ChatStore {
         } catch {
             lastError = "Answer not sent: \(error.localizedDescription)"
             throw error
+        }
+        // A question recovered from history (the server or its stream restarted) has no waiting
+        // turn, so the answer only completes the call. Resume as the desktop does; the server
+        // reports a turn that is already running instead of starting another.
+        let (model, agent) = turnOptions
+        do {
+            try await client.call("workspace/resumeStream", [
+                "workspaceId": .string(workspaceId),
+                "options": ["model": .string(model), "agentId": .string(agent)],
+            ])
+        } catch {
+            lastError = "Answer sent, but the agent did not continue: \(error.localizedDescription)"
         }
     }
 }

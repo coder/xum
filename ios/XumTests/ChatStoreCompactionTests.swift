@@ -55,6 +55,14 @@ struct ChatStoreCompactionTests {
         #expect(s.replayFailed)
         #expect(!s.hasOlder)
     }
+
+    @Test func attachmentOnlyMessageKeepsItsFiles() {
+        let s = store()
+        s.apply(["type": "message", "id": "u", "role": "user", "metadata": ["historySequence": 0],
+                 "parts": [["type": "file", "url": "data:image/png;base64,AA", "mediaType": "image/png", "filename": "shot.png"],
+                           ["type": "file", "url": "data:text/plain;base64,AA", "mediaType": "text/plain"]]])
+        #expect(s.messages.first?.files == [AttachedFile(name: "shot.png", mediaType: "image/png"), AttachedFile(name: "File", mediaType: "text/plain")])
+    }
 }
 
 struct ConnectionLinkTransportTests {
@@ -75,7 +83,18 @@ struct ConnectionLinkTransportTests {
     ])
     func protectedTransport(link: String, protected: Bool) throws {
         let parsed = try #require(ConnectionLink.parse(link))
-        #expect(parsed.isProtectedTransport == protected)
+        #expect(parsed.protectedTransport(tailnetUp: true) == protected)
+    }
+
+    /// Without Tailscale on this device a 100.64.0.0/10 address may be carrier NAT.
+    @Test(arguments: [
+        "http://100.100.16.68:3000/?token=t", "http://[fd7a:115c:a1e0::1]:3000/?token=t",
+        "http://devbox.tail4e2c.ts.net:3000/?token=t",
+    ])
+    func tailscaleNeedsTheTailnet(link: String) throws {
+        let parsed = try #require(ConnectionLink.parse(link))
+        #expect(!parsed.protectedTransport(tailnetUp: false))
+        #expect(try #require(ConnectionLink.parse("http://127.0.0.1:3000/?token=t")).protectedTransport(tailnetUp: false))
     }
 
     @Test func urlStringRoundTrips() throws {

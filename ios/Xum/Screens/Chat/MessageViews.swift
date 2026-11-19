@@ -87,6 +87,34 @@ struct UserBubble: View {
     }
 }
 
+/// A user message's attachment, by name and type, under its bubble.
+struct AttachmentChip: View {
+    let file: AttachedFile
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: file.mediaType.hasPrefix("image/") ? "photo" : "paperclip")
+                .font(.system(size: 13))
+                .foregroundStyle(Color.xText2)
+            Text(file.name)
+                .font(.system(size: 14))
+                .foregroundStyle(Color.xText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if !file.mediaType.isEmpty {
+                Text(file.mediaType).font(.system(size: 12)).foregroundStyle(Color.xText3).lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .frame(maxWidth: 300, alignment: .leading)
+        .background(Color.xUser, in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.xSep, lineWidth: 0.5))
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// Assistant message text: fenced ``` blocks split out into code blocks, the rest inline markdown.
 struct AssistantTextView: View {
     let text: String

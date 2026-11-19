@@ -11,7 +11,12 @@ struct ChatView: View {
     @State private var store: ChatStore?
     @State private var draft = ""
     @State private var agent = "exec"
-    @State private var modelId = "anthropic:claude-opus-5-5"
+    /// The user's pick or the agent's saved model. The composer follows the current server's
+    /// default until there is one the server offers: its catalog can still be loading.
+    @State private var pickedModel: String?
+    private var modelId: String {
+        pickedModel.flatMap { model.modelChoices.contains($0) ? $0 : nil } ?? model.defaultModel
+    }
     @State private var thinking: ThinkingLevel = .medium
     /// The inspected call is looked up in the store on each render, so a call that is still
     /// running keeps its output and state current in the open inspector.
@@ -33,6 +38,8 @@ struct ChatView: View {
     @State private var info: WorkspaceInfoStore?
     /// The plan file's text for the latest plan (keyed by its tool call ID).
     @State private var planFile: (toolId: String, content: String)?
+    /// Implement was tapped and its send is not yet accepted: a second tap would queue it twice.
+    @State private var implementing = false
 
     private var workspace: Workspace? { model.list?.workspace(workspaceId) }
     private var pendingQuestion: PendingQuestion? { store?.pendingQuestion }
@@ -144,7 +151,7 @@ struct ChatView: View {
             workspace?.raw["aiSettingsByAgent"]?[agentId]?[key]?.string
         }
         agent = agentId
-        modelId = setting("model") ?? model.defaultModel
+        pickedModel = setting("model")
         if let s = setting("thinkingLevel"), let level = ThinkingLevel(rawValue: s) {
             thinking = level
         } else {
@@ -226,7 +233,10 @@ struct ChatView: View {
         } else if case .summary(let source)? = m.compaction {
             CompactionCard(message: m, source: source)
         } else if m.role == .user {
-            if !m.text.isEmpty { UserBubble(text: m.text) }
+            VStack(spacing: 6) {
+                if !m.text.isEmpty { UserBubble(text: m.text) }
+                ForEach(Array(m.files.enumerated()), id: \.offset) { _, f in AttachmentChip(file: f) }
+            }
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(bodyElements(m)) { element in
@@ -318,12 +328,16 @@ struct ChatView: View {
                 tool: tool,
                 modelName: m.model,
                 timestamp: m.timestamp,
-                canImplement: store.latestPlanToolId == tool.id,
+                canImplement: store.latestPlanToolId == tool.id && !implementing,
                 fileContent: planFile?.toolId == tool.id ? planFile?.content : nil,
                 onImplement: {
                     // The composer moves to Exec with it, so the next message does not go back to Plan.
                     applySettings(for: "exec")
-                    Task { try? await store.send("Implement the plan", model: modelId, agentId: agent, thinking: thinking) }
+                    implementing = true
+                    Task {
+                        defer { implementing = false }
+                        try? await store.send("Implement the plan", model: modelId, agentId: agent, thinking: thinking)
+                    }
                 }
             )
         }
@@ -365,7 +379,7 @@ struct ChatView: View {
                 Composer(
                     text: $draft,
                     agent: $agent,
-                    modelId: $modelId,
+                    modelId: Binding(get: { modelId }, set: { pickedModel = $0 }),
                     thinking: $thinking,
                     placeholder: store.isStreaming ? "Queue a follow-up" : "Message \(workspace?.displayName ?? "agent")",
                     isStreaming: store.isStreaming,

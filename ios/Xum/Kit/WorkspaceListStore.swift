@@ -88,12 +88,12 @@ final class WorkspaceListStore {
                     if ev["type"]?.string == "snapshot" {
                         workspaces = (ev["workspaces"]?.array ?? []).compactMap(Workspace.init(json:))
                         pruneAttention()
+                        // A project created while disconnected arrives only as its workspaces' path.
+                        workspaces.forEach(addProject(of:))
                     } else if let id = ev["workspaceId"]?.string {
                         if let m = ev["metadata"], let w = Workspace(json: m) {
                             if let i = workspaces.firstIndex(where: { $0.id == id }) { workspaces[i] = w } else { workspaces.append(w) }
-                            if !projects.contains(where: { $0.path == w.projectPath }), !w.projectPath.isEmpty {
-                                projects.append(Project(path: w.projectPath, name: w.projectName))
-                            }
+                            addProject(of: w)
                         } else {
                             workspaces.removeAll { $0.id == id }
                             attention[id] = nil
@@ -123,6 +123,11 @@ final class WorkspaceListStore {
     /// recent idle workspace and look for an open question or a just-proposed plan.
     /// Every workspace, newest first, at most four replays at a time: the Inbox claims all of
     /// them, so an older idle one with an open question must count too.
+    private func addProject(of w: Workspace) {
+        guard !w.projectPath.isEmpty, !w.isScratch, !projects.contains(where: { $0.path == w.projectPath }) else { return }
+        projects.append(Project(path: w.projectPath, name: w.projectName))
+    }
+
     private func pruneAttention() {
         let ids = Set(workspaces.map(\.id))
         attention = attention.filter { ids.contains($0.key) }
