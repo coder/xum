@@ -46,6 +46,15 @@ struct ChatStoreCompactionTests {
         #expect(s.messages.first?.compaction == .summary(source: "auto"))
         #expect(s.messages.first?.isStreaming == true)
     }
+
+    @Test func failedReplayIsNotCaughtUp() {
+        let s = store()
+        s.apply(row("u", role: "user", seq: 4, text: "Hi"))
+        s.apply(["type": "caught-up", "historyReplayStatus": "failed"])
+        #expect(!s.caughtUp)
+        #expect(s.replayFailed)
+        #expect(!s.hasOlder)
+    }
 }
 
 struct ConnectionLinkTransportTests {
@@ -58,6 +67,11 @@ struct ConnectionLinkTransportTests {
         ("http://192.168.1.20:3000/?token=t", false),
         ("http://100.12.0.1:3000/?token=t", false),
         ("http://devbox.local:3000/?token=t", false),
+        ("http://127.attacker.example:3000/?token=t", false),
+        ("http://100.64.1.2.attacker.example:3000/?token=t", false),
+        ("http://[::1]:3000/?token=t", true),
+        ("http://[fd7a:115c:a1e0::1]:3000/?token=t", true),
+        ("http://[fd7a:115c:a1e1::1]:3000/?token=t", false),
     ])
     func protectedTransport(link: String, protected: Bool) throws {
         let parsed = try #require(ConnectionLink.parse(link))

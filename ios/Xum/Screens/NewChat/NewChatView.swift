@@ -378,7 +378,8 @@ struct NewChatView: View {
         do {
             let res = try await client.call("projects/listBranches", ["projectPath": .string(path)])
             let loaded = (res["branches"]?.array ?? []).compactMap { b in b.string ?? b["name"]?.string }
-            guard !loaded.isEmpty else { return }
+            // The user picked another project while this ran; its own load sets the branches.
+            guard selectedProject?.path == path, !loaded.isEmpty else { return }
             branches = loaded
             if let recommended = res["recommendedTrunk"]?.string, loaded.contains(recommended) {
                 trunk = recommended

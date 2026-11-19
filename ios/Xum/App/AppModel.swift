@@ -50,12 +50,19 @@ final class AppModel {
     /// first send would be refused. The server's own default wins, else its first usable model.
     func loadModels() async {
         guard let c = servers.currentClient else { return }
+        let serverID = servers.currentID
         guard let providers = try? await c.call("providers/getConfig") else { return }
+        let serverDefault = (try? await c.call("config/getConfig"))?["defaultModel"]?.string
+        // A switch while these calls ran started a newer load for the new server.
+        guard servers.currentID == serverID else { return }
         let models = ModelName.catalog(providers: providers)
         serverModels = models
-        guard !models.isEmpty, !models.contains(defaultModel) else { return }
-        let serverDefault = (try? await c.call("config/getConfig"))?["defaultModel"]?.string
-        defaultModel = serverDefault.flatMap { models.contains($0) ? $0 : nil } ?? models[0]
+        guard !models.isEmpty else { return }
+        if let d = serverDefault, models.contains(d) {
+            defaultModel = d
+        } else if !models.contains(defaultModel) {
+            defaultModel = models[0]
+        }
     }
     var defaultAgent = "exec"
     var defaultThinking: ThinkingLevel = .medium

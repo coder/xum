@@ -131,6 +131,8 @@ final class ChatStore {
     let workspaceId: String
     private(set) var messages: [ChatMessage] = []
     private(set) var caughtUp = false
+    /// The server ended the replay with `historyReplayStatus: "failed"`: the rows are incomplete.
+    private(set) var replayFailed = false
     private(set) var streamingMessageId: String?
     private(set) var lastError: String?
     private(set) var contextTokens: Int?
@@ -214,7 +216,10 @@ final class ChatStore {
                     connectionError = nil
                     backoff = 1
                     apply(ev)
+                    if replayFailed { break }
                 }
+                // A failed replay leaves partial history, so resubscribe instead of showing it.
+                if replayFailed { connectionError = "The server could not load this chat's history." }
             } catch is CancellationError {
                 return
             } catch {
@@ -232,7 +237,9 @@ final class ChatStore {
         sandboxApprovals = []
         heldInputs = []
         caughtUp = false
+        replayFailed = false
         hasOlder = false
+        autoCompacting = false
         streamingMessageId = nil
     }
 
@@ -248,6 +255,10 @@ final class ChatStore {
         case "message-batch":
             for m in ev["messages"]?.array ?? [] { apply(m) }
         case "caught-up":
+            if ev["historyReplayStatus"]?.string == "failed" {
+                replayFailed = true
+                return
+            }
             caughtUp = true
             // Servers send hasOlderHistory only to windowed clients; otherwise the replay holds
             // the active epoch, and rows before a compaction boundary are older pages.

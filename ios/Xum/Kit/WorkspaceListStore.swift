@@ -62,6 +62,7 @@ final class WorkspaceListStore {
             }
             let w = try await client.call("workspace/list", [:])
             workspaces = (w.array ?? []).compactMap(Workspace.init(json:))
+            pruneAttention()
             let a = try await client.call("workspace/activity/list")
             // `null` means the server could not read activity, not that every workspace is idle.
             if let snapshot = a.object {
@@ -86,6 +87,7 @@ final class WorkspaceListStore {
                 for try await ev in client.subscribe("workspace/onMetadata", [:]) {
                     if ev["type"]?.string == "snapshot" {
                         workspaces = (ev["workspaces"]?.array ?? []).compactMap(Workspace.init(json:))
+                        pruneAttention()
                     } else if let id = ev["workspaceId"]?.string {
                         if let m = ev["metadata"], let w = Workspace(json: m) {
                             if let i = workspaces.firstIndex(where: { $0.id == id }) { workspaces[i] = w } else { workspaces.append(w) }
@@ -94,6 +96,7 @@ final class WorkspaceListStore {
                             }
                         } else {
                             workspaces.removeAll { $0.id == id }
+                            attention[id] = nil
                         }
                     }
                 }
@@ -120,6 +123,11 @@ final class WorkspaceListStore {
     /// recent idle workspace and look for an open question or a just-proposed plan.
     /// Every workspace, newest first, at most four replays at a time: the Inbox claims all of
     /// them, so an older idle one with an open question must count too.
+    private func pruneAttention() {
+        let ids = Set(workspaces.map(\.id))
+        attention = attention.filter { ids.contains($0.key) }
+    }
+
     func scanAttention() async {
         let ordered = workspaces.sorted { (activity[$0.id]?.recency ?? .distantPast) > (activity[$1.id]?.recency ?? .distantPast) }
         await withTaskGroup(of: Void.self) { g in
@@ -136,9 +144,11 @@ final class WorkspaceListStore {
         do {
             for try await ev in client.subscribe("workspace/onChat", ["workspaceId": .string(id), "mode": ["type": "full"]]) {
                 store.apply(ev)
-                if store.caughtUp { break }
+                if store.caughtUp || store.replayFailed { break }
             }
         } catch { return }
+        // Keep the last answer when the replay did not finish, and never revive a removed workspace.
+        guard store.caughtUp, workspaces.contains(where: { $0.id == id }) else { return }
         if let q = store.pendingQuestion {
             attention[id] = .question(q.questions.first?.question ?? "")
         } else if store.latestPlanToolId != nil, !store.isStreaming {
@@ -150,10 +160,10 @@ final class WorkspaceListStore {
         }
     }
 
-    /// File names reach `xargs -0` and `cat` as arguments, never as shell text: a repository can
-    /// hold untracked files with any name, and this script runs when the list opens.
+    /// File names reach `awk` as `./`-prefixed arguments, never as options, assignments or shell
+    /// text: a repository can hold untracked files with any name, and this runs when the list opens.
     func refreshDiffStats() async {
-        let script = WorkspaceInfoStore.base + #"; u=$(git ls-files --others --exclude-standard -z | xargs -0 cat -- 2>/dev/null | wc -l); git diff --numstat "$b" | awk -v u="$u" '{a+=$1;d+=$2} END {print a+u, d+0}'"#
+        let script = WorkspaceInfoStore.base + #"; u=$(git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do awk 'END {print NR}' "./$f" 2>/dev/null; done | awk '{s+=$1} END {print s+0}'); git diff --numstat "$b" | awk -v u="$u" '{a+=$1;d+=$2} END {print a+u, d+0}'"#
         await withTaskGroup(of: (String, (Int, Int)?).self) { g in
             for w in workspaces where !w.isScratch {
                 g.addTask {

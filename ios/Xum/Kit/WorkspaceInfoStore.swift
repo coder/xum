@@ -221,7 +221,7 @@ final class WorkspaceInfoStore {
 
     func loadChanges() async {
         do {
-            let out = try await bash(Self.base + #"; printf 'BASE %s\0' "$b"; git diff --numstat -z "$b"; printf 'UNTRACKED\0'; git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do printf '%s\0%s\0' "$(wc -l < "$f" | tr -d ' ')" "$f"; done"#)
+            let out = try await bash(Self.base + #"; printf 'BASE %s\0' "$b"; git diff --numstat -z "$b"; printf 'UNTRACKED\0'; git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do printf '%s\0%s\0' "$(awk 'END {print NR}' "./$f" 2>/dev/null)" "$f"; done"#)
             (changesBase, changes) = Self.parseChanges(out)
             changesError = nil
         } catch {

@@ -28,11 +28,21 @@ struct ConnectionLink: Equatable, Sendable {
     var isProtectedTransport: Bool {
         if baseURL.scheme?.lowercased() == "https" { return true }
         let h = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        if h == "localhost" || h == "::1" || h.hasPrefix("127.") { return true }
-        if h.hasSuffix(".ts.net") || h.hasPrefix("fd7a:115c:a1e0:") { return true }
-        // Tailscale's IPv4 range, 100.64.0.0/10.
-        let octets = h.split(separator: ".").compactMap { Int($0) }
-        if octets.count == 4, octets[0] == 100, (64...127).contains(octets[1]) { return true }
+        if h == "localhost" || h.hasSuffix(".ts.net") { return true }
+        // Only literal addresses count: a hostname such as `127.attacker.example` resolves anywhere.
+        var v4 = in_addr()
+        if inet_pton(AF_INET, h, &v4) == 1 {
+            let b = withUnsafeBytes(of: &v4) { Array($0) }
+            // Loopback 127.0.0.0/8, or Tailscale's 100.64.0.0/10.
+            return b[0] == 127 || (b[0] == 100 && b[1] & 0xC0 == 64)
+        }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, h, &v6) == 1 {
+            let b = withUnsafeBytes(of: &v6) { Array($0) }
+            if b[0..<15].allSatisfy({ $0 == 0 }) && b[15] == 1 { return true }
+            // Tailscale's IPv6 range, fd7a:115c:a1e0::/48.
+            return Array(b[0..<6]) == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
+        }
         return false
     }
 
