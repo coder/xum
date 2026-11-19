@@ -1,6 +1,6 @@
 import type { ComponentType } from "react";
 import { expect, waitFor, within } from "storybook/test";
-import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
+import { lightweightMeta } from "@/browser/stories/meta.js";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { AutoModelRoutingGroup } from "./AutoModelRoutingExperimentConfig.js";
@@ -170,12 +170,15 @@ export const AutoModelRoutingEnabledPhone: Story = {
 
 /**
  * Phone-width contract for the configure buttons: in a narrow section the button shows only its
- * section icon and stays inside the row. A play only, no Pixel snapshot. The label hides by
- * container width, so the fixed 375px frame makes the check hold in the CI test-runner too,
- * which plays at desktop size (AGENTS.md).
+ * section icon and stays inside the row. Pixel snapshots it at the phone viewport; the label
+ * hides by container width, so the fixed 375px frame makes the play hold in the CI
+ * test-runner too, which plays at desktop size (AGENTS.md).
  */
 export const ConfigureButtonsPhoneWidth: Story = {
-  parameters: { pixel: PIXEL_DISABLED },
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
   render: () => (
     <SettingsSectionStory
       setup={() =>
