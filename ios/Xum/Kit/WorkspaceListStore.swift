@@ -61,8 +61,7 @@ final class WorkspaceListStore {
                 return Project(path: path, name: custom?.isEmpty == false ? custom! : URL(fileURLWithPath: path).lastPathComponent)
             }
             let w = try await client.call("workspace/list", [:])
-            workspaces = (w.array ?? []).compactMap(Workspace.init(json:))
-            pruneAttention()
+            setWorkspaces((w.array ?? []).compactMap(Workspace.init(json:)))
             let a = try await client.call("workspace/activity/list")
             // `null` means the server could not read activity, not that every workspace is idle.
             if let snapshot = a.object {
@@ -86,8 +85,7 @@ final class WorkspaceListStore {
             do {
                 for try await ev in client.subscribe("workspace/onMetadata", [:]) {
                     if ev["type"]?.string == "snapshot" {
-                        workspaces = (ev["workspaces"]?.array ?? []).compactMap(Workspace.init(json:))
-                        pruneAttention()
+                        setWorkspaces((ev["workspaces"]?.array ?? []).compactMap(Workspace.init(json:)))
                         // A project created while disconnected arrives only as its workspaces' path.
                         workspaces.forEach(addProject(of:))
                     } else if let id = ev["workspaceId"]?.string {
@@ -95,8 +93,7 @@ final class WorkspaceListStore {
                             if let i = workspaces.firstIndex(where: { $0.id == id }) { workspaces[i] = w } else { workspaces.append(w) }
                             addProject(of: w)
                         } else {
-                            workspaces.removeAll { $0.id == id }
-                            attention[id] = nil
+                            setWorkspaces(workspaces.filter { $0.id != id })
                         }
                     }
                 }
@@ -144,9 +141,16 @@ final class WorkspaceListStore {
         projects.append(Project(path: w.projectPath, name: w.projectName))
     }
 
-    private func pruneAttention() {
-        let ids = Set(workspaces.map(\.id))
+    /// Called with each workspace that was listed and is gone (archived or removed elsewhere).
+    var onRemoved: (String) -> Void = { _ in }
+
+    /// Replaces the list; drops state of workspaces no longer in it and reports them.
+    private func setWorkspaces(_ new: [Workspace]) {
+        let ids = Set(new.map(\.id))
+        let gone = workspaces.map(\.id).filter { !ids.contains($0) }
+        workspaces = new
         attention = attention.filter { ids.contains($0.key) }
+        gone.forEach(onRemoved)
     }
 
     func scanAttention() async {
@@ -171,7 +175,7 @@ final class WorkspaceListStore {
         // Keep the last answer when the replay did not finish, and never revive a removed workspace.
         guard store.caughtUp, workspaces.contains(where: { $0.id == id }) else { return }
         // An approval blocks a turn that is still streaming, so it comes first.
-        if let a = store.sandboxApprovals.first {
+        if let a = store.openApproval {
             attention[id] = .approval(ChatFormat.firstLine(a.script))
         } else if let q = store.pendingQuestion {
             attention[id] = .question(q.questions.first?.question ?? "")

@@ -8,8 +8,9 @@ struct SearchView: View {
     private var results: [Workspace] {
         guard let list = model.list else { return [] }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return list.workspaces }
-        return list.workspaces.filter {
+        let visible = list.workspaces.filter { !$0.isSideChat }
+        guard !q.isEmpty else { return visible }
+        return visible.filter {
             $0.displayName.lowercased().contains(q)
                 || $0.name.lowercased().contains(q)
                 || $0.projectName.lowercased().contains(q)

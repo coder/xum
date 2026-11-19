@@ -33,6 +33,17 @@ struct APIClient: Sendable {
         return URLSession(configuration: c)
     }()
 
+    /// `sendMessage` and `resumeStream` answer only when the turn ends, and nothing arrives
+    /// before that: under the 20-second idle timeout every longer turn would fail as "not sent".
+    private static let turnProcedures: Set<String> = ["workspace/sendMessage", "workspace/resumeStream"]
+    private static let turnSession: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 24 * 3600
+        c.timeoutIntervalForResource = 24 * 3600
+        c.waitsForConnectivity = false
+        return URLSession(configuration: c)
+    }()
+
     private static let streamSession: URLSession = {
         let c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 24 * 3600
@@ -61,7 +72,8 @@ struct APIClient: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await Self.session.data(for: request(procedure, body: body))
+            let session = Self.turnProcedures.contains(procedure) ? Self.turnSession : Self.session
+            (data, response) = try await session.data(for: request(procedure, body: body))
         } catch {
             throw APIError.transport(error.localizedDescription)
         }

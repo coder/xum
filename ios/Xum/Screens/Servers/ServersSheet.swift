@@ -7,6 +7,7 @@ struct ServersSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var renaming: ServerRecord?
     @State private var renameText = ""
+    @State private var forgettingCurrent = false
 
     private var others: [ServerRecord] {
         model.servers.servers.filter { $0.id != model.servers.currentID }
@@ -21,6 +22,16 @@ struct ServersSheet: View {
                             .listRowInsets(EdgeInsets())
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
+                        // The only way to remove the last server and its Keychain token.
+                        Button("Forget This Server", role: .destructive) { forgettingCurrent = true }
+                    }
+                    .confirmationDialog("Forget \(current.name)?", isPresented: $forgettingCurrent, titleVisibility: .visible) {
+                        Button("Forget", role: .destructive) {
+                            if others.isEmpty { dismiss() }
+                            model.forgetServer(current.id)
+                        }
+                    } message: {
+                        Text("This removes the server and its token from this iPhone. Its workspaces stay on the server.")
                     }
                 }
                 if !others.isEmpty {

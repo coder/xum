@@ -89,6 +89,11 @@ final class AppModel {
         selectedWorkspaceId = nil
         guard let c = servers.currentClient else { list = nil; return }
         let l = WorkspaceListStore(client: c)
+        // An open chat whose workspace is gone would keep offering sends the server refuses.
+        l.onRemoved = { [weak self] id in
+            self?.path.removeAll { $0 == id }
+            if self?.selectedWorkspaceId == id { self?.selectedWorkspaceId = nil }
+        }
         list = l
         l.start()
         serverModels = []

@@ -369,7 +369,7 @@ struct ChatView: View {
                     Task { await store.discardHeld([held.id]) }
                 }
             }
-            if let approval = store.sandboxApprovals.first {
+            if let approval = store.openApproval {
                 SandboxApprovalCard(approval: approval) { approved in
                     Task { try? await store.answerSandbox(approval, approved: approved) }
                 }

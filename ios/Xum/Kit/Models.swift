@@ -24,6 +24,8 @@ struct Workspace: Identifiable, Hashable, Sendable {
     var runtime: RuntimeKind
     var isScratch: Bool
     var parentWorkspaceId: String?
+    /// Ephemeral side chat of another workspace: private to its owning flow, never listed.
+    var isSideChat = false
     var createdAt: Date?
     var raw: JSONValue
 
@@ -45,6 +47,7 @@ struct Workspace: Identifiable, Hashable, Sendable {
         runtime = RuntimeKind(rawValue: rt) ?? .unknown
         isScratch = json["kind"]?.string == "scratch"
         parentWorkspaceId = json["parentWorkspaceId"]?.string ?? json["sideChatParentWorkspaceId"]?.string
+        isSideChat = json["sideChatParentWorkspaceId"]?.string != nil
         createdAt = json["createdAt"]?.string.flatMap { ISO8601DateFormatter.xum.date(from: $0) }
         raw = json
     }
@@ -181,9 +184,15 @@ enum ModelName {
     /// src/common/utils/tokens/models-extra.ts; other models fall back to 200K.
     static func contextWindow(_ id: String?) -> Int {
         let model = id?.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
+        // Every built-in (knownModels.test.ts checks these against models-extra.ts).
         let known: [String: Int] = [
             "claude-opus-5-5": 1_000_000, "claude-sonnet-5-5": 1_000_000, "claude-haiku-5-5": 1_000_000,
-            "claude-fable-5-2": 1_000_000, "gpt-6.2-sol": 922_000, "gemini-3.1-pro-preview": 1_048_576,
+            "claude-fable-5-2": 1_000_000, "claude-mythos-5-2": 1_000_000,
+            "gpt-6.2-sol": 922_000, "gpt-6-luna": 922_000, "gpt-6.2-astra": 922_000,
+            "gemini-3.1-pro-preview": 1_048_576, "gemini-3.8-flash": 1_048_576, "gemini-4-argon": 1_048_576,
+            "gemini-4-carbon": 1_048_576, "grok-4.7": 500_000, "deepseek-v4-pro": 1_000_000,
+            "deepseek-v4-flash": 1_000_000, "kimi-k3": 1_048_576, "muse-wonder-1.0": 1_048_576,
+            "glm-5.3-flash": 1_048_576,
         ]
         return known[model] ?? 200_000
     }

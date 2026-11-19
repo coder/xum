@@ -57,6 +57,8 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
     var compaction: CompactionKind?
     /// `file` parts (attachments, review images): shown by name, their data is not loaded.
     var files: [AttachedFile] = []
+    /// Question tool calls this row answers (`muxMetadata.askUserQuestionAnswer`).
+    var answersQuestionIds: [String] = []
 
     var text: String {
         parts.compactMap { if case .text(_, let t) = $0 { return t }; return nil }.joined()
@@ -184,6 +186,8 @@ final class ChatStore {
     }
 
     private(set) var sandboxApprovals: [SandboxApproval] = []
+    /// The approval to show, once the replay is caught up (a replayed request may be answered later in it).
+    var openApproval: SandboxApproval? { caughtUp ? sandboxApprovals.first : nil }
     private(set) var heldInputs: [HeldInput] = []
     private(set) var restoredInput: RestoredInput?
     private var restoreSeq = 0
@@ -194,7 +198,9 @@ final class ChatStore {
     /// The newest open question. A later user row ends a blocking question's turn, but a
     /// message-delivered question stays open until a message carries its answer, so answering
     /// one moves on to the next open one.
+    /// Nil until the replay is caught up: a later row may still show the question answered.
     var pendingQuestion: PendingQuestion? {
+        guard caughtUp else { return nil }
         var laterUserRow = false
         for m in messages.reversed() {
             if m.role == .user { laterUserRow = true; continue }
@@ -416,7 +422,10 @@ final class ChatStore {
             if let n = ev["usage"]?["inputTokens"]?.int { contextTokens = n }
         case "delete":
             let seqs = Set((ev["historySequences"]?.array ?? []).compactMap(\.int))
+            let deleted = messages.filter { $0.historySequence.map(seqs.contains) ?? false }
             messages.removeAll { $0.historySequence.map(seqs.contains) ?? false }
+            // An edited or truncated answer reopens its question.
+            answeredQuestionIds.subtract(deleted.flatMap(\.answersQuestionIds))
         case "queued-message-changed":
             hasQueued = ev["hasQueuedMessages"]?.bool ?? false
         default:
@@ -446,15 +455,15 @@ final class ChatStore {
         let isCompactionRequest = roleS == "user" && muxType == "compaction-request"
         if roleS == "user", !isCompactionRequest, meta?["synthetic"]?.bool == true, meta?["uiVisible"]?.bool != true { return nil }
         if roleS == "user", let t = ev["parts"]?[0]?["text"]?.string, t.hasPrefix("<notification>") { return nil }
-        if let a = meta?["muxMetadata"]?["askUserQuestionAnswer"] {
-            for e in a.array ?? [a] { if let id = e["toolCallId"]?.string { answeredQuestionIds.insert(id) } }
-        }
+        let answered = (meta?["muxMetadata"]?["askUserQuestionAnswer"]).map { a in (a.array ?? [a]).compactMap { $0["toolCallId"]?.string } } ?? []
+        answeredQuestionIds.formUnion(answered)
         let role = ChatRole(rawValue: roleS) ?? .system
         guard role != .system else { return nil }
         var m = ChatMessage(id: id, role: role, parts: Self.parseParts(ev["parts"]?.array ?? [], messageId: id),
                             model: meta?["model"]?.string, agentId: meta?["agentId"]?.string,
                             timestamp: date(meta?["timestamp"]), historySequence: meta?["historySequence"]?.int)
         m.files = (ev["parts"]?.array ?? []).compactMap(AttachedFile.init(part:))
+        m.answersQuestionIds = answered
         if role == .assistant, let ctx = meta?["contextUsage"]?["inputTokens"]?.int { contextTokens = ctx }
         if isCompactionRequest {
             let raw = meta?["muxMetadata"]?["commandPrefix"]?.string ?? meta?["muxMetadata"]?["rawCommand"]?.string

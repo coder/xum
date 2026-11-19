@@ -13,7 +13,23 @@ struct WorkspacesView: View {
         Group {
             if let list = model.list {
                 if list.loaded {
-                    if list.sections.isEmpty { emptyView } else { listView(list) }
+                    Group {
+                        if list.sections.isEmpty { emptyView } else { listView(list) }
+                    }
+                    // A later refresh or archive failure keeps the loaded rows and says so.
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        if let err = list.error {
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.triangle").foregroundStyle(Color.xBad)
+                                Text(err).font(.system(size: 13)).foregroundStyle(Color.xText).lineLimit(2)
+                                Spacer(minLength: 0)
+                                Button("Retry") { Task { await list.refresh() } }.font(.system(size: 13, weight: .semibold))
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(Color.xCell)
+                        }
+                    }
                 } else if let err = list.error {
                     ContentUnavailableView {
                         Label("Can't reach \(model.servers.current?.name ?? "server")", systemImage: "wifi.exclamationmark")

@@ -73,6 +73,17 @@ struct ChatStoreToolTests {
         s.apply(["type": "message", "id": "a2", "role": "user", "parts": [["type": "text", "text": "x"]],
                  "metadata": ["historySequence": 3, "muxMetadata": ["type": "normal", "askUserQuestionAnswer": ["toolCallId": "newer", "answers": [:]]]]])
         #expect(s.pendingQuestion?.toolCallId == "older")
+        // Another client truncates history to before that answer: "newer" is open again.
+        s.apply(["type": "delete", "historySequences": [3]])
+        #expect(s.pendingQuestion?.toolCallId == "newer")
+    }
+
+    @Test func questionWaitsForTheReplayToFinish() {
+        let s = store()
+        s.apply(row("q", role: "assistant", seq: 1, parts: [question("ask", byMessage: true)]))
+        #expect(s.pendingQuestion == nil)
+        s.apply(["type": "caught-up", "historyReplayStatus": "complete"])
+        #expect(s.pendingQuestion?.toolCallId == "ask")
     }
 
     @Test(arguments: [(true, true), (false, false)])
