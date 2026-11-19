@@ -1,6 +1,6 @@
 import type { ComponentType } from "react";
 import { expect, waitFor, within } from "storybook/test";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { AutoModelRoutingGroup } from "./AutoModelRoutingExperimentConfig.js";
@@ -73,7 +73,10 @@ export const MemorySettingsEnabled: Story = {
   },
 };
 
+// Play only: MemorySettingsEnabled already snapshots the nested sub-experiment panel at laptop
+// width, and dropping this duplicate keeps the Pixel budget flat for ConfigureButtonsPhoneWidth.
 export const ExperimentsToggleOn: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <SettingsSectionStory
       setup={() =>
