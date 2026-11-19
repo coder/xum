@@ -1,6 +1,6 @@
 import type { ComponentType } from "react";
 import { expect, waitFor, within } from "storybook/test";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { AutoModelRoutingGroup } from "./AutoModelRoutingExperimentConfig.js";
@@ -165,5 +165,44 @@ export const AutoModelRoutingEnabledPhone: Story = {
         await expect(element.getBoundingClientRect().right).toBeLessThanOrEqual(frameRight + 1);
       }
     });
+  },
+};
+
+/**
+ * Phone-width contract for the configure buttons: in a narrow section the button shows only its
+ * section icon and stays inside the row. A play only, no Pixel snapshot. The label hides by
+ * container width, so the fixed 375px frame makes the check hold in the CI test-runner too,
+ * which plays at desktop size (AGENTS.md).
+ */
+export const ConfigureButtonsPhoneWidth: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          experiments: {
+            [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: true,
+            [EXPERIMENT_IDS.MEMORY]: true,
+            [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
+          },
+        })
+      }
+    >
+      <div data-testid="phone-frame" style={{ width: 375, maxWidth: "100%" }}>
+        <ExperimentsSection />
+      </div>
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = canvas.getByTestId("phone-frame").getBoundingClientRect();
+    for (const name of ["Configure in Server access", "Configure in Memory"]) {
+      const button = await canvas.findByRole("button", { name });
+      // Icon only: the section name is the accessible name, not visible text.
+      await expect(within(button).queryByText(/Server access|Memory/)).not.toBeVisible();
+      await expect(button.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+    }
+    const toggle = canvas.getByLabelText("Toggle Expose API server on LAN/VPN");
+    await expect(toggle.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
   },
 };

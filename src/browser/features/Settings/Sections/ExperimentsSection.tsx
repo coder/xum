@@ -727,8 +727,8 @@ const EXPERIMENT_CONFIG_SETTINGS: Partial<Record<ExperimentId, SettingId>> = {
 
 /**
  * Opens the section that holds an enabled experiment's options, shown beside its switch. The
- * section's own nav icon says where it goes; phones show the icon alone (the name stays the
- * button's accessible name).
+ * section's own nav icon says where it goes. A narrow section (a phone) shows the icon alone,
+ * by container width rather than viewport, and the name stays the button's accessible name.
  */
 function ExperimentConfigButton(props: { experimentId: ExperimentId }) {
   const enabled = useExperimentValue(props.experimentId);
@@ -747,10 +747,10 @@ function ExperimentConfigButton(props: { experimentId: ExperimentId }) {
       size="sm"
       onClick={open}
       aria-label={`Configure in ${section.label}`}
-      className="text-content-secondary hover:text-content-primary gap-1.5 max-sm:px-2"
+      className="text-content-secondary hover:text-content-primary gap-1.5 @max-md:px-2"
     >
       {section.icon}
-      <span className="hidden sm:inline">{section.label}</span>
+      <span className="@max-md:hidden">{section.label}</span>
     </Button>
   );
 }
@@ -830,7 +830,8 @@ export function ExperimentsSection() {
   );
 
   return (
-    <div className="space-y-2">
+    // A container, so each row's configure button can drop its label at a narrow width.
+    <div className="@container space-y-2">
       <p className="text-muted mb-4 text-xs">
         Experimental features that are still in development. Enable at your own risk.
       </p>
