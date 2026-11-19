@@ -33,8 +33,8 @@ struct PickersPopover: View {
         "google:gemini-3.1-pro-preview",
     ]
 
-    /// The five-stop thinking slider; `xhigh` only arrives from server state.
-    private var levels: [ThinkingLevel] { [.off, .low, .medium, .high, .max] }
+    /// Every level, as the New Chat picker offers; the server clamps one a model does not support.
+    private var levels: [ThinkingLevel] { ThinkingLevel.allCases }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {

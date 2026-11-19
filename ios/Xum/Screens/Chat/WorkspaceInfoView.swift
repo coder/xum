@@ -470,27 +470,51 @@ private struct PDFKitView: UIViewRepresentable {
 
 /// HTML/SVG artifacts are agent-written, so they render with no network access (every http(s)
 /// load is blocked by a content rule, as the desktop's CSP does) and cannot navigate away.
-private struct SandboxedWebView: UIViewRepresentable {
+struct SandboxedWebView: UIViewRepresentable {
     let html: String
 
     private static let blockNetwork = #"[{"trigger":{"url-filter":"^https?://"},"action":{"type":"block"}},{"trigger":{"url-filter":"^wss?://"},"action":{"type":"block"}}]"#
 
+    /// SECURITY AUDIT: content rules do not cover WebRTC, whose ICE traffic (STUN/TURN) can reach
+    /// any host, so every RTC global is deleted before any artifact script runs, in every frame
+    /// (WebKit runs it in a script-made about:blank frame too; ArtifactSandboxTests checks both),
+    /// as the desktop artifact bridge does. `frame-src`/`child-src 'none'` matches the desktop's
+    /// frame policy as a second layer; CSP policies intersect, so the artifact cannot loosen it.
+    static let noWebRTC = """
+    (() => { for (const k of Object.getOwnPropertyNames(window)) { if (/^(webkit)?RTC/.test(k)) { try { delete window[k]; } catch (e) {} } } })();
+    """
+    static let noFramesPolicy = #"<meta http-equiv="Content-Security-Policy" content="frame-src 'none'; child-src 'none'">"#
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> WKWebView {
+        Self.load(html, delegate: context.coordinator)
+    }
+
+    /// Builds the locked-down view and loads `html` once the network rule is in place.
+    static func load(_ html: String, delegate: WKNavigationDelegate) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
+        config.userContentController.addUserScript(WKUserScript(source: noWebRTC, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let view = WKWebView(frame: .zero, configuration: config)
-        view.navigationDelegate = context.coordinator
+        view.navigationDelegate = delegate
         view.isOpaque = false
-        let html = html
-        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "xum-artifact-offline", encodedContentRuleList: Self.blockNetwork) { list, _ in
+        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "xum-artifact-offline", encodedContentRuleList: blockNetwork) { list, _ in
             // Never load the page without the rule: an error leaves the view empty.
             guard let list else { return }
             config.userContentController.add(list)
-            view.loadHTMLString(html, baseURL: nil)
+            view.loadHTMLString(withPolicy(html), baseURL: nil)
         }
         return view
+    }
+
+    /// The policy goes after a doctype, never before it: text ahead of the doctype would put the
+    /// page in quirks mode.
+    static func withPolicy(_ html: String) -> String {
+        let lead = html.prefix(while: \.isWhitespace)
+        let rest = html.dropFirst(lead.count)
+        guard rest.lowercased().hasPrefix("<!doctype"), let end = rest.firstIndex(of: ">") else { return noFramesPolicy + html }
+        return String(rest[...end]) + noFramesPolicy + String(rest[rest.index(after: end)...])
     }
 
     func updateUIView(_ v: WKWebView, context: Context) {}

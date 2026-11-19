@@ -31,8 +31,8 @@ struct ToolDetailSheet: View {
     private var counts: (added: Int, removed: Int)? { ToolMeta.editCounts(tool) }
 
     private var diff: [DiffLine] {
-        guard let old = tool.input["old_string"]?.string, let new = tool.input["new_string"]?.string else { return [] }
-        return Diff.build(old: old, new: new)
+        guard let texts = ToolMeta.editTexts(tool) else { return [] }
+        return Diff.build(old: texts.old, new: texts.new)
     }
 
     private var diffText: String {

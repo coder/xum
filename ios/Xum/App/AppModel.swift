@@ -158,20 +158,31 @@ final class AppModel {
         guard let id = res["metadata"]?["id"]?.string ?? res["id"]?.string else {
             throw APIError.http(0, res["error"]?.string ?? "Could not create workspace")
         }
-        var opts: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue)]
-        opts["sendId"] = .string("ios-" + UUID().uuidString)
-        try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message), "options": .object(opts)])
-        await list?.refresh()
+        await sendFirst(c, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
+    }
+
+    /// First messages that did not send, by the workspace they were for. The new workspace opens
+    /// with the text in its composer, so a retry sends it there instead of making another one.
+    private var unsentFirstMessages: [String: String] = [:]
+    func takeUnsentFirstMessage(_ workspaceId: String) -> String? { unsentFirstMessages.removeValue(forKey: workspaceId) }
+
+    private func sendFirst(_ c: APIClient, _ id: String, _ message: String, model: String, agentId: String, thinking: ThinkingLevel) async {
+        let opts: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue),
+                                         "sendId": .string("ios-" + UUID().uuidString)]
+        do {
+            try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message), "options": .object(opts)])
+        } catch {
+            unsentFirstMessages[id] = message
+        }
+        await list?.refresh()
     }
 
     func fork(_ sourceId: String, message: String, model: String, agentId: String, thinking: ThinkingLevel) async throws -> String {
         guard let c = servers.currentClient else { throw APIError.unauthorized }
         let res = try await c.call("workspace/fork", ["sourceWorkspaceId": .string(sourceId), "pendingAutoTitle": true])
         guard let id = res["metadata"]?["id"]?.string else { throw APIError.http(0, res["error"]?.string ?? "Could not fork") }
-        try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message),
-                                                   "options": ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue)]])
-        await list?.refresh()
+        await sendFirst(c, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
     }
 
@@ -182,9 +193,7 @@ final class AppModel {
         guard let id = res["metadata"]?["id"]?.string ?? res["id"]?.string else {
             throw APIError.http(0, res["error"]?.string ?? "Could not create chat")
         }
-        try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message),
-                                                   "options": ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue)]])
-        await list?.refresh()
+        await sendFirst(c, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
     }
 }

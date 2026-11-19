@@ -6,6 +6,8 @@ struct WorkspacesView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.inSidebar) private var sidebar
     @State private var filter: WorkspaceFilter = .all
+    /// An archive the server held back because it would lose untracked files (`confirm-lossy-untracked-files`).
+    @State private var lossyArchive: (workspace: Workspace, confirmation: JSONValue)?
 
     var body: some View {
         Group {
@@ -77,7 +79,9 @@ struct WorkspacesView: View {
 
     private func listBody(_ list: WorkspaceListStore) -> some View {
         List {
-            ForEach(filteredSections(list), id: \.title) { section in
+            // The project path is unique where titles are not (shared display names, a project named
+            // Chats); scratch chats have no path.
+            ForEach(filteredSections(list), id: \.projectPath) { section in
                 Section {
                     ForEach(Array(section.items.enumerated()), id: \.element.id) { i, w in
                         row(w, index: i, count: section.items.count, list: list)
@@ -90,6 +94,25 @@ struct WorkspacesView: View {
         }
         .scrollContentBackground(.hidden)
         .refreshable { await list.refresh() }
+        .confirmationDialog(lossyTitle, isPresented: Binding(get: { lossyArchive != nil }, set: { if !$0 { lossyArchive = nil } }),
+                            titleVisibility: .visible, presenting: lossyArchive) { pending in
+            Button("Archive and Lose Files", role: .destructive) {
+                Task { await archive(pending.workspace, in: list, acknowledging: pending.confirmation) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { pending in
+            Text(Self.lossyMessage(pending.confirmation))
+        }
+    }
+
+    private var lossyTitle: String { "Archive \(lossyArchive?.workspace.displayName ?? "workspace")?" }
+
+    static func lossyMessage(_ c: JSONValue) -> String {
+        let paths = (c["paths"]?.array ?? []).compactMap(\.string)
+            + (c["subagents"]?.array ?? []).flatMap { ($0["paths"]?.array ?? []).compactMap(\.string) }
+        let shown = paths.prefix(5).joined(separator: "\n")
+        let more = paths.count > 5 ? "\nand \(paths.count - 5) more" : ""
+        return "Archiving deletes \(paths.count) untracked \(paths.count == 1 ? "file" : "files") that git does not keep:\n\(shown)\(more)"
     }
 
     private func row(_ w: Workspace, index i: Int, count: Int, list: WorkspaceListStore) -> some View {
@@ -122,10 +145,23 @@ struct WorkspacesView: View {
         }
     }
 
-    private func archive(_ w: Workspace, in list: WorkspaceListStore) async {
+    private func archive(_ w: Workspace, in list: WorkspaceListStore, acknowledging confirmation: JSONValue? = nil) async {
         guard let client = model.servers.currentClient else { return }
+        var body: [String: JSONValue] = ["workspaceId": .string(w.id)]
+        if let confirmation {
+            body["acknowledgedUntrackedPaths"] = confirmation["paths"] ?? []
+            var bySubagent: [String: JSONValue] = [:]
+            for sub in confirmation["subagents"]?.array ?? [] {
+                if let id = sub["workspaceId"]?.string { bySubagent[id] = sub["paths"] ?? [] }
+            }
+            if !bySubagent.isEmpty { body["acknowledgedSubagentUntrackedPaths"] = .object(bySubagent) }
+        }
         do {
-            try await client.call("workspace/archive", ["workspaceId": .string(w.id)])
+            let r = try await client.call("workspace/archive", .object(body))
+            if r["data"]?["kind"]?.string == "confirm-lossy-untracked-files", let data = r["data"] {
+                lossyArchive = (w, data)
+                return
+            }
             await list.refresh()
         } catch {
             list.error = error.localizedDescription

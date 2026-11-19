@@ -26,8 +26,11 @@ struct AgentListDetail: View {
         .background(Color.xBg.ignoresSafeArea())
         .navigationTitle("Agents")
         .navigationBarTitleDisplayMode(.inline)
-        .task {
-            guard let client = model.servers.currentClient, agents.isEmpty else { return }
+        // Keyed by server: switching servers while this page is open loads the new one's list.
+        .task(id: model.servers.currentID) {
+            agents = []
+            failed = false
+            guard let client = model.servers.currentClient else { return }
             do {
                 let res = try await client.call("agents/list", try SettingsView.agentDiscovery(model))
                 agents = (res.array ?? []).compactMap { item in
@@ -68,8 +71,11 @@ struct ProviderListDetail: View {
         .background(Color.xBg.ignoresSafeArea())
         .navigationTitle("Providers")
         .navigationBarTitleDisplayMode(.inline)
-        .task {
-            guard let client = model.servers.currentClient, providers.isEmpty else { return }
+        // Keyed by server: switching servers while this page is open loads the new one's list.
+        .task(id: model.servers.currentID) {
+            providers = []
+            failed = false
+            guard let client = model.servers.currentClient else { return }
             do {
                 let res = try await client.call("providers/getConfig")
                 if let obj = res.object {
@@ -130,8 +136,11 @@ struct MCPListDetail: View {
         .background(Color.xBg.ignoresSafeArea())
         .navigationTitle("MCP Servers")
         .navigationBarTitleDisplayMode(.inline)
-        .task {
-            guard let client = model.servers.currentClient, servers.isEmpty else { return }
+        // Keyed by server: switching servers while this page is open loads the new one's list.
+        .task(id: model.servers.currentID) {
+            servers = []
+            failed = false
+            guard let client = model.servers.currentClient else { return }
             do {
                 let res = try await client.call("mcp/list", .object([:]))
                 if let obj = res.object {
@@ -164,6 +173,7 @@ struct ServerAccessDetail: View {
     @State private var listen: String?
     @State private var lan: Bool?
     @State private var failed = false
+    @State private var revokeError: String?
 
     struct ServerSession: Identifiable {
         let id: String
@@ -190,6 +200,10 @@ struct ServerAccessDetail: View {
                 }
                 if failed {
                     Text("Could not load sessions.").font(.system(size: 14)).foregroundStyle(Color.xText2)
+                        .listRowBackground(Color.xCell)
+                }
+                if let revokeError {
+                    Text(revokeError).font(.system(size: 14)).foregroundStyle(Color.xBad)
                         .listRowBackground(Color.xCell)
                 }
             } header: {
@@ -222,7 +236,7 @@ struct ServerAccessDetail: View {
                     .disabled(true)
             }
         }
-        .task { await load() }
+        .task(id: model.servers.currentID) { await load() }
     }
 
     private var thisDeviceRow: some View {
@@ -258,6 +272,10 @@ struct ServerAccessDetail: View {
     }
 
     private func load() async {
+        sessions = []
+        listen = nil
+        lan = nil
+        failed = false
         guard let client = model.servers.currentClient else { return }
         if let res = try? await client.call("serverAuth/listSessions") {
             sessions = (res.array ?? []).compactMap { item in
@@ -284,7 +302,17 @@ struct ServerAccessDetail: View {
 
     private func revoke(_ session: ServerSession) async {
         guard let client = model.servers.currentClient else { return }
-        _ = try? await client.call("serverAuth/revokeSession", ["sessionId": .string(session.id)])
-        sessions.removeAll { $0.id == session.id }
+        // The row goes only once the server confirms: a revoke that failed must not look done.
+        do {
+            let r = try await client.call("serverAuth/revokeSession", ["sessionId": .string(session.id)])
+            revokeError = nil
+            if r["removed"]?.bool == true {
+                sessions.removeAll { $0.id == session.id }
+            } else {
+                await load()
+            }
+        } catch {
+            revokeError = "Could not revoke \(session.label): \(error.localizedDescription)"
+        }
     }
 }

@@ -56,7 +56,7 @@ struct ServersSheet: View {
                     SectionCaption(text: "Add a server")
                 }
                 Section {
-                    Text("Each server keeps its own token in Keychain. Alerts from every server reach you, even when it isn't current.")
+                    Text("Each server keeps its own token in Keychain. The app follows only the current server: switch to another to see its workspaces and questions.")
                         .font(.system(size: 13))
                         .foregroundStyle(Color.xText3)
                         .lineSpacing(2)

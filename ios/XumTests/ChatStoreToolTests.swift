@@ -73,6 +73,31 @@ struct ChatStoreToolTests {
     }
 }
 
+@MainActor
+struct SandboxApprovalTests {
+    @Test func pendingApprovalShowsUntilAnsweredOrEnded() {
+        let s = ChatStore(workspaceId: "ws", client: APIClient(baseURL: URL(string: "http://127.0.0.1:1")!, token: "t"))
+        s.apply(["type": "bash-sandbox-approval", "toolCallId": "a", "script": "curl x", "reason": "network", "pending": true, "timestamp": 1])
+        #expect(s.sandboxApprovals.map(\.toolCallId) == ["a"])
+        s.apply(["type": "bash-sandbox-approval", "toolCallId": "a", "script": "curl x", "reason": "network", "pending": false, "timestamp": 2])
+        #expect(s.sandboxApprovals.isEmpty)
+        s.apply(["type": "bash-sandbox-approval", "toolCallId": "b", "script": "ls", "reason": "r", "pending": true, "timestamp": 3])
+        s.apply(["type": "tool-call-end", "messageId": "m", "toolCallId": "b", "result": [:], "timestamp": 4])
+        #expect(s.sandboxApprovals.isEmpty)
+    }
+}
+
+struct ChangesParserTests {
+    @Test func pathsWithTabsNewlinesAndRenamesSurvive() {
+        let out = "BASE f7da711ca4\u{0}3\t1\tsrc/a.ts\u{0}2\t0\t\u{0}old name.ts\u{0}new\tname.ts\u{0}-\t-\tlogo.png\u{0}UNTRACKED\u{0}1\u{0}tab\tnl\nname.txt\u{0}"
+        let (base, files) = WorkspaceInfoStore.parseChanges(out)
+        #expect(base == "f7da711c")
+        #expect(files.map(\.path) == ["src/a.ts", "new\tname.ts", "logo.png", "tab\tnl\nname.txt"])
+        #expect(files.map(\.added) == [3, 2, 0, 1])
+        #expect(files.map(\.untracked) == [false, false, false, true])
+    }
+}
+
 struct APIResultErrorTests {
     @Test(arguments: [
         (JSONValue.string("nope"), "nope"),

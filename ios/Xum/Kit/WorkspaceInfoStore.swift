@@ -219,20 +219,41 @@ final class WorkspaceInfoStore {
 
     func loadChanges() async {
         do {
-            let out = try await bash(Self.base + #"; echo "BASE $b"; git -c core.quotePath=false diff --numstat "$b"; git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do printf "%s\t0\t%s\tU\n" "$(wc -l < "$f" | tr -d ' ')" "$f"; done"#)
-            var files: [ChangedFile] = []
-            for line in out.split(separator: "\n") {
-                if line.hasPrefix("BASE ") { changesBase = String(line.dropFirst(5).prefix(8)); continue }
-                let cols = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-                guard cols.count >= 3 else { continue }
-                files.append(ChangedFile(path: cols[2], added: Int(cols[0]) ?? 0, removed: Int(cols[1]) ?? 0, untracked: cols.count > 3))
-            }
-            changes = files
+            let out = try await bash(Self.base + #"; printf 'BASE %s\0' "$b"; git diff --numstat -z "$b"; printf 'UNTRACKED\0'; git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do printf '%s\0%s\0' "$(wc -l < "$f" | tr -d ' ')" "$f"; done"#)
+            (changesBase, changes) = Self.parseChanges(out)
             changesError = nil
         } catch {
             changesError = error.localizedDescription
         }
         changesLoaded = true
+    }
+
+    /// NUL-separated records, so any byte in a path survives: `BASE <sha>`, then `git diff
+    /// --numstat -z` records (`added\tremoved\tpath`, or `added\tremoved\t` then the old and new
+    /// paths of a rename), then `UNTRACKED` and `lines`, `path` pairs. A numstat record always has
+    /// two tabs, so the marker cannot be mistaken for one.
+    static func parseChanges(_ out: String) -> (base: String?, files: [ChangedFile]) {
+        var fields = out.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)[...]
+        var base: String?
+        if let first = fields.first, first.hasPrefix("BASE ") {
+            base = String(first.dropFirst(5).prefix(8))
+            fields = fields.dropFirst()
+        }
+        var files: [ChangedFile] = []
+        while let record = fields.popFirst(), record != "UNTRACKED" {
+            let cols = record.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            guard cols.count == 3 else { continue }
+            var path = cols[2]
+            if path.isEmpty {
+                _ = fields.popFirst()
+                path = fields.popFirst() ?? ""
+            }
+            if !path.isEmpty { files.append(ChangedFile(path: path, added: Int(cols[0]) ?? 0, removed: Int(cols[1]) ?? 0, untracked: false)) }
+        }
+        while let lines = fields.popFirst(), let path = fields.popFirst() {
+            if !path.isEmpty { files.append(ChangedFile(path: path, added: Int(lines) ?? 0, removed: 0, untracked: true)) }
+        }
+        return (base, files)
     }
 
     func diff(_ file: ChangedFile) async throws -> String {

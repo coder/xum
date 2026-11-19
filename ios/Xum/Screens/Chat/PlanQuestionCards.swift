@@ -435,3 +435,47 @@ struct TodoPill: View {
         }
     }
 }
+/// A bash call the sandbox blocked: the user lets it run once outside, or denies it. Same
+/// choice and wording as the desktop SandboxApprovalCard.
+struct SandboxApprovalCard: View {
+    let approval: SandboxApproval
+    var onAnswer: (Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "lock.trianglebadge.exclamationmark").foregroundStyle(Color.xWarn)
+                Text("SANDBOX BLOCKED A COMMAND").font(.xCaption).kerning(0.4).foregroundStyle(Color.xWarn)
+            }
+            if !approval.reason.isEmpty {
+                Text(approval.reason).font(.system(size: 15)).foregroundStyle(Color.xText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ScrollView {
+                Text(approval.script).font(.xMono(12.5)).foregroundStyle(Color.xText2).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+            }
+            .frame(maxHeight: 120)
+            .background(Color.xFill2, in: RoundedRectangle(cornerRadius: 12))
+            Text("Runs once outside the sandbox, with full access to your files, keys and network.")
+                .font(.system(size: 13)).foregroundStyle(Color.xText2)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button { onAnswer(false) } label: {
+                    Text("Deny").font(.system(size: 16, weight: .semibold)).foregroundStyle(Color.xText)
+                        .padding(.horizontal, 22).frame(height: 48)
+                        .background(Color.xFill, in: Capsule()).contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                Button { onAnswer(true) } label: {
+                    Text("Run outside once").font(.system(size: 16, weight: .semibold))
+                        .frame(maxWidth: .infinity).frame(height: 48)
+                }
+                .buttonStyle(.glassProminent)
+            }
+        }
+        .padding(.init(top: 16, leading: 16, bottom: 14, trailing: 16))
+        .glassRect(28)
+    }
+}

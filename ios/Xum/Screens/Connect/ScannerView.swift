@@ -27,6 +27,14 @@ final class ConnectScanModel {
         defer { connecting = false }
         var version: String?
         if let (v, _) = try? await APIClient.probe(link.baseURL) { version = v.short }
+        // Save only a token the server accepts; otherwise the link sheet shows what is wrong
+        // (unreachable or rejected token) and lets the user fix it.
+        do {
+            _ = try await APIClient(baseURL: link.baseURL, token: link.token).call("projects/list")
+        } catch {
+            model.sheet = .connectLink(prefill: link.urlString)
+            return
+        }
         model.addServer(link, name: name ?? link.suggestedName, version: version)
     }
 }

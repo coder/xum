@@ -30,10 +30,15 @@ enum ToolMeta {
         return t.name
     }
 
-    static func editCounts(_ t: ToolCall) -> (added: Int, removed: Int)? {
+    /// Before and after text of a file edit or write; a write's `content` replaces nothing.
+    static func editTexts(_ t: ToolCall) -> (old: String, new: String)? {
         guard t.name.hasPrefix("file_edit") || t.name.hasPrefix("file_write") || t.name == "write" else { return nil }
-        let (added, removed) = Diff.counts(Diff.build(old: t.input["old_string"]?.string ?? "",
-                                                      new: t.input["new_string"]?.string ?? t.input["content"]?.string ?? ""))
+        return (t.input["old_string"]?.string ?? "", t.input["new_string"]?.string ?? t.input["content"]?.string ?? "")
+    }
+
+    static func editCounts(_ t: ToolCall) -> (added: Int, removed: Int)? {
+        guard let texts = editTexts(t) else { return nil }
+        let (added, removed) = Diff.counts(Diff.build(old: texts.old, new: texts.new))
         if added == 0, removed == 0 { return nil }
         return (added, removed)
     }

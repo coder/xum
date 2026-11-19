@@ -99,6 +99,14 @@ struct PendingQuestion: Hashable, Sendable {
     }
 }
 
+/// A bash call the sandbox blocked, waiting for the user to let it run once outside
+/// (`bash-sandbox-approval`, answered with `workspace.answerSandboxApproval`).
+struct SandboxApproval: Hashable, Sendable {
+    var toolCallId: String
+    var script: String
+    var reason: String
+}
+
 /// One workspace's chat: replays `workspace.onChat` (full) then applies live events, mirroring the
 /// web client's StreamingMessageAggregator closely enough for the phone UI. Unknown events are
 /// ignored so newer servers never break the app.
@@ -138,6 +146,8 @@ final class ChatStore {
         }
         return []
     }
+
+    private(set) var sandboxApprovals: [SandboxApproval] = []
 
     /// Tool call IDs answered by a later user message (`muxMetadata.askUserQuestionAnswer`).
     private(set) var answeredQuestionIds: Set<String> = []
@@ -197,6 +207,7 @@ final class ChatStore {
     private func resetForReplay() {
         messages = []
         answeredQuestionIds = []
+        sandboxApprovals = []
         caughtUp = false
         hasOlder = false
         streamingMessageId = nil
@@ -276,6 +287,7 @@ final class ChatStore {
                 m.parts[i] = .tool(t)
             }
         case "tool-call-end":
+            if let tid = ev["toolCallId"]?.string { sandboxApprovals.removeAll { $0.toolCallId == tid } }
             mutate(ev["messageId"]?.string) { m in
                 guard let tid = ev["toolCallId"]?.string, let i = m.parts.firstIndex(where: { $0.id == tid }),
                       case .tool(var t) = m.parts[i] else { return }
@@ -312,7 +324,14 @@ final class ChatStore {
                 if m.reasoningStartedAt != nil, m.reasoningEndedAt == nil { m.reasoningEndedAt = Date() }
             }
             if streamingMessageId == ev["messageId"]?.string { streamingMessageId = nil }
+        case "bash-sandbox-approval":
+            guard let tid = ev["toolCallId"]?.string else { return }
+            sandboxApprovals.removeAll { $0.toolCallId == tid }
+            if ev["pending"]?.bool == true {
+                sandboxApprovals.append(SandboxApproval(toolCallId: tid, script: ev["script"]?.string ?? "", reason: ev["reason"]?.string ?? ""))
+            }
         case "stream-abort":
+            sandboxApprovals = []
             mutate(ev["messageId"]?.string) { m in
                 m.isStreaming = false
                 m.parts = m.parts.map { p in
@@ -466,6 +485,20 @@ final class ChatStore {
             try await client.call("workspace/sendMessage", ["workspaceId": .string(workspaceId), "message": .string(text), "options": .object(options)])
         } catch {
             lastError = "Message not sent: \(error.localizedDescription)"
+            throw error
+        }
+    }
+
+    func report(_ error: String) { lastError = error }
+
+    func answerSandbox(_ approval: SandboxApproval, approved: Bool) async throws {
+        do {
+            try await client.call("workspace/answerSandboxApproval", [
+                "workspaceId": .string(workspaceId), "toolCallId": .string(approval.toolCallId), "approved": .bool(approved),
+            ])
+            sandboxApprovals.removeAll { $0.toolCallId == approval.toolCallId }
+        } catch {
+            lastError = "Answer not sent: \(error.localizedDescription)"
             throw error
         }
     }

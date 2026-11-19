@@ -12,7 +12,17 @@ struct ChatView: View {
     @State private var agent = "exec"
     @State private var modelId = "anthropic:claude-opus-5-5"
     @State private var thinking: ThinkingLevel = .medium
-    @State private var selectedTool: ToolCall?
+    /// The inspected call is looked up in the store on each render, so a call that is still
+    /// running keeps its output and state current in the open inspector.
+    @State private var selectedToolId: String?
+    private var selectedTool: ToolCall? {
+        guard let id = selectedToolId else { return nil }
+        for m in store?.messages.reversed() ?? [] { if let t = m.tools.first(where: { $0.id == id }) { return t } }
+        return nil
+    }
+    private var selectedToolBinding: Binding<ToolCall?> {
+        Binding(get: { selectedTool }, set: { selectedToolId = $0?.id })
+    }
     @State private var seeded = false
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @State private var followBottom = true
@@ -43,7 +53,7 @@ struct ChatView: View {
         .onAppear(perform: attach)
         // Regular width (iPhone Duo inner display): the tool detail is a persistent side panel
         // beside the chat instead of a modal sheet; tapping another row swaps its content.
-        .sheet(item: sizeClass == .regular ? .constant(nil) : $selectedTool) { tool in
+        .sheet(item: sizeClass == .regular ? .constant(nil) : selectedToolBinding) { tool in
             ToolDetailSheet(tool: tool) { prefill in
                 draft = prefill
             }
@@ -69,7 +79,7 @@ struct ChatView: View {
             if showInfo, let info {
                 WorkspaceInfoView(store: info, chat: store) { withAnimation { showInfo = false } }
             } else if let tool = selectedTool {
-                ToolDetailSheet(tool: tool, onAsk: { draft = $0 }, onClose: { selectedTool = nil })
+                ToolDetailSheet(tool: tool, onAsk: { draft = $0 }, onClose: { selectedToolId = nil })
                     .id(tool.id)
             } else if let question = pendingQuestion, let store {
                 QuestionCard(question: question, panel: true) { answers in
@@ -91,6 +101,10 @@ struct ChatView: View {
         guard !seeded else { return }
         seeded = true
         store = model.chatStore(workspaceId)
+        if let unsent = model.takeUnsentFirstMessage(workspaceId) {
+            draft = unsent
+            store?.report("The first message did not send. It is in the composer: tap send to retry.")
+        }
         info = model.servers.currentClient.map { WorkspaceInfoStore(workspaceId: workspaceId, client: $0) }
         seedSettings()
     }
@@ -268,7 +282,7 @@ struct ChatView: View {
             ToolGroupCard(tools: tools, inspectedId: sizeClass == .regular ? selectedTool?.id : nil) { tool in
                 if sizeClass == .regular { withAnimation { model.splitColumns = .detailOnly } }
                 showInfo = false
-                selectedTool = tool
+                selectedToolId = tool.id
             }
         case .plan(let tool):
             PlanCard(
@@ -296,7 +310,12 @@ struct ChatView: View {
                 TodoPill(todos: store.todos, isStreaming: store.isStreaming)
                     .padding(.horizontal, 12)
             }
-            if let question = store.pendingQuestion, sizeClass != .regular {
+            if let approval = store.sandboxApprovals.first {
+                SandboxApprovalCard(approval: approval) { approved in
+                    Task { try? await store.answerSandbox(approval, approved: approved) }
+                }
+                .id(approval.toolCallId)
+            } else if let question = store.pendingQuestion, sizeClass != .regular {
                 QuestionCard(question: question) { answers in
                     Task { try? await store.answer(question, answers: answers) }
                 }

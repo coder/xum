@@ -386,7 +386,9 @@ struct NewChatView: View {
             let loaded = (res["branches"]?.array ?? []).compactMap { b in b.string ?? b["name"]?.string }
             guard !loaded.isEmpty else { return }
             branches = loaded
-            if !loaded.contains(trunk) {
+            if let recommended = res["recommendedTrunk"]?.string, loaded.contains(recommended) {
+                trunk = recommended
+            } else if !loaded.contains(trunk) {
                 trunk = loaded.first { $0 == "main" } ?? loaded[0]
             }
         } catch {
