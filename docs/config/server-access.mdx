@@ -78,6 +78,30 @@ Equivalent CLI options:
 - `--ssh-host <host>`
 - `--add-project <path>`
 
+## Connect a phone
+
+The Xum iOS app can pair with a running server by scanning a QR code.
+
+1. Start `xum server` (the desktop app's built-in server also works).
+2. Open **Settings → Server Access → Pair device**.
+3. If the server listens on several addresses, pick the one the phone can reach; a LAN or
+   Tailscale address is preferred over localhost.
+4. Select **Show pairing code** and scan the QR with the Xum iOS app.
+
+The QR encodes the connection link `<baseUrl>/?token=<token>` — the same "Open in browser" link
+that `xum server` prints — and therefore carries the server's auth token. The code is generated
+locally; it is hidden until you reveal it.
+
+<Warning>
+  Anyone who scans the QR code gets full access to the server. Reveal it only to devices you trust.
+  Revoking a paired device means rotating the server token (restart the server with a new
+  `--auth-token` or let a new one be generated), which signs out every token-based client.
+</Warning>
+
+If the server only listens on localhost (127.0.0.1), a phone cannot reach it. Expose the server
+first: enable **Expose API server on LAN/VPN** in **Settings → Experiments**, then pick a network
+bind host under **Settings → Server Access → LAN / VPN access**.
+
 ## Updating the server
 
 Open **About** (or use the **Check for Updates**, **Download Update**, **Install Update and Restart**, and **Update Channel** command palette actions) to check for updates, download, then choose **Install & restart**. The server uses the saved update channel, or infers Nightly from an installed `-next.` version when no channel is saved. Stable follows the npm `latest` tag; Nightly follows `next`. **Newest npm** in the About dialog selects the most recently published package, including pre-releases, regardless of tags. Switching channels can install an older version. Checks and restarts are manual. The registry must be reachable over HTTPS without credentials (`XUM_UPDATE_REGISTRY_URL` or `npm_config_registry` override the default) and must answer metadata and tarball requests itself: redirects are refused, and registries that require authentication for metadata report the registry error at check time. The server downloads the release tarball and verifies it against the registry's published sha512 digest before the package manager installs it. The package manager installs the dependency versions that the release's `npm-shrinkwrap.json` pins, the versions that release was tested with, instead of resolving them afresh, so a dependency release published later is not installed. They download from the configured registry, which must serve them at npm's standard tarball paths (`<registry>/<package>/-/<file>.tgz`). After the install, every dependency recorded in the staged lockfile must be one of those pins and must match the digest the registry publishes for that exact version, so a dependency the package manager resolved afresh, fetched through a redirect, or took from a tampered mirror is refused. Stable releases up to 0.31.0 ship a shrinkwrap without most of these digests and cannot be installed as an update. Every request validates the registry certificate, ignoring `strict-ssl=false` and `NODE_TLS_REJECT_UNAUTHORIZED`; trust a private CA by starting the server with `NODE_EXTRA_CA_CERTS`, which the server and the package manager both honor (`cafile` is not consulted).

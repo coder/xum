@@ -50,6 +50,7 @@ import type {
   ProvidersConfigMap,
   WorkspaceStatsSnapshot,
   ServerAuthSession,
+  ApiServerStatus,
   UpdateStatus,
 } from "@/common/orpc/types";
 import type { UpdateChannel } from "@/common/types/project";
@@ -307,6 +308,8 @@ export interface MockORPCClientOptions {
   viewedSplashScreens?: string[];
   /** Server auth sessions for Settings → Server Access stories */
   serverAuthSessions?: ServerAuthSession[];
+  /** Server status for Settings → Server Access → Pair device (default: not running). */
+  apiServerStatus?: ApiServerStatus;
   /** Mock for projects.remove - return typed error to simulate failure */
   onProjectRemove?: (projectPath: string) => Awaited<ReturnType<APIClient["projects"]["remove"]>>;
   /** Override for nameGeneration.generate result (default: success) */
@@ -527,6 +530,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     viewedSplashScreens = ["onboarding-wizard-v1"],
     providersList = [],
     serverAuthSessions: initialServerAuthSessions = [],
+    apiServerStatus,
     onProjectRemove,
     nameGenerationResult,
     backgroundProcesses = new Map<string, MockBackgroundProcess[]>(),
@@ -930,6 +934,21 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       getLaunchProject: () => Promise.resolve(null),
       getSshHost: () => Promise.resolve(null),
       setSshHost: () => Promise.resolve(undefined),
+      getApiServerStatus: () =>
+        Promise.resolve(
+          apiServerStatus ?? {
+            running: false,
+            baseUrl: null,
+            bindHost: null,
+            port: null,
+            networkBaseUrls: [],
+            tailscaleBindHosts: [],
+            token: null,
+            configuredBindHost: null,
+            configuredPort: null,
+            configuredServeWebUi: false,
+          }
+        ),
     },
     serverAuth: {
       listSessions: () =>

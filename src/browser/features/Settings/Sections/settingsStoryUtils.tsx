@@ -15,7 +15,7 @@ import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import type { ExperimentId } from "@/common/constants/experiments";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY, SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
-import type { ProvidersConfigMap, ServerAuthSession } from "@/common/orpc/types";
+import type { ProvidersConfigMap, ServerAuthSession, ApiServerStatus } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectConfig } from "@/common/types/project";
 import type { TaskSettings } from "@/common/types/tasks";
@@ -114,6 +114,8 @@ interface SetupSettingsStoryOptions {
   agentSandbox?: MockORPCClientOptions["agentSandbox"];
   /** Sessions shown in Settings → Server Access. */
   serverAuthSessions?: ServerAuthSession[];
+  /** Server status for Settings → Server Access → Pair device (default: not running). */
+  apiServerStatus?: ApiServerStatus;
   /** Initial backend experiment values for config.getConfig */
   experiments?: Partial<Record<ExperimentId, boolean>>;
   userPreferences?: UserPreferences;
@@ -138,6 +140,7 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     agentSandbox: options.agentSandbox,
     taskSettings: options.taskSettings,
     serverAuthSessions: options.serverAuthSessions,
+    apiServerStatus: options.apiServerStatus,
     experiments: options.experiments,
     userPreferences: options.userPreferences,
   });
