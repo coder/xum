@@ -90,16 +90,16 @@ struct SectionCaption: View {
     }
 }
 
-/// `xum▌` wordmark: lowercase mono with a solid block cursor.
+/// The desktop app's wordmark (`scripts/generate-icons.ts` writes the asset). `size` is the
+/// matching font size: the SVG's lowercase x-height is about 0.41 of its height.
 struct Wordmark: View {
     var size: CGFloat = 20
     var body: some View {
-        HStack(spacing: size * 0.08) {
-            Text("xum").font(.system(size: size, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color.xText)
-            Rectangle().fill(Color.xAccentFill).frame(width: size * 0.5, height: size * 0.95)
-        }
-        .accessibilityLabel("Xum")
+        Image("Wordmark")
+            .resizable()
+            .scaledToFit()
+            .frame(height: size * 1.3)
+            .accessibilityLabel("Xum")
     }
 }
 

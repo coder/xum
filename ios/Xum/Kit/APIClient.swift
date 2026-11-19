@@ -33,8 +33,9 @@ struct APIClient: Sendable {
         return URLSession(configuration: c)
     }()
 
-    /// `sendMessage` and `resumeStream` answer only when the turn ends, and nothing arrives
-    /// before that: under the 20-second idle timeout every longer turn would fail as "not sent".
+    /// `sendMessage` and `resumeStream` answer only when the turn ends, with nothing before that.
+    /// Their reply is not what decides a send (ComposerDraft asks the backend for the send id), but
+    /// a 20-second idle timeout would still cut every longer turn's request.
     private static let turnProcedures: Set<String> = ["workspace/sendMessage", "workspace/resumeStream"]
     private static let turnSession: URLSession = {
         let c = URLSessionConfiguration.default

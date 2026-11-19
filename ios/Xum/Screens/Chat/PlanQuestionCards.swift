@@ -150,7 +150,7 @@ struct QuestionCard: View {
     /// Full-height side panel on the Duo inner display (docs/04 screen 02): larger question, a
     /// preview of the next one, Skip / Next pinned to the bottom.
     var panel = false
-    var onSubmit: ([String: String]) -> Void = { _ in }
+    var onSubmit: (QuestionAnswers) -> Void = { _ in }
 
     @State private var index = 0
     /// Question index to chosen option index; -1 = custom text, -2 = skipped.
@@ -352,22 +352,68 @@ struct QuestionCard: View {
     }
 
     private func submit() {
-        var answers: [String: String] = [:]
+        var answers = QuestionAnswers()
         for (i, q) in question.questions.enumerated() {
             if q.multiSelect, selections[i] != -2 {
                 // Same serialization as the desktop form: chosen labels, then the custom text.
-                var parts = pickedOptions(i).sorted().filter(q.options.indices.contains).map { q.options[$0].label }
-                if selections[i] ?? defaultSelection(i) == -1, let t = customText[i], !t.isEmpty { parts.append(t) }
-                answers[q.question] = parts.joined(separator: ", ")
+                let chosen = pickedOptions(i).sorted().filter(q.options.indices.contains)
+                var parts = chosen.map { q.options[$0].label }
+                let other = (selections[i] ?? defaultSelection(i)) == -1 ? customText[i] ?? "" : ""
+                if !other.isEmpty { parts.append(other) }
+                answers.answers[q.question] = parts.joined(separator: ", ")
+                answers.selections.append(.init(optionNumbers: chosen.map { $0 + 1 }, otherText: other))
                 continue
             }
             switch selections[i] ?? defaultSelection(i) {
-            case -1: answers[q.question] = customText[i] ?? ""
-            case -2: answers[q.question] = ""
-            case let sel: answers[q.question] = q.options.indices.contains(sel) ? q.options[sel].label : ""
+            case -1:
+                answers.answers[q.question] = customText[i] ?? ""
+                answers.selections.append(.init(optionNumbers: [], otherText: customText[i] ?? ""))
+            case -2:
+                answers.answers[q.question] = ""
+                answers.selections.append(.init(optionNumbers: [], otherText: ""))
+            case let sel:
+                let valid = q.options.indices.contains(sel)
+                answers.answers[q.question] = valid ? q.options[sel].label : ""
+                answers.selections.append(.init(optionNumbers: valid ? [sel + 1] : [], otherText: ""))
             }
         }
         onSubmit(answers)
+    }
+}
+
+/// A submitted question card: the answers by question text (the tool result and metadata), and
+/// per question the picked 1-based option numbers plus the user's own text, which a
+/// message-delivered answer is built from (the web's buildAnswerSelections).
+struct QuestionAnswers: Hashable, Sendable {
+    struct Selection: Hashable, Sendable {
+        var optionNumbers: [Int]
+        var otherText: String
+    }
+    var answers: [String: String] = [:]
+    var selections: [Selection] = []
+
+    /// The web's buildAskUserQuestionAnswerMessage. SECURITY: question text and option labels are
+    /// model-authored, so they never go into the user message: it names questions and options by
+    /// number and carries only the text the user typed.
+    func message(toolCallId: String) -> String {
+        let lines = selections.enumerated().map { i, s -> String in
+            var parts: [String] = []
+            if !s.optionNumbers.isEmpty {
+                parts.append("\(s.optionNumbers.count > 1 ? "options" : "option") \(s.optionNumbers.map(String.init).joined(separator: ", "))")
+            }
+            let other = s.otherText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !other.isEmpty { parts.append("other: \(Self.jsonString(other))") }
+            return "- Question \(i + 1): \(parts.isEmpty ? "skipped" : parts.joined(separator: "; "))"
+        }
+        return (["The user answered your ask_user_question (tool call \(toolCallId)). Questions and options are numbered as in that call:"]
+                + lines + ["Revisit any work that assumed differently."]).joined(separator: "\n")
+    }
+
+    /// JSON.stringify of a string.
+    static func jsonString(_ s: String) -> String {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.withoutEscapingSlashes]
+        return (try? enc.encode(s)).map { String(decoding: $0, as: UTF8.self) } ?? "\"\(s)\""
     }
 }
 
@@ -496,7 +542,8 @@ struct SandboxApprovalCard: View {
 /// A message the server returned unsent: put it back in the composer or drop it.
 struct HeldInputRow: View {
     let held: HeldInput
-    var onRestore: () -> Void
+    /// Send and Discard, as the web HeldInput banner offers.
+    var onSend: () -> Void
     var onDiscard: () -> Void
 
     var body: some View {
@@ -504,19 +551,18 @@ struct HeldInputRow: View {
             Image(systemName: "arrow.uturn.backward.circle").foregroundStyle(Color.xWarn)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Not sent").font(.xCaption).foregroundStyle(Color.xWarn)
-                Text(held.text.isEmpty ? "Attachments only" : held.text)
+                Text(held.text.isEmpty ? "No text" : held.text)
                     .font(.system(size: 14)).foregroundStyle(Color.xText).lineLimit(2)
             }
             Spacer(minLength: 8)
-            if !held.text.isEmpty {
-                Button("Restore", action: onRestore).font(.system(size: 14, weight: .semibold)).buttonStyle(.glass)
-            }
             Button(action: onDiscard) {
-                Image(systemName: "xmark").font(.system(size: 13, weight: .semibold)).frame(width: 32, height: 32)
+                Image(systemName: "trash").font(.system(size: 13, weight: .semibold)).frame(width: 32, height: 32)
             }
             .buttonStyle(.plain)
             .foregroundStyle(Color.xText2)
-            .accessibilityLabel("Discard")
+            .accessibilityLabel("Discard unsent message")
+            Button("Send", action: onSend).font(.system(size: 14, weight: .semibold)).buttonStyle(.glass)
+                .accessibilityLabel("Send unsent message")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)

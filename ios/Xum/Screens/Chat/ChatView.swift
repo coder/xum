@@ -9,7 +9,6 @@ struct ChatView: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.scenePhase) private var scenePhase
     @State private var store: ChatStore?
-    @State private var draft = ""
     @State private var agent = "exec"
     /// The user's pick or the agent's saved model. The composer follows the current server's
     /// default until there is one the server offers: its catalog can still be loading.
@@ -73,7 +72,7 @@ struct ChatView: View {
         // beside the chat instead of a modal sheet; tapping another row swaps its content.
         .sheet(item: sizeClass == .regular ? .constant(nil) : selectedToolBinding) { tool in
             ToolDetailSheet(tool: tool) { prefill in
-                draft = prefill
+                store?.draft.setText(prefill)
             }
         }
         .sheet(isPresented: sizeClass == .regular ? .constant(false) : $showInfo) {
@@ -97,11 +96,11 @@ struct ChatView: View {
             if showInfo, let info {
                 WorkspaceInfoView(store: info, chat: store) { withAnimation { showInfo = false } }
             } else if let tool = selectedTool {
-                ToolDetailSheet(tool: tool, onAsk: { draft = $0 }, onClose: { selectedToolId = nil })
+                ToolDetailSheet(tool: tool, onAsk: { store?.draft.setText($0) }, onClose: { selectedToolId = nil })
                     .id(tool.id)
             } else if let question = pendingQuestion, let store {
                 QuestionCard(question: question, panel: true) { answers in
-                    Task { try? await store.answer(question, answers: answers) }
+                    Task { try? await store.answer(question, answers: answers, options: sendOptions) }
                 }
                 .id(question.toolCallId)
                 .padding(.top, 8)
@@ -122,14 +121,14 @@ struct ChatView: View {
     }
 
     private func restoreToComposer(_ text: String) {
-        draft = draft.isEmpty ? text : draft + "\n\n" + text
+        store?.draft.restore(text)
     }
 
-    /// The first send runs after the chat opens, so its failure can arrive while it is shown.
+    /// The first send runs after the chat opens, so its failure can arrive while it is shown. Its
+    /// text is already back in this workspace's draft (AppModel.startFirstSend).
     private func takeUnsentFirstMessage() {
-        guard let unsent = model.takeUnsentFirstMessage(workspaceId) else { return }
-        restoreToComposer(unsent)
-        store?.report("The first message did not send. It is in the composer: tap send to retry.")
+        guard let reason = model.takeUnsentFirstMessage(workspaceId) else { return }
+        store?.report("The first message did not send: \(reason)")
     }
 
     private func attach() {
@@ -339,9 +338,10 @@ struct ChatView: View {
                     // The composer moves to Exec with it, so the next message does not go back to Plan.
                     applySettings(for: "exec")
                     implementing = true
+                    let file = planFile?.toolId == tool.id ? planFile?.content : nil
                     Task {
                         defer { implementing = false }
-                        try? await store.send("Implement the plan", model: modelId, agentId: agent, thinking: thinking)
+                        try? await store.implement(plan: tool, planFile: file, options: sendOptions)
                     }
                 }
             )
@@ -363,8 +363,7 @@ struct ChatView: View {
             }
             ForEach(store.heldInputs, id: \.id) { held in
                 HeldInputRow(held: held) {
-                    restoreToComposer(held.text)
-                    Task { await store.discardHeld([held.id]) }
+                    Task { await store.sendHeld(held.id) }
                 } onDiscard: {
                     Task { await store.discardHeld([held.id]) }
                 }
@@ -376,13 +375,13 @@ struct ChatView: View {
                 .id(approval.toolCallId)
             } else if let question = store.pendingQuestion, sizeClass != .regular {
                 QuestionCard(question: question) { answers in
-                    Task { try? await store.answer(question, answers: answers) }
+                    Task { try? await store.answer(question, answers: answers, options: sendOptions) }
                 }
                 // A new call gets fresh state: the old page index could be out of its range.
                 .id(question.toolCallId)
             } else {
                 Composer(
-                    text: $draft,
+                    text: Binding(get: { store.draft.text }, set: { store.draft.setText($0) }),
                     agent: $agent,
                     modelId: Binding(get: { modelId }, set: { pickedModel = $0 }),
                     thinking: $thinking,
@@ -415,18 +414,17 @@ struct ChatView: View {
 
     // MARK: - Actions
 
+    /// The composer's send options (the web's getSendOptionsFromStorage), for sends that are not
+    /// typed: question answers, Implement, resumes.
+    private var sendOptions: [String: JSONValue] {
+        ["model": .string(modelId), "agentId": .string(agent), "thinkingLevel": .string(thinking.rawValue)]
+    }
+
     private func send(_ store: ChatStore) {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = store.draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        draft = ""
-        Task {
-            do {
-                try await store.send(text, model: modelId, agentId: agent, thinking: thinking)
-            } catch {
-                // Keep the prompt: the store shows why it failed.
-                if draft.isEmpty { draft = text }
-            }
-        }
+        // The draft takes the text out of the composer and puts it back if it was not sent.
+        Task { try? await store.send(text, model: modelId, agentId: agent, thinking: thinking) }
     }
 
     // MARK: - Toolbar

@@ -40,6 +40,8 @@ const WORDMARK_TARGETS = {
   "docs/img/white-xum.svg": renderDocsWordmark("white"),
   "src/browser/assets/logos/xum-logo-dark.svg": renderAppWordmark("white"),
   "src/browser/assets/logos/xum-logo-light.svg": renderAppWordmark("black"),
+  "ios/Xum/Assets.xcassets/Wordmark.imageset/xum-logo-dark.svg": renderAppWordmark("white"),
+  "ios/Xum/Assets.xcassets/Wordmark.imageset/xum-logo-light.svg": renderAppWordmark("black"),
 } as const;
 
 const INLINE_WORDMARK_TARGETS = {
@@ -77,6 +79,8 @@ type RasterTargetConfig = {
   format?: "png" | "webp";
   /** Override the SVG viewBox before rendering to crop tightly around content. */
   cropViewBox?: string;
+  /** Drop the alpha channel: App Store Connect rejects an iOS app icon that has one. */
+  opaque?: boolean;
 };
 
 // Keep the source + background pairing centralized so targets stay DRY.
@@ -104,6 +108,13 @@ const LOGO_TARGETS = {
 
   // iOS Safari uses apple-touch-icon for home screen installs.
   "public/apple-touch-icon.png": { size: 180, ...APP_ICON },
+
+  // Native iOS app (ios/): the same app icon as the desktop and PWA builds.
+  "ios/Xum/Assets.xcassets/AppIcon.appiconset/AppIcon.png": {
+    size: 1024,
+    ...APP_ICON,
+    opaque: true,
+  },
 
   // Electron Tray Icons – Wide m-Block Mark (Monochrome on Transparent)
   //
@@ -148,6 +159,7 @@ async function generateRasterIcon({
   bg,
   format = "png",
   cropViewBox,
+  opaque = false,
 }: RasterTargetConfig) {
   const [w, h] = Array.isArray(size) ? size : [size, size];
 
@@ -189,6 +201,7 @@ async function generateRasterIcon({
     ]);
   }
 
+  if (opaque) pipeline = pipeline.removeAlpha();
   return format === "webp" ? pipeline.webp() : pipeline.png();
 }
 

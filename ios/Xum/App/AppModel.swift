@@ -209,21 +209,28 @@ final class AppModel {
         return id
     }
 
-    /// First messages that did not send, by the workspace they were for. The new workspace opens
-    /// with the text in its composer, so a retry sends it there instead of making another one.
+    /// Why a workspace's first message did not send, by workspace. Its text is back in that
+    /// workspace's draft, so a retry sends it there instead of making another workspace.
     private(set) var unsentFirstMessages: [String: String] = [:]
     func takeUnsentFirstMessage(_ workspaceId: String) -> String? { unsentFirstMessages.removeValue(forKey: workspaceId) }
 
-    /// `sendMessage` returns only when the turn ends, so the new workspace opens first: a first
-    /// turn that asks a question or needs a sandbox approval waits on a card the user must see.
+    /// The web creation flow's first send: no client send id (the backend mints one) and no
+    /// draft entry. `sendMessage` returns only when the turn ends, so the new workspace opens
+    /// first: a first turn that asks a question or needs a sandbox approval waits on a card the
+    /// user must see. On failure the text goes to the workspace's draft unless that already
+    /// holds something (the web's transferDraftToWorkspace).
     private func startFirstSend(_ c: APIClient, _ id: String, _ message: String, model: String, agentId: String, thinking: ThinkingLevel) {
-        let opts: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue),
-                                         "sendId": .string("ios-" + UUID().uuidString)]
+        let opts: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue)]
         Task {
             do {
                 try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message), "options": .object(opts)])
             } catch {
-                unsentFirstMessages[id] = message
+                let scope: JSONValue = ["kind": "workspace", "workspaceId": .string(id)]
+                let current = try? await c.call("drafts/get", ["scope": scope])
+                if (current?["text"]?.string ?? "").isEmpty, (current?["attachments"]?.array ?? []).isEmpty {
+                    _ = try? await c.call("drafts/update", ["scope": scope, "text": .string(message)])
+                }
+                unsentFirstMessages[id] = error.localizedDescription
             }
         }
         Task { await list?.refresh() }

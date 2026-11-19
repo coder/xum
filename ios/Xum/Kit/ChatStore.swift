@@ -162,10 +162,14 @@ final class ChatStore {
 
     private var client: APIClient
     private var task: Task<Void, Never>?
+    /// The composer's draft and its sends (the web client's DraftStore, for this workspace).
+    let draft: ComposerDraft
 
     init(workspaceId: String, client: APIClient) {
         self.workspaceId = workspaceId
         self.client = client
+        draft = ComposerDraft(workspaceId: workspaceId, client: client)
+        draft.onNotAccepted = { [weak self] reason in self?.lastError = "Message not sent: \(reason)" }
     }
 
     /// A turn is running: streaming, or still being prepared (runtime startup on SSH or Coder can
@@ -227,11 +231,14 @@ final class ChatStore {
     func start() {
         guard task == nil else { return }
         task = Task { [weak self] in await self?.run() }
+        draft.start()
+        Task { [draft] in await draft.load() }
     }
 
     func stop() {
         task?.cancel()
         task = nil
+        draft.stop()
     }
 
     private func run() async {
@@ -288,6 +295,8 @@ final class ChatStore {
                 return
             }
             caughtUp = true
+            // A reconnect: pending sends may have settled while the stream was down.
+            draft.triggerResolution(afterStop: true)
             // Servers send hasOlderHistory only to windowed clients; otherwise the replay holds
             // the active epoch, and rows before a compaction boundary are older pages.
             if let older = ev["hasOlderHistory"]?.bool {
@@ -388,16 +397,30 @@ final class ChatStore {
                 if m.reasoningStartedAt != nil, m.reasoningEndedAt == nil { m.reasoningEndedAt = Date() }
             }
             if streamingMessageId == ev["messageId"]?.string { streamingMessageId = nil }
+            draft.onSendEvent()
+            if autoRetryRollbackPending { Task { await rollbackAutoRetry() } }
         case "restore-to-input":
+            draft.onSendEvent()
+            // Per send: one this composer's draft still retains comes back through the draft
+            // (not accepted) instead, so inserting it here would show it twice.
+            var restored = ev["text"]?.string ?? ""
+            var textOnly = (ev["fileParts"]?.array ?? []).isEmpty && (ev["reviews"]?.array ?? []).isEmpty
+            if let inputs = ev["inputs"]?.array {
+                let rest = inputs.filter { !($0["sendIds"]?.array ?? []).compactMap(\.string).contains(where: draft.retains) }
+                restored = rest.compactMap { $0["text"]?.string }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+                textOnly = rest.allSatisfy { ($0["fileParts"]?.array ?? []).isEmpty && ($0["reviews"]?.array ?? []).isEmpty }
+            }
             restoreSeq += 1
-            restoredInput = RestoredInput(seq: restoreSeq, text: ev["text"]?.string ?? "",
+            restoredInput = RestoredInput(seq: restoreSeq, text: restored,
                                           heldInputIds: (ev["heldInputIds"]?.array ?? []).compactMap(\.string),
-                                          textOnly: (ev["fileParts"]?.array ?? []).isEmpty && (ev["reviews"]?.array ?? []).isEmpty)
+                                          textOnly: textOnly)
         case "held-inputs-changed":
             heldInputs = (ev["heldInputs"]?.array ?? []).compactMap { h in
                 guard let id = h["id"]?.string else { return nil }
                 return HeldInput(id: id, text: h["displayText"]?.string ?? "")
             }
+            // A released held input is no longer pending: its send resolves.
+            draft.onSendEvent()
         case "bash-sandbox-approval":
             guard let tid = ev["toolCallId"]?.string else { return }
             sandboxApprovals.removeAll { $0.toolCallId == tid }
@@ -406,6 +429,7 @@ final class ChatStore {
             }
         case "stream-abort":
             sandboxApprovals = []
+            if autoRetryRollbackPending { Task { await rollbackAutoRetry() } }
             mutate(ev["messageId"]?.string) { m in
                 m.isStreaming = false
                 m.parts = m.parts.map { p in
@@ -428,12 +452,17 @@ final class ChatStore {
             answeredQuestionIds.subtract(deleted.flatMap(\.answersQuestionIds))
         case "queued-message-changed":
             hasQueued = ev["hasQueuedMessages"]?.bool ?? false
+            draft.onQueuedSends((ev["sendIds"]?.array ?? []).compactMap(\.string))
         default:
             break
         }
     }
 
     private func upsertPersisted(_ ev: JSONValue) {
+        // The row that accepts a send carries its id: resolve that send's draft entry.
+        if caughtUp, ev["role"]?.string == "user", let ids = ev["metadata"]?["sendIds"]?.array {
+            draft.onSendEvent(rowSendIds: ids.compactMap(\.string))
+        }
         guard let m = persistedMessage(ev) else { return }
         if m.parts.isEmpty, m.role == .assistant, messages.contains(where: { $0.id == m.id }) { return }
         var merged = m
@@ -556,11 +585,16 @@ final class ChatStore {
 
     // MARK: - Actions
 
+    /// A composer send, as the web composer makes it: recorded in the draft, then sent; the
+    /// draft reports whether the backend took it (ComposerDraft).
     func send(_ text: String, model: String, agentId: String, thinking: ThinkingLevel?) async throws {
-        var options: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "sendId": .string("ios-" + UUID().uuidString)]
+        var options: [String: JSONValue] = [
+            "model": .string(model), "agentId": .string(agentId),
+            "muxMetadata": ["type": "normal", "requestedModel": .string(model)],
+        ]
         if let thinking { options["thinkingLevel"] = .string(thinking.rawValue) }
         do {
-            try await client.call("workspace/sendMessage", ["workspaceId": .string(workspaceId), "message": .string(text), "options": .object(options)])
+            try await draft.send(message: text, options: options)
         } catch {
             lastError = "Message not sent: \(error.localizedDescription)"
             throw error
@@ -572,6 +606,15 @@ final class ChatStore {
     func takeRestoredInput() -> RestoredInput? {
         defer { restoredInput = nil }
         return restoredInput
+    }
+
+    /// Sends a held input as it was queued (the web HeldInput banner's Send).
+    func sendHeld(_ id: String) async {
+        do {
+            try await client.call("workspace/sendHeldInput", ["workspaceId": .string(workspaceId), "heldInputId": .string(id)])
+        } catch {
+            lastError = "Could not send a returned message: \(error.localizedDescription)"
+        }
     }
 
     /// Tells the server the composer took these inputs, so they stop being held.
@@ -598,25 +641,34 @@ final class ChatStore {
         }
     }
 
+    /// Stop, as the web client's stopStream: fence the draft's re-sends first, then interrupt.
     func interrupt() async throws {
+        await draft.abortRetries()
         do {
-            try await client.call("workspace/interruptStream", ["workspaceId": .string(workspaceId)])
+            try await client.call("workspace/interruptStream", [
+                "workspaceId": .string(workspaceId),
+                // A user Stop dismisses owed bash-monitor output instead of waking the agent on it.
+                "options": ["retireBashMonitorAttention": true],
+            ])
         } catch {
             lastError = "Could not stop: \(error.localizedDescription)"
             throw error
         }
     }
 
-    func answer(_ q: PendingQuestion, answers: [String: String]) async throws {
-        guard q.answerByMessage else { return try await answer(toolCallId: q.toolCallId, answers: answers) }
-        let text = q.questions.map { "\($0.header.isEmpty ? $0.question : $0.header): \(answers[$0.question] ?? "Skipped")" }.joined(separator: "\n")
-        let (model, agent) = turnOptions
+    /// Answers a question card as the web card does. A message-delivered question takes a normal
+    /// send carrying the answer in its metadata; a blocking one takes `answerAskUserQuestion`, then
+    /// a resume (a recovered question has no waiting turn) with auto-retry on for that attempt.
+    /// `options` are the composer's send options (the web's getSendOptionsFromStorage).
+    func answer(_ q: PendingQuestion, answers: QuestionAnswers, options: [String: JSONValue]) async throws {
+        guard q.answerByMessage else { return try await answer(toolCallId: q.toolCallId, answers: answers.answers, options: options) }
         answeredQuestionIds.insert(q.toolCallId)
+        var opts = options
+        opts["sendId"] = .string(UUID().uuidString.lowercased())
+        opts["muxMetadata"] = ["type": "normal", "askUserQuestionAnswer": ["toolCallId": .string(q.toolCallId), "answers": .object(answers.answers.mapValues { .string($0) })]]
         do {
             try await client.call("workspace/sendMessage", [
-                "workspaceId": .string(workspaceId), "message": .string(text),
-                "options": ["model": .string(model), "agentId": .string(agent), "sendId": .string("ios-" + UUID().uuidString),
-                            "muxMetadata": ["type": "normal", "askUserQuestionAnswer": ["toolCallId": .string(q.toolCallId), "answers": .object(answers.mapValues { .string($0) })]]],
+                "workspaceId": .string(workspaceId), "message": .string(answers.message(toolCallId: q.toolCallId)), "options": .object(opts),
             ])
         } catch {
             answeredQuestionIds.remove(q.toolCallId)
@@ -625,12 +677,11 @@ final class ChatStore {
         }
     }
 
-    /// The model and agent of the turn being answered.
-    private var turnOptions: (model: String, agent: String) {
-        (lastModel ?? "anthropic:claude-opus-5-5", messages.last(where: { $0.role == .assistant })?.agentId ?? "exec")
-    }
+    /// Set when a question's resume turned auto-retry on for one attempt: it goes back off once
+    /// that attempt ends (the web card's rollback).
+    private var autoRetryRollbackPending = false
 
-    func answer(toolCallId: String, answers: [String: String]) async throws {
+    func answer(toolCallId: String, answers: [String: String], options: [String: JSONValue]) async throws {
         do {
             try await client.call("workspace/answerAskUserQuestion", [
                 "workspaceId": .string(workspaceId), "toolCallId": .string(toolCallId),
@@ -640,17 +691,71 @@ final class ChatStore {
             lastError = "Answer not sent: \(error.localizedDescription)"
             throw error
         }
-        // A question recovered from history (the server or its stream restarted) has no waiting
-        // turn, so the answer only completes the call. Resume as the desktop does; the server
-        // reports a turn that is already running instead of starting another.
-        let (model, agent) = turnOptions
         do {
-            try await client.call("workspace/resumeStream", [
-                "workspaceId": .string(workspaceId),
-                "options": ["model": .string(model), "agentId": .string(agent)],
-            ])
+            let enabled = try await client.call("workspace/setAutoRetryEnabled", ["workspaceId": .string(workspaceId), "enabled": true, "persist": false])
+            if enabled["data"]?["previousEnabled"]?.bool == false { autoRetryRollbackPending = true }
+            let resumed = try await client.call("workspace/resumeStream", ["workspaceId": .string(workspaceId), "options": .object(options)])
+            if resumed["data"]?["started"]?.bool == false { await rollbackAutoRetry() }
         } catch {
             lastError = "Answer sent, but the agent did not continue: \(error.localizedDescription)"
+            await rollbackAutoRetry()
         }
+    }
+
+    private func rollbackAutoRetry() async {
+        guard autoRetryRollbackPending else { return }
+        autoRetryRollbackPending = false
+        _ = try? await client.call("workspace/setAutoRetryEnabled", ["workspaceId": .string(workspaceId), "enabled": false, "persist": false])
+    }
+
+    /// propose_plan Implement, as the web card runs it: with the server's
+    /// proposePlanImplementReplacesChatHistory setting the plan first becomes a compaction
+    /// boundary ("Start Here"), then "Implement the plan" goes to Exec with the model and thinking
+    /// pinned (classifying that prompt would reroute them on text that says nothing of the plan).
+    func implement(plan: ToolCall, planFile: String?, options: [String: JSONValue]) async throws {
+        let config = try? await client.call("config/getConfig")
+        if config?["taskSettings"]?["proposePlanImplementReplacesChatHistory"]?.bool == true {
+            let summary = Self.startHereMessage(plan: plan, planFile: planFile)
+            _ = try? await client.call("workspace/replaceChatHistory", [
+                "workspaceId": .string(workspaceId), "summaryMessage": summary,
+                "mode": "append-compaction-boundary", "deletePlanFile": false,
+            ])
+        }
+        var opts = options
+        opts["agentId"] = "exec"
+        opts["autoModelRouting"] = false
+        opts["autoThinkingLevel"] = false
+        opts["savedAutoRouting"] = ["model": false, "thinkingLevel": false]
+        do {
+            try await client.call("workspace/sendMessage", ["workspaceId": .string(workspaceId), "message": "Implement the plan", "options": .object(opts)])
+        } catch {
+            lastError = "Could not start the plan: \(error.localizedDescription)"
+            throw error
+        }
+    }
+
+    /// The web's Start Here summary (ProposePlanToolCall startHereContent) as an assistant row,
+    /// built from the latest plan's file content as the web card reads it.
+    static func startHereMessage(plan: ToolCall, planFile: String?) -> JSONValue {
+        let path = plan.output?["planPath"]?.string
+        let content = planFile ?? plan.output?["planContent"]?.string ?? plan.input["plan"]?.string
+            ?? path.map { "*Plan saved to \($0)*" } ?? ""
+        let heading = content.components(separatedBy: "\n").first { $0.hasPrefix("#") && $0.dropFirst().first?.isWhitespace == true }
+        let title = heading.map { String($0.dropFirst()).trimmingCharacters(in: .whitespaces) }
+            ?? (planFile == nil ? plan.input["title"]?.string : nil)
+            ?? path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Plan"
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let note = !trimmed.isEmpty && !trimmed.hasPrefix("*Plan saved to ")
+            ? "\n\nNote: This chat already contains the full plan; no need to re-open the plan file."
+            : trimmed.hasPrefix("*Plan saved to ")
+                ? "\n\nNote: This chat only includes a placeholder. Read the plan file below for the full plan."
+                : ""
+        let pathNote = path.map { "\n\n---\n\n*Plan file preserved at:* `\($0)`" } ?? ""
+        let id = "start-here-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString.prefix(9).lowercased())"
+        return [
+            "id": .string(id), "role": "assistant",
+            "parts": [["type": "text", "state": "done", "text": .string("# \(title)\n\n\(content)\(note)\(pathNote)")]],
+            "metadata": ["timestamp": .number(Date().timeIntervalSince1970 * 1000), "compacted": "user", "agentId": "plan"],
+        ]
     }
 }
