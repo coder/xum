@@ -7,6 +7,7 @@ struct ChatView: View {
 
     @Environment(AppModel.self) private var model
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.scenePhase) private var scenePhase
     @State private var store: ChatStore?
     @State private var draft = ""
     @State private var agent = "exec"
@@ -30,6 +31,8 @@ struct ChatView: View {
     @State private var userScrolling = false
     @State private var showInfo = false
     @State private var info: WorkspaceInfoStore?
+    /// The plan file's text for the latest plan (keyed by its tool call ID).
+    @State private var planFile: (toolId: String, content: String)?
 
     private var workspace: Workspace? { model.list?.workspace(workspaceId) }
     private var pendingQuestion: PendingQuestion? { store?.pendingQuestion }
@@ -51,6 +54,8 @@ struct ChatView: View {
         .toolbar { toolbarContent }
         .toolbar(.hidden, for: .tabBar)
         .onAppear(perform: attach)
+        // Reload on return to the app too: the plan file may have been edited elsewhere.
+        .task(id: "\(store?.latestPlanToolId ?? "")|\(scenePhase == .active)") { await loadPlanFile() }
         // The server hands back a queued message it did not run (Stop, a refused send): put it
         // back in the composer, then let the server drop its held copy.
         .onChange(of: store?.restoredInput?.seq) { takeRestoredInput() }
@@ -124,12 +129,21 @@ struct ChatView: View {
         seedSettings()
     }
 
+    private func loadPlanFile() async {
+        guard scenePhase == .active, let toolId = store?.latestPlanToolId, let c = model.servers.currentClient else { return }
+        guard let r = try? await c.call("workspace/getPlanContent", ["workspaceId": .string(workspaceId)]),
+              let content = r["data"]?["content"]?.string, store?.latestPlanToolId == toolId else { return }
+        planFile = (toolId, content)
+    }
+
     /// Agent/model/thinking start from the workspace's saved per-agent settings, then app defaults.
-    private func seedSettings() {
+    private func seedSettings() { applySettings(for: model.defaultAgent) }
+
+    private func applySettings(for agentId: String) {
         func setting(_ key: String) -> String? {
-            workspace?.raw["aiSettingsByAgent"]?[model.defaultAgent]?[key]?.string
+            workspace?.raw["aiSettingsByAgent"]?[agentId]?[key]?.string
         }
-        agent = model.defaultAgent
+        agent = agentId
         modelId = setting("model") ?? model.defaultModel
         if let s = setting("thinkingLevel"), let level = ThinkingLevel(rawValue: s) {
             thinking = level
@@ -305,8 +319,11 @@ struct ChatView: View {
                 modelName: m.model,
                 timestamp: m.timestamp,
                 canImplement: store.latestPlanToolId == tool.id,
+                fileContent: planFile?.toolId == tool.id ? planFile?.content : nil,
                 onImplement: {
-                    Task { try? await store.send("Implement the plan", model: modelId, agentId: "exec", thinking: thinking) }
+                    // The composer moves to Exec with it, so the next message does not go back to Plan.
+                    applySettings(for: "exec")
+                    Task { try? await store.send("Implement the plan", model: modelId, agentId: agent, thinking: thinking) }
                 }
             )
         }

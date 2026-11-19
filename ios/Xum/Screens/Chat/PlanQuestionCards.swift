@@ -6,6 +6,9 @@ struct PlanCard: View {
     let modelName: String?
     let timestamp: Date?
     let canImplement: Bool
+    /// The plan file's current text (`workspace.getPlanContent`), for the latest plan only:
+    /// current calls keep the plan in that file, not in their input or result.
+    var fileContent: String?
     var onImplement: () -> Void = {}
 
     private struct Line: Identifiable {
@@ -17,15 +20,17 @@ struct PlanCard: View {
     }
 
     private var markdown: String {
-        tool.input["plan"]?.string ?? tool.output?["planContent"]?.string ?? ""
+        fileContent ?? tool.input["plan"]?.string ?? tool.output?["planContent"]?.string ?? ""
     }
+
+    private var planPath: String? { tool.output?["planPath"]?.string }
 
     private var title: String {
         if let t = tool.input["title"]?.string, !t.isEmpty { return t }
         for line in markdown.components(separatedBy: "\n") where line.trimmingCharacters(in: .whitespaces).hasPrefix("# ") {
             return String(line.drop(while: { $0 == "#" || $0 == " " })).trimmingCharacters(in: .whitespaces)
         }
-        return "Plan"
+        return planPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Plan"
     }
 
     var body: some View {
@@ -45,6 +50,13 @@ struct PlanCard: View {
             ForEach(lines) { line in
                 lineView(line).padding(.top, line.kind == .heading || line.kind == .subheading ? 12 : 4)
             }
+            if markdown.isEmpty, let planPath {
+                Text("Plan saved to \(planPath)")
+                    .font(.system(size: 13))
+                    .italic()
+                    .foregroundStyle(Color.xText2)
+                    .padding(.top, 4)
+            }
             if !markdown.isEmpty { Divider().overlay(Color.xPlanLine).padding(.top, 14) }
             HStack(alignment: .center, spacing: 10) {
                 Text("Revise in chat, or switch to Exec to implement.")
@@ -52,7 +64,8 @@ struct PlanCard: View {
                     .italic()
                     .foregroundStyle(Color.xText2)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                if canImplement {
+                // Implement only a plan the user can read.
+                if canImplement, !markdown.isEmpty {
                     Button(action: onImplement) {
                         HStack(spacing: 6) {
                             Image(systemName: "play.fill").font(.system(size: 10))

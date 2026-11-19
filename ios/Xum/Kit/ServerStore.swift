@@ -106,6 +106,10 @@ final class ServerStore {
                 } catch APIError.unauthorized {
                     reachability[server.id] = .unauthorized
                 }
+            } else {
+                // No Keychain token: a restored backup or a new device does not carry this-device-only
+                // items. The record stays, and pasting its link again replaces the token.
+                reachability[server.id] = .unauthorized
             }
         } catch {
             if case .offline = reachability[server.id] { return }

@@ -30,9 +30,10 @@ enum ToolMeta {
         return t.name
     }
 
-    /// Before and after text of a file edit or write; a write's `content` replaces nothing.
+    /// Before and after text of a file edit or write; a write's `content` replaces nothing. A
+    /// failed call changed nothing, so it has none.
     static func editTexts(_ t: ToolCall) -> (old: String, new: String)? {
-        guard t.name.hasPrefix("file_edit") || t.name.hasPrefix("file_write") || t.name == "write" else { return nil }
+        guard t.name.hasPrefix("file_edit") || t.name.hasPrefix("file_write") || t.name == "write", t.state != .failed else { return nil }
         return (t.input["old_string"]?.string ?? "", t.input["new_string"]?.string ?? t.input["content"]?.string ?? "")
     }
 

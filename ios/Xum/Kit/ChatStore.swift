@@ -192,7 +192,9 @@ final class ChatStore {
     /// The last proposed plan, when it is the newest assistant output (so the card shows Implement).
     var latestPlanToolId: String? {
         guard let last = messages.last(where: { $0.role == .assistant }) else { return nil }
-        return last.tools.last(where: { $0.name == "propose_plan" })?.id
+        // A failed call saved no plan, so there is nothing to implement.
+        guard let plan = last.tools.last(where: { $0.name == "propose_plan" }), plan.state == .done else { return nil }
+        return plan.id
     }
 
     var lastModel: String? { messages.last(where: { $0.role == .assistant && $0.model != nil })?.model }

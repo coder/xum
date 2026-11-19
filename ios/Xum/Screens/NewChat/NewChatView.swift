@@ -13,7 +13,9 @@ struct NewChatView: View {
     @State private var branches: [String] = ["main"]
     @State private var message = ""
     @State private var agentId = "exec"
-    @State private var modelId = ""
+    /// The user's pick; until then the sheet follows the current server's default, which can
+    /// change after the sheet opens (the server's catalog is still loading, or the server changed).
+    @State private var pickedModel: String?
     @State private var thinking: ThinkingLevel = .medium
     @State private var sending = false
     @State private var error: String?
@@ -62,7 +64,6 @@ struct NewChatView: View {
         }
         .presentationDetents([.large])
         .onAppear {
-            if modelId.isEmpty { modelId = model.defaultModel }
             if agentId.isEmpty { agentId = model.defaultAgent }
             thinking = model.defaultThinking
             if selectedProject == nil {
@@ -309,7 +310,7 @@ struct NewChatView: View {
         Menu {
             ForEach(model.modelChoices, id: \.self) { id in
                 Button {
-                    modelId = id
+                    pickedModel = id
                 } label: {
                     if id == modelId { Label(ModelName.display(id), systemImage: "checkmark") } else { Text(ModelName.display(id)) }
                 }
@@ -369,6 +370,10 @@ struct NewChatView: View {
     /// A workspace start needs a project; scratch chats always work.
     private var busy: Bool {
         (startFrom == .workspace && selectedProject == nil) || (startFrom == .fork && mostRecentWorkspace == nil)
+    }
+
+    private var modelId: String {
+        pickedModel.flatMap { model.modelChoices.contains($0) ? $0 : nil } ?? model.defaultModel
     }
 
     // MARK: Actions

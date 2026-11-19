@@ -37,8 +37,12 @@ final class AppModel {
     var splitColumns: NavigationSplitViewVisibility = .all
     /// Regular layout: the Settings page shown in the detail column while the Settings tab is open.
     var settingsPage: SettingsPage? = .serverAccess
-    /// Regular layout never shows an empty detail once the list loads: it falls back to the top row.
-    var shownWorkspaceId: String? { selectedWorkspaceId ?? list?.sections.first?.items.first?.id }
+    /// Regular layout never shows an empty detail once the list loads: it falls back to the top row,
+    /// also when the selected workspace is gone (archived or removed elsewhere).
+    var shownWorkspaceId: String? {
+        if let id = selectedWorkspaceId, list?.loaded != true || list?.workspace(id) != nil { return id }
+        return list?.sections.first?.items.first?.id
+    }
 
     /// Composer defaults (the server stores per-workspace settings; these seed new chats).
     var defaultModel = "anthropic:claude-opus-5-5"

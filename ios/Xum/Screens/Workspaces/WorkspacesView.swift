@@ -26,6 +26,16 @@ struct WorkspacesView: View {
                 } else {
                     ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+            } else if let server = model.servers.current {
+                // The record exists but its token does not (see ServerStore.refreshReachability).
+                ContentUnavailableView {
+                    Label("Sign in to \(server.name) again", systemImage: "key")
+                } description: {
+                    Text("This iPhone has no token for this server. Paste its connection link to add one.")
+                } actions: {
+                    Button("Paste Link") { model.sheet = .connectLink(prefill: nil) }.buttonStyle(.glass)
+                    Button("Switch Server") { model.sheet = .servers }
+                }
             } else {
                 ContentUnavailableView("No server", systemImage: "server.rack")
             }

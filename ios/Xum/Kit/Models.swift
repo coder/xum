@@ -145,10 +145,15 @@ enum ModelName {
     }
     static func provider(_ id: String) -> String { id.split(separator: ":").first.map(String.init) ?? "" }
 
-    /// Built-in choices, offered for the providers a server has configured.
+    /// Built-in choices, offered for the providers a server has configured: every model in
+    /// src/common/constants/knownModels.ts (knownModels.test.ts keeps the two in sync).
     static let builtIn = [
         "anthropic:claude-opus-5-5", "anthropic:claude-sonnet-5-5", "anthropic:claude-haiku-5-5",
-        "anthropic:claude-fable-5-2", "openai:gpt-6.2-sol", "google:gemini-3.1-pro-preview",
+        "anthropic:claude-fable-5-2", "anthropic:claude-mythos-5-2",
+        "openai:gpt-6.2-sol", "openai:gpt-6-luna", "openai:gpt-6.2-astra",
+        "google:gemini-3.1-pro-preview", "google:gemini-3.8-flash", "google:gemini-4-argon", "google:gemini-4-carbon",
+        "xai:grok-4.7", "deepseek:deepseek-v4-pro", "deepseek:deepseek-v4-flash", "moonshotai:kimi-k3",
+        "meta:muse-wonder-1.0", "zai:glm-5.3-flash",
     ]
 
     /// The models a server can run, from `providers.getConfig`: the built-ins of each configured,

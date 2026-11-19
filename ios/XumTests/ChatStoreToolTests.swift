@@ -130,7 +130,14 @@ struct ModelCatalogTests {
             "omlx": ["isConfigured": true, "isEnabled": true, "models": ["GLM-5.3-Flash", ["id": "qwen-small"]]],
             "google": ["isConfigured": true, "isEnabled": true],
         ]
-        #expect(ModelName.catalog(providers: providers) == ["google:gemini-3.1-pro-preview", "omlx:GLM-5.3-Flash", "omlx:qwen-small"])
+        let google = ModelName.builtIn.filter { $0.hasPrefix("google:") }
+        #expect(google.contains("google:gemini-3.1-pro-preview"))
+        #expect(ModelName.catalog(providers: providers) == google + ["omlx:GLM-5.3-Flash", "omlx:qwen-small"])
+    }
+
+    @Test func providerWithoutItsOwnListStillHasModels() {
+        let providers: JSONValue = ["xai": ["isConfigured": true, "isEnabled": true]]
+        #expect(ModelName.catalog(providers: providers) == ["xai:grok-4.7"])
     }
 }
 
