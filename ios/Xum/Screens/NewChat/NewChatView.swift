@@ -80,6 +80,8 @@ struct NewChatView: View {
             ForEach(model.list?.projects ?? []) { p in
                 Button {
                     selectedProject = p
+                    // Fork needs a source in the new project; fall back to a new workspace.
+                    if startFrom == .fork, mostRecentWorkspace == nil { startFrom = .workspace }
                     Task { await loadBranches(p.path) }
                 } label: {
                     if p.id == selectedProject?.id { Label(p.name, systemImage: "checkmark") } else { Text(p.name) }
@@ -305,11 +307,11 @@ struct NewChatView: View {
 
     private var modelChip: some View {
         Menu {
-            ForEach(Self.modelChoices, id: \.id) { choice in
+            ForEach(model.modelChoices, id: \.self) { id in
                 Button {
-                    modelId = choice.id
+                    modelId = id
                 } label: {
-                    if choice.id == modelId { Label(choice.label, systemImage: "checkmark") } else { Text(choice.label) }
+                    if id == modelId { Label(ModelName.display(id), systemImage: "checkmark") } else { Text(ModelName.display(id)) }
                 }
             }
         } label: {
@@ -322,14 +324,6 @@ struct NewChatView: View {
         }
     }
 
-    static let modelChoices: [(id: String, label: String)] = [
-        ("anthropic:claude-opus-5-5", "Opus 5.5"),
-        ("anthropic:claude-sonnet-5-5", "Sonnet 5.5"),
-        ("anthropic:claude-haiku-5-5", "Haiku 5.5"),
-        ("anthropic:claude-fable-5-2", "Fable 5.2"),
-        ("openai:gpt-6.2-sol", "GPT-6.2 Sol"),
-        ("google:gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
-    ]
 
     private var thinkingChip: some View {
         Menu {
@@ -374,7 +368,7 @@ struct NewChatView: View {
 
     /// A workspace start needs a project; scratch chats always work.
     private var busy: Bool {
-        startFrom == .workspace && selectedProject == nil
+        (startFrom == .workspace && selectedProject == nil) || (startFrom == .fork && mostRecentWorkspace == nil)
     }
 
     // MARK: Actions
@@ -402,7 +396,8 @@ struct NewChatView: View {
         defer { sending = false }
         do {
             let id: String
-            if startFrom == .fork, let source = mostRecentWorkspace {
+            if startFrom == .fork {
+                guard let source = mostRecentWorkspace else { return }
                 id = try await model.fork(source.id, message: message, model: modelId, agentId: agentId, thinking: thinking)
             } else if startFrom == .scratch {
                 id = try await model.createScratch(projectPath: selectedProject?.path, message: message,

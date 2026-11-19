@@ -93,7 +93,7 @@ struct ConnectLinkSheet: View {
                             .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.glassProminent)
-                    .disabled(parsed.map { !mayUseToken($0) } ?? true)
+                    .disabled(!verified)
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -117,8 +117,15 @@ struct ConnectLinkSheet: View {
         }
     }
 
+    /// Saving waits for the probe's authenticated call: a rejected token or an unreachable
+    /// server would leave the app on a server it cannot load.
+    private var verified: Bool {
+        guard let link = parsed, mayUseToken(link), case .reachable = status else { return false }
+        return true
+    }
+
     private func confirm() {
-        guard let link = parsed, mayUseToken(link) else { return }
+        guard verified, let link = parsed else { return }
         model.addServer(link, name: name.isEmpty ? link.suggestedName : name, version: version)
     }
 

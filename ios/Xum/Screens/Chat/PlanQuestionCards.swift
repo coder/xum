@@ -479,3 +479,34 @@ struct SandboxApprovalCard: View {
         .glassRect(28)
     }
 }
+
+/// A message the server returned unsent: put it back in the composer or drop it.
+struct HeldInputRow: View {
+    let held: HeldInput
+    var onRestore: () -> Void
+    var onDiscard: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.uturn.backward.circle").foregroundStyle(Color.xWarn)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Not sent").font(.xCaption).foregroundStyle(Color.xWarn)
+                Text(held.text.isEmpty ? "Attachments only" : held.text)
+                    .font(.system(size: 14)).foregroundStyle(Color.xText).lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            if !held.text.isEmpty {
+                Button("Restore", action: onRestore).font(.system(size: 14, weight: .semibold)).buttonStyle(.glass)
+            }
+            Button(action: onDiscard) {
+                Image(systemName: "xmark").font(.system(size: 13, weight: .semibold)).frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.xText2)
+            .accessibilityLabel("Discard")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassRect(20)
+    }
+}

@@ -107,6 +107,22 @@ struct SandboxApproval: Hashable, Sendable {
     var reason: String
 }
 
+/// Input the server returned instead of running it (Stop with a queued follow-up, a refused
+/// queued send): `held-inputs-changed` lists it until a composer takes or discards it.
+struct HeldInput: Hashable, Sendable {
+    var id: String
+    var text: String
+}
+
+/// A one-shot `restore-to-input`; `seq` tells repeated restores of the same text apart.
+struct RestoredInput: Equatable, Sendable {
+    var seq: Int
+    var text: String
+    var heldInputIds: [String]
+    /// Attachments and review notes cannot be put back in this composer, so such an input stays held.
+    var textOnly: Bool
+}
+
 /// One workspace's chat: replays `workspace.onChat` (full) then applies live events, mirroring the
 /// web client's StreamingMessageAggregator closely enough for the phone UI. Unknown events are
 /// ignored so newer servers never break the app.
@@ -148,19 +164,25 @@ final class ChatStore {
     }
 
     private(set) var sandboxApprovals: [SandboxApproval] = []
+    private(set) var heldInputs: [HeldInput] = []
+    private(set) var restoredInput: RestoredInput?
+    private var restoreSeq = 0
 
     /// Tool call IDs answered by a later user message (`muxMetadata.askUserQuestionAnswer`).
     private(set) var answeredQuestionIds: Set<String> = []
 
-    /// The newest question, while it is open. A later user row ends a blocking question's turn,
-    /// but a message-delivered question stays open until a message carries its answer.
+    /// The newest open question. A later user row ends a blocking question's turn, but a
+    /// message-delivered question stays open until a message carries its answer, so answering
+    /// one moves on to the next open one.
     var pendingQuestion: PendingQuestion? {
         var laterUserRow = false
         for m in messages.reversed() {
             if m.role == .user { laterUserRow = true; continue }
-            guard let t = m.tools.last(where: { $0.name == "ask_user_question" }) else { continue }
-            guard let q = PendingQuestion(tool: t), !answeredQuestionIds.contains(q.toolCallId) else { return nil }
-            return laterUserRow && !q.answerByMessage ? nil : q
+            for t in m.tools.reversed() where t.name == "ask_user_question" {
+                guard let q = PendingQuestion(tool: t), !answeredQuestionIds.contains(q.toolCallId) else { continue }
+                if laterUserRow && !q.answerByMessage { continue }
+                return q
+            }
         }
         return nil
     }
@@ -208,6 +230,7 @@ final class ChatStore {
         messages = []
         answeredQuestionIds = []
         sandboxApprovals = []
+        heldInputs = []
         caughtUp = false
         hasOlder = false
         streamingMessageId = nil
@@ -324,6 +347,16 @@ final class ChatStore {
                 if m.reasoningStartedAt != nil, m.reasoningEndedAt == nil { m.reasoningEndedAt = Date() }
             }
             if streamingMessageId == ev["messageId"]?.string { streamingMessageId = nil }
+        case "restore-to-input":
+            restoreSeq += 1
+            restoredInput = RestoredInput(seq: restoreSeq, text: ev["text"]?.string ?? "",
+                                          heldInputIds: (ev["heldInputIds"]?.array ?? []).compactMap(\.string),
+                                          textOnly: (ev["fileParts"]?.array ?? []).isEmpty && (ev["reviews"]?.array ?? []).isEmpty)
+        case "held-inputs-changed":
+            heldInputs = (ev["heldInputs"]?.array ?? []).compactMap { h in
+                guard let id = h["id"]?.string else { return nil }
+                return HeldInput(id: id, text: h["displayText"]?.string ?? "")
+            }
         case "bash-sandbox-approval":
             guard let tid = ev["toolCallId"]?.string else { return }
             sandboxApprovals.removeAll { $0.toolCallId == tid }
@@ -490,6 +523,23 @@ final class ChatStore {
     }
 
     func report(_ error: String) { lastError = error }
+
+    func takeRestoredInput() -> RestoredInput? {
+        defer { restoredInput = nil }
+        return restoredInput
+    }
+
+    /// Tells the server the composer took these inputs, so they stop being held.
+    func discardHeld(_ ids: [String]) async {
+        for id in ids {
+            do {
+                try await client.call("workspace/discardHeldInput", ["workspaceId": .string(workspaceId), "heldInputId": .string(id)])
+                heldInputs.removeAll { $0.id == id }
+            } catch {
+                lastError = "Could not clear a returned message: \(error.localizedDescription)"
+            }
+        }
+    }
 
     func answerSandbox(_ approval: SandboxApproval, approved: Bool) async throws {
         do {

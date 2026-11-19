@@ -145,6 +145,27 @@ enum ModelName {
     }
     static func provider(_ id: String) -> String { id.split(separator: ":").first.map(String.init) ?? "" }
 
+    /// Built-in choices, offered for the providers a server has configured.
+    static let builtIn = [
+        "anthropic:claude-opus-5-5", "anthropic:claude-sonnet-5-5", "anthropic:claude-haiku-5-5",
+        "anthropic:claude-fable-5-2", "openai:gpt-6.2-sol", "google:gemini-3.1-pro-preview",
+    ]
+
+    /// The models a server can run, from `providers.getConfig`: the built-ins of each configured,
+    /// enabled provider, then each provider's own model list (custom and local providers).
+    static func catalog(providers: JSONValue) -> [String] {
+        let usable = (providers.object ?? [:]).filter { $0.value["isConfigured"]?.bool == true && $0.value["isEnabled"]?.bool != false }
+        var out = builtIn.filter { usable[provider($0)] != nil }
+        for (name, info) in usable.sorted(by: { $0.key < $1.key }) {
+            for entry in info["models"]?.array ?? [] {
+                guard let id = entry.string ?? entry["id"]?.string else { continue }
+                let full = "\(name):\(id)"
+                if !out.contains(full) { out.append(full) }
+            }
+        }
+        return out
+    }
+
     /// Input token limit for the context ring, from `max_input_tokens` in
     /// src/common/utils/tokens/models-extra.ts; other models fall back to 200K.
     static func contextWindow(_ id: String?) -> Int {

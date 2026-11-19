@@ -207,8 +207,10 @@ final class WorkspaceInfoStore {
 
     // MARK: - Changes (git, through executeBash like the desktop Review tab)
 
-    /// Diff base: the merge base with origin/main (or main), else HEAD.
-    private static let base = #"b=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || git rev-parse HEAD)"#
+    /// Diff base: the merge base with origin's default branch (origin/HEAD, so `develop` or
+    /// `master` trunks work), else origin/main, main or master, else HEAD. Shared with the list's
+    /// diff badges so both count the same changes.
+    static let base = #"t=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); b=$({ [ -n "$t" ] && git merge-base HEAD "$t"; } 2>/dev/null || git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || git merge-base HEAD master 2>/dev/null || git rev-parse HEAD)"#
 
     private func bash(_ script: String) async throws -> String {
         let r = try await client.call("workspace/executeBash", ["workspaceId": .string(workspaceId), "script": .string(script),

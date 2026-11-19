@@ -118,10 +118,16 @@ final class WorkspaceListStore {
 
     /// "Waiting on you" is derived client side (the server has no inbox): replay the chat of each
     /// recent idle workspace and look for an open question or a just-proposed plan.
+    /// Every workspace, newest first, at most four replays at a time: the Inbox claims all of
+    /// them, so an older idle one with an open question must count too.
     func scanAttention() async {
-        let recent = workspaces.sorted { (activity[$0.id]?.recency ?? .distantPast) > (activity[$1.id]?.recency ?? .distantPast) }.prefix(12)
+        let ordered = workspaces.sorted { (activity[$0.id]?.recency ?? .distantPast) > (activity[$1.id]?.recency ?? .distantPast) }
         await withTaskGroup(of: Void.self) { g in
-            for w in recent { g.addTask { await self.scan(w.id) } }
+            var next = ordered.makeIterator()
+            for _ in 0..<4 { if let w = next.next() { g.addTask { await self.scan(w.id) } } }
+            while await g.next() != nil {
+                if let w = next.next() { g.addTask { await self.scan(w.id) } }
+            }
         }
     }
 
@@ -147,7 +153,7 @@ final class WorkspaceListStore {
     /// File names reach `xargs -0` and `cat` as arguments, never as shell text: a repository can
     /// hold untracked files with any name, and this script runs when the list opens.
     func refreshDiffStats() async {
-        let script = #"b=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo HEAD); u=$(git ls-files --others --exclude-standard -z | xargs -0 cat -- 2>/dev/null | wc -l); git diff --numstat "$b" | awk -v u="$u" '{a+=$1;d+=$2} END {print a+u, d+0}'"#
+        let script = WorkspaceInfoStore.base + #"; u=$(git ls-files --others --exclude-standard -z | xargs -0 cat -- 2>/dev/null | wc -l); git diff --numstat "$b" | awk -v u="$u" '{a+=$1;d+=$2} END {print a+u, d+0}'"#
         await withTaskGroup(of: (String, (Int, Int)?).self) { g in
             for w in workspaces where !w.isScratch {
                 g.addTask {
@@ -162,5 +168,9 @@ final class WorkspaceListStore {
         }
     }
 
-    func clearAttention(_ id: String) { attention[id] = nil }
+    /// Opening a workspace shows its failure, so that goes; a question or plan stays until the
+    /// chat resolves it (the next scan decides).
+    func clearAttention(_ id: String) {
+        if case .error? = attention[id] { attention[id] = nil }
+    }
 }

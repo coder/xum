@@ -23,15 +23,7 @@ struct PickersPopover: View {
 
     @Environment(\.dismiss) private var dismiss
 
-    /// Model ids come as `provider:model` (docs/06-backend-api-map.md).
-    static let models: [String] = [
-        "anthropic:claude-opus-5-5",
-        "anthropic:claude-sonnet-5-5",
-        "anthropic:claude-haiku-5-5",
-        "anthropic:claude-fable-5-2",
-        "openai:gpt-6.2-sol",
-        "google:gemini-3.1-pro-preview",
-    ]
+    @Environment(AppModel.self) private var app
 
     /// Every level, as the New Chat picker offers; the server clamps one a model does not support.
     private var levels: [ThinkingLevel] { ThinkingLevel.allCases }
@@ -53,7 +45,7 @@ struct PickersPopover: View {
             divider
             SectionCaption(text: "Model")
                 .padding(.init(top: 10, leading: 18, bottom: 4, trailing: 18))
-            ForEach(Self.models, id: \.self) { m in
+            ForEach(app.modelChoices, id: \.self) { m in
                 modelRow(m)
             }
             divider

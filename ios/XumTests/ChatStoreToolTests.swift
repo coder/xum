@@ -63,6 +63,18 @@ struct ChatStoreToolTests {
          "metadata": ["historySequence": .number(Double(seq))]]
     }
 
+    @Test func answeringOneMessageQuestionMovesToTheNextOpenOne() {
+        let s = store()
+        s.apply(row("q", role: "assistant", seq: 1, parts: [question("older", byMessage: true), question("newer", byMessage: true)]))
+        s.apply(row("a", role: "user", seq: 2, parts: [["type": "text", "text": "answer"]]))
+        s.apply(["type": "caught-up", "historyReplayStatus": "complete"])
+        #expect(s.pendingQuestion?.toolCallId == "newer")
+        // The answer row for "newer", as the server stores it.
+        s.apply(["type": "message", "id": "a2", "role": "user", "parts": [["type": "text", "text": "x"]],
+                 "metadata": ["historySequence": 3, "muxMetadata": ["type": "normal", "askUserQuestionAnswer": ["toolCallId": "newer", "answers": [:]]]]])
+        #expect(s.pendingQuestion?.toolCallId == "older")
+    }
+
     @Test(arguments: [(true, true), (false, false)])
     func unrelatedUserRowEndsOnlyBlockingQuestions(byMessage: Bool, stillOpen: Bool) {
         let s = store()
@@ -107,5 +119,40 @@ struct APIResultErrorTests {
     ] as [(JSONValue, String)])
     func readsStringOrObjectErrors(error: JSONValue, message: String) {
         #expect(APIClient.resultError(error) == message)
+    }
+}
+
+struct ModelCatalogTests {
+    @Test func offersConfiguredProvidersAndTheirOwnModels() {
+        let providers: JSONValue = [
+            "anthropic": ["isConfigured": false, "isEnabled": true],
+            "openai": ["isConfigured": true, "isEnabled": false],
+            "omlx": ["isConfigured": true, "isEnabled": true, "models": ["GLM-5.3-Flash", ["id": "qwen-small"]]],
+            "google": ["isConfigured": true, "isEnabled": true],
+        ]
+        #expect(ModelName.catalog(providers: providers) == ["google:gemini-3.1-pro-preview", "omlx:GLM-5.3-Flash", "omlx:qwen-small"])
+    }
+}
+
+@MainActor
+struct ReturnedInputTests {
+    private func store() -> ChatStore {
+        ChatStore(workspaceId: "ws", client: APIClient(baseURL: URL(string: "http://127.0.0.1:1")!, token: "t"))
+    }
+
+    @Test func restoreIsTakenOnceAndHeldInputsFollowTheServer() {
+        let s = store()
+        s.apply(["type": "restore-to-input", "workspaceId": "ws", "text": "follow up", "heldInputIds": ["h1"]])
+        let r = s.takeRestoredInput()
+        #expect(r?.text == "follow up")
+        #expect(r?.heldInputIds == ["h1"])
+        #expect(r?.textOnly == true)
+        #expect(s.takeRestoredInput() == nil)
+        s.apply(["type": "held-inputs-changed", "workspaceId": "ws", "heldInputs": [
+            ["id": "h1", "reason": "interrupted", "displayText": "follow up", "attachmentCount": 0, "reviewCount": 0],
+        ]])
+        #expect(s.heldInputs.map(\.id) == ["h1"])
+        s.apply(["type": "held-inputs-changed", "workspaceId": "ws", "heldInputs": []])
+        #expect(s.heldInputs.isEmpty)
     }
 }

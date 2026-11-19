@@ -42,6 +42,21 @@ final class AppModel {
 
     /// Composer defaults (the server stores per-workspace settings; these seed new chats).
     var defaultModel = "anthropic:claude-opus-5-5"
+    /// The current server's usable models (`ModelName.catalog`); the built-ins until it loads.
+    private(set) var serverModels: [String] = []
+    var modelChoices: [String] { serverModels.isEmpty ? ModelName.builtIn : serverModels }
+
+    /// A server with only local or custom models must not get a fixed Anthropic default: its
+    /// first send would be refused. The server's own default wins, else its first usable model.
+    func loadModels() async {
+        guard let c = servers.currentClient else { return }
+        guard let providers = try? await c.call("providers/getConfig") else { return }
+        let models = ModelName.catalog(providers: providers)
+        serverModels = models
+        guard !models.isEmpty, !models.contains(defaultModel) else { return }
+        let serverDefault = (try? await c.call("config/getConfig"))?["defaultModel"]?.string
+        defaultModel = serverDefault.flatMap { models.contains($0) ? $0 : nil } ?? models[0]
+    }
     var defaultAgent = "exec"
     var defaultThinking: ThinkingLevel = .medium
 
@@ -56,12 +71,15 @@ final class AppModel {
         list?.stop()
         chatStores.values.forEach { $0.stop() }
         chatStores = [:]
+        chatOrder = []
         path = []
         selectedWorkspaceId = nil
         guard let c = servers.currentClient else { list = nil; return }
         let l = WorkspaceListStore(client: c)
         list = l
         l.start()
+        serverModels = []
+        Task { await loadModels() }
     }
 
     func switchServer(_ id: String) {
@@ -85,7 +103,18 @@ final class AppModel {
         if wasCurrent { connectCurrent() }
     }
 
+    /// Live chats, most recent last. Each holds an SSE stream and a transcript, so only the
+    /// last few stay open; an evicted one replays again when it is reopened.
+    private var chatOrder: [String] = []
+    private static let liveChatLimit = 3
+
     func chatStore(_ workspaceId: String) -> ChatStore? {
+        chatOrder.removeAll { $0 == workspaceId }
+        chatOrder.append(workspaceId)
+        while chatOrder.count > Self.liveChatLimit {
+            let old = chatOrder.removeFirst()
+            chatStores.removeValue(forKey: old)?.stop()
+        }
         if let s = chatStores[workspaceId] { return s }
         guard let c = servers.currentClient else { return nil }
         let s = ChatStore(workspaceId: workspaceId, client: c)

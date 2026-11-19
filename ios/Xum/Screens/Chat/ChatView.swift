@@ -51,6 +51,11 @@ struct ChatView: View {
         .toolbar { toolbarContent }
         .toolbar(.hidden, for: .tabBar)
         .onAppear(perform: attach)
+        // The server hands back a queued message it did not run (Stop, a refused send): put it
+        // back in the composer, then let the server drop its held copy.
+        .onChange(of: store?.restoredInput?.seq) { takeRestoredInput() }
+        // Opening a chat does not answer it: rescan so a question or plan stays in the Inbox.
+        .onDisappear { if let list = model.list { Task { await list.scan(workspaceId) } } }
         // Regular width (iPhone Duo inner display): the tool detail is a persistent side panel
         // beside the chat instead of a modal sheet; tapping another row swaps its content.
         .sheet(item: sizeClass == .regular ? .constant(nil) : selectedToolBinding) { tool in
@@ -96,6 +101,16 @@ struct ChatView: View {
     }
 
     // MARK: - Setup
+
+    private func takeRestoredInput() {
+        guard let store, let r = store.takeRestoredInput(), !r.text.isEmpty else { return }
+        restoreToComposer(r.text)
+        if r.textOnly { Task { await store.discardHeld(r.heldInputIds) } }
+    }
+
+    private func restoreToComposer(_ text: String) {
+        draft = draft.isEmpty ? text : draft + "\n\n" + text
+    }
 
     private func attach() {
         guard !seeded else { return }
@@ -310,6 +325,14 @@ struct ChatView: View {
                 TodoPill(todos: store.todos, isStreaming: store.isStreaming)
                     .padding(.horizontal, 12)
             }
+            ForEach(store.heldInputs, id: \.id) { held in
+                HeldInputRow(held: held) {
+                    restoreToComposer(held.text)
+                    Task { await store.discardHeld([held.id]) }
+                } onDiscard: {
+                    Task { await store.discardHeld([held.id]) }
+                }
+            }
             if let approval = store.sandboxApprovals.first {
                 SandboxApprovalCard(approval: approval) { approved in
                     Task { try? await store.answerSandbox(approval, approved: approved) }
@@ -319,6 +342,8 @@ struct ChatView: View {
                 QuestionCard(question: question) { answers in
                     Task { try? await store.answer(question, answers: answers) }
                 }
+                // A new call gets fresh state: the old page index could be out of its range.
+                .id(question.toolCallId)
             } else {
                 Composer(
                     text: $draft,
