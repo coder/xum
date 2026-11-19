@@ -76,6 +76,16 @@ export interface Changes {
 
 export function changesSince(cwd: string, baseRef: string): Changes {
   const root = git(cwd, ["rev-parse", "--show-toplevel"]).trim();
+  // Untracked files never appear in `git diff`, so every gate built on this
+  // helper would skip them silently. Say which ones escaped the score.
+  const untracked = git(root, ["ls-files", "--others", "--exclude-standard", "-z", "--", "src"])
+    .split("\0")
+    .filter((path) => path !== "" && SCORED.test(path));
+  if (untracked.length > 0) {
+    console.error(
+      `warning  untracked source files bypass the quality gates until staged: ${untracked.join(", ")}`
+    );
+  }
   const base = git(root, [
     "rev-parse",
     "--verify",
