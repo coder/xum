@@ -326,9 +326,9 @@ struct NewChatView: View {
         ("anthropic:claude-opus-5-5", "Opus 5.5"),
         ("anthropic:claude-sonnet-5-5", "Sonnet 5.5"),
         ("anthropic:claude-haiku-5-5", "Haiku 5.5"),
-        ("anthropic:claude-fable-5-1", "Fable 5.1"),
-        ("openai:gpt-6.1-sol", "GPT-6.1 Sol"),
-        ("google:gemini-3.1-pro", "Gemini 3.1 Pro"),
+        ("anthropic:claude-fable-5-2", "Fable 5.2"),
+        ("openai:gpt-6.2-sol", "GPT-6.2 Sol"),
+        ("google:gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
     ]
 
     private var thinkingChip: some View {

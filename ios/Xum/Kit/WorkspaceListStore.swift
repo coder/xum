@@ -57,14 +57,18 @@ final class WorkspaceListStore {
             let p = try await client.call("projects/list")
             projects = (p.array ?? []).compactMap { pair in
                 guard let path = pair[0]?.string else { return nil }
-                return Project(path: path, name: URL(fileURLWithPath: path).lastPathComponent)
+                let custom = pair[1]?["displayName"]?.string?.trimmingCharacters(in: .whitespaces)
+                return Project(path: path, name: custom?.isEmpty == false ? custom! : URL(fileURLWithPath: path).lastPathComponent)
             }
             let w = try await client.call("workspace/list", [:])
             workspaces = (w.array ?? []).compactMap(Workspace.init(json:))
             let a = try await client.call("workspace/activity/list")
-            var act: [String: WorkspaceActivity] = [:]
-            for (k, v) in a.object ?? [:] { act[k] = WorkspaceActivity(json: v) }
-            activity = act
+            // `null` means the server could not read activity, not that every workspace is idle.
+            if let snapshot = a.object {
+                var act: [String: WorkspaceActivity] = [:]
+                for (k, v) in snapshot { act[k] = WorkspaceActivity(json: v) }
+                activity = act
+            }
             loaded = true
             error = nil
             await withTaskGroup(of: Void.self) { g in

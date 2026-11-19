@@ -29,7 +29,7 @@ struct AgentListDetail: View {
         .task {
             guard let client = model.servers.currentClient, agents.isEmpty else { return }
             do {
-                let res = try await client.call("agents/list")
+                let res = try await client.call("agents/list", try SettingsView.agentDiscovery(model))
                 agents = (res.array ?? []).compactMap { item in
                     guard let id = item["id"]?.string else { return nil }
                     return (id, item["name"]?.string ?? item["title"]?.string ?? id)

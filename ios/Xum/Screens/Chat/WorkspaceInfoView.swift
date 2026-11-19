@@ -208,7 +208,7 @@ private struct StatsTab: View {
     let chat: ChatStore?
 
     /// Same budget as the composer's context ring.
-    private let contextLimit = 200_000
+    private var contextLimit: Int { ModelName.contextWindow(store.contextModel ?? chat?.lastModel) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {

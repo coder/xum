@@ -5,7 +5,6 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @AppStorage("xum.appearance") private var appearance = Appearance.system.rawValue
-    @AppStorage("xum.requireFaceID") private var requireFaceID = false
     @Environment(\.inSidebar) private var sidebar
     @State private var stats = ServerStats()
 
@@ -146,7 +145,7 @@ struct SettingsView: View {
                     .contentShape(Rectangle())
                 }
             }
-            cellRow {
+            cellRow(last: true) {
                 HStack(spacing: 12) {
                     SettingsTileIcon(color: SettingsTile.rust, systemImage: "bell")
                     Text("Notifications").font(.system(size: 16)).foregroundStyle(Color.xText)
@@ -154,18 +153,6 @@ struct SettingsView: View {
                     if !sidebar {
                         Text("Done, needs you").font(.system(size: 16)).foregroundStyle(Color.xText2)
                     }
-                }
-                .padding(paddedRow)
-                .frame(minHeight: 52)
-            }
-            cellRow(last: true) {
-                HStack(spacing: 12) {
-                    SettingsTileIcon(color: SettingsTile.green, systemImage: "faceid")
-                    Text(sidebar ? "Face ID" : "Require Face ID").font(.system(size: 16)).foregroundStyle(Color.xText)
-                    Spacer(minLength: 8)
-                    Toggle("Require Face ID", isOn: $requireFaceID)
-                        .labelsHidden()
-                        .tint(Color.xAccentFill)
                 }
                 .padding(paddedRow)
                 .frame(minHeight: 52)
@@ -249,7 +236,8 @@ struct SettingsView: View {
     private func loadStats() async {
         guard let client = model.servers.currentClient else { return }
         stats = ServerStats()
-        async let agents = Self.loadAgents(client)
+        let discovery = try? Self.agentDiscovery(model)
+        async let agents = Self.loadAgents(client, discovery)
         async let providers = Self.loadConfiguredProviders(client)
         async let mcp = Self.loadMCPServers(client)
         async let sessions = Self.loadSessions(client)
@@ -257,9 +245,15 @@ struct SettingsView: View {
         stats = ServerStats(agentCount: a, configuredProviders: p?.configured, mcpCount: m, sessionCount: s)
     }
 
-    static func loadAgents(_ client: APIClient) async -> Int? {
-        guard let res = try? await client.call("agents/list") else { return nil }
+    static func loadAgents(_ client: APIClient, _ discovery: JSONValue?) async -> Int? {
+        guard let discovery, let res = try? await client.call("agents/list", discovery) else { return nil }
         return res.array?.count
+    }
+
+    /// `agents/list` discovers from a project or workspace; built-in agents come with any project.
+    static func agentDiscovery(_ model: AppModel) throws -> JSONValue {
+        guard let path = model.list?.projects.first?.path else { throw APIError.rejected("No project on this server") }
+        return ["projectPath": .string(path)]
     }
 
     /// `providers/getConfig` shape is lenient: an object keyed by provider or a plain array.

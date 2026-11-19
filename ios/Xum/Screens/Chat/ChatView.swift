@@ -308,7 +308,7 @@ struct ChatView: View {
                     thinking: $thinking,
                     placeholder: store.isStreaming ? "Queue a follow-up" : "Message \(workspace?.displayName ?? "agent")",
                     isStreaming: store.isStreaming,
-                    contextFraction: store.contextTokens.map { min(1, Double($0) / 200_000) },
+                    contextFraction: store.contextTokens.map { min(1, Double($0) / Double(ModelName.contextWindow(store.lastModel ?? modelId))) },
                     onSend: { send(store) },
                     onStop: { Task { try? await store.interrupt() } }
                 )
@@ -339,7 +339,14 @@ struct ChatView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
-        Task { try? await store.send(text, model: modelId, agentId: agent, thinking: thinking) }
+        Task {
+            do {
+                try await store.send(text, model: modelId, agentId: agent, thinking: thinking)
+            } catch {
+                // Keep the prompt: the store shows why it failed.
+                if draft.isEmpty { draft = text }
+            }
+        }
     }
 
     // MARK: - Toolbar

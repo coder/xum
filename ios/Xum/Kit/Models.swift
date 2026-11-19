@@ -131,8 +131,8 @@ enum ModelName {
         let model = id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? id
         let known: [String: String] = [
             "claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5", "claude-haiku-5-5": "Haiku 5.5",
-            "claude-fable-5-1": "Fable 5.1", "gpt-6.1-sol": "GPT-6.1 Sol", "gpt-6.2-sol": "GPT-6.2 Sol",
-            "gemini-3.1-pro": "Gemini 3.1 Pro",
+            "claude-fable-5-2": "Fable 5.2", "gpt-6.2-sol": "GPT-6.2 Sol",
+            "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
         ]
         if let k = known[model] { return k }
         // Local quantized builds (`GLM-5.3-Flash-oQ4e-mtp`): keep the family and size.
@@ -144,6 +144,17 @@ enum ModelName {
         return s.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
     }
     static func provider(_ id: String) -> String { id.split(separator: ":").first.map(String.init) ?? "" }
+
+    /// Input token limit for the context ring, from `max_input_tokens` in
+    /// src/common/utils/tokens/models-extra.ts; other models fall back to 200K.
+    static func contextWindow(_ id: String?) -> Int {
+        let model = id?.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
+        let known: [String: Int] = [
+            "claude-opus-5-5": 1_000_000, "claude-sonnet-5-5": 1_000_000, "claude-haiku-5-5": 1_000_000,
+            "claude-fable-5-2": 1_000_000, "gpt-6.2-sol": 922_000, "gemini-3.1-pro-preview": 1_048_576,
+        ]
+        return known[model] ?? 200_000
+    }
 }
 
 enum ThinkingLevel: String, CaseIterable, Sendable {

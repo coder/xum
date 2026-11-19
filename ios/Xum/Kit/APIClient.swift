@@ -5,6 +5,8 @@ enum APIError: Error, LocalizedError, Equatable {
     case http(Int, String)
     case transport(String)
     case decoding
+    /// A 2xx `{ success: false, error }` result: the server refused the operation.
+    case rejected(String)
 
     var errorDescription: String? {
         switch self {
@@ -12,6 +14,7 @@ enum APIError: Error, LocalizedError, Equatable {
         case .http(let code, let body): "Server error \(code): \(body.prefix(120))"
         case .transport(let m): m
         case .decoding: "Unexpected response"
+        case .rejected(let m): m
         }
     }
 }
@@ -67,7 +70,19 @@ struct APIClient: Sendable {
         guard (200..<300).contains(code) else { throw APIError.http(code, String(decoding: data, as: UTF8.self)) }
         if data.isEmpty { return .null }
         guard let v = JSONValue.parse(data) else { throw APIError.decoding }
+        // Many procedures report refusals as a 2xx Result; callers that ignore the value would
+        // otherwise present them as success.
+        if v["success"]?.bool == false { throw APIError.rejected(Self.resultError(v["error"])) }
         return v
+    }
+
+    /// A Result's `error` is a string or a typed object (SendMessageError and friends) whose
+    /// text is in `message`, `raw` or `reason`, else only its type and provider.
+    static func resultError(_ e: JSONValue?) -> String {
+        if let s = e?.string ?? e?["message"]?.string ?? e?["raw"]?.string ?? e?["reason"]?.string { return s }
+        guard let type = e?["type"]?.string else { return "The server refused the request" }
+        let readable = type.replacingOccurrences(of: "_", with: " ")
+        return e?["provider"]?.string.map { "\(readable): \($0)" } ?? readable
     }
 
     /// Subscription: yields each SSE `data:` payload as JSON. Ends when the server closes the

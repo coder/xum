@@ -40,11 +40,15 @@ PY
 rm -f "$devices_json"
 echo "Installing on ${DEVICE_NAME//_/ } as $BUNDLE_ID"
 
+# Fail on the build's own status, not on whether an earlier build left an app behind. grep
+# exits 1 when it prints nothing, which must not fail the script by itself.
+build_status=0
 xcodebuild -project "$ROOT/ios/Xum.xcodeproj" -scheme Xum -configuration "$CONFIGURATION" \
   -destination "platform=iOS,id=$DEVICE_UDID" -derivedDataPath "$DERIVED" \
   -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
   DEVELOPMENT_TEAM="$TEAM_ID" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-  build | grep -E "error:|BUILD" || true
+  build | { grep -E "error:|BUILD" || true; } || build_status=$?
+[ "$build_status" -eq 0 ] || { echo "build failed (xcodebuild exit $build_status)" >&2; exit 1; }
 
 APP="$DERIVED/Build/Products/$CONFIGURATION-iphoneos/Xum.app"
 [ -d "$APP" ] || { echo "build failed: no $APP" >&2; exit 1; }

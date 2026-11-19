@@ -143,6 +143,8 @@ struct QuestionCard: View {
     /// Question index to chosen option index; -1 = custom text, -2 = skipped.
     @State private var selections: [Int: Int] = [:]
     @State private var customText: [Int: String] = [:]
+    /// Chosen option indexes of multi-select questions; the custom row stays in `selections`.
+    @State private var picked: [Int: Set<Int>] = [:]
 
     private var q: PendingQuestion.Question { question.questions[index] }
     private var isLast: Bool { index == question.questions.count - 1 }
@@ -225,14 +227,27 @@ struct QuestionCard: View {
 
     private var selection: Int { selections[index] ?? defaultSelection(index) }
 
+    private func pickedOptions(_ i: Int) -> Set<Int> {
+        if let set = picked[i] { return set }
+        let d = defaultSelection(i)
+        return d >= 0 ? [d] : []
+    }
+
     private func optionRow(_ i: Int) -> some View {
         let option = q.options[i]
-        let selected = selection == i
+        let selected = q.multiSelect ? pickedOptions(index).contains(i) : selection == i
         return Button {
-            selections[index] = i
+            if q.multiSelect {
+                var set = pickedOptions(index)
+                if set.contains(i) { set.remove(i) } else { set.insert(i) }
+                picked[index] = set
+                if selections[index] == -2 { selections[index] = nil }
+            } else {
+                selections[index] = i
+            }
         } label: {
             HStack(alignment: .center, spacing: 12) {
-                radioDot(selected: selected)
+                radioDot(selected: selected, square: q.multiSelect)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(displayLabel(option.label))
@@ -265,7 +280,7 @@ struct QuestionCard: View {
     @ViewBuilder private var customRow: some View {
         if selection == -1 {
             HStack(spacing: 12) {
-                radioDot(selected: true)
+                radioDot(selected: true, square: q.multiSelect)
                 TextField("Type your answer…", text: Binding(
                     get: { customText[index] ?? "" },
                     set: { customText[index] = $0 }
@@ -281,7 +296,7 @@ struct QuestionCard: View {
                 selections[index] = -1
             } label: {
                 HStack(spacing: 12) {
-                    radioDot(selected: false)
+                    radioDot(selected: false, square: q.multiSelect)
                     Text("Something else…")
                         .font(.system(size: 15))
                         .foregroundStyle(Color.xText2)
@@ -296,10 +311,12 @@ struct QuestionCard: View {
         }
     }
 
-    private func radioDot(selected: Bool) -> some View {
-        ZStack {
-            Circle().strokeBorder(Color.xText3, lineWidth: 1.5)
-            if selected { Circle().fill(Color.xAccent).frame(width: 10, height: 10) }
+    /// A square marks a multi-select option (a checkbox), a circle a single choice.
+    private func radioDot(selected: Bool, square: Bool = false) -> some View {
+        let shape = RoundedRectangle(cornerRadius: square ? 5 : 10)
+        return ZStack {
+            shape.strokeBorder(Color.xText3, lineWidth: 1.5)
+            if selected { RoundedRectangle(cornerRadius: square ? 2.5 : 5).fill(Color.xAccent).frame(width: 10, height: 10) }
         }
         .frame(width: 20, height: 20)
     }
@@ -324,6 +341,13 @@ struct QuestionCard: View {
     private func submit() {
         var answers: [String: String] = [:]
         for (i, q) in question.questions.enumerated() {
+            if q.multiSelect, selections[i] != -2 {
+                // Same serialization as the desktop form: chosen labels, then the custom text.
+                var parts = pickedOptions(i).sorted().filter(q.options.indices.contains).map { q.options[$0].label }
+                if selections[i] ?? defaultSelection(i) == -1, let t = customText[i], !t.isEmpty { parts.append(t) }
+                answers[q.question] = parts.joined(separator: ", ")
+                continue
+            }
             switch selections[i] ?? defaultSelection(i) {
             case -1: answers[q.question] = customText[i] ?? ""
             case -2: answers[q.question] = ""

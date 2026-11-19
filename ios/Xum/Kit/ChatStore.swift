@@ -13,8 +13,9 @@ struct ToolCall: Identifiable, Hashable, Sendable {
     var endedAt: Date?
     var liveOutput: String = ""
 
+    /// Nil for a finished call whose end time is unknown (persisted parts carry no end time).
     var duration: TimeInterval? {
-        guard let s = startedAt else { return nil }
+        guard let s = startedAt, state == .running || endedAt != nil else { return nil }
         return (endedAt ?? Date()).timeIntervalSince(s)
     }
 }
@@ -141,13 +142,15 @@ final class ChatStore {
     /// Tool call IDs answered by a later user message (`muxMetadata.askUserQuestionAnswer`).
     private(set) var answeredQuestionIds: Set<String> = []
 
+    /// The newest question, while it is open. A later user row ends a blocking question's turn,
+    /// but a message-delivered question stays open until a message carries its answer.
     var pendingQuestion: PendingQuestion? {
+        var laterUserRow = false
         for m in messages.reversed() {
-            // A user message after the question means the turn moved on.
-            if m.role == .user { return nil }
-            for t in m.tools.reversed() {
-                if let q = PendingQuestion(tool: t), !answeredQuestionIds.contains(q.toolCallId) { return q }
-            }
+            if m.role == .user { laterUserRow = true; continue }
+            guard let t = m.tools.last(where: { $0.name == "ask_user_question" }) else { continue }
+            guard let q = PendingQuestion(tool: t), !answeredQuestionIds.contains(q.toolCallId) else { return nil }
+            return laterUserRow && !q.answerByMessage ? nil : q
         }
         return nil
     }
@@ -259,9 +262,18 @@ final class ChatStore {
         case "tool-call-start":
             mutate(ev["messageId"]?.string) { m in
                 guard let tid = ev["toolCallId"]?.string else { return }
+                // `timestamp` is when the model emitted the call; parallel calls run one at a time,
+                // so the timer starts at execution (here on replay, else tool-call-execution-start).
                 let t = ToolCall(id: tid, name: ev["toolName"]?.string ?? "tool", input: ev["args"] ?? .null, output: nil,
-                                 state: .running, startedAt: date(ev["timestamp"]) ?? Date(), endedAt: nil)
+                                 state: .running, startedAt: date(ev["executionStartedAt"]), endedAt: nil)
                 if let i = m.parts.firstIndex(where: { $0.id == tid }) { m.parts[i] = .tool(t) } else { m.parts.append(.tool(t)) }
+            }
+        case "tool-call-execution-start":
+            mutate(ev["messageId"]?.string) { m in
+                guard let tid = ev["toolCallId"]?.string, let i = m.parts.firstIndex(where: { $0.id == tid }),
+                      case .tool(var t) = m.parts[i] else { return }
+                t.startedAt = date(ev["timestamp"]) ?? Date()
+                m.parts[i] = .tool(t)
             }
         case "tool-call-end":
             mutate(ev["messageId"]?.string) { m in
@@ -283,7 +295,17 @@ final class ChatStore {
             }
         case "stream-end":
             mutate(ev["messageId"]?.string) { m in
-                if let parts = ev["parts"]?.array { m.parts = Self.parseParts(parts, messageId: m.id) }
+                if let parts = ev["parts"]?.array {
+                    // Keep the end times measured live; the persisted parts have none.
+                    var live: [String: ToolCall] = [:]
+                    for case .tool(let t) in m.parts { live[t.id] = t }
+                    m.parts = Self.parseParts(parts, messageId: m.id).map { p in
+                        guard case .tool(var t) = p, let l = live[t.id], l.endedAt != nil else { return p }
+                        t.startedAt = l.startedAt ?? t.startedAt
+                        t.endedAt = l.endedAt
+                        return .tool(t)
+                    }
+                }
                 m.isStreaming = false
                 m.model = ev["metadata"]?["model"]?.string ?? m.model
                 if let ctx = ev["metadata"]?["contextUsage"]?["inputTokens"]?.int { contextTokens = ctx }
@@ -354,14 +376,6 @@ final class ChatStore {
         } else if role == .assistant, muxType == "compaction-summary" {
             m.compaction = .summary(source: "user")
         }
-        // Persisted tool parts carry only their end time; each one started when the previous step
-        // ended (or the turn began), which gives rows and groups their durations.
-        var cursor = m.timestamp
-        for i in m.parts.indices {
-            guard case .tool(var t) = m.parts[i] else { continue }
-            if t.startedAt == nil, let c = cursor, let e = t.endedAt, e >= c { t.startedAt = c; m.parts[i] = .tool(t) }
-            if let e = t.endedAt { cursor = e }
-        }
         return m
     }
 
@@ -399,7 +413,8 @@ final class ChatStore {
         f(&messages[i])
     }
 
-    private func date(_ v: JSONValue?) -> Date? { v?.double.map { Date(timeIntervalSince1970: $0 / 1000) } }
+    private func date(_ v: JSONValue?) -> Date? { Self.date(v) }
+    private static func date(_ v: JSONValue?) -> Date? { v?.double.map { Date(timeIntervalSince1970: $0 / 1000) } }
 
     static func failed(_ output: JSONValue?) -> Bool {
         guard let o = output else { return false }
@@ -421,12 +436,19 @@ final class ChatStore {
             case "dynamic-tool":
                 let state = p["state"]?.string
                 let output = p["output"]
-                var t = ToolCall(id: p["toolCallId"]?.string ?? "\(messageId)-x\(i)", name: p["toolName"]?.string ?? "tool",
+                // `output-redacted` is terminal too: its output was dropped and `failed` keeps the outcome.
+                let failedCall = state == "output-redacted" ? p["failed"]?.bool == true : failed(output)
+                let t = ToolCall(id: p["toolCallId"]?.string ?? "\(messageId)-x\(i)", name: p["toolName"]?.string ?? "tool",
                                  input: p["input"] ?? .null, output: output,
-                                 state: state == "output-available" ? .done : (state == "output-error" ? .failed : .running),
-                                 startedAt: nil, endedAt: nil)
-                if t.state == .done, failed(output) { t.state = .failed }
-                if let ts = p["timestamp"]?.double { t.endedAt = Date(timeIntervalSince1970: ts / 1000) }
+                                 state: state == "output-available" || state == "output-redacted" ? (failedCall ? .failed : .done) : .running,
+                                 startedAt: date(p["executionStartedAt"]) ?? date(p["timestamp"]), endedAt: nil)
+                // A persisted part has no end time; the next call the model emitted came after this result.
+                if let prev = out.lastIndex(where: { if case .tool = $0 { true } else { false } }),
+                   case .tool(var pt) = out[prev], pt.state != .running, pt.endedAt == nil,
+                   let s = pt.startedAt, let next = date(p["timestamp"]), next >= s {
+                    pt.endedAt = next
+                    out[prev] = .tool(pt)
+                }
                 out.append(.tool(t))
             default:
                 break
@@ -440,11 +462,21 @@ final class ChatStore {
     func send(_ text: String, model: String, agentId: String, thinking: ThinkingLevel?) async throws {
         var options: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "sendId": .string("ios-" + UUID().uuidString)]
         if let thinking { options["thinkingLevel"] = .string(thinking.rawValue) }
-        try await client.call("workspace/sendMessage", ["workspaceId": .string(workspaceId), "message": .string(text), "options": .object(options)])
+        do {
+            try await client.call("workspace/sendMessage", ["workspaceId": .string(workspaceId), "message": .string(text), "options": .object(options)])
+        } catch {
+            lastError = "Message not sent: \(error.localizedDescription)"
+            throw error
+        }
     }
 
     func interrupt() async throws {
-        try await client.call("workspace/interruptStream", ["workspaceId": .string(workspaceId)])
+        do {
+            try await client.call("workspace/interruptStream", ["workspaceId": .string(workspaceId)])
+        } catch {
+            lastError = "Could not stop: \(error.localizedDescription)"
+            throw error
+        }
     }
 
     func answer(_ q: PendingQuestion, answers: [String: String]) async throws {
@@ -453,17 +485,28 @@ final class ChatStore {
         let model = lastModel ?? "anthropic:claude-opus-5-5"
         let agent = messages.last(where: { $0.role == .assistant })?.agentId ?? "exec"
         answeredQuestionIds.insert(q.toolCallId)
-        try await client.call("workspace/sendMessage", [
-            "workspaceId": .string(workspaceId), "message": .string(text),
-            "options": ["model": .string(model), "agentId": .string(agent), "sendId": .string("ios-" + UUID().uuidString),
-                        "muxMetadata": ["type": "normal", "askUserQuestionAnswer": ["toolCallId": .string(q.toolCallId), "answers": .object(answers.mapValues { .string($0) })]]],
-        ])
+        do {
+            try await client.call("workspace/sendMessage", [
+                "workspaceId": .string(workspaceId), "message": .string(text),
+                "options": ["model": .string(model), "agentId": .string(agent), "sendId": .string("ios-" + UUID().uuidString),
+                            "muxMetadata": ["type": "normal", "askUserQuestionAnswer": ["toolCallId": .string(q.toolCallId), "answers": .object(answers.mapValues { .string($0) })]]],
+            ])
+        } catch {
+            answeredQuestionIds.remove(q.toolCallId)
+            lastError = "Answer not sent: \(error.localizedDescription)"
+            throw error
+        }
     }
 
     func answer(toolCallId: String, answers: [String: String]) async throws {
-        try await client.call("workspace/answerAskUserQuestion", [
-            "workspaceId": .string(workspaceId), "toolCallId": .string(toolCallId),
-            "answers": .object(answers.mapValues { .string($0) }),
-        ])
+        do {
+            try await client.call("workspace/answerAskUserQuestion", [
+                "workspaceId": .string(workspaceId), "toolCallId": .string(toolCallId),
+                "answers": .object(answers.mapValues { .string($0) }),
+            ])
+        } catch {
+            lastError = "Answer not sent: \(error.localizedDescription)"
+            throw error
+        }
     }
 }

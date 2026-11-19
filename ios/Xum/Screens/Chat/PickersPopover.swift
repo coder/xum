@@ -28,9 +28,9 @@ struct PickersPopover: View {
         "anthropic:claude-opus-5-5",
         "anthropic:claude-sonnet-5-5",
         "anthropic:claude-haiku-5-5",
-        "anthropic:claude-fable-5-1",
+        "anthropic:claude-fable-5-2",
         "openai:gpt-6.2-sol",
-        "google:gemini-3.1-pro",
+        "google:gemini-3.1-pro-preview",
     ]
 
     /// The five-stop thinking slider; `xhigh` only arrives from server state.

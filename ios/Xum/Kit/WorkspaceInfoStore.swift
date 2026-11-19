@@ -19,6 +19,18 @@ struct ModelUsage: Identifiable, Hashable, Sendable {
     var totalTokens: Int { buckets.reduce(0) { $0 + $1.1.tokens } }
     var cost: Double { buckets.reduce(0) { $0 + ($1.1.cost ?? 0) } }
 
+    mutating func add(_ o: ModelUsage) {
+        func sum(_ a: Bucket, _ b: Bucket) -> Bucket {
+            Bucket(tokens: a.tokens + b.tokens, cost: a.cost == nil && b.cost == nil ? nil : (a.cost ?? 0) + (b.cost ?? 0))
+        }
+        input = sum(input, o.input)
+        cached = sum(cached, o.cached)
+        cacheCreate = sum(cacheCreate, o.cacheCreate)
+        output = sum(output, o.output)
+        reasoning = sum(reasoning, o.reasoning)
+        hasUnknownCosts = hasUnknownCosts || o.hasUnknownCosts
+    }
+
     init(model: String, json j: JSONValue) {
         func bucket(_ k: String) -> Bucket { Bucket(tokens: j[k]?["tokens"]?.int ?? 0, cost: j[k]?["cost_usd"]?.double) }
         self.model = model
@@ -123,8 +135,20 @@ final class WorkspaceInfoStore {
     var hasUnknownCosts: Bool { usage.contains(where: \.hasUnknownCosts) }
 
     func loadUsage() async {
+        async let subagents = try? client.call("workspace/getSubagentUsage", ws)
         guard let r = try? await client.call("workspace/getSessionUsage", ws) else { usageLoaded = true; return }
-        usage = (r["byModel"]?.object ?? [:]).map { ModelUsage(model: $0.key, json: $0.value) }.sorted { $0.cost == $1.cost ? $0.totalTokens > $1.totalTokens : $0.cost > $1.cost }
+        var byModel: [String: ModelUsage] = [:]
+        for (k, v) in r["byModel"]?.object ?? [:] { byModel[k] = ModelUsage(model: k, json: v) }
+        // Live sub-agents are not in the ledger yet; skip a child already rolled up into it, as
+        // the desktop Costs tab does, so it is not counted twice.
+        let rolledUp = Set((r["rolledUpFrom"]?.object ?? [:]).keys)
+        for (child, entry) in await subagents?["children"]?.object ?? [:] where !rolledUp.contains(child) {
+            for (k, v) in entry["byModel"]?.object ?? [:] {
+                let u = ModelUsage(model: k, json: v)
+                if byModel[k] == nil { byModel[k] = u } else { byModel[k]?.add(u) }
+            }
+        }
+        usage = byModel.values.sorted { $0.cost == $1.cost ? $0.totalTokens > $1.totalTokens : $0.cost > $1.cost }
         if let u = r["lastRequest"]?["usage"] {
             contextTokens = ["input", "cached", "cacheCreate"].reduce(0) { $0 + (u[$1]?["tokens"]?.int ?? 0) }
             contextModel = r["lastRequest"]?["model"]?.string
@@ -142,9 +166,7 @@ final class WorkspaceInfoStore {
     func loadArtifacts() async {
         do {
             let r = try await client.call("artifacts/list", ws)
-            if r["success"]?.bool == false {
-                artifactsUnavailable = r["error"]?.string ?? "Artifacts are not available"
-            } else if r["data"]?["available"]?.bool == false {
+            if r["data"]?["available"]?.bool == false {
                 artifactsUnavailable = r["data"]?["reason"]?.string ?? "Artifacts are not available"
             } else {
                 artifactsUnavailable = nil
@@ -171,9 +193,7 @@ final class WorkspaceInfoStore {
     func readArtifact(_ path: String) async throws -> ArtifactContent {
         lastReadText = nil
         let r = try await client.call("artifacts/read", ["workspaceId": .string(workspaceId), "path": .string(path)])
-        guard r["success"]?.bool == true, let d = r["data"] else {
-            throw APIError.transport(r["error"]?.string ?? "Could not read the artifact")
-        }
+        guard let d = r["data"] else { throw APIError.decoding }
         switch d["status"]?.string {
         case "too_large": return .tooLarge(d["size"]?.int ?? 0)
         case "binary": return .binary
@@ -194,7 +214,6 @@ final class WorkspaceInfoStore {
         let r = try await client.call("workspace/executeBash", ["workspaceId": .string(workspaceId), "script": .string(script),
                                                                 "options": ["timeout_secs": 15]])
         let result = r["data"] ?? r
-        if r["success"]?.bool == false { throw APIError.transport(r["error"]?.string ?? "Command failed") }
         return result["output"]?.string ?? ""
     }
 
