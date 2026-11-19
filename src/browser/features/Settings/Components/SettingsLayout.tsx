@@ -18,7 +18,7 @@ export interface SettingsFocusTarget {
 export const SettingsFocusContext = createContext<SettingsFocusTarget | null>(null);
 
 /**
- * Opens a setting from inside a section (an experiment's "Configure in" link) the way a search
+ * Opens a setting from inside a section (an experiment's "Configure in" button) the way a search
  * result opens it: switch section, then scroll to and highlight the row. Null outside the page.
  */
 export const SettingsOpenSettingContext = createContext<((id: SettingId) => void) | null>(null);

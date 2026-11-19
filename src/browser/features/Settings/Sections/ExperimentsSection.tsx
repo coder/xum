@@ -63,6 +63,8 @@ interface ExperimentRowProps {
   disabled?: boolean;
   availabilityMessage?: string | null;
   onToggle?: (enabled: boolean) => void;
+  /** Beside the switch: the button that opens this experiment's options (ExperimentConfigButton). */
+  action?: React.ReactNode;
 }
 
 function ExperimentRow(props: ExperimentRowProps) {
@@ -102,13 +104,16 @@ function ExperimentRow(props: ExperimentRowProps) {
           </div>
         )}
       </div>
-      <Switch
-        checked={enabled}
-        disabled={disabled}
-        onCheckedChange={handleToggle}
-        aria-label={`Toggle ${props.name}`}
-        title={availabilityMessage ?? undefined}
-      />
+      <div className="flex shrink-0 items-center gap-3">
+        {props.action}
+        <Switch
+          checked={enabled}
+          disabled={disabled}
+          onCheckedChange={handleToggle}
+          aria-label={`Toggle ${props.name}`}
+          title={availabilityMessage ?? undefined}
+        />
+      </div>
     </SettingsAnchor>
   );
 }
@@ -720,7 +725,12 @@ const EXPERIMENT_CONFIG_SETTINGS: Partial<Record<ExperimentId, SettingId>> = {
   [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: "auto-routing",
 };
 
-function ExperimentConfigLink(props: { experimentId: ExperimentId }) {
+/**
+ * Opens the section that holds an enabled experiment's options, shown beside its switch. The
+ * section's own nav icon says where it goes; phones show the icon alone (the name stays the
+ * button's accessible name).
+ */
+function ExperimentConfigButton(props: { experimentId: ExperimentId }) {
   const enabled = useExperimentValue(props.experimentId);
   const settings = useOptionalSettings();
   const openSetting = useContext(SettingsOpenSettingContext);
@@ -732,11 +742,16 @@ function ExperimentConfigLink(props: { experimentId: ExperimentId }) {
   if (!section || (!openSetting && !settings)) return null;
   const open = () => (openSetting ? openSetting(settingId) : settings?.setActiveSection(sectionId));
   return (
-    <div className="pb-3">
-      <Button variant="link" size="xs" onClick={open}>
-        Configure in {section.label}
-      </Button>
-    </div>
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={open}
+      aria-label={`Configure in ${section.label}`}
+      className="text-content-secondary hover:text-content-primary gap-1.5 max-sm:px-2"
+    >
+      {section.icon}
+      <span className="hidden sm:inline">{section.label}</span>
+    </Button>
   );
 }
 
@@ -772,6 +787,7 @@ function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
             experimentId={subId}
             name={subExp.name}
             description={subExp.description}
+            action={<ExperimentConfigButton experimentId={subId} />}
           />
         );
       })}
@@ -838,11 +854,11 @@ export function ExperimentsSection() {
                     ? handleConfigurableBindUrlToggle
                     : undefined
                 }
+                action={<ExperimentConfigButton experimentId={exp.id} />}
               />
               {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
                 <ExperimentSettingsPanel>
                   <SubExperimentRows experimentIds={MEMORY_SUB_EXPERIMENT_IDS} />
-                  <ExperimentConfigLink experimentId={EXPERIMENT_IDS.MEMORY_CONSOLIDATION} />
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING && ptcEnabled && (
@@ -856,7 +872,6 @@ export function ExperimentsSection() {
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}
-              <ExperimentConfigLink experimentId={exp.id} />
             </React.Fragment>
           );
         })}
