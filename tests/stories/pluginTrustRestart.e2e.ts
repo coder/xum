@@ -8,7 +8,7 @@
  * hook-guard PreToolUse handler only (../bugbash/pluginHookFixtures.ts), so the seeded
  * hook-review-demo plugin, whose PreToolUse hook is already trusted, cannot satisfy them.
  */
-import { expect, unique } from "e2e";
+import { expect } from "e2e";
 import { z } from "zod";
 import { disableTutorials } from "../bugbash/repros/helpers";
 import { test } from "./fixtures";
@@ -58,13 +58,19 @@ test(
     );
     expect(path).toMatch(/^\/\S+\/plugin-sources\/hook-guard$/);
 
-    // A param, not part of the instruction: the path is a new temp folder on each run, and
-    // unique() keeps it out of the replay cache key, so the recording replays with today's path.
-    await agent.act(
-      "open Settings > Plugins, type the path {path} into the install field (the field takes a " +
-        "local path), preview it, and install the hook-guard plugin",
-      { params: { path: unique(path) } }
-    );
+    // exact steps: the replay of an agent.act install ran every tap, but its end-state check gave
+    // up before "Plugin installed." showed; Haiku 5.5 then reopened the form, met "already
+    // installed" and failed the step (PR lane, run 44324537803). The names are the Add plugin
+    // panel's (PluginsSettingsSection.tsx), as in the plugin repros (cursorMarketplaceMerge.e2e.ts).
+    await screen.getByTestId("settings-button").tap();
+    await settings.getByRole("button", "Plugins").tap();
+    await settings.getByRole("button", "Add plugin").tap();
+    await settings.getByRole("textbox", "Git URL or owner/repo").fill(path);
+    await settings.getByRole("button", "Preview").tap();
+    const install = settings.getByRole("button", "Install");
+    await expect(install).toBeEnabled({ timeout: 30_000 });
+    await install.tap();
+    await expect(settings.getByText("Plugin installed.")).toBeVisible({ timeout: 30_000 });
     await agent.act(
       "in Settings > Plugins, open the hook review of the hook-guard plugin and trust ONLY its " +
         "PreToolUse hook (MCP tool guard / check_command). Do not trust or turn off any other hook."
