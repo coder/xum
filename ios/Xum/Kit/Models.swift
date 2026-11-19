@@ -85,12 +85,15 @@ struct WorkspaceActivity: Hashable, Sendable {
 enum Attention: Hashable, Sendable {
     case question(String)
     case planReady(String)
+    /// A sandboxed command waits for the user's approval (its script's first line).
+    case approval(String)
     case error(String)
 
     var line: String {
         switch self {
         case .question: "Waiting on you · question"
         case .planReady: "Waiting on you · plan ready"
+        case .approval: "Waiting on you · approval"
         case .error(let m): m
         }
     }
@@ -160,7 +163,10 @@ enum ModelName {
     /// enabled provider, then each provider's own model list (custom and local providers).
     static func catalog(providers: JSONValue) -> [String] {
         let usable = (providers.object ?? [:]).filter { $0.value["isConfigured"]?.bool == true && $0.value["isEnabled"]?.bool != false }
-        var out = builtIn.filter { usable[provider($0)] != nil }
+        // A gateway routes built-ins of providers that are not configured themselves; which ones
+        // depends on the server's routing rules, so offer them all (src/common/constants/providers.ts).
+        let gateway = usable.keys.contains { ["openrouter", "github-copilot", "coder", "bedrock"].contains($0) }
+        var out = gateway ? builtIn : builtIn.filter { usable[provider($0)] != nil }
         for (name, info) in usable.sorted(by: { $0.key < $1.key }) {
             for entry in info["models"]?.array ?? [] {
                 guard let id = entry.string ?? entry["id"]?.string else { continue }

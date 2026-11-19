@@ -180,10 +180,11 @@ struct WorkspacesView: View {
 }
 
 extension Attention {
-    /// Question and plan mean the agent stopped for the user; error rows are failures, not waits.
+    /// Questions, plans and approvals mean the agent stopped for the user; error rows are
+    /// failures, not waits.
     var isWaiting: Bool {
         switch self {
-        case .question, .planReady: true
+        case .question, .planReady, .approval: true
         case .error: false
         }
     }
@@ -224,7 +225,7 @@ struct StatusIcon: View {
                     .symbolEffect(.rotate, options: .repeating)
             } else if let attention {
                 switch attention {
-                case .question, .planReady:
+                case .question, .planReady, .approval:
                     Image(systemName: "exclamationmark.circle").foregroundStyle(Color.xWarn)
                 case .error:
                     Image(systemName: "xmark.circle").foregroundStyle(Color.xBad)

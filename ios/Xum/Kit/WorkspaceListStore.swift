@@ -106,7 +106,12 @@ final class WorkspaceListStore {
     }
 
     private func followActivity() async {
+        var reconnect = false
         while !Task.isCancelled {
+            // The subscription sends changes only, so a turn that started or ended while it was
+            // down shows up only in a fresh list. `refresh()` covers the first connection.
+            if reconnect { await reconcileActivity() }
+            reconnect = true
             do {
                 for try await ev in client.subscribe("workspace/activity/subscribe") {
                     guard ev["type"]?.string == "activity", let id = ev["workspaceId"]?.string else { continue }
@@ -117,6 +122,17 @@ final class WorkspaceListStore {
             } catch {}
             try? await Task.sleep(nanoseconds: 3_000_000_000)
         }
+    }
+
+    private func reconcileActivity() async {
+        guard let snapshot = (try? await client.call("workspace/activity/list"))?.object else { return }
+        var act: [String: WorkspaceActivity] = [:]
+        for (k, v) in snapshot { act[k] = WorkspaceActivity(json: v) }
+        // A turn ended while disconnected: it was streaming, or it ran and ended unseen (recency moved).
+        let old = activity
+        let finished = act.filter { id, a in !a.streaming && (old[id]?.streaming == true || old[id]?.recency != a.recency) }.map(\.key)
+        activity = act
+        for id in finished { await scan(id) }
     }
 
     /// "Waiting on you" is derived client side (the server has no inbox): replay the chat of each
@@ -154,7 +170,10 @@ final class WorkspaceListStore {
         } catch { return }
         // Keep the last answer when the replay did not finish, and never revive a removed workspace.
         guard store.caughtUp, workspaces.contains(where: { $0.id == id }) else { return }
-        if let q = store.pendingQuestion {
+        // An approval blocks a turn that is still streaming, so it comes first.
+        if let a = store.sandboxApprovals.first {
+            attention[id] = .approval(ChatFormat.firstLine(a.script))
+        } else if let q = store.pendingQuestion {
             attention[id] = .question(q.questions.first?.question ?? "")
         } else if store.latestPlanToolId != nil, !store.isStreaming {
             attention[id] = .planReady(store.messages.last?.tools.last(where: { $0.name == "propose_plan" })?.input["title"]?.string ?? "Plan")

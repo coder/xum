@@ -59,7 +59,9 @@ final class AppModel {
         let serverDefault = (try? await c.call("config/getConfig"))?["defaultModel"]?.string
         // A switch while these calls ran started a newer load for the new server.
         guard servers.currentID == serverID else { return }
-        let models = ModelName.catalog(providers: providers)
+        var models = ModelName.catalog(providers: providers)
+        // The server's own default is valid by its routing even when this catalog misses it.
+        if let d = serverDefault, !d.isEmpty, !models.contains(d) { models.insert(d, at: 0) }
         serverModels = models
         guard !models.isEmpty else { return }
         if let d = serverDefault, models.contains(d) {
@@ -183,7 +185,7 @@ final class AppModel {
         if ConnectionLink.parse(raw) != nil { sheet = .connectLink(prefill: raw) }
     }
 
-    /// Creates a workspace and sends its first message; returns the new ID.
+    /// Creates a workspace and starts sending its first message; returns the new ID.
     func createWorkspace(projectPath: String, runtime: RuntimeKind, trunk: String?, message: String,
                          model: String, agentId: String, thinking: ThinkingLevel) async throws -> String {
         guard let c = servers.currentClient else { throw APIError.unauthorized }
@@ -198,31 +200,35 @@ final class AppModel {
         guard let id = res["metadata"]?["id"]?.string ?? res["id"]?.string else {
             throw APIError.http(0, res["error"]?.string ?? "Could not create workspace")
         }
-        await sendFirst(c, id, message, model: model, agentId: agentId, thinking: thinking)
+        startFirstSend(c, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
     }
 
     /// First messages that did not send, by the workspace they were for. The new workspace opens
     /// with the text in its composer, so a retry sends it there instead of making another one.
-    private var unsentFirstMessages: [String: String] = [:]
+    private(set) var unsentFirstMessages: [String: String] = [:]
     func takeUnsentFirstMessage(_ workspaceId: String) -> String? { unsentFirstMessages.removeValue(forKey: workspaceId) }
 
-    private func sendFirst(_ c: APIClient, _ id: String, _ message: String, model: String, agentId: String, thinking: ThinkingLevel) async {
+    /// `sendMessage` returns only when the turn ends, so the new workspace opens first: a first
+    /// turn that asks a question or needs a sandbox approval waits on a card the user must see.
+    private func startFirstSend(_ c: APIClient, _ id: String, _ message: String, model: String, agentId: String, thinking: ThinkingLevel) {
         let opts: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue),
                                          "sendId": .string("ios-" + UUID().uuidString)]
-        do {
-            try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message), "options": .object(opts)])
-        } catch {
-            unsentFirstMessages[id] = message
+        Task {
+            do {
+                try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message), "options": .object(opts)])
+            } catch {
+                unsentFirstMessages[id] = message
+            }
         }
-        await list?.refresh()
+        Task { await list?.refresh() }
     }
 
     func fork(_ sourceId: String, message: String, model: String, agentId: String, thinking: ThinkingLevel) async throws -> String {
         guard let c = servers.currentClient else { throw APIError.unauthorized }
         let res = try await c.call("workspace/fork", ["sourceWorkspaceId": .string(sourceId), "pendingAutoTitle": true])
         guard let id = res["metadata"]?["id"]?.string else { throw APIError.http(0, res["error"]?.string ?? "Could not fork") }
-        await sendFirst(c, id, message, model: model, agentId: agentId, thinking: thinking)
+        startFirstSend(c, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
     }
 
@@ -233,7 +239,7 @@ final class AppModel {
         guard let id = res["metadata"]?["id"]?.string ?? res["id"]?.string else {
             throw APIError.http(0, res["error"]?.string ?? "Could not create chat")
         }
-        await sendFirst(c, id, message, model: model, agentId: agentId, thinking: thinking)
+        startFirstSend(c, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
     }
 }

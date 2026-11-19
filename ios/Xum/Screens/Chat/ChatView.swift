@@ -66,6 +66,7 @@ struct ChatView: View {
         // The server hands back a queued message it did not run (Stop, a refused send): put it
         // back in the composer, then let the server drop its held copy.
         .onChange(of: store?.restoredInput?.seq) { takeRestoredInput() }
+        .onChange(of: model.unsentFirstMessages[workspaceId] != nil) { takeUnsentFirstMessage() }
         // Opening a chat does not answer it: rescan so a question or plan stays in the Inbox.
         .onDisappear { if let list = model.list { Task { await list.scan(workspaceId) } } }
         // Regular width (iPhone Duo inner display): the tool detail is a persistent side panel
@@ -124,14 +125,18 @@ struct ChatView: View {
         draft = draft.isEmpty ? text : draft + "\n\n" + text
     }
 
+    /// The first send runs after the chat opens, so its failure can arrive while it is shown.
+    private func takeUnsentFirstMessage() {
+        guard let unsent = model.takeUnsentFirstMessage(workspaceId) else { return }
+        restoreToComposer(unsent)
+        store?.report("The first message did not send. It is in the composer: tap send to retry.")
+    }
+
     private func attach() {
         guard !seeded else { return }
         seeded = true
         store = model.chatStore(workspaceId)
-        if let unsent = model.takeUnsentFirstMessage(workspaceId) {
-            draft = unsent
-            store?.report("The first message did not send. It is in the composer: tap send to retry.")
-        }
+        takeUnsentFirstMessage()
         info = model.servers.currentClient.map { WorkspaceInfoStore(workspaceId: workspaceId, client: $0) }
         seedSettings()
     }

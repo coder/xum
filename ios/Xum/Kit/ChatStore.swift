@@ -166,7 +166,10 @@ final class ChatStore {
         self.client = client
     }
 
-    var isStreaming: Bool { streamingMessageId != nil }
+    /// A turn is running: streaming, or still being prepared (runtime startup on SSH or Coder can
+    /// take a while before `stream-start`), so the composer offers Stop, not a second Send.
+    var isStreaming: Bool { streamingMessageId != nil || preparing }
+    private(set) var preparing = false
 
     var todos: [TodoItem] {
         for m in messages.reversed() {
@@ -258,6 +261,7 @@ final class ChatStore {
         replayFailed = false
         hasOlder = false
         autoCompacting = false
+        preparing = false
         streamingMessageId = nil
     }
 
@@ -285,6 +289,8 @@ final class ChatStore {
             } else if let first = messages.first {
                 hasOlder = (first.historySequence ?? 0) > 0
             }
+        case "stream-lifecycle":
+            preparing = ev["phase"]?.string == "preparing"
         case "auto-compaction-triggered":
             autoCompacting = true
         case "auto-compaction-completed":

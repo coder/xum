@@ -71,6 +71,7 @@ struct InboxView: View {
         case .question(let q):
             q.isEmpty ? "Question" : "Question · \(q)"
         case .planReady: "Plan ready"
+        case .approval(let script): script.isEmpty ? "Approval" : "Approval · \(script)"
         case .error(let m): m
         }
     }

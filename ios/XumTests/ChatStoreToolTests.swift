@@ -135,6 +135,11 @@ struct ModelCatalogTests {
         #expect(ModelName.catalog(providers: providers) == google + ["omlx:GLM-5.3-Flash", "omlx:qwen-small"])
     }
 
+    @Test func gatewayOffersEveryBuiltIn() {
+        let providers: JSONValue = ["openrouter": ["isConfigured": true, "isEnabled": true]]
+        #expect(ModelName.catalog(providers: providers) == ModelName.builtIn)
+    }
+
     @Test func providerWithoutItsOwnListStillHasModels() {
         let providers: JSONValue = ["xai": ["isConfigured": true, "isEnabled": true]]
         #expect(ModelName.catalog(providers: providers) == ["xai:grok-4.7"])
