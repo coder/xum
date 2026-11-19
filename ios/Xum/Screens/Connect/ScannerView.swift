@@ -18,6 +18,11 @@ final class ConnectScanModel {
     /// Probes `/version` for the saved version label, then hands off to `AppModel.addServer`.
     func connect(name: String?, model: AppModel) async {
         guard let link, !connecting else { return }
+        // A plain-HTTP link needs the user's explicit OK, which the link sheet asks for.
+        guard link.isProtectedTransport else {
+            model.sheet = .connectLink(prefill: link.urlString)
+            return
+        }
         connecting = true
         defer { connecting = false }
         var version: String?

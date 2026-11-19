@@ -47,3 +47,25 @@ struct ChatStoreCompactionTests {
         #expect(s.messages.first?.isStreaming == true)
     }
 }
+
+struct ConnectionLinkTransportTests {
+    @Test(arguments: [
+        ("https://devbox.example.com/?token=t", true),
+        ("http://127.0.0.1:3000/?token=t", true),
+        ("http://localhost:3000/?token=t", true),
+        ("http://100.100.16.68:3000/?token=t", true),
+        ("http://devbox.tail4e2c.ts.net:3000/?token=t", true),
+        ("http://192.168.1.20:3000/?token=t", false),
+        ("http://100.12.0.1:3000/?token=t", false),
+        ("http://devbox.local:3000/?token=t", false),
+    ])
+    func protectedTransport(link: String, protected: Bool) throws {
+        let parsed = try #require(ConnectionLink.parse(link))
+        #expect(parsed.isProtectedTransport == protected)
+    }
+
+    @Test func urlStringRoundTrips() throws {
+        let link = try #require(ConnectionLink.parse("http://10.0.0.2:3000/proxy/?token=a%2Bb%2Fc"))
+        #expect(ConnectionLink.parse(link.urlString) == link)
+    }
+}

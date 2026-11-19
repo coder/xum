@@ -16,6 +16,26 @@ struct ConnectionLink: Equatable, Sendable {
     }
     var tokenLast4: String { String(token.suffix(4)) }
 
+    /// The link in its `<baseUrl>?token=` form.
+    var urlString: String {
+        baseURL.absoluteString + "?token=" + (token.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? token)
+    }
+
+    /// Whether the token is protected in transit: HTTPS, a loopback host (it never leaves the
+    /// device), or a Tailscale address (WireGuard encrypts the tailnet). Anything else is plain
+    /// HTTP that anyone on the network path can read, and the token lets its holder run commands
+    /// on the server.
+    var isProtectedTransport: Bool {
+        if baseURL.scheme?.lowercased() == "https" { return true }
+        let h = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if h == "localhost" || h == "::1" || h.hasPrefix("127.") { return true }
+        if h.hasSuffix(".ts.net") || h.hasPrefix("fd7a:115c:a1e0:") { return true }
+        // Tailscale's IPv4 range, 100.64.0.0/10.
+        let octets = h.split(separator: ".").compactMap { Int($0) }
+        if octets.count == 4, octets[0] == 100, (64...127).contains(octets[1]) { return true }
+        return false
+    }
+
     static func parse(_ raw: String) -> ConnectionLink? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let comps = URLComponents(string: trimmed), let scheme = comps.scheme?.lowercased() else { return nil }

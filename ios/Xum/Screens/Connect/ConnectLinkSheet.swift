@@ -43,6 +43,9 @@ struct ConnectLinkSheet: View {
     }
 
     private var parsed: ConnectionLink? { ConnectionLink.parse(text) }
+    @State private var allowCleartext = false
+    /// Sending the token is allowed: the transport protects it, or the user accepted plain HTTP.
+    private func mayUseToken(_ link: ConnectionLink) -> Bool { link.isProtectedTransport || allowCleartext }
 
     var body: some View {
         NavigationStack {
@@ -56,6 +59,7 @@ struct ConnectLinkSheet: View {
                     if let link = parsed {
                         SectionCaption(text: "Parsed").padding(.top, 22)
                         parsedGroup(link).padding(.top, 8)
+                        if !link.isProtectedTransport { cleartextWarning.padding(.top, 12) }
                         nameGroup(link).padding(.top, 12)
                         Text("The token stays in this iPhone's Keychain. Revoke it any time from Server Access on the computer.")
                             .font(.system(size: 13))
@@ -89,7 +93,7 @@ struct ConnectLinkSheet: View {
                             .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.glassProminent)
-                    .disabled(parsed == nil)
+                    .disabled(parsed.map { !mayUseToken($0) } ?? true)
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -101,8 +105,11 @@ struct ConnectLinkSheet: View {
                         .frame(height: 50)
                 }
                 .padding(.bottom, 8)
+                .frame(maxWidth: .infinity)
+                // Opaque, so the form does not show through when it scrolls under the button.
+                .background(Color.xBg2)
             }
-            .task(id: text) { await probe() }
+            .task(id: "\(text)|\(allowCleartext)") { await probe() }
             .task { checkClipboardOrigin() }
             .onChange(of: parsed) { _, link in
                 if let link, !nameEdited { name = link.suggestedName }
@@ -111,7 +118,7 @@ struct ConnectLinkSheet: View {
     }
 
     private func confirm() {
-        guard let link = parsed else { return }
+        guard let link = parsed, mayUseToken(link) else { return }
         model.addServer(link, name: name.isEmpty ? link.suggestedName : name, version: version)
     }
 
@@ -128,6 +135,12 @@ struct ConnectLinkSheet: View {
         do {
             let (v, ms) = try await APIClient.probe(link.baseURL)
             if Task.isCancelled { return }
+            // Do not send the token over plain HTTP before the user accepts that.
+            guard mayUseToken(link) else {
+                status = .reachable(ms: ms)
+                version = v.short
+                return
+            }
             do {
                 _ = try await APIClient(baseURL: link.baseURL, token: link.token).call("projects/list")
                 if Task.isCancelled { return }
@@ -142,6 +155,23 @@ struct ConnectLinkSheet: View {
             if Task.isCancelled { return }
             status = .unreachable
         }
+    }
+
+    private var cleartextWarning: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("This link is not encrypted", systemImage: "lock.open")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.xWarn)
+            Text("Anyone on this network can read the token and use it to run commands on the server. Use an HTTPS link or a Tailscale address when you can.")
+                .font(.system(size: 13))
+                .foregroundStyle(Color.xText2)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("Connect over plain HTTP", isOn: $allowCleartext)
+                .font(.system(size: 15))
+                .tint(Color.xWarn)
+        }
+        .padding(14)
+        .background(Color.xWarn.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
     }
 
     /// The "Pasted from your Mac" row shows only when the prefill still matches the clipboard.

@@ -200,7 +200,7 @@ final class WorkspaceInfoStore {
 
     func loadChanges() async {
         do {
-            let out = try await bash(Self.base + #"; echo "BASE $b"; git diff --numstat "$b"; git ls-files --others --exclude-standard | while IFS= read -r f; do printf "%s\t0\t%s\tU\n" "$(wc -l < "$f" | tr -d ' ')" "$f"; done"#)
+            let out = try await bash(Self.base + #"; echo "BASE $b"; git -c core.quotePath=false diff --numstat "$b"; git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do printf "%s\t0\t%s\tU\n" "$(wc -l < "$f" | tr -d ' ')" "$f"; done"#)
             var files: [ChangedFile] = []
             for line in out.split(separator: "\n") {
                 if line.hasPrefix("BASE ") { changesBase = String(line.dropFirst(5).prefix(8)); continue }

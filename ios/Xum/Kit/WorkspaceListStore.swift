@@ -140,8 +140,10 @@ final class WorkspaceListStore {
         }
     }
 
+    /// File names reach `xargs -0` and `cat` as arguments, never as shell text: a repository can
+    /// hold untracked files with any name, and this script runs when the list opens.
     func refreshDiffStats() async {
-        let script = #"b=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo HEAD); { git diff --numstat "$b"; git ls-files --others --exclude-standard -z | xargs -0 -I{} sh -c 'printf "%s\t0\t{}\n" $(wc -l < "{}")'; } | awk '{a+=$1;d+=$2} END {print a+0, d+0}'"#
+        let script = #"b=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo HEAD); u=$(git ls-files --others --exclude-standard -z | xargs -0 cat -- 2>/dev/null | wc -l); git diff --numstat "$b" | awk -v u="$u" '{a+=$1;d+=$2} END {print a+u, d+0}'"#
         await withTaskGroup(of: (String, (Int, Int)?).self) { g in
             for w in workspaces where !w.isScratch {
                 g.addTask {
