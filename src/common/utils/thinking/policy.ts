@@ -82,7 +82,7 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  * minimal level; Carbon and Neon return HTTP 400 for minimal).
  * @param modelName Provider model ID without the provider prefix.
  */
-function isGeminiNoOffModelName(modelName: string): boolean {
+export function isGeminiNoOffModelName(modelName: string): boolean {
   return (
     isGeminiFlashMinimalRejectingModelName(modelName) ||
     /^gemini-4-(?:argon|carbon|neon)/.test(modelName.trim().toLowerCase())

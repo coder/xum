@@ -65,7 +65,7 @@ function providersStore(providers: Record<string, unknown> | null) {
 
 /**
  * Router whose providers.jsonc-backed factory yields a fake evaluation model, so the real
- * experimental_evaluate runs, minus I/O.
+ * experimental_decide runs, minus I/O.
  */
 function createRouter(options: {
   doDecide?: DoDecide;

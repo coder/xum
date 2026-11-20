@@ -6179,6 +6179,47 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     }
   );
 
+  // @ai-sdk/google maps the adapter's reasoning "none" to thinkingLevel "minimal",
+  // which Gemini 4 models reject; older Gemini models keep the SDK mapping.
+  it.each([
+    ["google:gemini-4-neon", "low"],
+    ["google:gemini-4-carbon", "low"],
+    ["google:gemini-3-flash", "minimal"],
+  ] as const)(
+    "sends %s evaluation requests with thinkingLevel %s",
+    async (modelString, expectedLevel) => {
+      await withEvaluationFixture(
+        { google: { apiKey: "k-key" } },
+        async (_c, factory, fetchSpy) => {
+          const pinned = expectResolved(await factory.createEvaluationModel(modelString));
+          const bodies: unknown[] = [];
+          fetchSpy.mockImplementation(
+            Object.assign(
+              (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+                bodies.push(JSON.parse(String(init?.body)));
+                return Promise.reject(new Error("captured"));
+              },
+              { preconnect: () => undefined }
+            )
+          );
+          await pinned.model
+            .doDecide({
+              state: [{ type: "text", text: "hello" }],
+              questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+            })
+            .then(
+              () => undefined,
+              () => undefined
+            );
+          expect(bodies).toHaveLength(1);
+          expect(bodies[0]).toMatchObject({
+            generationConfig: { thinkingConfig: { thinkingLevel: expectedLevel } },
+          });
+        }
+      );
+    }
+  );
+
   it("rejects an OpenAI model the chat path would route through Codex OAuth", async () => {
     const codexOauth = {
       type: "oauth",

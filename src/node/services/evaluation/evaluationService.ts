@@ -28,6 +28,7 @@ import {
   type EvaluationRounding,
   type EvaluationState,
 } from "@/common/types/evaluation";
+import { isGeminiNoOffModelName } from "@/common/utils/thinking/policy";
 import { isKnownOpenAIServiceTier } from "@/common/utils/tokens/serviceTierPricing";
 import { getAnthropicCacheWrite1hTokens } from "@/common/utils/tokens/usageHelpers";
 
@@ -89,7 +90,39 @@ export function evaluationModelFromLanguageModel(
   model: LanguageModelV4,
   providerName: "openai" | "google"
 ): EvaluationModelInstance {
-  return new Experimental_DecisionLanguageModel({ model, provider: `${providerName}.decision` });
+  const decisionModel = new Experimental_DecisionLanguageModel({
+    model,
+    provider: `${providerName}.decision`,
+  });
+  const bareModelName = model.modelId.split("/").at(-1) ?? model.modelId;
+  return providerName === "google" && isGeminiNoOffModelName(bareModelName)
+    ? withGeminiLowThinkingDefault(decisionModel)
+    : decisionModel;
+}
+
+/**
+ * The adapter asks for reasoning "none", which @ai-sdk/google maps to
+ * `thinkingLevel: "minimal"` for Gemini 4 models. Gemini 3.8 Flash and Gemini 4
+ * Argon, Carbon and Neon have no minimal level (Neon and Carbon return HTTP 400), so
+ * default them to "low", their lowest level. A caller-supplied google option wins.
+ */
+function withGeminiLowThinkingDefault(model: EvaluationModelInstance): EvaluationModelInstance {
+  // The wrapper hides the adapter's inner model; evaluate() needs it for billing capture.
+  installInnerBillingCapture(model);
+  return {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    modelId: model.modelId,
+    supportedQuestionTypes: model.supportedQuestionTypes,
+    doDecide: (options) =>
+      model.doDecide({
+        ...options,
+        providerOptions: {
+          ...options.providerOptions,
+          google: { thinkingConfig: { thinkingLevel: "low" }, ...options.providerOptions?.google },
+        },
+      }),
+  };
 }
 
 /**
@@ -260,7 +293,7 @@ const billingScope = new AsyncLocalStorage<BillingScope>();
 const INNER_BILLING_CAPTURE = Symbol("xum.evaluationInnerBillingCapture");
 
 /**
- * provider-utils' `DecisionLanguageModel` (behind Anthropic's `.evaluationModel()`
+ * provider-utils' `DecisionLanguageModel` (behind Anthropic's `.decisionModel()`
  * and `evaluationModelFromLanguageModel`) validates answers inside `doDecide` and throws
  * before returning usage, so a billed response it rejects would never reach the
  * ledger (#4728). It keeps the wrapped LanguageModelV4 on `model`, an SDK
