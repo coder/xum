@@ -428,8 +428,8 @@ describe("bash_output tool", () => {
     if (result.success) {
       expect(result.output).toContain("quick exit");
       expect(result.status).toBe("exited");
-      // Must not wait out the 10 s timeout. An idle host returns in 100 to 200 ms, and a slow
-      // status probe on a busy host added about a second, so 500 ms failed there.
+      // Must not wait out the 10 s timeout. An idle host returns in 100 to 200 ms. A busy host
+      // took about a second (cause not traced: getOutput polls every 100 ms), so 500 ms failed.
       expect(elapsed).toBeLessThan(2_000);
     }
 
@@ -555,10 +555,11 @@ describe("bash_output tool", () => {
     // Abort after 200ms
     setTimeout(() => abortController.abort(), 200);
 
-    // Call with long timeout - should be interrupted by abort signal
+    // Call with a long timeout - should be interrupted by abort signal. The 10 s wait sits well
+    // below the 30 s file limit, so a broken abort fails the status check below, not the limit.
     const start = Date.now();
     const result = (await tool.execute!(
-      { process_id: spawnResult.processId, timeout_secs: 30 },
+      { process_id: spawnResult.processId, timeout_secs: 10 },
       { ...mockToolCallOptions, abortSignal: abortController.signal }
     )) as BashOutputToolResult;
     const elapsed = Date.now() - start;
@@ -567,7 +568,7 @@ describe("bash_output tool", () => {
     if (result.success) {
       expect(result.status).toBe("interrupted");
       expect(result.output).toBe("(waiting interrupted)");
-      // Should have returned quickly after abort, not waiting full 30s
+      // Should have returned quickly after abort, not waiting the full 10s
       expect(elapsed).toBeLessThan(1000);
       expect(elapsed).toBeGreaterThan(150); // At least waited until abort
     }
@@ -609,10 +610,10 @@ describe("bash_output tool", () => {
       return queued;
     };
 
-    // Call with long timeout - should be interrupted by queued message
+    // Call with a long timeout - should be interrupted by queued message (10 s: see the abort test)
     const start = Date.now();
     const resultPromise = tool.execute!(
-      { process_id: spawnResult.processId, timeout_secs: 30 },
+      { process_id: spawnResult.processId, timeout_secs: 10 },
       mockToolCallOptions
     ) as Promise<BashOutputToolResult>;
     await waiting.promise;
@@ -624,7 +625,7 @@ describe("bash_output tool", () => {
     if (result.success) {
       expect(result.status).toBe("interrupted");
       expect(result.output).toBe("(waiting interrupted)");
-      // Should have returned quickly after queued message, not waiting full 30s
+      // Should have returned quickly after queued message, not waiting the full 10s
       expect(elapsed).toBeLessThan(1000);
     }
 
