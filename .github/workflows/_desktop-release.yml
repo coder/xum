@@ -295,9 +295,9 @@ jobs:
   build-windows:
     name: Build and Release Windows
     # The EV signing service account (coder-ci) only trusts jobs in this
-    # environment, which only main and v* tags may use. v* tags are not
-    # protected in this repository, so callers must only pass a commit on main
-    # (release.yml's preflight resolves the tag and checks this).
+    # environment, which only main and v* tags may use. A v* tag can point at
+    # any commit, so callers must only pass a commit on main (release.yml's
+    # preflight resolves the tag and checks this).
     environment: code-signing
     runs-on: windows-latest
     permissions:

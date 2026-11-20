@@ -62,7 +62,9 @@ jobs:
             echo "::error::tag ${tag_ref#refs/tags/} does not exist"
             exit 1
           fi
-          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...main" --jq .status)
+          # The branch's commit, not the name main: a tag can have that name too.
+          main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...$main" --jq .status)
           if [ "$status" != "ahead" ] && [ "$status" != "identical" ]; then
             echo "::error::${tag_ref#refs/tags/} points at $sha, which is not on main"
             exit 1
