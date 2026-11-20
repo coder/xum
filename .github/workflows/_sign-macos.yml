@@ -46,22 +46,17 @@ jobs:
     name: Build rcodesign
     runs-on: ubuntu-22.04
     outputs:
-      sha256: ${{ steps.checksum.outputs.sha256 }}
+      sha256: ${{ steps.rcodesign.outputs.sha256 }}
     steps:
       - name: Build rcodesign
-        uses: coder/coder-desktop-macos/.github/actions/install-rcodesign@bff0687ff171436ebd008c03645cb5dcf968db58
-
-      - name: Record checksum
-        id: checksum
-        run: |
-          set -euo pipefail
-          echo "sha256=$(sha256sum /tmp/rcodesign-bin/rcodesign | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+        id: rcodesign
+        uses: coder/setup-apple-signing-action/rcodesign@7901d28b3975e01adede2dd2044dde8280ce605a # main 2026-11-19
 
       - name: Upload rcodesign
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: rcodesign
-          path: /tmp/rcodesign-bin/rcodesign
+          path: ${{ steps.rcodesign.outputs.path }}
           retention-days: 3
           if-no-files-found: error
           overwrite: true
