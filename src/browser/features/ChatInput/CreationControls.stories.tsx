@@ -319,6 +319,17 @@ export const SshWithoutIsolation: Story = {
     // The project is trusted but this host directory is not: its own trust is offered, on the
     // page (checked before the panel opens: the panel is modal and hides the page from queries).
     await expect(canvas.getByRole("button", { name: "Trust directory" })).toBeVisible();
+    // Too narrow for one line, the row stacks in its text column: title and detail, then the
+    // button under them (not squeezed beside the copy), with the shield on the title's line.
+    const trust = trustRowGeometry(storyRoot);
+    await expect(trust.row.right).toBeLessThanOrEqual(frame.right + 1);
+    // The chip and the trust row under it are one control: the same edges.
+    const chipBox = chip.getBoundingClientRect();
+    await expect(Math.abs(chipBox.left - trust.row.left)).toBeLessThanOrEqual(1);
+    await expect(Math.abs(chipBox.right - trust.row.right)).toBeLessThanOrEqual(1);
+    await expect(trust.button.top).toBeGreaterThanOrEqual(trust.status.bottom);
+    await expect(Math.abs(trust.button.left - trust.status.left)).toBeLessThanOrEqual(1);
+    await expect(Math.abs(centerY(trust.icon) - (trust.status.top + 8))).toBeLessThanOrEqual(2);
 
     await openEnvironmentPanel(storyRoot);
     await expect(await body.findByLabelText("Project directory on host")).toHaveValue(
@@ -331,6 +342,27 @@ export const SshWithoutIsolation: Story = {
     await expect(dockerOption).toHaveTextContent("Not yet supported on SSH projects");
   },
 };
+
+/** Where the SSH+None trust row's parts sit, for its layout contracts. */
+function trustRowGeometry(storyRoot: HTMLElement) {
+  const row = storyRoot.querySelector<HTMLElement>('[data-component="SshDirectoryTrust"]');
+  if (!row) throw new Error("SSH directory trust row not found");
+  const part = (selector: string) => {
+    const el = row.querySelector(selector);
+    if (!el) throw new Error(`${selector} not found in the trust row`);
+    return el.getBoundingClientRect();
+  };
+  return {
+    row: row.getBoundingClientRect(),
+    icon: part("svg"),
+    status: part('[role="status"]'),
+    button: part("button"),
+  };
+}
+
+function centerY(rect: DOMRect): number {
+  return rect.top + rect.height / 2;
+}
 
 /**
  * The environment panel open on the default selection: where it runs, the isolation and the base
