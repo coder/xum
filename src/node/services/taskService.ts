@@ -57,7 +57,7 @@ import {
   type WorkspaceTurnHost,
 } from "@/node/services/taskWorkspaceSeam";
 export type { TaskKind } from "@/node/services/taskWorkspaceSeam";
-export { ForegroundWaitBackgroundedError } from "@/node/services/taskWaiters";
+export { ForegroundWaitBackgroundedError, TaskNotFoundError } from "@/node/services/taskWaiters";
 import {
   ACTIVE_AGENT_TASK_STATUSES,
   buildAgentTaskIndex,
@@ -111,6 +111,7 @@ import { TaskStopLatch } from "@/node/services/taskStopLatch";
 import { StreamEndLedger } from "@/node/services/streamEndLedger";
 import { PeerSendParking } from "@/node/services/peerSendParking";
 import {
+  TaskNotFoundError,
   TaskWaiters,
   type PendingTaskStartWaiter,
   type PendingTaskWaiter,
@@ -14644,7 +14645,7 @@ export class TaskService implements AgentTaskIntegration {
               childWorkspaceId: notification.sourceId,
               agentType: "agent",
               errorType: failure.errorType,
-              errorMessage: failure.errorMessage,
+              awaitTaskId: notification.sourceId,
             })
           : null;
       if (content == null) {
@@ -16267,7 +16268,7 @@ export class TaskService implements AgentTaskIntegration {
       throw persistedFailure;
     }
 
-    throw new Error("Task not found");
+    throw new TaskNotFoundError();
   }
 
   /** An interrupted task: its persisted report, else a wait while its stream still runs. */
@@ -16341,7 +16342,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     const persistedFailure = await this.readPersistedFailureForWait(request);
-    settle.reject(persistedFailure ?? new Error("Task not found"));
+    settle.reject(persistedFailure ?? new TaskNotFoundError());
   }
 
   /** The row is still interrupted: settle with its persisted report, else wait while it streams. */
@@ -16674,6 +16675,112 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return null;
+  }
+
+  /**
+   * The stored result of a terminal workspace-turn handle for an ancestor of the handle's child
+   * that need not own the handle. A handle is stored under its owner, which is the ancestor that
+   * reawakened the child, so the child's direct parent is not always the owner. The failure row
+   * names the failed turn's handle for every parent, and this lets a non-owner read that exact
+   * turn after the child has moved on to a newer one. Read-only and terminal only: an active
+   * turn is not readable this way, and `ancestorWorkspaceId` must be an ancestor of the child
+   * the record belongs to.
+   */
+  async getDescendantTerminalWorkspaceTurnSnapshot(
+    ancestorWorkspaceId: string,
+    handleId: string,
+    options: { consumingWorkspaceId?: string } = {}
+  ): Promise<{
+    ownerWorkspaceId: string;
+    record: WorkspaceTurnTaskHandleRecord;
+  } | null> {
+    assert(
+      ancestorWorkspaceId.length > 0,
+      "getDescendantTerminalWorkspaceTurnSnapshot: ancestorWorkspaceId must be non-empty"
+    );
+    assert(
+      handleId.length > 0,
+      "getDescendantTerminalWorkspaceTurnSnapshot: handleId must be non-empty"
+    );
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const descendants = new Set(
+      this.listDescendantAgentTaskIdsFromIndex(index, ancestorWorkspaceId)
+    );
+    const workspaceTurnManager = this.getWorkspaceTurnManager();
+    // The owner is an ancestor of some descendant, so probe each such ancestor once. A string
+    // that is not a handle ID finds no record under any owner (the store refuses it).
+    for (const ownerWorkspaceId of this.listAncestorsOfWorkspaces(index.parentById, descendants)) {
+      // Probe the stored record, not a snapshot: a snapshot can repair or revive a stale record
+      // (a write under this owner), and nothing may be written until the checks below pass.
+      const probe = await workspaceTurnManager.getWorkspaceTurnRecord(ownerWorkspaceId, handleId);
+      if (probe == null) continue;
+      if (
+        !this.isTerminalTurnOfDescendantUnder(
+          index.parentById,
+          descendants,
+          ownerWorkspaceId,
+          probe
+        )
+      ) {
+        // mutation-equivalent: a handle ID is stored under one owner, so this loop never has a
+        // second candidate to continue to.
+        return null;
+      }
+      const record = await workspaceTurnManager.getWorkspaceTurnSnapshot(
+        ownerWorkspaceId,
+        handleId,
+        options
+      );
+      // Check the snapshot that is returned, not only the probe: an auto-retry that starts
+      // between the two reads makes this one `running`, and a live turn is not readable here.
+      return record != null &&
+        this.isTerminalTurnOfDescendantUnder(
+          index.parentById,
+          descendants,
+          ownerWorkspaceId,
+          record
+        )
+        ? { ownerWorkspaceId, record }
+        : null;
+    }
+    return null;
+  }
+
+  /** Every ancestor of one of `workspaceIds`: the workspaces that can own a handle for one. */
+  private listAncestorsOfWorkspaces(
+    parentById: Map<string, string>,
+    workspaceIds: Iterable<string>
+  ): Set<string> {
+    const ancestors = new Set<string>();
+    for (const workspaceId of workspaceIds) {
+      for (const ancestor of this.listAncestorWorkspaceIdsUsingParentById(
+        parentById,
+        workspaceId
+      )) {
+        ancestors.add(ancestor);
+      }
+    }
+    return ancestors;
+  }
+
+  /**
+   * Whether `record`, stored under `ownerWorkspaceId`, is a finished turn of one of `descendants`
+   * that its owner can own: the child is a descendant of the reading ancestor, the owner is an
+   * ancestor of that child, and the turn is not active.
+   */
+  private isTerminalTurnOfDescendantUnder(
+    parentById: Map<string, string>,
+    descendants: ReadonlySet<string>,
+    ownerWorkspaceId: string,
+    record: WorkspaceTurnTaskHandleRecord
+  ): boolean {
+    return (
+      descendants.has(record.workspaceId) &&
+      this.listAncestorWorkspaceIdsUsingParentById(parentById, record.workspaceId).includes(
+        ownerWorkspaceId
+      ) &&
+      !isActiveWorkspaceTurnTaskStatus(record.status)
+    );
   }
 
   private hasLiveRunningExecution(workspace: WorkspaceConfigEntry, workspaceId: string): boolean {
@@ -21969,7 +22076,9 @@ export class TaskService implements AgentTaskIntegration {
   private async maybeResumeParentAfterTerminalChildFailure(
     childWorkspaceId: string,
     childEntry: { projectPath: string; workspace: WorkspaceConfigEntry },
-    failure: { errorType: string; errorMessage: string },
+    // The error text is not an input: the parent's row never carries it (see
+    // formatSubagentFailureUserMessage); the parent reads it through task_await.
+    failure: { errorType: string },
     hadForegroundWaiters: boolean
   ): Promise<void> {
     const parentWorkspaceId = childEntry.workspace.parentWorkspaceId;
@@ -22004,7 +22113,7 @@ export class TaskService implements AgentTaskIntegration {
         childWorkspaceId,
         agentType: coerceNonEmptyString(childEntry.workspace.agentType) ?? "agent",
         errorType: failure.errorType,
-        errorMessage: failure.errorMessage,
+        awaitTaskId: childWorkspaceId,
       }),
       { timestamp: Date.now(), synthetic: true, uiVisible: true }
     );
