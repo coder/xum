@@ -35,6 +35,7 @@ import {
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
   GEMINI_THINKING_LEVELS,
+  geminiSupportsXhigh,
   getOpenAIReasoningEffort,
   isGpt6LunaModel,
   grokSupportsNativeXhigh,
@@ -205,7 +206,11 @@ function geminiThinkingConfig(
   if (/gemini-[34]/.test(capBareModelName)) {
     // Policy enforcement should clamp to valid Google levels before this adapter runs.
     // Avoid leaking xhigh/max to Google if a caller bypasses policy.
-    return { includeThoughts: true, thinkingLevel: GEMINI_THINKING_LEVELS[effectiveThinking] };
+    const thinkingLevel =
+      effectiveThinking === "xhigh" && geminiSupportsXhigh(capBareModelName)
+        ? "xhigh"
+        : GEMINI_THINKING_LEVELS[effectiveThinking];
+    return { includeThoughts: true, thinkingLevel };
   }
   // Gemini 2.5 uses thinkingBudget
   const budget = GEMINI_THINKING_BUDGETS[effectiveThinking];

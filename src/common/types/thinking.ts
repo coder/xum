@@ -424,6 +424,15 @@ export function grokSupportsNativeXhigh(modelString: string): boolean {
 }
 
 /**
+ * Gemini models with a native XHIGH thinking level (Google's Gemini 4 Neon developer
+ * guide lists LOW/MEDIUM/HIGH/XHIGH). @ai-sdk/google's option schema accepts an explicit
+ * "xhigh" from 4.0.119; older versions reject it before the request is sent.
+ */
+export function geminiSupportsXhigh(modelString: string): boolean {
+  return /^gemini-4-neon(?:$|-)/.test(stripModelProviderPrefixes(modelString));
+}
+
+/**
  * GLM 5.3 and GLM 5.3 Flash always reason with low, high, or max effort.
  *
  * Self-hosted deployments append quantization and format tags to the id
@@ -608,7 +617,10 @@ export const GEMINI_THINKING_BUDGETS: Record<ThinkingLevel, number> = {
   max: 16384,
 } as const;
 
-/** Gemini 3+ thinkingLevel per Xum level; Gemini has no xhigh/max, so both map to high. */
+/**
+ * Gemini 3+ thinkingLevel per Xum level. xhigh/max map to high; models with native XHIGH
+ * (geminiSupportsXhigh) get "xhigh" in the provider-options adapter instead.
+ */
 export const GEMINI_THINKING_LEVELS: Record<
   Exclude<ThinkingLevel, "off">,
   "low" | "medium" | "high"

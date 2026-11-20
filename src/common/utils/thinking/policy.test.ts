@@ -555,18 +555,25 @@ describe("getThinkingPolicyForModel", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
   });
 
-  test("returns low/medium/high (no off) for Gemini 4 Argon, Carbon and Neon, unlike the Gemini 3 Pro set", () => {
+  test("returns low/medium/high (no off) for Gemini 4 Argon and Carbon, unlike the Gemini 3 Pro set", () => {
     for (const model of [
       "google:gemini-4-argon",
       "openrouter:google/gemini-4-argon",
       "google:gemini-4-carbon",
-      "google:gemini-4-neon",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
       expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
-      // The pinned @ai-sdk/google schema rejects "xhigh", even for Neon, which accepts XHIGH.
       expect(enforceThinkingPolicy(model, "xhigh")).toBe("high");
+    }
+  });
+
+  test("returns low/medium/high/xhigh (no off) for Gemini 4 Neon", () => {
+    for (const model of ["google:gemini-4-neon", "google-vertex:gemini-4-neon"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high", "xhigh"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("xhigh");
+      expect(enforceThinkingPolicy(model, "max")).toBe("xhigh");
     }
   });
 

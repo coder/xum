@@ -21,6 +21,7 @@ import {
   anthropicRejectsDisabledThinking,
   anthropicSupportsBetweenToolsThinking,
   anthropicSupportsNativeXhigh,
+  geminiSupportsXhigh,
   grokSupportsNativeXhigh,
   isGrokFrontierModel,
   isGlm53Model,
@@ -76,18 +77,23 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
 }
 
 /**
- * True for Gemini models whose thinking levels are only low/medium/high, so Xum cannot
- * expose "off": Gemini 3.8 Flash (rejects minimal) and Gemini 4 Argon, Carbon and Neon
- * (document no minimal level; Carbon and Neon return HTTP 400 for minimal).
- * Neon also accepts XHIGH, but the pinned @ai-sdk/google schema rejects "xhigh" (support
- * landed in 4.0.119), so Neon stays on low/medium/high until that bump.
+ * True for Gemini models with no minimal thinking level, so Xum cannot expose "off":
+ * Gemini 3.8 Flash (rejects minimal) and Gemini 4 Argon, Carbon and Neon (document no
+ * minimal level; Carbon and Neon return HTTP 400 for minimal).
  * @param modelName Provider model ID without the provider prefix.
  */
-function isGeminiLowMediumHighModelName(modelName: string): boolean {
+function isGeminiNoOffModelName(modelName: string): boolean {
   return (
     isGeminiFlashMinimalRejectingModelName(modelName) ||
     /^gemini-4-(?:argon|carbon|neon)/.test(modelName.trim().toLowerCase())
   );
+}
+
+/** Levels of a Gemini model with no "off": low/medium/high, plus xhigh where Gemini has it. */
+function geminiNoOffPolicy(modelName: string): ThinkingPolicy {
+  return geminiSupportsXhigh(modelName)
+    ? ["low", "medium", "high", "xhigh"]
+    : ["low", "medium", "high"];
 }
 
 /**
@@ -99,7 +105,8 @@ function isGeminiLowMediumHighModelName(modelName: string): boolean {
  *   disabled)
  * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
  * - openai:gpt-5.6 / -sol / -terra / -luna → ["off", "low", "medium", "high", "xhigh", "max"]
- * - Gemini 3.8 Flash / Gemini 4 Argon / Carbon / Neon → ["low", "medium", "high"] (no minimal, so no "off")
+ * - Gemini 3.8 Flash / Gemini 4 Argon / Carbon → ["low", "medium", "high"] (no minimal, so no "off")
+ * - Gemini 4 Neon → ["low", "medium", "high", "xhigh"] (native XHIGH, no minimal)
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
  * - xai:grok-4.7 / xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
@@ -185,9 +192,9 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   }
 
   // Gemini 3.8 Flash and Gemini 4 Argon/Carbon/Neon have no "minimal" level, so thinking cannot be
-  // disabled; "off" clamps to "low".
-  if (isGeminiLowMediumHighModelName(withoutProviderNamespace)) {
-    return ["low", "medium", "high"];
+  // disabled; "off" clamps to "low". Neon alone adds a native XHIGH level.
+  if (isGeminiNoOffModelName(withoutProviderNamespace)) {
+    return geminiNoOffPolicy(withoutProviderNamespace);
   }
 
   // Older Gemini Flash chat models support minimal/low/medium/high. Xum exposes minimal as "off".
@@ -356,11 +363,11 @@ export function resolveEffectiveThinkingLevel(
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
   // Gemini 3.8 Flash rejects "minimal" and GPT-6 Astra rejects "none", so an
   // unset/"off" level must clamp here too; otherwise the tracked level would say
-  // "off" while the adapter sends "low". Gemini 4 Argon and Carbon have no "off" either: an
-  // unclamped "off" sends no thinkingConfig and the model thinks at its medium default.
+  // "off" while the adapter sends "low". Gemini 4 Argon, Carbon and Neon have no "off" either: an
+  // unclamped "off" sends no thinkingConfig and the model thinks at its own default.
   return ALWAYS_ON_FIVE_LEVEL_MODELS.some((matches) => matches(capabilityModel)) ||
     isGlm53Model(capabilityModel) ||
-    isGeminiLowMediumHighModelName(stripModelProviderPrefixes(capabilityModel))
+    isGeminiNoOffModelName(stripModelProviderPrefixes(capabilityModel))
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;
 }
