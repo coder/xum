@@ -18,13 +18,21 @@ on:
         default: ""
 
 jobs:
+  # macOS apps go through three jobs: a macOS job builds the unsigned apps, Linux jobs sign and
+  # notarize them (_sign-macos.yml: the release key is reachable only from there), and a macOS
+  # job checks, packages and uploads the signed apps.
   build-macos:
-    name: Build and Release macOS
+    name: Build macOS
     runs-on: macos-15
     permissions:
-      contents: write # Upload release assets
+      contents: read
+    outputs:
+      sha256-x64: ${{ steps.checksum.outputs.sha256-x64 }}
+      sha256-arm64: ${{ steps.checksum.outputs.sha256-arm64 }}
     env:
       NODE_OPTIONS: --max-old-space-size=4096
+      # scripts/generate-version.sh stamps the release tag, not a git describe that the version
+      # patch below would mark -dirty.
       RELEASE_TAG: ${{ inputs.release_tag }}
       VERSION_OVERRIDE: ${{ inputs.version_override }}
     steps:
@@ -35,7 +43,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      # electron-builder unpacks the checked Electron zips (both arches: `make dist-mac` builds x64
+      # electron-builder unpacks the checked Electron zips (both arches: this job builds x64
       # and arm64) instead of downloading them without retries.
       - uses: ./.github/actions/setup-xum
         with:
@@ -52,18 +60,102 @@ jobs:
       - name: Build application
         run: bun run build
 
-      - name: Setup code signing
-        run: ./scripts/setup-macos-signing.sh
+      - name: Build the unsigned macOS apps
+        run: make dist-mac-app-x64 dist-mac-app-arm64
+
+      - name: Record checksums
+        id: checksum
+        run: |
+          for arch in x64 arm64; do
+            echo "sha256-$arch=$(shasum -a 256 "release/macos-app-unsigned-$arch.tar" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Upload the unsigned x64 app
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: macos-app-unsigned-x64
+          path: release/macos-app-unsigned-x64.tar
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload the unsigned arm64 app
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: macos-app-unsigned-arm64
+          path: release/macos-app-unsigned-arm64.tar
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+
+  sign-macos:
+    name: Sign macOS
+    needs: [build-macos]
+    permissions:
+      contents: read
+      id-token: write # Google Cloud workload identity, for the release key
+    # By full path at main, and it must stay so: the release key answers only to main's copy of
+    # this file, and a release runs at its tag, where a local path names the tag's copy. As for
+    # build-windows, callers must only pass a commit on main; the sign job refuses any other.
+    uses: coder/xum/.github/workflows/_sign-macos.yml@main # zizmor: ignore[unpinned-uses]
+    with:
+      ref: ${{ inputs.ref }}
+      certificate: developer-id
+      sha256-x64: ${{ needs.build-macos.outputs.sha256-x64 }}
+      sha256-arm64: ${{ needs.build-macos.outputs.sha256-arm64 }}
+    secrets: inherit # zizmor: ignore[secrets-inherit] -- the sign job reads the secrets of its environment
+
+  package-macos:
+    name: Package and Release macOS
+    needs: [sign-macos]
+    runs-on: macos-15
+    permissions:
+      contents: write # Upload release assets
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      VERSION_OVERRIDE: ${{ inputs.version_override }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-xum
+
+      # The package names and the update files carry the version, as the built app does.
+      - name: Patch package.json version
+        if: inputs.version_override != ''
+        shell: bash
+        run: node ./scripts/set-package-version.js "$VERSION_OVERRIDE"
+
+      - name: Download the signed apps
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: macos-app-signed-*
+          path: release
+          merge-multiple: true
+
+      - name: Check the signed apps
         env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
-          AC_APIKEY_P8_BASE64: ${{ secrets.AC_APIKEY_P8_BASE64 }}
-          AC_APIKEY_ID: ${{ secrets.AC_APIKEY_ID }}
-          AC_APIKEY_ISSUER_ID: ${{ secrets.AC_APIKEY_ISSUER_ID }}
+          SHA256_X64: ${{ needs.sign-macos.outputs.sha256-x64 }}
+          SHA256_ARM64: ${{ needs.sign-macos.outputs.sha256-arm64 }}
+        run: |
+          for sha256 in "$SHA256_X64" "$SHA256_ARM64"; do
+            [[ "$sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::No checksum from the sign job."; exit 1; }
+          done
+          shasum -a 256 -c <<EOF
+          $SHA256_X64  release/macos-app-signed-x64.tar
+          $SHA256_ARM64  release/macos-app-signed-arm64.tar
+          EOF
 
       - name: Package for macOS
-        # Retry for transient Apple timestamp-server failures during code signing.
-        run: ./scripts/retry.sh 3 30 make dist-mac
+        run: make package-mac
+
+      - name: Check the signatures
+        run: |
+          make check-mac-signature MAC_ARCH=x64 MAC_CERTIFICATE=developer-id
+          make check-mac-signature MAC_ARCH=arm64 MAC_CERTIFICATE=developer-id
 
       - name: Create legacy mux artifact aliases
         run: ./scripts/create-legacy-mux-artifact-aliases.sh

@@ -305,7 +305,6 @@
     "directories": {
       "output": "release"
     },
-    "afterSign": "scripts/notarize-mac.js",
     "files": [
       "dist/**/*",
       "!node_modules/electron/dist{,/**/*}"
