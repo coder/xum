@@ -12,6 +12,7 @@ import {
 } from "ai";
 import type {
   Experimental_DecisionModelV4,
+  JSONObject,
   JSONValue,
   LanguageModelV4,
   SharedV4ProviderMetadata,
@@ -104,7 +105,8 @@ export function evaluationModelFromLanguageModel(
  * The adapter asks for reasoning "none", which @ai-sdk/google maps to
  * `thinkingLevel: "minimal"` for Gemini 4 models. Gemini 3.8 Flash and Gemini 4
  * Argon, Carbon and Neon have no minimal level (Neon and Carbon return HTTP 400), so
- * default them to "low", their lowest level. A caller-supplied google option wins.
+ * default them to "low", their lowest level. A caller-supplied thinkingLevel wins; other
+ * google options merge, so a caller's `includeThoughts` keeps the "low" default.
  */
 function withGeminiLowThinkingDefault(model: EvaluationModelInstance): EvaluationModelInstance {
   // The wrapper hides the adapter's inner model; evaluate() needs it for billing capture.
@@ -119,8 +121,49 @@ function withGeminiLowThinkingDefault(model: EvaluationModelInstance): Evaluatio
         ...options,
         providerOptions: {
           ...options.providerOptions,
-          google: { thinkingConfig: { thinkingLevel: "low" }, ...options.providerOptions?.google },
+          google: withLowThinkingLevel(options.providerOptions?.google),
         },
+      }),
+  };
+}
+
+function withLowThinkingLevel(google: JSONObject | undefined): JSONObject {
+  const thinkingConfig = google?.thinkingConfig;
+  const callerConfig =
+    thinkingConfig != null && typeof thinkingConfig === "object" && !Array.isArray(thinkingConfig)
+      ? thinkingConfig
+      : {};
+  return { ...google, thinkingConfig: { thinkingLevel: "low", ...callerConfig } };
+}
+
+/**
+ * @ai-sdk/typesafe-ai (3.0.3x) rejects a null Score level before sending the request,
+ * while Xum's question schema and the workflow-authoring guide allow null levels
+ * ("no description"), and the TypeSafe API took them before. Levels are indexed from
+ * zero, so a null level is sent as its index.
+ */
+export function withTypeSafeScoreLevelLabels(
+  model: EvaluationModelInstance
+): EvaluationModelInstance {
+  return {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    modelId: model.modelId,
+    supportedQuestionTypes: model.supportedQuestionTypes,
+    doDecide: (options) =>
+      model.doDecide({
+        ...options,
+        questions: Object.fromEntries(
+          Object.entries(options.questions).map(([id, question]) => [
+            id,
+            question.type === "score"
+              ? {
+                  ...question,
+                  criteria: question.criteria.map((level, index) => level ?? String(index)),
+                }
+              : question,
+          ])
+        ),
       }),
   };
 }

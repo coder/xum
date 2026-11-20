@@ -6206,6 +6206,8 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
             .doDecide({
               state: [{ type: "text", text: "hello" }],
               questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+              // A caller's other thinkingConfig fields must not drop the "low" default.
+              providerOptions: { google: { thinkingConfig: { includeThoughts: true } } },
             })
             .then(
               () => undefined,
@@ -6213,7 +6215,9 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
             );
           expect(bodies).toHaveLength(1);
           expect(bodies[0]).toMatchObject({
-            generationConfig: { thinkingConfig: { thinkingLevel: expectedLevel } },
+            generationConfig: {
+              thinkingConfig: { thinkingLevel: expectedLevel, includeThoughts: true },
+            },
           });
         }
       );

@@ -44,6 +44,7 @@ import {
 import { computeConfigFingerprint } from "@/node/services/evaluation/evaluationDigest";
 import {
   evaluationModelFromLanguageModel,
+  withTypeSafeScoreLevelLabels,
   installInnerBillingCapture,
   type EvaluationModelInstance,
 } from "@/node/services/evaluation/evaluationService";
@@ -3674,12 +3675,14 @@ export class ProviderModelFactory {
           // and trimmed it; the raw `configuredBaseURL` would embed a stray
           // space before the SDK's `/systemone` suffix.
           effectiveBaseURL = creds.baseUrl;
-          model = createTypeSafeAi({
-            apiKey: creds.apiKey,
-            ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
-            headers: providerConfig.headers,
-            fetch: providerFetch,
-          }).decisionModel(modelId);
+          model = withTypeSafeScoreLevelLabels(
+            createTypeSafeAi({
+              apiKey: creds.apiKey,
+              ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
+              headers: providerConfig.headers,
+              fetch: providerFetch,
+            }).decisionModel(modelId)
+          );
           break;
         }
       }

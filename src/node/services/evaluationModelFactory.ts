@@ -21,6 +21,7 @@ import {
 import { isMockAiMode, MOCK_AI_MODEL_REFUSED_MESSAGE } from "@/node/services/mock/mockAiMode";
 import {
   evaluationModelFromLanguageModel,
+  withTypeSafeScoreLevelLabels,
   type EvaluationModelInstance,
 } from "@/node/services/evaluation/evaluationService";
 import {
@@ -159,7 +160,7 @@ export function createEvaluationModel(
     const { provider, modelId, settings, organization } = target.data;
     switch (provider) {
       case TYPESAFE_PROVIDER_KEY:
-        return Ok(createTypeSafeAi(settings).decisionModel(modelId));
+        return Ok(withTypeSafeScoreLevelLabels(createTypeSafeAi(settings).decisionModel(modelId)));
       case "openai": {
         const { createOpenAI } = yield* Effect.promise(PROVIDER_REGISTRY.openai);
         return Ok(

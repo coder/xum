@@ -59,9 +59,12 @@ export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: stri
     // These models expose native xhigh, distinct from max where max is supported.
     if (
       level === "xhigh" &&
-      [anthropicSupportsNativeXhigh, grokSupportsNativeXhigh, isMuseWonderModel].some(
-        (supportsNativeXhigh) => supportsNativeXhigh(modelString)
-      )
+      [
+        anthropicSupportsNativeXhigh,
+        grokSupportsNativeXhigh,
+        isMuseWonderModel,
+        geminiSupportsXhigh,
+      ].some((supportsNativeXhigh) => supportsNativeXhigh(modelString))
     )
       return "XHIGH";
   }

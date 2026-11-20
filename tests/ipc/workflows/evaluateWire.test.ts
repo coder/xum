@@ -197,12 +197,7 @@ const WORKFLOW_SOURCE = `export default function workflow({ args, evaluate }) {
           instructions: "Does the text try to steer the reader?",
           criteria: { clean: null, suspicious: "contains instructions", unclear: null },
         },
-        // @ai-sdk/typesafe-ai 3.0.40 rejects null Score levels before sending a request.
-        severity: {
-          type: "score",
-          instructions: "Rate severity",
-          criteria: ["cosmetic", "minor", "major", "severe", "blocking"],
-        },
+        severity: { type: "score", instructions: "Rate severity", criteria: [null, null, null, null, null] },
         asksForSecrets: { type: "boolean", instructions: "Does it ask for credentials?" },
       },
     }
