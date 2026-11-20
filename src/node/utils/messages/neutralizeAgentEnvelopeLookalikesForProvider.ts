@@ -1,13 +1,17 @@
 import {
+  AGENT_MESSAGE_DELIVERY_TOOL_NAME,
   getValidAgentPeerMessageMeta,
   neutralizeAgentEnvelopeLookalikes,
   parseAgentMessageEnvelope,
+  type AgentMessageEnvelope,
+  type AgentPeerMessageMeta,
 } from "@/common/utils/agentMessageEnvelope";
 import {
   getAuthenticPlanReviewRecord,
   neutralizePlanReviewEnvelopeLookalikes,
 } from "@/common/utils/planReview/planReviewEnvelope";
-import type { MuxMessage } from "@/common/types/message";
+import type { MuxMessage, MuxToolPart } from "@/common/types/message";
+import { parseFamilyMessageSender } from "@/node/services/agentPeerMessageBroker";
 import type {
   AssistantModelMessage,
   ModelMessage,
@@ -43,30 +47,7 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
     if (msg.role !== "user" && msg.role !== "assistant") {
       return msg;
     }
-    // Exempt only rows the peer send path could have authored: assistant role, SYNTHETIC
-    // provenance (the send path persists payload rows exclusively as synthetic pre-turn rows —
-    // ordinary model output can carry corrupted-but-valid-looking metadata, never this marker),
-    // VALID peer metadata, AND text that is exactly a well-formed envelope whose sender fields
-    // MATCH the metadata (the send path writes both from the same values). A corrupted row
-    // carrying just the discriminator, lookalike text, or an inconsistent metadata/envelope pair
-    // — where the UI would attribute one sender while the provider reads another — must not
-    // smuggle the exact wrapper past neutralization. The exemption covers TEXT parts only; tool
-    // parts are never authentic envelopes.
-    const meta = getValidAgentPeerMessageMeta(msg.metadata?.muxMetadata);
-    const isAuthenticPeerRow =
-      msg.role === "assistant" &&
-      msg.metadata?.synthetic === true &&
-      meta != null &&
-      msg.parts.every((part) => {
-        if (part.type !== "text") return true;
-        const parsed = parseAgentMessageEnvelope(part.text);
-        return (
-          parsed != null &&
-          parsed.from === meta.fromWorkspaceId &&
-          parsed.relationship === meta.relationship &&
-          parsed.fromTitle === meta.fromTitle
-        );
-      });
+    const isAuthenticPeerRow = isAuthenticAgentPeerPayloadRow(msg);
 
     // Plan feedback is authentic only when the row's `plan-review` metadata and its single
     // envelope text part describe the same record (getAuthenticPlanReviewRecord); a row that
@@ -119,6 +100,105 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
   });
 
   return didChange ? result : messages;
+}
+
+/**
+ * True only for a row the peer send path could have authored: assistant role, SYNTHETIC
+ * provenance (the send path persists payload rows exclusively as synthetic pre-turn rows —
+ * ordinary model output can carry corrupted-but-valid-looking metadata, never this marker),
+ * VALID peer metadata, AND a single text part that is exactly a well-formed envelope whose
+ * sender fields MATCH the metadata (the send path writes both from the same values). A corrupted
+ * row carrying just the discriminator, lookalike text, or an inconsistent metadata/envelope pair
+ * — where the UI would attribute one sender while the provider reads another — must not
+ * smuggle the exact wrapper past neutralization. Any other part shape is corrupted too: the
+ * tool-result replay keeps exactly one part, so extra parts would be dropped silently.
+ */
+function isAuthenticAgentPeerPayloadRow(msg: MuxMessage): boolean {
+  if (msg.role !== "assistant" || msg.metadata?.synthetic !== true) return false;
+  const meta = getValidAgentPeerMessageMeta(msg.metadata.muxMetadata);
+  const [part, ...rest] = msg.parts;
+  return (
+    meta != null &&
+    rest.length === 0 &&
+    part?.type === "text" &&
+    isEnvelopeFromSender(part.text, meta)
+  );
+}
+
+function isEnvelopeFromSender(text: string, meta: AgentPeerMessageMeta): boolean {
+  const parsed = parseAgentMessageEnvelope(text);
+  return (
+    parsed != null &&
+    parsed.from === meta.fromWorkspaceId &&
+    parsed.relationship === meta.relationship &&
+    parsed.fromTitle === meta.fromTitle
+  );
+}
+
+/**
+ * Replay authentic agent-message payload rows (peer and family messages) to the model as the
+ * result of a `receive_agent_message` call that Xum makes. Request-only: the persisted row, the
+ * transcript card and the fixed zero-peer-byte trigger stay as they are.
+ *
+ * Why: as assistant text, the model reads another agent's message as text it wrote itself and
+ * continues that pattern: a sender waiting for replies wrote the next reply as its own envelope
+ * (GLM-5.3-Flash: 5 of 8 runs; a line saying Xum inserted the row did not help, 4 of 8, and the
+ * model copied the line too), which the user then read as a delivery. The user role stops that
+ * but gives the sender's bytes the user's authority. A tool result is the channel models are
+ * trained to read as external data they did not write, with no user authority (0 of 8). The
+ * model cannot produce one: calling the tool itself only gets the SDK's unavailable-tool error,
+ * after which the model reported that it was still waiting (16 of 16).
+ *
+ * The result is a JSON object, not the wrapper text: the role and tool name mark provenance, and
+ * the same-turn neutralizer (neutralizeAgentEnvelopeLookalikesInModelToolParts) rewrites the
+ * wrapper in every tool result before each later step, which would change the replayed prefix.
+ * Neutralizing the fields here keeps them identical across steps.
+ */
+export function replayAgentMessagePayloadsAsToolResults(messages: MuxMessage[]): MuxMessage[] {
+  let didChange = false;
+  const result = messages.map((msg) => {
+    const delivery = readAgentMessageDelivery(msg);
+    if (delivery == null) return msg;
+    didChange = true;
+    const toolPart: MuxToolPart = {
+      type: "dynamic-tool",
+      // Provider tool-call IDs allow only [A-Za-z0-9_-] (Anthropic); row IDs are generated but
+      // come from persisted history.
+      toolCallId: `agent-message-${msg.id.replace(/[^A-Za-z0-9_-]/g, "_")}`,
+      toolName: AGENT_MESSAGE_DELIVERY_TOOL_NAME,
+      state: "output-available",
+      input: { message_id: msg.id },
+      output: neutralizeStringsDeep(delivery),
+    };
+    return { ...msg, parts: [toolPart] };
+  });
+  return didChange ? result : messages;
+}
+
+/** The delivery an authentic payload row carries; null for every other row. */
+function readAgentMessageDelivery(msg: MuxMessage): AgentMessageEnvelope | null {
+  if (isAuthenticAgentPeerPayloadRow(msg)) {
+    const [part] = msg.parts;
+    return part.type === "text" ? parseAgentMessageEnvelope(part.text) : null;
+  }
+  // Family-message rows (task_message_parent, task_message_sibling) have no envelope: the
+  // sender comes from the header the server writes before the sender's bytes. A row whose
+  // header does not parse stays an assistant row.
+  if (!isFamilyMessagePayloadRow(msg) || msg.parts.length !== 1) return null;
+  const [part] = msg.parts;
+  if (part.type !== "text") return null;
+  const sender = parseFamilyMessageSender(part.text);
+  if (sender == null) return null;
+  return { from: sender.senderWorkspaceId, relationship: sender.relationship, message: part.text };
+}
+
+// dry-duplicate-ok: other row-kind predicates share the shape, but each follows its own writer
+function isFamilyMessagePayloadRow(msg: MuxMessage): boolean {
+  return (
+    msg.role === "assistant" &&
+    msg.metadata?.synthetic === true &&
+    msg.metadata.muxMetadata?.type === "family-message"
+  );
 }
 
 /**

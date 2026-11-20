@@ -22,6 +22,12 @@ const AGENT_MESSAGE_RELATIONSHIPS = [
 export type AgentMessageRelationship = (typeof AGENT_MESSAGE_RELATIONSHIPS)[number];
 const AGENT_MESSAGE_RELATIONSHIP_SET = new Set<unknown>(AGENT_MESSAGE_RELATIONSHIPS);
 
+/**
+ * Tool name of the call that carries an agent message to the model (request-only replay of the
+ * persisted payload row). No tool with this name is registered, so the model cannot produce one.
+ */
+export const AGENT_MESSAGE_DELIVERY_TOOL_NAME = "receive_agent_message";
+
 export interface AgentMessageEnvelope {
   /** Sender's tree target id — doubles as the reply address for task_send_message. */
   from: string;
