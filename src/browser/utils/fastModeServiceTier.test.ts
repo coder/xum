@@ -125,7 +125,7 @@ describe("fast mode service tier", () => {
     expect(provider("unknown-instance")).toBeNull();
   });
 
-  test("offers Fast but not Ultrafast on the Codex OAuth transport", () => {
+  test("offers Ultrafast on the Codex OAuth transport only for supported models", () => {
     const providersConfig = {
       openai: { apiKeySet: false, isEnabled: true, isConfigured: true, codexOauthSet: true },
       coder: {
@@ -136,7 +136,8 @@ describe("fast mode service tier", () => {
       },
     };
     expect(getFastModeProvider("openai:gpt-6.2-astra", { providersConfig })).toBe("openai");
-    expect(ultrafastModeAvailable("openai:gpt-6.2-astra", { providersConfig })).toBe(false);
+    expect(ultrafastModeAvailable("openai:gpt-6.2-astra", { providersConfig })).toBe(true);
+    expect(ultrafastModeAvailable("openai:gpt-6-luna", { providersConfig })).toBe(false);
     expect(
       ultrafastModeAvailable("openai:gpt-6.2-astra", {
         providersConfig: {
@@ -155,7 +156,7 @@ describe("fast mode service tier", () => {
         providersConfig,
         resolvedRouteProvider: "direct",
       })
-    ).toBe(false);
+    ).toBe(true);
     expect(
       getFastModeProvider("openai:gpt-6.2-astra", {
         providersConfig: {

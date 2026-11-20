@@ -93,13 +93,22 @@ export function openaiModelSupportsServiceTier(
   serviceTier: string,
   options?: OpenAIDirectProviderOptionsAvailability
 ): boolean {
-  if (usesCodexServiceTier(modelString, options)) {
-    return CODEX_SERVICE_TIERS.has(serviceTier);
+  if (serviceTier === "ultrafast") {
+    // Codex OAuth and the API accept Ultrafast on the same Responses models.
+    return (
+      ultrafastWireAccepted(modelString, options) &&
+      openaiServiceTierCapabilities(modelString, options)?.ultrafast === true
+    );
   }
-  return openaiApiModelSupportsServiceTier(modelString, serviceTier, options);
+  if (usesCodexServiceTier(modelString, options)) {
+    return CODEX_STANDARD_AND_FAST_TIERS.has(serviceTier);
+  }
+  return (
+    serviceTier !== "flex" || openaiServiceTierCapabilities(modelString, options)?.flex !== false
+  );
 }
 
-const CODEX_SERVICE_TIERS = new Set(["priority", "default"]);
+const CODEX_STANDARD_AND_FAST_TIERS = new Set(["priority", "default"]);
 
 function usesCodexServiceTier(
   modelString: string,
@@ -116,24 +125,6 @@ function usesCodexServiceTier(
       }
     )
   );
-}
-
-function openaiApiModelSupportsServiceTier(
-  modelString: string,
-  serviceTier: string,
-  options?: OpenAIDirectProviderOptionsAvailability
-): boolean {
-  switch (serviceTier) {
-    case "ultrafast":
-      return (
-        ultrafastWireAccepted(modelString, options) &&
-        openaiServiceTierCapabilities(modelString, options)?.ultrafast === true
-      );
-    case "flex":
-      return openaiServiceTierCapabilities(modelString, options)?.flex !== false;
-    default:
-      return true;
-  }
 }
 
 function openaiServiceTierCapabilities(

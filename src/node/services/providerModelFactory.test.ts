@@ -1807,7 +1807,7 @@ describe("ProviderModelFactory Google Vertex AI", () => {
 });
 
 describe("ProviderModelFactory native OpenAI tiers", () => {
-  it("sends Codex Fast and restores Standard without changing OAuth credentials", async () => {
+  it("sends Codex Fast, Ultrafast, and Standard with the same OAuth credentials", async () => {
     await withTempConfig(async (_config, factory, oauth, store) => {
       const auth = {
         type: "oauth" as const,
@@ -1823,7 +1823,7 @@ describe("ProviderModelFactory native OpenAI tiers", () => {
       try {
         const result = await factory.createModel("openai:gpt-6.2-astra");
         if (!result.success) throw new Error(result.error.type);
-        for (const serviceTier of [undefined, "default", "ultrafast"] as const) {
+        for (const serviceTier of [undefined, "ultrafast", "default", "flex"] as const) {
           await streamText({
             model: result.data,
             providerOptions: serviceTier == null ? undefined : { openai: { serviceTier } },
@@ -1831,9 +1831,18 @@ describe("ProviderModelFactory native OpenAI tiers", () => {
             maxRetries: 0,
           }).consumeStream({ onError: () => undefined });
         }
-        expect(calls).toHaveLength(3);
+        const luna = await factory.createModel("openai:gpt-6-luna");
+        if (!luna.success) throw new Error(luna.error.type);
+        await streamText({
+          model: luna.data,
+          providerOptions: { openai: { serviceTier: "ultrafast" } },
+          prompt: "hello",
+          maxRetries: 0,
+        }).consumeStream({ onError: () => undefined });
         expect(calls.map((call) => parseSentBody(call).service_tier)).toEqual([
           "priority",
+          "ultrafast",
+          undefined,
           undefined,
           undefined,
         ]);
@@ -4167,7 +4176,7 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it("pins Fast on Codex OAuth but not on non-OpenAI Coder upstreams", async () => {
+  it("pins Codex OAuth tiers but drops them on non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, { additionalProviders: [{ name: "openai", type: "anthropic" }] });
       const auth = {
@@ -4238,7 +4247,7 @@ describe("ProviderModelFactory Coder", () => {
                 parseSentBody(calls[before]).model
               );
               expect(parseSentBody(calls[liveBefore]).service_tier).toBe(
-                tier === "priority" ? configuredTier : undefined
+                isCodex && tier !== "default" ? tier : undefined
               );
             }
           }
