@@ -186,6 +186,12 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
       if (!runs.has(entry.run.id)) runs.set(entry.run.id, { run: entry.run, steps: [] });
     } else if (entry.type === "step") {
       orphanSteps.push(entry.step);
+      // DevToolsService compaction merges a step's updates into its step row.
+      foldStepUpdate(
+        { stepUsageUpdates, failedStepIds, stepPromptCacheWires },
+        entry.step.id,
+        entry.step
+      );
     } else if (entry.type === "step-update") {
       foldStepUpdate(
         { stepUsageUpdates, failedStepIds, stepPromptCacheWires },
