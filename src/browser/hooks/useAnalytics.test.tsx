@@ -494,8 +494,8 @@ describe("useAnalytics hooks", () => {
 
     const { result } = renderAnalyticsHook(() => useAnalyticsRawQuery());
 
-    let stalePromise!: Promise<void>;
-    let freshPromise!: Promise<void>;
+    let stalePromise!: Promise<boolean>;
+    let freshPromise!: Promise<boolean>;
     act(() => {
       stalePromise = result.current.executeQuery("SELECT 'stale'");
       freshPromise = result.current.executeQuery("SELECT 'fresh'");
@@ -518,6 +518,9 @@ describe("useAnalytics hooks", () => {
     expect(result.current.data?.rows).toEqual([{ v: "fresh" }]);
     expect(result.current.loading).toBe(false);
     expect(result.current.error).toBeNull();
+    // Only the run whose answer is shown reports it ran (SqlExplorer records its SQL then).
+    expect(await freshPromise).toBe(true);
+    expect(await stalePromise).toBe(false);
   });
 
   test("executeRawQuery keeps infrastructure failures as generic internal errors", async () => {

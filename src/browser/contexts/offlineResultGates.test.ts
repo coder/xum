@@ -10,8 +10,8 @@ import ts from "typescript";
  * ConnectionLostError instead of the handler's own offline result.
  *
  * The check follows the gated name to its declaration, whatever it is called: `{ api } =
- * useAPI()`, `{ api: client } = useAPI()`, `useAPI().api`, or `state.api` with
- * `state = useAPI()`.
+ * useAPI()`, `{ api: client } = useAPI()`, `useAPI().api`, and through `state = useAPI()` both
+ * `state.api` and `{ api: client } = state`.
  */
 /** The names an offline gate checks: `!x`, `x == null`, and each operand of `a || b`. */
 function missingCheckNames(expression: ts.Expression): ts.Identifier[] {
@@ -76,20 +76,26 @@ function declaredNames(declaration: ts.VariableDeclaration): Map<string, string 
   return names;
 }
 
+/** Whether `expression` is the useAPI() result: the call, or a name with `= useAPI()`. */
+function isUseAPIResult(expression: ts.Expression | undefined, from: ts.Node): boolean {
+  if (isUseAPICall(expression)) return true;
+  if (expression == null || !ts.isIdentifier(expression)) return false;
+  const holder = findDeclaration(expression.text, from);
+  return holder != null && ts.isIdentifier(holder.name) && isUseAPICall(holder.initializer);
+}
+
 /** Whether `name` (declared at `declaration`) is the client from useAPI(). */
 function isUseAPIClient(name: string, declaration: ts.VariableDeclaration): boolean {
   const init = declaration.initializer;
+  // `{ api } = useAPI()`, or `{ api: client } = state` where `state = useAPI()`.
   if (ts.isObjectBindingPattern(declaration.name)) {
-    return isUseAPICall(init) && declaredNames(declaration).get(name) === "api";
+    return isUseAPIResult(init, declaration) && declaredNames(declaration).get(name) === "api";
   }
   // `useAPI().api`, or `state.api` where `state = useAPI()`.
   if (init == null || !ts.isPropertyAccessExpression(init) || init.name.text !== "api") {
     return false;
   }
-  if (isUseAPICall(init.expression)) return true;
-  if (!ts.isIdentifier(init.expression)) return false;
-  const holder = findDeclaration(init.expression.text, declaration);
-  return holder != null && ts.isIdentifier(holder.name) && isUseAPICall(holder.initializer);
+  return isUseAPIResult(init.expression, declaration);
 }
 
 function isUseAPIClientCheck(expression: ts.Expression): boolean {
@@ -147,6 +153,9 @@ describe("offline result gates", () => {
     ["const { api: client } = useAPI();", "client", true],
     ["const client = useAPI().api;", "client", true],
     ["const state = useAPI(); const client = state.api;", "client", true],
+    ["const state = useAPI(); const { api: client } = state;", "client", true],
+    ["const state = useAPI(); const { api } = state;", "api", true],
+    ["const state = props; const { api } = state;", "api", false],
     ["const api = useLiveAPI();", "api", false],
     ["const { api } = props;", "api", false],
   ])("%s, then a gate on %s: old gate %p", (declaration, name, old) => {
