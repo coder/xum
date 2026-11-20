@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseGoalBudgetInputCents } from "./budgetParser";
+import { parseGoalBudgetInputCents, parseGoalTurnCapInput } from "./budgetParser";
 
 describe("parseGoalBudgetInputCents", () => {
   test("returns null for empty / whitespace input (= no budget)", () => {
@@ -42,5 +42,25 @@ describe("parseGoalBudgetInputCents", () => {
     expect(parseGoalBudgetInputCents("5.000")).toBeUndefined();
     expect(parseGoalBudgetInputCents("-5")).toBeUndefined();
     expect(parseGoalBudgetInputCents("$5.5.5")).toBeUndefined();
+  });
+});
+
+describe("parseGoalTurnCapInput", () => {
+  test("returns null for empty / whitespace input (= no cap)", () => {
+    expect(parseGoalTurnCapInput("")).toBeNull();
+    expect(parseGoalTurnCapInput("   ")).toBeNull();
+  });
+
+  test("parses positive integers, the smallest cap included", () => {
+    expect(parseGoalTurnCapInput("1")).toBe(1);
+    expect(parseGoalTurnCapInput(" 25 ")).toBe(25);
+  });
+
+  test("returns undefined for zero, negative, fractional and partial input", () => {
+    expect(parseGoalTurnCapInput("0")).toBeUndefined();
+    expect(parseGoalTurnCapInput("-3")).toBeUndefined();
+    expect(parseGoalTurnCapInput("1.5")).toBeUndefined();
+    expect(parseGoalTurnCapInput("12abc")).toBeUndefined();
+    expect(parseGoalTurnCapInput("9007199254740993")).toBeUndefined();
   });
 });
