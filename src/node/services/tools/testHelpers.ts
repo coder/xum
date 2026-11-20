@@ -3,6 +3,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "path";
 import * as os from "os";
 import type { ToolExecutionOptions } from "ai";
+import { z } from "zod";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { InitStateManager } from "@/node/services/initStateManager";
@@ -12,6 +13,16 @@ import type { XumToolScope } from "@/common/types/toolScope";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+
+/**
+ * A tool's advertised input schema as the Zod schema Xum builds it from. The AI
+ * SDK types `inputSchema` as `FlexibleSchema`, which has no `parse`/`safeParse`.
+ */
+export function zodInputSchemaOf(tool: { inputSchema: unknown }): z.ZodType {
+  const schema = tool.inputSchema;
+  if (!(schema instanceof z.ZodType)) throw new Error("Expected a Zod input schema");
+  return schema;
+}
 
 export class TestTempDir implements Disposable {
   public readonly path: string;

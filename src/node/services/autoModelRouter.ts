@@ -1,4 +1,4 @@
-import { APICallError, experimental_evaluate } from "ai";
+import { APICallError, experimental_decide } from "ai";
 import { Effect } from "effect";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type {
@@ -52,7 +52,7 @@ export interface AutoModelRouterFailure {
 
 /**
  * Difficulty classifier for the auto-model-routing experiment: one AI SDK
- * `experimental_evaluate` "choice" question whose options are the user's tier
+ * `experimental_decide` "choice" question whose options are the user's tier
  * descriptions, judged by the user's evaluation model. Every failure is an Err so
  * the caller falls back to the composer's choices. No retries: a second paid
  * round-trip is not worth the send latency.
@@ -100,7 +100,7 @@ export class AutoModelRouter {
       const evaluation = yield* Effect.tryPromise({
         try: () =>
           capture.run(() =>
-            experimental_evaluate({
+            experimental_decide({
               model: capture.model,
               state: {
                 prompt: input.prompt.slice(0, AUTO_MODEL_ROUTING_MAX_PROMPT_CHARS),
@@ -138,7 +138,7 @@ export class AutoModelRouter {
         );
       }
 
-      // experimental_evaluate rejects a choice outside the criteria and any distribution
+      // experimental_decide rejects a choice outside the criteria and any distribution
       // that is not complete over exactly the criteria keys, so both are trusted here.
       const answer = evaluation.data.answers[QUESTION_ID];
       const confidence = readTypeSafeConfidence(evaluation.data.providerMetadata);

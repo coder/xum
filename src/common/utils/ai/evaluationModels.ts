@@ -2,7 +2,7 @@ import type { ProviderName } from "@/common/constants/providers";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 
 /**
- * Providers whose AI SDK package exposes `provider.evaluationModel(id)` and that
+ * Providers Xum can build an AI SDK decision model for, and that
  * the evaluation resolver knows how to construct on a direct API-key route.
  * Eligibility is per provider (no model verification). `typesafe` is the
  * evaluation-only TypeSafe AI credential key (not a chat ProviderName; see

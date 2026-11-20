@@ -1,5 +1,7 @@
 import { describe, test, expect, mock } from "bun:test";
+import * as aiSdk from "ai";
 import { tool, type ToolExecutionOptions } from "ai";
+import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -499,6 +501,91 @@ describe("StreamManager - default refusal fallback chains", () => {
     expect(completion.status).toBe("completed");
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(prepare.mock.calls[0]?.[0]).toBe(sonnet5);
+  });
+});
+
+describe("StreamManager - OpenAI refusals", () => {
+  // @ai-sdk/openai 4.0.117 streams a Responses refusal as text and finishes it as
+  // content-filter; 4.0.71 dropped the refusal frames, so the turn looked empty. A
+  // refusal is a deliberate provider outcome: Xum keeps the text and treats it like
+  // any other refusal (fallback chain, else a terminal model_refusal).
+  const REFUSAL_TEXT = "I can't help with that.";
+  const refusalEvents = [
+    { type: "response.created", response: { id: "resp_1", created_at: 1, model: "gpt-5.2" } },
+    { type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1" } },
+    {
+      type: "response.refusal.delta",
+      item_id: "msg_1",
+      output_index: 0,
+      content_index: 0,
+      delta: REFUSAL_TEXT,
+    },
+    {
+      type: "response.refusal.done",
+      item_id: "msg_1",
+      output_index: 0,
+      content_index: 0,
+      refusal: REFUSAL_TEXT,
+    },
+    { type: "response.output_item.done", output_index: 0, item: { type: "message", id: "msg_1" } },
+    { type: "response.completed", response: { usage: { input_tokens: 10, output_tokens: 5 } } },
+  ];
+  const refusingOpenAIModel = () =>
+    createOpenAI({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        () =>
+          Promise.resolve(
+            new Response(
+              refusalEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+              {
+                headers: { "content-type": "text/event-stream" },
+              }
+            )
+          ),
+        { preconnect: fetch.preconnect.bind(fetch) }
+      ),
+    }).responses("gpt-5.2");
+
+  test("a Responses refusal without a chain fails as model_refusal and keeps its text", async () => {
+    const workspaceId = "ws-openai-refusal";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText((options) => aiSdk.streamText(options)),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      model: refusingOpenAIModel(),
+      modelString: "openai:gpt-5.2",
+    });
+    expect(completion.status).toBe("failed");
+    expect(completion.status === "failed" ? completion.streamError.errorType : null).toBe(
+      "model_refusal"
+    );
+    const partial = await historyService.readPartial(workspaceId);
+    expect(partial?.parts).toMatchObject([{ type: "text", text: REFUSAL_TEXT }]);
+  });
+
+  test("a Responses refusal walks the configured fallback chain", async () => {
+    const { prepare, chain } = preparedFallback();
+    // The refusing hop runs the real SDK; the prepared fallback hop is scripted.
+    const fallbackStream = scriptedStreamText([
+      { chunks: [{ type: "text-delta", text: "fallback answer" }, STOP_FINISH], usage: NO_USAGE },
+    ]);
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText((options) =>
+        typeof options.model === "object" && options.model.provider === "openai.responses"
+          ? aiSdk.streamText(options)
+          : fallbackStream(options)
+      ),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "ws-openai-refusal-fallback",
+      model: refusingOpenAIModel(),
+      modelString: "openai:gpt-5.2",
+      modelFallback: { chain, prepare },
+    });
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(completion.status).toBe("completed");
   });
 });
 

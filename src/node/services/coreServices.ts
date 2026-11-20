@@ -93,7 +93,7 @@ export interface CoreServices {
    */
   idleDispatcher: IdleDispatcher;
   aiService: AIService;
-  /** Headless `experimental_evaluate` wrapper for the workflow `evaluate()` primitive. */
+  /** Headless `experimental_decide` wrapper for the workflow `evaluate()` primitive. */
   evaluationService: EvaluationService;
   streamManager: StreamManager;
   mcpConfigService: MCPConfigService;

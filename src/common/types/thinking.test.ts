@@ -12,6 +12,14 @@ import {
   parseThinkingInput,
 } from "./thinking";
 
+describe("Gemini thinking labels", () => {
+  test("labels Neon's native xhigh as XHIGH and keeps other Gemini models at MAX", () => {
+    expect(getThinkingDisplayLabel("xhigh", "google:gemini-4-neon")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "google-vertex:gemini-4-neon")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "google:gemini-4-carbon")).toBe("MAX");
+  });
+});
+
 describe("Muse Wonder thinking labels", () => {
   test("distinguishes native xhigh from max without changing other model labels", () => {
     expect(getThinkingDisplayLabel("xhigh", "meta:muse-wonder-1.0")).toBe("XHIGH");

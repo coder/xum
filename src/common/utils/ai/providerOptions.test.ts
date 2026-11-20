@@ -1026,6 +1026,11 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
         expected: thinkingConfig({ include_thoughts: true, thinking_level: "high" }),
       },
       {
+        model: "gemini-4-neon",
+        thinking: "xhigh",
+        expected: thinkingConfig({ include_thoughts: true, thinking_level: "xhigh" }),
+      },
+      {
         model: "gemini-2.5-pro",
         thinking: "high",
         expected: thinkingConfig({ include_thoughts: true, thinking_budget: 16384 }),
@@ -3304,6 +3309,20 @@ describe("buildProviderOptions - Google", () => {
         },
       },
     });
+  });
+
+  test("sends native xhigh only to Gemini models that have it, on Gemini API and Vertex AI", () => {
+    const level = (model: string, provider: "google" | "googleVertex"): unknown => {
+      const options = buildProviderOptions(model, "xhigh") as Record<
+        string,
+        { thinkingConfig?: { thinkingLevel?: string } }
+      >;
+      return options[provider]?.thinkingConfig?.thinkingLevel;
+    };
+    expect(level("google:gemini-4-neon", "google")).toBe("xhigh");
+    expect(level("google-vertex:gemini-4-neon", "googleVertex")).toBe("xhigh");
+    expect(level("google:gemini-4-carbon", "google")).toBe("high");
+    expect(level("google-vertex:gemini-4-carbon", "googleVertex")).toBe("high");
   });
 
   test("defensively maps unsupported Gemini 3.5 Flash xhigh to high", () => {

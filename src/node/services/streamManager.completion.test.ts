@@ -1,7 +1,9 @@
 import { describe, test, expect, mock, spyOn } from "bun:test";
 import nodeFs from "node:fs";
 import * as path from "node:path";
+import * as aiSdk from "ai";
 import { tool } from "ai";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
@@ -479,54 +481,105 @@ describe("StreamManager - empty stream completions", () => {
     expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
   });
 
-  test("treats streamText's synthesized (other, undefined) finish part as a truncated stream", async () => {
-    // streamText's runStep initializes stepFinishReason="other" /
-    // stepRawFinishReason=undefined and unconditionally emits those from its
-    // flush() at end-of-stream. The OpenAI Responses, Chat Completions, and
-    // Anthropic Messages adapters all surface this shape when the upstream
-    // SSE stream closed before any terminal event arrived. StreamManager
-    // must treat that synthesized default as a missing terminal event so the
-    // existing truncation guard fires a retryable `stream_truncated` error
-    // rather than committing the partial output as a clean assistant
-    // message.
-    const turnStream = () =>
-      createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "text-delta", text: "partial answer" };
-          // The provider adapter never emitted its own finish (e.g. clean
-          // SSE EOF before response.completed / message_stop). The ai
-          // package's flush() synthesizes this one:
-          yield { type: "finish", finishReason: "other", rawFinishReason: undefined };
-        })(),
-        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
-      );
+  // streamText's runStep initializes stepFinishReason="other" /
+  // stepRawFinishReason=undefined and emits those from its flush() when no
+  // model finish arrived. Since AI SDK 7.0.1xx the OpenAI, Anthropic and Google
+  // adapters emit their own `interrupted` finish when the upstream SSE stream
+  // closed before any terminal event. StreamManager must treat both as a
+  // missing terminal event so the truncation guard fires a retryable
+  // `stream_truncated` error rather than committing the partial output as a
+  // clean assistant message.
+  test.each(["other", "interrupted"])(
+    "treats a cut-off (%s, undefined) finish part as a truncated stream",
+    async (finishReason) => {
+      const turnStream = () =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "text-delta", text: "partial answer" };
+            // The stream closed before response.completed / message_stop /
+            // finishReason arrived.
+            yield { type: "finish", finishReason, rawFinishReason: undefined };
+          })(),
+          { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+        );
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: turnStreamTextForTests(turnStream),
+      });
+      const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
+      const streamEndEvents: unknown[] = [];
+
+      onTurnEngineEvent(streamManager, "error", (data) => {
+        errorEvents.push(data as { messageId: string; error: string; errorType?: string });
+      });
+      onTurnEngineEvent(streamManager, "stream-end", (data) => {
+        streamEndEvents.push(data);
+      });
+
+      const workspaceId = "synthesized-finish-workspace";
+      const messageId = "synthesized-finish-message";
+      const historySequence = 1;
+
+      await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
+
+      expect(streamEndEvents).toHaveLength(0);
+      expect(errorEvents).toHaveLength(1);
+      expect(errorEvents[0]).toMatchObject({
+        messageId,
+        errorType: "stream_truncated",
+      });
+
+      const partial = await historyService.readPartial(workspaceId);
+      expect(partial?.metadata?.errorType).toBe("stream_truncated");
+      expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
+    }
+  );
+
+  test("a real Anthropic stream cut before message_stop fails as stream_truncated", async () => {
+    // @ai-sdk/anthropic 4.0.104 finishes this stream as `interrupted` itself.
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-5-5",
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 3, output_tokens: 0 },
+        },
+      },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "partial answer" },
+      },
+    ];
+    const anthropic = createAnthropic({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        () =>
+          Promise.resolve(
+            new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+              headers: { "content-type": "text/event-stream" },
+            })
+          ),
+        { preconnect: fetch.preconnect.bind(fetch) }
+      ),
+    });
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: turnStreamTextForTests(turnStream),
+      streamText: fakeStreamText((options) => aiSdk.streamText(options)),
     });
-    const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
-    const streamEndEvents: unknown[] = [];
+    const workspaceId = "anthropic-cut-off-workspace";
 
-    onTurnEngineEvent(streamManager, "error", (data) => {
-      errorEvents.push(data as { messageId: string; error: string; errorType?: string });
-    });
-    onTurnEngineEvent(streamManager, "stream-end", (data) => {
-      streamEndEvents.push(data);
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      model: anthropic("claude-sonnet-5-5"),
     });
 
-    const workspaceId = "synthesized-finish-workspace";
-    const messageId = "synthesized-finish-message";
-    const historySequence = 1;
-
-    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
-
-    expect(streamEndEvents).toHaveLength(0);
-    expect(errorEvents).toHaveLength(1);
-    expect(errorEvents[0]).toMatchObject({
-      messageId,
-      errorType: "stream_truncated",
-    });
-
+    expect(completion.status).toBe("failed");
     const partial = await historyService.readPartial(workspaceId);
     expect(partial?.metadata?.errorType).toBe("stream_truncated");
     expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
