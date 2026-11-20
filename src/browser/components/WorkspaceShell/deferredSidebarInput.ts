@@ -5,6 +5,7 @@ import {
   KEYBINDS,
   matchesKeybind,
   matchesNewSidebarTabKeybind,
+  matchesOpenPlanTabKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 
@@ -16,6 +17,7 @@ export type HeldSidebarInput = () => void;
 // at once and opens the side chat full-screen when no sidebar claims it, as on a narrow layout.
 const SIDEBAR_EVENTS = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
+  CUSTOM_EVENTS.OPEN_PLAN_TAB,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
   CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB,
   CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
@@ -40,6 +42,7 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
     const sidebarKey =
       SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
       matchesNewSidebarTabKeybind(e) || // its own matcher: AltGr does not count
+      matchesOpenPlanTabKeybind(e) || // likewise
       // Shift+I types a letter in a text field, where the sidebar ignores it.
       (matchesKeybind(e, KEYBINDS.TOGGLE_REVIEW_IMMERSIVE) && !isEditableElement(e.target));
     if (!sidebarKey) return;
@@ -78,11 +81,13 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
 
 function holdEventInto(held: HeldSidebarInput[]): (e: Event) => void {
   return (e) => {
-    // While the layout hides the sidebar, RightSidebar ignores these two and WorkspaceMenuBar acts
-    // on them. Chromium may already have run the menu bar's listener (window listeners run in
-    // registration order at the window target), so a replay would act twice (#6208).
+    // While the layout hides the sidebar, WorkspaceMenuBar acts on these events (it shows the
+    // tab full-screen). Chromium may already have run the menu bar's listener (window listeners
+    // run in registration order at the window target), so a replay would act twice (#6208).
     const menuBarEvent =
-      e.type === CUSTOM_EVENTS.OPEN_ARTIFACT || e.type === CUSTOM_EVENTS.OPEN_MCP_APP_VIEW;
+      e.type === CUSTOM_EVENTS.OPEN_ARTIFACT ||
+      e.type === CUSTOM_EVENTS.OPEN_MCP_APP_VIEW ||
+      e.type === CUSTOM_EVENTS.OPEN_PLAN_TAB;
     if (
       menuBarEvent &&
       isWorkspaceRightSidebarHidden(document.querySelector("[data-workspace-shell]"))
@@ -103,7 +108,8 @@ export function guardSidebarKeys(): () => void {
   const guard = (e: KeyboardEvent) => {
     const sidebarKey =
       SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
-      matchesNewSidebarTabKeybind(e);
+      matchesNewSidebarTabKeybind(e) ||
+      matchesOpenPlanTabKeybind(e);
     if (sidebarKey) e.preventDefault();
   };
   window.addEventListener("keydown", guard);
