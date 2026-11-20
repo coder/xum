@@ -123,39 +123,22 @@ jobs:
           sudo install -m 0755 "$RUNNER_TEMP/rcodesign/rcodesign" /usr/bin/rcodesign
           rcodesign --version
 
-      - name: Set up the Cloud KMS PKCS#11 library
+      - name: Set up Apple signing
+        id: apple_signing
         if: inputs.certificate == 'developer-id'
-        env:
-          KMS_KEY_RING: ${{ secrets.MACOS_SIGNING_KMS_KEY_RING }}
-        run: |
-          set -euo pipefail
-          : "${KMS_KEY_RING:?the code-signing environment has no MACOS_SIGNING_KMS_KEY_RING secret}"
-          curl -sSfL --retry 3 -o "$RUNNER_TEMP/libkmsp11.tar.gz" \
-            https://github.com/GoogleCloudPlatform/kms-integrations/releases/download/pkcs11-v1.9/libkmsp11-1.9-linux-amd64.tar.gz
-          sha256sum -c <<<"5397f965073cd5d1e2c43e5148f102f31a7c835902f97eb41c7c9c0f1b876a40  $RUNNER_TEMP/libkmsp11.tar.gz"
-          sudo tar -xzf "$RUNNER_TEMP/libkmsp11.tar.gz" -C /usr/local/lib --strip-components=1 \
-            libkmsp11-1.9-linux-amd64/libkmsp11.so
-
-          # The library refuses a configuration file that others can write.
-          install -m 600 /dev/null "$RUNNER_TEMP/kmsp11.yaml"
-          printf -- '---\ntokens:\n  - key_ring: "%s"\n' "$KMS_KEY_RING" > "$RUNNER_TEMP/kmsp11.yaml"
+        uses: coder/setup-apple-signing-action@7901d28b3975e01adede2dd2044dde8280ce605a # main 2026-11-19
+        with:
+          certificate-pem: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PEM }}
+          key-ring: ${{ secrets.MACOS_SIGNING_KMS_KEY_RING }}
 
       # Before anything slow, so a wrong secret fails in seconds and says which one.
-      - name: Write the certificate and the notarization key
+      - name: Write the notarization key
         if: inputs.certificate == 'developer-id'
         env:
-          CERTIFICATE_PEM: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PEM }}
           AC_APIKEY_P8_BASE64: ${{ secrets.AC_APIKEY_P8_BASE64 }}
         run: |
           set -euo pipefail
-          install -m 600 /dev/null "$RUNNER_TEMP/certificate.pem"
           install -m 600 /dev/null "$RUNNER_TEMP/notary-key.p8"
-          printf '%s\n' "$CERTIFICATE_PEM" > "$RUNNER_TEMP/certificate.pem"
-          # The certificate is public; the log records which one signed.
-          if ! openssl x509 -in "$RUNNER_TEMP/certificate.pem" -noout -subject -serial -enddate; then
-            echo "::error::The MACOS_SIGNING_CERTIFICATE_PEM secret is not a PEM certificate. It is the certificate text itself, not base64 of it."
-            exit 1
-          fi
           # A pasted value often carries a line break or a space, which base64 refuses.
           if ! tr -d '[:space:]' <<<"$AC_APIKEY_P8_BASE64" | base64 -d > "$RUNNER_TEMP/notary-key.p8" ||
             ! openssl pkey -in "$RUNNER_TEMP/notary-key.p8" -noout; then
@@ -201,7 +184,9 @@ jobs:
 
       - name: Sign
         env:
-          KMS_PKCS11_CONFIG: ${{ runner.temp }}/kmsp11.yaml
+          KMS_PKCS11_CONFIG: ${{ steps.apple_signing.outputs.pkcs11-config }}
+          PKCS11_LIBRARY: ${{ steps.apple_signing.outputs.pkcs11-library }}
+          CERTIFICATE_FILE: ${{ steps.apple_signing.outputs.certificate-file }}
           KMS_KEY: ${{ secrets.MACOS_SIGNING_KMS_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.gcloud_auth.outputs.credentials_file_path }}
         run: |
@@ -210,9 +195,9 @@ jobs:
             developer-id)
               : "${KMS_KEY:?the code-signing environment has no MACOS_SIGNING_KMS_KEY secret}"
               key_options=(
-                --pkcs11-library /usr/local/lib/libkmsp11.so
+                --pkcs11-library "$PKCS11_LIBRARY"
                 --pkcs11-key-label "$KMS_KEY"
-                --pkcs11-certificate-file "$RUNNER_TEMP/certificate.pem"
+                --pkcs11-certificate-file "$CERTIFICATE_FILE"
               )
               ;;
             throwaway)
