@@ -356,16 +356,17 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash, Argon and Carbon but not older Flash", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash, Argon, Carbon and Neon but not older Flash", () => {
     // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
     // request envelope and debug snapshots agree with what the Google adapter sends.
-    // Argon and Carbon have no "off" either; unclamped, they would run at their medium default.
+    // Argon, Carbon and Neon have no "off" either; unclamped, they would run at their own default.
     for (const model of [
       "google:gemini-3.8-flash",
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-4-argon",
       "google:gemini-4-carbon",
       "google-vertex:gemini-4-carbon-cyber-permissive",
+      "google:gemini-4-neon",
     ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
@@ -554,15 +555,18 @@ describe("getThinkingPolicyForModel", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
   });
 
-  test("returns low/medium/high (no off) for Gemini 4 Argon and Carbon, unlike the Gemini 3 Pro set", () => {
+  test("returns low/medium/high (no off) for Gemini 4 Argon, Carbon and Neon, unlike the Gemini 3 Pro set", () => {
     for (const model of [
       "google:gemini-4-argon",
       "openrouter:google/gemini-4-argon",
       "google:gemini-4-carbon",
+      "google:gemini-4-neon",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
       expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
+      // The pinned @ai-sdk/google schema rejects "xhigh", even for Neon, which accepts XHIGH.
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("high");
     }
   });
 

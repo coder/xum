@@ -19,6 +19,7 @@ const SAMPLING_CALL_SETTINGS = ["temperature", "topP", "topK"] as const;
 const SAMPLING_REJECTING_GEMINI_PREFIXES = [
   "gemini-4-argon",
   "gemini-4-carbon",
+  "gemini-4-neon",
   "gemini-3.8-flash",
   "gemini-3.7-flash",
   "gemini-3.6-flash",
@@ -26,7 +27,7 @@ const SAMPLING_REJECTING_GEMINI_PREFIXES = [
 ] as const;
 
 /**
- * Gemini 4 Argon and Carbon, Gemini 3.8/3.7/3.6 Flash and Gemini 3.5 Flash-Lite deprecate the sampling
+ * Gemini 4 Argon, Carbon and Neon, Gemini 3.8/3.7/3.6 Flash and Gemini 3.5 Flash-Lite deprecate the sampling
  * parameters temperature/top_p/top_k; Google's migration guides require stripping them from
  * generation configs, so forwarding user overrides would break existing setups
  * (e.g. a wildcard temperature) when the gemini-flash alias repoints.
@@ -53,11 +54,12 @@ export function modelRejectsSamplingParameters(modelString: string): boolean {
 const PENALTY_CALL_SETTINGS = ["frequencyPenalty", "presencePenalty"] as const;
 
 /**
- * Gemini 4 Carbon returns HTTP 400 when frequency_penalty or presence_penalty is present
- * (Google's Carbon developer guide), so a wildcard penalty override would fail every request.
+ * Gemini 4 Carbon and Neon return HTTP 400 when frequency_penalty or presence_penalty is
+ * present (Google's Carbon and Neon developer guides), so a wildcard penalty override would
+ * fail every request.
  */
 function modelRejectsPenaltyParameters(modelString: string): boolean {
-  return stripModelProviderPrefixes(modelString).startsWith("gemini-4-carbon");
+  return /^gemini-4-(?:carbon|neon)/.test(stripModelProviderPrefixes(modelString));
 }
 
 function rejectedCallSettings(modelString: string): readonly string[] {

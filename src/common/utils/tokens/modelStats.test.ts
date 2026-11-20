@@ -157,6 +157,16 @@ describe("getModelStats", () => {
     });
   });
 
+  test("resolves Gemini 4 Neon with its list pricing and synchronous output cap", () => {
+    expect(expectStats("google:gemini-4-neon")).toMatchObject({
+      max_input_tokens: 1048576,
+      max_output_tokens: 65536,
+      input_cost_per_token: 0.000003,
+      output_cost_per_token: 0.000015,
+      cache_read_input_token_cost: 0.00000015,
+    });
+  });
+
   test.each([
     // [model, input, output, cacheRead]: the base models' introductory rates do not apply.
     ["google-vertex:gemini-3.8-flash-cyber", 0.0000015, 0.0000075, 0.00000015],

@@ -77,14 +77,16 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
 
 /**
  * True for Gemini models whose thinking levels are only low/medium/high, so Xum cannot
- * expose "off": Gemini 3.8 Flash (rejects minimal) and Gemini 4 Argon and Carbon (document
- * no minimal level and default to medium; Carbon returns HTTP 400 for minimal).
+ * expose "off": Gemini 3.8 Flash (rejects minimal) and Gemini 4 Argon, Carbon and Neon
+ * (document no minimal level; Carbon and Neon return HTTP 400 for minimal).
+ * Neon also accepts XHIGH, but the pinned @ai-sdk/google schema rejects "xhigh" (support
+ * landed in 4.0.119), so Neon stays on low/medium/high until that bump.
  * @param modelName Provider model ID without the provider prefix.
  */
 function isGeminiLowMediumHighModelName(modelName: string): boolean {
   return (
     isGeminiFlashMinimalRejectingModelName(modelName) ||
-    /^gemini-4-(?:argon|carbon)/.test(modelName.trim().toLowerCase())
+    /^gemini-4-(?:argon|carbon|neon)/.test(modelName.trim().toLowerCase())
   );
 }
 
@@ -97,7 +99,7 @@ function isGeminiLowMediumHighModelName(modelName: string): boolean {
  *   disabled)
  * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
  * - openai:gpt-5.6 / -sol / -terra / -luna → ["off", "low", "medium", "high", "xhigh", "max"]
- * - Gemini 3.8 Flash / Gemini 4 Argon / Carbon → ["low", "medium", "high"] (no minimal, so no "off")
+ * - Gemini 3.8 Flash / Gemini 4 Argon / Carbon / Neon → ["low", "medium", "high"] (no minimal, so no "off")
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
  * - xai:grok-4.7 / xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
@@ -182,7 +184,7 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }
 
-  // Gemini 3.8 Flash and Gemini 4 Argon/Carbon have no "minimal" level, so thinking cannot be
+  // Gemini 3.8 Flash and Gemini 4 Argon/Carbon/Neon have no "minimal" level, so thinking cannot be
   // disabled; "off" clamps to "low".
   if (isGeminiLowMediumHighModelName(withoutProviderNamespace)) {
     return ["low", "medium", "high"];

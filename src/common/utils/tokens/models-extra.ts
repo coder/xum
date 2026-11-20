@@ -762,6 +762,28 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Gemini 4 Neon - GA on the paid Gemini API on November 18, 2026. Stable
+  // `gemini-4-neon` model ID; limits as Carbon (one shared 1,048,576-token window, 65,536
+  // tokens per synchronous request). No introductory rate: $3/M input, $15/M output,
+  // $0.15/M implicitly cached input (explicit caching is not supported). No >200K tier.
+  // Source: Gemini API model and pricing docs, 2026-11-20.
+  "gemini-4-neon": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.000003, // $3 per million input tokens
+    output_cost_per_token: 0.000015, // $15 per million output tokens, including thinking tokens
+    cache_read_input_token_cost: 0.00000015, // $0.15 per million cached input tokens
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Gemini 4 Carbon Cyber Permissive - Vertex AI only (`google-vertex:`), for projects on
   // its own allowlist (Fairwind program), in the `global` and `us` locations. Limits as
   // Gemini 4 Carbon above, including the 65,536-token synchronous output cap. Carbon's
