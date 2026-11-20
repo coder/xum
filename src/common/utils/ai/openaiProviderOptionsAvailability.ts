@@ -61,9 +61,19 @@ export function resolveProviderOptionsRoute(
   return options?.resolvedRouteProvider ?? "direct";
 }
 
+function resolveServiceTierModel(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null | undefined
+): string {
+  if (modelString.startsWith("coder:")) {
+    return resolveCoderGatewayMetadataModel(modelString, providersConfig) ?? modelString;
+  }
+  return normalizeToCanonical(modelString);
+}
+
 /**
- * Whether the model accepts the given OpenAI service tier. Other tiers are
- * route-gated only (see openaiServiceTierAvailable).
+ * Whether the route and model accept the given OpenAI service tier. The caller
+ * first checks if the route accepts any service tiers (openaiServiceTierAvailable).
  *
  * Ultrafast (`service_tier: "ultrafast"`, launched at DevDay 2026-09-29) is
  * model-gated: among the supported models OpenAI serves it only for the GPT
@@ -83,12 +93,55 @@ export function openaiModelSupportsServiceTier(
   serviceTier: string,
   options?: OpenAIDirectProviderOptionsAvailability
 ): boolean {
-  if (serviceTier !== "ultrafast" && serviceTier !== "flex") return true;
-  if (serviceTier === "ultrafast" && !ultrafastWireAccepted(modelString, options)) return false;
-  // Resolve mapped aliases and Coder gateway identities to the upstream model.
-  const capabilityModel = resolveModelForMetadata(modelString, options?.providersConfig ?? null);
-  const tier = openaiGptTier(capabilityModel);
-  return serviceTier === "ultrafast" ? tier?.ultrafast === true : tier?.flex !== false;
+  if (usesCodexServiceTier(modelString, options)) {
+    return CODEX_SERVICE_TIERS.has(serviceTier);
+  }
+  return openaiApiModelSupportsServiceTier(modelString, serviceTier, options);
+}
+
+const CODEX_SERVICE_TIERS = new Set(["priority", "default"]);
+
+function usesCodexServiceTier(
+  modelString: string,
+  options?: OpenAIDirectProviderOptionsAvailability
+): boolean {
+  const { providersConfig, openaiWireFormat } = options ?? {};
+  return (
+    resolveProviderOptionsRoute(modelString, options) === "direct" &&
+    wouldRouteOpenAIThroughCodexOauth(
+      resolveServiceTierModel(modelString, providersConfig),
+      providersConfig,
+      {
+        openaiWireFormat,
+      }
+    )
+  );
+}
+
+function openaiApiModelSupportsServiceTier(
+  modelString: string,
+  serviceTier: string,
+  options?: OpenAIDirectProviderOptionsAvailability
+): boolean {
+  switch (serviceTier) {
+    case "ultrafast":
+      return (
+        ultrafastWireAccepted(modelString, options) &&
+        openaiServiceTierCapabilities(modelString, options)?.ultrafast === true
+      );
+    case "flex":
+      return openaiServiceTierCapabilities(modelString, options)?.flex !== false;
+    default:
+      return true;
+  }
+}
+
+function openaiServiceTierCapabilities(
+  modelString: string,
+  options?: OpenAIDirectProviderOptionsAvailability
+) {
+  // Mapped aliases and Coder models use the upstream model's tier capabilities.
+  return openaiGptTier(resolveModelForMetadata(modelString, options?.providersConfig ?? null));
 }
 
 /**
@@ -157,9 +210,7 @@ export function openaiServiceTierAvailable(
     return wire?.providerType === "openai" || wire?.providerType === "openai-compat";
   }
 
-  const normalized = modelString.startsWith("coder:")
-    ? (resolveCoderGatewayMetadataModel(modelString, options?.providersConfig) ?? modelString)
-    : normalizeToCanonical(modelString);
+  const normalized = resolveServiceTierModel(modelString, options?.providersConfig);
   const [origin, modelId] = normalized.split(":", 2);
   if (origin === "github-copilot") {
     // Copilot's unscoped catalog mixes upstreams; capability mappings cannot
@@ -170,10 +221,8 @@ export function openaiServiceTierAvailable(
   if (route === "openrouter" || route === "github-copilot") {
     return true;
   }
-  return openaiDirectProviderOptionsAvailable(normalized, {
-    ...options,
-    resolvedRouteProvider: route,
-  });
+  // Both direct OpenAI API requests and Codex OAuth requests support Fast.
+  return route === "direct";
 }
 
 export function openaiDirectProviderOptionsAvailable(

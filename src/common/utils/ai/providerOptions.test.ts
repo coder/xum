@@ -1668,26 +1668,32 @@ describe("buildProviderOptions - OpenAI", () => {
       }
     );
 
-    test.each([false, true])("uses native route auth when codexOauthSet=%s", (codexOauthSet) => {
+    test.each([
+      ["priority", "priority"],
+      ["default", "default"],
+      ["ultrafast", undefined],
+      ["flex", undefined],
+      ["auto", undefined],
+    ] as const)("applies Codex OAuth tier support to %s", (serviceTier, expected) => {
       const options = buildProviderOptions(
-        "openai:gpt-6-astra",
+        "openai:gpt-6.2-astra",
         "off",
         undefined,
         undefined,
-        { openai: { serviceTier: "priority" } },
+        { openai: { serviceTier } },
         undefined,
         undefined,
         {
           openai: {
-            apiKeySet: !codexOauthSet,
-            codexOauthSet,
+            apiKeySet: false,
+            codexOauthSet: true,
             isEnabled: true,
             isConfigured: true,
           },
         },
         "openai"
       );
-      expect(getOpenAIOptions(options)?.serviceTier).toBe(codexOauthSet ? undefined : "priority");
+      expect(getOpenAIOptions(options)?.serviceTier).toBe(expected);
     });
 
     test("should include explicit non-auto serviceTier", () => {
