@@ -256,6 +256,7 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 - Examples:
   - Bad: asserting an exact prompt sentence or other newly-added copy from the same diff.
   - Good: asserting precedence, gating, fallback behavior, matching logic, or another behavioral branch that would still matter if the wording changed.
+- **Plugin override sweep: no unlocked pre-lock scan.** `prunePluginOverrideKeysForWorkspaces` reads and prunes override documents only under the lock of every workspace it sweeps and the global override lock. Do not add a scan outside those locks that decides which workspaces to lock. It rests on the banned premise "nothing changes a non-candidate workspace between the unlocked scan and the locks", and renames, moves, forks and a rename away and back broke it in every review round of #7946, #7964, #7967, #7969 and #8004.
 
 ## UI Component Testability (tests/ui)
 

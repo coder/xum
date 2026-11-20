@@ -307,6 +307,49 @@ export function runtimeFilesystemIdentity(config: RuntimeConfig): string | undef
   }
 }
 /**
+ * The text of `handle`'s file, refused over `maxBytes` (OverridesFileTooLargeError). It reads
+ * one byte past the cap and never buffers more: the file can grow after any stat.
+ */
+async function readHandleUpTo(
+  handle: fsPromises.FileHandle,
+  filePath: string,
+  maxBytes: number
+): Promise<string> {
+  const buffer = Buffer.alloc(maxBytes + 1);
+  let length = 0;
+  // mutation-equivalent: at a full buffer, a further read asks for 0 bytes, gets 0, and ends the loop
+  while (length < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+    if (bytesRead === 0) break;
+    length += bytesRead;
+  }
+  if (length > maxBytes) throw new OverridesFileTooLargeError(filePath, length);
+  return buffer.toString("utf-8", 0, length);
+}
+/** See readHostOverrideDocumentNoFollow, step 2. */
+const VERIFIED_DOCUMENT_OPEN_FLAGS =
+  fsConstants.O_RDONLY |
+  // mutation-equivalent: O_NOFOLLOW is a nonzero constant wherever Node defines it, so ?? and || agree; only Windows, which lacks it, reads the 0, and these tests run on POSIX
+  (fsConstants.O_NOFOLLOW ?? 0) |
+  // mutation-equivalent: as O_NOFOLLOW above
+  (fsConstants.O_NONBLOCK ?? 0);
+/**
+ * The path of `segments` joined under the checkout's realpath `root`, refused when any of
+ * them is a symbolic link (see readHostOverrideDocumentNoFollow).
+ */
+async function guardOverrideSegments(
+  root: string,
+  segments: readonly string[],
+  refuse: (reason: string) => never
+): Promise<string> {
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    if ((await fsPromises.lstat(current)).isSymbolicLink()) refuse(`${segment} is a symbolic link`);
+  }
+  return current;
+}
+/**
  * SECURITY: read a host override document whose bytes leave the checkout (the
  * fork copy; unknown fields carried into another document) without following
  * a symlink swapped in after the point-in-time segment guards. Code running
@@ -314,12 +357,17 @@ export function runtimeFilesystemIdentity(config: RuntimeConfig): string | undef
  * design) can replace the document — or a PARENT segment such as `.xum` —
  * with a symlink between a check and a path-based read. Node cannot open
  * relative to a pinned directory descriptor, so the read is verified instead:
- * 1. open once with O_NOFOLLOW (the final component is never followed) and
- *    fstat the handle (a regular file);
- * 2. AFTER the open, re-guard every repo-controlled segment under the
- *    checkout's realpath (`lstat`, not a symlink) and require the file at
- *    that canonical path to be the very inode the handle holds.
- * A parent swapped to a symlink at open time either still is one at step 2
+ * 1. BEFORE the open, guard every parent segment under the checkout's
+ *    realpath (`lstat`, not a symlink): a path whose parent chain was not
+ *    checked is never opened. (A tracked `.xum` symlink can lead to a FIFO or
+ *    a device outside the checkout, and an open of a FIFO without a writer
+ *    never returns, even after the caller's deadline.)
+ * 2. open once with O_NOFOLLOW (the final component is never followed) and
+ *    O_NONBLOCK (an open of a FIFO swapped in after step 1 returns at once),
+ *    and fstat the handle: only a regular file is read;
+ * 3. AFTER the open, guard every segment again and require the file at that
+ *    canonical path to be the very inode the handle holds.
+ * A parent swapped to a symlink at open time either still is one at step 3
  * (guard fails) or was swapped back (the handle's inode then differs from
  * the checkout's own file); the bytes are read from the verified handle. A
  * hardlink planted inside the checkout is indistinguishable from the
@@ -327,34 +375,32 @@ export function runtimeFilesystemIdentity(config: RuntimeConfig): string | undef
  */
 export async function readHostOverrideDocumentNoFollow(
   filePath: string,
-  workspacePath: string
+  workspacePath: string,
+  /** Refuse a file over this many bytes, counted from the verified handle (see OverridesFileTooLargeError). */
+  maxBytes?: number
 ): Promise<string> {
   const refuse = (reason: string): never => {
     throw new Error(
       `Workspace MCP overrides path could not be verified (${reason}); refusing to read it: ${filePath}`
     );
   };
-  const handle = await fsPromises.open(
-    filePath,
-    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
-  );
+  const relative = path.relative(workspacePath, filePath).replaceAll("\\", "/");
+  if (relative.startsWith("..") || path.isAbsolute(relative)) refuse("outside the checkout");
+  const segments = relative.split("/");
+  const root = await fsPromises.realpath(workspacePath);
+  await guardOverrideSegments(root, segments.slice(0, -1), refuse);
+  const handle = await fsPromises.open(filePath, VERIFIED_DOCUMENT_OPEN_FLAGS);
   try {
     const opened = await handle.stat();
     if (!opened.isFile()) refuse("not a regular file");
-    const relative = path.relative(workspacePath, filePath).replaceAll("\\", "/");
-    if (relative.startsWith("..") || path.isAbsolute(relative)) refuse("outside the checkout");
-    const root = await fsPromises.realpath(workspacePath);
-    let current = root;
-    for (const segment of relative.split("/")) {
-      current = path.join(current, segment);
-      if ((await fsPromises.lstat(current)).isSymbolicLink())
-        refuse(`${segment} is a symbolic link`);
-    }
+    const current = await guardOverrideSegments(root, segments, refuse);
     const canonical = await fsPromises.stat(current);
     if (canonical.dev !== opened.dev || canonical.ino !== opened.ino) {
       refuse("the opened file is not the checkout's own document");
     }
-    return await handle.readFile("utf-8");
+    return maxBytes === undefined
+      ? await handle.readFile("utf-8")
+      : await readHandleUpTo(handle, filePath, maxBytes);
   } finally {
     await handle.close();
   }
@@ -884,6 +930,67 @@ function groupByCheckout(
   }
   return [...new Set(groupOfId.values())].map((group) => [...group]);
 }
+/** Every legacy `workspace.mcp` value registered under `workspaceId`. */
+function legacyOverridesOf(config: ProjectsConfig, workspaceId: string): unknown[] {
+  return [...config.projects.values()]
+    .flatMap((projectConfig) => projectConfig.workspaces)
+    .filter((workspace) => workspace.id === workspaceId && workspace.mcp !== undefined)
+    .map((workspace) => workspace.mcp);
+}
+/** A legacy `workspace.mcp` value without `keyPrefix` keys; undefined for a shape this build cannot edit. */
+function prunedLegacyValue(value: unknown, keyPrefix: string): WorkspaceMCPOverrides | undefined {
+  if (!isRecognizedOverridesDocument(value)) {
+    return undefined;
+  }
+  try {
+    const text = prunePluginKeysFromDocument(
+      JSON.stringify(value),
+      keyPrefix,
+      "config.json workspace.mcp"
+    );
+    return JSON.parse(text) as WorkspaceMCPOverrides;
+  } catch {
+    return undefined;
+  }
+}
+/** Whether a legacy `workspace.mcp` value may name `keyPrefix` keys in any of its decoded strings. */
+function legacyValueMayNameKey(value: unknown, keyPrefix: string): boolean {
+  // mutation-equivalent: JSON.stringify yields undefined or a non-empty string, so ?? and || agree
+  return documentStringsContain(JSON.stringify(value) ?? "", (text) => text.includes(keyPrefix));
+}
+/**
+ * Removes `keyPrefix` keys, in place in `config`, from each legacy value of `workspaceId` that
+ * may name them (see pruneLegacyOverrides). Returns whether one of those values has a shape this
+ * build cannot edit, and so still names the key: another process (an older or newer build) can
+ * write a value after the caller checked it.
+ */
+function pruneLegacyValuesIn(
+  config: ProjectsConfig,
+  workspaceId: string,
+  keyPrefix: string
+): boolean {
+  let uneditable = false;
+  for (const projectConfig of config.projects.values()) {
+    for (const workspace of projectConfig.workspaces) {
+      if (workspace.id !== workspaceId || !legacyValueMayNameKey(workspace.mcp, keyPrefix))
+        continue;
+      const pruned = prunedLegacyValue(workspace.mcp, keyPrefix);
+      if (pruned === undefined) uneditable = true;
+      else workspace.mcp = pruned;
+    }
+  }
+  return uneditable;
+}
+/** Ids of the workspaces whose config.json entry still carries a legacy `workspace.mcp` value. */
+function idsWithLegacyOverrides(config: ProjectsConfig): Set<string> {
+  const ids = new Set<string>();
+  for (const projectConfig of config.projects.values()) {
+    for (const workspace of projectConfig.workspaces) {
+      if (workspace.id !== undefined && workspace.mcp !== undefined) ids.add(workspace.id);
+    }
+  }
+  return ids;
+}
 /**
  * Lock files and checkouts touched at once by a batch (see withWorkspaceLocks).
  * Measured on Node: 7,550 lock files took 70 s one at a time, 4.6 s 16 at a time.
@@ -1392,6 +1499,11 @@ function legacyOverridesById(
     }
   }
   return byId;
+}
+
+/** A checkout lock key: a short digest of what identifies the checkout (see checkoutLockKeys). */
+function checkoutLockKeyDigest(parts: string[]): string {
+  return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 32);
 }
 
 export class WorkspaceMcpOverridesService {
@@ -3993,6 +4105,60 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
+   * The lock keys of one registry entry of `id` (see checkoutLockKeys), or the error that makes
+   * the id unresolvable: a runtime that cannot be built, or a checkout whose real path does not
+   * answer.
+   */
+  private async checkoutKeysOf(
+    id: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<string[] | Error> {
+    const identity = runtimeFilesystemIdentity(metadata.runtimeConfig);
+    if (identity === undefined) {
+      return [checkoutLockKeyDigest(["workspace", metadata.runtimeConfig.type, id])];
+    }
+    let workspacePath: string;
+    try {
+      ({ workspacePath } = this.resolveWorkspace(metadata));
+    } catch (error) {
+      return new Error(
+        `Could not establish the checkout of workspace ${id} (${getErrorMessage(error)})`
+      );
+    }
+    if (identity !== "host") {
+      const keys = [checkoutLockKeyDigest([identity, workspacePath])];
+      if (metadata.runtimeConfig.type === "ssh") {
+        // SSH `host` may be an ssh_config alias: two aliases can name one
+        // machine, and nothing here can resolve them to a stable remote
+        // identity. A rename through one alias and a save through the
+        // other must still contend, so every SSH registration of a
+        // remote path also takes a path-only fence shared across SSH
+        // identities (conservative: same path on different hosts
+        // serializes needlessly, which only costs a short wait).
+        keys.push(checkoutLockKeyDigest(["ssh-path", workspacePath]));
+      }
+      return keys;
+    }
+    const spelled = path.resolve(workspacePath);
+    const keys = [checkoutLockKeyDigest([identity, spelled])];
+    try {
+      const real = await withDeadline(
+        fsPromises.realpath(spelled),
+        REALPATH_TIMEOUT_MS,
+        "realpath timed out"
+      );
+      if (real !== spelled) keys.push(checkoutLockKeyDigest([identity, real]));
+    } catch (error) {
+      if (!isPositivelyAbsent(error)) {
+        return new Error(
+          `Could not establish the checkout identity of workspace ${id} (${getErrorMessage(error)}); retry once its filesystem responds.`
+        );
+      }
+    }
+    return keys;
+  }
+
+  /**
    * The lock KEYS of each workspace's checkout. Keyed by checkout identity,
    * not workspace id: aliases sharing one checkout (an isolation:none child
    * and its parent, in-place registrations) hold distinct ids for one
@@ -4051,60 +4217,17 @@ export class WorkspaceMcpOverridesService {
     // sweep prunes EVERY such checkout, so the id's key set is the union over
     // all of them (any indeterminate entry makes the id unresolvable).
     const byId = groupMetadataById(all, /* hostLocalOnly */ false);
-    const digest = (parts: string[]): string =>
-      createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 32);
-    const keysFor = async (
-      id: string,
-      metadata: FrontendWorkspaceMetadata
-    ): Promise<string[] | Error> => {
-      const identity = runtimeFilesystemIdentity(metadata.runtimeConfig);
-      if (identity === undefined) {
-        return [digest(["workspace", metadata.runtimeConfig.type, id])];
-      }
-      const { workspacePath } = this.resolveWorkspace(metadata);
-      if (identity !== "host") {
-        const keys = [digest([identity, workspacePath])];
-        if (metadata.runtimeConfig.type === "ssh") {
-          // SSH `host` may be an ssh_config alias: two aliases can name one
-          // machine, and nothing here can resolve them to a stable remote
-          // identity. A rename through one alias and a save through the
-          // other must still contend, so every SSH registration of a
-          // remote path also takes a path-only fence shared across SSH
-          // identities (conservative: same path on different hosts
-          // serializes needlessly, which only costs a short wait).
-          keys.push(digest(["ssh-path", workspacePath]));
-        }
-        return keys;
-      }
-      const spelled = path.resolve(workspacePath);
-      const keys = [digest([identity, spelled])];
-      try {
-        const real = await withDeadline(
-          fsPromises.realpath(spelled),
-          REALPATH_TIMEOUT_MS,
-          "realpath timed out"
-        );
-        if (real !== spelled) keys.push(digest([identity, real]));
-      } catch (error) {
-        if (!isPositivelyAbsent(error)) {
-          return new Error(
-            `Could not establish the checkout identity of workspace ${id} (${getErrorMessage(error)}); retry once its filesystem responds.`
-          );
-        }
-      }
-      return keys;
-    };
     const derived = await mapWithConcurrency(
       workspaceIds,
       CANONICALIZE_CONCURRENCY,
       async (id): Promise<string[] | Error> => {
         const entries = byId.get(id);
         if (entries === undefined) {
-          return [digest(["id", id])];
+          return [checkoutLockKeyDigest(["id", id])];
         }
         const union = new Set<string>();
         for (const metadata of entries) {
-          const result = await keysFor(id, metadata);
+          const result = await this.checkoutKeysOf(id, metadata);
           if (result instanceof Error) return result;
           for (const key of result) union.add(key);
         }
@@ -4963,6 +5086,7 @@ export class WorkspaceMcpOverridesService {
       /* hostLocalOnly */ true
     );
     const failures: Array<{ workspaceId: string; error: unknown }> = [];
+    const legacyIds = idsWithLegacyOverrides(snapshot.loadLegacyConfig());
     const swept = new Map<string, SweptWorkspace>();
     let anyOwesEpoch = false;
     // Many checkouts at once: thousands of sequential stats outlasted the
@@ -4989,7 +5113,7 @@ export class WorkspaceMcpOverridesService {
               metadataById.get(workspaceId.trim()),
               workspaceId,
               keyPrefix,
-              { budget, snapshot }
+              { budget, snapshot, hasLegacyValue: legacyIds.has(workspaceId.trim()) }
             )
           );
         }
@@ -5005,14 +5129,13 @@ export class WorkspaceMcpOverridesService {
         failures.push({ workspaceId, error: outcome.error });
       }
     }
-    if (swept.size === 0) {
-      return failures;
-    }
     // Files changed: siblings must learn about it BEFORE the bounded (and
     // possibly slow) publication below, like a settings save (see
     // writeOverridesLocked). Without the durable signal every swept workspace
     // keeps its tombstone (retry re-bumps). No document anywhere → nothing to
-    // signal (see prunePluginOverrideKeys).
+    // signal (see prunePluginOverrideKeys). A rewrite that landed owes the
+    // signal even when every workspace of the sweep failed (a partial rewrite of
+    // a duplicated ID).
     if (anyOwesEpoch) {
       try {
         await this.bumpOverridesEpoch();
@@ -5021,6 +5144,9 @@ export class WorkspaceMcpOverridesService {
           failures.push({ workspaceId, error });
         }
       }
+    }
+    if (swept.size === 0) {
+      return failures;
     }
 
     // A fresh post-sweep enumeration serves both checks below: the rename
@@ -5089,11 +5215,15 @@ export class WorkspaceMcpOverridesService {
     entries: readonly FrontendWorkspaceMetadata[] | undefined,
     workspaceId: string,
     keyPrefix: string,
-    sweep: { budget: PublicationBudget; snapshot: ConfigSnapshot }
+    sweep: { budget: PublicationBudget; snapshot: ConfigSnapshot; hasLegacyValue: boolean }
   ): Promise<SweptOutcome> {
     // Owed even when a later checkout of the ID fails: an earlier one may
-    // already be rewritten.
-    let owesEpoch = false;
+    // already be rewritten. A legacy config.json value owes it whether or not this
+    // sweep rewrites it, as a document does (see pruneResolvedWorkspace): the
+    // rewrite below can land and the document prune after it throw or time out,
+    // or an earlier sweep rewrote it and failed its epoch bump. Its retry then
+    // finds no key in the value, and must still publish the epoch.
+    let owesEpoch = sweep.hasLegacyValue;
     try {
       if (!entries) {
         throw new Error(`Host-local workspace metadata not found for ${workspaceId.trim()}`);
@@ -5109,9 +5239,17 @@ export class WorkspaceMcpOverridesService {
         // deadline (a stat/read finally answering) must not start its
         // rewrite once the caller moved on — settleSideEffects can only
         // join a write that has been registered by then.
+        // The deadline cannot stop a prune that is spent before it starts:
+        // remaining() never drops below 1 ms, and the legacy prune starts its
+        // config.json edit before its first await. Without this check, every
+        // workspace left after the budget still rewrote config.json once, under
+        // the locks.
+        if (sweep.budget.exhausted()) {
+          throw new Error(`pruning workspace ${metadata.id} exceeded the plugin-prune budget`);
+        }
         const step = sweep.snapshot.scoped();
         const result = await withDeadline(
-          this.pruneResolvedWorkspace(this.resolveWorkspace(metadata), keyPrefix, step),
+          this.pruneSweptCheckout(metadata, keyPrefix, step, sweep.hasLegacyValue),
           sweep.budget.remaining(),
           `pruning workspace ${metadata.id} exceeded the plugin-prune budget`,
           () => step.cancel()
@@ -5132,8 +5270,73 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
+   * One checkout of a sweep: its config.json `workspace.mcp` value, then its documents
+   * (pruneResolvedWorkspace). The legacy value decides whenever the workspace has no
+   * document, or one that normalizes to nothing (resolveOverridesFor), so a key it keeps
+   * comes back after the documents' prune: right away when the prune empties the document,
+   * or on a later edit. The legacy value goes first, so that one this build cannot edit
+   * fails the workspace before any document is rewritten.
+   */
+  private async pruneSweptCheckout(
+    metadata: FrontendWorkspaceMetadata,
+    keyPrefix: string,
+    step: ConfigSnapshot,
+    hasLegacyValue: boolean
+  ): Promise<{ filePaths: readonly string[]; owesEpoch: boolean; rewrote: boolean }> {
+    const legacyRewritten =
+      hasLegacyValue && (await this.pruneLegacyOverrides(metadata.id, keyPrefix, step));
+    const pruned = await this.pruneResolvedWorkspace(
+      this.resolveWorkspace(metadata),
+      keyPrefix,
+      step
+    );
+    // A rewritten legacy value changes what the workspace resolves to: it owes its own
+    // publication, like a rewritten document. (The caller owes the epoch for any legacy value.)
+    return legacyRewritten ? { ...pruned, rewrote: true } : pruned;
+  }
+
+  /**
+   * Remove `keyPrefix` keys from the config.json `workspace.mcp` values registered under
+   * `workspaceId` (every entry: a corrupted config can list one ID twice). Returns whether
+   * one may have changed. A value this build cannot edit stays as it is, so it fails the
+   * workspace when it may name the key.
+   */
+  private async pruneLegacyOverrides(
+    workspaceId: string,
+    keyPrefix: string,
+    step: ConfigSnapshot
+  ): Promise<boolean> {
+    const naming = legacyOverridesOf(step.loadLegacyConfig(), workspaceId).filter((value) =>
+      legacyValueMayNameKey(value, keyPrefix)
+    );
+    if (naming.length === 0) {
+      return false;
+    }
+    // A value this build cannot edit fails the workspace before any write. The edit reads
+    // config.json again, and a value written since this check is checked there.
+    // No cancellation check before the edit: this runs before the caller's deadline can fire
+    // (see pruneSweptWorkspace, which checks the budget before each checkout instead).
+    let uneditable = naming.some((value) => prunedLegacyValue(value, keyPrefix) === undefined);
+    if (!uneditable) {
+      await step.trackSideEffect(
+        this.config.editConfig((config) => {
+          uneditable = pruneLegacyValuesIn(config, workspaceId, keyPrefix);
+          return config;
+        })
+      );
+    }
+    if (uneditable) {
+      throw new Error(
+        `Workspace ${workspaceId} carries a legacy MCP settings value in config.json that this version cannot edit and that may name "${keyPrefix}" keys`
+      );
+    }
+    return true;
+  }
+
+  /**
    * Publication phase of sweepPluginOverrideKeys: re-publish each swept
    * workspace's effective overrides, in sweep order, under the sweep's budget.
+   * Once the budget is spent, the rest are evicted with every other cache.
    * Returns the workspaces whose publication failed (the caller keeps their
    * tombstones).
    */
@@ -5164,6 +5367,15 @@ export class WorkspaceMcpOverridesService {
     // The sweep's single budget continues here: each fan-out would
     // otherwise reset its own 30 s while the locks stay held.
     for (const [workspaceId, { metadata, filePaths, ownFileRewritten }] of swept) {
+      // The budget is spent: every step below would still run, each under a 0 ms deadline
+      // and each with its eviction, while the locks stay held. 300 rewritten workspaces
+      // with a 250 ms publisher held the global lock 60 s, and a save queued behind it
+      // timed out. Evict every cache once instead, as the fan-out does when its budget runs
+      // out: every prune here already landed, so each next serve reads pruned documents.
+      if (budget.exhausted()) {
+        await publish(null, ALL_WORKSPACES_TARGET);
+        break;
+      }
       // This workspace's own files did not change and the receiver holds
       // nothing to repair for it: skip the (disk-reading) resolution. Still
       // evict: the I/O-free marker fences a cold first serve already in
@@ -5252,8 +5464,16 @@ export class WorkspaceMcpOverridesService {
       // survives) until the link is removed.
       await assertPruneTargetNotSymlinked(filePath, workspacePath);
       // Strict read: unreadable/unparseable content must throw so the
-      // caller keeps its retry tombstone (mirrors readOverridesFile).
-      const original = await readFileString(runtime, filePath);
+      // caller keeps its retry tombstone (mirrors readOverridesFile). Verified
+      // and bounded (readHostOverrideDocumentNoFollow): a FIFO at this path,
+      // which code in the checkout can make, is refused at once instead of
+      // blocking this read, and every lock held, until the sweep's budget runs
+      // out.
+      const original = await readHostOverrideDocumentNoFollow(
+        filePath,
+        workspacePath,
+        MAX_PRUNED_OVERRIDES_BYTES
+      );
       let text: string;
       try {
         text = prunePluginKeysFromDocument(original, keyPrefix, filePath);
