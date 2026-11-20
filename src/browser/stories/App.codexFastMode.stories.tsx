@@ -32,15 +32,21 @@ export const Toggle: AppStory = {
     const thinking = canvas.getByRole("button", { name: /Thinking:/ });
     await userEvent.click(thinking);
     const fast = canvas.getByRole("button", { name: /^Fast mode/ });
+    const ultrafast = canvas.getByRole("button", { name: /^Ultrafast mode/ });
     await expect(fast).toHaveAttribute("aria-pressed", "false");
-    await expect(canvas.queryByRole("button", { name: /Ultrafast mode/ })).not.toBeInTheDocument();
+    await expect(ultrafast).toHaveAttribute("aria-pressed", "false");
 
     await userEvent.click(fast);
     await waitFor(() => expect(fast).toHaveAttribute("aria-pressed", "true"));
     await expect(thinking).toHaveAccessibleName("Thinking: high, fast mode");
 
-    await userEvent.click(fast);
-    await waitFor(() => expect(fast).toHaveAttribute("aria-pressed", "false"));
+    await userEvent.click(ultrafast);
+    await waitFor(() => expect(ultrafast).toHaveAttribute("aria-pressed", "true"));
+    await expect(fast).toHaveAttribute("aria-pressed", "false");
+    await expect(thinking).toHaveAccessibleName("Thinking: high, ultrafast mode");
+
+    await userEvent.click(ultrafast);
+    await waitFor(() => expect(ultrafast).toHaveAttribute("aria-pressed", "false"));
     await expect(thinking).toHaveAccessibleName("Thinking: high");
   },
 };

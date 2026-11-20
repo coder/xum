@@ -51,7 +51,15 @@ Toggle Fast off to return to Standard for that chat. Xum still uses your Codex s
 
 ### OpenAI Ultrafast
 
-To use OpenAI's fastest processing tier, turn on the thinking selector's **Ultrafast mode** row (it sits next to **Fast mode**), run **Toggle Ultrafast Mode** from the command palette, or use its keyboard shortcut. You can also choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Fast and Ultrafast are mutually exclusive, and turning either off switches the chat to Standard. Like the thinking level, the choice is saved per chat and stays with the chat when you switch models; chats without a choice use the provider's service tier. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6.2 Sol, GPT-6.2 Astra, GPT-6.1 Sol, and GPT-6 Astra. It also needs a route that sends OpenAI's own Responses API: direct OpenAI on the default wire format, Coder instances of type OpenAI, or custom OpenAI Responses providers. Direct OpenAI set to Chat Completions, Coder OpenAI-compatible instances, OpenRouter, and GitHub Copilot do not accept the tier. Elsewhere the request runs without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate. OpenAI charges 3× for GPT-6.2 Sol and Astra through February 28, 2027, so until then Xum shows twice their real Ultrafast cost.
+Turn on **Ultrafast mode** in the **Thinking** selector or type `/ultrafast`. You can also use **Toggle Ultrafast Mode** in the Command Palette or use its keyboard shortcut. To set a default for new chats, select **ultrafast** in **Settings → Providers → OpenAI**.
+
+Fast and Ultrafast are mutually exclusive. Turn either mode off to return to Standard. Xum saves your choice per chat, even when you switch models. Chats without a choice use the provider's service tier.
+
+Ultrafast supports GPT-6.2 Sol, GPT-6.2 Astra, GPT-6.1 Sol, and GPT-6 Astra. It requires the Responses API. Supported routes include direct OpenAI (API key or Codex OAuth), Coder instances of type OpenAI, and custom OpenAI Responses providers. Chat Completions, Coder OpenAI-compatible instances, OpenRouter, and GitHub Copilot do not support Ultrafast. On unsupported models or routes, Xum omits Ultrafast instead of switching to Fast.
+
+With Codex OAuth, Ultrafast uses your Codex subscription. [Codex plan, workspace, and residency requirements](https://learn.chatgpt.com/codex/speed#ultrafast-plan-and-workspace-requirements) apply.
+
+For API key requests, Xum estimates Ultrafast costs at 6× the Standard price. OpenAI charges 3× for GPT-6.2 Sol and Astra through February 28, 2027. Until then, Xum estimates twice the actual API cost for these models.
 
 OpenAI does not offer the Flex tier for GPT-6.2 Sol and Astra. If **Settings → Providers → OpenAI** sets the service tier to **flex**, their requests run at Standard instead.
 

@@ -26,6 +26,7 @@ import {
   anthropicRejectsDisabledThinking,
   isGpt6LunaModel,
   isGrokFrontierModel,
+  openaiGptTier,
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { Ok, Err } from "@/common/types/result";
@@ -1620,7 +1621,10 @@ function extractTextContent(content: unknown): string {
   return "";
 }
 
-function normalizeCodexOptions(json: Record<string, unknown>): void {
+function normalizeCodexOptions(
+  json: Record<string, unknown>,
+  modelTier: ReturnType<typeof openaiGptTier>
+): void {
   // Strip the native pro-mode field before forwarding to the stricter ChatGPT
   // backend. Unknown nested reasoning fields risk a hard 4xx, and falling back
   // to standard mode is safer. Preserve effort/summary.
@@ -1631,20 +1635,26 @@ function normalizeCodexOptions(json: Record<string, unknown>): void {
     }
   }
 
-  // Codex uses priority for Fast and omits service_tier for Standard.
-  if (json.service_tier !== "priority") {
+  // Forward only paid speed tiers that Codex accepts. Standard omits the field.
+  if (
+    json.service_tier !== "priority" &&
+    !(json.service_tier === "ultrafast" && modelTier?.ultrafast === true)
+  ) {
     delete json.service_tier;
   }
 }
 
-export function normalizeCodexResponsesBody(body: string): string {
+export function normalizeCodexResponsesBody(
+  body: string,
+  modelTier?: ReturnType<typeof openaiGptTier>
+): string {
   const json = JSON.parse(body) as Record<string, unknown>;
 
   // ChatGPT's Codex endpoint is stricter than the public OpenAI Responses API
   // and currently rejects the `truncation` field entirely.
   delete json.truncation;
 
-  normalizeCodexOptions(json);
+  normalizeCodexOptions(json, modelTier);
 
   // Codex-compatible Responses requests must disable storage and strip unsupported params.
   json.store = false;
@@ -2511,6 +2521,8 @@ export class ProviderModelFactory {
           // Includes request-level overrides from muxProviderOptions, not just config.
           const effectiveWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
 
+          const capabilityModel = resolveModelForMetadata(fullModelId, providersConfig);
+          const modelTier = openaiGptTier(capabilityModel);
           const baseFetch = getProviderFetch(providerConfig);
           const codexOauthService = self.oauthServices?.codexOauthService;
           const webSocketTransportEnabled =
@@ -2567,7 +2579,7 @@ export class ProviderModelFactory {
                     nextInit = {
                       ...init,
                       headers,
-                      body: normalizeCodexResponsesBody(body),
+                      body: normalizeCodexResponsesBody(body, modelTier),
                     };
                   } catch {
                     // If body isn't JSON, fall through to normal fetch (but still allow Codex routing).
@@ -2644,7 +2656,6 @@ export class ProviderModelFactory {
           // API model rules, for OAuth. Mapped IDs also need to bypass the SDK's model rules.
           // Explicit mappings forward the requested tier for upstream validation;
           // only unmapped native IDs retain the SDK's name-based restrictions.
-          const capabilityModel = resolveModelForMetadata(fullModelId, providersConfig);
           const isMappedAlias = capabilityModel !== fullModelId;
           const preservedModel = createOpenAIModelWithPreservedOptions(
             createNativeModel,

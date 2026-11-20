@@ -1671,7 +1671,7 @@ describe("buildProviderOptions - OpenAI", () => {
     test.each([
       ["priority", "priority"],
       ["default", "default"],
-      ["ultrafast", undefined],
+      ["ultrafast", "ultrafast"],
       ["flex", undefined],
       ["auto", undefined],
     ] as const)("applies Codex OAuth tier support to %s", (serviceTier, expected) => {
