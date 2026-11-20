@@ -1,4 +1,3 @@
-import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { createTypeSafeAi } from "@ai-sdk/typesafe-ai";
 import { Effect } from "effect";
 import { PROVIDER_REGISTRY } from "@/common/constants/providers";
@@ -21,6 +20,10 @@ import {
 } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { isMockAiMode, MOCK_AI_MODEL_REFUSED_MESSAGE } from "@/node/services/mock/mockAiMode";
 import {
+  evaluationModelFromLanguageModel,
+  type EvaluationModelInstance,
+} from "@/node/services/evaluation/evaluationService";
+import {
   buildAIProviderRequestHeaders,
   normalizeAnthropicBaseURL,
   normalizeOpenAICompatibleBaseURL,
@@ -33,7 +36,7 @@ import {
 } from "@/node/utils/providerRequirements";
 
 /**
- * Builds AI SDK evaluation models (`experimental_evaluate`) from the user's
+ * Builds AI SDK evaluation models (`experimental_decide`) from the user's
  * `provider:model` choice. Mirrors the chat-model factory's contract in
  * miniature: providers.jsonc is the only credential source, and every failure is
  * a typed reason the Settings status line can show.
@@ -141,7 +144,7 @@ export function resolveEvaluationModelTarget(
 export function createEvaluationModel(
   modelString: string,
   deps: EvaluationModelFactoryDeps
-): Effect.Effect<Result<Experimental_EvaluationModelV4, EvaluationModelFailure>> {
+): Effect.Effect<Result<EvaluationModelInstance, EvaluationModelFailure>> {
   return Effect.gen(function* () {
     // Perf harness replay mode (XUM_REPLAY_TAPES): no provider call, by construction.
     if (isSessionTapeReplayMode()) {
@@ -156,24 +159,32 @@ export function createEvaluationModel(
     const { provider, modelId, settings, organization } = target.data;
     switch (provider) {
       case TYPESAFE_PROVIDER_KEY:
-        return Ok(createTypeSafeAi(settings).evaluationModel(modelId));
+        return Ok(createTypeSafeAi(settings).decisionModel(modelId));
       case "openai": {
         const { createOpenAI } = yield* Effect.promise(PROVIDER_REGISTRY.openai);
         return Ok(
-          createOpenAI({ ...settings, ...(organization ? { organization } : {}) }).evaluationModel(
-            modelId
+          evaluationModelFromLanguageModel(
+            createOpenAI({ ...settings, ...(organization ? { organization } : {}) }).responses(
+              modelId
+            ),
+            "openai"
           )
         );
       }
       case "anthropic": {
         const { createAnthropic } = yield* Effect.promise(PROVIDER_REGISTRY.anthropic);
         return Ok(
-          withAnthropicEvaluationEffort(createAnthropic(settings).evaluationModel(modelId), modelId)
+          withAnthropicEvaluationEffort(createAnthropic(settings).decisionModel(modelId), modelId)
         );
       }
       case "google": {
         const { createGoogleGenerativeAI } = yield* Effect.promise(PROVIDER_REGISTRY.google);
-        return Ok(createGoogleGenerativeAI(settings).evaluationModel(modelId));
+        return Ok(
+          evaluationModelFromLanguageModel(
+            createGoogleGenerativeAI(settings).chat(modelId),
+            "google"
+          )
+        );
       }
     }
   });

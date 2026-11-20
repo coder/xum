@@ -43,6 +43,7 @@ import {
 } from "@/common/utils/ai/evaluationModels";
 import { computeConfigFingerprint } from "@/node/services/evaluation/evaluationDigest";
 import {
+  evaluationModelFromLanguageModel,
   installInnerBillingCapture,
   type EvaluationModelInstance,
 } from "@/node/services/evaluation/evaluationService";
@@ -636,11 +637,74 @@ function withOpenAICyberAccessProgram(
 }
 
 /**
- * Preserve OpenAI request options that @ai-sdk/openai drops by model-name capability
- * checks, without rewriting the raw model/endpoint routing identity.
+ * Names of the function tools a call leaves without a strict mode. Since 4.0.77
+ * (2abd503), @ai-sdk/openai sends `strict: false` for them on Responses; before, it
+ * omitted the key, and OpenAI then applies strict mode, which schemaSanitizer's
+ * nullable widening of optional properties is built for. Chat Completions still
+ * omits an unset `strict`, and its tools carry no top-level `name`.
+ */
+function unsetStrictFunctionToolNames(
+  tools: LanguageModelV4CallOptions["tools"]
+): ReadonlySet<string> {
+  return new Set(
+    (tools ?? []).flatMap((tool) =>
+      tool.type === "function" && tool.strict === undefined ? [tool.name] : []
+    )
+  );
+}
+
+/** Drop the SDK's defaulted `strict: false` from those Responses function tools. */
+function withoutDefaultedToolStrict(
+  body: Record<string, unknown>,
+  names: ReadonlySet<string>
+): Record<string, unknown> {
+  if (!Array.isArray(body.tools)) return body;
+  return {
+    ...body,
+    tools: body.tools.map((tool: unknown) => {
+      if (!isPlainObject(tool) || tool.strict !== false || tool.type !== "function") return tool;
+      if (typeof tool.name !== "string" || !names.has(tool.name)) return tool;
+      const { strict: _defaulted, ...rest } = tool;
+      return rest;
+    }),
+  };
+}
+
+/**
+ * A model whose Responses requests omit `strict` on the function tools a call left
+ * unset (see unsetStrictFunctionToolNames). A model on another wire is returned as
+ * built. Per-call models keep concurrent calls' tool sets independent.
+ */
+function withUnsetToolStrictOmitted(
+  createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
+  baseFetch: typeof fetch
+): LanguageModelV4 {
+  const model = createModel(baseFetch);
+  // `${providerName}.responses` is the SDK's provider id for its Responses model.
+  if (!model.provider.endsWith(".responses")) return model;
+  const modelForCall = (params: LanguageModelV4CallOptions): LanguageModelV4 => {
+    const names = unsetStrictFunctionToolNames(params.tools);
+    if (names.size === 0) return model;
+    return createModel(
+      wrapFetchWithJsonBodyPatch(baseFetch, (body) => withoutDefaultedToolStrict(body, names))
+    );
+  };
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      wrapGenerate: ({ params }) => modelForCall(params).doGenerate(params),
+      wrapStream: ({ params }) => modelForCall(params).doStream(params),
+    },
+  });
+}
+
+/**
+ * Preserve OpenAI request options that @ai-sdk/openai drops or defaults by model-name
+ * capability checks, without rewriting the raw model/endpoint routing identity.
  */
 function createOpenAIModelWithPreservedOptions(
-  createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
+  createSdkModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
   baseFetch: typeof fetch,
   options: {
     serviceTierAvailable: boolean;
@@ -649,6 +713,9 @@ function createOpenAIModelWithPreservedOptions(
     cyberAccessProgramAvailable?: boolean;
   }
 ): LanguageModelV4 {
+  // Every model built here, per-call ones included, omits an unset tool `strict`.
+  const createModel = (fetch: typeof globalThis.fetch) =>
+    withUnsetToolStrictOmitted(createSdkModel, fetch);
   const model = createModel(baseFetch);
   // @ai-sdk/openai (through at least 4.0.72) allowlists GPT-6 reasoning efforts
   // without "none" and silently strips it, but Luna accepts "none" and OpenAI
@@ -1407,8 +1474,8 @@ export function withAnthropicEvaluationEffort(
     provider: model.provider,
     modelId: model.modelId,
     supportedQuestionTypes: model.supportedQuestionTypes,
-    doEvaluate: (options) =>
-      model.doEvaluate({
+    doDecide: (options) =>
+      model.doDecide({
         ...options,
         providerOptions: {
           ...options.providerOptions,
@@ -3236,7 +3303,7 @@ export class ProviderModelFactory {
             providerDef.import()
           )) as Record<
             string,
-            (config: Record<string, unknown>) => (modelId: string) => LanguageModel
+            (config: Record<string, unknown>) => (modelId: string) => LanguageModelV4
           >;
           const factory = providerModule[providerDef.factoryName];
           if (!factory) {
@@ -3254,11 +3321,14 @@ export class ProviderModelFactory {
           };
 
           const providerFetch = getProviderFetch(providerConfig);
-          const provider = factory({
-            ...configWithCreds,
-            fetch: providerFetch,
-          });
-          return Ok(provider(modelId));
+          // Meta serves the OpenAI Responses wire through @ai-sdk/openai; other generic
+          // providers' models come back as built.
+          return Ok(
+            withUnsetToolStrictOmitted(
+              (fetch) => factory({ ...configWithCreds, fetch })(modelId),
+              providerFetch
+            )
+          );
         }
 
         return Err({
@@ -3552,7 +3622,7 @@ export class ProviderModelFactory {
             PROVIDER_REGISTRY.anthropic()
           );
           model = withAnthropicEvaluationEffort(
-            createAnthropic({ ...normalizedConfig, fetch: providerFetch }).evaluationModel(modelId),
+            createAnthropic({ ...normalizedConfig, fetch: providerFetch }).decisionModel(modelId),
             modelId
           );
           break;
@@ -3570,8 +3640,9 @@ export class ProviderModelFactory {
             ...(creds.organization && { organization: creds.organization }),
           };
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          model = createOpenAI({ ...configWithCreds, fetch: providerFetch }).evaluationModel(
-            modelId
+          model = evaluationModelFromLanguageModel(
+            createOpenAI({ ...configWithCreds, fetch: providerFetch }).responses(modelId),
+            "openai"
           );
           break;
         }
@@ -3589,10 +3660,10 @@ export class ProviderModelFactory {
           const { createGoogleGenerativeAI } = yield* Effect.promise(async () =>
             PROVIDER_REGISTRY.google()
           );
-          model = createGoogleGenerativeAI({
-            ...configWithCreds,
-            fetch: providerFetch,
-          }).evaluationModel(modelId);
+          model = evaluationModelFromLanguageModel(
+            createGoogleGenerativeAI({ ...configWithCreds, fetch: providerFetch }).chat(modelId),
+            "google"
+          );
           break;
         }
         case TYPESAFE_PROVIDER_KEY: {
@@ -3608,7 +3679,7 @@ export class ProviderModelFactory {
             ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
             headers: providerConfig.headers,
             fetch: providerFetch,
-          }).evaluationModel(modelId);
+          }).decisionModel(modelId);
           break;
         }
       }

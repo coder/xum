@@ -561,17 +561,22 @@ describe("partFold", () => {
       ]);
     });
 
-    test("the SDK's synthesized (other, undefined) finish is not a terminal event", () => {
-      const { steps } = replay([[{ type: "finish", finishReason: "other" }, 100]]);
-      expect(steps[0].intents).toEqual([
-        {
-          _tag: "Log",
-          level: "warn",
-          message: "Treating synthesized-default (other, undefined) finish as truncated stream",
-          fields: { messageId: MESSAGE_ID, model: MODEL },
-        },
-      ]);
-    });
+    // (other, undefined) is streamText's synthesized default; adapters in AI SDK
+    // 7.0.1xx report the same cut-off stream as `interrupted` themselves.
+    test.each(["other", "interrupted"])(
+      "a cut-off (%s, undefined) finish is not a terminal event",
+      (finishReason) => {
+        const { steps } = replay([[{ type: "finish", finishReason }, 100]]);
+        expect(steps[0].intents).toEqual([
+          {
+            _tag: "Log",
+            level: "warn",
+            message: "Treating a cut-off finish as truncated stream",
+            fields: { messageId: MESSAGE_ID, model: MODEL, finishReason },
+          },
+        ]);
+      }
+    );
 
     test("finish-step normalizes usage, then records it before the in-flight usage and the soft stop", () => {
       const { steps } = replay([
