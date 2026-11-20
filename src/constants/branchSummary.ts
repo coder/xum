@@ -40,15 +40,48 @@ export const BRANCH_SUMMARY_MAX_OUTPUT_TOKENS = 512;
 export const BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS = 1_536;
 
 /**
- * Hard wall-clock bound for the whole summary generation (all candidate
- * models share one deadline). Sized to cover the full output cap at real
- * side-channel throughput: dogfooded haiku streams ~100 tok/s with ~0.6s
- * TTFB, so a worst-case max_tokens stream is ~0.6s + 512/100 ≈ 5.7s and the
- * typical natural stop (~325 tokens) lands around 3.9s. The edit-resend path
- * waits synchronously on this deadline (see maybeAppendAbandonedBranchSummary
- * for why), so it also caps how long that user-facing operation can stall.
+ * Hard wall-clock bound for the whole summary generation (all candidate models share one
+ * deadline). The candidates are STRICTLY the workspace's own configured models (see
+ * `deriveSideChannelModelCandidates`), so the throughput that sizes this is the USER's
+ * model, not a hosted one. The previous 6s came from dogfooded hosted haiku: ~100 tok/s
+ * with ~0.6s TTFB, so a worst-case max_tokens stream is ~0.6s + 512/100 = ~5.7s and the
+ * typical natural stop (~325 tokens) lands around 3.9s. That hosted bound starves a
+ * self-hosted open-weights model, which commonly answers at 20-50 tok/s (512 tokens then
+ * needs ~11-26s) and adds time-to-first-token while it loads.
+ *
+ * So the deadline is sized off the SLOW END of that stated range, plus startup margin:
+ * 512 tokens at the 20 tok/s floor is ~25.6s, and with ~0.6s of time-to-first-token the
+ * worst case is ~26.2s, leaving ~3.8s of margin for stream setup and the post-stream
+ * settle. Sizing off the middle of the range was the mistake that kept this failing: 20s
+ * left only ~3.8s of loading plus time-to-first-token for the typical ~325-token summary at
+ * 20 tok/s and could not reach the 512-token cap at all, so a deadline-exhausting summary —
+ * whose output trimSummaryToBoundary then discards for lacking a boundary — stayed a normal
+ * outcome on the slowest configured route instead of a signal of a wedged provider.
+ * branchSummary.test.ts asserts this budget invariant at the floor rate and at the hosted
+ * rate.
+ *
+ * The same deadline also bounds candidates that cannot disable thinking, whose output cap is
+ * 512 + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS = 2048 tokens. Those are pinned Anthropic
+ * routes at roughly the hosted rate, so ~0.6s + 2048/100 = ~21s also fits; on a slow route
+ * neither this deadline nor the cap can buy the full stream, which is why the deadline is
+ * the operative bound there.
+ *
+ * The raise costs a fast route nothing: this is a deadline, not a wait, so a summary that
+ * finishes in 4s still finishes in 4s. The cost lands on the slow path — the edit-resend
+ * flow waits synchronously on it (see maybeAppendAbandonedBranchSummary for why), and
+ * `BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS` derives from this value, so the fork's first-send
+ * wait grows with it. Both are traded against the alternative, which is silently dropping
+ * the abandoned branch's context on every fork and edit-resend.
+ *
+ * Neither the margin above nor any larger number covers loading a COLD self-hosted model
+ * into memory, which can take minutes: that stays a timeout here, and it is the provider's
+ * to fix, not something a UI deadline should paper over by holding a send open.
+ *
+ * Varying: the max_output_tokens override in branchSummary.ts is what bounds the stream
+ * this deadline must cover — raising the 512-token cap without raising this timeout
+ * reintroduces the truncation.
  */
-export const BRANCH_SUMMARY_TIMEOUT_MS = 6_000;
+export const BRANCH_SUMMARY_TIMEOUT_MS = 30_000;
 
 /**
  * Hard cap on characters accumulated from the summary stream. Purely
