@@ -1560,6 +1560,7 @@ const CODEX_ALLOWED_PARAMS = new Set([
   "store",
   "prompt_cache_key",
   "reasoning",
+  "service_tier",
   "temperature",
   "top_p",
   "include",
@@ -1619,13 +1620,7 @@ function extractTextContent(content: unknown): string {
   return "";
 }
 
-export function normalizeCodexResponsesBody(body: string): string {
-  const json = JSON.parse(body) as Record<string, unknown>;
-
-  // ChatGPT's Codex endpoint is stricter than the public OpenAI Responses API
-  // and currently rejects the `truncation` field entirely.
-  delete json.truncation;
-
+function normalizeCodexOptions(json: Record<string, unknown>): void {
   // Strip the native pro-mode field before forwarding to the stricter ChatGPT
   // backend. Unknown nested reasoning fields risk a hard 4xx, and falling back
   // to standard mode is safer. Preserve effort/summary.
@@ -1635,6 +1630,21 @@ export function normalizeCodexResponsesBody(body: string): string {
       delete json.reasoning;
     }
   }
+
+  // Codex uses priority for Fast and omits service_tier for Standard.
+  if (json.service_tier !== "priority") {
+    delete json.service_tier;
+  }
+}
+
+export function normalizeCodexResponsesBody(body: string): string {
+  const json = JSON.parse(body) as Record<string, unknown>;
+
+  // ChatGPT's Codex endpoint is stricter than the public OpenAI Responses API
+  // and currently rejects the `truncation` field entirely.
+  delete json.truncation;
+
+  normalizeCodexOptions(json);
 
   // Codex-compatible Responses requests must disable storage and strip unsupported params.
   json.store = false;
@@ -2630,9 +2640,8 @@ export class ProviderModelFactory {
               ? provider.chat(modelId)
               : provider.responses(modelId);
           };
-          // Reuse the same transport across per-call adapters. Inject tiers before
-          // its HTTP/WebSocket dispatch, and keep OAuth's normalization unchanged.
-          // Mappings are metadata, not authority over the raw/proxy model's tier support.
+          // Inject tiers before dispatch. Use the Codex backend's tier rules, not the SDK's
+          // API model rules, for OAuth. Mapped IDs also need to bypass the SDK's model rules.
           // Explicit mappings forward the requested tier for upstream validation;
           // only unmapped native IDs retain the SDK's name-based restrictions.
           const capabilityModel = resolveModelForMetadata(fullModelId, providersConfig);
@@ -2641,9 +2650,8 @@ export class ProviderModelFactory {
             createNativeModel,
             webSocketTransport.fetch,
             {
-              // Codex OAuth keeps its existing tier behavior; only effort is preserved.
               serviceTierAvailable:
-                !shouldRouteThroughCodexOauth && serviceTierAvailable && isMappedAlias,
+                shouldRouteThroughCodexOauth || (serviceTierAvailable && isMappedAlias),
               wireModelId: modelId,
               // Codex OAuth needs no gate: normalizeCodexResponsesBody's allowlist drops access_programs.
               cyberAccessProgramAvailable: true,

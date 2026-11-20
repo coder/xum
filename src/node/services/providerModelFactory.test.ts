@@ -1806,7 +1806,48 @@ describe("ProviderModelFactory Google Vertex AI", () => {
   });
 });
 
-describe("ProviderModelFactory native OpenAI alias tiers", () => {
+describe("ProviderModelFactory native OpenAI tiers", () => {
+  it("sends Codex Fast and restores Standard without changing OAuth credentials", async () => {
+    await withTempConfig(async (_config, factory, oauth, store) => {
+      const auth = {
+        type: "oauth" as const,
+        access: "test-access",
+        refresh: "test-refresh",
+        expires: Date.now() + 60_000,
+      };
+      store.saveProvidersConfig({ openai: { codexOauth: auth, serviceTier: "priority" } });
+      oauth.codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
+      oauth.codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("openai:gpt-6.2-astra");
+        if (!result.success) throw new Error(result.error.type);
+        for (const serviceTier of [undefined, "default", "ultrafast"] as const) {
+          await streamText({
+            model: result.data,
+            providerOptions: serviceTier == null ? undefined : { openai: { serviceTier } },
+            prompt: "hello",
+            maxRetries: 0,
+          }).consumeStream({ onError: () => undefined });
+        }
+        expect(calls).toHaveLength(3);
+        expect(calls.map((call) => parseSentBody(call).service_tier)).toEqual([
+          "priority",
+          undefined,
+          undefined,
+        ]);
+        for (const call of calls) {
+          expect(call.url).toBe(CODEX_ENDPOINT);
+          expect(new Headers(call.init.headers).get("authorization")).toBe("Bearer test-access");
+          expect(parseSentBody(call).store).toBe(false);
+        }
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
   it.each(["responses", "chatCompletions"] as const)(
     "retains SDK tier gating for unmapped native models over %s",
     async (wireFormat) => {
@@ -4126,7 +4167,7 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
+  it("pins Fast on Codex OAuth but not on non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, { additionalProviders: [{ name: "openai", type: "anthropic" }] });
       const auth = {
@@ -4141,7 +4182,7 @@ describe("ProviderModelFactory Coder", () => {
           serviceTier: "priority",
           codexOauth: auth,
           codexOauthDefaultAuth: "oauth",
-          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6.2-astra" }],
         },
       });
       await saveRoutePriority(config, ["direct"]);
@@ -4153,26 +4194,28 @@ describe("ProviderModelFactory Coder", () => {
       try {
         for (const model of [
           "openai:team-astra",
-          "openai:gpt-6-astra",
-          "coder:openai/gpt-6-astra",
+          "openai:gpt-6.2-astra",
+          "coder:openai/gpt-6.2-astra",
           "coder:google/gemini-3-pro",
         ]) {
           const result = await factory.createModelWithPinnedOptions(model, {
             providerOptions: { openai: { serviceTier: "priority" } },
           });
           if (!result.success) throw new Error(result.error.type);
-          expect(result.data.optionsMuxProviderOptions.openai?.serviceTier).toBeUndefined();
+          const isCodex = model.startsWith("openai:");
+          const configuredTier = isCodex ? "priority" : undefined;
+          expect(result.data.optionsMuxProviderOptions.openai?.serviceTier).toBe(configuredTier);
           const before = calls.length;
           await generateText({ model: result.data.model, prompt: "hello", maxRetries: 0 }).catch(
             () => undefined
           );
           expect(calls.length).toBe(before + 1);
-          if (model.startsWith("openai:")) {
+          if (isCodex) {
             expect(calls[before].url).toBe(CODEX_ENDPOINT);
             expect(parseSentBody(calls[before]).store).toBe(false);
             expect(hasLanguageModelCleanup(result.data.model)).toBe(false);
           }
-          expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
+          expect(parseSentBody(calls[before]).service_tier).toBe(configuredTier);
 
           const chat: { serviceTier?: ServiceTier } = {};
           const live = await factory.createModel(model, undefined, {
@@ -4194,7 +4237,9 @@ describe("ProviderModelFactory Coder", () => {
               expect(parseSentBody(calls[liveBefore]).model).toBe(
                 parseSentBody(calls[before]).model
               );
-              expect(parseSentBody(calls[liveBefore])).not.toHaveProperty("service_tier");
+              expect(parseSentBody(calls[liveBefore]).service_tier).toBe(
+                tier === "priority" ? configuredTier : undefined
+              );
             }
           }
         }
