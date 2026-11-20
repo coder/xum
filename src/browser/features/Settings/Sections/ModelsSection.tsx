@@ -4,6 +4,7 @@ import { AutoModelRoutingGroup } from "./AutoModelRoutingExperimentConfig";
 import { ArrowRight, ChevronDown, Info, Loader2, Plus, Search } from "lucide-react";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { Button } from "@/browser/components/Button/Button";
+import { ModelClassesEditor } from "./ModelClassesEditor";
 import { ModelFallbacksEditor } from "./ModelFallbacksEditor";
 import { ProviderIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import {
@@ -1111,6 +1112,8 @@ export function ModelsSection() {
         <SettingsMark id="model-fallbacks" />
         <ModelFallbacksEditor />
       </div>
+
+      <ModelClassesEditor />
 
       <div className="border-border-medium bg-background-secondary/40 text-muted rounded-md border px-3 py-2.5 text-xs">
         <div className="flex items-start gap-2">

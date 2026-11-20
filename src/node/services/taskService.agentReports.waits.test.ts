@@ -448,6 +448,7 @@ describe("TaskService", () => {
 
     expect(report).toEqual({
       reportMarkdown: "persisted report",
+      carriesProjectSkillContent: true,
       title: "persisted title",
       planFilePath,
     });
@@ -502,7 +503,11 @@ describe("TaskService", () => {
       requestingWorkspaceId: parentId,
     });
 
-    expect(report).toEqual({ reportMarkdown: "persisted report", title: "persisted title" });
+    expect(report).toEqual({
+      carriesProjectSkillContent: true,
+      reportMarkdown: "persisted report",
+      title: "persisted title",
+    });
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
     expect(patchGeneration).toHaveBeenCalledWith(
       parentId,

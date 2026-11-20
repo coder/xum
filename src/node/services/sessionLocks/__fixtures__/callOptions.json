@@ -34,6 +34,17 @@
   },
   {
     "site": "node/services/agentSession.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:turn>/sessions/.auto-retry-preference-locks/ws-record-turn.lock",
+        "timeoutMs": 5000,
+        "label": "auto-retry preference lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/agentSession.ts",
     "fn": "WorkspaceUseLeases.hold",
     "args": ["ws-record-refusal", "turn"]
   },

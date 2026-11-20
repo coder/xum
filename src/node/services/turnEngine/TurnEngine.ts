@@ -460,6 +460,23 @@ export class TurnEngine {
     return Effect.gen({ self: this }, function* () {
       const prepared = yield* this.prepareStreamStartup(start, startup);
       if (!prepared) return this.settleStartupAbort(start);
+      // Routed project-skill turns: final consent verdict inside the critical
+      // section — the start lock wait, ensureStreamSafety, temp-dir creation
+      // and the admission check were the last revocation windows before the
+      // provider stream is constructed below; the gate runs again per step.
+      const consentGate = start.options.preDispatchConsentGate;
+      if (consentGate) {
+        const consentError = yield* attempt(() => consentGate());
+        if (consentError) {
+          // No handle goes out: settle the completion like a failed start.
+          start.completionController.settle({
+            status: "aborted",
+            abortReason: this.deps.turnRegistry.getStartupAbortReason(start.options.abortSignal),
+          });
+          return Err(consentError);
+        }
+        if (startup.abortController.signal.aborted) return this.settleStartupAbort(start);
+      }
       const streamInfo = yield* attempt(() =>
         this.registerStartingStream(start, startup, prepared)
       );
