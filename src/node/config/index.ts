@@ -2011,6 +2011,12 @@ function configFileWatchDirsKey(dirs: ReadonlyMap<string, ReadonlySet<string>>):
  * made inside the same hold (a check read before the lock can miss another process's commit).
  */
 export const CONFIG_UNCHANGED: unique symbol = Symbol("config unchanged");
+/** An edit's read of config.json: the stat key just before it, and the bytes it got. */
+interface ConfigFileRead {
+  statKey: string;
+  /** Undefined when the read found no file or failed. */
+  bytes: Buffer | undefined;
+}
 /** An editConfig transform (see CONFIG_UNCHANGED). */
 export type ConfigEditTransform = (
   config: ProjectsConfig
@@ -2698,26 +2704,41 @@ export class Config {
   }
 
   /** The beforeRename check for a save, or undefined when the save has no read to compare. */
-  private unchangedConfigCheck(expectedStatKey: string): () => void {
-    return () => this.assertConfigFileUnchanged(expectedStatKey);
+  private unchangedConfigCheck(expected: ConfigFileRead): () => void {
+    return () => this.assertConfigFileUnchanged(expected);
   }
 
   /**
    * Throw when config.json changed since the edit read it (#5929): a writer that skips the
-   * registration lock (a manual editor, an older build) replaced it, and this save would drop
-   * that write. One stat, right before the rename. An in-place rewrite with the same inode,
-   * size and mtime still passes; a content hash would cost a read per save.
+   * registration lock (a manual editor, an older build) replaced or rewrote it, and this save
+   * would drop that write. One stat and one read, right before the rename. The stat alone
+   * passed an in-place rewrite of the same size: it keeps the inode, and within one tick of a
+   * coarse filesystem clock the mtime too. So the check also compares the bytes the edit read.
    */
-  private assertConfigFileUnchanged(expectedStatKey: string): void {
+  private assertConfigFileUnchanged(expected: ConfigFileRead): void {
     // configFileStamp stats the configured path, not the writer's resolved target: a
     // config.json symlink retargeted after the writer resolved it then shows up as changed.
     // Any stat failure reads as "missing", which refuses unless the edit also read none.
     const currentKey = this.configFileStamp();
-    if (currentKey !== expectedStatKey) {
-      throw new Error(
-        `config.json changed on disk while Xum was saving it (${this.configFile}). Your change was not saved. Retry the change.`
-      );
+    if (currentKey !== expected.statKey) this.throwConfigChangedOnDisk();
+    // The edit read no file, and there is still none: no bytes to compare.
+    if (currentKey === "missing") return;
+    let current: Buffer;
+    try {
+      current = fs.readFileSync(this.configFile);
+    } catch {
+      this.throwConfigChangedOnDisk();
     }
+    // An edit whose read failed has no bytes that it could vouch for, so it refuses as well.
+    if (expected.bytes === undefined || !current.equals(expected.bytes)) {
+      this.throwConfigChangedOnDisk();
+    }
+  }
+
+  private throwConfigChangedOnDisk(): never {
+    throw new Error(
+      `config.json changed on disk while Xum was saving it (${this.configFile}). Your change was not saved. Retry the change.`
+    );
   }
 
   /** Failure state this instance's last failed load wrote; see getConfigLoadError. */
@@ -2805,6 +2826,8 @@ export class Config {
       keepSnapshot?: boolean;
       /** A missing config.json fails the read like an unreadable one (see readConfigBytes). */
       requireFile?: boolean;
+      /** Receives the bytes that the read got, parsed or not (see assertConfigFileUnchanged). */
+      readBytes?: { bytes?: Buffer };
     },
     key?: string
   ): ProjectsConfig {
@@ -2818,7 +2841,7 @@ export class Config {
     const kept = options?.keepSnapshot ? this.configSnapshot : undefined;
     this.configSnapshot = undefined;
     try {
-      rawBytes = this.readConfigBytes(options?.requireFile);
+      rawBytes = this.readConfigBytes(options);
       if (rawBytes !== undefined) {
         const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
         if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
@@ -2891,13 +2914,19 @@ export class Config {
    * failure path (throwOnError callers rethrow); only ENOENT means missing, and with
    * `requireFile` (editConfigIfChanged) it throws too.
    */
-  private readConfigBytes(requireFile: boolean | undefined): Buffer | undefined {
+  private readConfigBytes(options?: {
+    requireFile?: boolean;
+    readBytes?: { bytes?: Buffer };
+  }): Buffer | undefined {
+    let bytes: Buffer;
     try {
-      return fs.readFileSync(this.configFile);
+      bytes = fs.readFileSync(this.configFile);
     } catch (readError) {
-      if (requireFile || !isEnoentError(readError)) throw readError;
+      if (options?.requireFile || !isEnoentError(readError)) throw readError;
       return undefined;
     }
+    if (options?.readBytes) options.readBytes.bytes = bytes;
+    return bytes;
   }
 
   private validateConfigStructure(parsed: Partial<AppConfigOnDisk>): void {
@@ -3406,12 +3435,12 @@ export class Config {
    * that did not land); saveConfigEffect below holds the actual pipeline.
    */
   /**
-   * `expectedStatKey`: the stat key of the bytes the edit read. The save then fails without
-   * writing when config.json no longer has it. Required, so no save path can skip the check
+   * `expected`: the stat key and the bytes of the edit's read. The save then fails without
+   * writing when config.json no longer has them. Required, so no save path can skip the check
    * (#6595).
    */
-  private saveConfig(config: ProjectsConfig, expectedStatKey: string): Promise<void> {
-    return Effect.runPromise(this.saveConfigEffect(config, expectedStatKey));
+  private saveConfig(config: ProjectsConfig, expected: ConfigFileRead): Promise<void> {
+    return Effect.runPromise(this.saveConfigEffect(config, expected));
   }
 
   /**
@@ -3421,7 +3450,7 @@ export class Config {
    */
   private saveConfigEffect(
     config: LegacyAdvisorProjectsConfig,
-    expectedStatKey: string
+    expected: ConfigFileRead
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -3710,7 +3739,7 @@ export class Config {
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: () => self.writeConfigFileTracked(text, self.unchangedConfigCheck(expectedStatKey)),
+        try: () => self.writeConfigFileTracked(text, self.unchangedConfigCheck(expected)),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
@@ -3820,7 +3849,7 @@ export class Config {
    * read hands `fn` defaults instead, which hold nothing to change, so CONFIG_UNCHANGED would
    * report success for a file nobody read (a settings clear then left a legacy enabled server in
    * config.json). So CONFIG_UNCHANGED only ever answers the parsed config.json. It also fails
-   * when config.json was replaced after that read, as a write's save does (#5929).
+   * when config.json was replaced or rewritten after that read, as a write's save does (#5929).
    */
   async editConfigIfChanged(fn: ConfigEditTransform): Promise<void> {
     return this.enqueueGatedConfigEdit(fn, /* strictRead */ true);
@@ -4308,28 +4337,30 @@ export class Config {
      * pure (callers run their own updaters and record results inside it): only after the
      * edit holds the lock it will write under, so no invocation's result is discarded.
      */
-    // The stat key of config.json just before the edit's fresh read: the save refuses to replace
-    // bytes this edit did not read (#5929). A rename between this stat and the read only makes
-    // the save refuse (fail closed), never overwrite.
-    let readStatKey: string | undefined;
+    // The stat key of config.json just before the edit's fresh read, and the bytes of that read:
+    // the save refuses to replace bytes this edit did not read (#5929). A rename between this
+    // stat and the read only makes the save refuse (fail closed), never overwrite.
+    let read: ConfigFileRead | undefined;
     const transform = (): ProjectsConfig | typeof CONFIG_UNCHANGED => {
-      readStatKey = self.readEditStatKey();
-      return fn(
-        self.readConfigOrDefault({
-          keepSnapshot: true,
-          throwOnError: strictRead,
-          requireFile: strictRead,
-        })
-      );
+      const statKey = self.readEditStatKey();
+      const readBytes: { bytes?: Buffer } = {};
+      const current = self.readConfigOrDefault({
+        keepSnapshot: true,
+        throwOnError: strictRead,
+        requireFile: strictRead,
+        readBytes,
+      });
+      read = { statKey, bytes: readBytes.bytes };
+      return fn(current);
     };
     // A transform that changes nothing writes nothing, so the save's check that config.json is
     // still the file this edit read (#5929) runs here instead. A file that a manual editor or an
-    // older build replaced after the read fails the edit as that save would: a legacy clear then
-    // reported success while the replaced file carried a legacy enable.
+    // older build replaced or rewrote after the read fails the edit as that save would: a legacy
+    // clear then reported success while the file carried a legacy enable.
     const assertReadUnchanged = (): void => {
-      const expectedStatKey = readStatKey;
-      assert(expectedStatKey !== undefined, "config edit skipped its write without a fresh read");
-      self.assertConfigFileUnchanged(expectedStatKey);
+      const expected = read;
+      assert(expected !== undefined, "config edit skipped its write without a fresh read");
+      self.assertConfigFileUnchanged(expected);
     };
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
@@ -4349,11 +4380,11 @@ export class Config {
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write. A failed save rejects
       // the edit and skips the change notification below (#4444).
-      // transform() always runs before write and records the key.
-      const expectedStatKey = readStatKey;
-      assert(expectedStatKey !== undefined, "config edit saved without a fresh read");
+      // transform() always runs before write and records the read.
+      const expected = read;
+      assert(expected !== undefined, "config edit saved without a fresh read");
       yield* Effect.tryPromise({
-        try: () => self.saveConfig(newConfig, expectedStatKey),
+        try: () => self.saveConfig(newConfig, expected),
         catch: (error) => error,
       });
       // Backend-initiated config edits (for example provider auth changes) use this signal
