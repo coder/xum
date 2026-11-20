@@ -5,11 +5,18 @@
 // pinned digest.
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally: bun test ./scripts/zizmorFallback.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { runScript, writeExecutable, type RunResult } from "./ci/runScript";
+import {
+  SPAWNING_TEST_TIMEOUT_MS,
+  runScript,
+  writeExecutable,
+  type RunResult,
+} from "./ci/runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const SCRIPTS = import.meta.dir;
 const COPIED = ["zizmor.sh", "retry.sh", "ci/download-verified.sh", "ci/fetch-once.sh"];
