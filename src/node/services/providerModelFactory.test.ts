@@ -6196,7 +6196,7 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
           fetchSpy.mockImplementation(
             Object.assign(
               (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-                bodies.push(JSON.parse(String(init?.body)));
+                bodies.push(JSON.parse(typeof init?.body === "string" ? init.body : "null"));
                 return Promise.reject(new Error("captured"));
               },
               { preconnect: () => undefined }
