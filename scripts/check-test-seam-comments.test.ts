@@ -101,6 +101,59 @@ test("matches override-for-tests claims", () => {
   expect(seams("// Override for the request timeout.\nexport const b = 1;")).toEqual([]);
 });
 
+test("matches test-double seam claims, not prose about doubles", () => {
+  expect(
+    seams(
+      "interface S {\n  /** Absent on test doubles; production always sets it. */\n  clock?: number;\n}"
+    )
+  ).toEqual(["2:S.clock"]);
+  expect(seams("// Absent from test doubles.\nexport const a = 1;")).toEqual(["1:a"]);
+  expect(
+    seams("// Builds runtimes. Test doubles of AIService pass one too.\nexport const b = 1;")
+  ).toEqual(["1:b"]);
+  // Prose about doubles that claims no seam.
+  expect(
+    seams("// Test doubles replace the modal on the index module.\nexport const c = 1;")
+  ).toEqual([]);
+  expect(
+    seams("// Manager without an inventory (test doubles): list from disk.\nexport const d = 1;")
+  ).toEqual([]);
+  // Singular forms make the same claim.
+  expect(seams("// Absent from a test double.\nexport const f = 1;")).toEqual(["1:f"]);
+  expect(seams("// A test double of AIService passes one too.\nexport const g = 1;")).toEqual([
+    "1:g",
+  ]);
+  // A negated absence and the noun "pass" claim no seam.
+  expect(seams("// Not absent from test doubles.\nexport const h = 1;")).toEqual([]);
+  expect(seams("// Test doubles record each render pass.\nexport const i = 1;")).toEqual([]);
+  expect(seams("// Test doubles pass runtimeFactory too.\nexport const j = 1;")).toEqual(["1:j"]);
+  expect(seams("// This member is absent from test doubles.\nexport const p = 1;")).toEqual([
+    "1:p",
+  ]);
+  expect(seams("// runtimeFactory is absent from test doubles.\nexport const q = 1;")).toEqual([
+    "1:q",
+  ]);
+  expect(seams("// This member is not absent from test doubles.\nexport const r = 1;")).toEqual([]);
+  expect(seams("// `clock` is absent from test doubles.\nexport const s = 1;")).toEqual(["1:s"]);
+  // A subject or object that does not name the declaration claims no seam.
+  expect(seams("// The race is absent from test doubles.\nexport const t = 1;")).toEqual([]);
+  expect(seams("// This behavior is absent from test doubles.\nexport const u = 1;")).toEqual([]);
+  expect(
+    seams("// Test doubles pass the same contract tests as production.\nexport const v = 1;")
+  ).toEqual([]);
+  expect(seams("// Test doubles pass every integration test.\nexport const w = 1;")).toEqual([]);
+  // The double must be the subject: no test outcome, negation, or other subject.
+  expect(seams("// Test doubles pass the contract tests.\nexport const k = 1;")).toEqual([]);
+  expect(seams("// Test doubles pass their tests.\nexport const l = 1;")).toEqual([]);
+  expect(seams("// Test doubles never pass it.\nexport const m = 1;")).toEqual([]);
+  expect(seams("// Test doubles do not pass it.\nexport const n = 1;")).toEqual([]);
+  expect(
+    seams("// Supplies defaults for fields absent from test doubles.\nexport const o = 1;")
+  ).toEqual([]);
+  // "pass" in a later sentence is not part of the claim.
+  expect(seams("// Uses test doubles. Callers pass a factory.\nexport const e = 1;")).toEqual([]);
+});
+
 test("matches in-tests seam claims, not prose about tests", () => {
   expect(
     seams("class Pool {\n  /** Shorten the idle window in tests. */\n  setIdle(ms: number) {}\n}")
