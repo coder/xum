@@ -33,7 +33,12 @@ interface Row {
   ms: number;
   /** The window's scroll position after the pass: the audit must put back the one it found. */
   scrollY: number;
+  /** The scroll position of every element before and after the pass: it must not change one. */
+  scrollTopsBefore: number[];
+  scrollTopsAfter: number[];
 }
+
+const readScrollTops = () => Array.from(document.querySelectorAll("*"), (el) => el.scrollTop);
 
 async function auditFixture(
   browser: Browser,
@@ -49,6 +54,7 @@ async function auditFixture(
     await page.goto(pathToFileURL(path.join(FIXTURE_DIR, `${fixture}.html`)).href, {
       waitUntil: "load",
     });
+    const scrollTopsBefore = await page.evaluate(readScrollTops);
     const started = performance.now();
     const raw: unknown = await Promise.race([
       page.evaluate(LAYOUT_AUDIT_PAGE_SCRIPT),
@@ -61,6 +67,7 @@ async function auditFixture(
     ]);
     const ms = performance.now() - started;
     const scrollY = await page.evaluate(() => window.scrollY);
+    const scrollTopsAfter = await page.evaluate(readScrollTops);
     return {
       fixture,
       width: viewport.width,
@@ -68,6 +75,8 @@ async function auditFixture(
       pass: LayoutAuditPagePassSchema.parse(raw),
       ms,
       scrollY,
+      scrollTopsBefore,
+      scrollTopsAfter,
     };
   } finally {
     await context.close();
@@ -114,6 +123,10 @@ function mismatches(row: Row): string[] {
   // A fresh page starts at the top, and the overlap rule scrolls the window to sample text below
   // the screen: it must leave the window where it found it.
   if (row.scrollY !== 0) problems.push(`the pass left the window scrolled to ${row.scrollY}`);
+  // A scrolling box the overlap rule scrolled must be back where the page had it.
+  if (JSON.stringify(row.scrollTopsBefore) !== JSON.stringify(row.scrollTopsAfter)) {
+    problems.push("the pass left a scrolling box at a position other than the one it found");
+  }
   if (JSON.stringify(found) !== JSON.stringify(expected.map(describeFinding).sort())) {
     problems.push(
       `findings [${found.join(" | ")}], expected [${expected.map(describeFinding).sort().join(" | ")}]`

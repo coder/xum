@@ -67,6 +67,12 @@ function scrollInstantly(win: BrowserWindow, top: number): number {
   return win.scrollY || 0;
 }
 
+// The same for a scrolling box: "instant" beats the box's own `scroll-behavior: smooth`.
+function scrollElementInstantly(el: Element, top: number): number {
+  el.scrollTo({ top, behavior: "instant" });
+  return el.scrollTop;
+}
+
 export function createBrowserLayoutPage(win: BrowserWindow): LayoutPage {
   return {
     document: win.document,
@@ -77,6 +83,8 @@ export function createBrowserLayoutPage(win: BrowserWindow): LayoutPage {
     textLines: (node) => readTextLines(win, node),
     elementAt: (x, y) => win.document.elementFromPoint(x, y),
     scrollTo: (top) => scrollInstantly(win, top),
+    scrollTopOf: (el) => el.scrollTop,
+    scrollElementTo: scrollElementInstantly,
     animatedElements: () => readAnimatedElements(win),
     escapeIdent: (value) => win.CSS.escape(value),
   };

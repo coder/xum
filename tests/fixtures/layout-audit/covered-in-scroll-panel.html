@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Covered text below the visible part of a scrolling panel</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      .card {
+        position: relative;
+        border: 1px solid #aebbc4;
+      }
+      .card h2 {
+        margin: 0;
+        padding: 12px 18px;
+        font-size: 16px;
+      }
+      /* A panel 120 px tall: the notice below its spacer is out of sight until it scrolls. */
+      .list {
+        height: 120px;
+        overflow-y: auto;
+        padding: 0 18px;
+      }
+      .spacer {
+        height: 300px;
+      }
+      .list p {
+        margin: 0;
+        padding: 18px 0;
+        font-size: 18px;
+        line-height: 1.3;
+      }
+      .cover {
+        position: absolute;
+        inset: 0;
+        background: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Account</h1>
+      <section class="card">
+        <h2>Inbox</h2>
+        <div class="list">
+          <div class="spacer"></div>
+          <p id="late-notice">Your trial ends in two days. Add a card to keep your plan.</p>
+        </div>
+        <div class="cover"></div>
+      </section>
+    </main>
+    <script>
+      // The page loads with its panel already scrolled: the audit must put it back there.
+      document.querySelector(".list").scrollTop = 40;
+    </script>
+  </body>
+</html>

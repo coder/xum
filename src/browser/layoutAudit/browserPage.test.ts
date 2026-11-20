@@ -152,6 +152,30 @@ describe("createBrowserLayoutPage", () => {
     ]);
   });
 
+  test("scrolls a box instantly and reads back the position it reached", () => {
+    using fake = createFakeBrowserWindow({ bodyHtml: '<div id="panel"></div>' });
+    const panel = fake.win.document.getElementById("panel") as Element;
+    const requests: ScrollToOptions[] = [];
+    let scrollTop = 40;
+    Object.defineProperty(panel, "scrollTop", { get: () => scrollTop, configurable: true });
+    Object.assign(panel, {
+      // The content ends at 500: a scroll past it stops there.
+      scrollTo: (options: ScrollToOptions) => {
+        requests.push(options);
+        scrollTop = Math.min(options.top ?? 0, 500);
+      },
+    });
+    const page = createBrowserLayoutPage(fake.win);
+    expect(page.scrollTopOf(panel)).toBe(40);
+    // "instant" beats the box's own `scroll-behavior: smooth`.
+    expect(page.scrollElementTo(panel, 300)).toBe(300);
+    expect(page.scrollElementTo(panel, 900)).toBe(500);
+    expect(requests).toEqual([
+      { top: 300, behavior: "instant" },
+      { top: 900, behavior: "instant" },
+    ]);
+  });
+
   test("reads rendered text from innerText, and from textContent where an element has none", () => {
     using fake = createFakeBrowserWindow({
       bodyHtml: '<p id="p">visible <i>words</i></p><svg><text id="t">label</text></svg>',

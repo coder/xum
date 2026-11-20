@@ -12,11 +12,17 @@ import type { Box, LayoutPage, LayoutStyle, PageMetrics, SettleSignals } from ".
  *   data-css="overflow-x: hidden; opacity: 0.5"   computed style over browser-like defaults
  *   data-animated                 the element is the target of a running animation
  *   data-z="2"                    stacking for elementAt (default 0; a tie goes to the later element)
+ *   data-scroll="40"              a scrolling box's scrollTop before the audit (default 0)
+ *   data-scroll-height="900"      the height of its content: it scrolls to this minus its own
+ *                                 height at most (default: it does not scroll)
  *
- * Coordinates are client coordinates at the page's first scroll position (`viewport.scrollY`).
- * `scrollTo` moves the fake window, and `elementAt` reads the markup at the scrolled position, as
- * a browser's hit test does. `box` and `textLines` do not follow the scroll: the rules read them
- * before any scroll, and a test that needs the page read after one uses a real browser.
+ * Coordinates are client coordinates at the page's first scroll position (`viewport.scrollY`) and
+ * the first scrollTop of every scrolling box. `scrollTo` moves the fake window and
+ * `scrollElementTo` a box (one with `overflow-y: auto | scroll`), and `elementAt` reads the markup
+ * at the scrolled positions, as a browser's hit test does: what a box holds moves up with its
+ * scroll, and only what its own box shows can be hit. `box` and `textLines` do not follow the
+ * scroll: the rules read them before any scroll, and a test that needs the page read after one
+ * uses a real browser.
  */
 
 const DEFAULT_STYLE: LayoutStyle = {
@@ -130,17 +136,51 @@ function contains(box: Box, x: number, y: number): boolean {
   return box.width > 0 && x >= box.left && x <= box.right && y >= box.top && y <= box.bottom;
 }
 
-function topElementAt(document: Document, x: number, y: number): Element | null {
+function isPanel(el: Element): boolean {
+  const { overflowY } = styleOf(el);
+  return overflowY === "auto" || overflowY === "scroll";
+}
+
+/** How far each scrolling box is from where it started: the page's contents moved up by this much. */
+type PanelShift = (el: Element) => number;
+
+// The box where the scrolled panels above `el` left it.
+function scrolledBox(el: Element, shiftOf: PanelShift): Box {
+  const box = boxOf(el);
+  let moved = 0;
+  for (let panel = el.parentElement; panel; panel = panel.parentElement) moved += shiftOf(panel);
+  return toBox([box.left, box.top - moved, box.width, box.height]);
+}
+
+// A scrolling box cuts what it holds at its own box: the rest cannot be hit.
+function isShownByPanels(el: Element, x: number, y: number, shiftOf: PanelShift): boolean {
+  for (let panel = el.parentElement; panel; panel = panel.parentElement) {
+    if (isPanel(panel) && !contains(scrolledBox(panel, shiftOf), x, y)) return false;
+  }
+  return true;
+}
+
+function topElementAt(
+  document: Document,
+  x: number,
+  y: number,
+  shiftOf: PanelShift
+): Element | null {
   let top: Element | null = null;
   let topZ = Number.NEGATIVE_INFINITY;
   for (const el of Array.from(document.body.querySelectorAll("*"))) {
     const z = Number(el.getAttribute("data-z") ?? 0);
-    if (contains(boxOf(el), x, y) && z >= topZ) {
+    const hit = contains(scrolledBox(el, shiftOf), x, y) && isShownByPanels(el, x, y, shiftOf);
+    if (hit && z >= topZ) {
       top = el;
       topZ = z;
     }
   }
   return top;
+}
+
+function nameOf(el: Element): string {
+  return el.id ? `#${el.id}` : el.tagName.toLowerCase();
 }
 
 function createSignals(options: FakeLayoutPageOptions, calls: string[]): SettleSignals {
@@ -186,6 +226,10 @@ export function createFakeLayoutPage(
     scrollHeight,
   };
   let scrollY = firstScrollY;
+  const firstScrollTop = (el: Element) => Number(el.getAttribute("data-scroll") ?? 0);
+  const scrollTops = new Map<Element, number>();
+  const scrollTopOf = (el: Element) => scrollTops.get(el) ?? firstScrollTop(el);
+  const shiftOf: PanelShift = (el) => scrollTopOf(el) - firstScrollTop(el);
   const page: LayoutPage = {
     document,
     metrics: () => (calls.push("measure"), { ...metrics, scrollY }),
@@ -193,12 +237,21 @@ export function createFakeLayoutPage(
     style: styleOf,
     renderedText: (el) => el.textContent ?? "",
     textLines: linesOfTextNode,
-    elementAt: (x, y) => topElementAt(document, x, y + (scrollY - firstScrollY)),
+    elementAt: (x, y) => topElementAt(document, x, y + (scrollY - firstScrollY), shiftOf),
     scrollTo(top) {
       calls.push(`scrollTo ${top}`);
       // The end of the page limits the scroll, as in a browser.
       scrollY = Math.min(Math.max(0, top), Math.max(0, scrollHeight - viewport.height));
       return scrollY;
+    },
+    scrollTopOf,
+    scrollElementTo(el, top) {
+      calls.push(`scrollPanel ${nameOf(el)} ${top}`);
+      // The end of its content limits the scroll, as in a browser.
+      const contentHeight = Number(el.getAttribute("data-scroll-height") ?? 0);
+      const reached = Math.min(Math.max(0, top), Math.max(0, contentHeight - boxOf(el).height));
+      scrollTops.set(el, reached);
+      return reached;
     },
     animatedElements: () => Array.from(document.querySelectorAll("[data-animated]")),
     escapeIdent: (value) => value.replace(/[^a-zA-Z0-9_-]/g, (char) => `\\${char}`),

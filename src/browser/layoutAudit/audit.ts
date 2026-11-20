@@ -13,8 +13,10 @@ import {
   isNestedInTextBoundary,
   isRequiredControl,
   isRootElement,
+  isScrolling,
   isVisible,
   isVisibleTextHolder,
+  judgedTextLines,
   nestedClippingBoundaries,
   paddingBox,
   rootVerticalScrollLocked,
@@ -53,11 +55,25 @@ interface AuditPass {
   readonly failedRoots: Element[];
   readonly findings: LayoutAuditPageFinding[];
   readonly seen: Set<string>;
+  /** Each element looked at for a scroll box: its panel, or null for one that does not scroll. */
+  readonly panels: Map<Element, Panel | null>;
 }
 
 interface Point {
   x: number;
   y: number;
+}
+
+/**
+ * A box that scrolls its contents (`overflow-y: auto | scroll`) and so hides some of them: what a
+ * user sees of it before any scroll, with `top` and `bottom` in document coordinates.
+ */
+interface Panel {
+  readonly el: Element;
+  readonly left: number;
+  readonly right: number;
+  readonly top: number;
+  readonly bottom: number;
 }
 
 function roundedOverflowPx(value: number): number {
@@ -456,15 +472,65 @@ function isScrollReachable(point: Point, metrics: PageMetrics): boolean {
 // The rectangles whose points are sampled: the text lines, or for a control with no text line of
 // its own the control's box. That is an <input value>, a <select>, an icon-only button, or a
 // <textarea> that holds text (its value is drawn from a shadow tree, and a Range over the text it
-// holds has no rectangle). Each is cut to the part that a clipping box leaves visible: a
-// clipped-away line has a rectangle, and a point on it would find whatever sits there instead.
+// holds has no rectangle). Each is cut to the part that a clipping box leaves visible, as seen
+// from the element it is drawn in: a clipped-away line has a rectangle, and a point on it would
+// find whatever sits there instead.
 function sampleRects(pass: AuditPass, el: Element): Box[] {
-  const lines = textFragments(pass.page, el);
-  const rects = lines.length === 0 && isRequiredControl(el) ? [pass.page.box(el)] : lines;
-  return rects.flatMap((rect) => {
-    const visible = visiblePart(pass.page, el, rect);
+  const lines = judgedTextLines(pass.page, el);
+  const rects =
+    lines.length === 0 && isRequiredControl(el) ? [{ rect: pass.page.box(el), holder: el }] : lines;
+  return rects.flatMap(({ rect, holder }) => {
+    const visible = visiblePart(pass.page, holder, rect);
     return visible && visible.width * visible.height >= THRESHOLDS.minFragmentArea ? [visible] : [];
   });
+}
+
+// ---- scrolling panels ------------------------------------------------------------------------
+
+// A box with `overflow-y: auto | scroll`, or null for any other. A box with no area (`display:
+// contents`, whose overflow does nothing) is no panel either.
+function panelOf(pass: AuditPass, node: Element): Panel | null {
+  const known = pass.panels.get(node);
+  if (known !== undefined) return known;
+  const { page, metrics } = pass;
+  let panel: Panel | null = null;
+  if (isScrolling(page.style(node).overflowY)) {
+    const { left, right, top, bottom } = paddingBox(page, node);
+    if (right > left && bottom > top) {
+      panel = {
+        el: node,
+        left,
+        right,
+        top: top + metrics.scrollY,
+        bottom: bottom + metrics.scrollY,
+      };
+    }
+  }
+  pass.panels.set(node, panel);
+  return panel;
+}
+
+// The panels whose content `el`'s rectangles are, outermost first. A panel's own text is held too.
+function panelsHolding(pass: AuditPass, el: Element): Panel[] {
+  return chainBelowRoot(pass.page, el)
+    .flatMap((node) => panelOf(pass, node) ?? [])
+    .reverse();
+}
+
+type PanelView = "shown" | "scroll" | "sideways";
+
+// Where a point, in document coordinates, sits in the panels that hold it: inside every one
+// ("shown"), below or above one ("scroll": scrolling that panel brings it into view), or past the
+// left or right edge of one ("sideways": only a horizontal scroll reaches it, and the audit makes
+// none). A point that no panel hides is as visible as the page is.
+function viewIn(panels: readonly Panel[], point: Point): PanelView {
+  if (panels.some((panel) => point.x < panel.left || point.x > panel.right)) return "sideways";
+  return panels.some((panel) => point.y < panel.top || point.y > panel.bottom) ? "scroll" : "shown";
+}
+
+/** A sample point that waits for a scroll: where it is in the document before any, and its panels. */
+interface ScrollPoint extends Point {
+  readonly panels: readonly Panel[];
 }
 
 /** What the sample points of one candidate found so far. */
@@ -472,52 +538,199 @@ interface OcclusionSamples {
   el: Element;
   /** The cover found at each sampled point, null where nothing covers it. */
   covers: Array<Element | null>;
-  /** Points above or below the screen, in document coordinates: sampled after a scroll. */
-  offscreen: Point[];
+  /** Points above or below the screen, or scrolled out of a panel: sampled after a scroll. */
+  offscreen: ScrollPoint[];
 }
 
-// Points inside the viewport are sampled where they are. Points above or below it wait for a
-// scroll (every rect is read here, before any scroll, so all of them are in the one coordinate
-// frame).
+// Points a user sees without a scroll are sampled where they are. The others wait for a scroll:
+// above or below the screen (every rect is read here, before any scroll, so all of them are in the
+// one coordinate frame), or hidden by a panel. A point that a panel hides is never sampled where
+// it lies: the page shows something else there (the block after the panel, say) and not this text.
 function sampleOnScreen(pass: AuditPass, el: Element): OcclusionSamples {
   const samples: OcclusionSamples = { el, covers: [], offscreen: [] };
+  const panels = panelsHolding(pass, el);
   for (const point of sampleRects(pass, el).flatMap(fragmentSamplePoints)) {
-    if (isInsideViewport(point, pass.metrics)) {
+    const inDocument = { x: point.x, y: point.y + pass.metrics.scrollY };
+    const view = viewIn(panels, inDocument);
+    if (view === "sideways") continue;
+    if (view === "shown" && isInsideViewport(point, pass.metrics)) {
       samples.covers.push(opaqueSiblingBlocker(pass, el, point));
-    } else if (isScrollReachable(point, pass.metrics)) {
-      samples.offscreen.push({ x: point.x, y: point.y + pass.metrics.scrollY });
+    } else if (view === "scroll" || isScrollReachable(point, pass.metrics)) {
+      samples.offscreen.push({ ...inDocument, panels });
     }
   }
   return samples;
 }
 
 /**
- * Samples the points above and below the screen, which a user reaches by scrolling. The points
- * are taken in page order. One that is not in the middle half of the viewport scrolls the window
- * to put it in the middle (the scroll is instant, whatever the page's `scroll-behavior`), and the
- * points that follow reuse that position. The scroll that was reached is read back: a point the
- * page could not bring on screen is skipped, not sampled where it is not. A page that cannot
- * scroll (its root clips vertically) shows a user none of this text. The scroll position is put
- * back before this returns, so a later pass measures the same page.
+ * Every scroll the overlap rule makes, so that all of them are put back. A panel's scroll moves
+ * what it holds (the points, and the panels inside it) up by how far it went: positions are
+ * worked out from the ones read before any scroll, and the position reached is read back each time.
+ */
+interface ScrollTrail {
+  readonly page: LayoutPage;
+  readonly metrics: PageMetrics;
+  /** The root clips vertically: the window cannot scroll. */
+  readonly windowLocked: boolean;
+  windowTop: number;
+  windowMoved: boolean;
+  /** The panels scrolled so far, each with the position it started at and the one it is at. */
+  readonly panels: Map<Element, PanelScroll>;
+  panelScrolls: number;
+}
+
+interface PanelScroll {
+  readonly start: number;
+  now: number;
+  /** The way its content ended before a scroll arrived: asking for more that way moves nothing. */
+  end?: "up" | "down";
+}
+
+function shiftOf(trail: ScrollTrail, panel: Panel): number {
+  const scroll = trail.panels.get(panel.el);
+  return scroll ? scroll.now - scroll.start : 0;
+}
+
+// Where the point is in the document now: each panel that scrolled moved it up.
+function currentY(trail: ScrollTrail, point: ScrollPoint): number {
+  return point.panels.reduce((y, panel) => y - shiftOf(trail, panel), point.y);
+}
+
+// A point at least a quarter of the way in from both edges: not at an edge, where a sticky bar or
+// a scrollbar sits, and a scroll that put one point there serves the points near it too.
+function inMiddleHalf(y: number, top: number, bottom: number): boolean {
+  return y - top >= (bottom - top) / 4 && y - top <= ((bottom - top) * 3) / 4;
+}
+
+function isWithin(y: number, top: number, bottom: number): boolean {
+  return y >= top && y <= bottom;
+}
+
+// Whether a scroll of the panel toward `way` may go ahead: not past a bound (`maxScrolledPanels`,
+// `maxPanelScrolls`), and not toward an end the panel is known to have. A box that scrolls nowhere
+// is tried once, not for each of its points.
+function mayScrollPanel(trail: ScrollTrail, panel: Panel, way: "up" | "down"): boolean {
+  const scroll = trail.panels.get(panel.el);
+  if (scroll?.end === way || trail.panelScrolls >= THRESHOLDS.maxPanelScrolls) return false;
+  return scroll !== undefined || trail.panels.size < THRESHOLDS.maxScrolledPanels;
+}
+
+// Recorded before the first scroll of the panel, so a scroll that throws is still put back.
+function startScroll(trail: ScrollTrail, panel: Panel): PanelScroll {
+  const start = trail.page.scrollTopOf(panel.el);
+  const scroll = { start, now: start };
+  trail.panels.set(panel.el, scroll);
+  return scroll;
+}
+
+// One scroll of a panel by `delta`, if it may go ahead.
+function scrollPanelBy(trail: ScrollTrail, panel: Panel, delta: number): void {
+  const way = delta > 0 ? "down" : "up";
+  if (!mayScrollPanel(trail, panel, way)) return;
+  const scroll = trail.panels.get(panel.el) ?? startScroll(trail, panel);
+  trail.panelScrolls += 1;
+  const asked = scroll.now + delta;
+  scroll.now = trail.page.scrollElementTo(panel.el, asked);
+  if (Math.abs(scroll.now - asked) > THRESHOLDS.scrollRoundingPx) scroll.end = way;
+}
+
+// The part of its panel's box a user sees, where the panels outside it left it: each of them moved
+// the box up by the distance it scrolled.
+function boxNow(trail: ScrollTrail, panels: readonly Panel[], index: number) {
+  const panel = panels[index];
+  const moved = panels.slice(0, index).reduce((sum, outer) => sum + shiftOf(trail, outer), 0);
+  return { top: panel.top - moved, bottom: panel.bottom - moved };
+}
+
+// Scrolls the panels that hold the point, the innermost first, until each one shows it (in the
+// middle of its box when it had to scroll). The innermost goes first because its scroll puts the
+// point in the middle of its box, and the panel around it then has one place to show. Returns
+// where the point is in the document then, or null when a panel does not show it: a bound was
+// reached, the end of its content stopped the scroll, or the box scrolls nothing that holds it.
+function revealInPanels(trail: ScrollTrail, point: ScrollPoint): number | null {
+  const { panels } = point;
+  for (let index = panels.length - 1; index >= 0; index--) {
+    const { top, bottom } = boxNow(trail, panels, index);
+    const y = currentY(trail, point);
+    if (!isWithin(y, top, bottom)) scrollPanelBy(trail, panels[index], y - (top + bottom) / 2);
+  }
+  const y = currentY(trail, point);
+  const shown = panels.every((_, index) => {
+    const { top, bottom } = boxNow(trail, panels, index);
+    return isWithin(y, top, bottom);
+  });
+  return shown ? y : null;
+}
+
+// Scrolls the window, unless it already shows the point in its middle half and the window can
+// scroll (the scroll is instant, whatever the page's `scroll-behavior`). Returns the point's
+// place on the screen: the scroll reached is read back, as the end of the page limits it.
+function revealInWindow(trail: ScrollTrail, y: number): number {
+  const { viewportHeight } = trail.metrics;
+  if (!trail.windowLocked && !inMiddleHalf(y, trail.windowTop, trail.windowTop + viewportHeight)) {
+    trail.windowMoved = true;
+    trail.windowTop = trail.page.scrollTo(y - viewportHeight / 2);
+  }
+  return y - trail.windowTop;
+}
+
+// Every restore runs, even when an earlier one threw: the error that comes out holds all failures.
+function restoreScrolls(trail: ScrollTrail): void {
+  const restores: Array<() => unknown> = [];
+  for (const [el, { start }] of trail.panels) {
+    restores.push(() => trail.page.scrollElementTo(el, start));
+  }
+  if (trail.windowMoved) restores.push(() => trail.page.scrollTo(trail.metrics.scrollY));
+  const failures: unknown[] = [];
+  for (const restore of restores) {
+    try {
+      restore();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "a scroll position was not put back");
+}
+
+/**
+ * Samples the points that wait for a scroll, which a user reaches by scrolling: the page for what
+ * is above or below the screen, a panel for what it hides. The points are taken in page order. A
+ * panel that hides a point scrolls it into the middle of its box, the innermost panel first, and
+ * the points that follow reuse that position. Then the window scrolls to put the point in the middle
+ * of the viewport, as far as the page lets it: a point that no scroll brings on screen is skipped,
+ * not sampled where it is not. A page that cannot scroll (its root clips vertically) shows a user
+ * none of what lies off the screen, but its panels still scroll. Every scroll is put back before
+ * this returns, so a later pass measures the same page.
+ *
+ * A measured element that is gone when its panel has scrolled (a list that draws only the rows
+ * that show) leaves its sample unknown: the point is skipped, and counts as neither covered nor
+ * free. The same holds for a point beyond the bounds on panels and panel scrolls: the work stays
+ * inside the time budget, and the rest of that panel is not sampled.
  */
 function sampleOffScreen(pass: AuditPass, all: readonly OcclusionSamples[]): void {
-  const { page, metrics } = pass;
   const pending = all.flatMap((samples) => samples.offscreen.map((point) => ({ samples, point })));
-  if (pending.length === 0 || rootVerticalScrollLocked(page)) return;
+  if (pending.length === 0) return;
   pending.sort((a, b) => a.point.y - b.point.y);
-  const { viewportHeight } = metrics;
-  let top = metrics.scrollY;
+  const { page, metrics } = pass;
+  const trail: ScrollTrail = {
+    page,
+    metrics,
+    windowLocked: rootVerticalScrollLocked(page),
+    windowTop: metrics.scrollY,
+    windowMoved: false,
+    panels: new Map(),
+    panelScrolls: 0,
+  };
   try {
     for (const { samples, point } of pending) {
-      const inMiddleHalf =
-        point.y - top >= viewportHeight / 4 && point.y - top <= (viewportHeight * 3) / 4;
-      if (!inMiddleHalf) top = page.scrollTo(point.y - viewportHeight / 2);
-      const clientPoint = { x: point.x, y: point.y - top };
+      const y = revealInPanels(trail, point);
+      if (y === null || (point.panels.length > 0 && !samples.el.isConnected)) continue;
+      const clientPoint = { x: point.x, y: revealInWindow(trail, y) };
       if (!isInsideViewport(clientPoint, metrics)) continue;
       samples.covers.push(opaqueSiblingBlocker(pass, samples.el, clientPoint));
     }
   } finally {
-    page.scrollTo(metrics.scrollY);
+    restoreScrolls(trail);
   }
 }
 
@@ -576,12 +789,13 @@ function createPass(page: LayoutPage): AuditPass {
     failedRoots: [],
     findings: [],
     seen: new Set(),
+    panels: new Map(),
   };
 }
 
 /**
- * One measurement of the page. It never changes the DOM. The overlap rule scrolls the window to
- * sample text above and below the screen and puts it back before this returns.
+ * One measurement of the page. It never changes the DOM. The overlap rule scrolls the window and
+ * the panels that hide text, to sample it, and puts every scroll back before this returns.
  */
 export function auditLayout(page: LayoutPage): LayoutAuditPageFinding[] {
   const pass = createPass(page);

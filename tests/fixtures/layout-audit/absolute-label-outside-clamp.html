@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>A clamped container whose only text is an absolutely positioned label, covered</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      .stage {
+        position: relative;
+        height: 260px;
+        border: 1px solid #aebbc4;
+      }
+      /* The container clips its own box, but it is not positioned: the label is placed in .stage
+         and the container does not cut it. */
+      .tag {
+        margin: 0;
+        height: 24px;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        line-clamp: 2;
+        overflow: hidden;
+      }
+      .label {
+        position: absolute;
+        top: 90px;
+        left: 18px;
+        right: 18px;
+        font-size: 20px;
+        line-height: 1.3;
+      }
+      .cover {
+        position: absolute;
+        top: 70px;
+        left: 0;
+        right: 0;
+        height: 180px;
+        background: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Order status</h1>
+      <section class="stage">
+        <p id="tag" class="tag">
+          <span class="label"
+            >Your payment failed. Update your billing details to keep your plan.</span
+          >
+        </p>
+        <div class="cover"></div>
+      </section>
+    </main>
+  </body>
+</html>
