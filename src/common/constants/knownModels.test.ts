@@ -2,6 +2,8 @@
  * Integration tests for the curated known-model registry.
  */
 
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, test, expect } from "@jest/globals";
 import {
   KNOWN_MODELS,
@@ -9,6 +11,7 @@ import {
   TOKENIZER_MODEL_OVERRIDES,
 } from "@/common/constants/knownModels";
 import modelsJson from "@/common/utils/tokens/models.json";
+import { modelsExtra } from "@/common/utils/tokens/models-extra";
 import { findMissingKnownModels } from "@/common/utils/tokens/updateModelsData";
 
 describe("Known Models Integration", () => {
@@ -87,5 +90,44 @@ describe("Known Models Integration", () => {
         expect(MODEL_ABBREVIATIONS[alias]).toBe(model.id);
       }
     }
+  });
+
+  // The iOS app cannot import this registry, so it keeps a copy that offers these models for
+  // every configured provider; a model missing there cannot be picked on a server that has it.
+  test("the iOS built-in model list matches the registry", () => {
+    const swift = readFileSync(
+      path.join(process.cwd(), "ios", "Xum", "Kit", "Models.swift"),
+      "utf8"
+    );
+    const block = /static let builtIn = \[([\s\S]*?)\]/.exec(swift);
+    expect(block).not.toBeNull();
+    const iosIds = [...(block?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+    const knownIds = Object.values(KNOWN_MODELS)
+      .map((m) => m.id)
+      .sort();
+    expect(iosIds).toEqual(knownIds);
+  });
+
+  test("the iOS context windows match the registry's input limits", () => {
+    const swift = readFileSync(
+      path.join(process.cwd(), "ios", "Xum", "Kit", "Models.swift"),
+      "utf8"
+    );
+    const block = /\[String: Int\] = \[([\s\S]*?)\]/.exec(swift)?.[1] ?? "";
+    const ios = Object.fromEntries(
+      [...block.matchAll(/"([^"]+)": ([0-9_]+)/g)].map((m) => [
+        m[1],
+        Number(m[2].replaceAll("_", "")),
+      ])
+    );
+    const expected = Object.fromEntries(
+      Object.values(KNOWN_MODELS).map((m) => {
+        const key = Object.keys(modelsExtra).find(
+          (k) => k === m.providerModelId || k.endsWith(`/${m.providerModelId}`)
+        );
+        return [m.providerModelId, key ? modelsExtra[key].max_input_tokens : undefined];
+      })
+    );
+    expect(ios).toEqual(expected);
   });
 });
