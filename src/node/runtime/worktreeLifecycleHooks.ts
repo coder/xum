@@ -3,6 +3,7 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import { Ok, type Result } from "@/common/types/result";
 import { isWorktreeRuntime as isCommonWorktreeRuntime } from "@/common/types/runtime";
 import type { AfterArchiveHook } from "@/node/services/workspaceLifecycleHooks";
@@ -37,6 +38,27 @@ export function archiveDeletesManagedWorktree(
       Array.isArray(workspaceMetadata.projects) &&
       workspaceMetadata.projects.length > 1
     )
+  );
+}
+
+/**
+ * Whether archiving removes what a live external editor or native terminal may still use: the
+ * checkout (a snapshot capture, or the "delete" behavior) or a stopped or deleted dedicated
+ * Coder workspace. Only a caller that does not forbid the "delete" behaviors reaches it under
+ * them: a forced archive.
+ */
+export function archiveRemovesExternalAppEnvironment(args: {
+  needsSnapshotCapture: boolean;
+  remoteBoxBehavior: CoderWorkspaceArchiveBehavior;
+  worktreeArchiveBehavior: WorktreeArchiveBehavior;
+  metadata: WorkspaceMetadata | undefined;
+}): boolean {
+  return (
+    args.needsSnapshotCapture ||
+    args.remoteBoxBehavior !== "keep" ||
+    (args.worktreeArchiveBehavior === "delete" &&
+      args.metadata != null &&
+      archiveDeletesManagedWorktree(args.metadata, args.worktreeArchiveBehavior))
   );
 }
 

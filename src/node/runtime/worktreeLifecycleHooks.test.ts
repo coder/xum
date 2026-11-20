@@ -8,7 +8,10 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { log } from "@/node/services/log";
 import * as disposableExec from "@/node/utils/disposableExec";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
-import { createWorktreeArchiveHook } from "./worktreeLifecycleHooks";
+import {
+  archiveRemovesExternalAppEnvironment,
+  createWorktreeArchiveHook,
+} from "./worktreeLifecycleHooks";
 
 // eslint-disable-next-line @typescript-eslint/no-empty-function
 const noop = () => {};
@@ -358,5 +361,59 @@ describe("createWorktreeArchiveHook", () => {
     expect(execFileAsyncSpy).toHaveBeenCalledTimes(2);
     expect(debugSpy).not.toHaveBeenCalled();
     expect(await pathExists(managedPath)).toBe(false);
+  });
+});
+
+describe("archiveRemovesExternalAppEnvironment", () => {
+  const managed = createWorkspaceMetadata();
+  const sshWorkspace = createWorkspaceMetadata({
+    runtimeConfig: { type: "ssh", host: "box.example", srcBaseDir: "/home/u/src" },
+  });
+  const sharedCheckout = createWorkspaceMetadata({ taskIsolation: "none" });
+  const idle = {
+    needsSnapshotCapture: false,
+    remoteBoxBehavior: "keep",
+    worktreeArchiveBehavior: "keep",
+    metadata: managed,
+  } as const;
+
+  it("is false when the archive keeps the checkout and the remote workspace", () => {
+    expect(archiveRemovesExternalAppEnvironment(idle)).toBe(false);
+  });
+
+  it("is true for a snapshot capture alone", () => {
+    expect(archiveRemovesExternalAppEnvironment({ ...idle, needsSnapshotCapture: true })).toBe(
+      true
+    );
+  });
+
+  it("is true when the Coder behavior stops or deletes the dedicated workspace", () => {
+    for (const remoteBoxBehavior of ["stop", "delete"] as const) {
+      expect(archiveRemovesExternalAppEnvironment({ ...idle, remoteBoxBehavior })).toBe(true);
+    }
+  });
+
+  it("is true when the delete behavior deletes a managed checkout", () => {
+    expect(
+      archiveRemovesExternalAppEnvironment({ ...idle, worktreeArchiveBehavior: "delete" })
+    ).toBe(true);
+  });
+
+  it("is false when the delete behavior has no managed checkout to delete", () => {
+    const base = { ...idle, worktreeArchiveBehavior: "delete" } as const;
+
+    expect(archiveRemovesExternalAppEnvironment({ ...base, metadata: undefined })).toBe(false);
+    expect(archiveRemovesExternalAppEnvironment({ ...base, metadata: sshWorkspace })).toBe(false);
+    expect(archiveRemovesExternalAppEnvironment({ ...base, metadata: sharedCheckout })).toBe(false);
+  });
+
+  it("is false under keep, and under snapshot when no capture is needed", () => {
+    expect(archiveRemovesExternalAppEnvironment({ ...idle, worktreeArchiveBehavior: "keep" })).toBe(
+      false
+    );
+    // A snapshot behavior without a capture (multi-project, shared) does not delete here.
+    expect(
+      archiveRemovesExternalAppEnvironment({ ...idle, worktreeArchiveBehavior: "snapshot" })
+    ).toBe(false);
   });
 });

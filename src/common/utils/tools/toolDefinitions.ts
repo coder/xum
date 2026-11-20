@@ -1384,11 +1384,14 @@ export const TaskWorkspaceLifecycleToolArgsSchema = z
 
 // Live model-facing input schema for the restored tool. Deliberately narrower than
 // TaskWorkspaceLifecycleToolArgsSchema (which is kept intact so historical transcripts
-// with delete_worktree/remove/force calls still parse and render): only the reversible
-// archive/unarchive verbs are model-invocable; task_remove stays the only irreversible verb.
-// It also has no untracked-file acknowledgement (#3950): paths returned to the model can be
-// echoed back, so only the user may approve a lossy snapshot archive (through the UI). The
-// strict schema rejects a model-supplied acknowledged_untracked_paths outright.
+// with delete_worktree/remove/force calls still parse and render): only the archive/unarchive
+// verbs are model-invocable; task_remove stays the only verb that removes a workspace record.
+// It still has no untracked-file acknowledgement (#3950): the model cannot echo paths back, and
+// the strict schema rejects a model-supplied acknowledged_untracked_paths outright. Instead,
+// `force` is one explicit flag. Under it the backend lists the untracked files itself, deletes
+// exactly those (a set that changes before the delete refuses), and reports every deletion in
+// the result. It is a prompt rule, not an enforcement, so a user who asked an agent to clean up
+// accepted that the agent can lose unsaved work in workspaces it created.
 export const TaskWorkspaceLifecycleToolInputSchema = z
   .object({
     action: z
@@ -1405,6 +1408,12 @@ export const TaskWorkspaceLifecycleToolInputSchema = z
       .nullish()
       .describe(
         "Archive only: interrupt the target's active workspace turns first (default false)."
+      ),
+    force: z
+      .boolean()
+      .nullish()
+      .describe(
+        'Archive only: delete the saved state that archive otherwise refuses to lose: a checkout under the "Delete checkout" policy, a dedicated Coder workspace under the Coder "delete" policy, and untracked files a snapshot archive drops (target and sub-agents). The result lists what was deleted. Ignored by unarchive. Set it only when the user asked for cleanup or the work is provably saved. Default false.'
       ),
   })
   .strict();
@@ -3049,7 +3058,7 @@ export const TOOL_DEFINITIONS = {
     resultSchema: TaskWorkspaceLifecycleToolResultSchema,
     description:
       'Archive (reversible) or unarchive full workspaces you created with task(kind="workspace"); for sub-agents use task_remove. Archived targets refuse mode="existing" follow-ups. ' +
-      'Archive refuses a target with an active workspace turn unless interrupt_active is set, and always refuses live user activity, archives that would delete untracked files, and managed worktrees under the "Delete checkout" policy; only the user can approve those. An idle unviewed desktop is closed.',
+      'Archive refuses a target with an active workspace turn unless interrupt_active is set, and refuses live user activity, an untrackable external editor or native terminal, and active workflow runs. It also refuses archives that would delete saved state: managed worktrees under the "Delete checkout" policy, a dedicated Coder workspace under the Coder "delete" policy, and untracked files. Set force only when the user asked for cleanup or the work is provably saved: force deletes that state (and the same state of the target\'s sub-agents) and reports it, but never skips the other refusals. An idle unviewed desktop is closed.',
     schema: TaskWorkspaceLifecycleToolInputSchema,
   },
   task_list: {

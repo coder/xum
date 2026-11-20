@@ -209,6 +209,48 @@ export const BlockedNeedsAction: Story = {
   },
 };
 
+/**
+ * archive with force · deleted saved state is reported on the archived row: the untracked files
+ * (sub-agent files carry the sub-agent's workspace ID) and what else the policies deleted.
+ */
+export const ForcedArchiveReport: Story = {
+  args: {
+    args: {
+      action: "archive",
+      targets: [{ workspaceId: "24e33167af" }, { workspaceId: "4a92f76fbf" }],
+      force: true,
+    },
+    status: "completed",
+    defaultExpanded: true,
+    result: {
+      results: [
+        {
+          status: "archived",
+          action: "archive",
+          workspaceId: "24e33167af",
+          displayName: "Fix streaming resume",
+          paths: ["scratch/notes.md", "24e33167af-sub: debug.log"],
+          note: 'Force let the archive delete the untracked files listed in paths, because the snapshot archive cannot keep them. A path that starts with a workspace ID belongs to that sub-agent. Force let the "Delete checkout" archive policy delete the checkout at ~/.xum/src/xum/fix-streaming-resume. Uncommitted changes in it are lost once it is deleted, and its commits stay on branch fix-streaming-resume. A deletion that failed leaves the path or workspace in place.',
+        },
+        {
+          status: "archived",
+          action: "archive",
+          workspaceId: "4a92f76fbf",
+          displayName: "Review settings polish",
+        },
+      ],
+    },
+  },
+  play: ({ canvasElement }) => {
+    const text = canvasElement.textContent ?? "";
+    for (const expected of ["Untracked files not kept", "scratch/notes.md", "debug.log"]) {
+      if (!text.includes(expected)) {
+        throw new Error(`WorkspaceLifecycle forced archive row did not render ${expected}`);
+      }
+    }
+  },
+};
+
 /** Mid-flight, before the result arrives — falls back to the requested targets. */
 export const Executing: Story = {
   args: {

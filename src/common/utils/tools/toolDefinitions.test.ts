@@ -173,7 +173,7 @@ describe("TOOL_DEFINITIONS", () => {
     ).toBe(false);
   });
 
-  it("restricts live task_workspace_lifecycle input to reversible actions", () => {
+  it("restricts live task_workspace_lifecycle input to archive and unarchive", () => {
     expect(
       TaskWorkspaceLifecycleToolInputSchema.safeParse({
         action: "archive",
@@ -189,8 +189,8 @@ describe("TOOL_DEFINITIONS", () => {
       }).success
     ).toBe(true);
 
-    // Irreversible verbs and their escape hatch must not be model-invocable through
-    // this tool; task_remove is the only irreversible verb.
+    // The verbs that delete a worktree or a workspace record must not be model-invocable
+    // through this tool; task_remove is the only verb that removes a workspace record.
     expect(
       TaskWorkspaceLifecycleToolInputSchema.safeParse({
         action: "delete_worktree",
@@ -205,11 +205,29 @@ describe("TOOL_DEFINITIONS", () => {
       }).success
     ).toBe(false);
 
+    // force is a boolean flag on archive; a model-supplied path list is still rejected.
+    for (const force of [true, false, null]) {
+      expect(
+        TaskWorkspaceLifecycleToolInputSchema.safeParse({
+          action: "archive",
+          targets: [{ workspaceId: "child-workspace" }],
+          force,
+        }).success
+      ).toBe(true);
+    }
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "archive",
+        targets: [{ workspaceId: "child-workspace" }],
+        force: "yes",
+      }).success
+    ).toBe(false);
     expect(
       TaskWorkspaceLifecycleToolInputSchema.safeParse({
         action: "archive",
         targets: [{ workspaceId: "child-workspace" }],
         force: true,
+        acknowledged_untracked_paths: { "child-workspace": ["scratch.txt"] },
       }).success
     ).toBe(false);
   });
