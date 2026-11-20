@@ -74,12 +74,25 @@ async function discoverServer(): Promise<ServerDiscovery> {
   });
 
   try {
-    await run({ argv: args });
+    await run({
+      argv: args,
+      process: {
+        ...process,
+        exit: (code: number): never => {
+          // If the procedure returned { success: false }, exit with code 1 instead of 0 (#7856)
+          const finalCode = code === 0 && process.exitCode ? process.exitCode : code;
+          return process.exit(finalCode);
+        },
+      },
+    });
   } catch (error) {
     // trpc-cli throws FailedToExitError after calling process.exit()
     // In Electron, process.exit() doesn't immediately terminate, so the error surfaces.
     // This is expected and safe to ignore since exit was already requested.
     if (error instanceof Error && error.constructor.name === "FailedToExitError") {
+      if (process.exitCode) {
+        process.exit(process.exitCode);
+      }
       return;
     }
     throw error;
