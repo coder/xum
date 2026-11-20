@@ -7,10 +7,12 @@ import { EventEmitter } from "node:events";
 import * as syncFs from "node:fs";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
+import type { ModelMessage } from "ai";
 import {
   createMuxMessage,
   type CompactionFollowUpRequest,
   type MuxMessage,
+  type ToolCallReplayMetadata,
 } from "@/common/types/message";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { EAGER_LEAD_PERCENT } from "@/constants/continuousCompaction";
@@ -27,6 +29,8 @@ import {
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
 import { HistoryService } from "./historyService";
+import { log } from "./log";
+import { ProviderRequest } from "./turnEngine/ProviderRequest";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "./workspaceRemoval";
 
@@ -661,7 +665,12 @@ describe("ContinuousCompactor", () => {
     expect(fastApply).not.toHaveBeenCalled();
   });
 
-  async function seedLiveTurn(committedTail = false, splitCommitted = false, hiddenInHead = false) {
+  async function seedLiveTurn(
+    committedTail = false,
+    splitCommitted = false,
+    hiddenInHead = false,
+    committedSignature?: ToolCallReplayMetadata
+  ) {
     const earlier = createMuxMessage("committed-tail", "assistant", "", {
       stepStartPartIndices: [0],
       partial: true,
@@ -674,6 +683,7 @@ describe("ContinuousCompactor", () => {
         state: "output-available",
         input: { script: "pwd" },
         output: { success: true },
+        ...(committedSignature ? { providerOptions: committedSignature } : {}),
       },
     ];
     if (splitCommitted) {
@@ -1111,6 +1121,112 @@ describe("ContinuousCompactor", () => {
     expect(JSON.stringify(current.slice(1))).not.toContain("committed investigation");
     expect(JSON.stringify(current.slice(1))).toContain("committed-tool");
     expect(current[0].metadata?.compactionBoundary).toBe(true);
+  });
+
+  /** A signed committed Gemini call in the retained tail, and a signed call in the live step. */
+  async function observeSignedGeminiSwap(model: string, capabilityModel?: string) {
+    const answer = await seedLiveTurn(true, false, false, {
+      google: { thoughtSignature: "sig-committed" },
+    });
+    assert(live, "Live fixture missing");
+    const liveCall: MuxMessage["parts"][number] = {
+      type: "dynamic-tool",
+      toolCallId: "tail-tool",
+      toolName: "bash",
+      state: "output-available",
+      input: { script: "pwd" },
+      output: { success: true },
+      providerOptions: { google: { thoughtSignature: "sig-live" } },
+    };
+    live.parts[0] = liveCall;
+    answer.parts[0] = liveCall;
+    const deps = Reflect.get(compactor, "deps") as Dependencies;
+    const setSwap = mock((_workspaceId: string, _swap: ContinuousPrefixSwap) => true);
+    deps.streamManager.setPrefixSwap = setSwap;
+    deps.prepareSwap = () =>
+      Promise.resolve({
+        preparation: {
+          modelString: model,
+          providerForMessages: "google",
+          effectiveAgentId: "exec",
+          effectiveThinkingLevel: "high",
+          toolNamesForSentinel: ["bash"],
+        },
+        requestProviderOptions: { google: { thinkingConfig: { includeThoughts: true } } },
+        attachments: [],
+        systemPrefix: [],
+        cacheEnabled: false,
+      });
+    const midStream = { ...context, model, capabilityModel, phase: "mid-stream" as const };
+    await (
+      await start(eagerPercent, midStream)
+    ).job;
+    const verdict = await compactor.observe(context.thresholdPercent, midStream);
+    return { verdict, swap: setSwap.mock.calls.at(0)?.[1] };
+  }
+
+  it("a Gemini prefix swap replays no copy's thought signature and keeps the live call's after a user turn", async () => {
+    const { verdict, swap } = await observeSignedGeminiSwap("google:gemini-4-carbon");
+    expect(verdict).toBe("none");
+    assert(swap, "Expected seamless prefix activation");
+    // The retained committed call is a static copy in the prefix, without its signature.
+    expect(JSON.stringify(swap.prefix)).toContain("committed-tool");
+    expect(JSON.stringify(swap.prefix)).not.toContain("sig-");
+    // The live step's next request: the swapped prefix, then the live call as the SDK sent it.
+    const liveStep: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "tail-tool",
+            toolName: "bash",
+            input: { script: "pwd" },
+            providerOptions: { google: { thoughtSignature: "sig-live" } },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "tail-tool",
+            toolName: "bash",
+            output: { type: "json", value: { success: true } },
+          },
+        ],
+      },
+    ];
+    const request = new ProviderRequest({
+      getProvidersConfig: () => null,
+      workspaceLogger: () => log,
+    });
+    const swapped = request.swapPrefix(
+      [{ role: "user", content: "Investigate the regression" }, ...liveStep],
+      swap
+    );
+    assert(swapped, "Expected the live call to anchor the swap");
+    const liveIndex = swapped.length - liveStep.length;
+    expect(swapped.slice(liveIndex)).toEqual(liveStep);
+    // A user turn separates every copy from the live call, so no copy is in the active turn,
+    // the only turn where Gemini rejects a call without its signature.
+    expect(swapped[liveIndex - 1].role).toBe("user");
+  });
+
+  it("ends a Gemini 4 Hydrogen turn instead of swapping the prefix its live signatures are bound to", async () => {
+    // A custom entry mapped to Hydrogen: the selected model ID alone does not name it.
+    const { verdict, swap } = await observeSignedGeminiSwap(
+      "google:team-hydrogen",
+      "google:gemini-4-hydrogen"
+    );
+    expect(verdict).toBe("applied");
+    expect(swap).toBeUndefined();
+    expect(fastApply).toHaveBeenCalledTimes(1);
+    const current = await rows();
+    expect(current[0].metadata?.compactionBoundary).toBe(true);
+    expect(JSON.stringify(current.slice(1))).toContain("committed-tool");
+    expect(JSON.stringify(current.slice(1))).not.toContain("sig-");
   });
 
   it("seamlessly rebuilds an internal committed cut as static prefix context and anchors the live step", async () => {

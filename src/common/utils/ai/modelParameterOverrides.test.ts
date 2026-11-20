@@ -466,7 +466,7 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
-  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon and Carbon", () => {
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon, Carbon and Hydrogen", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         max_output_tokens: 32768,
@@ -480,6 +480,8 @@ describe("resolveModelParameterOverrides", () => {
       "google:gemini-3.8-flash",
       "google:gemini-4-argon",
       "google:gemini-4-carbon",
+      "google:gemini-4-hydrogen",
+      "openrouter:google/gemini-4-hydrogen",
     ]) {
       const result = resolveModelParameterOverrides(providersConfig, "google", model);
 
@@ -491,7 +493,7 @@ describe("resolveModelParameterOverrides", () => {
     }
   });
 
-  it("strips penalty parameters for Gemini 4 Carbon only", () => {
+  it("strips penalty parameters for Gemini 4 Carbon and Hydrogen only", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         seed: 42,
@@ -500,9 +502,15 @@ describe("resolveModelParameterOverrides", () => {
       },
     });
 
-    expect(
-      resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-carbon")
-    ).toEqual({ standard: { seed: 42 } });
+    for (const model of [
+      "google:gemini-4-carbon",
+      "google:gemini-4-hydrogen",
+      "google-vertex:gemini-4-hydrogen",
+    ]) {
+      expect(resolveModelParameterOverrides(providersConfig, "google", model)).toEqual({
+        standard: { seed: 42 },
+      });
+    }
     expect(
       resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-argon")
     ).toEqual({ standard: { seed: 42, frequencyPenalty: 0.5, presencePenalty: 0.5 } });

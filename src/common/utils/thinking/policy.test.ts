@@ -365,6 +365,8 @@ describe("getThinkingPolicyForModel", () => {
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-4-argon",
       "google:gemini-4-carbon",
+      "google:gemini-4-hydrogen",
+      "openrouter:google/gemini-4-hydrogen",
       "google-vertex:gemini-4-carbon-cyber-permissive",
     ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
@@ -554,16 +556,20 @@ describe("getThinkingPolicyForModel", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
   });
 
-  test("returns low/medium/high (no off) for Gemini 4 Argon and Carbon, unlike the Gemini 3 Pro set", () => {
+  test("returns low/medium/high (no off) for Gemini 4 Argon, Carbon and Hydrogen, unlike the Gemini 3 Pro set", () => {
     for (const model of [
       "google:gemini-4-argon",
       "openrouter:google/gemini-4-argon",
       "google:gemini-4-carbon",
+      "google:gemini-4-hydrogen",
+      "openrouter:google/gemini-4-hydrogen",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
       expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
     }
+    // @ai-sdk/google rejects thinkingLevel "xhigh", so Hydrogen's native xhigh must clamp.
+    expect(enforceThinkingPolicy("google:gemini-4-hydrogen", "xhigh")).toBe("high");
   });
 
   test("returns off/low/medium/high for stable Gemini 3.5 Flash", () => {
