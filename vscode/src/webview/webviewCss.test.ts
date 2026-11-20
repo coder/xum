@@ -169,7 +169,7 @@ const DESKTOP_ONLY_CLASSES = new Set([
   "react-colorful",
   "section-color-picker",
   "subagent-connector-active",
-  "subagent-connector-elbow-active",
+  "subagent-connector-clock",
   "workspace-status-dot-active",
   // First-run tutorial overlay: desktop only.
   "tutorial-highlight",
