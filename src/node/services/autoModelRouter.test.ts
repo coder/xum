@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type {
-  Experimental_EvaluationModelV4,
-  Experimental_EvaluationModelV4Result,
+  Experimental_DecisionModelV4,
+  Experimental_DecisionModelV4Result,
 } from "@ai-sdk/provider";
 import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError } from "ai";
@@ -17,6 +17,7 @@ import {
   resolveEvaluationModelTarget,
   type EvaluationModelFactoryDeps,
 } from "./evaluationModelFactory";
+import { evaluationModelFromLanguageModel } from "./evaluation/evaluationService";
 import type { ProvidersConfig } from "@/node/config/providersConfigStore";
 import { Err, Ok } from "@/common/types/result";
 import { DEFAULT_AUTO_MODEL_ROUTING_TIERS } from "@/common/types/autoModelRouting";
@@ -28,22 +29,22 @@ import {
 const TIERS = DEFAULT_AUTO_MODEL_ROUTING_TIERS.map((tier) => ({ ...tier }));
 const EVALUATION_MODEL = DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL;
 
-type DoEvaluate = Experimental_EvaluationModelV4["doEvaluate"];
+type DoDecide = Experimental_DecisionModelV4["doDecide"];
 
-function fakeEvaluationModel(doEvaluate: DoEvaluate): Experimental_EvaluationModelV4 {
+function fakeEvaluationModel(doDecide: DoDecide): Experimental_DecisionModelV4 {
   return {
     specificationVersion: "v4",
     provider: "fake",
     modelId: "fake-judge",
     supportedQuestionTypes: ["choice"],
-    doEvaluate,
+    doDecide,
   };
 }
 
 function verdict(
   choice = "hard",
-  extra: Partial<Experimental_EvaluationModelV4Result> = {}
-): Experimental_EvaluationModelV4Result {
+  extra: Partial<Experimental_DecisionModelV4Result> = {}
+): Experimental_DecisionModelV4Result {
   return {
     answers: {
       difficulty: {
@@ -64,22 +65,22 @@ function providersStore(providers: Record<string, unknown> | null) {
 
 /**
  * Router whose providers.jsonc-backed factory yields a fake evaluation model, so the real
- * experimental_evaluate runs, minus I/O.
+ * experimental_decide runs, minus I/O.
  */
 function createRouter(options: {
-  doEvaluate?: DoEvaluate;
-  /** A real provider evaluation model instead of the fake; `doEvaluate` is then unused. */
-  model?: Experimental_EvaluationModelV4;
+  doDecide?: DoDecide;
+  /** A real provider evaluation model instead of the fake; `doDecide` is then unused. */
+  model?: Experimental_DecisionModelV4;
 }) {
-  const doEvaluate = mock<DoEvaluate>(options.doEvaluate ?? (() => Promise.resolve(verdict())));
+  const doDecide = mock<DoDecide>(options.doDecide ?? (() => Promise.resolve(verdict())));
   const buildModel = spyOn(evaluationModelFactory, "createEvaluationModel").mockImplementation(() =>
-    Effect.succeed(Ok(options.model ?? fakeEvaluationModel(doEvaluate)))
+    Effect.succeed(Ok(options.model ?? fakeEvaluationModel(doDecide)))
   );
   const router = new AutoModelRouter({
     providersConfigStore: providersStore({}),
     env: {},
   });
-  return { router, doEvaluate, buildModel };
+  return { router, doDecide, buildModel };
 }
 
 const tempPaths: string[] = [];
@@ -90,7 +91,7 @@ afterEach(() => {
 
 describe("AutoModelRouter.classify", () => {
   it("asks one choice question keyed by tier id and maps the verdict", async () => {
-    const { router, doEvaluate, buildModel } = createRouter({});
+    const { router, doDecide, buildModel } = createRouter({});
 
     const result = await router.classify({
       prompt: "Rename a variable",
@@ -111,12 +112,12 @@ describe("AutoModelRouter.classify", () => {
     });
     // The judge is built from the requested evaluation model, not a default.
     expect(buildModel.mock.calls.map(([modelString]) => modelString)).toEqual([EVALUATION_MODEL]);
-    expect(doEvaluate).toHaveBeenCalledTimes(1);
-    const call = doEvaluate.mock.calls[0][0];
-    const state = call.state as { prompt: string; recentUserMessages?: string[] };
-    expect(state.prompt).toBe("Rename a variable");
-    // Only the most recent messages ride along.
-    expect(state.recentUserMessages).toEqual(["b", "c", "d"]);
+    expect(doDecide).toHaveBeenCalledTimes(1);
+    const call = doDecide.mock.calls[0][0];
+    // Only the most recent messages ride along, as one JSON state part.
+    expect(call.state).toEqual([
+      { type: "json", value: { prompt: "Rename a variable", recentUserMessages: ["b", "c", "d"] } },
+    ]);
     const question = call.questions.difficulty;
     expect(question.type).toBe("choice");
     if (question.type !== "choice") return;
@@ -126,7 +127,7 @@ describe("AutoModelRouter.classify", () => {
 
   it("omits confidence and probabilities when the evaluator reports none", async () => {
     const { router } = createRouter({
-      doEvaluate: () =>
+      doDecide: () =>
         Promise.resolve({
           answers: { difficulty: { type: "choice", choice: "easy" } },
           warnings: [],
@@ -144,7 +145,7 @@ describe("AutoModelRouter.classify", () => {
   });
 
   it("fails when the evaluator chooses outside the tiers", async () => {
-    const { router } = createRouter({ doEvaluate: () => Promise.resolve(verdict("impossible")) });
+    const { router } = createRouter({ doDecide: () => Promise.resolve(verdict("impossible")) });
     const result = await router.classify({
       prompt: "x",
       tiers: TIERS,
@@ -155,7 +156,7 @@ describe("AutoModelRouter.classify", () => {
 
   it("fails when the evaluator throws, without leaking the error body into the reason", async () => {
     const { router } = createRouter({
-      doEvaluate: () => Promise.reject(new Error("HTTP 429 sk-secret rate limited")),
+      doDecide: () => Promise.reject(new Error("HTTP 429 sk-secret rate limited")),
     });
     const result = await router.classify({
       prompt: "x",
@@ -172,7 +173,7 @@ describe("AutoModelRouter.classify", () => {
 
   it("reduces a provider HTTP failure to its status code", async () => {
     const { router } = createRouter({
-      doEvaluate: () =>
+      doDecide: () =>
         Promise.reject(
           new APICallError({
             message: 'Rate limited: {"error":"key sk-secret exhausted"}',
@@ -193,7 +194,7 @@ describe("AutoModelRouter.classify", () => {
 
   it("passes the evaluator's usage and provider metadata through for cost accounting", async () => {
     const { router } = createRouter({
-      doEvaluate: () =>
+      doDecide: () =>
         Promise.resolve(verdict("hard", { usage: { inputTokens: 40, outputTokens: 3 } })),
     });
     const result = await router.classify({
@@ -212,7 +213,7 @@ describe("AutoModelRouter.classify", () => {
   // #4774: the provider billed these responses even though the answer was rejected.
   it("keeps the billed usage of a verdict outside the tiers", async () => {
     const { router } = createRouter({
-      doEvaluate: () =>
+      doDecide: () =>
         Promise.resolve(
           verdict("impossible", {
             usage: { inputTokens: 40, outputTokens: 4 },
@@ -237,7 +238,7 @@ describe("AutoModelRouter.classify", () => {
 
   it("omits a billed total that overflows the safe-integer range", async () => {
     const { router } = createRouter({
-      doEvaluate: () =>
+      doDecide: () =>
         Promise.resolve(
           verdict("impossible", {
             usage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 },
@@ -256,7 +257,7 @@ describe("AutoModelRouter.classify", () => {
 
   it("keeps the billed usage of an answer the real OpenAI evaluation adapter rejects", async () => {
     // "c9" is not one of the tier option codes, so provider-utils throws inside
-    // doEvaluate before it would return usage.
+    // doDecide before it would return usage.
     const fetch = (() =>
       Promise.resolve(
         new Response(
@@ -280,7 +281,10 @@ describe("AutoModelRouter.classify", () => {
         )
       )) as unknown as typeof globalThis.fetch;
     const { router } = createRouter({
-      model: createOpenAI({ apiKey: "test", fetch }).evaluationModel("gpt-5-nano"),
+      model: evaluationModelFromLanguageModel(
+        createOpenAI({ apiKey: "test", fetch }).responses("gpt-5-nano"),
+        "openai"
+      ),
     });
     const result = await router.classify({
       prompt: "x",
@@ -298,7 +302,7 @@ describe("AutoModelRouter.classify", () => {
   it("fails when the caller aborts", async () => {
     const controller = new AbortController();
     controller.abort();
-    const { router, doEvaluate } = createRouter({});
+    const { router, doDecide } = createRouter({});
     const result = await router.classify({
       prompt: "x",
       tiers: TIERS,
@@ -306,18 +310,18 @@ describe("AutoModelRouter.classify", () => {
       signal: controller.signal,
     });
     expect(result.success).toBe(false);
-    expect(doEvaluate).not.toHaveBeenCalled();
+    expect(doDecide).not.toHaveBeenCalled();
   });
 
   it("requires at least two tiers", async () => {
-    const { router, doEvaluate } = createRouter({});
+    const { router, doDecide } = createRouter({});
     const result = await router.classify({
       prompt: "x",
       tiers: TIERS.slice(0, 1),
       evaluationModel: EVALUATION_MODEL,
     });
     expect(result.success).toBe(false);
-    expect(doEvaluate).not.toHaveBeenCalled();
+    expect(doDecide).not.toHaveBeenCalled();
   });
 
   it("fails without evaluating when the evaluation model cannot be built", async () => {
@@ -429,6 +433,67 @@ describe("evaluation model factory", () => {
       error: { code: "missing_api_key" },
     });
   });
+
+  // @ai-sdk/openai and @ai-sdk/google route `.evaluationModel()` to native `/decisions`
+  // endpoints that serve only dedicated decision models; chat model ids must keep going
+  // through the chat API with the JSON answer the language-model adapter asks for.
+  const answerText = JSON.stringify({ q0: "c2" }); // c2 = the third tier option, "hard"
+  it.each([
+    [
+      "openai:gpt-5-nano",
+      "/v1/responses",
+      {
+        id: "resp_test",
+        created_at: 0,
+        model: "gpt-5-nano",
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            id: "msg_test",
+            content: [{ type: "output_text", text: answerText, annotations: [] }],
+          },
+        ],
+        usage: { input_tokens: 12, output_tokens: 3 },
+      },
+    ],
+    [
+      "google:gemini-2.5-flash",
+      "/v1beta/models/gemini-2.5-flash:generateContent",
+      {
+        candidates: [
+          { content: { role: "model", parts: [{ text: answerText }] }, finishReason: "STOP" },
+        ],
+        usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 3, totalTokenCount: 15 },
+      },
+    ],
+  ] as const)(
+    "classifies with %s through its chat API, not a /decisions endpoint",
+    async (evaluationModel, expectedPath, reply) => {
+      // A configured base URL keeps the SDKs from reading the host's *_BASE_URL env.
+      const paths: string[] = [];
+      spyOn(globalThis, "fetch").mockImplementation(
+        Object.assign(
+          (input: Parameters<typeof fetch>[0]) => {
+            paths.push(new URL(input instanceof Request ? input.url : String(input)).pathname);
+            return Promise.resolve(
+              new Response(JSON.stringify(reply), {
+                headers: { "Content-Type": "application/json" },
+              })
+            );
+          },
+          { preconnect: () => undefined }
+        )
+      );
+      const provider = evaluationModel.slice(0, evaluationModel.indexOf(":"));
+      const baseUrl = `https://proxy.example.test/${expectedPath.split("/")[1]}`;
+      const router = new AutoModelRouter(deps({ [provider]: { apiKey: "sk-test", baseUrl } }));
+      const result = await router.classify({ prompt: "x", tiers: TIERS, evaluationModel });
+      expect(paths).toEqual([expectedPath]);
+      expect(result).toMatchObject({ success: true, data: { tierId: "hard" } });
+    }
+  );
 
   it("rejects model strings outside the evaluation-capable providers", () => {
     for (const modelString of ["coder:openai/gpt-5", "typesafe", "openai:", "unknown-provider:x"]) {

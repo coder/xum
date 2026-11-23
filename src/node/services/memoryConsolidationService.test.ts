@@ -5831,12 +5831,19 @@ describe("MemoryConsolidationService", () => {
                   : [{ type: "error", error: new Error("provider exploded") }];
               if (calls === 1)
                 return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
-              // The provider fails first; the deadline passes right after it.
-              const stream = new ReadableStream<LanguageModelV3StreamPart>({
-                pull: (controller) => {
-                  controller.error(new Error("provider exploded"));
+              // The provider fails first; the deadline passes once the service has read the error.
+              // A real deadline fires in its own timer task, after the error reached the service.
+              // An abort in the same turn as the error cannot stand in for it: since ai 6f6b9c0
+              // such an abort cancels the stream before any reader can see the error.
+              const providerError = new Error("provider exploded");
+              Object.defineProperty(providerError, "message", {
+                get: () => {
                   timeout.abort(new DOMException("run timeout", "TimeoutError"));
+                  return "provider exploded";
                 },
+              });
+              const stream = new ReadableStream<LanguageModelV3StreamPart>({
+                pull: (controller) => controller.error(providerError),
               });
               return Promise.resolve({ stream });
             },

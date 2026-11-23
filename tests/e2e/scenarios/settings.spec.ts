@@ -14,11 +14,11 @@ test.describe("Settings", () => {
 
     // Verify section navigation is present
     const dialog = page.getByRole("dialog", { name: "Settings" });
-    await expect(dialog.getByRole("button", { name: "General", exact: true })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Appearance", exact: true })).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Providers", exact: true })).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Models", exact: true })).toBeVisible();
 
-    // Verify default section is General (theme toggle visible)
+    // Verify default section is Appearance (theme toggle visible)
     await expect(page.getByText("Theme", { exact: true })).toBeVisible();
   });
 
@@ -34,8 +34,8 @@ test.describe("Settings", () => {
     await ui.settings.selectSection("Models");
     await expect(page.getByPlaceholder(/model-id/i)).toBeVisible();
 
-    // Navigate back to General
-    await ui.settings.selectSection("General");
+    // Navigate back to Appearance
+    await ui.settings.selectSection("Appearance");
     await expect(page.getByText("Theme", { exact: true })).toBeVisible();
   });
 

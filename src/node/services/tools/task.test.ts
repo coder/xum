@@ -20,6 +20,7 @@ import {
   createTestToolConfig,
   mockToolCallOptions,
   TestTempDir,
+  zodInputSchemaOf,
 } from "./testHelpers";
 import { Ok, Err } from "@/common/types/result";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -184,16 +185,18 @@ describe("task tool", () => {
       "- ci-watcher: ci-watcher agent [meant to run in the background (run_in_background=true)]"
     );
     expect(lines).toContain("- reviewer: reviewer agent");
-    const parsed = (
-      tool.inputSchema as { parse: (v: unknown) => { run_in_background?: boolean | null } }
-    ).parse({ agentId: "ci-watcher", prompt: "watch", title: "CI watcher" });
+    const parsed = zodInputSchemaOf(tool).parse({
+      agentId: "ci-watcher",
+      prompt: "watch",
+      title: "CI watcher",
+    }) as { run_in_background?: boolean | null };
     expect(parsed.run_in_background).toBe(false);
   });
 
   // The advertised inputSchema is the raw (strict) Zod schema. A `.strict()` schema that omits
   // `isolation` rejects the field outright, proving it never enters LLM context for that runtime.
   const parseWithIsolation = (tool: ReturnType<typeof createTaskTool>) =>
-    (tool.inputSchema as { safeParse: (v: unknown) => { success: boolean } }).safeParse({
+    zodInputSchemaOf(tool).safeParse({
       agentId: "explore",
       prompt: "look",
       title: "Look",
@@ -244,9 +247,7 @@ describe("task tool", () => {
       xumEnv: { MUX_RUNTIME: "worktree" },
     });
 
-    const parsed = (
-      tool.inputSchema as { safeParse: (v: unknown) => { success: boolean } }
-    ).safeParse({
+    const parsed = zodInputSchemaOf(tool).safeParse({
       kind: "workspace",
       prompt: "summarize the fork",
       title: "Workspace fork",
@@ -263,9 +264,7 @@ describe("task tool", () => {
       xumEnv: { MUX_RUNTIME: "worktree" },
     });
 
-    const parsed = (
-      tool.inputSchema as { safeParse: (v: unknown) => { success: boolean } }
-    ).safeParse({
+    const parsed = zodInputSchemaOf(tool).safeParse({
       kind: "workspace",
       prompt: "keep working",
       title: "Persistent workspace",

@@ -1,4 +1,4 @@
-// Limits for the workflow `evaluate()` primitive (AI SDK `experimental_evaluate`).
+// Limits for the workflow `evaluate()` primitive (AI SDK `experimental_decide`).
 //
 // The option/level limits are the strictest limits across the supported
 // evaluation providers, applied universally so a workflow that validates here

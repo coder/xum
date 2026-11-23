@@ -202,7 +202,7 @@ Workspace-file workflow scripts are executable only after the project is trusted
 
 ## `xum trust`
 
-Trust gates all repo-controlled automation: project workflows, hooks, and `.mux` configuration. The desktop app records trust via Settings → Security; `xum trust` writes the same entry in `~/.xum/config.json` headlessly — no desktop app or server required, registering the project if it was never added to Xum. A running desktop instance picks the change up automatically.
+Trust gates all repo-controlled automation: project workflows, hooks, and `.mux` configuration. The desktop app records trust via Settings → Project trust; `xum trust` writes the same entry in `~/.xum/config.json` headlessly — no desktop app or server required, registering the project if it was never added to Xum. A running desktop instance picks the change up automatically.
 
 ```bash
 # Trust the project containing the current directory (git toplevel)

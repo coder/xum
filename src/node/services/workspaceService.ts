@@ -6303,7 +6303,7 @@ export class WorkspaceService
     // share their parent's checkout, so trust is owned by that parent project.
     if (!projectConfig?.trusted) {
       return Err(
-        "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
+        "This project must be trusted before creating workspaces. Trust the project in Settings → Project trust, or create a workspace from the project page."
       );
     }
 
@@ -6918,7 +6918,7 @@ export class WorkspaceService
         );
         if (!projectConfig?.trusted) {
           return Err(
-            `Project ${project.projectName} must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page.`
+            `Project ${project.projectName} must be trusted before creating workspaces. Trust the project in Settings → Project trust, or create a workspace from the project page.`
           );
         }
       }
@@ -13874,7 +13874,7 @@ export class WorkspaceService
         .projects.get(stripTrailingSlashes(foundProjectPath));
       if (!projectConfig?.trusted) {
         return Err(
-          "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
+          "This project must be trusted before creating workspaces. Trust the project in Settings → Project trust, or create a workspace from the project page."
         );
       }
 

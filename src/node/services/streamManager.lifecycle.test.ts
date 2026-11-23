@@ -28,8 +28,8 @@ import {
   historyService,
   installStreamManagerTestHistory,
   testStartOptions,
+  type TurnOptionsWith,
 } from "./streamManager.suite.testHarness";
-import type { TurnExecutionOptions } from "./turnEngine/TurnEngine";
 
 installStreamManagerTestHistory();
 
@@ -104,7 +104,7 @@ function recordingManager(deps: StreamManagerTestDeps = {}): TurnRecorder {
 
 async function startTurn(
   streamManager: StreamManager,
-  options: Partial<TurnExecutionOptions> & Pick<TurnExecutionOptions, "workspaceId" | "model">
+  options: TurnOptionsWith<"workspaceId" | "model">
 ) {
   const messageId = options.messageId ?? `${options.workspaceId}-msg`;
   const historySequence = options.historySequence ?? 1;

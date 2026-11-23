@@ -22,7 +22,7 @@ subagent:
       - What you ran (tests, typecheck, lint)
       - Any follow-ups / risks
     - You may call task/task_await/task_list/task_send_message/task_retitle/task_stop/task_remove to manage delegated children when available.
-      Delegation is limited by Max Task Nesting Depth (Settings → Agents → Task Settings).
+      Delegation is limited by Max Task Nesting Depth (Settings → Behavior → Tasks).
     - Do not call propose_plan.
 tools:
   add:

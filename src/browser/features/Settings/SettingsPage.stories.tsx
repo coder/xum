@@ -13,43 +13,48 @@ export default {
 };
 
 const BASE_SECTION_LABELS = [
-  "General",
+  "Appearance",
+  "Terminal & editor",
+  "Keybinds",
+  "Behavior",
   "Agents",
   "Heartbeats",
   "Providers",
   "Models",
   "MCP",
-  "Secrets",
-  "Security",
-  "Server Access",
   "Runtimes",
+  "Sandbox & limits",
+  "Project trust",
+  "Secrets",
+  "Server access",
   "Experiments",
-  "Keybinds",
   "Backup",
 ] as const;
 
 type BaseSectionLabel = (typeof BASE_SECTION_LABELS)[number];
 
 const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
-  General: /Theme/i,
-  Agents: /Max Parallel Agent Tasks/i,
+  Appearance: /Theme/i,
+  "Terminal & editor": /Terminal Font/i,
+  Behavior: /Max Parallel Agent Tasks/i,
+  Agents: /Agent defaults/i,
   Heartbeats: /Default interval/i,
   Providers: /Configure API keys and endpoints for AI providers|API Key/i,
   Models: /Custom Models|Built-in Models/i,
   MCP: /MCP Servers/i,
   Secrets: /Secrets are stored in/i,
-  Security: /Project Trust/i,
-  "Server Access": /Server access sessions/i,
+  "Project trust": /Project Trust/i,
+  "Server access": /Server access sessions/i,
   Runtimes: /Default isolation/i,
+  "Sandbox & limits": /Run agent commands in a sandbox/i,
   Experiments: /Experimental features that are still in development/i,
   Keybinds: /Open agent picker/i,
   Backup: /Settings backup/i,
 };
 
 async function clickSectionButton(dialog: HTMLElement, sectionLabel: string): Promise<void> {
-  await userEvent.click(
-    await within(dialog).findByRole("button", { name: new RegExp(`^${sectionLabel}$`, "i") })
-  );
+  const nav = await within(dialog).findByRole("navigation", { name: "Settings sections" });
+  await userEvent.click(within(nav).getByRole("button", { name: sectionLabel }));
 }
 
 async function assertSectionBodyRendered(
@@ -267,5 +272,81 @@ export const PhoneFullScreen: AppStory = {
         await expect(select.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
       }
     }
+  },
+};
+
+// Search: Ctrl+F focuses the field, every query word must match, arrows move the active result
+// and Enter opens its section with the matching row highlighted. Escape clears, then closes.
+export const SearchSettings: AppStory = {
+  // An interaction contract: the snapshot budget goes to the section and phone stories.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    const settings = within(dialog);
+    const search = settings.getByRole("combobox", { name: "Search settings" });
+    await userEvent.click(settings.getByRole("navigation", { name: "Settings sections" }));
+    // The open section stays mounted (hidden) under the results, so its unsaved drafts survive a
+    // search the user clears again.
+    const sectionRow = await waitFor(() => {
+      const row = dialog.querySelector('[data-setting-id="theme"]');
+      if (!row) throw new Error("Appearance is not open");
+      return row;
+    });
+    await userEvent.keyboard("{Control>}f{/Control}");
+    await waitFor(() => expect(search).toHaveFocus());
+    await userEvent.keyboard("theme");
+    await expect(sectionRow).not.toBeVisible();
+    await userEvent.keyboard("{Escape}");
+    await expect(sectionRow).toBeVisible();
+    await expect(sectionRow.isConnected).toBe(true);
+
+    await userEvent.keyboard("badge size");
+    const results = await settings.findByRole("listbox", { name: "Settings search results" });
+    const options = within(results).getAllByRole("option");
+    // "badge" and "size" must both match: Terminal Font Size has no "badge".
+    await expect(options.map((option) => option.textContent)).toEqual([
+      expect.stringContaining("Terminal Badge Font Size"),
+    ]);
+    await expect(options[0]).toHaveAttribute("aria-selected", "true");
+
+    await userEvent.keyboard("{Enter}");
+    // The badge sub-options render only while the badge is on (off here), so the result lands on
+    // the switch that reveals them.
+    await waitFor(() => {
+      const row = dialog.querySelector('[data-setting-id="terminal-badge"]');
+      if (row?.getAttribute("data-search-focused") !== "true") {
+        throw new Error("Terminal Badge row is not highlighted");
+      }
+    });
+    await expect(dialog.querySelector('[data-setting-id="terminal-badge-font-size"]')).toBeNull();
+    await expect(search).toHaveValue("");
+
+    await userEvent.click(search);
+    await userEvent.keyboard("zzzz");
+    await expect(await settings.findByText(/No settings match/)).toBeVisible();
+    await userEvent.keyboard("{Escape}");
+    await expect(search).toHaveValue("");
+    await expect(getSettingsDialog()).toBe(dialog);
+
+    // A result inside a collapsed disclosure opens it, so the form's fields are on screen.
+    await userEvent.keyboard("add mcp server{Enter}");
+    await waitFor(() => {
+      const mark = dialog.querySelector('[data-setting-id="mcp-add-server"]');
+      if (!mark?.closest("details")?.open) throw new Error("Add server form is collapsed");
+    });
+    await expect(dialog.querySelector("#server-name")).toBeVisible();
+
+    // A field inside a provider card expands the card and lands on the field, not the header.
+    await userEvent.click(search);
+    await userEvent.keyboard("response storage{Enter}");
+    await waitFor(() => {
+      const block = dialog.querySelector(
+        '[data-setting-id="openai-response-storage"]'
+      )?.parentElement;
+      if (block?.getAttribute("data-search-focused") !== "true") {
+        throw new Error("Response storage is not highlighted");
+      }
+    });
   },
 };

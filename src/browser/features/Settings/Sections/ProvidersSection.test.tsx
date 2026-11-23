@@ -863,6 +863,7 @@ describe("ProvidersSection", () => {
       setSecretsProjectPath: () => undefined,
       instructionsProjectPath: null,
       setInstructionsProjectPath: () => undefined,
+      openedWithoutSection: false,
     }));
 
     const view = render(

@@ -1216,6 +1216,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
       let pulls = 0;
+      let cancelled = false;
       // A runaway provider: streams one complete sentence, then keeps
       // yielding fragments forever, ignoring abortSignal entirely. Each pull
       // waits a real timer tick so the deadline can actually fire (a
@@ -1236,10 +1237,17 @@ describe("maybeAppendAbandonedBranchSummary", () => {
                 new Promise((resolve) =>
                   setTimeout(() => {
                     pulls += 1;
-                    controller.enqueue({ type: "text-delta", id: "t1", delta: " overflow" });
+                    if (!cancelled) {
+                      controller.enqueue({ type: "text-delta", id: "t1", delta: " overflow" });
+                    }
                     resolve();
                   }, 1)
                 ),
+              // Since ai 6f6b9c0 the SDK cancels the provider stream on abort, so
+              // a pull already in flight must not enqueue into the closed stream.
+              cancel: () => {
+                cancelled = true;
+              },
             }),
           }),
       });

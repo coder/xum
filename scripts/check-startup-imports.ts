@@ -34,6 +34,7 @@
  * Run: bun scripts/check-startup-imports.ts
  */
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import { builtinModules } from "node:module";
 import * as path from "node:path";
 import * as esbuild from "esbuild";
@@ -176,6 +177,12 @@ export async function analyzeStartupImports(options: {
   assert(path.isAbsolute(options.rootDir), "rootDir must be absolute");
   assert(options.entries.length > 0, "at least one entry is required");
 
+  // esbuild reports importer paths through the real filesystem, so a symlinked root
+  // (macOS temp dirs: mkdtemp returns /var/folders/..., esbuild resolves importers to
+  // /private/var/folders/...) would make path.relative produce ../..-littered project
+  // paths that never match the metafile keys. Compare against the real root instead.
+  const rootDir = realpathSync(options.rootDir);
+
   // esbuild lists imports it elided (type-only or unused bindings) in the metafile as
   // unresolved externals without calling onResolve. Record the banned imports that were
   // really resolved so elided ones are not mistaken for eager loads. The kind is part of
@@ -183,8 +190,7 @@ export async function analyzeStartupImports(options: {
   const resolvedBannedImports = new Set<string>();
   const edgeKey = (importer: string, kind: string, specifier: string) =>
     `${importer}\0${kind}\0${specifier}`;
-  const toProjectPath = (file: string) =>
-    path.relative(options.rootDir, file).split(path.sep).join("/");
+  const toProjectPath = (file: string) => path.relative(rootDir, file).split(path.sep).join("/");
 
   const result = await esbuild.build({
     absWorkingDir: options.rootDir,

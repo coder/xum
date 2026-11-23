@@ -6,6 +6,7 @@ import {
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, within } from "storybook/test";
 import { GeneralSection } from "./GeneralSection.js";
+import { TerminalEditorSection } from "./TerminalEditorSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
 const meta: Meta = {
@@ -27,11 +28,12 @@ export const General: Story = {
     const canvas = within(canvasElement);
 
     await canvas.findByText(/^Theme$/i);
-    await canvas.findByText(/^Terminal Font$/i);
-    await canvas.findByText(/^Terminal Font Size$/i);
+    await canvas.findByText(/^Transcript density$/i);
   },
 };
 
+// The terminal settings moved to Terminal & editor; their stories stay in this file so their
+// story ids (and Pixel baselines) carry over and the story-file budget does not grow.
 /**
  * Phone-width contract for the Terminal Font row (#5814): the row wraps, so the fixed-width
  * input moves below its label instead of running past the screen edge (#5813). A play only, no
@@ -46,7 +48,7 @@ export const TerminalFontPhoneWidth: Story = {
   render: () => (
     <SettingsSectionStory setup={() => setupSettingsStory({})}>
       <div data-testid="phone-frame" style={{ width: 375, maxWidth: "100%" }}>
-        <GeneralSection />
+        <TerminalEditorSection />
       </div>
     </SettingsSectionStory>
   ),
@@ -73,7 +75,7 @@ export const TerminalBadgeEnabledPhone: Story = {
         })
       }
     >
-      <GeneralSection />
+      <TerminalEditorSection />
     </SettingsSectionStory>
   ),
   globals: {

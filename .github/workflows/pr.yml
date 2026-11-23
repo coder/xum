@@ -105,6 +105,8 @@ jobs:
               - 'vite*.ts'
               - 'Makefile'
               - 'electron-builder.yml'
+              # The entitlements that Sign / macOS gives the app.
+              - 'build/**'
               # Pixel's default matrix and the Storybook config decide which snapshots exist,
               # so the snapshot-budget step (Test / Storybook) must run when they change.
               - 'pixel.jsonc'
@@ -1283,6 +1285,9 @@ jobs:
           if-no-files-found: error
           archive: false
 
+  # macOS apps go through three jobs: a macOS job builds the unsigned app, Linux jobs sign it
+  # (_sign-macos.yml: the release key is reachable only from there), and a macOS job checks
+  # and packages the signed app.
   build-macos:
     # One runner per arch: both arches packaging in parallel on one 3-core runner was a
     # ~11 min critical-path job.
@@ -1294,11 +1299,13 @@ jobs:
       matrix:
         arch: [x64, arm64]
     runs-on: macos-15
+    outputs:
+      # Each matrix job sets only the output of its own arch.
+      sha256-x64: ${{ steps.checksum.outputs.sha256-x64 }}
+      sha256-arm64: ${{ steps.checksum.outputs.sha256-arm64 }}
     env:
       NODE_OPTIONS: --max-old-space-size=4096
       ARCH: ${{ matrix.arch }}
-      # PRs only need the DMG they upload; merge-queue and main runs keep the full target list.
-      MAC_TARGETS: ${{ github.event_name == 'pull_request' && 'dmg' || '' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -1310,18 +1317,69 @@ jobs:
         with:
           electron-zip: "true"
           electron-zip-targets: darwin-${{ matrix.arch }}
-      - name: Setup code signing
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: ./scripts/setup-macos-signing.sh
+      - name: Build the unsigned macOS app
+        run: make "dist-mac-app-$ARCH"
+      - name: Record checksum
+        id: checksum
+        run: echo "sha256-$ARCH=$(shasum -a 256 "release/macos-app-unsigned-$ARCH.tar" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Upload the unsigned app
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: macos-app-unsigned-${{ matrix.arch }}
+          path: release/macos-app-unsigned-${{ matrix.arch }}.tar
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+
+  sign-macos:
+    name: Sign / macOS
+    needs: [build-macos]
+    permissions:
+      contents: read
+      id-token: write # Google Cloud workload identity, for the release key
+    uses: ./.github/workflows/_sign-macos.yml
+    with:
+      # Pushes to main sign with the release certificate and notarize. PR and merge queue
+      # builds run code that is not on main yet, so they sign with a throwaway certificate:
+      # the same steps run, and no credential is in reach.
+      certificate: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'developer-id' || 'throwaway' }}
+      sha256-x64: ${{ needs.build-macos.outputs.sha256-x64 }}
+      sha256-arm64: ${{ needs.build-macos.outputs.sha256-arm64 }}
+    secrets: inherit # zizmor: ignore[secrets-inherit] -- the sign job reads the secrets of its environment
+
+  package-macos:
+    name: Package / macOS (${{ matrix.arch }})
+    needs: [sign-macos]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    runs-on: macos-15
+    env:
+      ARCH: ${{ matrix.arch }}
+      # PRs only need the DMG they upload; merge-queue and main runs keep the full target list.
+      MAC_TARGETS: ${{ github.event_name == 'pull_request' && 'dmg' || '' }}
+      MAC_CERTIFICATE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'developer-id' || 'throwaway' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+      - name: Download the signed app
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-app-signed-${{ matrix.arch }}
+          path: release
+      - name: Check the signed app
         env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
-          AC_APIKEY_P8_BASE64: ${{ secrets.AC_APIKEY_P8_BASE64 }}
-          AC_APIKEY_ID: ${{ secrets.AC_APIKEY_ID }}
-          AC_APIKEY_ISSUER_ID: ${{ secrets.AC_APIKEY_ISSUER_ID }}
-      - name: Build macOS distributable
-        # Retry for transient Apple timestamp-server failures during code signing.
-        run: ./scripts/retry.sh 3 30 make "dist-mac-$ARCH"
+          SHA256: ${{ needs.sign-macos.outputs[format('sha256-{0}', matrix.arch)] }}
+        run: |
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::No checksum from the sign job."; exit 1; }
+          shasum -a 256 -c <<<"$SHA256  release/macos-app-signed-$ARCH.tar"
+      - name: Package the signed app
+        run: make "package-mac-$ARCH"
+      - name: Check the signature
+        run: make check-mac-signature MAC_ARCH="$ARCH"
       - name: Smoke test packaged macOS attach_file runtime
         run: make check-mac-attach-file-runtime MAC_ARCH="$ARCH"
       - name: Upload artifact
@@ -1462,6 +1520,8 @@ jobs:
       - smoke-docker
       - build-linux
       - build-macos
+      - sign-macos
+      - package-macos
       - build-windows
       - build-vscode
       - codex-comments

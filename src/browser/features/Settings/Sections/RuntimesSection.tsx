@@ -65,6 +65,15 @@ import type {
   RuntimeMode,
 } from "@/common/types/runtime";
 
+import { ArchiveBehaviorSettings } from "./ArchiveBehaviorSettings";
+import { DefaultProjectDirSetting } from "./DefaultProjectDirSetting";
+import {
+  SETTINGS_CARD_CLASS,
+  SETTINGS_GROUP_CARD_CLASS,
+  SETTINGS_GROUP_HEADING_CLASS,
+  SettingsMark,
+} from "../Components/SettingsLayout";
+
 type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 
 /**
@@ -103,11 +112,14 @@ const WORKSPACE_ISOLATION_ROWS: RuntimeRow[] = WORKSPACE_ISOLATIONS.map((workspa
 const ISOLATION_ROW_GROUPS = [
   {
     title: "Project isolation",
+    // Settings search target (settingsRegistry).
+    markId: "project-isolation",
     description: "Where workspaces run. Local is always available.",
     rows: PROJECT_ISOLATION_ROWS,
   },
   {
     title: "Workspace isolation",
+    markId: "workspace-isolation",
     description: "How each workspace is separated from the others.",
     rows: WORKSPACE_ISOLATION_ROWS,
   },
@@ -589,8 +601,9 @@ export function RuntimesSection() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="space-y-4">
+    <div className="space-y-8">
+      <div className={cn(SETTINGS_CARD_CLASS, "space-y-4")}>
+        <SettingsMark id="runtime-scope" />
         <div className="flex items-center justify-between gap-4">
           <div>
             <div className="text-foreground text-sm">Scope</div>
@@ -635,13 +648,15 @@ export function RuntimesSection() {
         ) : null}
       </div>
 
-      <div className="space-y-4">
+      <div>
         <div
           className={cn(
+            SETTINGS_CARD_CLASS,
             "flex flex-wrap items-center justify-between gap-4",
             defaultIsolationDisabled && "opacity-60"
           )}
         >
+          <SettingsMark id="default-isolation" />
           <div>
             <div className="text-foreground text-sm">Default isolation</div>
             <div className="text-muted text-xs">
@@ -714,12 +729,13 @@ export function RuntimesSection() {
         </div>
 
         {ISOLATION_ROW_GROUPS.map((group) => (
-          <div key={group.title} className="space-y-1">
-            <div>
-              <div className="text-foreground text-sm font-medium">{group.title}</div>
-              <div className="text-muted text-xs">{group.description}</div>
+          <section key={group.title} className="space-y-2 pt-4">
+            <SettingsMark id={group.markId} />
+            <div className="px-1">
+              <h3 className={SETTINGS_GROUP_HEADING_CLASS}>{group.title}</h3>
+              <div className="text-muted mt-1 text-xs">{group.description}</div>
             </div>
-            <div className="divide-border-light divide-y">
+            <div className={SETTINGS_GROUP_CARD_CLASS}>
               {group.rows.map((runtime) => {
                 const Icon = runtime.Icon;
                 const isCoder = runtime.id === "coder";
@@ -777,7 +793,7 @@ export function RuntimesSection() {
                   <div
                     key={runtime.id}
                     className={cn(
-                      "flex items-start justify-between gap-4 py-3",
+                      "flex items-start justify-between gap-4 px-4 py-3",
                       rowDisabled && "opacity-60"
                     )}
                   >
@@ -870,9 +886,14 @@ export function RuntimesSection() {
                 );
               })}
             </div>
-          </div>
+          </section>
         ))}
       </div>
+
+      {/* Global settings about where workspaces live and what archiving does to them; they used
+          to sit in General. They apply to every project, whatever the scope above shows. */}
+      <ArchiveBehaviorSettings />
+      <DefaultProjectDirSetting />
     </div>
   );
 }

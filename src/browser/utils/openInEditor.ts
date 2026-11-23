@@ -286,7 +286,7 @@ async function openInEditorWithLaunch(
 
   // For custom editor with no command configured, open settings (if available)
   if (editorConfig.editor === "custom" && !editorConfig.customCommand) {
-    args.openSettings?.("general");
+    args.openSettings?.("terminal");
     return { success: false, error: "Please configure a custom editor command in Settings" };
   }
 

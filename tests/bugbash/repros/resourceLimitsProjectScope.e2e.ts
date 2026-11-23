@@ -1,7 +1,7 @@
 // Bug bash of the per-project agent resource limits (charter limits-fuzz): after an invalid value
 // in a field, switching the Project picker reset the field to the new project's saved limit but
 // kept the old field's error on screen.
-// Settings → Agents → Resource limits has a Project picker: "All projects" edits the shared
+// Settings → Sandbox & limits → Resource limits has a Project picker: "All projects" edits the shared
 // limit, a project edits its own limit. Xum cannot manage its cgroup in the repro environments,
 // so a saved limit shows "Not applied" and changes no cgroup; only the saved values matter here.
 import { test } from "@e2e-dev/web";
@@ -22,7 +22,7 @@ async function openResourceLimits(
   await browser.locator('[data-testid="settings-button"]').tap();
   const settings = screen.getByRole("dialog", "Settings");
   await expect(settings).toBeVisible({ timeout: 15_000 });
-  await settings.getByRole("button", "Agents").tap();
+  await settings.getByRole("button", "Sandbox & limits").tap();
   const toggle = settings.getByRole("switch", "Resource limits");
   const cpu = settings.getByRole("spinbutton", "CPU limit");
   const memory = settings.getByRole("spinbutton", "Memory limit");

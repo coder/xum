@@ -580,8 +580,21 @@ function streamPartError(error: unknown): Error {
   return Object.assign(new Error(errorMessage), { cause: errorObj });
 }
 
+/**
+ * A finish part that means the stream ended before the provider's own terminal
+ * event, so the turn must take the retryable `stream_truncated` path below.
+ */
+function isCutOffStreamFinish(part: FoldablePart): boolean {
+  // AI SDK 7.0.1xx provider adapters (OpenAI Responses/Chat/Completions,
+  // Anthropic, Google) emit `interrupted` themselves when the SSE stream closes
+  // without a completion signal; the spec defines it as exactly that.
+  if (part.finishReason === "interrupted") return true;
+  return part.finishReason === "other" && part.rawFinishReason === undefined;
+}
+
 function foldFinish(view: FoldView, part: FoldablePart): FoldIntent[] {
-  // Skip the `ai` package's synthesized-default finish part.
+  // Skip cut-off finish parts: the adapters' own `interrupted` (above) and the
+  // `ai` package's synthesized-default finish part.
   //
   // `streamText`'s internal `runStep` initializes
   // `stepFinishReason = "other"` and `stepRawFinishReason = undefined`,
@@ -606,7 +619,7 @@ function foldFinish(view: FoldView, part: FoldablePart): FoldIntent[] {
   // `handleTruncatedStreamCompletion`, which surfaces a
   // retryable `stream_truncated` error instead of silently
   // committing partial output as a normal assistant message.
-  if (part.finishReason === "other" && part.rawFinishReason === undefined) {
+  if (isCutOffStreamFinish(part)) {
     // Observability for the unaudited-adapter risk: if a future
     // provider adapter we haven't read source for legitimately
     // emits `(other, undefined)` as a real terminal finish, the
@@ -617,8 +630,12 @@ function foldFinish(view: FoldView, part: FoldablePart): FoldIntent[] {
       {
         _tag: "Log",
         level: "warn",
-        message: "Treating synthesized-default (other, undefined) finish as truncated stream",
-        fields: { messageId: view.messageId, model: view.model },
+        message: "Treating a cut-off finish as truncated stream",
+        fields: {
+          messageId: view.messageId,
+          model: view.model,
+          finishReason: part.finishReason,
+        },
       },
     ];
   }

@@ -37,7 +37,7 @@ export function splitAutoModelRoutingEvaluationModel(value: string): {
   return { provider: value.slice(0, colonIndex), modelId: value.slice(colonIndex + 1) };
 }
 
-/** `provider:model` whose provider ships an AI SDK `evaluationModel()` factory. */
+/** `provider:model` whose provider Xum can build an AI SDK decision model for. */
 export function isAutoModelRoutingEvaluationModel(value: string): boolean {
   return (
     isValidModelFormat(value) &&

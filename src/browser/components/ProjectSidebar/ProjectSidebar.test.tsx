@@ -564,6 +564,7 @@ function installProjectSidebarTestDoubles() {
     usesBrowserHistory: false,
     currentWorkspaceId: null,
     currentSettingsSection: null,
+    currentSettingsSectionless: false,
     currentProjectId: null,
     currentProjectPathFromState: null,
     pendingSectionId: null,
@@ -587,6 +588,7 @@ function installProjectSidebarTestDoubles() {
     setSecretsProjectPath: () => undefined,
     instructionsProjectPath: null,
     setInstructionsProjectPath: () => undefined,
+    openedWithoutSection: false,
   }));
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>

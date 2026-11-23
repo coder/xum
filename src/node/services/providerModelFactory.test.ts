@@ -11,7 +11,7 @@ import {
   type Tool,
 } from "ai";
 import type { GoogleVertexProviderSettings } from "@ai-sdk/google-vertex";
-import type { Experimental_EvaluationModelV4, SharedV4ProviderOptions } from "@ai-sdk/provider";
+import type { Experimental_DecisionModelV4, SharedV4ProviderOptions } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
 import { Cause, Effect, Exit, Option } from "effect";
@@ -36,6 +36,7 @@ import {
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { MAX_CREDENTIAL_FILE_BYTES } from "@/node/utils/providerRequirements";
@@ -1806,7 +1807,57 @@ describe("ProviderModelFactory Google Vertex AI", () => {
   });
 });
 
-describe("ProviderModelFactory native OpenAI alias tiers", () => {
+describe("ProviderModelFactory native OpenAI tiers", () => {
+  it("sends Codex Fast, Ultrafast, and Standard with the same OAuth credentials", async () => {
+    await withTempConfig(async (_config, factory, oauth, store) => {
+      const auth = {
+        type: "oauth" as const,
+        access: "test-access",
+        refresh: "test-refresh",
+        expires: Date.now() + 60_000,
+      };
+      store.saveProvidersConfig({ openai: { codexOauth: auth, serviceTier: "priority" } });
+      oauth.codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
+      oauth.codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("openai:gpt-6.2-astra");
+        if (!result.success) throw new Error(result.error.type);
+        for (const serviceTier of [undefined, "ultrafast", "default", "flex"] as const) {
+          await streamText({
+            model: result.data,
+            providerOptions: serviceTier == null ? undefined : { openai: { serviceTier } },
+            prompt: "hello",
+            maxRetries: 0,
+          }).consumeStream({ onError: () => undefined });
+        }
+        const luna = await factory.createModel("openai:gpt-6-luna");
+        if (!luna.success) throw new Error(luna.error.type);
+        await streamText({
+          model: luna.data,
+          providerOptions: { openai: { serviceTier: "ultrafast" } },
+          prompt: "hello",
+          maxRetries: 0,
+        }).consumeStream({ onError: () => undefined });
+        expect(calls.map((call) => parseSentBody(call).service_tier)).toEqual([
+          "priority",
+          "ultrafast",
+          undefined,
+          undefined,
+          undefined,
+        ]);
+        for (const call of calls) {
+          expect(call.url).toBe(CODEX_ENDPOINT);
+          expect(new Headers(call.init.headers).get("authorization")).toBe("Bearer test-access");
+          expect(parseSentBody(call).store).toBe(false);
+        }
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
   it.each(["responses", "chatCompletions"] as const)(
     "retains SDK tier gating for unmapped native models over %s",
     async (wireFormat) => {
@@ -2113,6 +2164,85 @@ describe("ProviderModelFactory Cyber access program", () => {
       }
     });
   });
+});
+
+describe("ProviderModelFactory Responses tool strict mode", () => {
+  // @ai-sdk/openai 4.0.77+ sends `strict: false` for a function tool without a strict
+  // mode; before, it omitted the key and OpenAI applied strict mode, which
+  // schemaSanitizer's nullable widening of optional properties is built for.
+  const inputSchema = jsonSchema<{ query: string }>({
+    type: "object",
+    properties: { query: { type: "string" } },
+    required: ["query"],
+  });
+  const codexAuth = {
+    type: "oauth" as const,
+    access: "test-access",
+    refresh: "test-refresh",
+    expires: Date.now() + 3_600_000,
+  };
+
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE", "META_BASE_URL");
+
+  it.each([
+    ["openai:gpt-5", "https://api.openai.com/v1/responses"],
+    ["codex:gpt-6.1-sol", CODEX_ENDPOINT],
+    ["responses-proxy:gpt-5", "https://proxy.example.com/v1/responses"],
+    ["meta:muse-wonder-1.0", "https://api.meta.ai/v1/responses"],
+  ])(
+    "omits strict for tools without a strict mode and keeps explicit ones via %s",
+    async (route, expectedUrl) => {
+      await withTempConfig(async (_config, factory, oauth, store) => {
+        const codex = route.startsWith("codex:");
+        store.saveProvidersConfig({
+          openai: codex
+            ? { codexOauth: codexAuth }
+            : { apiKey: "native-key", webSocketTransportEnabled: false },
+          "responses-proxy": {
+            providerType: "openai-responses",
+            baseUrl: "https://proxy.example.com/v1",
+            apiKey: "custom-key",
+          },
+          meta: { apiKey: "meta-key" },
+        });
+        if (codex) {
+          oauth.codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
+          oauth.codexOauthService.getValidAuth = () => Promise.resolve(Ok(codexAuth));
+        }
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel(route.replace(/^codex:/, "openai:"));
+          if (!result.success) throw new Error(result.error.type);
+          await generateText({
+            model: result.data,
+            prompt: "hello",
+            tools: {
+              unset: tool({ inputSchema }),
+              strictOn: tool({ inputSchema, strict: true }),
+              strictOff: tool({ inputSchema, strict: false }),
+            },
+            maxRetries: 0,
+          }).catch(() => undefined);
+          expect(calls.map((call) => call.url)).toEqual([expectedUrl]);
+          const tools = parseSentBody(calls[0]).tools as Array<Record<string, unknown>>;
+          expect(
+            tools.map((sent) => ({
+              name: sent.name,
+              hasStrict: "strict" in sent,
+              strict: sent.strict,
+            }))
+          ).toEqual([
+            { name: "unset", hasStrict: false, strict: undefined },
+            { name: "strictOn", hasStrict: true, strict: true },
+            { name: "strictOff", hasStrict: true, strict: false },
+          ]);
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
 });
 
 describe("ProviderModelFactory GPT-6 Chat Completions tool reasoning", () => {
@@ -2468,7 +2598,8 @@ describe("ProviderModelFactory Codex authentication", () => {
       });
 
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
-      let capturedApiKey: string | undefined;
+      // @ai-sdk/openai types apiKey as Resolvable<string>; the factory passes a string.
+      let capturedApiKey: unknown;
       PROVIDER_REGISTRY.openai = async () => {
         const module = await originalOpenAIRegistry();
         return {
@@ -3266,8 +3397,6 @@ describe("ProviderModelFactory GPT-6 Luna reasoning effort none", () => {
     ["gpt-6-luna", "none", "none"],
     ["gpt-6-luna-2026-09-22", "none", "none"],
     ["gpt-6-luna", "high", "high"],
-    // Astra genuinely rejects "none"; keep the SDK's gating for it.
-    ["gpt-6-astra", "none", undefined],
   ] as const;
   // The SDK gates effort on the raw wire ID, so on Chat Completions an opaque alias
   // mapped to Luna already keeps "none" (and so its tool calls) without the rewrite.
@@ -3322,6 +3451,47 @@ describe("ProviderModelFactory GPT-6 Luna reasoning effort none", () => {
       }
     );
   }
+
+  // Astra rejects "none". @ai-sdk/openai through 4.0.7x stripped it for every GPT-6
+  // id; 4.0.117 sends whatever effort it is given, so Xum's own path must never
+  // produce "none" for Astra: thinking "off" clamps to low before the request.
+  it.each(["responses", "chatCompletions"] as const)(
+    "sends gpt-6-astra thinking off as low, never none, over %s",
+    async (wireFormat) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: { apiKey: "native-key", wireFormat, webSocketTransportEnabled: false },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const modelString = "openai:gpt-6-astra";
+          const options = buildProviderOptions(
+            modelString,
+            enforceThinkingPolicy(modelString, "off")
+          );
+          if (!("openai" in options)) throw new Error("Astra must use the OpenAI namespace");
+          const result = await factory.createModel(modelString);
+          if (!result.success) throw new Error(result.error.type);
+          await generateText({
+            model: result.data,
+            prompt: "hello",
+            providerOptions: { openai: options.openai },
+            maxRetries: 0,
+          }).catch(() => undefined);
+          expect(calls).toHaveLength(1);
+          const body = parseSentBody(calls[0]);
+          const sentEffort =
+            wireFormat === "chatCompletions"
+              ? body.reasoning_effort
+              : (body.reasoning as { effort?: unknown } | undefined)?.effort;
+          expect(sentEffort).toBe("low");
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
 });
 
 describe("wrapFetchWithXAIServiceTier", () => {
@@ -4157,7 +4327,7 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
+  it("pins Codex OAuth tiers but drops them on non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, { additionalProviders: [{ name: "openai", type: "anthropic" }] });
       const auth = {
@@ -4172,7 +4342,7 @@ describe("ProviderModelFactory Coder", () => {
           serviceTier: "priority",
           codexOauth: auth,
           codexOauthDefaultAuth: "oauth",
-          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6.2-astra" }],
         },
       });
       await saveRoutePriority(config, ["direct"]);
@@ -4184,26 +4354,28 @@ describe("ProviderModelFactory Coder", () => {
       try {
         for (const model of [
           "openai:team-astra",
-          "openai:gpt-6-astra",
-          "coder:openai/gpt-6-astra",
+          "openai:gpt-6.2-astra",
+          "coder:openai/gpt-6.2-astra",
           "coder:google/gemini-3-pro",
         ]) {
           const result = await factory.createModelWithPinnedOptions(model, {
             providerOptions: { openai: { serviceTier: "priority" } },
           });
           if (!result.success) throw new Error(result.error.type);
-          expect(result.data.optionsMuxProviderOptions.openai?.serviceTier).toBeUndefined();
+          const isCodex = model.startsWith("openai:");
+          const configuredTier = isCodex ? "priority" : undefined;
+          expect(result.data.optionsMuxProviderOptions.openai?.serviceTier).toBe(configuredTier);
           const before = calls.length;
           await generateText({ model: result.data.model, prompt: "hello", maxRetries: 0 }).catch(
             () => undefined
           );
           expect(calls.length).toBe(before + 1);
-          if (model.startsWith("openai:")) {
+          if (isCodex) {
             expect(calls[before].url).toBe(CODEX_ENDPOINT);
             expect(parseSentBody(calls[before]).store).toBe(false);
             expect(hasLanguageModelCleanup(result.data.model)).toBe(false);
           }
-          expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
+          expect(parseSentBody(calls[before]).service_tier).toBe(configuredTier);
 
           const chat: { serviceTier?: ServiceTier } = {};
           const live = await factory.createModel(model, undefined, {
@@ -4225,7 +4397,9 @@ describe("ProviderModelFactory Coder", () => {
               expect(parseSentBody(calls[liveBefore]).model).toBe(
                 parseSentBody(calls[before]).model
               );
-              expect(parseSentBody(calls[liveBefore])).not.toHaveProperty("service_tier");
+              expect(parseSentBody(calls[liveBefore]).service_tier).toBe(
+                isCodex && tier !== "default" ? tier : undefined
+              );
             }
           }
         }
@@ -5744,12 +5918,12 @@ describe("withAnthropicEvaluationEffort", () => {
 
   it("defaults always-thinking models to low effort without overriding the caller", async () => {
     const seen: unknown[] = [];
-    const inner: Experimental_EvaluationModelV4 = {
+    const inner: Experimental_DecisionModelV4 = {
       specificationVersion: "v4",
       provider: "anthropic.messages",
       modelId: "claude-opus-5-5",
       supportedQuestionTypes: ["choice"],
-      doEvaluate: (options) => {
+      doDecide: (options) => {
         seen.push(options.providerOptions);
         return Promise.resolve({ answers: {}, warnings: [] });
       },
@@ -5757,13 +5931,13 @@ describe("withAnthropicEvaluationEffort", () => {
 
     expect(withAnthropicEvaluationEffort(inner, "claude-opus-5")).toBe(inner);
     const wrapped = withAnthropicEvaluationEffort(inner, "claude-opus-5-5");
-    await wrapped.doEvaluate({
-      state: "x",
+    await wrapped.doDecide({
+      state: [{ type: "text", text: "x" }],
       questions,
       providerOptions: { other: { keep: true } },
     });
-    await wrapped.doEvaluate({
-      state: "x",
+    await wrapped.doDecide({
+      state: [{ type: "text", text: "x" }],
       questions,
       providerOptions: { anthropic: { effort: "high" } },
     });
@@ -5795,14 +5969,17 @@ describe("withAnthropicEvaluationEffort", () => {
     );
     const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
     const evaluationModel = (modelId: string) =>
-      createAnthropic({ apiKey: "test", fetch: captureFetch }).evaluationModel(modelId);
+      createAnthropic({ apiKey: "test", fetch: captureFetch }).decisionModel(modelId);
 
     // Unwrapped, @ai-sdk/anthropic 4.0.67+ maps the evaluation's reasoning "none" to
     // `between_tools` on Sonnet 5.5. #5086 keeps evaluation calls on low adaptive
     // thinking, which the wrapper's explicit effort preserves.
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(
-      evaluationModel("claude-sonnet-5-5").doEvaluate({ state: "x", questions })
+      evaluationModel("claude-sonnet-5-5").doDecide({
+        state: [{ type: "text", text: "x" }],
+        questions,
+      })
     ).rejects.toThrow();
     expect(bodies[0].thinking).toEqual({ type: "between_tools" });
 
@@ -5810,8 +5987,8 @@ describe("withAnthropicEvaluationEffort", () => {
       bodies.length = 0;
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
       await expect(
-        withAnthropicEvaluationEffort(evaluationModel(modelId), modelId).doEvaluate({
-          state: "x",
+        withAnthropicEvaluationEffort(evaluationModel(modelId), modelId).doDecide({
+          state: [{ type: "text", text: "x" }],
           questions,
         })
       ).rejects.toThrow();
@@ -5845,7 +6022,7 @@ describe("withAnthropicEvaluationEffort billed usage (#4728)", () => {
     );
     const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
     const model = withAnthropicEvaluationEffort(
-      createAnthropic({ apiKey: "test", fetch: answerFetch }).evaluationModel("claude-opus-5-5"),
+      createAnthropic({ apiKey: "test", fetch: answerFetch }).decisionModel("claude-opus-5-5"),
       "claude-opus-5-5"
     );
     const exit = await Effect.runPromiseExit(
@@ -5957,7 +6134,7 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
         async (_config, factory, fetchSpy) => {
           const pinned = expectResolved(await factory.createEvaluationModel(modelString));
           expect(pinned.model.specificationVersion).toBe("v4");
-          expect(typeof pinned.model.doEvaluate).toBe("function");
+          expect(typeof pinned.model.doDecide).toBe("function");
           expect(pinned.model.provider.startsWith(providerName)).toBe(true);
           expect(pinned.model.modelId).toBe(modelString.slice(modelString.indexOf(":") + 1));
           expect(pinned.routeKind).toBe("direct");
@@ -6037,13 +6214,20 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     }
   );
 
+  // The paths also pin the chat APIs: @ai-sdk/openai and @ai-sdk/google route
+  // `.evaluationModel()` to `/decisions` endpoints that serve no gpt-*/gemini-* model.
   it.each([
-    ["anthropic", "anthropic:claude-haiku-4-5", "api.anthropic.com"],
-    ["openai", "openai:gpt-5-mini", "api.openai.com"],
-    ["google", "google:gemini-2.5-flash", "generativelanguage.googleapis.com"],
+    ["anthropic", "anthropic:claude-haiku-4-5", "api.anthropic.com", "/v1/messages"],
+    ["openai", "openai:gpt-5-mini", "api.openai.com", "/v1/responses"],
+    [
+      "google",
+      "google:gemini-2.5-flash",
+      "generativelanguage.googleapis.com",
+      "/v1beta/models/gemini-2.5-flash:generateContent",
+    ],
   ] as const)(
     "sends %s requests to the provider default when the configured base URL is blank and no env proxy exists",
-    async (provider, modelString, defaultHost) => {
+    async (provider, modelString, defaultHost, chatPath) => {
       // Regression: the blank `baseURL` property used to survive the config
       // spread into the SDK settings, so requests targeted "  /v1/…".
       await withEvaluationFixture(
@@ -6061,8 +6245,8 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
             )
           );
           await pinned.model
-            .doEvaluate({
-              state: "hello",
+            .doDecide({
+              state: [{ type: "text", text: "hello" }],
               questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
             })
             .then(
@@ -6070,7 +6254,56 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
               () => undefined
             );
           expect(urls).toHaveLength(1);
-          expect(new URL(urls[0] ?? "").host).toBe(defaultHost);
+          const url = new URL(urls[0] ?? "");
+          expect({ host: url.host, path: url.pathname }).toEqual({
+            host: defaultHost,
+            path: chatPath,
+          });
+        }
+      );
+    }
+  );
+
+  // @ai-sdk/google maps the adapter's reasoning "none" to thinkingLevel "minimal",
+  // which Gemini 4 models reject; older Gemini models keep the SDK mapping.
+  it.each([
+    ["google:gemini-4-neon", "low"],
+    ["google:gemini-4-carbon", "low"],
+    ["google:gemini-3-flash", "minimal"],
+  ] as const)(
+    "sends %s evaluation requests with thinkingLevel %s",
+    async (modelString, expectedLevel) => {
+      await withEvaluationFixture(
+        { google: { apiKey: "k-key" } },
+        async (_c, factory, fetchSpy) => {
+          const pinned = expectResolved(await factory.createEvaluationModel(modelString));
+          const bodies: unknown[] = [];
+          fetchSpy.mockImplementation(
+            Object.assign(
+              (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+                bodies.push(JSON.parse(typeof init?.body === "string" ? init.body : "null"));
+                return Promise.reject(new Error("captured"));
+              },
+              { preconnect: () => undefined }
+            )
+          );
+          await pinned.model
+            .doDecide({
+              state: [{ type: "text", text: "hello" }],
+              questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+              // A caller's other thinkingConfig fields must not drop the "low" default.
+              providerOptions: { google: { thinkingConfig: { includeThoughts: true } } },
+            })
+            .then(
+              () => undefined,
+              () => undefined
+            );
+          expect(bodies).toHaveLength(1);
+          expect(bodies[0]).toMatchObject({
+            generationConfig: {
+              thinkingConfig: { thinkingLevel: expectedLevel, includeThoughts: true },
+            },
+          });
         }
       );
     }
@@ -6191,7 +6424,7 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
       { typesafe: { apiKey: "ts-key" } },
       async (_c, factory, fetchSpy) => {
         const pinned = expectResolved(await factory.createEvaluationModel("typesafe:jev-latest"));
-        expect(pinned.model.provider).toBe("typesafe.evaluation");
+        expect(pinned.model.provider).toBe("typesafe.decision");
         expect(pinned.model.modelId).toBe("jev-latest");
         expect(pinned.wireProviderName).toBe("typesafe");
         expect(pinned.routeKind).toBe("direct");
@@ -6224,8 +6457,8 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
           )
         );
         await pinned.model
-          .doEvaluate({
-            state: "hello",
+          .doDecide({
+            state: [{ type: "text", text: "hello" }],
             questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
           })
           .then(
@@ -6255,8 +6488,8 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
         )
       );
       await pinned.model
-        .doEvaluate({
-          state: "hello",
+        .doDecide({
+          state: [{ type: "text", text: "hello" }],
           questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
         })
         .then(

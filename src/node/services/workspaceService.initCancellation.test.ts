@@ -166,7 +166,7 @@ describe("WorkspaceService init cancellation", () => {
 
     expect(result).toEqual(
       Err(
-        "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
+        "This project must be trusted before creating workspaces. Trust the project in Settings → Project trust, or create a workspace from the project page."
       )
     );
     expect(generateStableId).not.toHaveBeenCalled();

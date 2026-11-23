@@ -400,11 +400,16 @@ describe("workspaceHasNewLayoutIssueAtTurnEnd", () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  /** Writes and publishes a page. By default it was edited after its publish, a minute ago. */
+  /**
+   * Writes and publishes a page. By default it was edited after its publish, a minute ago, at a
+   * time with a millisecond part. A whole-second time reads as a remote runtime's listing, which
+   * isModifiedSince compares by the second, so a page an audit settled a millisecond after its
+   * edit would still be due: a default taken from Date.now() hit that one run in 1000.
+   */
   const publishedPage = async (
     name: string,
     publishedAtMs = Date.now() - 60_000,
-    modifiedMs = publishedAtMs + 1_000
+    modifiedMs = Math.floor((publishedAtMs + 1_000) / 1000) * 1000 + 500
   ) => {
     const file = path.join(artifactsDir, name);
     await fs.writeFile(file, "<h1>hi</h1>");

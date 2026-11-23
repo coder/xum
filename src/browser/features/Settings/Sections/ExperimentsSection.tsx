@@ -1,4 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { SettingsAnchor, SettingsOpenSettingContext } from "../Components/SettingsLayout";
+import { experimentAnchorId } from "../settingsRegistry";
 import { AlertTriangle, Info } from "lucide-react";
 import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
@@ -25,28 +27,27 @@ import { Input } from "@/browser/components/Input/Input";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
-import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
-import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
-import { MemoryDreamCostCeilingSetting } from "./MemoryDreamCostCeilingSetting";
-import { MemoryDreamEditLimitSetting } from "./MemoryDreamEditLimitSetting";
-import { MemoryDreamRunTimeoutSetting } from "./MemoryDreamRunTimeoutSetting";
+import { useOptionalSettings } from "@/browser/contexts/SettingsContext";
+import {
+  SETTINGS_SECTION_META,
+  SETTING_DEFINITIONS,
+  subExperimentsOf,
+  type SettingId,
+} from "../settingsRegistry";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
 // Sub-experiments of Agent Memory: hidden from the flat list and rendered in a
 // nested panel under the parent toggle, since they are no-ops while memory is off.
-const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.MEMORY_CONSOLIDATION];
+const MEMORY_SUB_EXPERIMENT_IDS = subExperimentsOf(EXPERIMENT_IDS.MEMORY);
 
 // Sub-experiments of Programmatic Tool Calling: same nesting treatment — RLM
 // mode is a no-op while PTC is off (code_execution is never assembled).
-const PTC_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.RLM];
+const PTC_SUB_EXPERIMENT_IDS = subExperimentsOf(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
 
 // Sub-experiments of Artifacts: the Agent interface view shows an artifact, so it is a no-op
 // while Artifacts is off.
-const ARTIFACTS_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
-  EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
-  EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
-];
+const ARTIFACTS_SUB_EXPERIMENT_IDS = subExperimentsOf(EXPERIMENT_IDS.ARTIFACTS);
 
 // Every sub-experiment: hidden from the flat list, since each renders under its parent row.
 const NESTED_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
@@ -62,6 +63,8 @@ interface ExperimentRowProps {
   disabled?: boolean;
   availabilityMessage?: string | null;
   onToggle?: (enabled: boolean) => void;
+  /** Beside the switch: the button that opens this experiment's options (ExperimentConfigButton). */
+  action?: React.ReactNode;
 }
 
 function ExperimentRow(props: ExperimentRowProps) {
@@ -86,7 +89,11 @@ function ExperimentRow(props: ExperimentRowProps) {
   );
 
   return (
-    <div className="flex items-center justify-between py-3">
+    // Anchored so a settings search result for this experiment scrolls to it.
+    <SettingsAnchor
+      id={experimentAnchorId(experimentId)}
+      className="-mx-2 flex items-center justify-between rounded-md px-2 py-3"
+    >
       <div className="flex-1 pr-4">
         <div className="text-foreground text-sm font-medium">{props.name}</div>
         <div className="text-muted mt-0.5 text-xs">{props.description}</div>
@@ -97,14 +104,17 @@ function ExperimentRow(props: ExperimentRowProps) {
           </div>
         )}
       </div>
-      <Switch
-        checked={enabled}
-        disabled={disabled}
-        onCheckedChange={handleToggle}
-        aria-label={`Toggle ${props.name}`}
-        title={availabilityMessage ?? undefined}
-      />
-    </div>
+      <div className="flex shrink-0 items-center gap-3">
+        {props.action}
+        <Switch
+          checked={enabled}
+          disabled={disabled}
+          onCheckedChange={handleToggle}
+          aria-label={`Toggle ${props.name}`}
+          title={availabilityMessage ?? undefined}
+        />
+      </div>
+    </SettingsAnchor>
   );
 }
 
@@ -268,6 +278,8 @@ export function PortableDesktopExperimentWarning() {
   );
 }
 
+// The LAN/VPN bind controls render in Settings → Server access (LanAccessGroup), not here. They
+// stay in this file so the component keeps its history.
 const TAILSCALE_BIND_HOST_MODE_PREFIX = "tailscale:";
 
 type BindHostMode =
@@ -295,7 +307,7 @@ function formatTailscaleBindHostLabel(host: ApiServerStatus["tailscaleBindHosts"
   return `Tailscale ${host.interfaceName} (${host.address}, ${protocol})`;
 }
 
-function ConfigurableBindUrlControls() {
+export function ConfigurableBindUrlControls() {
   const enabled = useExperimentValue(EXPERIMENT_IDS.CONFIGURABLE_BIND_URL);
   const { api } = useAPI();
 
@@ -700,6 +712,49 @@ function ConfigurableBindUrlControls() {
   );
 }
 
+/**
+ * Experiments only turns features on and off. Options of an enabled experiment live in the
+ * section they belong to; this row links there.
+ */
+// The first control of each experiment's moved configuration: the link scrolls to it, since it
+// can sit far down its section (Auto routing is below the model lists).
+const EXPERIMENT_CONFIG_SETTINGS: Partial<Record<ExperimentId, SettingId>> = {
+  [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: "lan-bind",
+  [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: "dream-cost-ceiling",
+  [EXPERIMENT_IDS.ARTIFACTS]: "artifacts-cdn",
+  [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: "auto-routing",
+};
+
+/**
+ * Opens the section that holds an enabled experiment's options, shown beside its switch. The
+ * section's own nav icon says where it goes. A narrow section (a phone) shows the icon alone,
+ * by container width rather than viewport, and the name stays the button's accessible name.
+ */
+function ExperimentConfigButton(props: { experimentId: ExperimentId }) {
+  const enabled = useExperimentValue(props.experimentId);
+  const settings = useOptionalSettings();
+  const openSetting = useContext(SettingsOpenSettingContext);
+  const settingId = EXPERIMENT_CONFIG_SETTINGS[props.experimentId];
+  if (!enabled || !settingId) return null;
+  const sectionId = SETTING_DEFINITIONS[settingId].section;
+  const section = SETTINGS_SECTION_META.find((meta) => meta.id === sectionId);
+  // Outside the page (a lone section story) there is no row focus to hand over: open the section.
+  if (!section || (!openSetting && !settings)) return null;
+  const open = () => (openSetting ? openSetting(settingId) : settings?.setActiveSection(sectionId));
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={open}
+      aria-label={`Configure in ${section.label}`}
+      className="text-content-secondary hover:text-content-primary gap-1.5 @max-md:px-2"
+    >
+      {section.icon}
+      <span className="@max-md:hidden">{section.label}</span>
+    </Button>
+  );
+}
+
 interface ExperimentSettingsPanelProps {
   children: React.ReactNode;
 }
@@ -732,6 +787,7 @@ function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
             experimentId={subId}
             name={subExp.name}
             description={subExp.description}
+            action={<ExperimentConfigButton experimentId={subId} />}
           />
         );
       })}
@@ -742,9 +798,7 @@ function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
 export function ExperimentsSection() {
   const allExperiments = getExperimentList();
   const { api } = useAPI();
-  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const memoryConsolidationEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   const artifactsSubExperimentIds = visibleArtifactsSubExperimentIds(
@@ -776,7 +830,8 @@ export function ExperimentsSection() {
   );
 
   return (
-    <div className="space-y-2">
+    // A container, so each row's configure button can drop its label at a narrow width.
+    <div className="@container space-y-2">
       <p className="text-muted mb-4 text-xs">
         Experimental features that are still in development. Enable at your own risk.
       </p>
@@ -800,20 +855,11 @@ export function ExperimentsSection() {
                     ? handleConfigurableBindUrlToggle
                     : undefined
                 }
+                action={<ExperimentConfigButton experimentId={exp.id} />}
               />
-              {exp.id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && autoModelRoutingEnabled && (
-                <AutoModelRoutingExperimentConfig />
-              )}
               {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
                 <ExperimentSettingsPanel>
                   <SubExperimentRows experimentIds={MEMORY_SUB_EXPERIMENT_IDS} />
-                  {memoryConsolidationEnabled && (
-                    <>
-                      <MemoryDreamCostCeilingSetting />
-                      <MemoryDreamEditLimitSetting />
-                      <MemoryDreamRunTimeoutSetting />
-                    </>
-                  )}
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING && ptcEnabled && (
@@ -822,15 +868,11 @@ export function ExperimentsSection() {
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.ARTIFACTS && artifactsEnabled && (
-                <>
-                  <ArtifactsExperimentConfig />
-                  <ExperimentSettingsPanel>
-                    <SubExperimentRows experimentIds={artifactsSubExperimentIds} />
-                  </ExperimentSettingsPanel>
-                </>
+                <ExperimentSettingsPanel>
+                  <SubExperimentRows experimentIds={artifactsSubExperimentIds} />
+                </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}
-              {exp.id === EXPERIMENT_IDS.CONFIGURABLE_BIND_URL && <ConfigurableBindUrlControls />}
             </React.Fragment>
           );
         })}

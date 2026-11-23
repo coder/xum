@@ -1,4 +1,8 @@
 import React, { useEffect, useState } from "react";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { cn } from "@/common/lib/utils";
+import { SETTINGS_GROUP_HEADING_CLASS, SettingsAnchor } from "../Components/SettingsLayout";
 import { ArrowDown, ArrowUp, Loader2, Plus, RotateCcw, Trash2, X } from "lucide-react";
 
 import { Button } from "@/browser/components/Button/Button";
@@ -510,5 +514,25 @@ export function AutoModelRoutingExperimentConfig() {
         ) : null}
       </div>
     </div>
+  );
+}
+
+/**
+ * Models → Auto routing: the evaluation model and difficulty tiers, shown while the Auto model
+ * routing experiment is on. Moved from under its row in Experiments, which now only turns it on.
+ */
+export function AutoModelRoutingGroup() {
+  const enabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  if (!enabled) return null;
+  return (
+    <section className="space-y-2">
+      <h3 className={cn(SETTINGS_GROUP_HEADING_CLASS, "px-1")}>Auto routing</h3>
+      <SettingsAnchor
+        id="auto-routing"
+        className="border-border-light overflow-hidden rounded-lg border"
+      >
+        <AutoModelRoutingExperimentConfig />
+      </SettingsAnchor>
+    </section>
   );
 }

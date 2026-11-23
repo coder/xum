@@ -374,14 +374,14 @@ describe("the Electron zip wiring", () => {
   const BASH_FLAG = '${ELECTRON_ZIP_DIR:+-c.electronDist="$ELECTRON_ZIP_DIR"}';
   const DIRECT_CALLS: Record<string, string[]> = {
     "_desktop-release.yml#build-linux": [
-      `bun x electron-builder --linux --publish always ${BASH_FLAG}`,
+      `bun x electron-builder --linux --publish never ${BASH_FLAG}`,
     ],
     "_desktop-release.yml#build-linux-arm64": [
       `bun x electron-builder --linux --arm64 --publish never ${BASH_FLAG}`,
     ],
     "_desktop-release.yml#build-windows": [
       '$extra = @("-c.electronDist=$env:ELECTRON_ZIP_DIR")',
-      "bun x electron-builder --win --publish always @extra",
+      "bun x electron-builder --win --publish never @extra",
     ],
   };
 
@@ -417,6 +417,8 @@ describe("make dist-*: the zip directory reaches every electron-builder call", (
     ["dist-mac", 3],
     ["dist-mac-x64", 1],
     ["dist-mac-arm64", 1],
+    ["dist-mac-app-x64", 1],
+    ["dist-mac-app-arm64", 1],
     ["dist-win", 1],
     ["dist-linux", 1],
     ["dist-linux-arm64", 1],

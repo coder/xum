@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useId, useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
+import { AutoModelRoutingGroup } from "./AutoModelRoutingExperimentConfig";
 import { ArrowRight, ChevronDown, Info, Loader2, Plus, Search } from "lucide-react";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { Button } from "@/browser/components/Button/Button";
@@ -716,6 +718,7 @@ export function ModelsSection() {
   return (
     <div className="space-y-4">
       <div className="relative">
+        <SettingsMark id="models-filter" />
         <Search
           aria-hidden
           className="text-muted pointer-events-none absolute top-2 left-2 h-3.5 w-3.5"
@@ -743,6 +746,7 @@ export function ModelsSection() {
 
       {/* Custom Models */}
       <div className="space-y-3">
+        <SettingsMark id="custom-models" />
         <div className="text-muted text-xs font-medium tracking-wide uppercase">Custom Models</div>
 
         {/* Add new model form - styled to match table */}
@@ -1051,6 +1055,7 @@ export function ModelsSection() {
 
       {/* Built-in Models */}
       <div className="space-y-3">
+        <SettingsMark id="built-in-models" />
         <div className="text-muted text-xs font-medium tracking-wide uppercase">
           Built-in Models
         </div>
@@ -1103,9 +1108,15 @@ export function ModelsSection() {
         )}
       </div>
 
-      <ModelFallbacksEditor />
+      <div>
+        <SettingsMark id="model-fallbacks" />
+        <ModelFallbacksEditor />
+      </div>
 
-      <ModelClassesEditor />
+      <div>
+        <SettingsMark id="model-classes" />
+        <ModelClassesEditor />
+      </div>
 
       <div className="border-border-medium bg-background-secondary/40 text-muted rounded-md border px-3 py-2.5 text-xs">
         <div className="flex items-start gap-2">
@@ -1162,6 +1173,8 @@ export function ModelsSection() {
           </p>
         </div>
       </div>
+
+      <AutoModelRoutingGroup />
     </div>
   );
 }
