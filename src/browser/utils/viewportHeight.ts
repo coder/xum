@@ -52,6 +52,39 @@ function installVisualViewportHeightFix(): () => void {
 }
 
 /**
+ * Calls the callback when the layout viewport's size actually changes: a fixed box spanning the
+ * viewport resizes once the new layout exists. A display change can settle its real layout a few
+ * frames after its last resize event with no event of its own, so an event-time re-read misses it
+ * and this catches the settle. The keyboard does not resize the box while a pinned viewport height
+ * holds the layout, and callers re-read nothing but their own state on a fire.
+ *
+ * Returns a remover that disconnects the observer and drops the box. Startup must never fail on
+ * the probe: with no ResizeObserver, or when observing throws, it removes the box and returns a
+ * remover that only does that cleanup, after one console.error.
+ */
+export function observeLayoutViewportSize(callback: () => void, label: string): () => void {
+  const box = document.createElement("div");
+  box.setAttribute("aria-hidden", "true");
+  box.style.cssText = "position:fixed;inset:0;visibility:hidden;pointer-events:none;z-index:-1";
+  let observer: ResizeObserver | undefined;
+  try {
+    document.body.appendChild(box);
+    if (typeof window.ResizeObserver === "function") {
+      observer = new window.ResizeObserver(callback);
+      observer.observe(box);
+    }
+  } catch (error) {
+    console.error(`${label}: could not observe the viewport`, error);
+    observer?.disconnect();
+    box.remove();
+  }
+  return () => {
+    observer?.disconnect();
+    box.remove();
+  };
+}
+
+/**
  * Size the app shell from the visual viewport on iOS home-screen web apps, where iOS 26 can
  * resolve 100dvh as if a browser toolbar were still present and leave a blank band under
  * the footer, and the keyboard resizes nothing else. Other environments keep the CSS dvh
@@ -71,33 +104,18 @@ export function installViewportHeightSync(): () => void {
   // Turning an iPad from landscape to portrait can fire resize while innerHeight still holds the
   // landscape height, and no later resize follows, so the app kept filling only the old height.
   // Folding the iPhone Duo does the same once iosCoverColumn.ts has taken the cover display's
-  // column back, and its height arrives about three frames later, so a next-frame re-read misses it.
-  // A fixed box spanning the viewport resizes once the new layout exists; sync again then.
-  const viewportBox = document.createElement("div");
-  viewportBox.setAttribute("aria-hidden", "true");
-  viewportBox.style.cssText =
-    "position:fixed;inset:0;visibility:hidden;pointer-events:none;z-index:-1";
-  let observer: ResizeObserver | undefined;
-  try {
-    document.body.appendChild(viewportBox);
-    if (typeof window.ResizeObserver === "function") {
-      observer = new window.ResizeObserver(syncViewportHeight);
-      observer.observe(viewportBox);
-    }
-  } catch (error) {
-    // main.tsx calls this before React mounts, and startup must never fail on the probe:
-    // keep the resize listener alone.
-    console.error("Viewport height sync: could not observe the viewport", error);
-    observer?.disconnect();
-    viewportBox.remove();
-  }
+  // column back, and its height arrives about three frames later, so a next-frame re-read misses
+  // it. The viewport box above syncs again once the new layout exists.
+  const removeLayoutObserver = observeLayoutViewportSize(
+    syncViewportHeight,
+    "Viewport height sync"
+  );
 
   return () => {
     window.removeEventListener("resize", syncViewportHeight);
     window.visualViewport?.removeEventListener("resize", syncViewportHeight);
     window.visualViewport?.removeEventListener("scroll", syncViewportHeight);
-    observer?.disconnect();
-    viewportBox.remove();
+    removeLayoutObserver();
     document.documentElement.style.removeProperty(APP_VIEWPORT_HEIGHT_PROPERTY);
     removeVisualViewportHeightFix();
   };
