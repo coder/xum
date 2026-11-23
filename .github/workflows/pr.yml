@@ -82,7 +82,7 @@ jobs:
               - 'tests/fixtures/**'
               - 'tests/run/**'
               - 'jest.config.js'
-              - 'babel.config.cjs'
+              - 'babel.config.js'
               - 'scripts/lib/worker_budget.js'
             browser:
               - 'src/browser/**'
@@ -98,13 +98,12 @@ jobs:
               # Playwright-config-only change and test-e2e never runs.
               - 'playwright.config.ts'
               - 'bunfig.toml'
-              - 'babel.config.cjs'
+              - 'babel.config.js'
               - 'package.json'
               - 'bun.lock'
               - 'tsconfig*.json'
               - 'vite*.ts'
               - 'Makefile'
-              - 'electron-builder.yml'
               # The entitlements that Sign / macOS gives the app.
               - 'build/**'
               # Pixel's default matrix and the Storybook config decide which snapshots exist,

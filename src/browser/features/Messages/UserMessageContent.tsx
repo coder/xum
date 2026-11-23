@@ -300,7 +300,7 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
             >
               <FileText className="h-4 w-4 shrink-0" />
               <span className="truncate">{attachment.filename}</span>
-              <span className="text-[var(--color-text-muted)]">{attachment.sizeLabel}</span>
+              <span className="text-muted">{attachment.sizeLabel}</span>
             </button>
           ))}
         </div>

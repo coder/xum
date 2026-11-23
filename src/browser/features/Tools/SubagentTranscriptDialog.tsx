@@ -37,7 +37,7 @@ export const SubagentTranscriptDialog: React.FC<SubagentTranscriptDialogProps> =
           <DialogTitle className="flex flex-col gap-1">
             <div className="flex items-center gap-2">
               <span>Transcript</span>
-              <code className="rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 font-mono text-[10px]">
+              <code className="bg-surface-tertiary rounded px-1.5 py-0.5 font-mono text-[10px]">
                 {props.taskId}
               </code>
             </div>
@@ -46,7 +46,7 @@ export const SubagentTranscriptDialog: React.FC<SubagentTranscriptDialogProps> =
               <div className="text-muted flex flex-wrap items-baseline gap-2 text-[11px] font-normal">
                 {model && <ModelDisplay modelString={model} />}
                 {thinkingLevel && (
-                  <span className="inline-flex items-center rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 font-mono text-[10px] leading-none">
+                  <span className="bg-surface-tertiary inline-flex items-center rounded px-1.5 py-0.5 font-mono text-[10px] leading-none">
                     thinking: {thinkingLevel}
                   </span>
                 )}
@@ -176,7 +176,7 @@ const SubagentTranscriptViewer: React.FC<{
     <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
       {error && <ErrorBox>{error}</ErrorBox>}
 
-      <div className="min-h-0 flex-1 overflow-y-auto rounded bg-[var(--color-bg-secondary)] p-3">
+      <div className="bg-background-secondary min-h-0 flex-1 overflow-y-auto rounded p-3">
         {isLoading ? (
           <div className="text-muted text-[11px] italic">
             Loading transcript

@@ -12,7 +12,7 @@ export interface ToolsConfigCarrier {
 
 function toolMatchesPatterns(toolName: string, patterns: readonly string[]): boolean {
   for (const pattern of patterns) {
-    const regex = new RegExp(`^${pattern}$`);
+    const regex = new RegExp(`^(?:${pattern})$`);
     if (regex.test(toolName)) {
       return true;
     }

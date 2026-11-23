@@ -3,6 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import * as path from "node:path";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { Config } from "@/node/config";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 
 type RunSessionRootEnv = Readonly<Record<string, string | undefined>>;
 
@@ -118,7 +119,7 @@ export async function prepareRunSessionRootOverride(
   realConfigRoot: string,
   options: RunSessionRootPreparationOptions = {}
 ): Promise<PreparedRunSessionRoot | undefined> {
-  const envSessionRoot = (env.XUM_RUN_SESSION_ROOT ?? env.MUX_RUN_SESSION_ROOT)?.trim();
+  const envSessionRoot = resolveXumEnvironmentValue("RUN_SESSION_ROOT", env)?.trim();
   if (!envSessionRoot) {
     return undefined;
   }

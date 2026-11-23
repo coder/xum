@@ -1657,9 +1657,6 @@ html[data-renderer-inactive] *::after {
 .titlebar-safe-left-gutter-4 {
   --titlebar-safe-left-gutter: 1rem;
 } /* px-4 */
-.titlebar-safe-right-gutter-3 {
-  --titlebar-safe-right-gutter: 0.75rem;
-} /* px-3 */
 .titlebar-safe-right-gutter-2 {
   --titlebar-safe-right-gutter: 0.5rem;
 } /* px-2 */

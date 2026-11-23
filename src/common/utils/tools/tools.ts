@@ -980,9 +980,6 @@ function toolAllowlistOptions(
     enableReviewPane: !config.enableAgentReport && !config.scratchWorkspace,
     // Scratch sub-agents share the chat's folder and never produce patches.
     enableGitPatches: !config.scratchWorkspace,
-    // Xum global tools are always created; tool policy (agent frontmatter)
-    // controls which agents can actually use them.
-    enableMuxGlobalAgentsTools: true,
   };
 }
 

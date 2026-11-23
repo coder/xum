@@ -891,7 +891,3 @@ export function subExperimentsOf(parent: ExperimentId): readonly ExperimentId[] 
 export const experimentAnchorId = (experimentId: string) => `experiment:${experimentId}`;
 export const keybindAnchorId = (keybindId: string) => `keybind:${keybindId}`;
 export const providerAnchorId = (provider: string) => `provider:${provider}`;
-
-export function getSettingDefinition(id: SettingId): SettingDefinition {
-  return SETTING_DEFINITIONS[id];
-}

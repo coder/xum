@@ -249,7 +249,7 @@ async function main(): Promise<void> {
 
     if (serverInfo.networkBaseUrls.length > 0) {
       console.log(`\n  # Connect from another machine:`);
-      console.log(`  export MUX_SERVER_URL=${remoteUrl}`);
+      console.log(`  export XUM_SERVER_URL=${remoteUrl}`);
     }
 
     // Avoid logging user-supplied long-lived credentials by default.
@@ -260,7 +260,7 @@ async function main(): Promise<void> {
       const shellToken = `'${resolved.token.replace(/'/g, "'\\''")}'`;
       const urlToken = encodeURIComponent(resolved.token);
 
-      console.log(`  export MUX_SERVER_AUTH_TOKEN=${shellToken}`);
+      console.log(`  export XUM_SERVER_AUTH_TOKEN=${shellToken}`);
       console.log(`\n  # Open in browser:`);
       console.log(`  ${remoteUrl}/?token=${urlToken}`);
     } else {
@@ -345,7 +345,7 @@ async function main(): Promise<void> {
       ? {
           supported: false as const,
           reason:
-            "Server updates require a stable auth token: set MUX_SERVER_AUTH_TOKEN or pass --auth-token",
+            "Server updates require a stable auth token: set XUM_SERVER_AUTH_TOKEN or pass --auth-token",
         }
       : resolveInstallLayout(process.env, process.argv);
   await serviceContainer.updateService.enableServerUpdater(updateLayout, {

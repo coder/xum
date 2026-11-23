@@ -111,9 +111,7 @@ export const ChatAttachments: React.FC<ChatAttachmentsProps> = (props) => {
             <FileText className="h-4 w-4 shrink-0 text-[var(--color-subtle)]" />
             <span className="min-w-0 truncate text-xs text-[var(--color-subtle)]">
               {label}
-              {detail ? (
-                <span className="ml-1 text-[var(--color-text-muted)]">{detail}</span>
-              ) : null}
+              {detail ? <span className="text-muted ml-1">{detail}</span> : null}
             </span>
             {handleRemove && (
               <button

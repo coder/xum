@@ -564,7 +564,7 @@ const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string 
         </span>
       )}
       {props.thinkingLevel != null && (
-        <span className="rounded bg-[var(--color-bg-tertiary)] px-1 py-0.5 font-mono leading-none">
+        <span className="bg-surface-tertiary rounded px-1 py-0.5 font-mono leading-none">
           thinking:{" "}
           <ThinkingLevelLabel level={props.thinkingLevel} modelString={props.modelString} />
         </span>
@@ -2025,8 +2025,6 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
   );
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// LEGACY TASK TERMINATE TOOL CALL
 // ═══════════════════════════════════════════════════════════════════════════════
 // TASK TERMINATE TOOL CALL
 // ═══════════════════════════════════════════════════════════════════════════════

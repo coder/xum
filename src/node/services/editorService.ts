@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "child_process";
+import { spawn } from "child_process";
 import * as fsPromises from "fs/promises";
 import type { Config } from "@/node/config";
 import type { WorkspaceService } from "@/node/services/workspaceService";
@@ -6,6 +6,7 @@ import { isDockerRuntime, isSSHRuntime, isDevcontainerRuntime } from "@/common/t
 import { log } from "@/node/services/log";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
 import { getErrorMessage } from "@/common/utils/errors";
+import { findExecutableOnPath } from "@/node/utils/findExecutableOnPath";
 
 /**
  * Quote a string for safe use in shell commands.
@@ -174,9 +175,7 @@ export class EditorService {
         return true;
       }
 
-      const lookupCommand = process.platform === "win32" ? "where" : "which";
-      const result = spawnSync(lookupCommand, [command], { encoding: "utf8" });
-      return result.status === 0;
+      return findExecutableOnPath(command) !== null;
     } catch {
       return false;
     }

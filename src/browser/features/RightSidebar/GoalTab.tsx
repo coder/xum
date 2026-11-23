@@ -1170,19 +1170,19 @@ function GoalCreateForm(props: GoalCreateFormProps) {
       </div>
 
       {props.workspaceId != null && (
-        <div className="text-muted -mt-1 flex items-center justify-between text-[11px]">
-          <span>
+        <div className="text-muted -mt-1 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px]">
+          <span className="min-w-0">
             {defaults.alwaysRequireExplicitBudget
               ? "Leave Budget / Turn cap blank to use the defaults shown above."
               : "Leave Budget blank to create an unbudgeted goal; Turn cap blank uses the default shown above."}
           </span>
           <button
             type="button"
-            className="hover:text-foreground inline-flex items-center gap-1 underline"
+            className="hover:text-foreground inline-flex shrink-0 items-center gap-1 whitespace-nowrap underline"
             aria-label="Change goal defaults"
             onClick={() => setIsDefaultsModalOpen(true)}
           >
-            <Settings2 className="h-3 w-3" aria-hidden="true" />
+            <Settings2 className="h-3 w-3 shrink-0" aria-hidden="true" />
             Change defaults
           </button>
         </div>

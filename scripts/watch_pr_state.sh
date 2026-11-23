@@ -62,9 +62,11 @@ finish() {
   trap - EXIT
   rm -f "${RESPONSE_FILE:-}" "${JQ_ERR_FILE:-}"
   local line="RESULT $1" i
-  for i in "${!PRS[@]}"; do
-    line+=" ${PRS[i]}:${FINAL[i]:-${STATE[i]:-unread}}"
-  done
+  if ((${#PRS[@]} > 0)); then
+    for i in "${!PRS[@]}"; do
+      line+=" ${PRS[i]}:${FINAL[i]:-${STATE[i]:-unread}}"
+    done
+  fi
   echo "$line"
   exit "$2"
 }
@@ -86,7 +88,7 @@ while (($#)); do
       ;;
     *)
       [[ $1 =~ ^[1-9][0-9]*$ ]] || usage_error "Not a PR number or flag: '$1'"
-      for pr in "${PRS[@]}"; do
+      for pr in ${PRS[@]+"${PRS[@]}"}; do
         [[ $pr != "$1" ]] || usage_error "PR #$1 is listed twice"
       done
       PRS+=("$1")

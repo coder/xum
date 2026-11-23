@@ -4,7 +4,7 @@
  */
 
 import * as fs from "fs/promises";
-import { spawnSync } from "child_process";
+import { findExecutableOnPath, isExecutableFile } from "@/node/utils/findExecutableOnPath";
 
 /** Known installation paths for GUI editors on macOS */
 const MACOS_APP_PATHS: Record<string, string[]> = {
@@ -24,9 +24,14 @@ const MACOS_APP_PATHS: Record<string, string[]> = {
 
 /**
  * Check if a command is available in the system PATH or known locations.
- * First checks macOS-specific paths for known apps, then falls back to `which`.
+ * First checks macOS-specific paths for known apps, then scans PATH in-process
+ * without spawning `which`/`where`.
  */
 export async function isCommandAvailable(command: string): Promise<boolean> {
+  if (!command) {
+    return false;
+  }
+
   // Check known paths for macOS apps
   if (process.platform === "darwin" && command in MACOS_APP_PATHS) {
     for (const appPath of MACOS_APP_PATHS[command]) {
@@ -42,13 +47,11 @@ export async function isCommandAvailable(command: string): Promise<boolean> {
     }
   }
 
-  // Fall back to which (inherits enriched PATH from process.env)
-  try {
-    const result = spawnSync("which", [command], { encoding: "utf8" });
-    return result.status === 0;
-  } catch {
-    return false;
+  if (command.includes("/") || command.includes("\\")) {
+    return isExecutableFile(command);
   }
+
+  return findExecutableOnPath(command) !== null;
 }
 
 /**

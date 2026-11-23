@@ -96,4 +96,13 @@ describe("isToolEnabledByConfigs", () => {
     expect(isToolEnabledByConfigs("propose_plan", configs)).toBe(true);
     expect(isToolEnabledByConfigs("file_read", configs)).toBe(false);
   });
+
+  it("anchors alternation patterns as a whole instead of splitting ^ and $ across branches", () => {
+    const configs: ToolsConfig[] = [{ add: ["file_read|bash"] }];
+
+    expect(isToolEnabledByConfigs("file_read", configs)).toBe(true);
+    expect(isToolEnabledByConfigs("bash", configs)).toBe(true);
+    expect(isToolEnabledByConfigs("file_read_extra", configs)).toBe(false);
+    expect(isToolEnabledByConfigs("my_bash", configs)).toBe(false);
+  });
 });

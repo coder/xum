@@ -40,7 +40,7 @@ const DEPTH_HARD_DENY: ToolPolicy = [
 
 function matchesToolPattern(pattern: string, toolName: string): boolean {
   try {
-    const regex = new RegExp(`^${pattern}$`);
+    const regex = new RegExp(`^(?:${pattern})$`);
     return regex.test(toolName);
   } catch {
     return false;

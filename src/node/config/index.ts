@@ -3247,13 +3247,8 @@ export class Config {
               continue;
             }
 
-            const usagePath = path.join(
-              path.join(this.sessionsDir, sessionEntry.name),
-              "session-usage.json"
-            );
-            if (fs.existsSync(usagePath)) {
-              fs.rmSync(usagePath, { force: true });
-            }
+            const usagePath = path.join(this.sessionsDir, sessionEntry.name, "session-usage.json");
+            fs.rmSync(usagePath, { force: true });
           }
         }
       } catch (error) {

@@ -233,7 +233,7 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 
 ## Debugging & Diagnostics
 
-- Debug CLI (`src/cli/debug/index.ts`): `bun run debug list-workspaces`, `bun run debug costs <workspace-id>`, `bun run debug send-message <workspace-id> [--edit <message-id>] [--message <text>]`. Workspace IDs are the directory names in `~/.xum/sessions/`. To inspect raw provider requests, enable API Debug Logs and read `~/.xum/sessions/<workspace>/devtools.jsonl`.
+- Debug CLI (`src/cli/debug/index.ts`): `bun run debug list-workspaces`, `bun run debug costs <workspace-id>`, `bun run debug cache-audit <workspace-id>`. Workspace IDs are the directory names in `~/.xum/sessions/`. To inspect raw provider requests, enable API Debug Logs and read `~/.xum/sessions/<workspace>/devtools.jsonl`.
 
 ## UX Guardrails
 

@@ -7,7 +7,7 @@ export type ResolvedAuthToken =
 /**
  * Resolve the auth token for `xum server` from CLI flags, env vars, or generate one.
  *
- * Precedence: --no-auth > --auth-token > MUX_SERVER_AUTH_TOKEN > auto-generated.
+ * Precedence: --no-auth > --auth-token > XUM_SERVER_AUTH_TOKEN > auto-generated.
  */
 export function resolveServerAuthToken(opts: {
   noAuth: boolean;

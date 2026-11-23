@@ -321,7 +321,6 @@ export function extractToolInstructions(
   options?: {
     enableAgentReport?: boolean;
     enableReviewPane?: boolean;
-    enableMuxGlobalAgentsTools?: boolean;
     /** Agent prompt sections, searched first (see buildSystemMessageFromSources options). */
     agentInstructions?: readonly string[];
   }
@@ -399,7 +398,6 @@ function extractToolInstructionsCached(
   const keyedOptions: Record<keyof ExtractToolInstructionsOptions, unknown> = {
     enableAgentReport: options?.enableAgentReport ?? null,
     enableReviewPane: options?.enableReviewPane ?? null,
-    enableMuxGlobalAgentsTools: options?.enableMuxGlobalAgentsTools ?? null,
     agentInstructions: options?.agentInstructions ?? null,
   };
   const key = createHash("sha1")

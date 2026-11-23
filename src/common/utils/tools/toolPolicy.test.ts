@@ -434,3 +434,27 @@ describe("resolveLegacyTodoNudgeToolPolicy", () => {
     expect(resolveLegacyTodoNudgeToolPolicy(corrupt, [nudge([legacy])])).toBe(corrupt);
   });
 });
+
+describe("alternation anchoring", () => {
+  test("applyToolPolicyToNames anchors top-level alternations as a group", () => {
+    const result = applyToolPolicyToNames(
+      ["bash", "bash_output", "my_file_read", "file_read"],
+      [
+        { regex_match: ".*", action: "disable" },
+        { regex_match: "bash|file_read", action: "enable" },
+      ]
+    );
+    expect(result).toEqual(["bash", "file_read"]);
+  });
+
+  test("buildRequiredToolPatterns anchors top-level alternations as a group", () => {
+    const patterns = buildRequiredToolPatterns([
+      { regex_match: "agent_report|propose_plan", action: "require" },
+    ]);
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].test("agent_report")).toBe(true);
+    expect(patterns[0].test("propose_plan")).toBe(true);
+    expect(patterns[0].test("agent_report_extra")).toBe(false);
+    expect(patterns[0].test("my_propose_plan")).toBe(false);
+  });
+});

@@ -308,4 +308,28 @@ describe("resolveToolPolicyForAgent", () => {
       { regex_match: "bash", action: "enable" },
     ]);
   });
+
+  test("subagent hard-deny check anchors alternation patterns as a group", () => {
+    // `ask_user_question` should not be mistaken for matching `ask_user|other` (only exact match).
+    const policy = resolveToolPolicyForAgent({
+      agents: [{ tools: { add: ["ask_user|other_tool"] } }],
+      isSubagent: true,
+      disableTaskToolsForDepth: false,
+    });
+    expect(policy).toEqual([
+      { regex_match: ".*", action: "disable" },
+      { regex_match: "ask_user|other_tool", action: "enable" },
+      { regex_match: "ask_user_question", action: "disable" },
+      { regex_match: "propose_plan", action: "disable" },
+      { regex_match: "agent_report", action: "enable" },
+    ]);
+
+    // Meanwhile an alternation that actually matches ask_user_question must drop a require on it.
+    const requiredPolicy = resolveToolPolicyForAgent({
+      agents: [{ tools: { require: ["ask_user_question"] } }],
+      isSubagent: true,
+      disableTaskToolsForDepth: false,
+    });
+    expect(requiredPolicy.some((r) => r.action === "require")).toBe(false);
+  });
 });

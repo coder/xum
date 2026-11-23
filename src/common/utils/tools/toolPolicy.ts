@@ -34,7 +34,7 @@ export function applyToolPolicyToNames(toolNames: string[], policy?: ToolPolicy)
   }
 
   for (const filter of policy) {
-    const regex = new RegExp(`^${filter.regex_match}$`);
+    const regex = new RegExp(`^(?:${filter.regex_match})$`);
     const shouldEnable = filter.action !== "disable";
 
     for (const toolName of toolNames) {
@@ -60,7 +60,7 @@ export function buildRequiredToolPatterns(policy?: ToolPolicy): RegExp[] {
     .filter((filter) => filter.action === "require")
     .map((filter) => {
       const rawPattern = filter.regex_match.replace(/^\^/, "").replace(/\$$/, "");
-      return new RegExp(`^${rawPattern}$`);
+      return new RegExp(`^(?:${rawPattern})$`);
     });
 }
 

@@ -114,14 +114,14 @@ function PlanFileBody(props: { workspaceId: string }) {
         <DialogTitle className="flex flex-col gap-1">
           <span>Plan file</span>
           {path && (
-            <code className="rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 font-mono text-[10px]">
+            <code className="bg-surface-tertiary rounded px-1.5 py-0.5 font-mono text-[10px]">
               {path}
             </code>
           )}
         </DialogTitle>
       </DialogHeader>
 
-      <div className="min-h-0 flex-1 overflow-y-auto rounded bg-[var(--color-bg-secondary)] p-3">
+      <div className="bg-background-secondary min-h-0 flex-1 overflow-y-auto rounded p-3">
         {error ? (
           <div className="text-error text-[11px]" data-testid="plan-file-dialog-error">
             {error}

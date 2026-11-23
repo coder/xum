@@ -108,14 +108,14 @@ describe("DesktopTokenManager", () => {
     const manager = new DesktopTokenManager();
     const token = manager.mint("workspace-1", "session-1");
     const internalManager = manager as unknown as {
-      cleanupTimer: ReturnType<typeof setInterval> | null;
+      store: { cleanupTimer: ReturnType<typeof setInterval> | null };
     };
 
-    expect(internalManager.cleanupTimer).not.toBeNull();
+    expect(internalManager.store.cleanupTimer).not.toBeNull();
 
     manager.dispose();
 
-    expect(internalManager.cleanupTimer).toBeNull();
+    expect(internalManager.store.cleanupTimer).toBeNull();
     expect(manager.validate(token)).toBeNull();
   });
 });
