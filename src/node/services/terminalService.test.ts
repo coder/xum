@@ -13,6 +13,7 @@ import type { TerminalCreateParams } from "@/common/types/terminal";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as childProcess from "child_process";
 import * as fs from "fs/promises";
+import * as findExecutableOnPathModule from "@/node/utils/findExecutableOnPath";
 
 // Unique per test run: native-terminal markers persist on disk, so a shared path would leak
 // sticky state across runs and flake the "not yet opened" assertions.
@@ -1166,11 +1167,10 @@ function findRegisteredWorkspace(workspaceId: string) {
 
 describe("TerminalService.openNative", () => {
   let service: TerminalService;
-  // Using simplified mock types since spawnSync has complex overloads
+  // Using simplified mock types since spawn has complex overloads
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let spawnSpy: Mock<any>;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let spawnSyncSpy: Mock<any>;
+  let findExecutableOnPathSpy: Mock<typeof findExecutableOnPathModule.findExecutableOnPath>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let fsStatSpy: Mock<any>;
   let originalPlatform: NodeJS.Platform;
@@ -1293,11 +1293,11 @@ describe("TerminalService.openNative", () => {
     spawnSpy = spyOn(childProcess, "spawn").mockImplementation((() =>
       createMockChildProcess()) as unknown as typeof childProcess.spawn);
 
-    // Spy on spawnSync for command availability checks
-    spawnSyncSpy = spyOn(childProcess, "spawnSync").mockImplementation((() => ({
-      status: 0,
-      output: [null, "/usr/bin/cmd"],
-    })) as unknown as typeof childProcess.spawnSync);
+    // Spy on findExecutableOnPath so command availability is deterministic regardless of host PATH
+    findExecutableOnPathSpy = spyOn(
+      findExecutableOnPathModule,
+      "findExecutableOnPath"
+    ).mockImplementation((name: string) => `/usr/bin/${name}`);
 
     // Spy on fs.stat to reject (no ghostty installed by default)
     fsStatSpy = spyOn(fs, "stat").mockImplementation((() =>
@@ -1309,7 +1309,7 @@ describe("TerminalService.openNative", () => {
     Object.defineProperty(process, "platform", { value: originalPlatform });
     // Restore spies
     spawnSpy.mockRestore();
-    spawnSyncSpy.mockRestore();
+    findExecutableOnPathSpy.mockRestore();
     fsStatSpy.mockRestore();
   });
 
@@ -1326,13 +1326,10 @@ describe("TerminalService.openNative", () => {
     });
 
     it("should open Terminal.app for local workspace when ghostty is not available", async () => {
-      // spawnSync returns non-zero for ghostty check (not available)
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) => {
-        if (cmd === "which" && args?.[0] === "ghostty") {
-          return { status: 1 }; // ghostty not found
-        }
-        return { status: 0 }; // other commands available
-      });
+      // ghostty is not available on PATH
+      findExecutableOnPathSpy.mockImplementation((name: string) =>
+        name === "ghostty" ? null : `/usr/bin/${name}`
+      );
 
       service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
@@ -1348,7 +1345,7 @@ describe("TerminalService.openNative", () => {
     });
 
     it("rolls back the recording when the open fails before the marker persists", async () => {
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
       service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
       // Unique IDs: other tests open ws-local and its durable marker would leak in here.
@@ -1367,7 +1364,7 @@ describe("TerminalService.openNative", () => {
     });
 
     it("remembers native terminal opens across service instances via the durable marker", async () => {
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
       service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
       await service.openNative("ws-local");
 
@@ -1383,7 +1380,7 @@ describe("TerminalService.openNative", () => {
     });
 
     it("refuses native terminal opens while the workspace is being archived", async () => {
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
       service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
       service.setWorkspaceArchiveGuard(() => true);
 
@@ -1402,7 +1399,7 @@ describe("TerminalService.openNative", () => {
     });
 
     it("refuses native terminal opens for archived workspaces", async () => {
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
       const configWithArchivedWorkspace = {
         ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
         getAllWorkspaceMetadata: mock(() =>
@@ -1432,7 +1429,7 @@ describe("TerminalService.openNative", () => {
     });
 
     it("refuses the native launch when the durable marker cannot be persisted", async () => {
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
       // Session dir rooted under /dev/null: marker persistence (mkdir/writeFile) must fail.
       const configWithUnwritableSessions = {
         ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
@@ -1475,12 +1472,9 @@ describe("TerminalService.openNative", () => {
 
     it("should use osascript for SSH workspace with Terminal.app", async () => {
       // No ghostty available
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) => {
-        if (cmd === "which" && args?.[0] === "ghostty") {
-          return { status: 1 };
-        }
-        return { status: 0 };
-      });
+      findExecutableOnPathSpy.mockImplementation((name: string) =>
+        name === "ghostty" ? null : `/usr/bin/${name}`
+      );
 
       service = new TerminalService(configWithSSHWorkspace, mockPTYService, mockSecretsStore);
 
@@ -1530,7 +1524,7 @@ describe("TerminalService.openNative", () => {
 
     beforeEach(() => {
       setPlatform("darwin");
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
     });
 
     it("refuses the other backend's mutation until this backend archives or removes the workspace", async () => {
@@ -1715,7 +1709,7 @@ describe("TerminalService.openNative", () => {
     it("rolls back a freshly created marker when the launch fails after it persists", async () => {
       // No terminal emulator is available: the launch fails deterministically after the
       // durable marker was written, and no shell was spawned.
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
       const config = configWithWorkspace("ws-marker-rollback");
       service = new TerminalService(config, mockPTYService, mockSecretsStore);
 
@@ -1739,7 +1733,7 @@ describe("TerminalService.openNative", () => {
       // marker written by the first, but that in-flight marker must not masquerade as
       // evidence of a real prior launch — with no launch in the whole batch, the marker
       // must not survive.
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
       const config = configWithWorkspace("ws-marker-concurrent");
       service = new TerminalService(config, mockPTYService, mockSecretsStore);
 
@@ -1759,7 +1753,7 @@ describe("TerminalService.openNative", () => {
       // collapses the shared marker and cache entry, but B already passed the archive guard
       // and will launch after its awaits without rechecking — the pending-open count must
       // keep the probe true for B's whole pre-marker window.
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 })); // every launch fails
+      findExecutableOnPathSpy.mockImplementation(() => null); // every launch fails
       const metadata = [
         {
           id: "ws-pending-sibling",
@@ -1803,14 +1797,14 @@ describe("TerminalService.openNative", () => {
     it("preserves a marker that predates the failed launch", async () => {
       const config = configWithWorkspace("ws-marker-preexisting");
       // First open succeeds and persists the durable marker.
-      spawnSyncSpy.mockImplementation(() => ({ status: 0 }));
+      findExecutableOnPathSpy.mockImplementation((name: string) => `/usr/bin/${name}`);
       service = new TerminalService(config, mockPTYService, mockSecretsStore);
       await service.openNative("ws-marker-preexisting");
       expect(spawnSpy).toHaveBeenCalledTimes(1);
 
       // A relaunch after a restart fails (say the emulator was uninstalled): the earlier
       // session's shell may still be running, so the pre-existing marker must survive.
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
       const restartedService = new TerminalService(config, mockPTYService, mockSecretsStore);
       try {
         await restartedService.openNative("ws-marker-preexisting");
@@ -1936,8 +1930,8 @@ describe("TerminalService.openNative", () => {
 
     it("Terminal.app", async () => {
       setPlatform("darwin");
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
-        cmd === "which" && args?.[0] === "ghostty" ? { status: 1 } : { status: 0 }
+      findExecutableOnPathSpy.mockImplementation((name: string) =>
+        name === "ghostty" ? null : `/usr/bin/${name}`
       );
       const script = (await spawnedArgs())[1];
       const appleScriptString = /do script "((?:[^"\\]|\\.)*)"/.exec(script)?.[1] ?? "";
@@ -1946,8 +1940,8 @@ describe("TerminalService.openNative", () => {
 
     it("xfce4-terminal", async () => {
       setPlatform("linux");
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
-        cmd === "which" && args?.[0] === "xfce4-terminal" ? { status: 0 } : { status: 1 }
+      findExecutableOnPathSpy.mockImplementation((name: string) =>
+        name === "xfce4-terminal" ? "/usr/bin/xfce4-terminal" : null
       );
       const args = await spawnedArgs();
       expect(shellArgv(args[1])).toEqual(expectedArgv);
@@ -1955,8 +1949,8 @@ describe("TerminalService.openNative", () => {
 
     it("expands a ~ workspace path on the remote host", async () => {
       setPlatform("linux");
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
-        cmd === "which" && args?.[0] === "xfce4-terminal" ? { status: 0 } : { status: 1 }
+      findExecutableOnPathSpy.mockImplementation((name: string) =>
+        name === "xfce4-terminal" ? "/usr/bin/xfce4-terminal" : null
       );
       const [workspace] = await configWithRemoteWorkspace.getAllWorkspaceMetadata();
       service = new TerminalService(
@@ -1982,18 +1976,9 @@ describe("TerminalService.openNative", () => {
 
     it("should try terminal emulators in order of preference", async () => {
       // Make gnome-terminal the first available
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) => {
-        if (cmd === "which") {
-          const terminal = args?.[0];
-          // x-terminal-emulator, ghostty, alacritty, kitty, wezterm not found
-          // gnome-terminal found
-          if (terminal === "gnome-terminal") {
-            return { status: 0 };
-          }
-          return { status: 1 };
-        }
-        return { status: 0 };
-      });
+      findExecutableOnPathSpy.mockImplementation((name: string) =>
+        name === "gnome-terminal" ? "/usr/bin/gnome-terminal" : null
+      );
 
       service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
@@ -2008,7 +1993,7 @@ describe("TerminalService.openNative", () => {
 
     it("should throw error when no terminal emulator is found", async () => {
       // All terminals not found
-      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      findExecutableOnPathSpy.mockImplementation(() => null);
 
       service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
@@ -2018,12 +2003,9 @@ describe("TerminalService.openNative", () => {
 
     it("should pass SSH args to terminal for SSH workspace", async () => {
       // Make alacritty available
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) => {
-        if (cmd === "which" && args?.[0] === "alacritty") {
-          return { status: 0 };
-        }
-        return { status: 1 };
-      });
+      findExecutableOnPathSpy.mockImplementation((name: string) =>
+        name === "alacritty" ? "/usr/bin/alacritty" : null
+      );
 
       service = new TerminalService(configWithSSHWorkspace, mockPTYService, mockSecretsStore);
 
@@ -2040,12 +2022,9 @@ describe("TerminalService.openNative", () => {
 
     it("shell-escapes devcontainer paths passed through sh -c", async () => {
       // Make gnome-terminal available
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) => {
-        if (cmd === "which" && args?.[0] === "gnome-terminal") {
-          return { status: 0 };
-        }
-        return { status: 1 };
-      });
+      findExecutableOnPathSpy.mockImplementation((name: string) =>
+        name === "gnome-terminal" ? "/usr/bin/gnome-terminal" : null
+      );
 
       service = new TerminalService(
         configWithDevcontainerWorkspace,
@@ -2069,7 +2048,7 @@ describe("TerminalService.openNative", () => {
   describe("error handling", () => {
     beforeEach(() => {
       setPlatform("darwin");
-      spawnSyncSpy.mockImplementation(() => ({ status: 0 }));
+      findExecutableOnPathSpy.mockImplementation((name: string) => `/usr/bin/${name}`);
     });
 
     it("should throw error for non-existent workspace", async () => {
