@@ -205,7 +205,7 @@ import { CoreOptionsTag } from "./core";
 export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
   Layer.effectContext(
     Effect.map(ConfigTag, (config) => {
-      // The Settings → General opt-out gates the collector at capture time (not
+      // The Settings → Behavior opt-out gates the collector at capture time (not
       // only at initialize), so a toggle applies to the running process.
       const telemetryService = new TelemetryService(config.rootDir, () =>
         config.isTelemetryDisabledByConfig()

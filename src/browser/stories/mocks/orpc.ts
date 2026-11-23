@@ -211,7 +211,7 @@ export interface MockORPCClientOptions {
   agentAiDefaults?: AgentAiDefaults;
   /** Agent definitions to expose via agents.list */
   agentDefinitions?: AgentDefinitionDescriptor[];
-  /** Initial telemetry opt-in state for config.getConfig (Settings → General → Privacy) */
+  /** Initial telemetry opt-in state for config.getConfig (Settings → Behavior → Privacy) */
   telemetryEnabled?: boolean;
   /** Coder lifecycle preferences for config.getConfig (e.g., Settings → Coder section) */
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;

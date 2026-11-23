@@ -4538,7 +4538,7 @@ export class Config {
   }
 
   /**
-   * Settings → General telemetry opt-out; absent means enabled.
+   * Settings → Behavior telemetry opt-out; absent means enabled.
    *
    * Fail CLOSED: when the persisted state cannot be read, report disabled —
    * corrupted or inaccessible state must not silently override an opt-out. A
@@ -4799,7 +4799,7 @@ export class Config {
       try {
         fs.writeSync(
           fd,
-          "Usage telemetry is disabled while this file exists (Settings → General).\n"
+          "Usage telemetry is disabled while this file exists (Settings → Behavior).\n"
         );
       } finally {
         fs.closeSync(fd);

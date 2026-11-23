@@ -162,7 +162,7 @@ void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => (
   SelectValue: () => null,
 }));
 
-import { TasksSection } from "./TasksSection";
+import { AgentBehaviorSection, TasksSection } from "./TasksSection";
 
 interface RenderTasksSectionOptions {
   agentAiDefaults?: AgentAiDefaults;
@@ -1165,6 +1165,29 @@ describe("TasksSection limit inputs", () => {
     act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 600));
     });
+
+  // The telemetry switch sits outside the task settings fieldset: a privacy control must not wait
+  // on (or lock with) the task settings load.
+  test("the Behavior telemetry switch stays usable while the task settings load", async () => {
+    apiMock = {
+      config: {
+        getConfig: mock(() => new Promise<never>(() => undefined)),
+        saveConfig: mock(() => Promise.resolve(undefined)),
+      },
+    };
+    const view = render(
+      <APIProvider client={createTestApiClient(apiMock)}>
+        <AgentBehaviorSection />
+      </APIProvider>
+    );
+    // happy-dom does not apply a disabled <fieldset> to `:disabled`: read the fieldset.
+    const isDisabled = (element: HTMLElement) =>
+      element.hasAttribute("disabled") || element.closest("fieldset")?.disabled === true;
+    await waitFor(() =>
+      expect(isDisabled(limitInput(view, "Max Parallel Agent Tasks"))).toBe(true)
+    );
+    expect(isDisabled(view.getByRole("switch", { name: "Toggle Usage Telemetry" }))).toBe(false);
+  });
 
   test("Max Parallel Agent Tasks keeps the typed text and never saves a cleared field as 1", async () => {
     const view = renderTasksSection({ part: "behavior" });

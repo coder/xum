@@ -199,7 +199,7 @@ export const AppConfigOnDiskSchema = z
     /** Expose the `heartbeat` tool so agents can schedule their own recurring turns. Absent = off. */
     agentHeartbeatsEnabled: z.boolean().optional(),
     /**
-     * Anonymous usage telemetry opt-out (Settings → General). Absent/true =
+     * Anonymous usage telemetry opt-out (Settings → Behavior). Absent/true =
      * enabled; false = disabled. MUX_DISABLE_TELEMETRY=1 also hard-disables
      * regardless of this field.
      */

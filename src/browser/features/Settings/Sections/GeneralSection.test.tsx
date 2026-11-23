@@ -1147,7 +1147,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <UsageTelemetrySetting />
       </TestProviders>
     );
 
@@ -1194,7 +1194,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <UsageTelemetrySetting />
       </TestProviders>
     );
 
@@ -1232,7 +1232,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <UsageTelemetrySetting />
       </TestProviders>
     );
 
@@ -1298,7 +1298,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <UsageTelemetrySetting />
       </TestProviders>
     );
 
@@ -1361,7 +1361,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <UsageTelemetrySetting />
       </TestProviders>
     );
 
@@ -1386,7 +1386,7 @@ describe("GeneralSection", () => {
     mockApi = setupB.api;
     view.rerender(
       <TestProviders>
-        <GeneralSection />
+        <UsageTelemetrySetting />
       </TestProviders>
     );
 
@@ -1414,7 +1414,7 @@ describe("GeneralSection", () => {
         }}
       >
         <ThemeProvider forcedTheme="dark">
-          <GeneralSection />
+          <UsageTelemetrySetting />
         </ThemeProvider>
       </APIContext.Provider>
     );
@@ -1438,7 +1438,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <UsageTelemetrySetting />
       </TestProviders>
     );
 
@@ -1474,7 +1474,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <UsageTelemetrySetting />
       </TestProviders>
     );
 

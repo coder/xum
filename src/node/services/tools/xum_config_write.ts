@@ -150,7 +150,7 @@ async function rewriteConfigDocument(
       return {
         success: false,
         error:
-          'Refusing to change "telemetryEnabled" through the generic config writer: the telemetry preference is a two-record transaction (config field + opt-out marker). Ask the user to toggle Usage Telemetry in Settings → General instead.',
+          'Refusing to change "telemetryEnabled" through the generic config writer: the telemetry preference is a two-record transaction (config field + opt-out marker). Ask the user to toggle Usage Telemetry in Settings → Behavior instead.',
       };
     }
   }

@@ -253,8 +253,8 @@ export function UsageTelemetrySetting() {
             </a>
             {telemetryDisabledByEnv && (
               <span className="text-warning block">
-                Disabled by the environment (XUM_DISABLE_TELEMETRY / CI) — this switch has no
-                effect until that is removed.
+                Disabled by the environment (XUM_DISABLE_TELEMETRY / CI) — this switch has no effect
+                until that is removed.
               </span>
             )}
           </div>

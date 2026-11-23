@@ -92,7 +92,7 @@ export interface TelemetryEnablementContext {
   env: NodeJS.ProcessEnv;
   isElectron: boolean;
   isPackaged: boolean | null;
-  /** User opt-out persisted in config.json (Settings → General). */
+  /** User opt-out persisted in config.json (Settings → Behavior). */
   disabledByConfig?: boolean;
 }
 
@@ -175,7 +175,7 @@ export class TelemetryService {
 
   /**
    * Check if telemetry was explicitly disabled by the user — either via
-   * XUM_DISABLE_TELEMETRY=1 or the Settings → General opt-out. This is
+   * XUM_DISABLE_TELEMETRY=1 or the Settings → Behavior opt-out. This is
    * different from isEnabled() which also returns false in test/CI contexts.
    * Consumers gating on explicit opt-out must treat both switches the same;
    * the docs present them as equivalent.
@@ -225,7 +225,7 @@ export class TelemetryService {
   }
 
   /**
-   * Apply the Settings → General telemetry toggle at runtime: disabling shuts
+   * Apply the Settings → Behavior telemetry toggle at runtime: disabling shuts
    * the PostHog client down (capture() no-ops on a null client), enabling
    * re-runs initialize(), which re-checks every enablement gate.
    *
