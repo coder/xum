@@ -166,25 +166,21 @@ describe("settingsProjection", () => {
     expect(merged.hiddenModels).toBeUndefined();
   });
 
-  it("canonicalizes accepted values the way config.json persists them", () => {
-    // A schema-valid document can still hold spellings the save path would rewrite; reading
-    // them canonically is what makes the post-write comparison hold.
-    const { settings } = readBackupSettings({
-      settings: {
-        defaultModel: " anthropic:claude-exec ",
-        hiddenModels: ["openai:gpt-a", "openai:gpt-a", " "],
-        modelFallbacks: {
-          "anthropic:claude-exec": { models: ["anthropic:claude-exec", "openai:gpt-plan"] },
-        },
-        agentAiDefaults: { exec: { modelString: " openai:gpt-exec " } },
+  it("keeps the local value for spellings the save path would rewrite", () => {
+    // Exports are canonical, so a padded, repeated or self-referencing value comes from a hand
+    // edit or another tool; applying the rewritten copy would restore something the document
+    // does not say.
+    const rewritten = {
+      agentAiDefaults: { exec: { modelString: " openai:gpt-exec " } },
+      defaultModel: " anthropic:claude-exec ",
+      hiddenModels: ["openai:gpt-a", "openai:gpt-a"],
+      modelFallbacks: {
+        "anthropic:claude-exec": { models: ["anthropic:claude-exec", "openai:gpt-plan"] },
       },
-    });
-
-    expect(settings).toMatchObject({
-      defaultModel: "anthropic:claude-exec",
-      hiddenModels: ["openai:gpt-a"],
-      modelFallbacks: { "anthropic:claude-exec": { models: ["openai:gpt-plan"] } },
-      agentAiDefaults: { exec: { modelString: "openai:gpt-exec" } },
+    };
+    expect(readBackupSettings({ settings: rewritten })).toEqual({
+      settings: {},
+      unsupported: Object.keys(rewritten),
     });
   });
 
@@ -270,6 +266,8 @@ describe("settingsProjection", () => {
     const rejected = {
       defaultModel: "garbage",
       hiddenModels: ["anthropic:claude-plan", "garbage"],
+      // A floor keyed by a string no model lookup can match.
+      minThinkingLevelByModel: { garbage: "high" },
       modelFallbacks: { "openai:gpt-a": { models: ["openai:gpt-a"] } },
       // Load would heal a tier list it cannot parse to the default tiers.
       autoModelRouting: { tiers: [{ id: "tier-from-a-newer-build" }] },
@@ -285,10 +283,12 @@ describe("settingsProjection", () => {
     };
     expect(mergeBackupSettings(current, read.settings!)).toEqual(current);
 
-    // Values load would quietly shorten or drop: a chain over this build's limit, repeated tier
-    // ids (fewer than the minimum remain, so load falls back to the default tiers), and an
-    // evaluation block without a usable model.
-    const tier = getDefaultAutoModelRoutingConfig().tiers[0];
+    // Values load would quietly shorten, drop in part or strip: a chain over this build's limit,
+    // a map with one valid chain beside a self-only one, repeated tier ids (fewer than the
+    // minimum remain, so load falls back to the default tiers), a tier field this build does not
+    // know, and an evaluation block without a usable model.
+    const routing = getDefaultAutoModelRoutingConfig();
+    const tier = routing.tiers[0];
     for (const [key, value] of [
       [
         "modelFallbacks",
@@ -298,7 +298,18 @@ describe("settingsProjection", () => {
           },
         },
       ],
+      [
+        "modelFallbacks",
+        {
+          "openai:gpt-a": { models: ["openai:gpt-b"] },
+          "openai:gpt-c": { models: ["openai:gpt-c"] },
+        },
+      ],
       ["autoModelRouting", { tiers: [tier, tier] }],
+      [
+        "autoModelRouting",
+        { ...routing, tiers: [{ ...tier, fieldFromANewerBuild: true }, ...routing.tiers.slice(1)] },
+      ],
       ["evaluationDefaults", {}],
     ] as const) {
       expect(readBackupSettings({ settings: { [key]: value } })).toEqual({
@@ -307,22 +318,20 @@ describe("settingsProjection", () => {
       });
     }
 
-    // Empty spellings are still resets.
+    // `null` is the only spelling of unset; an empty spelling load would read as unset is
+    // reported rather than applied as a reset. An empty hidden list is a real value.
     expect(
       readBackupSettings({
         settings: {
           defaultModel: " ",
           hiddenModels: [],
           modelFallbacks: {},
+          minThinkingLevelByModel: {},
         },
       })
     ).toEqual({
-      settings: {
-        defaultModel: null,
-        hiddenModels: [],
-        modelFallbacks: null,
-      },
-      unsupported: [],
+      settings: { hiddenModels: [] },
+      unsupported: ["defaultModel", "minThinkingLevelByModel", "modelFallbacks"],
     });
   });
 
@@ -353,22 +362,22 @@ describe("settingsProjection", () => {
       );
     }
 
-    // Valid nested models still apply, canonicalized, and empty spellings still mean unset.
-    const valid = readBackupSettings({
-      settings: {
-        agentAiDefaults: {
-          exec: {
-            modelString: " openai:gpt-exec ",
-            subagent: { modelString: "anthropic:claude-sub" },
-          },
-          plan: { modelString: "", subagent: { modelString: " " } },
-        },
-      },
-    });
-    expect(valid.unsupported).toEqual([]);
-    expect(mergeBackupSettings(current, valid.settings!).agentAiDefaults).toEqual({
+    // Padded and empty nested model strings are rewritten or dropped by load, so they are
+    // reported too; canonical nested models apply.
+    for (const agentAiDefaults of [
+      { exec: { modelString: " openai:gpt-exec " } },
+      { plan: { modelString: "", subagent: { modelString: " " } } },
+    ]) {
+      expect(readBackupSettings({ settings: { agentAiDefaults } }).unsupported).toEqual([
+        "agentAiDefaults",
+      ]);
+    }
+    const restored = {
       exec: { modelString: "openai:gpt-exec", subagent: { modelString: "anthropic:claude-sub" } },
-    });
+    };
+    const valid = readBackupSettings({ settings: { agentAiDefaults: restored } });
+    expect(valid.unsupported).toEqual([]);
+    expect(mergeBackupSettings(current, valid.settings!).agentAiDefaults).toEqual(restored);
     expect(readBackupSettings({ settings: { agentAiDefaults: {} } })).toEqual({
       settings: { agentAiDefaults: {} },
       unsupported: [],

@@ -1,17 +1,9 @@
-import { z } from "zod";
-import {
-  AgentAiDefaultsEntrySchema,
-  AgentAiSubagentProfileSchema,
-  AppConfigOnDiskSchema,
-} from "@/common/config/schemas/appConfigOnDisk";
-import { AgentIdSchema } from "@/common/schemas/ids";
+import type { z } from "zod";
+import { isDeepStrictEqual } from "node:util";
+import { AppConfigOnDiskSchema } from "@/common/config/schemas/appConfigOnDisk";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
-import {
-  AutoModelRoutingConfigSchema,
-  normalizeAutoModelRoutingConfig,
-} from "@/common/types/autoModelRouting";
+import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import type { ProjectsConfig } from "@/common/types/project";
-import { MODEL_FALLBACK_CHAIN_LIMIT } from "@/common/utils/ai/modelFallbacks";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   normalizeAiDefaultsModelStrings,
@@ -94,8 +86,7 @@ export interface BackupSettingsRead {
 /**
  * The canonical in-memory value of each setting, using the same normalization Config applies
  * on save and load. Export, read, merge, and the post-write check all go through this table, so
- * a schema-valid but non-canonical document (a padded model string, an unsanitized fallback
- * chain) compares equal to what config.json holds after the write. Unset resolves to what a
+ * what a restore writes compares equal to what config.json holds after the write. Unset resolves to what a
  * loaded config holds when the key is absent: `undefined` for optional settings, the default
  * for settings load always fills in.
  */
@@ -110,60 +101,35 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
   chatTranscriptFullWidth: (value) => value === true,
 };
 
-function isEmptySpelling(value: unknown): boolean {
-  if (typeof value === "string") return value.trim() === "";
-  if (Array.isArray(value)) return value.length === 0;
-  return isPlainObject(value) && Object.keys(value).length === 0;
+/**
+ * Load-time normalization heals what it cannot read: it drops invalid entries, caps chains,
+ * strips unknown fields and fills defaults. Applying a healed copy of a damaged or newer-build
+ * value would silently replace the target's setting, so a value is accepted only when
+ * normalization keeps it exactly as written; anything else keeps the local value and is
+ * reported. Exports are always canonical, and `null` is the only spelling of unset.
+ */
+function isCanonical(key: BackedUpSettingsKey, value: unknown): boolean {
+  const normalized = NORMALIZE[key](value);
+  return normalized !== undefined && isDeepStrictEqual(copyJson(normalized), value);
 }
 
-const acceptedBy = (normalize: (value: unknown) => unknown) => (value: unknown) =>
-  isEmptySpelling(value) || normalize(value) !== undefined;
-
-const ModelStringSchema = z.string().refine(acceptedBy(normalizeOptionalModelString));
-
 /**
- * Where the on-disk schema accepts values load-time normalization rejects or shortens (any
- * string is a model string, at the top level and inside each agent's defaults), the field schema
- * is tightened to what the normalizer keeps. Otherwise a damaged or newer-build value would pass the schema, normalize to unset, and reset the target's setting,
- * when the contract is to keep the local value and report the key as unsupported. Empty
- * spellings (`""`, `[]`, `{}`) still canonicalize to unset.
+ * Per-key on-disk schemas rather than one picked object: the on-disk schema is passthrough,
+ * which would carry any key of a repository-controlled document into the config. Where
+ * normalization keeps values lookups can never match, the schema is tightened: a per-model
+ * floor needs a model-string key.
  */
 const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = {
-  agentAiDefaults: z.record(
-    AgentIdSchema,
-    AgentAiDefaultsEntrySchema.extend({
-      modelString: ModelStringSchema.optional(),
-      subagent: AgentAiSubagentProfileSchema.extend({
-        modelString: ModelStringSchema.optional(),
-      }).optional(),
-    })
-  ),
-  defaultModel: ModelStringSchema,
-  hiddenModels: z.array(ModelStringSchema),
-  // Normalization caps each chain; a longer one (a newer build's limit) would restore truncated.
-  modelFallbacks: AppConfigOnDiskSchema.shape.modelFallbacks
+  minThinkingLevelByModel: AppConfigOnDiskSchema.shape.minThinkingLevelByModel
     .unwrap()
-    .refine(acceptedBy(normalizeModelFallbacks))
     .refine((value) =>
-      Object.values(value).every((entry) => entry.models.length <= MODEL_FALLBACK_CHAIN_LIMIT)
+      Object.keys(value).every((model) => normalizeOptionalModelString(model) === model)
     ),
-  // The on-disk shape degrades anything to absent and load heals each field to its default.
-  // Load also drops repeated tier ids, and below the minimum count falls back to the defaults.
-  autoModelRouting: AutoModelRoutingConfigSchema.refine(
-    (value) => normalizeAutoModelRoutingConfig(value).tiers.length === value.tiers.length
-  ),
-  // An unset block is spelled null; an object without a usable model would reset the target.
-  evaluationDefaults: AppConfigOnDiskSchema.shape.evaluationDefaults
-    .unwrap()
-    .refine((value) => normalizeEvaluationDefaults(value) !== undefined),
 };
 
-/**
- * Per-key schemas rather than one picked object: the on-disk schema is passthrough, which would
- * carry any key of a repository-controlled document into the config, and each key accepts null.
- */
-function fieldSchema(key: BackedUpSettingsKey): z.ZodType {
-  return (FIELD_SCHEMA_OVERRIDES[key] ?? AppConfigOnDiskSchema.shape[key]).nullable();
+function isSupported(key: BackedUpSettingsKey, value: unknown): boolean {
+  const schema = FIELD_SCHEMA_OVERRIDES[key] ?? AppConfigOnDiskSchema.shape[key];
+  return schema.safeParse(value).success && isCanonical(key, value);
 }
 
 function setSetting<K extends BackedUpSettingsKey>(
@@ -194,7 +160,7 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
   return copyJson(projected);
 }
 
-/** Reads and canonicalizes the `settings` block of a preferences document. */
+/** Reads the `settings` block of a preferences document. */
 export function readBackupSettings(document: unknown): BackupSettingsRead {
   if (!isPlainObject(document) || document.settings === undefined) {
     return { settings: undefined, unsupported: [] };
@@ -207,9 +173,9 @@ export function readBackupSettings(document: unknown): BackupSettingsRead {
   const unsupported: string[] = [];
   for (const key of BACKED_UP_SETTINGS_KEYS) {
     if (!(key in block)) continue;
-    const parsed = fieldSchema(key).safeParse(block[key]);
-    if (parsed.success) {
-      setSetting(settings, key, NORMALIZE[key](parsed.data));
+    const value = block[key];
+    if (value === null || isSupported(key, value)) {
+      setSetting(settings, key, NORMALIZE[key](value));
     } else {
       unsupported.push(key);
     }
