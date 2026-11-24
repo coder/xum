@@ -28,6 +28,7 @@ describe("deriveTasksSectionAgentGroups", () => {
       agentAiDefaults,
       portableDesktopEnabled: false,
       memoryConsolidationEnabled: false,
+      statusPageAgentEnabled: false,
     });
 
     expect(groups.subagents.map((agent) => agent.id)).toEqual(["explore"]);
@@ -40,6 +41,7 @@ describe("deriveTasksSectionAgentGroups", () => {
       agentAiDefaults: {},
       portableDesktopEnabled: true,
       memoryConsolidationEnabled: false,
+      statusPageAgentEnabled: false,
     });
 
     expect(groups.subagents.map((agent) => agent.id)).toEqual(["desktop", "explore"]);
@@ -55,6 +57,7 @@ describe("deriveTasksSectionAgentGroups", () => {
       agentAiDefaults,
       portableDesktopEnabled: false,
       memoryConsolidationEnabled: false,
+      statusPageAgentEnabled: false,
     });
 
     expect(groups.internalAgents.map((agent) => agent.id)).not.toContain("dream");
@@ -68,8 +71,29 @@ describe("deriveTasksSectionAgentGroups", () => {
       agentAiDefaults: {},
       portableDesktopEnabled: false,
       memoryConsolidationEnabled: true,
+      statusPageAgentEnabled: false,
     });
 
     expect(groups.internalAgents.map((agent) => agent.id)).toContain("dream");
+  });
+
+  test("shows Status Page under Internal only when the status page agent is enabled", () => {
+    const agentAiDefaults: AgentAiDefaults = {
+      status_page: { modelString: "anthropic:claude-haiku-4-5" },
+    };
+    const derive = (statusPageAgentEnabled: boolean) =>
+      deriveTasksSectionAgentGroups({
+        listedAgents: FALLBACK_AGENTS,
+        agentAiDefaults,
+        portableDesktopEnabled: false,
+        memoryConsolidationEnabled: false,
+        statusPageAgentEnabled,
+      });
+
+    const off = derive(false);
+    expect(off.internalAgents.map((agent) => agent.id)).not.toContain("status_page");
+    // The saved model choice must stay "known", not surface under Unknown agents.
+    expect(off.unknownAgentIds).toEqual([]);
+    expect(derive(true).internalAgents.map((agent) => agent.id)).toContain("status_page");
   });
 });

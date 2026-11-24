@@ -25,13 +25,6 @@ function getMarkdownCodeFenceDelimiter(args: { output: string }): string {
   const fenceLength = Math.max(3, longestBacktickRun + 1);
   return "`".repeat(fenceLength);
 }
-export interface ParsedBashOutputReport {
-  processId: string;
-  status: string;
-  exitCode?: number;
-  output: string;
-}
-
 export function formatBashOutputReport(args: {
   processId: string;
   status: string;
@@ -63,92 +56,4 @@ export function formatBashOutputReport(args: {
   }
 
   return lines.join("\n");
-}
-
-export function tryParseBashOutputReport(
-  reportMarkdown: string
-): ParsedBashOutputReport | undefined {
-  if (typeof reportMarkdown !== "string") return undefined;
-
-  const lines = reportMarkdown.split("\n");
-  const header = lines[0] ?? "";
-  const headerPrefix = "### Bash task:";
-  if (!header.startsWith(headerPrefix)) {
-    return undefined;
-  }
-
-  const processId = header.slice(headerPrefix.length).trim();
-  if (!processId) {
-    return undefined;
-  }
-
-  // Parse fenced output block (optional).
-  const fenceStart = lines.findIndex((line) => /^`{3,}text\s*$/.test(line.trimEnd()));
-
-  // Find status/exitCode lines. Keep this tolerant to extra blank lines.
-  // IMPORTANT: only scan the header section; the output block may contain literal
-  // "status:" / "exitCode:" lines that must not override the header.
-  const headerLines = fenceStart === -1 ? lines : lines.slice(0, fenceStart);
-
-  let status: string | undefined;
-  let exitCode: number | undefined;
-
-  for (const line of headerLines) {
-    if (status === undefined && line.startsWith("status:")) {
-      status = line.slice("status:".length).trim();
-      continue;
-    }
-
-    if (exitCode === undefined && line.startsWith("exitCode:")) {
-      const parsed = Number.parseInt(line.slice("exitCode:".length).trim(), 10);
-      if (Number.isFinite(parsed)) {
-        exitCode = parsed;
-      }
-    }
-  }
-
-  if (!status) {
-    return undefined;
-  }
-
-  let output = "";
-  if (fenceStart !== -1) {
-    const fenceLine = lines[fenceStart]?.trimEnd() ?? "";
-    const match = /^(`{3,})text\s*$/.exec(fenceLine);
-    if (!match) {
-      return undefined;
-    }
-
-    const fence = match[1];
-
-    // We always append the closing fence at the end of the report. If the output contains
-    // literal fence lines (e.g. "```"), picking the *first* closing fence would truncate
-    // the parsed output and permanently drop data when we rewrite the report.
-    let fenceEnd = -1;
-    for (let index = lines.length - 1; index > fenceStart; index -= 1) {
-      if ((lines[index]?.trimEnd() ?? "") !== fence) {
-        continue;
-      }
-
-      const onlyBlankLinesAfterFence = lines
-        .slice(index + 1)
-        .every((line) => line.trim().length === 0);
-      if (onlyBlankLinesAfterFence) {
-        fenceEnd = index;
-        break;
-      }
-    }
-
-    if (fenceEnd === -1) {
-      fenceEnd = lines.findIndex((line, index) => index > fenceStart && line.trimEnd() === fence);
-    }
-
-    if (fenceEnd === -1) {
-      return undefined;
-    }
-
-    output = lines.slice(fenceStart + 1, fenceEnd).join("\n");
-  }
-
-  return { processId, status, exitCode, output };
 }

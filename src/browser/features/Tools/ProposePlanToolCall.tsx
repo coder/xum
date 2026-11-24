@@ -13,6 +13,7 @@ import {
   ToolName,
   StatusIndicator,
   ToolDetails,
+  ErrorBox,
 } from "./Shared/ToolPrimitives";
 import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
@@ -27,7 +28,9 @@ import {
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { useStartHere } from "@/browser/hooks/useStartHere";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { createMuxMessage } from "@/common/types/message";
@@ -41,26 +44,20 @@ import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  getAgentIdKey,
-  getModelKey,
-  getPlanContentKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
-  resolveWorkspaceAiSettingsForAgent,
-  type WorkspaceAISettingsCache,
-} from "@/browser/utils/workspaceModeAi";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+  useHostTranscriptMutationAllowed,
+  useHostTranscriptMutationCheck,
+} from "@/browser/utils/transcriptBarrier";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
+import { flushUserPreferences, useAppConfig } from "@/browser/stores/AppConfigStore";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import type { ReviewActionCallbacks } from "../Shared/InlineReviewNote";
 import { isPlanFilePath, normalizePlanFilePath } from "@/common/types/review";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import {
   Check,
   Clipboard,
@@ -77,6 +74,8 @@ import {
   X,
 } from "lucide-react";
 import { getErrorMessage } from "@/common/utils/errors";
+import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 
 /**
  * Check if the result is a successful file-based propose_plan result.
@@ -133,6 +132,19 @@ function isLegacyProposePlanArgs(args: unknown): args is LegacyProposePlanToolAr
   return args !== null && typeof args === "object" && "title" in args && "plan" in args;
 }
 
+/**
+ * True while the user is typing in a field that has content. The plan-action shortcut must not
+ * fire then (#4963); from an empty composer it may.
+ */
+function isTypingInNonEmptyField(element: Element | null): boolean {
+  if (!element || !isEditableElement(element)) return false;
+  // input, textarea and select carry a string value; contentEditable hosts carry text.
+  if ("value" in element && typeof element.value === "string") {
+    return element.value.trim() !== "";
+  }
+  return (element.textContent ?? "").trim() !== "";
+}
+
 interface ProposePlanToolCallProps {
   args: Record<string, unknown>;
   result?: unknown;
@@ -152,6 +164,19 @@ interface ProposePlanToolCallProps {
   className?: string;
 }
 
+// Shown on hosts that cannot replace chat history (VS Code webview, #4942).
+const HISTORY_REPLACEMENT_UNAVAILABLE_MESSAGE =
+  "Your settings make this replace the chat history, which is not available here. Use the Xum app, or turn off that setting.";
+
+/**
+ * Latest plan content per workspace, used to paint the latest plan card without a layout
+ * flash when it remounts (e.g. switching back to a workspace). The backend owns the plan
+ * file and the card always refetches it, so this lives in memory only: persisting full plan
+ * text per workspace in localStorage contributed to QuotaExceededError. After a full reload
+ * the card shows the placeholder until getPlanContent resolves.
+ */
+const latestPlanContentCache = new Map<string, { content: string; path: string }>();
+
 export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) => {
   const {
     args,
@@ -170,7 +195,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const [annotateMode, setAnnotateMode] = useState(false);
   const [isImplementing, setIsImplementing] = useState(false);
   const [isContinuingInAuto, setIsContinuingInAuto] = useState(false);
-  const [implementReplacesChatHistory, setImplementReplacesChatHistory] = useState(false);
+  // Why the last Implement / Continue in Auto did not start (#4980); cleared on the next click.
+  const [planActionError, setPlanActionError] = useState<string | null>(null);
 
   // On small screens, render the primary plan actions (Implement / Continue in Auto) as
   // shortcut icons alongside the other action buttons to avoid right-side overflow.
@@ -200,19 +226,39 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     : undefined;
   const runtimeConfig = workspaceMetadata?.runtimeConfig;
 
+  // Implement / Continue in Auto send (and may replace history) based on the transcript the
+  // user sees, so they stay disabled until the onChat replay is complete. Leaf subscription to
+  // the caught-up flag only; the full WorkspaceState would re-render every plan card per delta.
+  // Ephemeral previews have no workspace: nothing to subscribe to, and no primary actions.
+  // The snapshot is the same predicate the click handlers re-check at dispatch time.
+  // Host-aware (#4942): the VS Code webview supplies its own barrier through ChatHostContext
+  // instead of registering in WorkspaceStore.
+  const isTranscriptCaughtUp = useHostTranscriptMutationAllowed(workspaceId);
+  const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
+  // A host that cannot replace chat history (VS Code webview) hides Start Here, and refuses
+  // Implement / Continue in Auto when the user's setting says they replace history, rather than
+  // silently sending without the replacement.
+  // Live from the shared app config store (refreshed on config changes), so a setting change
+  // while the card is mounted updates the affordance. Dispatch re-reads the config anyway.
+  const implementReplacesChatHistory =
+    useAppConfig((config) => config.proposePlanImplementReplacesChatHistory) ?? false;
+  const canReplaceChatHistory =
+    useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
+  const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
+
   // Fresh content from disk for the latest plan (external edit detection)
-  // Only use cache for completed tools (page reload case) - not for in-flight tools
+  // Only use cache for completed tools (remount case) - not for in-flight tools
   // which may have stale cache from a previous propose_plan call
-  const cacheKey = workspaceId ? getPlanContentKey(workspaceId) : "";
   const shouldUseCache = workspaceId && isLatest && !isEphemeralPreview && status === "completed";
-  const cached = shouldUseCache
-    ? readPersistedState<{ content: string; path: string } | null>(cacheKey, null)
-    : null;
+  const cached = shouldUseCache ? latestPlanContentCache.get(workspaceId) : undefined;
 
   const [freshContent, setFreshContent] = useState<string | null>(cached?.content ?? null);
   const [freshPath, setFreshPath] = useState<string | null>(cached?.path ?? null);
 
   useEffect(() => {
+    // Set on setup too: StrictMode replays effects (setup, cleanup, setup) in development, and
+    // plan-action errors are only shown while this is true.
+    isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
     };
@@ -229,31 +275,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     return () => window.removeEventListener("resize", handleResize);
   }, []);
 
-  useEffect(() => {
-    if (!api) return;
-    if (isEphemeralPreview) return;
-    if (!isLatest) return;
-    if (status !== "completed") return;
-
-    let cancelled = false;
-
-    void api.config
-      .getConfig()
-      .then((cfg) => {
-        if (cancelled) return;
-        setImplementReplacesChatHistory(
-          cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false
-        );
-      })
-      .catch(() => {
-        // Ignore failures (we'll default to old behavior).
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, isEphemeralPreview, isLatest, status]);
-
   // Fetch fresh plan content for the latest plan
   // Re-fetches on mount, when window regains focus, and when tool completes
   useEffect(() => {
@@ -265,8 +286,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         if (res.success) {
           setFreshContent(res.data.content);
           setFreshPath(res.data.path);
-          // Update cache for page reload (only useful when tool is completed)
-          updatePersistedState(cacheKey, { content: res.data.content, path: res.data.path });
+          // Update cache for remounts (only useful when tool is completed)
+          latestPlanContentCache.set(workspaceId, {
+            content: res.data.content,
+            path: res.data.path,
+          });
         }
       } catch {
         // Fetch failed, keep existing content
@@ -281,7 +305,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
     // status in deps ensures refetch when tool completes (captures final file state)
-  }, [api, workspaceId, isLatest, isEphemeralPreview, cacheKey, status]);
+  }, [api, workspaceId, isLatest, isEphemeralPreview, status]);
 
   // Determine plan content and title based on result type
   // For ephemeral previews, use direct content/path props
@@ -382,6 +406,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     setAnnotateMode(false);
   }, [canAnnotate]);
 
+  // The latest plan in the main chat and in the /side chat tab can both be mounted; only the pane
+  // owning the focused element toggles its plan's annotate mode.
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     // Scope the global annotate shortcut to the latest non-ephemeral plan tool call.
     // Ephemeral previews can still use the button, but should not all toggle together.
@@ -393,7 +420,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || isEditableElement(event.target)) {
+      if (
+        event.defaultPrevented ||
+        isEditableElement(event.target) ||
+        !paneHandlesKeyEvent(paneScope, event.target)
+      ) {
         return;
       }
 
@@ -413,7 +444,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canAnnotate, isPlanVisible, isLatest, isEphemeralPreviewMode]);
+  }, [canAnnotate, isPlanVisible, isLatest, isEphemeralPreviewMode, paneScope]);
 
   // When using "Start Here" (replace chat history), the plan is already included in the
   // conversation *only* when the Propose Plan tool result includes full plan text.
@@ -469,103 +500,105 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
   };
 
-  // User request: propose_plan primary actions send immediately after agent switch.
-  // Resolve and persist model/thinking synchronously here so the follow-up message
-  // uses the target agent defaults instead of stale planning-mode preferences.
-  const resolveAndPersistTargetAgentSettings = (args: {
+  /**
+   * One plan action ("Implement the plan" as exec, or Continue in Auto). Ordering matters:
+   * every await and the final barrier check come BEFORE the irreversible steps (the optional
+   * history replacement, the workspace mode switch, the send), so a barrier that closes during
+   * the waits leaves the workspace exactly as it was instead of replaced-but-not-implemented.
+   * Resolves to the message the card shows when the action did not start, or null.
+   */
+  const runPlanAction = async (args: {
     workspaceId: string;
     targetAgentId: "auto" | "exec";
-  }): { resolvedModel: string; resolvedThinking: ThinkingLevel } => {
-    const modelKey = getModelKey(args.workspaceId);
-    const thinkingKey = getThinkingLevelKey(args.workspaceId);
-    const reasoningKey = getReasoningModeKey(args.workspaceId);
-    const fallbackModel = getDefaultModel();
+    replacementIdPrefix: string;
+    replacementErrorContext: string;
+  }): Promise<string | null> => {
+    if (!api) return null;
+    const { workspaceId } = args;
+    let shouldReplaceChatHistory = false;
 
-    const existingModel = readPersistedState<string>(modelKey, fallbackModel);
-    const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
-    const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
-    const agentAiDefaults = readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {});
-    const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
-      getWorkspaceAISettingsByAgentKey(args.workspaceId),
-      {}
-    );
+    try {
+      const cfg = await api.config.getConfig();
+      shouldReplaceChatHistory = cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false;
+    } catch {
+      // Ignore config read errors (we'll default to old behavior).
+    }
+    if (shouldReplaceChatHistory && !canReplaceChatHistory) return null;
 
-    const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
-      resolveWorkspaceAiSettingsForAgent({
-        agentId: args.targetAgentId,
-        agentAiDefaults,
-        // Propose-plan actions are explicit mode switches; honor any per-agent
-        // workspace override before inheriting the previously active plan settings.
-        workspaceByAgent,
-        useWorkspaceByAgentFallback: true,
-        fallbackModel,
-        existingModel,
-        existingThinking,
-        existingReasoningMode: existingReasoning,
+    // Same barrier as the composer: the backend reads the send model's auto-compaction
+    // threshold from persisted preferences, so a slider move right before this click must
+    // reach config.json first. A failed save lands in the handlers' best-effort catch.
+    await flushUserPreferences();
+
+    // Final re-check after every await; nothing has been changed yet.
+    if (!isTranscriptMutationAllowed(workspaceId)) return null;
+    if (shouldReplaceChatHistory) {
+      await replaceChatHistoryWithPlan({
+        idPrefix: args.replacementIdPrefix,
+        errorContext: args.replacementErrorContext,
       });
-
-    updatePersistedState(getAgentIdKey(args.workspaceId), args.targetAgentId);
-
-    if (existingModel !== resolvedModel) {
-      setWorkspaceModelWithOrigin(args.workspaceId, resolvedModel, "agent");
     }
-    if (existingThinking !== resolvedThinking) {
-      updatePersistedState(thinkingKey, resolvedThinking);
+    setWorkspaceAgentPick(workspaceId, args.targetAgentId);
+    // The target agent's resolved model, thinking level and Auto choices.
+    const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
+    const options = {
+      ...sendMessageOptions,
+      agentId: args.targetAgentId,
+      // The target agent's model and thinking level are explicit; classifying
+      // "Implement the plan" would reroute them based on a prompt that says nothing
+      // about the plan's difficulty.
+      autoModelRouting: false,
+      autoThinkingLevel: false,
+      // The agent's later composer sends keep its Auto choices.
+      savedAutoRouting: {
+        model: sendMessageOptions.autoModelRouting === true,
+        thinkingLevel: sendMessageOptions.autoThinkingLevel === true,
+      },
+    };
+    // Picks the send carries, consumed like a composer send's.
+    const aiSelection = getAiSelectionIntentForSendOptions(
+      workspaceId,
+      args.targetAgentId,
+      options
+    );
+    const sendResult = await api.workspace.sendMessage({
+      workspaceId,
+      message: "Implement the plan",
+      options,
+    });
+    if (sendResult.success) {
+      consumeAiSelectionIntent(workspaceId, args.targetAgentId, aiSelection);
+      return null;
     }
-    // Persist before getSendOptionsFromStorage reads the key for the follow-up send.
-    if (existingReasoning !== resolvedReasoningMode) {
-      updatePersistedState(reasoningKey, resolvedReasoningMode);
-    }
-
-    return { resolvedModel, resolvedThinking };
+    const formatted = formatSendMessageError(sendResult.error);
+    return formatted.resolutionHint
+      ? `${formatted.message} ${formatted.resolutionHint}`
+      : formatted.message;
   };
 
   const handleImplement = async () => {
     if (!workspaceId || !api) return;
     if (isImplementingRef.current) return;
+    // The button is disabled while hydrating; this covers a click racing the barrier closing.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
 
     isImplementingRef.current = true;
     if (isMountedRef.current) {
       setIsImplementing(true);
+      setPlanActionError(null);
     }
 
     try {
-      let shouldReplaceChatHistory = false;
-
-      try {
-        const cfg = await api.config.getConfig();
-        shouldReplaceChatHistory =
-          cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false;
-      } catch {
-        // Ignore config read errors (we'll default to old behavior).
-      }
-
-      if (shouldReplaceChatHistory) {
-        await replaceChatHistoryWithPlan({
-          idPrefix: "start-here",
-          errorContext: "Failed to replace chat history before implementing:",
-        });
-      }
-
-      const targetAgentId = "exec";
-      const { resolvedModel, resolvedThinking } = resolveAndPersistTargetAgentSettings({
+      const error = await runPlanAction({
         workspaceId,
-        targetAgentId,
+        targetAgentId: "exec",
+        replacementIdPrefix: "start-here",
+        replacementErrorContext: "Failed to replace chat history before implementing:",
       });
-      const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
-
-      await api.workspace.sendMessage({
-        workspaceId,
-        message: "Implement the plan",
-        options: {
-          ...sendMessageOptions,
-          agentId: targetAgentId,
-          model: resolvedModel,
-          thinkingLevel: resolvedThinking,
-        },
-      });
-    } catch {
-      // Best-effort: user can retry manually if sending fails.
+      if (isMountedRef.current) setPlanActionError(error);
+    } catch (error) {
+      // The user retries after reading why it failed.
+      if (isMountedRef.current) setPlanActionError(getErrorMessage(error));
     } finally {
       isImplementingRef.current = false;
       if (isMountedRef.current) {
@@ -576,49 +609,24 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const handleContinueInAuto = async () => {
     if (!workspaceId || !api) return;
     if (isContinuingInAutoRef.current) return;
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
 
     isContinuingInAutoRef.current = true;
     if (isMountedRef.current) {
       setIsContinuingInAuto(true);
+      setPlanActionError(null);
     }
 
     try {
-      let shouldReplaceChatHistory = false;
-
-      try {
-        const cfg = await api.config.getConfig();
-        shouldReplaceChatHistory =
-          cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false;
-      } catch {
-        // Ignore config read errors (we'll default to old behavior).
-      }
-
-      if (shouldReplaceChatHistory) {
-        await replaceChatHistoryWithPlan({
-          idPrefix: "continue-auto",
-          errorContext: "Failed to replace chat history before continuing in auto:",
-        });
-      }
-
-      const targetAgentId = "auto";
-      const { resolvedModel, resolvedThinking } = resolveAndPersistTargetAgentSettings({
+      const error = await runPlanAction({
         workspaceId,
-        targetAgentId,
+        targetAgentId: "auto",
+        replacementIdPrefix: "continue-auto",
+        replacementErrorContext: "Failed to replace chat history before continuing in auto:",
       });
-      const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
-
-      await api.workspace.sendMessage({
-        workspaceId,
-        message: "Implement the plan",
-        options: {
-          ...sendMessageOptions,
-          agentId: targetAgentId,
-          model: resolvedModel,
-          thinkingLevel: resolvedThinking,
-        },
-      });
-    } catch {
-      // Best-effort: user can retry manually if sending fails.
+      if (isMountedRef.current) setPlanActionError(error);
+    } catch (error) {
+      if (isMountedRef.current) setPlanActionError(getErrorMessage(error));
     } finally {
       isContinuingInAutoRef.current = false;
       if (isMountedRef.current) {
@@ -697,11 +705,20 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ? {
           label: "Implement",
           onClick: () => void handleImplement(),
-          disabled: !api || isImplementing || isContinuingInAuto,
+          disabled:
+            !api ||
+            isImplementing ||
+            isContinuingInAuto ||
+            !isTranscriptCaughtUp ||
+            historyReplacementUnavailable,
           icon: <Play className="size-4" />,
-          tooltip: implementReplacesChatHistory
-            ? "Replace chat history with this plan, switch to Exec, and start implementing"
-            : "Switch to Exec and start implementing",
+          tooltip: !isTranscriptCaughtUp
+            ? TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
+            : historyReplacementUnavailable
+              ? HISTORY_REPLACEMENT_UNAVAILABLE_MESSAGE
+              : implementReplacesChatHistory
+                ? "Replace chat history with this plan, switch to Exec, and start implementing"
+                : "Switch to Exec and start implementing",
         }
       : null;
 
@@ -710,16 +727,75 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ? {
           label: "Continue in Auto",
           onClick: () => void handleContinueInAuto(),
-          disabled: !api || isContinuingInAuto || isImplementing,
+          disabled:
+            !api ||
+            isContinuingInAuto ||
+            isImplementing ||
+            !isTranscriptCaughtUp ||
+            historyReplacementUnavailable,
           icon: <Sparkles className="size-4" />,
-          tooltip: implementReplacesChatHistory
-            ? "Replace chat history with this plan, switch to Auto, and let it decide the executor"
-            : "Switch to Auto and let it decide the executor",
+          tooltip: !isTranscriptCaughtUp
+            ? TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
+            : historyReplacementUnavailable
+              ? HISTORY_REPLACEMENT_UNAVAILABLE_MESSAGE
+              : implementReplacesChatHistory
+                ? "Replace chat history with this plan, switch to Auto, and let it decide the executor"
+                : "Switch to Auto and let it decide the executor",
         }
       : null;
 
-  // Start Here button: only for tool calls, not ephemeral previews
-  if (!isEphemeralPreview && workspaceId) {
+  // #4963: keyboard shortcut and command palette entry for the latest plan's primary action.
+  // Both go through the visible button's own enablement (transcript barrier, including the VS
+  // Code webview's host barrier, in-flight guard, history-replacement refusal), so they can never
+  // do what a click could not. The listener lives in the card, not in a composer, so it works in
+  // the desktop app and in the webview alike.
+  const primaryPlanAction = implementButton ?? autoButton;
+  const selectedWorkspaceId = workspaceContext?.selectedWorkspace?.workspaceId;
+  useEffect(() => {
+    if (!primaryPlanAction || !workspaceId) return;
+    const runIfEnabled = (): boolean => {
+      const { disabled, onClick } = primaryPlanAction;
+      if (disabled || !onClick) return false;
+      onClick();
+      return true;
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.RUN_LATEST_PLAN_ACTION)) return;
+      // A focused control already handled it (the agent picker treats Alt+Enter as Enter).
+      if (event.defaultPrevented) return;
+      // The /side chat tab's transcript is never the selected workspace, so it is gated by focus
+      // instead: it runs its plan only while focus is inside the side pane, the main one otherwise.
+      if (!paneHandlesKeyEvent(paneScope, event.target)) return;
+      // Only the selected workspace's transcript (a sub-agent transcript may show its own plan).
+      // Hosts without a workspace context (the webview) show one transcript.
+      if (
+        paneScope === "main" &&
+        selectedWorkspaceId !== undefined &&
+        selectedWorkspaceId !== workspaceId
+      ) {
+        return;
+      }
+      if (isTypingInNonEmptyField(document.activeElement)) return;
+      event.preventDefault();
+      if (event.repeat) return;
+      runIfEnabled();
+    };
+    const handlePaletteRequest = (event: Event) => {
+      const { detail } = event as CustomEventType<typeof CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION>;
+      if (detail.workspaceId !== workspaceId) return;
+      if (runIfEnabled()) detail.handled = true;
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, handlePaletteRequest);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, handlePaletteRequest);
+    };
+  });
+
+  // Start Here button: only for tool calls, not ephemeral previews, on hosts that can replace
+  // chat history
+  if (!isEphemeralPreview && workspaceId && canReplaceChatHistory) {
     actionButtons.push({
       label: buttonLabel,
       onClick: openModal,
@@ -833,7 +909,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         <ClipboardList aria-hidden="true" className="h-4 w-4" />
         <div className="text-plan-mode font-mono text-[13px] font-semibold">{planTitle}</div>
         {annotateMode && (
-          <div className="bg-accent/10 text-accent rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
+          <div className="bg-accent/10 text-accent-text rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
             Annotating
           </div>
         )}
@@ -896,6 +972,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
                 </TooltipTrigger>
                 <TooltipContent align="center">
                   {implementButton.tooltip ?? implementButton.label}
+                  {/* Wide layout only, so the hint never shows on mobile widths. */}
+                  {!implementButton.disabled &&
+                    ` (${formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION)})`}
                 </TooltipContent>
               </Tooltip>
             )}
@@ -917,12 +996,22 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
                 </TooltipTrigger>
                 <TooltipContent align="center">
                   {autoButton.tooltip ?? autoButton.label}
+                  {!autoButton.disabled && ` (${formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION)})`}
                 </TooltipContent>
               </Tooltip>
             )}
           </div>
         )}
       </ToolChrome>
+
+      {planActionError && (implementButton ?? autoButton) && (
+        <ToolChrome className="mt-2">
+          {/* Backend errors can hold long unbroken model IDs or URLs. */}
+          <ErrorBox role="alert" className="wrap-anywhere">
+            {planActionError}
+          </ErrorBox>
+        </ToolChrome>
+      )}
     </div>
   );
 

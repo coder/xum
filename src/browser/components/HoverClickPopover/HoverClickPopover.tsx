@@ -31,6 +31,11 @@ const HOVER_BRIDGE_CLASSNAME = cn(
   "data-[side=right]:before:top-0 data-[side=right]:before:bottom-0 data-[side=right]:before:-left-2 data-[side=right]:before:w-2"
 );
 
+/** Whether an event's relatedTarget (where the pointer or focus went) lies inside `container`. */
+function isInside(container: HTMLElement | null, target: EventTarget | null): boolean {
+  return target instanceof Node && container?.contains(target) === true;
+}
+
 function composeEventHandlers<E extends { defaultPrevented?: boolean }>(
   userHandler: ((event: E) => void) | undefined,
   ourHandler: ((event: E) => void) | undefined
@@ -54,6 +59,7 @@ export const HoverClickPopover: React.FC<HoverClickPopoverProps> = (props) => {
   const triggerRef = React.useRef<HTMLButtonElement | null>(null);
   const contentRef = React.useRef<HTMLDivElement | null>(null);
   const closeTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoverOpenedRef = React.useRef(false);
 
   // Cleanup timeout on unmount
   React.useEffect(() => {
@@ -102,19 +108,22 @@ export const HoverClickPopover: React.FC<HoverClickPopoverProps> = (props) => {
     setIsFocused(false);
   };
 
-  const handleTriggerPointerEnter = (event: React.PointerEvent<HTMLButtonElement>) => {
+  // Opens on pointermove, not pointerenter: a trigger that slides under a resting pointer (the
+  // header widening as the right sidebar collapses) gets pointerenter but no pointermove, and
+  // must not open a preview that takes focus from the control the user was on. Once per visit,
+  // so a preview dismissed under the pointer stays closed until the pointer leaves.
+  const handleTriggerPointerMove = (event: React.PointerEvent<HTMLButtonElement>) => {
     // Avoid disabling hover for mouse on hybrid devices: only ignore *touch* pointers.
-    if (event.pointerType === "touch") return;
+    if (event.pointerType === "touch" || hoverOpenedRef.current) return;
+    hoverOpenedRef.current = true;
     cancelPendingClose();
     setIsHovering(true);
   };
 
   const handleTriggerPointerLeave = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (event.pointerType === "touch") return;
-    const relatedTarget = event.relatedTarget;
-    if (relatedTarget instanceof Node && contentRef.current?.contains(relatedTarget)) {
-      return;
-    }
+    hoverOpenedRef.current = false;
+    if (isInside(contentRef.current, event.relatedTarget)) return;
     scheduleClose();
   };
 
@@ -124,10 +133,7 @@ export const HoverClickPopover: React.FC<HoverClickPopoverProps> = (props) => {
   };
 
   const handleTriggerBlur = (event: React.FocusEvent<HTMLButtonElement>) => {
-    const relatedTarget = event.relatedTarget;
-    if (relatedTarget instanceof Node && contentRef.current?.contains(relatedTarget)) {
-      return;
-    }
+    if (isInside(contentRef.current, event.relatedTarget)) return;
     setIsFocused(false);
   };
 
@@ -139,10 +145,7 @@ export const HoverClickPopover: React.FC<HoverClickPopoverProps> = (props) => {
 
   const handleContentPointerLeave = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.pointerType === "touch") return;
-    const relatedTarget = event.relatedTarget;
-    if (relatedTarget instanceof Node && triggerRef.current?.contains(relatedTarget)) {
-      return;
-    }
+    if (isInside(triggerRef.current, event.relatedTarget)) return;
     scheduleClose();
   };
 
@@ -152,13 +155,8 @@ export const HoverClickPopover: React.FC<HoverClickPopoverProps> = (props) => {
   };
 
   const handleContentBlur = (event: React.FocusEvent<HTMLDivElement>) => {
-    const relatedTarget = event.relatedTarget;
-    if (relatedTarget instanceof Node && triggerRef.current?.contains(relatedTarget)) {
-      return;
-    }
-    if (relatedTarget instanceof Node && contentRef.current?.contains(relatedTarget)) {
-      return;
-    }
+    if (isInside(triggerRef.current, event.relatedTarget)) return;
+    if (isInside(contentRef.current, event.relatedTarget)) return;
     setIsFocused(false);
   };
 
@@ -178,7 +176,7 @@ export const HoverClickPopover: React.FC<HoverClickPopoverProps> = (props) => {
     onClick: composeEventHandlers(triggerProps.onClick, handleTriggerClick),
     onFocus: composeEventHandlers(triggerProps.onFocus, handleTriggerFocus),
     onBlur: composeEventHandlers(triggerProps.onBlur, handleTriggerBlur),
-    onPointerEnter: composeEventHandlers(triggerProps.onPointerEnter, handleTriggerPointerEnter),
+    onPointerMove: composeEventHandlers(triggerProps.onPointerMove, handleTriggerPointerMove),
     onPointerLeave: composeEventHandlers(triggerProps.onPointerLeave, handleTriggerPointerLeave),
   });
 

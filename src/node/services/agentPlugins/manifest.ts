@@ -1,0 +1,530 @@
+/**
+ * Agent Plugins 1.0.0 manifest (`plugin.json`) validation.
+ *
+ * Implements §5 of the Agent Plugins specification (https://agent-plugins.org,
+ * spec repo: agentplugins/agent-plugins-spec) against the canonical
+ * plugin.schema.json:
+ * - Closed top-level schema, but unknown top-level fields are NON-fatal:
+ *   report + ignore (§5.3).
+ * - `$schema` (required) dispatches the spec version; anything other than the
+ *   recognized 1.0.0 const is rejected with the distinct "unsupported-version"
+ *   reason so clients can report it separately from malformed manifests.
+ * - `name` (required): 1-64 chars, lowercase alphanumeric/dot/hyphen,
+ *   alphanumeric start/end, no `--` or `..` runs.
+ * - Any other schema violation (wrong-typed permitted field) is fatal.
+ * - `extensions`: a non-object value is NON-fatal (report + ignore); namespace
+ *   member contents are never validated (§8.1/§11.1) — Xum implements no
+ *   extension namespace, so all payloads are treated as opaque.
+ * - `contributes` (Mux extension, not part of the 1.0.0 spec schema): declares
+ *   the plugin's component contributions. Every malformed member is NON-fatal
+ *   (report + ignore) so a spec-valid plugin never breaks on a Mux extension,
+ *   and older Mux versions simply report `contributes` as an unknown field.
+ */
+
+/** Canonical `$schema` const for Agent Plugins 1.0.0 plugin manifests. */
+export const AGENT_PLUGIN_SCHEMA_ID_1_0_0 =
+  "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
+
+import * as path from "node:path";
+
+// Name grammar shared with the install registry schema (see the module's doc comment).
+import {
+  isValidAgentPluginName,
+  isValidMarketplaceEntryName,
+} from "@/common/utils/agentPluginName";
+
+export { isValidAgentPluginName };
+
+export interface AgentPluginAuthor {
+  name?: string;
+  email?: string;
+  url?: string;
+}
+
+/** Command-name grammar shared with skill names (kebab-case, 1-64 chars). */
+const SLASH_COMMAND_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const SLASH_COMMAND_NAME_MAX_LENGTH = 64;
+// Expansions become chat-input text; bound them so one manifest cannot inject
+// unbounded content into the composer.
+const SLASH_COMMAND_EXPANSION_MAX_LENGTH = 16_384;
+
+export interface AgentPluginSlashCommandContribution {
+  name: string;
+  description?: string;
+  /** Replacement text inserted when the command is invoked (data-driven expansion template). */
+  expansion: string;
+}
+
+/**
+ * Mux `contributes` block: path members override the conventional component
+ * locations (skills/, mcp.json, agents/, workflows/, hooks.js) with a safe
+ * relative path inside the plugin root; `slashCommands` declares data-driven
+ * chat commands that have no on-disk convention.
+ */
+export interface AgentPluginContributes {
+  /**
+   * One skills root, or several (Codex `skills` may be an array: #6121). A list replaces the
+   * default `skills/`, as in Codex. On a duplicate skill name the earlier root wins.
+   */
+  skills?: string | string[];
+  mcp?: string;
+  agents?: string;
+  workflows?: string;
+  hooks?: string;
+  slashCommands?: AgentPluginSlashCommandContribution[];
+}
+
+const CONTRIBUTES_PATH_KEYS = ["mcp", "agents", "workflows", "hooks"] as const;
+const CONTRIBUTES_KEYS = new Set<string>([...CONTRIBUTES_PATH_KEYS, "skills", "slashCommands"]);
+/**
+ * Skills roots read per plugin. Each root costs a realpath and a directory scan in every
+ * discovery, and a 256 KiB manifest can list thousands of them.
+ */
+export const MAX_SKILLS_ROOTS = 16;
+
+/**
+ * A contributes path must stay a plain relative path. Realpath containment is
+ * enforced again at discovery time; rejecting obvious escapes here yields
+ * clearer manifest-level warnings.
+ */
+export function isSafeContributesPath(value: string): boolean {
+  if (value.length === 0 || value.includes("\0")) {
+    return false;
+  }
+  if (/^[/\\]/.test(value) || /^[a-zA-Z]:/.test(value) || value.startsWith("~")) {
+    return false;
+  }
+  const segments = value.replaceAll("\\", "/").split("/");
+  return segments.every((segment) => segment.length > 0 && segment !== "..");
+}
+
+function parseSlashCommandContributions(
+  raw: unknown,
+  warnings: string[]
+): AgentPluginSlashCommandContribution[] | undefined {
+  if (!Array.isArray(raw)) {
+    warnings.push("'contributes.slashCommands' must be an array; ignoring");
+    return undefined;
+  }
+
+  const commands: AgentPluginSlashCommandContribution[] = [];
+  const seenNames = new Set<string>();
+  for (const entry of raw) {
+    if (!isPlainObject(entry)) {
+      warnings.push("'contributes.slashCommands' entries must be objects; ignoring an entry");
+      continue;
+    }
+    const { name, description, expansion } = entry;
+    if (
+      typeof name !== "string" ||
+      name.length > SLASH_COMMAND_NAME_MAX_LENGTH ||
+      !SLASH_COMMAND_NAME_PATTERN.test(name)
+    ) {
+      warnings.push(
+        "'contributes.slashCommands[].name' must be 1-64 kebab-case characters; ignoring an entry"
+      );
+      continue;
+    }
+    if (
+      typeof expansion !== "string" ||
+      expansion.trim().length === 0 ||
+      expansion.length > SLASH_COMMAND_EXPANSION_MAX_LENGTH
+    ) {
+      warnings.push(
+        `'contributes.slashCommands[].expansion' for '${name}' must be a non-empty string (max ${SLASH_COMMAND_EXPANSION_MAX_LENGTH} chars); ignoring the entry`
+      );
+      continue;
+    }
+    if (description !== undefined && typeof description !== "string") {
+      warnings.push(
+        `'contributes.slashCommands[].description' for '${name}' must be a string; ignoring the entry`
+      );
+      continue;
+    }
+    if (seenNames.has(name)) {
+      warnings.push(`Duplicate contributed slash command '${name}'; first declaration wins`);
+      continue;
+    }
+    seenNames.add(name);
+    commands.push({
+      name,
+      expansion,
+      ...(description !== undefined ? { description } : {}),
+    });
+  }
+
+  return commands;
+}
+
+const SKILLS_PATH_RULE =
+  "'contributes.skills' must be a relative path inside the plugin, or a list of them";
+
+/**
+ * `contributes.skills`: one safe path, or a list that keeps its safe, distinct entries. With none
+ * left the default `skills/` applies.
+ */
+function parseSkillsRoots(
+  raw: unknown,
+  warnings: string[]
+): Pick<AgentPluginContributes, "skills"> {
+  if (raw === undefined) return {};
+  if (typeof raw === "string" && isSafeContributesPath(raw)) return { skills: raw };
+  if (!Array.isArray(raw)) {
+    warnings.push(`${SKILLS_PATH_RULE}; ignoring (using the default location)`);
+    return {};
+  }
+  const roots = parseSkillsRootList(raw, warnings);
+  return roots.length > 0 ? { skills: roots } : {};
+}
+
+/**
+ * Up to MAX_SKILLS_ROOTS distinct safe roots, in declared order. Only kept roots count toward the
+ * cap, so repeated or invalid entries cannot push out a later valid root (Codex
+ * PRRT_kwDOPxxmWM6sPFP6). The scan is pure string checks, so a long list costs no I/O, and one
+ * warning reports every ignored entry.
+ */
+function parseSkillsRootList(raw: unknown[], warnings: string[]): string[] {
+  const roots: string[] = [];
+  let invalid = 0;
+  let index = 0;
+  for (; index < raw.length && roots.length < MAX_SKILLS_ROOTS; index++) {
+    const entry = raw[index];
+    if (typeof entry !== "string" || !isSafeContributesPath(entry)) invalid++;
+    else if (!roots.includes(entry)) roots.push(entry);
+  }
+  if (invalid > 0) warnings.push(`${SKILLS_PATH_RULE}; ignoring invalid entries (${invalid})`);
+  if (index < raw.length) {
+    warnings.push(
+      `'contributes.skills' lists more than ${MAX_SKILLS_ROOTS} roots; reading only the first ${MAX_SKILLS_ROOTS}`
+    );
+  }
+  return roots;
+}
+
+function parseContributes(raw: unknown, warnings: string[]): AgentPluginContributes | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!isPlainObject(raw)) {
+    warnings.push("'contributes' must be an object; ignoring");
+    return undefined;
+  }
+
+  const contributes: AgentPluginContributes = {};
+
+  for (const key of Object.keys(raw)) {
+    if (!CONTRIBUTES_KEYS.has(key)) {
+      warnings.push(`Unknown 'contributes.${key}' member ignored`);
+    }
+  }
+
+  for (const key of CONTRIBUTES_PATH_KEYS) {
+    const value = raw[key];
+    if (value === undefined) {
+      continue;
+    }
+    if (typeof value !== "string" || !isSafeContributesPath(value)) {
+      warnings.push(
+        `'contributes.${key}' must be a relative path inside the plugin; ignoring (using the default location)`
+      );
+      continue;
+    }
+    contributes[key] = value;
+  }
+
+  Object.assign(contributes, parseSkillsRoots(raw.skills, warnings));
+
+  if (raw.slashCommands !== undefined) {
+    const commands = parseSlashCommandContributions(raw.slashCommands, warnings);
+    if (commands !== undefined) {
+      contributes.slashCommands = commands;
+    }
+  }
+
+  return contributes;
+}
+
+export interface AgentPluginManifest {
+  /** The accepted `$schema` value (identifies the spec version). */
+  schemaId: string;
+  name: string;
+  version?: string;
+  description?: string;
+  author?: AgentPluginAuthor;
+  homepage?: string;
+  repository?: string;
+  license?: string;
+  keywords?: string[];
+  /** Opaque §8 extension namespaces. Contents are never validated here; Mux
+   * consumers (e.g. plugin hook capability requests under `extensions.mux`)
+   * interpret their own namespace defensively. */
+  extensions?: Record<string, unknown>;
+  /** Mux extension: declarative component contributions (see module docs). */
+  contributes?: AgentPluginContributes;
+}
+
+/**
+ * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
+ * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
+ * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
+ * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
+ * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
+ * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
+ * file off. Those builds then load only the skills roots the manifest lists. Builds before
+ * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
+ */
+export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
+
+/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
+export function inertGeneratedComponents(): {
+  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
+  openai: { hooks: [] };
+} {
+  return {
+    contributes: {
+      hooks: INERT_COMPONENT_PATH,
+      agents: INERT_COMPONENT_PATH,
+      workflows: INERT_COMPONENT_PATH,
+      mcp: INERT_COMPONENT_PATH,
+    },
+    openai: { hooks: [] },
+  };
+}
+
+/**
+ * `extensions.mux.generatedFrom`: Xum wrote this plugin.json for a repository that had none
+ * (installMethods.ts). Update reads it from the installed tree to regenerate with the same
+ * method. `claude-marketplace` names the marketplace entry, and carries the entry's `commands`
+ * paths (a Claude component without a `contributes` member) and the agent file names that its
+ * `agents` lists (ClaudePluginComponents.agentFiles).
+ */
+export type GeneratedFrom =
+  | { kind: "skills" }
+  | { kind: "claude-marketplace"; entry: string; commands?: string[]; agentFiles?: string[] };
+
+function generatedFromValue(manifest: Pick<AgentPluginManifest, "extensions">): unknown {
+  const mux = manifest.extensions?.mux;
+  return isPlainObject(mux) ? mux.generatedFrom : undefined;
+}
+
+/**
+ * True when the manifest carries the marker in any shape. A repository can write the marker
+ * itself, so discovery uses this only to REMOVE capabilities (see discoverPluginAt).
+ */
+export function hasGeneratedFromMarker(manifest: Pick<AgentPluginManifest, "extensions">): boolean {
+  return generatedFromValue(manifest) !== undefined;
+}
+
+/** `commands` of a claude-marketplace marker: normalized safe paths, at most MAX_SKILLS_ROOTS. */
+function isMarkerCommandList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_SKILLS_ROOTS &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        isSafeContributesPath(item) &&
+        path.posix.normalize(item) === item
+    )
+  );
+}
+
+/**
+ * The marker when its kind is one this build generates, in exactly the shape Xum writes;
+ * undefined for absent, unknown or malformed ones (discovery reads those as skills-only).
+ */
+export function readGeneratedFrom(
+  manifest: Pick<AgentPluginManifest, "extensions">
+): GeneratedFrom | undefined {
+  const value = generatedFromValue(manifest);
+  if (!isPlainObject(value)) return undefined;
+  if (value.kind === "skills") return { kind: "skills" };
+  if (value.kind !== "claude-marketplace") return undefined;
+  if (typeof value.entry !== "string" || !isValidMarketplaceEntryName(value.entry)) {
+    return undefined;
+  }
+  if (value.commands !== undefined && !isMarkerCommandList(value.commands)) return undefined;
+  if (value.agentFiles !== undefined && !isMarkerAgentFileList(value.agentFiles)) return undefined;
+  return {
+    kind: "claude-marketplace",
+    entry: value.entry,
+    ...(value.commands !== undefined ? { commands: value.commands } : {}),
+    ...(value.agentFiles !== undefined ? { agentFiles: value.agentFiles } : {}),
+  };
+}
+
+/** `agentFiles` of a claude-marketplace marker: `.md` file names without a folder. */
+function isMarkerAgentFileList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        item.endsWith(".md") &&
+        isSafeContributesPath(item) &&
+        !item.includes("/") &&
+        !item.includes("\\")
+    )
+  );
+}
+
+export type PluginManifestValidation =
+  | { ok: true; manifest: AgentPluginManifest; warnings: string[] }
+  | { ok: false; reason: "unsupported-version" | "invalid-manifest"; errors: string[] };
+
+const PERMITTED_TOP_LEVEL_KEYS = new Set([
+  "$schema",
+  "name",
+  "version",
+  "description",
+  "author",
+  "homepage",
+  "repository",
+  "license",
+  "keywords",
+  "extensions",
+  "contributes",
+]);
+
+const OPTIONAL_STRING_FIELDS = [
+  "version",
+  "description",
+  "homepage",
+  "repository",
+  "license",
+] as const;
+
+const AUTHOR_KEYS = ["name", "email", "url"] as const;
+
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function validatePluginManifest(raw: unknown): PluginManifestValidation {
+  if (!isPlainObject(raw)) {
+    return {
+      ok: false,
+      reason: "invalid-manifest",
+      errors: ["plugin.json must be a JSON object"],
+    };
+  }
+
+  const warnings: string[] = [];
+  const errors: string[] = [];
+
+  // §5.3: unknown top-level fields are ignored with a report, not fatal.
+  for (const key of Object.keys(raw)) {
+    if (!PERMITTED_TOP_LEVEL_KEYS.has(key)) {
+      warnings.push(`Unknown top-level field '${key}' ignored`);
+    }
+  }
+
+  const schemaId = raw.$schema;
+  if (typeof schemaId !== "string") {
+    return {
+      ok: false,
+      reason: "invalid-manifest",
+      errors: ["'$schema' is required and must be a string"],
+    };
+  }
+  if (schemaId !== AGENT_PLUGIN_SCHEMA_ID_1_0_0) {
+    // Distinct reason so callers can report "newer/unknown spec version" separately.
+    return {
+      ok: false,
+      reason: "unsupported-version",
+      errors: [`Unsupported Agent Plugins '$schema': '${schemaId}'`],
+    };
+  }
+
+  const name = raw.name;
+  if (typeof name !== "string" || !isValidAgentPluginName(name)) {
+    errors.push(
+      "'name' is required and must be 1-64 characters of lowercase [a-z0-9.-], starting/ending alphanumeric, without '--' or '..'"
+    );
+  }
+
+  for (const field of OPTIONAL_STRING_FIELDS) {
+    const value = raw[field];
+    if (value !== undefined && typeof value !== "string") {
+      errors.push(`'${field}' must be a string`);
+    }
+  }
+
+  const keywords = raw.keywords;
+  if (
+    keywords !== undefined &&
+    (!Array.isArray(keywords) || keywords.some((keyword) => typeof keyword !== "string"))
+  ) {
+    errors.push("'keywords' must be an array of strings");
+  }
+
+  let author: AgentPluginAuthor | undefined;
+  if (raw.author !== undefined) {
+    if (!isPlainObject(raw.author)) {
+      errors.push("'author' must be an object");
+    } else {
+      // Canonical schema closes the author object (additionalProperties: false).
+      const authorRecord = raw.author;
+      const authorErrors: string[] = [];
+      for (const key of Object.keys(authorRecord)) {
+        if (!AUTHOR_KEYS.includes(key as (typeof AUTHOR_KEYS)[number])) {
+          authorErrors.push(`'author.${key}' is not a permitted field`);
+        }
+      }
+      for (const key of AUTHOR_KEYS) {
+        const value = authorRecord[key];
+        if (value !== undefined && typeof value !== "string") {
+          authorErrors.push(`'author.${key}' must be a string`);
+        }
+      }
+
+      if (authorErrors.length > 0) {
+        errors.push(...authorErrors);
+      } else {
+        author = {
+          ...(typeof authorRecord.name === "string" ? { name: authorRecord.name } : {}),
+          ...(typeof authorRecord.email === "string" ? { email: authorRecord.email } : {}),
+          ...(typeof authorRecord.url === "string" ? { url: authorRecord.url } : {}),
+        };
+      }
+    }
+  }
+
+  // §8.1/§11.1: a non-object `extensions` value is reported and ignored; object
+  // contents are opaque and never validated (do not enforce the JSON Schema's
+  // per-namespace member typing here).
+  if (raw.extensions !== undefined && !isPlainObject(raw.extensions)) {
+    warnings.push("'extensions' must be an object; ignoring");
+  }
+
+  // Mux extension: malformed contributes members warn + fall back to defaults,
+  // never invalidating an otherwise spec-valid manifest.
+  const contributes = parseContributes(raw.contributes, warnings);
+
+  if (errors.length > 0) {
+    return { ok: false, reason: "invalid-manifest", errors };
+  }
+
+  // Narrowing: `name` passed validation above or we'd have returned errors.
+  if (typeof name !== "string") {
+    throw new Error("validatePluginManifest: name must be a string after validation");
+  }
+
+  const manifest: AgentPluginManifest = {
+    schemaId,
+    name,
+    ...(typeof raw.version === "string" ? { version: raw.version } : {}),
+    ...(typeof raw.description === "string" ? { description: raw.description } : {}),
+    ...(author !== undefined ? { author } : {}),
+    ...(typeof raw.homepage === "string" ? { homepage: raw.homepage } : {}),
+    ...(typeof raw.repository === "string" ? { repository: raw.repository } : {}),
+    ...(typeof raw.license === "string" ? { license: raw.license } : {}),
+    ...(Array.isArray(keywords)
+      ? { keywords: keywords.filter((k): k is string => typeof k === "string") }
+      : {}),
+    ...(isPlainObject(raw.extensions) ? { extensions: raw.extensions } : {}),
+    ...(contributes !== undefined ? { contributes } : {}),
+  };
+
+  return { ok: true, manifest, warnings };
+}

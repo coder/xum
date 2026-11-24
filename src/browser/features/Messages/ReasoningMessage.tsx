@@ -151,7 +151,10 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
           </span>
           <div className="flex min-w-0 items-center gap-1 truncate">
             {isStreaming ? (
-              <Shimmer colorClass="var(--color-thinking-mode)">Thinking...</Shimmer>
+              <Shimmer className="thinking-shimmer" colorClass="var(--color-thinking-mode)">
+                {/* The collapsed-content ellipsis below already communicates truncation. */}
+                {showEllipsis ? "Thinking" : "Thinking..."}
+              </Shimmer>
             ) : hasContent ? (
               <span className={cn("truncate whitespace-nowrap text-text", REASONING_FONT_CLASSES)}>
                 {parsedLeadingBoldSummary ? (

@@ -162,11 +162,11 @@ describe("Task report relocation UI", () => {
       expect(taskMessageBlock?.textContent).toContain("item 1");
       expect(taskMessageBlock?.textContent).toContain("item 2");
 
-      const awaitToolName = view.getByText("task_await");
-      const awaitMessageBlock = awaitToolName.closest('[data-testid="chat-message"]');
+      const awaitSummary = view.getByLabelText("1 task completed. Show task wait details");
+      const awaitMessageBlock = awaitSummary.closest('[data-testid="chat-message"]');
       expect(awaitMessageBlock).toBeTruthy();
 
-      awaitToolName.click();
+      awaitSummary.click();
 
       await waitFor(() => {
         expect(awaitMessageBlock?.textContent).toContain("task-1");

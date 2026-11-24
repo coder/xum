@@ -7,338 +7,285 @@ import react from "eslint-plugin-react";
 import reactHooks from "eslint-plugin-react-hooks";
 import tailwindcss from "eslint-plugin-tailwindcss";
 import tseslint from "typescript-eslint";
+import path from "node:path";
+import localPlugin from "./eslint-local-rules.mjs";
 
-/**
- * Custom ESLint plugin for safe Node.js patterns
- * Enforces safe child_process and filesystem patterns
- */
-const localPlugin = {
-  rules: {
-    "no-unsafe-child-process": {
-      meta: {
-        type: "problem",
-        docs: {
-          description: "Prevent unsafe child_process usage that can cause zombie processes",
-        },
-        messages: {
-          unsafePromisifyExec:
-            "Do not use promisify(exec) directly. Use DisposableExec wrapper with 'using' declaration to prevent zombie processes.",
-        },
-      },
-      create(context) {
-        return {
-          CallExpression(node) {
-            // Ban promisify(exec)
-            if (
-              node.callee.type === "Identifier" &&
-              node.callee.name === "promisify" &&
-              node.arguments.length > 0 &&
-              node.arguments[0].type === "Identifier" &&
-              node.arguments[0].name === "exec"
-            ) {
-              context.report({
-                node,
-                messageId: "unsafePromisifyExec",
-              });
-            }
-          },
-        };
-      },
-    },
-    "no-sync-fs-methods": {
-      meta: {
-        type: "problem",
-        docs: {
-          description: "Prevent synchronous filesystem operations",
-        },
-        messages: {
-          syncFsMethod:
-            "Do not use synchronous fs methods ({{method}}). Use async version instead: {{asyncMethod}}",
-        },
-      },
-      create(context) {
-        // Map of sync methods to their async equivalents
-        const syncMethods = {
-          statSync: "stat",
-          readFileSync: "readFile",
-          writeFileSync: "writeFile",
-          readdirSync: "readdir",
-          mkdirSync: "mkdir",
-          unlinkSync: "unlink",
-          rmdirSync: "rmdir",
-          existsSync: "access or stat",
-          accessSync: "access",
-          copyFileSync: "copyFile",
-          renameSync: "rename",
-          chmodSync: "chmod",
-          chownSync: "chown",
-          lstatSync: "lstat",
-          linkSync: "link",
-          symlinkSync: "symlink",
-          readlinkSync: "readlink",
-          realpathSync: "realpath",
-          truncateSync: "truncate",
-          fstatSync: "fstat",
-          appendFileSync: "appendFile",
-        };
-
-        return {
-          MemberExpression(node) {
-            // Only flag if it's a property access on 'fs' or imported fs methods
-            if (
-              node.property &&
-              node.property.type === "Identifier" &&
-              syncMethods[node.property.name] &&
-              node.object &&
-              node.object.type === "Identifier" &&
-              (node.object.name === "fs" || node.object.name === "fsPromises")
-            ) {
-              context.report({
-                node,
-                messageId: "syncFsMethod",
-                data: {
-                  method: node.property.name,
-                  asyncMethod: syncMethods[node.property.name],
-                },
-              });
-            }
-          },
-        };
-      },
-    },
-    "no-cross-boundary-imports": {
-      meta: {
-        type: "problem",
-        docs: {
-          description: "Enforce folder boundaries to prevent architectural violations",
-        },
-        messages: {
-          browserToNode:
-            "browser/ cannot import from node/. Move shared code to common/ or use IPC.",
-          nodeToDesktop:
-            "node/ cannot import from desktop/. Move shared code to common/ or use dependency injection.",
-          nodeToCli: "node/ cannot import from cli/. Move shared code to common/.",
-          cliToBrowser: "cli/ cannot import from browser/. Move shared code to common/.",
-          desktopToBrowser: "desktop/ cannot import from browser/. Move shared code to common/.",
-        },
-      },
-      create(context) {
-        return {
-          ImportDeclaration(node) {
-            // Allow type-only imports (for DI patterns)
-            if (node.importKind === "type") {
-              return;
-            }
-
-            const sourceFile = context.filename;
-            const importPath = node.source.value;
-
-            // Extract folder from source file (browser, node, desktop, cli, common)
-            const sourceFolderMatch = sourceFile.match(
-              /\/src\/(browser|node|desktop|cli|common)\//
-            );
-            if (!sourceFolderMatch) return;
-            const sourceFolder = sourceFolderMatch[1];
-
-            // Extract folder from import target
-            // Handle relative imports (e.g., '../node/...')
-            let targetFolder = null;
-            if (importPath.startsWith("../")) {
-              const targetMatch = importPath.match(/\.\.\/(browser|node|desktop|cli|common)\//);
-              if (targetMatch) {
-                targetFolder = targetMatch[1];
-              }
-            } else if (importPath.startsWith("@/")) {
-              // Handle alias imports (e.g., '@/node/...')
-              const targetMatch = importPath.match(/@\/(browser|node|desktop|cli|common)\//);
-              if (targetMatch) {
-                targetFolder = targetMatch[1];
-              }
-            }
-
-            if (!targetFolder) return;
-
-            // Allow imports from common
-            if (targetFolder === "common") return;
-
-            // Check for violations
-            if (sourceFolder === "browser" && targetFolder === "node") {
-              context.report({
-                node,
-                messageId: "browserToNode",
-              });
-            } else if (sourceFolder === "node" && targetFolder === "desktop") {
-              context.report({
-                node,
-                messageId: "nodeToDesktop",
-              });
-            } else if (sourceFolder === "node" && targetFolder === "cli") {
-              context.report({
-                node,
-                messageId: "nodeToCli",
-              });
-            } else if (sourceFolder === "cli" && targetFolder === "browser") {
-              context.report({
-                node,
-                messageId: "cliToBrowser",
-              });
-            } else if (sourceFolder === "desktop" && targetFolder === "browser") {
-              context.report({
-                node,
-                messageId: "desktopToBrowser",
-              });
-            }
-          },
-        };
-      },
-    },
-    "no-native-interactive-tooltips": {
-      meta: {
-        type: "problem",
-        docs: {
-          description:
-            "Disallow native title tooltips on interactive controls when the content is long or dynamic",
-        },
-        messages: {
-          useTooltip:
-            "Native title tooltips on raw interactive elements truncate easily when the content is long or dynamic. Use the shared Tooltip surface instead, or pass `title` through a shared control that intercepts it.",
-        },
-      },
-      create(context) {
-        const MAX_NATIVE_TOOLTIP_LENGTH = 20;
-        const INTERACTIVE_TAGS = new Set(["button", "input", "select", "textarea"]);
-
-        const getAttribute = (node, attributeName) =>
-          node.attributes.find(
-            (attribute) =>
-              attribute.type === "JSXAttribute" &&
-              attribute.name.type === "JSXIdentifier" &&
-              attribute.name.name === attributeName
-          ) ?? null;
-
-        const getStaticString = (expression) => {
-          if (!expression) {
-            return null;
-          }
-
-          if (expression.type === "Literal") {
-            return typeof expression.value === "string" ? expression.value : null;
-          }
-
-          if (expression.type === "TemplateLiteral" && expression.expressions.length === 0) {
-            return expression.quasis
-              .map((quasi) => quasi.value.cooked ?? quasi.value.raw)
-              .join("");
-          }
-
-          return null;
-        };
-
-        const isProblematicTitleExpression = (expression) => {
-          if (!expression) {
-            return false;
-          }
-
-          if (expression.type === "Literal") {
-            if (expression.value == null) {
-              return false;
-            }
-
-            return (
-              typeof expression.value === "string" &&
-              (expression.value.includes("\n") ||
-                expression.value.length > MAX_NATIVE_TOOLTIP_LENGTH)
-            );
-          }
-
-          if (expression.type === "TemplateLiteral") {
-            if (expression.expressions.length > 0) {
-              return true;
-            }
-
-            const value = getStaticString(expression);
-            return value !== null
-              ? value.includes("\n") || value.length > MAX_NATIVE_TOOLTIP_LENGTH
-              : true;
-          }
-
-          if (expression.type === "ConditionalExpression") {
-            return (
-              isProblematicTitleExpression(expression.consequent) ||
-              isProblematicTitleExpression(expression.alternate)
-            );
-          }
-
-          const staticValue = getStaticString(expression);
-          if (staticValue !== null) {
-            return (
-              staticValue.includes("\n") || staticValue.length > MAX_NATIVE_TOOLTIP_LENGTH
-            );
-          }
-
-          return true;
-        };
-
-        return {
-          JSXOpeningElement(node) {
-            if (node.name.type !== "JSXIdentifier") {
-              return;
-            }
-
-            const elementName = node.name.name;
-            if (elementName !== elementName.toLowerCase()) {
-              return;
-            }
-
-            const onClickAttribute = getAttribute(node, "onClick");
-            const hrefAttribute = getAttribute(node, "href");
-            const roleAttribute = getAttribute(node, "role");
-            const roleValue =
-              roleAttribute &&
-              roleAttribute.value?.type === "Literal" &&
-              typeof roleAttribute.value.value === "string"
-                ? roleAttribute.value.value
-                : null;
-            const isInteractive =
-              INTERACTIVE_TAGS.has(elementName) ||
-              (elementName === "a" && hrefAttribute !== null) ||
-              onClickAttribute !== null ||
-              roleValue === "button" ||
-              roleValue === "link" ||
-              roleValue === "switch";
-            if (!isInteractive) {
-              return;
-            }
-
-            const titleAttribute = getAttribute(node, "title");
-            if (!titleAttribute || !titleAttribute.value) {
-              return;
-            }
-
-            // Normalize: Literal value nodes and JSXExpressionContainer inner
-            // expressions are both valid AST expression nodes that
-            // isProblematicTitleExpression already handles.
-            let expression;
-            if (titleAttribute.value.type === "Literal") {
-              expression = titleAttribute.value;
-            } else if (titleAttribute.value.type === "JSXExpressionContainer") {
-              expression = titleAttribute.value.expression;
-            } else {
-              return;
-            }
-
-            if (isProblematicTitleExpression(expression)) {
-              context.report({
-                node: titleAttribute,
-                messageId: "useTooltip",
-              });
-            }
-          },
-        };
-      },
-    },
-  },
+// Shared by the two no-restricted-imports blocks for src/** (a later block replaces an earlier
+// block's options for the files it matches, so each block must restate these).
+const AI_TOKENIZER_ENCODING_RESTRICTION = {
+  name: "ai-tokenizer/encoding",
+  allowTypeImports: true,
+  message:
+    "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts.",
 };
+const SHIKI_RESTRICTION = {
+  group: ["shiki"],
+  importNamePattern: "^(?!type\\s)",
+  allowTypeImports: true,
+  message:
+    "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead.",
+};
+// Browser and common code must not value-import the @/common/orpc/schemas barrel (#5971).
+// Matches "@/common/orpc/schemas" and relative forms such as "../orpc/schemas", but not leaf
+// modules such as "@/common/orpc/schemas/runtime". Every later no-restricted-imports block that
+// matches browser or common files must include it, because that block replaces this one's options.
+// The end of a module specifier: an optional extension, then an optional Vite query or hash
+// (e.g. "?worker"), which still resolves to the same module.
+const MODULE_SPECIFIER_END = "(\\.[jt]s)?([?#].*)?$";
+const ORPC_SCHEMAS_BARREL_RESTRICTION = {
+  regex: `(^|/)orpc/schemas${MODULE_SPECIFIER_END}`,
+  allowTypeImports: true,
+  message:
+    "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine.",
+};
+// Browser and common code must not value-import src/node (#6107): a src/node module can
+// value-import the barrel, which bypasses the barrel guard (e.g. src/common/utils/tools/tools.ts ->
+// src/node/services/tools/agent_skill_read.ts -> @/common/orpc/schemas). Unlike the first-load
+// forbid list in scripts/perf/firstLoadJs.ts, this runs in CI and also guards lazy chunks.
+const NODE_VALUE_IMPORT_RESTRICTION = {
+  // tsconfig maps both @/* and @shared/* to src/*.
+  regex: "^(@/|@shared/|(\\.\\./)+)node(/|$)",
+  allowTypeImports: true,
+  message:
+    "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine.",
+};
+// Backend-only modules in src/common that value-import src/node. They are exempt from
+// NODE_VALUE_IMPORT_RESTRICTION, so browser and common code must not value-import them either.
+const BACKEND_ONLY_COMMON_FILES = [
+  "src/common/utils/ai/providerOptions.ts",
+  "src/common/utils/tokens/tokenStatsCalculator.ts",
+  "src/common/utils/tools/tools.ts",
+];
+const backendOnlyCommonRestriction = (regex) => ({
+  regex,
+  allowTypeImports: true,
+  message:
+    "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine.",
+});
+// Matches "@/common/utils/tools/tools" and relative forms such as "../tools/tools". A file in the
+// module's folder or a subfolder imports it as "./tools" or "../tools", which the per-folder
+// blocks below cover.
+const BACKEND_ONLY_COMMON_RESTRICTION = backendOnlyCommonRestriction(
+  `(^|/)(${BACKEND_ONLY_COMMON_FILES.map((file) => file.split("/").slice(-2).join("/").replace(/\.ts$/, "")).join("|")})${MODULE_SPECIFIER_END}`
+);
+// Every no-restricted-imports block for browser or common files replaces the options of the
+// earlier blocks that match the same file, so each one starts from these lists.
+// local/no-host-imports (agent loop refactor, phase 1). .oxlintrc.json repeats these lists.
+// The loop core, its context code and its tools. Not tests or test helpers.
+const AGENT_LOOP_FILES = [
+  "src/node/services/agentSession.ts",
+  "src/node/services/aiService.ts",
+  "src/node/services/aiServiceEventGuards.ts",
+  "src/node/services/messagePipeline.ts",
+  "src/node/services/retryManager.ts",
+  "src/node/services/streamManager.ts",
+  "src/node/services/turn*.ts",
+  "src/node/services/contextManagement/**/*.ts",
+  "src/node/services/tools/**/*.ts",
+  // Phase 2: the history layer, whose fs calls move behind SessionFiles.
+  "src/node/services/compactionCancellation.ts",
+  "src/node/services/compactionPendingState.ts",
+  "src/node/services/continuousCompactionJournal.ts",
+  "src/node/services/historyAppendProvenance.ts",
+  "src/node/services/historyReplacementRows.ts",
+  "src/node/services/historyRowScanner.ts",
+  "src/node/services/historyScanner.ts",
+  "src/node/services/historyService.ts",
+  "src/node/services/sendIds.ts",
+];
+const AGENT_LOOP_IGNORES = [
+  "**/*.test.ts",
+  "**/*.testHarness.ts",
+  "**/*.bench.ts",
+  "src/node/services/tools/testHelpers.ts",
+];
+// local/no-raw-clock (agent loop refactor, phase 3). Its own literal list, not
+// ...AGENT_LOOP_FILES: phase 2 adds history modules there, and their clock reads are not phase 3
+// work. .oxlintrc.json repeats these lists.
+const RAW_CLOCK_FILES = [
+  "src/node/services/agentSession.ts",
+  "src/node/services/aiService.ts",
+  "src/node/services/aiServiceEventGuards.ts",
+  "src/node/services/messagePipeline.ts",
+  "src/node/services/retryManager.ts",
+  "src/node/services/streamManager.ts",
+  "src/node/services/turn*.ts",
+  "src/node/services/contextManagement/**/*.ts",
+  "src/node/services/tools/**/*.ts",
+  // Not in AGENT_LOOP_FILES: phase 3 moves its timers too.
+  "src/node/services/backgroundProcessManager.ts",
+];
+// Loop test files that moved from global fake timers and Date patches to the TestClock
+// (makeTestEffectRunner). Each phase 3 PR adds the test files it moves.
+const CLOCK_PATCH_FREE_TESTS = [
+  "src/node/services/backgroundProcessManager.test.ts",
+  "src/node/services/retryManager.test.ts",
+  "src/node/services/streamManager.toolEvents.test.ts",
+  "src/node/services/tools/web_fetch.test.ts",
+];
+// File -> the exact number of raw clock reads it still has. Phase 3 lowers each entry as it
+// moves the file onto the HostClock service, and the rule fails an entry that is too high.
+const RAW_CLOCK_ALLOW = {
+  "src/node/services/tools/bash.ts": 1,
+  // AbortSignal.timeout() on the skills.sh search request (#7282). The file calls the
+  // module-level node host services, not injected ones, so it has no HostClock to arm the
+  // deadline on. It bounds a network request, not loop time.
+  "src/node/services/tools/skillsCatalogFetch.ts": 1,
+};
+
+// local/no-fixed-sleep: browser test file -> the exact number of fixed real-time waits it still
+// has. Shrink-only: lower or delete an entry when a PR removes waits (#7608). .oxlintrc.json
+// repeats this map.
+const FIXED_SLEEP_ALLOW = {
+  "src/browser/components/AppLoader/AppLoader.auth.test.tsx": 2,
+  "src/browser/components/LeftSidebar/LeftSidebar.stories.tsx": 1,
+  "src/browser/components/ProjectSidebar/ProjectSidebar.test.tsx": 3,
+  "src/browser/components/TerminalView/TerminalView.test.tsx": 1,
+  "src/browser/components/WorkspaceMenuBar/LazySettingsModal.test.tsx": 4,
+  "src/browser/contexts/API.switch.test.tsx": 4,
+  "src/browser/contexts/API.test.tsx": 2,
+  "src/browser/contexts/AgentContext.test.tsx": 2,
+  "src/browser/contexts/WorkspaceContext.test.tsx": 4,
+  "src/browser/features/ChatInput/useComposerSuggestionsReconnect.test.tsx": 5,
+  "src/browser/features/ChatInput/useCreationWorkspace.test.tsx": 1,
+  "src/browser/features/Messages/ChatBarrier/StreamingBarrier.test.tsx": 1,
+  "src/browser/features/Messages/ChunkedStreamingMarkdown.test.tsx": 6,
+  "src/browser/features/Messages/TypewriterMarkdown.backfill.test.tsx": 1,
+  "src/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactInteractions.test.tsx": 2,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactViewer.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactsPanel.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/McpAppFrame.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/artifactBridge.test.ts": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/mcpAppOpenAiShim.test.ts": 2,
+  "src/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore.test.tsx": 1,
+  "src/browser/features/RightSidebar/BrowserTab/BrowserToolbar.test.tsx": 1,
+  "src/browser/features/RightSidebar/CodeReview/ImmersiveReviewView.test.tsx": 1,
+  "src/browser/features/RightSidebar/RightSidebar.stories.tsx": 6,
+  "src/browser/features/Settings/Sections/BackupSectionReconnect.test.tsx": 2,
+  "src/browser/features/Settings/Sections/ExperimentsSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/GeneralSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/HeartbeatSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/SecretsSection.test.tsx": 9,
+  "src/browser/features/Settings/Sections/ServerAccessSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/TasksSection.ui.test.tsx": 7,
+  "src/browser/features/SplashScreens/SplashScreenProviderReconnect.test.tsx": 3,
+  "src/browser/features/Tools/AskUserQuestion/AskUserQuestionToolCall.stories.tsx": 1,
+  "src/browser/features/desktop/useDesktopConnection.test.tsx": 4,
+  "src/browser/hooks/useAnalyticsReconnect.test.tsx": 1,
+  "src/browser/hooks/useCoderWorkspaceReconnect.test.tsx": 4,
+  "src/browser/hooks/useEscapeToDismiss.test.tsx": 1,
+  "src/browser/hooks/useWorkflowRunByIdReconnect.test.tsx": 1,
+  "src/browser/hooks/useWorkspaceHeartbeat.test.tsx": 1,
+  "src/browser/stores/CreationDraftStore.test.ts": 3,
+  "src/browser/stores/DraftStore.sendIds.test.ts": 3,
+  "src/browser/stores/DraftStore.test.ts": 4,
+  "src/browser/stores/WorkspaceStore.test.ts": 14,
+  "src/browser/stores/subscriptionTransport.test.ts": 2,
+  "src/browser/stories/App.phoneSidebarFullscreen.stories.tsx": 2,
+  "src/browser/utils/messages/StreamingMessageAggregator.init.test.ts": 2,
+  "src/browser/utils/messages/StreamingMessageAggregator.test.ts": 4,
+  "tests/ui/agents/creationWaitsForBranches.test.ts": 2,
+  "tests/ui/chat/composerSendIds.test.ts": 1,
+  "tests/ui/chat/composerStaysOnDuringSend.test.ts": 1,
+  "tests/ui/chat/editKeepsUnsentDraft.test.ts": 4,
+  "tests/ui/chat/heldQueuedMessage.test.ts": 1,
+  "tests/ui/chat/readMore.test.ts": 10,
+  "tests/ui/chat/stopRestoreQueuedDraft.test.ts": 1,
+  "tests/ui/chat/streamInterrupt.test.ts": 1,
+  "tests/ui/chat/unreadIndicator.test.ts": 2,
+  "tests/ui/helpers.ts": 1,
+  "tests/ui/layout/rightSidebar.test.ts": 1,
+  "tests/ui/review/refresh.test.ts": 2,
+  "tests/ui/review/sendAfterFailedSubscription.test.ts": 1,
+  "tests/ui/workspaces/creationDraftProjectChange.test.ts": 1,
+  "tests/ui/workspaces/lifecycle.test.ts": 1,
+};
+// The rule strips "node:" and resolves relative specifiers to "@/..." forms.
+const HOST_MODULES = [
+  "fs",
+  "fs/promises",
+  "os",
+  "net",
+  "child_process",
+  "electron",
+  // Host timers. Loop code arms timers through the HostClock service (phase 3).
+  "timers",
+  "timers/promises",
+  "@/node/utils/writeFileAtomic",
+  { module: "@/node/utils/fs", names: ["ensurePrivateDir", "ensurePrivateDirSync"] },
+  // Concrete runtimes. The Runtime interface (runtime/Runtime.ts) stays allowed.
+  ...[
+    "CoderSSHRuntime",
+    "DevcontainerRuntime",
+    "DockerRuntime",
+    "LocalBaseRuntime",
+    "LocalRuntime",
+    "RemoteRuntime",
+    "SSHRuntime",
+    "WorktreeRuntime",
+    "multiProjectRuntime",
+    "runtimeFactory",
+  ].map((name) => `@/node/runtime/${name}`),
+  // The two builders make concrete runtimes. Its path helpers and types stay allowed.
+  {
+    module: "@/node/runtime/runtimeHelpers",
+    names: ["createRuntimeForWorkspace", "createRuntimeContextForWorkspace"],
+  },
+  // getXumHome() reads XUM_ROOT and stats ~/.xum (paths.ts). Phase 5 gives loop code the
+  // Xum home through HostPaths instead. The other names here call getXumHome() when no rootDir
+  // is passed. The file-name constants of paths.ts stay allowed.
+  {
+    module: "@/common/constants/paths",
+    names: [
+      "cleanupObsoleteXumBinArtifacts",
+      "getXumExtensionMetadataPath",
+      "getXumHome",
+      "getXumLogsDir",
+      "getXumPerfCapturesDir",
+      "getXumPerfReportsDir",
+      "getXumPerfTapesDir",
+      "getXumProjectsDir",
+      "getXumSessionsDir",
+    ],
+  },
+  // The session lock modules (phase 4): loop code takes its locks through SessionLocks. Not
+  // mutexMap: tools/file_edit_operation.ts keeps a pure in-memory map.
+  "@/node/utils/concurrency/workspaceFileLocks",
+  "@/node/utils/concurrency/fileLock",
+  "@/node/utils/concurrency/processLiveness",
+  "@/node/utils/main/crossProcessLock",
+  "@/node/services/workspaceUseLeases",
+];
+// File -> the host modules it still imports. Phase plans list the pairs they add or remove.
+const HOST_IMPORT_ALLOW = {};
+
+const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];
+const SHARED_RESTRICTED_PATTERNS = [SHIKI_RESTRICTION, ORPC_SCHEMAS_BARREL_RESTRICTION];
+const BROWSER_COMMON_RESTRICTED_PATTERNS = [
+  ...SHARED_RESTRICTED_PATTERNS,
+  NODE_VALUE_IMPORT_RESTRICTION,
+  BACKEND_ONLY_COMMON_RESTRICTION,
+];
+const restrictedImportsRule = (paths, patterns) => ({
+  "no-restricted-imports": ["error", { paths: [...SHARED_RESTRICTED_PATHS, ...paths], patterns }],
+});
+// A common folder with its own no-restricted-imports options gets two blocks: production files
+// get the full browser/common list, and tests get only the shared list, because tests may use
+// src/node helpers like every other test. Both keep the folder's own paths and patterns.
+const TEST_FILES = "src/**/*.test.{ts,tsx}";
+const commonFolderBlocks = ({ glob, paths = [], patterns }) => [
+  {
+    files: [glob],
+    ignores: [TEST_FILES],
+    rules: restrictedImportsRule(paths, [...BROWSER_COMMON_RESTRICTED_PATTERNS, ...patterns]),
+  },
+  {
+    // A nested array matches files that match every glob in it.
+    files: [[glob, TEST_FILES]],
+    rules: restrictedImportsRule(paths, [...SHARED_RESTRICTED_PATTERNS, ...patterns]),
+  },
+];
 
 export default defineConfig([
   {
@@ -352,7 +299,6 @@ export default defineConfig([
       "!eslint.config.mjs",
       "vite.config.ts",
       "electron.vite.config.ts",
-      "src/browser/main.tsx",
     ],
   },
   js.configs.recommended,
@@ -391,6 +337,13 @@ export default defineConfig([
       "react-hooks": reactHooks,
       tailwindcss,
       local: localPlugin,
+    },
+    linterOptions: {
+      // Grandfathered anti-slop violations are marked with per-site
+      // eslint-disable-next-line directives. Erroring on unused directives
+      // makes that a true shrink-only ratchet: fixing a site forces removal
+      // of its directive, and the directive cannot silently outlive the code.
+      reportUnusedDisableDirectives: "error",
     },
     settings: {
       react: {
@@ -465,6 +418,18 @@ export default defineConfig([
       // Highlight unnecessary assertions to keep code idiomatic
       "@typescript-eslint/no-unnecessary-type-assertion": "error",
 
+      // Switches over union types must handle every member (or declare an
+      // explicit default). Pairs with the Record<Enum, Value> mapping rule:
+      // adding a union member then surfaces every switch that needs updating.
+      "@typescript-eslint/switch-exhaustiveness-check": [
+        "error",
+        {
+          // A default case counts as handling the rest; without this the rule
+          // would force enumerating members that intentionally share one path.
+          considerDefaultExhaustiveForUnions: true,
+        },
+      ],
+
       // Encourage readonly where possible to surface unintended mutations
       "@typescript-eslint/prefer-readonly": [
         "error",
@@ -499,6 +464,30 @@ export default defineConfig([
       "local/no-cross-boundary-imports": "error",
 
       "local/no-native-interactive-tooltips": "error",
+
+      // Anti-slop ports (see localPlugin). Chained assertions are banned in
+      // production code; test/story/mock files are exempt (casting partial
+      // doubles through `unknown` is the standard mock idiom). Pre-existing
+      // violations carry per-site eslint-disable-next-line directives so new
+      // violations fail lint even in files that contain grandfathered ones.
+      "local/no-chained-type-assertions": "error",
+      // Implemented but not enforced: 629 existing occurrences across 145
+      // files use `...(cond ? { x } : {})` deliberately to omit keys
+      // (omitted-vs-undefined matters for JSON serialization and spread
+      // merging). Flip to "error" only after a codebase-wide cleanup.
+      "local/no-conditional-empty-object-spread": "off",
+      // Assertion-position widening of known values (`{...} as Record<string,
+      // unknown>`, `literal as unknown`) is never necessary — an annotation or
+      // `satisfies` always works and, unlike an assertion, cannot mask typos.
+      // Annotation flows stay unchecked (checkAnnotations: false): 247 prod
+      // sites include semantically required open dictionaries (arbitrary-key
+      // tables like `Record<string, LucideIcon>` need the index signature at
+      // call sites), the `Record<Enum, Value>` exhaustive-mapping pattern this
+      // repo mandates, and legit `unknown`-returning boundary parsers.
+      "local/no-known-value-widening": ["error", { checkAnnotations: false }],
+      "local/no-widen-then-assert": "error",
+      "local/no-unknown-type-aliases": "error",
+      "local/no-object-parameters": "error",
 
       // Allow console for this app (it's a dev tool)
       "no-console": "off",
@@ -581,10 +570,92 @@ export default defineConfig([
     },
   },
   {
+    // Web storage goes through the persisted-state helpers (see local/no-direct-web-storage).
+    // Tests, stories and story utilities seed and inspect storage directly.
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: [
+      "src/browser/hooks/usePersistedState.ts",
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.stories.ts",
+      "**/*.stories.tsx",
+      "src/browser/stories/**",
+      "src/**/*StoryUtils.tsx",
+      "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
+      "src/**/test[A-Z]*.ts",
+    ],
+    rules: {
+      "local/no-direct-web-storage": "error",
+    },
+  },
+  {
+    // CSS zoom lays out differently in Safari than in Chromium (see local/no-css-zoom), so
+    // renderer code sizes elements with explicit pixels. CSS files: `make check-no-css-zoom`.
+    // Tests and stories keep fixtures that may use the name for other data.
+    files: ["src/browser/**/*.{ts,tsx}", "vscode/src/webview/**/*.{ts,tsx}"],
+    ignores: [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.stories.ts",
+      "**/*.stories.tsx",
+      "src/browser/stories/**",
+      "src/**/*StoryUtils.tsx",
+      "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
+      "src/**/test[A-Z]*.ts",
+    ],
+    rules: {
+      "local/no-css-zoom": "error",
+    },
+  },
+  {
+    // Agent-loop files get host access from Effect services, not by an import (agent loop
+    // refactor, phase 1). The allow map is today's debt: later phases only remove entries, and
+    // scripts/noHostImports.test.ts freezes it.
+    files: AGENT_LOOP_FILES,
+    ignores: AGENT_LOOP_IGNORES,
+    rules: {
+      "local/no-host-imports": ["error", { modules: HOST_MODULES, allow: HOST_IMPORT_ALLOW }],
+    },
+  },
+  {
+    // Agent-loop files read time and arm timers through the HostClock service, so tests can
+    // drive loop time with the TestClock (agent loop refactor, phase 3).
+    files: RAW_CLOCK_FILES,
+    ignores: AGENT_LOOP_IGNORES,
+    rules: {
+      "local/no-raw-clock": ["error", { allow: RAW_CLOCK_ALLOW }],
+    },
+  },
+  {
+    // These loop tests drive time with the TestClock; a global patch would come back silently.
+    files: CLOCK_PATCH_FREE_TESTS,
+    rules: {
+      "local/no-global-clock-patch": "error",
+    },
+  },
+  {
+    // Backend production code: required-member typeof guards only exist to tolerate partial
+    // test doubles; tests must complete the doubles instead (see the rule's docs).
+    files: ["src/node/services/**/*.ts"],
+    ignores: [
+      "**/*.test.ts",
+      "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
+      "**/*.testUtils.ts",
+      "**/test*/**",
+    ],
+    rules: {
+      "local/no-required-member-typeof-guard": "error",
+    },
+  },
+  {
     // Temporarily allow sync fs methods in files with existing usage
     // TODO: Gradually migrate these to async operations
     files: [
-      "src/node/config.ts",
+      "src/node/config/index.ts",
+      "src/node/config/**/*.ts",
       "src/cli/debug/**/*.ts",
       "src/node/git.ts",
       "src/desktop/main.ts",
@@ -648,58 +719,106 @@ export default defineConfig([
       "no-restricted-imports": [
         "error",
         {
-          patterns: [
-            {
-              group: ["shiki"],
-              importNamePattern: "^(?!type\\s)",
-              allowTypeImports: true,
-              message:
-                "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead.",
-            },
-          ],
+          // Lives here, not in the src/** block above: this later block replaces that block's
+          // no-restricted-imports options for every file it matches.
+          paths: [AI_TOKENIZER_ENCODING_RESTRICTION],
+          patterns: [SHIKI_RESTRICTION],
         },
       ],
     },
   },
   {
-    // ORPC must import config schemas via direct file paths, never the schemas barrel
-    files: ["src/common/orpc/**/*.ts"],
-    rules: {
-      "no-restricted-imports": [
-        "error",
-        {
-          paths: [
-            {
-              name: "@/common/config/schemas",
-              message:
-                "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
-            },
-            {
-              name: "@/common/config/schemas/index",
-              message:
-                "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
-            },
-          ],
-        },
-      ],
-    },
+    // Browser and common code import schemas from their leaf modules, never the
+    // @/common/orpc/schemas barrel: one value import of the barrel puts every schema, including
+    // the api.ts router schemas, on the browser's first load (#5971). Type-only imports are
+    // erased at compile time, so they stay allowed. Restates the block above, because this block
+    // replaces its no-restricted-imports options for the files it matches.
+    // src/constants is shared with the browser, so it is guarded too.
+    files: ["src/browser/**/*.{ts,tsx}", "src/common/**/*.{ts,tsx}", "src/constants/**/*.{ts,tsx}"],
+    ignores: ["src/browser/workers/highlightWorker.ts", TEST_FILES],
+    rules: restrictedImportsRule([], BROWSER_COMMON_RESTRICTED_PATTERNS),
   },
   {
-    // Config schemas must remain independent from ORPC schema definitions
-    files: ["src/common/config/schemas/**/*.ts"],
+    // The highlight worker is exempt from the shiki rule only.
+    files: ["src/browser/workers/highlightWorker.ts"],
+    rules: restrictedImportsRule(
+      [],
+      BROWSER_COMMON_RESTRICTED_PATTERNS.filter((pattern) => pattern !== SHIKI_RESTRICTION)
+    ),
+  },
+  {
+    // The backend-only src/common modules may value-import src/node and each other.
+    files: BACKEND_ONLY_COMMON_FILES,
+    rules: restrictedImportsRule([], SHARED_RESTRICTED_PATTERNS),
+  },
+  // Files in a backend-only module's folder or its subfolders import it as "./<name>" or
+  // "../<name>". This can also report a same-named module in a subfolder, which is rare.
+  ...BACKEND_ONLY_COMMON_FILES.map((file) => ({
+    files: [`${path.posix.dirname(file)}/**/*.{ts,tsx}`],
+    ignores: [file, TEST_FILES],
+    rules: restrictedImportsRule(
+      [],
+      [
+        ...BROWSER_COMMON_RESTRICTED_PATTERNS,
+        backendOnlyCommonRestriction(
+          `^(\\./|(\\.\\./)+)${path.posix.basename(file, ".ts")}${MODULE_SPECIFIER_END}`
+        ),
+      ]
+    ),
+  })),
+  // ORPC must import config schemas via direct file paths, never the schemas barrel
+  ...commonFolderBlocks({
+    glob: "src/common/orpc/**/*.ts",
+    paths: [
+      {
+        name: "@/common/config/schemas",
+        message:
+          "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
+      },
+      {
+        name: "@/common/config/schemas/index",
+        message:
+          "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
+      },
+    ],
+    patterns: [
+      // Inside src/common/orpc, "./schemas" and "../schemas" are the barrel too.
+      { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: `^\\.\\.?/schemas${MODULE_SPECIFIER_END}` },
+    ],
+  }),
+  // Config schemas must remain independent from ORPC schema definitions
+  ...commonFolderBlocks({
+    glob: "src/common/config/schemas/**/*.ts",
+    patterns: [
+      {
+        group: ["@/common/orpc/schemas/*", "**/orpc/schemas/*"],
+        message:
+          "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead.",
+      },
+    ],
+  }),
+  {
+    // Production code must not add non-null assertions: `x!` hides a missing
+    // check, and the CRAP gate (.xum/skills/crap-gate) forbids trading `?.`/`??`
+    // for `!` to lower complexity. Each site from before the ban carries an
+    // inline disable comment; reportUnusedDisableDirectives flags a stale one.
+    files: ["src/**/*.{ts,tsx}"],
+    // These globs must match isProductionSource() in
+    // scripts/check-test-seam-comments.ts, the repo's one definition of
+    // production code (the CRAP gate uses it too), plus benchmarks. Change both
+    // together; do not add conventions that isProductionSource() does not have.
+    ignores: [
+      "src/**/{__tests__,__mocks__,test,tests,testing,mocks,stories}/**",
+      "src/**/*.@(test|spec)*([a-zA-Z0-9_-]).{ts,tsx}",
+      "src/**/*.@(stories|generated).{ts,tsx}",
+      "src/**/test[A-Z_.-]*",
+      "src/**/*Test@(Helper|Helpers|Harness|Utils|Fixture|Fixtures|Overlay|Child)[!a-zA-Z0-9_]*",
+      "src/**/*.*([a-zA-Z0-9_])[fF]ixture?(s).{ts,tsx}",
+      "src/version.ts",
+      "src/**/*.bench.{ts,tsx}",
+    ],
     rules: {
-      "no-restricted-imports": [
-        "error",
-        {
-          patterns: [
-            {
-              group: ["@/common/orpc/schemas/*", "**/orpc/schemas/*"],
-              message:
-                "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead.",
-            },
-          ],
-        },
-      ],
+      "@typescript-eslint/no-non-null-assertion": "error",
     },
   },
   {
@@ -820,8 +939,157 @@ export default defineConfig([
     },
   },
   {
+    // Test/story/mock files and shared test support (harnesses/utils named
+    // per repo convention: *.testHarness.ts, test[A-Z]*.ts): casting partial
+    // doubles through `unknown` is the standard mocking idiom, so the
+    // chained-assertion ban is production-only. Microbenchmarks (*.bench.ts)
+    // never ship either and stub services the same way.
+    files: [
+      "**/*.bench.ts",
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.stories.ts",
+      "**/*.stories.tsx",
+      "src/browser/stories/**",
+      "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
+      "src/**/test[A-Z]*.ts",
+    ],
+    rules: {
+      "local/no-chained-type-assertions": "off",
+      "local/no-known-value-widening": "off",
+      "local/no-widen-then-assert": "off",
+      "local/no-object-parameters": "off",
+    },
+  },
+  {
+    // tests/ (IPC, e2e, runtime, UI harness) is type-checked by tsconfig.json; lint it with the
+    // same type-aware base rules as src/. src/-only architecture rules stay scoped to src/.
+    files: ["tests/**/*.{ts,tsx}"],
+    // Registered so repo-wide test rules (e.g. local/no-cast-to-api-client on
+    // **/*.test.ts) resolve here too.
+    plugins: {
+      local: localPlugin,
+    },
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        require: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        window: "readonly",
+        document: "readonly",
+      },
+    },
+    rules: {
+      // Harness doubles implement async interfaces with synchronous or empty bodies
+      // (`async () => {}` stubs for services, windows, and IPC handlers).
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-empty-function": "off",
+      // Same options as src/: a leading underscore marks an intentionally unused binding
+      // (mock signatures, destructured tuple slots). The base default flags those too.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          vars: "all",
+          args: "after-used",
+          ignoreRestSiblings: true,
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+        },
+      ],
+    },
+  },
+  {
+    // Tooling tests (scripts/**/*.test.ts) and the VS Code extension (vscode/src) are type-checked
+    // by tsconfig.tooling.json (make typecheck), not by the tsconfig.json the project service
+    // would pick, so lint them against that program with the same base rules as tests/.
+    files: ["scripts/**/*.test.ts", "vscode/src/**/*.{ts,tsx}"],
+    plugins: {
+      local: localPlugin,
+      "react-hooks": reactHooks,
+    },
+    languageOptions: {
+      parserOptions: {
+        project: "./tsconfig.tooling.json",
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        require: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        window: "readonly",
+        document: "readonly",
+      },
+    },
+    rules: {
+      // Same options as src/ and tests/: a leading underscore marks an intentionally unused binding.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          vars: "all",
+          args: "after-used",
+          ignoreRestSiblings: true,
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+        },
+      ],
+    },
+  },
+  {
+    // The webview is React: run the two hook rules src/ runs (src/ also runs the compiler rules).
+    files: ["vscode/src/**/*.tsx"],
+    rules: {
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
+    },
+  },
+  {
+    // Like tests/: test doubles implement async interfaces with synchronous or empty bodies.
+    files: ["scripts/**/*.test.ts", "vscode/src/**/*.test.{ts,tsx}"],
+    rules: {
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-empty-function": "off",
+    },
+  },
+  {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
+    rules: {
+      "local/no-cast-to-api-client": "error",
+      "local/no-clear-dom-global": "error",
+      "local/require-module-mock-restore": [
+        "error",
+        {
+          allow: {
+            // bun 1.3.5 cannot load the real noVNC RFB module (`require() async module
+            // .../util/browser.js is unsupported`), so there are no real exports to restore and
+            // no later suite can observe the stub.
+            "src/browser/features/desktop/DesktopPanel.test.tsx": ["@novnc/novnc/lib/rfb"],
+            "src/browser/features/desktop/useDesktopConnection.test.tsx": ["@novnc/novnc/lib/rfb"],
+          },
+        },
+      ],
+    },
     languageOptions: {
       globals: {
         describe: "readonly",
@@ -834,6 +1102,78 @@ export default defineConfig([
         beforeAll: "readonly",
         afterAll: "readonly",
       },
+    },
+  },
+  {
+    // Browser tests wait on signals or fake timers, not on a fixed real time (#7608).
+    // Stories count too: `make test-storybook` runs their play functions as interaction tests.
+    files: [
+      "src/browser/**/*.test.{ts,tsx}",
+      "src/browser/**/*.stories.tsx",
+      "tests/ui/**/*.{ts,tsx}",
+    ],
+    rules: {
+      "local/no-fixed-sleep": ["error", { allow: FIXED_SLEEP_ALLOW }],
+    },
+  },
+  {
+    // Test files and the support code they load run in the same covered bun process.
+    files: [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "tests/**/*.{ts,tsx}",
+      "src/**/*.testHarness.{ts,tsx}",
+      "src/**/*.hostProof.ts",
+      "src/**/*.testUtils.{ts,tsx}",
+      "src/**/test[A-Z]*.{ts,tsx}",
+    ],
+    rules: {
+      "local/no-module-query-copy": [
+        "error",
+        {
+          // Existing copies. Each one can still lose coverage of its module in a shared shard;
+          // replace it with a file-scope snapshot or a static import, then drop it from here.
+          allow: {
+            "src/browser/AppEarlyPageImport.test.tsx": [
+              "@/browser/components/AIView/AIView?real=1",
+              "@/browser/App?earlyImport=root",
+              "@/browser/App?earlyImport=workspace",
+              "@/browser/App?prefetch=browser",
+              "@/browser/App?prefetch=desktop",
+            ],
+            "src/browser/components/AgentListItem/AgentListItem.test.tsx": [
+              "./AgentListItem?agent-list-item-test=1",
+            ],
+            "src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx": [
+              "./WorkspaceFooterBar?workspace-footer-bar-test=1",
+              "./WorkspaceFooterBar?workspace-footer-bar-test=2",
+            ],
+            "src/browser/components/Dialog/Dialog.test.tsx": ["./Dialog?real=1"],
+            "src/browser/components/LoadingScreen/LoadingScreen.test.tsx": [
+              "../LoadingScreen/LoadingScreen?real=1",
+            ],
+            "src/browser/components/ProjectSidebar/ProjectSidebar.test.tsx": [
+              "../AgentListItem/AgentListItem?project-sidebar-real-row=1",
+              "./ProjectSidebar?project-sidebar-test=1",
+              "./ProjectSidebar?project-sidebar-scratch-test=1",
+              "./ProjectSidebar?project-sidebar-flat-test=1",
+            ],
+            "src/browser/components/WorkspaceMenuBar/WorkspaceMenuBar.test.tsx": [
+              "../Dialog/Dialog?real=1",
+              "./WorkspaceMenuBar?workspace-menu-bar-test=1",
+            ],
+            "src/browser/contexts/API.test.tsx": ["./API?real=1"],
+            "src/browser/features/Analytics/SavedQuerySqlDialog.test.tsx": [
+              "./SavedQuerySqlDialog?real=1",
+            ],
+            "src/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection.test.tsx": [
+              "./useBrowserBridgeConnection.ts?test-isolation=static",
+            ],
+            "src/browser/utils/feedbackToastView.test.tsx": ["../components/Dialog/Dialog?real=1"],
+            "src/browser/utils/perf/appShellReady.test.ts": ["./appShellReady?fresh=1"],
+          },
+        },
+      ],
     },
   },
   {

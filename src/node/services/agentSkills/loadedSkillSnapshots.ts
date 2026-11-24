@@ -13,14 +13,9 @@ import {
   normalizeAgentSkillSnapshotBody,
   renderAgentSkillSnapshotText,
 } from "@/common/utils/agentSkills/skillSnapshot";
+import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
 
-export interface PersistedLoadedSkillSnapshotInput {
-  name?: unknown;
-  scope?: unknown;
-  body?: unknown;
-  frontmatterYaml?: unknown;
-  truncated?: unknown;
-}
+import { prependSkillDirectoryNote, type SkillDirectory } from "./skillDirectory";
 
 interface CreateLoadedSkillSnapshotArgs {
   name: string;
@@ -112,12 +107,47 @@ function getMessageTextContent(message: MuxMessage): string {
     .join("");
 }
 
-function extractLoadedSkillSnapshotFromToolOutput(output: unknown): LoadedSkillSnapshot | null {
+/**
+ * The SkillDirectory an agent_skill_read result reported. Fields are read one
+ * by one, not with the full result schema: persisted history is untrusted, and
+ * one malformed optional field must not drop the whole skill from later
+ * requests (it degrades to the bare body instead).
+ */
+function getToolResultSkillDirectory(toolResult: {
+  skillDir?: unknown;
+  pluginRoot?: unknown;
+  skillDirUnavailable?: unknown;
+}): SkillDirectory | undefined {
+  // The tool writes one or the other, so both means corrupted history: the
+  // unavailable reason wins, because the path then cannot be trusted (#6854).
+  if (typeof toolResult.skillDirUnavailable === "string") {
+    return { available: false, reason: toolResult.skillDirUnavailable };
+  }
+  if (typeof toolResult.skillDir === "string" && toolResult.skillDir.length > 0) {
+    return {
+      available: true,
+      skillDir: toolResult.skillDir,
+      ...(typeof toolResult.pluginRoot === "string" ? { pluginRoot: toolResult.pluginRoot } : {}),
+    };
+  }
+  return undefined;
+}
+
+function extractLoadedSkillSnapshotFromToolOutput(
+  output: unknown,
+  input?: unknown
+): LoadedSkillSnapshot | null {
   if (typeof output !== "object" || output == null || Array.isArray(output)) {
     return null;
   }
 
-  const toolResult = output as { success?: unknown; skill?: unknown };
+  const toolResult = output as {
+    success?: unknown;
+    skill?: unknown;
+    skillDir?: unknown;
+    pluginRoot?: unknown;
+    skillDirUnavailable?: unknown;
+  };
   if (toolResult.success !== true) {
     return null;
   }
@@ -128,10 +158,20 @@ function extractLoadedSkillSnapshotFromToolOutput(output: unknown): LoadedSkillS
   }
 
   const skill = parsedSkill.data;
+  // #6704/#6462: rebuilding the snapshot from the body alone dropped where the
+  // skill's bundled files are, so after compaction the model saw a bare
+  // ${CLAUDE_SKILL_DIR} with no path or off-host note, and this bare snapshot
+  // replaced an earlier slash snapshot's directory line in
+  // mergeLoadedSkillSnapshots. Use the slash-snapshot builder: it also hides
+  // unsafe paths, since persisted history is untrusted.
+  const directory = getToolResultSkillDirectory(toolResult);
+  // Results persisted before #6409 have no location fields: keep the body.
+  const body = directory != null ? prependSkillDirectoryNote(skill.body, directory) : skill.body;
+
   return createLoadedSkillSnapshot({
-    name: skill.frontmatter.name,
+    name: resolveSkillReadIdentity(input, skill.frontmatter.name),
     scope: skill.scope,
-    body: skill.body,
+    body,
     frontmatterYaml: stringifyAgentSkillFrontmatter(skill.frontmatter),
   });
 }
@@ -167,19 +207,56 @@ function extractLoadedSkillSnapshotFromSyntheticMessage(
   });
 }
 
+/**
+ * Nested agent_skill_read calls inside a code_execution part (exclusive PTC):
+ * skill reads happen as nested xum.agent_skill_read calls, so the outer part
+ * is named "code_execution" and the results live in its output's toolCalls
+ * records. Classic PTC records retain the full result (snapshot recoverable);
+ * kernel-compacted records drop result contents, so nothing survives there —
+ * extractLoadedSkillSnapshotFromToolOutput rejects those records naturally.
+ */
+function extractLoadedSkillSnapshotsFromCodeExecutionOutput(
+  output: unknown
+): LoadedSkillSnapshot[] {
+  if (typeof output !== "object" || output === null) return [];
+  const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return [];
+
+  const snapshots: LoadedSkillSnapshot[] = [];
+  for (const record of toolCalls as Array<Record<string, unknown>>) {
+    if (typeof record !== "object" || record === null) continue;
+    if (record.toolName !== "agent_skill_read" || record.error !== undefined) continue;
+    // Nested history is untrusted: an explicit ok:false marks the call failed
+    // even when a schema-valid result rides alongside (r18). Other nested
+    // extractors treat ok:false as authoritative failure — do the same here so
+    // contradictory rows cannot inject a skill snapshot into later requests.
+    if (record.ok === false) continue;
+    const snapshot = extractLoadedSkillSnapshotFromToolOutput(record.result, record.args);
+    if (snapshot) {
+      snapshots.push(snapshot);
+    }
+  }
+  return snapshots;
+}
+
 function extractLoadedSkillSnapshotsFromMessage(message: MuxMessage): LoadedSkillSnapshot[] {
   const snapshots: LoadedSkillSnapshot[] = [];
 
   for (const part of message.parts) {
-    if (
-      part.type !== "dynamic-tool" ||
-      part.toolName !== "agent_skill_read" ||
-      part.state !== "output-available"
-    ) {
+    if (part.type !== "dynamic-tool" || part.state !== "output-available") {
       continue;
     }
 
-    const snapshot = extractLoadedSkillSnapshotFromToolOutput(part.output);
+    if (part.toolName === "code_execution") {
+      snapshots.push(...extractLoadedSkillSnapshotsFromCodeExecutionOutput(part.output));
+      continue;
+    }
+
+    if (part.toolName !== "agent_skill_read") {
+      continue;
+    }
+
+    const snapshot = extractLoadedSkillSnapshotFromToolOutput(part.output, part.input);
     if (snapshot) {
       snapshots.push(snapshot);
     }

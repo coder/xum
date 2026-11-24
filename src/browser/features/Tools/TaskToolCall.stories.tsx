@@ -1,8 +1,14 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { waitFor, within } from "storybook/test";
 import type { ReactNode } from "react";
 import { TaskApplyGitPatchToolCall } from "@/browser/features/Tools/TaskApplyGitPatchToolCall";
-import { TaskToolCall } from "@/browser/features/Tools/TaskToolCall";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import {
+  TaskRemoveToolCall,
+  TaskRetitleToolCall,
+  TaskStopToolCall,
+  TaskToolCall,
+} from "@/browser/features/Tools/TaskToolCall";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 
 const meta = {
   ...lightweightMeta,
@@ -30,12 +36,14 @@ export const TaskWorkflowStates: Story = {
         args={{
           subagent_type: "explore",
           prompt: "Analyze the frontend React components in src/browser/",
-          title: "Frontend analysis",
+          title: "Frontend Reviewer",
           run_in_background: true,
         }}
         result={{
           status: "running",
           taskId: "task-fe-001",
+          modelString: "anthropic:claude-opus-5",
+          thinkingLevel: "high",
           note: "Use task_await to monitor progress.",
         }}
         status="completed"
@@ -45,13 +53,53 @@ export const TaskWorkflowStates: Story = {
         args={{
           subagent_type: "exec",
           prompt: "Run linting on src/node/ and summarize the findings.",
-          title: "Backend linting",
+          title: "Backend Auditor",
           run_in_background: true,
         }}
         result={{
           status: "queued",
           taskId: "task-be-002",
           note: "Task is queued and will start shortly.",
+        }}
+        status="completed"
+      />
+    </ToolStoryShell>
+  ),
+};
+
+/** simplified persistent-child lifecycle operations */
+export const TaskLifecycleOperations: Story = {
+  render: () => (
+    <ToolStoryShell>
+      <TaskRetitleToolCall
+        args={{ task_id: "lifecycle-auditor", title: "Simplicity Auditor" }}
+        result={{
+          status: "retitled",
+          taskId: "lifecycle-auditor",
+          title: "Simplicity Auditor",
+        }}
+        status="completed"
+      />
+      <TaskStopToolCall
+        args={{ task_ids: ["react-expert", "api-expert"] }}
+        result={{
+          results: [
+            { status: "stopped", taskId: "react-expert", stoppedTaskIds: ["react-expert"] },
+            { status: "already_inactive", taskId: "api-expert" },
+          ],
+        }}
+        status="completed"
+      />
+      <TaskRemoveToolCall
+        args={{ task_ids: ["obsolete-reviewer"] }}
+        result={{
+          results: [
+            {
+              status: "removed",
+              taskId: "obsolete-reviewer",
+              workspaceId: "obsolete-reviewer",
+            },
+          ],
         }}
         status="completed"
       />
@@ -75,6 +123,8 @@ export const TaskWithReport: Story = {
           status: "completed",
           taskId: "task-abc123",
           title: "Test File Analysis",
+          modelString: "openai:gpt-5.6-sol",
+          thinkingLevel: "xhigh",
           reportMarkdown: `# Test File Analysis
 
 Found **47 test files** across the project.
@@ -111,6 +161,8 @@ export const BestOfTaskGroup: Story = {
               title: "Option 1",
               agentId: "explore",
               agentType: "explore",
+              modelString: "anthropic:claude-sonnet-5",
+              thinkingLevel: "medium",
               reportMarkdown: "Use **shared helper utilities** for tree coalescing.",
             },
             {
@@ -133,6 +185,108 @@ export const BestOfTaskGroup: Story = {
       />
     </ToolStoryShell>
   ),
+};
+
+/** long custom model IDs must wrap inside a narrow card instead of overflowing */
+export const TaskNarrowLongModelId: Story = {
+  render: () => (
+    <div data-testid="narrow-task-card" className="bg-background w-[320px] p-2">
+      <TaskToolCall
+        args={{
+          subagent_type: "explore",
+          prompt: "Analyze the frontend React components in src/browser/",
+          title: "Frontend Reviewer",
+          run_in_background: true,
+        }}
+        result={{
+          status: "running",
+          taskId: "task-fe-001",
+          // Deliberately hyphen-free: only an unbroken token exercises the wrap fix.
+          modelString:
+            "openrouter:acmelabs/somextremelylongcustommodelidentifierwithoutanybreakopportunitieswhatsoeverv2instruct",
+          thinkingLevel: "high",
+          note: "Use task_await to monitor progress.",
+        }}
+        status="completed"
+      />
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    canvas.getByText("task").click();
+    await waitFor(() => {
+      if (!canvasElement.querySelector("[data-task-ai-settings]")) {
+        throw new Error("task AI settings did not render after expanding");
+      }
+    });
+    const container = canvasElement.querySelector('[data-testid="narrow-task-card"]');
+    if (!(container instanceof HTMLElement)) {
+      throw new Error("narrow task card container not found");
+    }
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+    const containerRight = container.getBoundingClientRect().right;
+    const settings = container.querySelector("[data-task-ai-settings]");
+    const settingsRight = settings?.getBoundingClientRect().right ?? Number.POSITIVE_INFINITY;
+    // Right-edge containment, not scrollWidth: ancestors clip overflow, which would
+    // hide a too-wide settings row from scrollWidth-based checks.
+    if (settingsRight > containerRight + 1) {
+      throw new Error(
+        `task AI settings overflowed the ${container.clientWidth}px card by ` +
+          `${Math.round(settingsRight - containerRight)}px`
+      );
+    }
+  },
+};
+
+/** a forced task_remove lists what it deleted; long paths and the checkout path must stay in a 375px card */
+export const TaskRemoveForcedNarrow: Story = {
+  // The play function asserts the layout; the Pixel snapshot budget is at its cap.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <div data-testid="forced-remove-card" className="bg-background w-[375px] p-2">
+      <TaskRemoveToolCall
+        args={{ task_ids: ["obsolete-reviewer", "clean-reviewer"], force: true }}
+        result={{
+          results: [
+            {
+              status: "removed",
+              taskId: "obsolete-reviewer",
+              workspaceId: "obsolete-reviewer",
+              deletedWork:
+                "Deleted the uncommitted or untracked files listed in paths and 2 commit(s) not captured by a ready patch artifact. Checkout: /home/user/.xum/src/project/obsolete-reviewer-with-a-long-name. Branch: obsolete-reviewer-with-a-long-name.",
+              paths: ["src/node/services/someVeryLongFileNameThatNeverBreaksAnywhereAtAll.ts"],
+            },
+            { status: "removed", taskId: "clean-reviewer", workspaceId: "clean-reviewer" },
+          ],
+        }}
+        status="completed"
+      />
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    canvas.getByText("task_remove").click();
+    const deletedWork = await waitFor(() => canvas.getByText(/^Deleted the uncommitted/));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+    const container = canvasElement.querySelector('[data-testid="forced-remove-card"]');
+    if (!(container instanceof HTMLElement)) {
+      throw new Error("forced task_remove card container not found");
+    }
+    // Right-edge containment, not scrollWidth: ancestors clip overflow, which would hide it.
+    const containerRight = container.getBoundingClientRect().right;
+    for (const element of [deletedWork, canvas.getByText(/someVeryLongFileName/)]) {
+      const overflow = element.getBoundingClientRect().right - containerRight;
+      if (overflow > 1) {
+        throw new Error(
+          `forced task_remove text overflowed the 375px card by ${Math.round(overflow)}px`
+        );
+      }
+    }
+  },
 };
 
 /** task_apply_git_patch states: executing, dry-run, success, and failure */

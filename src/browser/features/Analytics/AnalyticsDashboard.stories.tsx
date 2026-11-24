@@ -2,7 +2,7 @@
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
-import { RouterProvider } from "@/browser/contexts/RouterContext";
+import { RouterProvider, useRouter } from "@/browser/contexts/RouterContext";
 import type {
   AgentCostItem,
   DelegationSummary,
@@ -14,20 +14,21 @@ import type {
   TimingDistribution,
   TokensByModelItem,
 } from "@/browser/hooks/useAnalytics";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { NOW, createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { waitForModalLayer } from "@/browser/stories/storyPlayHelpers";
 import assert from "@/common/utils/assert";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import React from "react";
-import { AnalyticsDashboard } from "./AnalyticsDashboard.js";
+import { LazyAnalyticsDashboard } from "./LazyAnalyticsDashboard.js";
 
 const meta = {
   ...lightweightMeta,
   title: "Analytics/AnalyticsDashboard",
-  component: AnalyticsDashboard,
-} satisfies Meta<typeof AnalyticsDashboard>;
+} satisfies Meta;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
@@ -55,6 +56,7 @@ interface StoryAnalyticsNamespace {
     granularity: "hour" | "day" | "week";
     from?: Date | null;
     to?: Date | null;
+    timeZone?: string | null;
   }) => Promise<SpendOverTimeItem[]>;
   getSpendByProject: (_input: Record<string, never>) => Promise<SpendByProjectItem[]>;
   getSpendByModel: (input: { projectPath?: string | null }) => Promise<SpendByModelItem[]>;
@@ -929,6 +931,16 @@ function setupAnalyticsMockClient(): APIClient {
   return client as APIClient;
 }
 
+/** The dashboard is a route-backed modal, so open its route as the title-bar button would. */
+function OpenAnalyticsRoute() {
+  const { navigateToAnalytics } = useRouter();
+  React.useEffect(() => {
+    // No-op once the route is /analytics.
+    navigateToAnalytics();
+  }, [navigateToAnalytics]);
+  return null;
+}
+
 function AnalyticsDashboardStory() {
   const client = React.useRef(setupAnalyticsMockClient()).current;
 
@@ -936,25 +948,87 @@ function AnalyticsDashboardStory() {
     <APIProvider client={client}>
       <RouterProvider>
         <ProjectProvider>
-          <AnalyticsDashboard
-            leftSidebarCollapsed={false}
-            onToggleLeftSidebarCollapsed={() => {
-              /* noop */
-            }}
-          />
+          <OpenAnalyticsRoute />
+          <LazyAnalyticsDashboard />
         </ProjectProvider>
       </RouterProvider>
     </APIProvider>
   );
 }
 
+/** The dialog portals to document.body, outside the story canvas. */
+async function findAnalyticsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
+  return waitForModalLayer(
+    await within(canvasElement.ownerDocument.body).findByRole(
+      "dialog",
+      { name: "Analytics" },
+      { timeout: 10000 }
+    )
+  );
+}
+
+export const StatsDashboardPhone: Story = {
+  render: () => <AnalyticsDashboardStory />,
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const dialog = await findAnalyticsDialog(canvasElement);
+    const analytics = within(dialog);
+
+    await analytics.findByText("Total Spend");
+    await analytics.findByRole("button", { name: "Local" });
+    await analytics.findByRole("button", { name: "UTC" });
+    await analytics.findByRole("button", { name: "7D" });
+    await analytics.findByRole("button", { name: "All" });
+
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+    // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
+    if (window.innerWidth < 768) {
+      const rect = dialog.getBoundingClientRect();
+      await expect(rect.left).toBe(0);
+      await expect(rect.width).toBe(window.innerWidth);
+      await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
+      const header = analytics.getByTestId("analytics-header");
+      await expect(header.scrollWidth).toBeLessThanOrEqual(header.clientWidth);
+      const close = analytics.getByRole("button", { name: "Close analytics" });
+      await expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+    }
+  },
+};
+
 export const StatsDashboard: Story = {
   render: () => <AnalyticsDashboardStory />,
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
-    const canvas = within(canvasElement);
+    const canvas = within(await findAnalyticsDialog(canvasElement));
 
     await canvas.findByText("Total Spend");
     await canvas.findByText("$184.73");
+
+    const localTimeButton = await canvas.findByRole("button", { name: "Local" });
+    const utcButton = await canvas.findByRole("button", { name: "UTC" });
+    if (localTimeButton.getAttribute("aria-pressed") !== "true") {
+      await userEvent.click(localTimeButton);
+      await waitFor(() => {
+        if (localTimeButton.getAttribute("aria-pressed") !== "true") {
+          throw new Error("Expected local timezone mode to become selected");
+        }
+      });
+    }
+
+    await userEvent.click(utcButton);
+    await waitFor(() => {
+      if (utcButton.getAttribute("aria-pressed") !== "true") {
+        throw new Error("Expected UTC timezone mode to become selected");
+      }
+    });
 
     await canvas.findByRole("heading", { name: /spend over time/i });
     await canvas.findByRole("heading", { name: /spend by project/i });
@@ -988,5 +1062,16 @@ export const StatsDashboard: Story = {
         throw new Error("Expected agent-cost chart to render populated data");
       }
     });
+
+    // Recharts colors legend labels with their series color by default. Several series colors
+    // were below WCAG AA as text, in every theme (#6885).
+    const dialog = await findAnalyticsDialog(canvasElement);
+    const legendLabels = () => [
+      ...dialog.querySelectorAll<HTMLElement>(".recharts-legend-item-text"),
+    ];
+    await waitFor(() => {
+      if (legendLabels().length < 5) throw new Error("expected 5+ chart legend labels");
+    });
+    await expect(textsBelowAaInThemes(legendLabels).join("\n")).toBe("");
   },
 };

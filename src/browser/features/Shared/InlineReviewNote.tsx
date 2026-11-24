@@ -194,7 +194,7 @@ export const InlineReviewNote: React.FC<InlineReviewNoteProps> = ({
             className={cn(
               "shrink-0 rounded px-1 py-0.5 text-[9px] font-medium uppercase",
               review.status === "checked"
-                ? "bg-success/20 text-success"
+                ? "bg-success/20 text-success-text"
                 : review.status === "attached"
                   ? "bg-warning/20 text-warning"
                   : "bg-muted/20 text-muted"
@@ -228,7 +228,7 @@ export const InlineReviewNote: React.FC<InlineReviewNoteProps> = ({
                       type="button"
                       onClick={() => actions?.onComplete?.(review.id)}
                       aria-label="Mark as done"
-                      className="text-muted hover:text-success flex items-center justify-center rounded p-0.5 transition-colors"
+                      className="text-muted hover:text-success-text flex items-center justify-center rounded p-0.5 transition-colors"
                     >
                       <Check className="size-3" />
                     </button>

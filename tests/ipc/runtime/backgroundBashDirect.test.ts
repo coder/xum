@@ -30,6 +30,7 @@ import { LocalRuntime } from "../../../src/node/runtime/LocalRuntime";
 import { BackgroundProcessManager } from "../../../src/node/services/backgroundProcessManager";
 import { createBashTool } from "../../../src/node/services/tools/bash";
 import { createBashOutputTool } from "../../../src/node/services/tools/bash_output";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Access private fields from ServiceContainer for direct testing
 interface ServiceContainerPrivates {
@@ -82,6 +83,39 @@ async function waitForBashOutput(
   throw new Error(`Timed out waiting for bash output: ${expectedText}`);
 }
 
+/**
+ * A file the test creates to let a gated foreground script print its second marker. The migration
+ * tests used `sleep 2` for this, but on Windows CI the migration can take longer than that, so the
+ * command finished first and took the normal completion path (#5593). The gate makes the script
+ * wait for the test instead of a CI-dependent delay.
+ */
+async function createReleaseGate(testId: string) {
+  const file = path.join(os.tmpdir(), `bg-release-${testId}`);
+  await fs.rm(file, { force: true });
+  // Git Bash accepts C:/ paths, and forward slashes avoid backslash escapes in the script.
+  const shellPath = file.replace(/\\/g, "/");
+  return {
+    waitScript: `while [ ! -e "${shellPath}" ]; do sleep 0.1; done`,
+    release: () => fs.writeFile(file, ""),
+    remove: () => fs.rm(file, { force: true }),
+  };
+}
+
+/** Waits for a background process to leave "running", instead of sleeping a fixed time. */
+async function waitForProcessExit(
+  manager: BackgroundProcessManager,
+  processId: string,
+  timeoutMs: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while ((await manager.getProcess(processId))?.status === "running") {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${processId} to exit`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+const PROCESS_EXIT_TIMEOUT_MS = 10_000;
+
 interface ToolExecuteResult {
   success: boolean;
   backgroundProcessId?: string;
@@ -132,10 +166,11 @@ describe("Background Bash Direct Integration", () => {
     const marker = `MULTI_MSG_${Date.now()}`;
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
@@ -156,7 +191,9 @@ describe("Background Bash Direct Integration", () => {
     expect(spawnResult.success).toBe(true);
     const processId = spawnResult.backgroundProcessId!;
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Wait for the exit, not a fixed delay: on Windows the process can start writing later than
+    // 200 ms, and the read below then saw an empty output (#5606).
+    await waitForProcessExit(manager, processId, PROCESS_EXIT_TIMEOUT_MS);
 
     // Message 2: Read with NEW tool instances (same manager)
     const bashOutput2 = createBashOutputTool(toolConfig);
@@ -184,7 +221,7 @@ describe("Background Bash Direct Integration", () => {
     expect(spawnResult.success).toBe(true);
     if (!spawnResult.success) return;
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForProcessExit(manager, spawnResult.processId, PROCESS_EXIT_TIMEOUT_MS);
 
     const output = await manager.getOutput(spawnResult.processId);
     expect(output.success).toBe(true);
@@ -340,7 +377,7 @@ describe("Background Bash Output Capture", () => {
     expect(spawnResult.success).toBe(true);
     if (!spawnResult.success) return;
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitForProcessExit(manager, spawnResult.processId, PROCESS_EXIT_TIMEOUT_MS);
 
     const output = await manager.getOutput(spawnResult.processId);
     expect(output.success).toBe(true);
@@ -367,7 +404,7 @@ describe("Background Bash Output Capture", () => {
     expect(spawnResult.success).toBe(true);
     if (!spawnResult.success) return;
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitForProcessExit(manager, spawnResult.processId, PROCESS_EXIT_TIMEOUT_MS);
 
     const output = await manager.getOutput(spawnResult.processId);
     expect(output.success).toBe(true);
@@ -394,7 +431,7 @@ describe("Background Bash Output Capture", () => {
     expect(spawnResult.success).toBe(true);
     if (!spawnResult.success) return;
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await waitForProcessExit(manager, spawnResult.processId, PROCESS_EXIT_TIMEOUT_MS);
 
     const output = await manager.getOutput(spawnResult.processId);
     expect(output.success).toBe(true);
@@ -458,10 +495,11 @@ describe("Foreground to Background Migration", () => {
     const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
@@ -471,11 +509,11 @@ describe("Foreground to Background Migration", () => {
     // Create tools for "message 1"
     const bash1 = createBashTool(toolConfig);
 
-    // Start foreground bash that runs for ~3 seconds
-    // Script: output marker1, sleep, output marker2
+    // Script: output marker1, wait for the test's release, output marker2
+    const gate = await createReleaseGate(testId);
     const bashPromise = bash1.execute!(
       {
-        script: `echo "${marker1}"; sleep 2; echo "${marker2}"`,
+        script: `echo "${marker1}"; ${gate.waitScript}; echo "${marker2}"`,
         run_in_background: false,
         display_name: testId,
         timeout_secs: 30,
@@ -519,8 +557,10 @@ describe("Foreground to Background Migration", () => {
     // Create NEW tool instances (same manager reference, fresh tools)
     const bashOutput2 = createBashOutputTool(toolConfig);
 
-    // Wait for process to complete (marker2 should appear)
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    // Let the process finish (marker2 should appear) and wait for its exit
+    await gate.release();
+    await waitForProcessExit(manager, testId, PROCESS_EXIT_TIMEOUT_MS);
+    await gate.remove();
 
     // Get output via bash_output tool (new tool instance)
     const outputResult = (await bashOutput2.execute!(
@@ -549,10 +589,11 @@ describe("Foreground to Background Migration", () => {
     const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
@@ -561,8 +602,9 @@ describe("Foreground to Background Migration", () => {
 
     const bash1 = createBashTool(toolConfig);
 
-    // Script outputs marker1, sleeps, then outputs marker2
-    const script = `echo "${marker1}"; sleep 2; echo "${marker2}"`;
+    // Script outputs marker1, waits for the test's release, then outputs marker2
+    const gate = await createReleaseGate(testId);
+    const script = `echo "${marker1}"; ${gate.waitScript}; echo "${marker2}"`;
 
     const bashPromise = bash1.execute!(
       {
@@ -586,8 +628,10 @@ describe("Foreground to Background Migration", () => {
     // marker1 should be in the output already
     expect(result.output).toContain(marker1);
 
-    // Wait for process to complete
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    // Let the process finish and wait for its exit
+    await gate.release();
+    await waitForProcessExit(manager, testId, PROCESS_EXIT_TIMEOUT_MS);
+    await gate.remove();
 
     // Get the full output by reading from the file directly
     const proc = await manager.getProcess(testId);
@@ -607,10 +651,11 @@ describe("Foreground to Background Migration", () => {
     const runtime = new LocalRuntime(workspacePath);
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
@@ -693,10 +738,11 @@ describe("Foreground to Background Migration", () => {
     const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
-      muxEnv: {},
+      xumEnv: {},
       runtimeTempDir: os.tmpdir(),
       backgroundProcessManager: manager,
       workspaceId,
@@ -709,9 +755,10 @@ describe("Foreground to Background Migration", () => {
     const bash = createBashTool(toolConfig);
 
     // Start a foreground bash with the abort signal
+    const gate = await createReleaseGate(testId);
     const bashPromise = bash.execute!(
       {
-        script: `echo "${marker1}"; sleep 2; echo "${marker2}"`,
+        script: `echo "${marker1}"; ${gate.waitScript}; echo "${marker2}"`,
         run_in_background: false,
         display_name: testId,
         timeout_secs: 30,
@@ -733,8 +780,10 @@ describe("Foreground to Background Migration", () => {
     // The stream manager aborts the previous stream
     abortController.abort();
 
-    // Wait for process to complete (it should NOT be killed by abort)
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    // Let the process finish and wait for its exit (it should NOT be killed by abort)
+    await gate.release();
+    await waitForProcessExit(manager, testId, PROCESS_EXIT_TIMEOUT_MS);
+    await gate.remove();
 
     // Check process status - should be "exited" with code 0, NOT "killed" with -997
     const proc = await manager.getProcess(testId);

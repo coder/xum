@@ -97,6 +97,28 @@ describe("createWorktreeArchiveHook", () => {
     expect(await pathExists(managedPath)).toBe(true);
   });
 
+  it("never deletes the ancestor checkout used by an isolation-none task", async () => {
+    const srcBaseDir = await createTempRoot();
+    const workspaceMetadata = createWorkspaceMetadata({
+      runtimeConfig: { type: "worktree", srcBaseDir },
+      taskIsolation: "none",
+      namedWorkspacePath: path.join(srcBaseDir, "_workspaces", "parent-workspace"),
+    });
+    const sharedPath = getManagedPath(workspaceMetadata);
+    await mkdir(sharedPath, { recursive: true });
+    const execFileAsyncSpy = spyOn(disposableExec, "execFileAsync");
+
+    const hook = createWorktreeArchiveHook({
+      getWorktreeArchiveBehavior: () => "delete",
+    });
+
+    const result = await hook({ workspaceId: workspaceMetadata.id, workspaceMetadata });
+
+    expect(result).toEqual(Ok(undefined));
+    expect(execFileAsyncSpy).not.toHaveBeenCalled();
+    expect(await pathExists(sharedPath)).toBe(true);
+  });
+
   it("deletes the managed worktree with git worktree remove when cleanup is enabled", async () => {
     const srcBaseDir = await createTempRoot();
     const workspaceMetadata = createWorkspaceMetadata({
@@ -155,7 +177,6 @@ describe("createWorktreeArchiveHook", () => {
     });
     const managedPath = getManagedPath(workspaceMetadata);
     await mkdir(managedPath, { recursive: true });
-    const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
 
     const hook = createWorktreeArchiveHook({
       getWorktreeArchiveBehavior: () => "snapshot",
@@ -165,10 +186,6 @@ describe("createWorktreeArchiveHook", () => {
 
     expect(result).toEqual(Ok(undefined));
     expect(await pathExists(managedPath)).toBe(true);
-    expect(debugSpy).toHaveBeenCalledWith(
-      "Skipping snapshot worktree cleanup for multi-project archive",
-      { workspaceId: workspaceMetadata.id }
-    );
   });
 
   it("skips cleanup for non-worktree runtimes even when cleanup is enabled", async () => {

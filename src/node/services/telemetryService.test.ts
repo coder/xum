@@ -14,6 +14,28 @@ describe("TelemetryService enablement", () => {
   test("disables telemetry when explicitly disabled", () => {
     const enabled = shouldEnableTelemetry(
       createContext({
+        env: { XUM_DISABLE_TELEMETRY: "1" },
+        isElectron: true,
+        isPackaged: true,
+      })
+    );
+
+    expect(enabled).toBe(false);
+  });
+
+  test("disables telemetry in session tape replay mode, even for a packaged app", () => {
+    const context = { isElectron: true, isPackaged: true };
+    expect(shouldEnableTelemetry(createContext({ ...context, env: {} }))).toBe(true);
+    expect(
+      shouldEnableTelemetry(
+        createContext({ ...context, env: { XUM_REPLAY_TAPES: '{"ws":"/tapes/ws.jsonl"}' } })
+      )
+    ).toBe(false);
+  });
+
+  test("treats leftover MUX_DISABLE_TELEMETRY as an explicit opt-out", () => {
+    const enabled = shouldEnableTelemetry(
+      createContext({
         env: { MUX_DISABLE_TELEMETRY: "1" },
         isElectron: true,
         isPackaged: true,
@@ -23,10 +45,22 @@ describe("TelemetryService enablement", () => {
     expect(enabled).toBe(false);
   });
 
+  test("canonical XUM_DISABLE_TELEMETRY wins over a leftover MUX value", () => {
+    const enabled = shouldEnableTelemetry(
+      createContext({
+        env: { XUM_DISABLE_TELEMETRY: "0", MUX_DISABLE_TELEMETRY: "1" },
+        isElectron: true,
+        isPackaged: true,
+      })
+    );
+
+    expect(enabled).toBe(true);
+  });
+
   test("disables telemetry in E2E runs", () => {
     const enabled = shouldEnableTelemetry(
       createContext({
-        env: { MUX_E2E: "1" },
+        env: { XUM_E2E: "1" },
         isElectron: true,
         isPackaged: true,
       })

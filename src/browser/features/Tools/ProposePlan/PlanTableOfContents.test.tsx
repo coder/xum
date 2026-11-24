@@ -37,6 +37,7 @@ function stubHeadingTop(el: HTMLElement, top: number): void {
 function withSyncAnimationFrame<T>(run: () => T): T {
   const previous = (globalThis as unknown as { requestAnimationFrame?: unknown })
     .requestAnimationFrame;
+  // eslint-disable-next-line local/no-clear-dom-global -- restored in the finally below
   (globalThis as unknown as { requestAnimationFrame?: unknown }).requestAnimationFrame = undefined;
   try {
     return run();
@@ -202,7 +203,7 @@ describe("PlanTableOfContents", () => {
       stubHeadingTop(headings[2], 400); // second h2: below trigger
 
       act(() => {
-        window.dispatchEvent(new Event("scroll"));
+        window.dispatchEvent(new window.Event("scroll"));
       });
 
       let activeBtn = view.container.querySelector<HTMLElement>('[aria-current="location"]');
@@ -215,7 +216,7 @@ describe("PlanTableOfContents", () => {
       stubHeadingTop(headings[2], 10); // second h2: just above trigger now
 
       act(() => {
-        window.dispatchEvent(new Event("scroll"));
+        window.dispatchEvent(new window.Event("scroll"));
       });
 
       activeBtn = view.container.querySelector<HTMLElement>('[aria-current="location"]');
@@ -247,7 +248,7 @@ describe("PlanTableOfContents", () => {
       stubHeadingTop(headings[1], -10);
       stubHeadingTop(headings[2], 500);
       act(() => {
-        window.dispatchEvent(new Event("scroll"));
+        window.dispatchEvent(new window.Event("scroll"));
       });
       expect(view.container.querySelector('[aria-current="location"]')?.textContent).toBe(
         "First section"
@@ -257,7 +258,7 @@ describe("PlanTableOfContents", () => {
       stubHeadingTop(headings[1], 200);
       stubHeadingTop(headings[2], 700);
       act(() => {
-        window.dispatchEvent(new Event("scroll"));
+        window.dispatchEvent(new window.Event("scroll"));
       });
       expect(view.container.querySelector('[aria-current="location"]')).toBeNull();
     });
@@ -279,7 +280,7 @@ describe("PlanTableOfContents", () => {
       );
       headings.forEach((el) => stubHeadingTop(el, 500));
       act(() => {
-        window.dispatchEvent(new Event("scroll"));
+        window.dispatchEvent(new window.Event("scroll"));
       });
       expect(view.container.querySelector('[aria-current="location"]')).toBeNull();
 

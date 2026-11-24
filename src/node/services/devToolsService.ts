@@ -1,7 +1,9 @@
+import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
-import * as path from "path";
+import { StringDecoder } from "string_decoder";
 import assert from "@/common/utils/assert";
+import { getErrorMessage } from "@/common/utils/errors";
 import type {
   DevToolsEvent,
   DevToolsLogEntry,
@@ -10,204 +12,196 @@ import type {
   DevToolsStep,
 } from "@/common/types/devtools";
 import type { Config } from "@/node/config";
-import { DEVTOOLS_LOG_MAX_BYTES, DEVTOOLS_LOG_ROTATED_SUFFIX } from "@/constants/devtools";
 import { log } from "@/node/services/log";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { sanitizeInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
+
+/**
+ * Retention policy for in-memory DevTools state.
+ *
+ * devtools.jsonl is append-only and grows without bound: a live server was
+ * observed with 58 files totalling 6.8 GB (largest 1.18 GB) and ~4 GB of live
+ * heap made of replayed runs/steps, because every workspace file was read whole
+ * and every run ever logged was kept. Files past V8's max string length also
+ * made the whole-file read throw, and the failed load was retried on every
+ * subsequent createRun/createStep.
+ *
+ * Policy: only the newest MAX_RETAINED_RUNS_PER_WORKSPACE runs (with their
+ * steps) are kept per workspace, evicting the oldest by append order as new runs
+ * arrive. Load replays the whole file forward, streamed in LOAD_CHUNK_BYTES
+ * reads so it is never materialized in memory, applying every line through the
+ * same retention as the live path; peak memory is the retention budget plus one
+ * line regardless of file size. Replaying from byte 0 (rather than a byte-offset
+ * tail cut) is deliberate: lines depend on earlier lines (a step needs its run
+ * header, an update needs its step), so any cut point loses or corrupts the
+ * newest run in some layout. Steps whose run was already evicted are dropped.
+ * The DevTools panel therefore shows a bounded recent window rather than the
+ * full history; the on-disk file is left untouched (compaction is a follow-up).
+ *
+ * The run bound alone does not cap memory: a single streamed step carries the
+ * raw provider payload (a live heap held two 15-16 MB arrays of raw OpenAI SSE
+ * events in `rawChunks`/`rawResponse` plus multi-MB `rawRequest` strings), so
+ * 100 such runs are still hundreds of MB. Retained runs are therefore also
+ * capped at MAX_RETAINED_BYTES_PER_WORKSPACE, measured as the length of the
+ * JSON lines appended to devtools.jsonl (already serialized for the write) and
+ * attributed to the owning run. The run being written is never evicted, even
+ * when it alone exceeds the budget.
+ */
+export const MAX_RETAINED_RUNS_PER_WORKSPACE = 100;
+const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
+/** FIFO cap on remembered evicted run ids; see WorkspaceData.evictedRunIds. */
+const MAX_TRACKED_EVICTED_RUNS = 4 * MAX_RETAINED_RUNS_PER_WORKSPACE;
+const LOAD_CHUNK_BYTES = 1024 * 1024;
 
 interface WorkspaceData {
   runs: Map<string, DevToolsRun>;
   steps: Map<string, DevToolsStep>;
+  /** Approximate JSON bytes retained per run: the run entry plus its current steps. */
+  runBytes: Map<string, number>;
+  /** Approximate JSON bytes of each retained step, so an update replaces rather than adds. */
+  stepBytes: Map<string, number>;
+  retainedBytes: number;
   loaded: boolean;
-  /** Incremented on each clear() for defense-in-depth against stale state. */
+  /**
+   * In-flight steps dropped from memory by live retention since the last
+   * clear(). A late updateStep for one of these must still reach disk (eviction
+   * is memory-only), while an update for a cleared or unknown step must not
+   * re-populate the truncated log with an orphan line. Bounded by the number of
+   * evicted steps that have not finished yet: finalized steps are never added
+   * (they receive no further updates), an id is removed once its completing
+   * update lands, and the set is reset after replay and on clear().
+   */
+  evictedStepIds: Set<string>;
+  /**
+   * Runs dropped from memory by live retention since the last clear(), oldest
+   * first. A still-active run whose id is here must not be resurrected by
+   * createStep's self-heal: its real header (startedAt, toolPolicy,
+   * requestHistorySequence) is still on disk and replay restores it, whereas a
+   * healed stand-in would carry the new step's timestamp and no metadata. Capped
+   * at MAX_TRACKED_EVICTED_RUNS by dropping the oldest id; a run that ages out
+   * and then logs another step falls back to the self-heal, which is accepted.
+   * Reset after replay and on clear(), like evictedStepIds.
+   */
+  evictedRunIds: Set<string>;
+  /**
+   * Whether the on-disk log was replayed to EOF (or did not exist). After a
+   * failed partial replay, memory is a prefix of the file, so a step that looks
+   * in progress may have completed on disk; stale finalization must not write
+   * an "Interrupted (stale)" line over it.
+   */
+  replayComplete: boolean;
+  /** Incremented on each clear(); appendToFile drops writes queued under an older generation. */
   clearGeneration: number;
-  /** Rotation count, persisted via snapshot-meta/log-meta pairs. */
-  logGeneration: number;
-  /**
-   * Generation of the log-meta marker actually present in the live file.
-   * Falls behind logGeneration when a snapshot commits but the live-marker
-   * write fails (e.g. ENOSPC); appends repair the marker before writing so
-   * they are not discarded as pre-snapshot on the next load.
-   */
-  liveMarkerGeneration: number;
-  /**
-   * Base-record content whose live-file write failed during rotation
-   * reconciliation. Must land before any later append: a queued step append
-   * succeeding while its run's base records exist nowhere durable would
-   * orphan the step on the next load.
-   */
-  pendingLiveRepairs: string[];
-  /**
-   * Set when an append to the live file rejects: the write may have landed
-   * partially, leaving an unterminated fragment as the file's tail. The
-   * next append must start with a newline so the fragment seals into its
-   * own malformed line instead of merging with (and destroying) the next
-   * record.
-   */
-  liveTailMayBeTorn: boolean;
 }
 
-/**
- * Detects a live file shaped like a pre-rotation binary left it. Such a
- * binary clears by truncating devtools.jsonl to empty (or removes it
- * outright) without touching the rotated snapshot, and its appends carry no
- * log-meta marker. A markerless live file also arises when a first
- * snapshot commit (generation 0 -> 1) is interrupted before the live
- * rewrite; the retire sentinel written by commitSnapshotPair tells those
- * apart, so callers must also consult hasRetireSentinel. A partial
- * (unparseable) first line is not classified as legacy: marker writes are
- * atomic, so only a legacy append crash produces it, and preferring the
- * snapshot there merely loses part of one legacy debug session.
- */
-function isLegacyLiveLog(liveRaw: string | null): boolean {
-  if (liveRaw == null) {
-    return true;
-  }
-  const firstLine = liveRaw.split("\n").find((line) => line.trim().length > 0);
-  if (firstLine == null) {
-    return true;
-  }
-  try {
-    const entry = JSON.parse(firstLine) as DevToolsLogEntry;
-    return entry.type !== "log-meta";
-  } catch {
-    return false;
-  }
-}
-
-/**
- * True when the live file carries the retire sentinel for exactly this
- * snapshot generation, i.e. the markerless live file is an interrupted
- * current-version commit (snapshot wins), not a legacy rewrite (live wins).
- * A legacy clear truncates the live file, destroying any sentinel, so a
- * post-downgrade clear can never be mistaken for an interrupted commit.
- */
-function hasRetireSentinel(liveRaw: string | null, snapshotGeneration: number): boolean {
-  if (liveRaw == null) {
-    return false;
-  }
-  for (const line of liveRaw.split("\n")) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const entry = JSON.parse(line) as DevToolsLogEntry;
-      if (entry.type === "log-retire" && entry.generation === snapshotGeneration) {
-        return true;
-      }
-    } catch {
-      // Partial trailing line from an interrupted append.
-    }
-  }
-  return false;
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
-/**
- * True only for a history entry a legacy writer could actually have
- * produced: the payload fields replay depends on must be present (a run
- * needs id, workspaceId, and startedAt; a step needs id, runId, and
- * startedAt). A line that parses as JSON with a recognized type but a
- * missing or gutted payload (for example a torn `{"type":"step-update"}`
- * or `{"run":{"id":"x"}}`) is corruption, and letting it count as legacy
- * evidence would discard the snapshot for a line that replays into
- * nothing usable.
- */
-function isReplayableHistoryEntry(entry: DevToolsLogEntry): boolean {
-  switch (entry.type) {
-    case "run":
-      return (
-        isRecord(entry.run) &&
-        isNonEmptyString(entry.run.id) &&
-        isNonEmptyString(entry.run.workspaceId) &&
-        isNonEmptyString(entry.run.startedAt)
-      );
-    case "step":
-      return (
-        isRecord(entry.step) &&
-        isNonEmptyString(entry.step.id) &&
-        isNonEmptyString(entry.step.runId) &&
-        isNonEmptyString(entry.step.startedAt)
-      );
-    case "step-update":
-      return typeof entry.stepId === "string" && entry.stepId.length > 0 && isRecord(entry.update);
-    default:
-      return false;
-  }
-}
-
-/**
- * True when valid log entries follow the LAST retire sentinel for this
- * snapshot generation. The current binary never appends entries after
- * writing a sentinel (the commit either rewrites the live file or fails,
- * and a failed commit's retry writes a fresh sentinel after any entries it
- * appended), so such entries prove a downgraded pre-rotation binary
- * recorded them after the interrupted commit; the live history must win or
- * the downgraded session's runs would be discarded as stale.
- */
-function hasLegacyEntriesAfterRetireSentinel(
-  liveRaw: string | null,
-  snapshotGeneration: number
-): boolean {
-  if (liveRaw == null) {
-    return false;
-  }
-  let entriesSinceSentinel = false;
-  let sawSentinel = false;
-  for (const line of liveRaw.split("\n")) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const entry = JSON.parse(line) as DevToolsLogEntry;
-      if (entry.type === "log-retire" && entry.generation === snapshotGeneration) {
-        sawSentinel = true;
-        entriesSinceSentinel = false;
-        continue;
-      }
-      if (isReplayableHistoryEntry(entry)) {
-        entriesSinceSentinel = true;
-      }
-    } catch {
-      // Partial trailing line from an interrupted append.
-    }
-  }
-  return sawSentinel && entriesSinceSentinel;
-}
-
-/**
- * A live log written after a rotation starts with a log-meta line carrying
- * exactly the snapshot's generation. When a snapshot exists (generation >= 1)
- * and the marker generation differs, the pair is broken: replaying the live
- * log could resurrect runs a snapshot retirement dropped, so its marker gets
- * repaired before ordinary appends land and make the file look pre-snapshot
- * forever. Markerless and empty live files are classified by isLegacyLiveLog
- * before this check applies.
- */
-function isStaleLiveLog(raw: string, snapshotGeneration: number): boolean {
-  if (snapshotGeneration === 0) {
-    return false;
-  }
-  const firstLine = raw.split("\n").find((line) => line.trim().length > 0);
-  if (firstLine == null) {
-    return true;
-  }
-  try {
-    const entry = JSON.parse(firstLine) as DevToolsLogEntry;
-    // The protocol only commits matching snapshot/live pairs: a lower or
-    // missing generation predates the snapshot, a higher one pairs with a
-    // snapshot that is no longer on disk, and either can resurrect dropped
-    // runs. Strict equality against the validated snapshot generation also
-    // rejects corrupt markers (numeric strings, unsafe numbers).
-    return !(entry.type === "log-meta" && entry.generation === snapshotGeneration);
-  } catch {
-    return true;
-  }
+export interface DevToolsServiceOptions {
+  maxRetainedBytesPerWorkspace?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * Yield every line of a file in order, streamed in LOAD_CHUNK_BYTES reads with
+ * an await between chunks, so memory holds one chunk plus one pending line and
+ * the event loop is never blocked for the whole file.
+ */
+async function* readLines(filePath: string): AsyncGenerator<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const chunk = Buffer.alloc(LOAD_CHUNK_BYTES);
+    const decoder = new StringDecoder("utf-8");
+    let pending = "";
+    let position = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) {
+        break;
+      }
+      position += bytesRead;
+      pending += decoder.write(chunk.subarray(0, bytesRead));
+
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      yield* lines;
+    }
+
+    pending += decoder.end();
+    if (pending.length > 0) {
+      yield pending;
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function jsonLength(value: unknown): number {
+  const json = JSON.stringify(value);
+  return json === undefined ? 0 : json.length;
+}
+
+/**
+ * Bytes of `existing` that `update` overwrites. Subtracting them keeps a step
+ * that is re-sent (or finalized) from being counted once per update; the values
+ * replaced are normally `null` placeholders, so this is cheap even for large
+ * payloads.
+ */
+function replacedStepBytes(existing: DevToolsStep, update: Partial<DevToolsStep>): number {
+  let bytes = 0;
+  for (const key of Object.keys(update) as Array<keyof DevToolsStep>) {
+    bytes += jsonLength(existing[key]);
+  }
+  return bytes;
+}
+
+function isStepInFlight(step: Pick<DevToolsStep, "durationMs" | "error">): boolean {
+  return step.durationMs == null && step.error == null;
+}
+
+/** Whether applying `update` finishes a step (it will not be updated again). */
+function completesStep(update: Partial<DevToolsStep>): boolean {
+  return update.durationMs != null || update.error != null;
+}
+
+/** Drop a run, its steps, and their byte accounting. Returns the removed steps. */
+function removeRun(data: WorkspaceData, runId: string): DevToolsStep[] {
+  data.runs.delete(runId);
+  const removedSteps: DevToolsStep[] = [];
+  for (const [stepId, step] of data.steps) {
+    if (step.runId === runId) {
+      data.steps.delete(stepId);
+      data.stepBytes.delete(stepId);
+      removedSteps.push(step);
+    }
+  }
+  data.retainedBytes -= data.runBytes.get(runId) ?? 0;
+  data.runBytes.delete(runId);
+  return removedSteps;
+}
+
+function evictRun(data: WorkspaceData, runId: string): void {
+  for (const step of removeRun(data, runId)) {
+    if (isStepInFlight(step)) {
+      data.evictedStepIds.add(step.id);
+    }
+  }
+  data.evictedRunIds.add(runId);
+  if (data.evictedRunIds.size > MAX_TRACKED_EVICTED_RUNS) {
+    const oldest = data.evictedRunIds.keys().next().value;
+    if (oldest !== undefined) {
+      data.evictedRunIds.delete(oldest);
+    }
+  }
+}
+
+function removeStep(data: WorkspaceData, step: DevToolsStep): void {
+  data.steps.delete(step.id);
+  const bytes = data.stepBytes.get(step.id) ?? 0;
+  data.stepBytes.delete(step.id);
+  data.runBytes.set(step.runId, (data.runBytes.get(step.runId) ?? 0) - bytes);
+  data.retainedBytes -= bytes;
 }
 
 function isUnknownArray(value: unknown): value is unknown[] {
@@ -265,10 +259,18 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
     responseHeaders: step.responseHeaders ?? null,
     rawResponse: step.rawResponse ?? null,
     rawChunks: step.rawChunks ?? null,
+    // Rows from older binaries lack the field; hand-edited or damaged rows must not
+    // reach the renderer as non-arrays.
+    inputTransformations: sanitizeInputTransformations(step.inputTransformations),
   };
 }
 
-type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy">>;
+type PendingRunMetadata = Partial<
+  Pick<
+    DevToolsRun,
+    "toolPolicy" | "requestHistorySequence" | "contextEpoch" | "compactionInputBudgetTokens"
+  >
+>;
 
 export class DevToolsService extends EventEmitter {
   private readonly workspaces = new Map<string, WorkspaceData>();
@@ -282,12 +284,15 @@ export class DevToolsService extends EventEmitter {
    * one pending metadata payload per request instead of a single workspace slot.
    */
   private readonly pendingRunMetadata = new Map<string, Map<string, PendingRunMetadata>>();
+  private readonly maxRetainedBytesPerWorkspace: number;
 
   constructor(
     private readonly config: Config,
-    private readonly maxLogBytes: number = DEVTOOLS_LOG_MAX_BYTES
+    options?: DevToolsServiceOptions
   ) {
     super();
+    this.maxRetainedBytesPerWorkspace =
+      options?.maxRetainedBytesPerWorkspace ?? MAX_RETAINED_BYTES_PER_WORKSPACE;
   }
 
   get enabled(): boolean {
@@ -299,12 +304,14 @@ export class DevToolsService extends EventEmitter {
    *
    * This bridges the timing gap between policy resolution in AIService (before
    * any provider call) and lazy run creation in DevTools middleware (on first
-   * provider invocation). Metadata is consumed exactly once by createRun.
+   * provider invocation). createRun applies it to every run that carries the
+   * metadata ID: the primary run and each refusal-fallback run (a new model, so a
+   * new run) of the same turn. AIService clears it when the turn ends.
    */
   setPendingRunMetadata(
     workspaceId: string,
     metadataId: string,
-    metadata: Partial<Pick<DevToolsRun, "toolPolicy">>
+    metadata: PendingRunMetadata
   ): void {
     assert(
       workspaceId.trim().length > 0,
@@ -376,39 +383,25 @@ export class DevToolsService extends EventEmitter {
     const byWorkspace = this.pendingRunMetadata.get(workspaceId);
     const normalizedMetadataId = metadataId?.trim();
     if (byWorkspace && normalizedMetadataId != null && normalizedMetadataId.length > 0) {
+      // Kept for the turn's later runs: a fallback run without the chat-turn metadata looks
+      // like a headless side call to the replay audit, which then drops the fallback model's
+      // steps and baseline. clearPendingRunMetadata drops it at the turn's end.
       const pendingMetadata = byWorkspace.get(normalizedMetadataId);
       if (pendingMetadata != null) {
         Object.assign(run, pendingMetadata);
-        byWorkspace.delete(normalizedMetadataId);
-      }
-
-      if (byWorkspace.size === 0) {
-        this.pendingRunMetadata.delete(workspaceId);
       }
     }
 
-    data.runs.set(run.id, run);
-    // Emit even when the append rejects (guarded against mid-append
-    // eviction/clear): the run may already be durable (a rotation's snapshot
-    // rename commits before a failed live-marker write throws), and memory,
-    // which backs detail lookups, holds it either way; swallowing the event
-    // would leave open panels inconsistent until resubscribe.
-    const emitRunCreated = (): void => {
-      if (!data.runs.has(run.id)) {
-        return;
+    const entry: DevToolsLogEntry = { type: "run", run };
+    const json = JSON.stringify(entry);
+    this.emitEvicted(workspaceId, this.insertRun(data, run, json.length));
+    await this.persistOrRollback([this.appendToFile(workspaceId, json)], () => {
+      if (data.runs.get(run.id) === run) {
+        removeRun(data, run.id);
       }
-      this.emitWorkspaceEvent(workspaceId, {
-        type: "run-created",
-        run: this.buildRunSummary(data, run.id),
-      });
-    };
-    try {
-      await this.appendToFile(workspaceId, { type: "run", run });
-    } catch (error) {
-      emitRunCreated();
-      throw error;
-    }
-    emitRunCreated();
+    });
+
+    this.emitRunEventIfRetained(workspaceId, data, "run-created", run.id);
   }
 
   async createStep(workspaceId: string, step: DevToolsStep): Promise<void> {
@@ -422,55 +415,73 @@ export class DevToolsService extends EventEmitter {
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
 
-    // Self-healing: if the run was cleared during an active stream,
-    // recreate it so steps aren't orphaned.
+    const entry: DevToolsLogEntry = { type: "step", step };
+    const json = JSON.stringify(entry);
+
+    if (!data.runs.has(step.runId) && data.evictedRunIds.has(step.runId)) {
+      // Eviction is memory-only and disk is authoritative: an evicted run that
+      // is still streaming keeps logging to disk, where replay reassembles it
+      // under its original header, but it is not brought back into memory and
+      // nothing is announced. Its later updates land via evictedStepIds, but
+      // only if no clear() happened while the append was queued: clear()
+      // empties that set and truncates the log, and re-adding the id here
+      // would let the step's finalization write an orphan update into it.
+      const clearGeneration = data.clearGeneration;
+      await this.appendToFile(workspaceId, json);
+      if (
+        isStepInFlight(step) &&
+        this.workspaces.get(workspaceId) === data &&
+        data.clearGeneration === clearGeneration
+      ) {
+        data.evictedStepIds.add(step.id);
+      }
+      return;
+    }
+
+    // Self-healing: if the run was cleared during an active stream (or its
+    // eviction aged out of evictedRunIds), recreate it so steps aren't
+    // orphaned. Should the original header still be on disk, replay keeps that
+    // first line and ignores this duplicate.
+    //
+    // The healed run and the step enter memory in the same synchronous section
+    // before either append is awaited: an await in between let a concurrent
+    // write evict the healed run, after which setStep retained a step (and its
+    // bytes) under a run no longer in data.runs, where evictRun never reclaims it.
+    let healedRun: DevToolsRun | undefined;
+    const appends: Array<Promise<void>> = [];
     if (!data.runs.has(step.runId)) {
-      const autoRun: DevToolsRun = {
+      healedRun = {
         id: step.runId,
         workspaceId,
         startedAt: step.startedAt,
       };
-      data.runs.set(autoRun.id, autoRun);
-      // Emit-on-failure rationale in createRun.
-      const emitAutoRunCreated = (): void => {
-        if (!data.runs.has(autoRun.id)) {
-          return;
-        }
-        this.emitWorkspaceEvent(workspaceId, {
-          type: "run-created",
-          run: this.buildRunSummary(data, autoRun.id),
-        });
-      };
-      try {
-        await this.appendToFile(workspaceId, { type: "run", run: autoRun });
-      } catch (error) {
-        emitAutoRunCreated();
-        throw error;
-      }
-      emitAutoRunCreated();
+      const runEntry: DevToolsLogEntry = { type: "run", run: healedRun };
+      const runJson = JSON.stringify(runEntry);
+      this.emitEvicted(workspaceId, this.insertRun(data, healedRun, runJson.length));
+      appends.push(this.appendToFile(workspaceId, runJson));
     }
 
-    data.steps.set(step.id, step);
-    // The append itself can trigger a rotation that evicts this step's run;
-    // emitting after the runs-evicted event would resurrect it in open
-    // panels. Emit-on-failure rationale in createRun.
-    const emitStepCreated = (): void => {
-      if (!data.steps.has(step.id)) {
-        return;
+    this.emitEvicted(workspaceId, this.setStep(data, step, json.length));
+    appends.push(this.appendToFile(workspaceId, json));
+
+    // Publish only after both lines are durable: if an append rejects (disk
+    // full), the caller sees the error and subscribers never learn of a run
+    // whose step could never finalize. Both appends are queued before either
+    // is awaited so a rejected run line does not leave the step line unqueued.
+    await this.persistOrRollback(appends, () => {
+      if (data.steps.get(step.id) === step) {
+        removeStep(data, step);
       }
-      this.emitWorkspaceEvent(workspaceId, { type: "step-created", step });
-      if (data.runs.has(step.runId)) {
-        const summary = this.buildRunSummary(data, step.runId);
-        this.emitWorkspaceEvent(workspaceId, { type: "run-updated", run: summary });
+      if (healedRun !== undefined && data.runs.get(healedRun.id) === healedRun) {
+        removeRun(data, healedRun.id);
       }
-    };
-    try {
-      await this.appendToFile(workspaceId, { type: "step", step });
-    } catch (error) {
-      emitStepCreated();
-      throw error;
+    });
+
+    if (healedRun !== undefined) {
+      this.emitRunEventIfRetained(workspaceId, data, "run-created", step.runId);
     }
-    emitStepCreated();
+    this.emitStepEventIfRetained(workspaceId, data, "step-created", step.id);
+    this.emitRunEventIfRetained(workspaceId, data, "run-updated", step.runId);
   }
 
   async updateStep(
@@ -484,11 +495,33 @@ export class DevToolsService extends EventEmitter {
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
 
+    const entry: DevToolsLogEntry = { type: "step-update", stepId, update };
+    const json = JSON.stringify(entry);
+
     const existing = data.steps.get(stepId);
     if (!existing) {
-      log.warn(
-        `DevToolsService.updateStep skipped missing step ${stepId} in workspace ${workspaceId}`
-      );
+      if (!data.evictedStepIds.has(stepId)) {
+        // Cleared (the log was truncated) or never seen: appending would leave
+        // an orphan update, possibly MBs of raw payload, that replay cannot show.
+        log.debug("DevToolsService.updateStep skipping update for cleared or unknown step", {
+          workspaceId,
+          stepId,
+        });
+        return;
+      }
+      // Disk is authoritative and retention eviction is memory-only: when an
+      // overlapping request's step is evicted while still in flight, its final
+      // duration/output/usage must still reach devtools.jsonl. Memory, byte
+      // accounting, and events stay untouched because nothing retains the step.
+      log.debug("DevToolsService.updateStep persisting update for evicted step", {
+        workspaceId,
+        stepId,
+      });
+      await this.appendToFile(workspaceId, json);
+      // Safe unguarded: after a clear() during the await the set is already empty.
+      if (completesStep(update)) {
+        data.evictedStepIds.delete(stepId);
+      }
       return;
     }
 
@@ -496,37 +529,20 @@ export class DevToolsService extends EventEmitter {
       ...existing,
       ...update,
     };
-    data.steps.set(stepId, mergedStep);
+    const previousBytes = data.stepBytes.get(stepId) ?? 0;
+    this.emitEvicted(
+      workspaceId,
+      this.setStep(data, mergedStep, this.updatedStepBytes(data, existing, update, json.length))
+    );
 
-    // The append itself can trigger a rotation that evicts this step's run
-    // (a final step-update crossing the cap completes the run); emitting
-    // after the runs-evicted event would resurrect the step in open panels.
-    // Emit-on-failure rationale in createRun.
-    const emitStepUpdated = (): void => {
-      if (!data.steps.has(stepId)) {
-        return;
+    await this.persistOrRollback([this.appendToFile(workspaceId, json)], () => {
+      if (data.steps.get(stepId) === mergedStep) {
+        this.setStep(data, existing, previousBytes);
       }
-      this.emitWorkspaceEvent(workspaceId, {
-        type: "step-updated",
-        step: mergedStep,
-      });
+    });
 
-      if (data.runs.has(mergedStep.runId)) {
-        const summary = this.buildRunSummary(data, mergedStep.runId);
-        this.emitWorkspaceEvent(workspaceId, { type: "run-updated", run: summary });
-      }
-    };
-    try {
-      await this.appendToFile(workspaceId, {
-        type: "step-update",
-        stepId,
-        update,
-      });
-    } catch (error) {
-      emitStepUpdated();
-      throw error;
-    }
-    emitStepUpdated();
+    this.emitStepEventIfRetained(workspaceId, data, "step-updated", stepId);
+    this.emitRunEventIfRetained(workspaceId, data, "run-updated", mergedStep.runId);
   }
 
   async finalizeStaleSteps(workspaceId: string): Promise<void> {
@@ -600,34 +616,24 @@ export class DevToolsService extends EventEmitter {
     const data = this.getOrCreateWorkspaceData(workspaceId);
     data.runs.clear();
     data.steps.clear();
-    // Queued base repairs belong to cleared runs; flushing them after the
-    // clear would resurrect those runs on the next load.
-    data.pendingLiveRepairs = [];
+    data.runBytes.clear();
+    data.stepBytes.clear();
+    data.evictedStepIds.clear();
+    data.evictedRunIds.clear();
+    data.retainedBytes = 0;
     data.clearGeneration += 1;
     data.loaded = true;
+    data.replayComplete = true;
     this.pendingRunMetadata.delete(workspaceId);
 
-    // Enqueue so clear() cannot race with pending appends. An empty snapshot
-    // pair (instead of truncate-then-remove) keeps an interrupted clear
-    // cleared: after the snapshot rename commits, a leftover live log is
-    // stale by generation and skipped on the next load.
-    let markerError: Error | undefined;
-    await this.enqueueWrite(workspaceId, async () => {
-      markerError = await this.commitSnapshotPair(
-        workspaceId,
-        data,
-        this.getSessionFilePath(workspaceId),
-        []
-      );
-    });
+    // Enqueue truncation so clear() cannot race with pending appends.
+    await this.enqueueWrite(workspaceId, () =>
+      this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
+        fs.writeFile(filePath, "", "utf-8")
+      )
+    );
 
-    // A marker-write failure happens after the snapshot rename committed the
-    // clear: memory, detail lookups, and future restarts are already empty,
-    // so subscribers must drop their run cards before the failure propagates.
     this.emitWorkspaceEvent(workspaceId, { type: "cleared" });
-    if (markerError !== undefined) {
-      throw markerError;
-    }
   }
 
   /**
@@ -653,18 +659,13 @@ export class DevToolsService extends EventEmitter {
     }
 
     // Deleting the entry (rather than clearing it in place) makes stale queued
-    // appends no-ops via the existence guard in appendToFile.
+    // appends no-ops via the workspace guard in appendToFile.
     this.workspaces.delete(workspaceId);
     this.pendingRunMetadata.delete(workspaceId);
 
     // Enqueue the deletion so it serializes behind any pending appends.
     await this.enqueueWrite(workspaceId, async () => {
       await fs.rm(this.getSessionFilePath(workspaceId), { force: true });
-      await fs.rm(this.getRotatedFilePath(workspaceId), { force: true });
-      // An interrupted rotation can leave a full compacted snapshot here.
-      await fs.rm(this.getRotatedTmpFilePath(workspaceId), { force: true });
-      // An interrupted marker write can leave its tmp file behind.
-      await fs.rm(`${this.getSessionFilePath(workspaceId)}.tmp`, { force: true });
     });
 
     this.emitWorkspaceEvent(workspaceId, { type: "cleared" });
@@ -674,16 +675,92 @@ export class DevToolsService extends EventEmitter {
     this.emit(`update:${workspaceId}`, event);
   }
 
+  /**
+   * Memory is mutated before the disk append (so a concurrent write cannot
+   * slip between them), which means a rejected append (disk full) would leave
+   * an unpersisted run or step visible until restart. Wait for every append to
+   * settle, and if any failed run the caller's rollback for the entity it was
+   * writing, then rethrow the first failure. Runs that retention evicted to
+   * make room are not restored: they are on disk, which is authoritative, and
+   * come back on the next load. The rollback must check the entity is still
+   * the one it inserted, since eviction or clear() may have removed it already.
+   */
+  private async persistOrRollback(
+    appends: Array<Promise<void>>,
+    rollback: () => void
+  ): Promise<void> {
+    const results = await Promise.allSettled(appends);
+    const failure = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (failure) {
+      rollback();
+      throw failure.reason;
+    }
+  }
+
+  /**
+   * Every event that follows an await must go through these guards: while the
+   * disk append was queued the run or step may have been evicted, cleared, or
+   * its workspace removed, and each of those already told subscribers to drop
+   * it (runs-evicted / cleared). Announcing it afterwards would resurrect it
+   * in the renderer, possibly with its raw payload, under a run that no
+   * longer exists. The payload is read from memory at emit time so it is
+   * exactly what readers see.
+   */
+  private emitRunEventIfRetained(
+    workspaceId: string,
+    data: WorkspaceData,
+    type: "run-created" | "run-updated",
+    runId: string
+  ): void {
+    if (this.workspaces.get(workspaceId) === data && data.runs.has(runId)) {
+      this.emitWorkspaceEvent(workspaceId, { type, run: this.buildRunSummary(data, runId) });
+    }
+  }
+
+  private emitStepEventIfRetained(
+    workspaceId: string,
+    data: WorkspaceData,
+    type: "step-created" | "step-updated",
+    stepId: string
+  ): void {
+    const step = this.workspaces.get(workspaceId) === data ? data.steps.get(stepId) : undefined;
+    if (step && data.runs.has(step.runId)) {
+      this.emitWorkspaceEvent(workspaceId, { type, step });
+    }
+  }
+
+  /**
+   * Tell live subscribers which runs retention just dropped, so the renderer
+   * releases them too instead of showing a run whose steps are gone. Replay
+   * evictions are not announced: the snapshot already reflects them.
+   */
+  private emitEvicted(workspaceId: string, runIds: string[]): void {
+    if (runIds.length > 0) {
+      this.emitWorkspaceEvent(workspaceId, { type: "runs-evicted", runIds });
+    }
+  }
+
+  /** Whether removeWorkspaceData() has anything to remove: live in-memory state or the on-disk log. */
+  async hasWorkspaceData(workspaceId: string): Promise<boolean> {
+    assert(
+      workspaceId.trim().length > 0,
+      "DevToolsService.hasWorkspaceData requires a workspaceId"
+    );
+    if (this.workspaces.has(workspaceId)) {
+      return true;
+    }
+    try {
+      await fs.access(this.getSessionFilePath(workspaceId));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private getSessionFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), "devtools.jsonl");
-  }
-
-  private getRotatedFilePath(workspaceId: string): string {
-    return `${this.getSessionFilePath(workspaceId)}${DEVTOOLS_LOG_ROTATED_SUFFIX}`;
-  }
-
-  private getRotatedTmpFilePath(workspaceId: string): string {
-    return `${this.getRotatedFilePath(workspaceId)}.tmp`;
+    return path.join(this.config.sessionsDir, workspaceId, "devtools.jsonl");
   }
 
   private getOrCreateWorkspaceData(workspaceId: string): WorkspaceData {
@@ -695,15 +772,79 @@ export class DevToolsService extends EventEmitter {
     data = {
       runs: new Map<string, DevToolsRun>(),
       steps: new Map<string, DevToolsStep>(),
+      runBytes: new Map<string, number>(),
+      stepBytes: new Map<string, number>(),
+      retainedBytes: 0,
       loaded: false,
+      evictedStepIds: new Set<string>(),
+      evictedRunIds: new Set<string>(),
+      replayComplete: false,
       clearGeneration: 0,
-      logGeneration: 0,
-      liveMarkerGeneration: 0,
-      pendingLiveRepairs: [],
-      liveTailMayBeTorn: false,
     };
     this.workspaces.set(workspaceId, data);
     return data;
+  }
+
+  /** Returns the run ids retention evicted to make room. */
+  private insertRun(data: WorkspaceData, run: DevToolsRun, bytes: number): string[] {
+    data.runs.set(run.id, run);
+    this.addRunBytes(data, run.id, bytes);
+    return this.enforceRetention(data, run.id);
+  }
+
+  /** Returns the run ids retention evicted to make room. */
+  private setStep(data: WorkspaceData, step: DevToolsStep, bytes: number): string[] {
+    const previousBytes = data.stepBytes.get(step.id) ?? 0;
+    data.steps.set(step.id, step);
+    data.stepBytes.set(step.id, bytes);
+    this.addRunBytes(data, step.runId, bytes - previousBytes);
+    return this.enforceRetention(data, step.runId);
+  }
+
+  /** Size of `existing` after applying `update`, given the update's serialized length. */
+  private updatedStepBytes(
+    data: WorkspaceData,
+    existing: DevToolsStep,
+    update: Partial<DevToolsStep>,
+    updateJsonBytes: number
+  ): number {
+    const previousBytes = data.stepBytes.get(existing.id) ?? 0;
+    return Math.max(0, previousBytes + updateJsonBytes - replacedStepBytes(existing, update));
+  }
+
+  private addRunBytes(data: WorkspaceData, runId: string, delta: number): void {
+    data.runBytes.set(runId, (data.runBytes.get(runId) ?? 0) + delta);
+    data.retainedBytes += delta;
+  }
+
+  /**
+   * Drop the oldest runs (by append order) and their steps until both the run
+   * and byte bounds hold. `writingRunId` is the run the caller just inserted or
+   * grew; it is never evicted, so a single oversized run stays visible. It is
+   * skipped rather than treated as a stop: an old in-flight run that grows
+   * late must still push out the newer runs behind it. Returns the evicted
+   * run ids in eviction order.
+   */
+  private enforceRetention(data: WorkspaceData, writingRunId: string): string[] {
+    const evictedRunIds: string[] = [];
+    while (
+      data.runs.size > MAX_RETAINED_RUNS_PER_WORKSPACE ||
+      data.retainedBytes > this.maxRetainedBytesPerWorkspace
+    ) {
+      let oldestEvictableRunId: string | undefined;
+      for (const runId of data.runs.keys()) {
+        if (runId !== writingRunId) {
+          oldestEvictableRunId = runId;
+          break;
+        }
+      }
+      if (oldestEvictableRunId === undefined) {
+        break;
+      }
+      evictRun(data, oldestEvictableRunId);
+      evictedRunIds.push(oldestEvictableRunId);
+    }
+    return evictedRunIds;
   }
 
   private async ensureLoaded(workspaceId: string): Promise<void> {
@@ -733,149 +874,82 @@ export class DevToolsService extends EventEmitter {
   }
 
   private async loadFromDisk(workspaceId: string, data: WorkspaceData): Promise<void> {
-    const readOrNull = async (filePath: string): Promise<string | null> => {
-      try {
-        return await fs.readFile(filePath, "utf-8");
-      } catch (error) {
-        if (isRecord(error) && error.code === "ENOENT") {
-          return null;
-        }
-        throw error;
+    const filePath = this.getSessionFilePath(workspaceId);
+
+    try {
+      for await (const line of readLines(filePath)) {
+        this.replayLogLine(workspaceId, data, line);
       }
-    };
-
-    const rotatedRaw = await readOrNull(this.getRotatedFilePath(workspaceId));
-    const livePath = this.getSessionFilePath(workspaceId);
-    const liveRaw = await readOrNull(livePath);
-
-    // Rotated log first so live-file step-updates can find their base records.
-    if (rotatedRaw != null) {
-      this.replayLogLines(workspaceId, data, rotatedRaw);
-    }
-
-    // A validly committed snapshot paired with a markerless live file means
-    // either a downgraded pre-rotation binary rewrote (or cleared) the live
-    // file, or a commit was interrupted before the live rewrite. The retire
-    // sentinel separates them: without it, the live file is legacy and wins,
-    // because replaying the snapshot would resurrect history the user
-    // cleared while downgraded and discard the legacy binary's newer runs.
-    // Entries recorded AFTER the sentinel equally prove a legacy writer:
-    // a downgraded binary appending to an interrupted commit's live file
-    // leaves the stale marker (or no marker) in place, so without this
-    // check its writes would be discarded as stale. Generations reset to 0,
-    // so appends continue markerless until the next rotation re-establishes
-    // a snapshot/marker pair.
-    if (
-      data.logGeneration > 0 &&
-      (hasLegacyEntriesAfterRetireSentinel(liveRaw, data.logGeneration) ||
-        (isLegacyLiveLog(liveRaw) && !hasRetireSentinel(liveRaw, data.logGeneration)))
-    ) {
-      data.runs.clear();
-      data.steps.clear();
-      data.logGeneration = 0;
-      data.liveMarkerGeneration = 0;
-      if (liveRaw != null) {
-        this.replayLogLines(workspaceId, data, liveRaw);
-      }
-      data.loaded = true;
-      await this.finalizeStaleStepsForLoadedWorkspace(workspaceId, data);
-      return;
-    }
-
-    if (liveRaw != null && !isStaleLiveLog(liveRaw, data.logGeneration)) {
-      this.replayLogLines(workspaceId, data, liveRaw);
-      data.liveMarkerGeneration = data.logGeneration;
-    } else if (data.logGeneration > 0) {
-      // A crash interrupted rotation (or clear) between the snapshot rename
-      // and the live-log rewrite, leaving the live file stale or missing.
-      // Replaying a stale file would resurrect dropped runs, and appends
-      // landing before a marker exists would look pre-snapshot on the next
-      // load, so finish the interrupted retirement instead.
-      if (liveRaw != null) {
-        log.warn("Skipping stale devtools.jsonl superseded by rotated snapshot", { workspaceId });
-      }
-      try {
-        await this.writeLiveMarker(livePath, data.logGeneration);
-        data.liveMarkerGeneration = data.logGeneration;
-      } catch (error) {
-        // Best-effort: the snapshot already replayed, so loading must not
-        // fail on an unwritable session dir. The lagging marker generation
-        // makes the next append retry this repair.
-        log.warn("Failed to repair devtools.jsonl live marker on load", {
-          workspaceId,
-          error: String(error),
-        });
+      data.replayComplete = true;
+    } catch (error) {
+      // Any failure still marks the workspace loaded with whatever partial state
+      // was replayed. Leaving `loaded` false made every later createRun/createStep
+      // re-run the failing load against a multi-hundred-MB file.
+      if (isRecord(error) && error.code === "ENOENT") {
+        data.replayComplete = true;
+      } else {
+        log.warn(
+          "DevTools: failed to load devtools.jsonl, continuing with partial state (replay incomplete, stale finalization skipped)",
+          { workspaceId, error: getErrorMessage(error) }
+        );
       }
     }
 
+    // Replay evictions cannot receive live updates (every live call awaits
+    // ensureLoaded first), so only evictions from here on need remembering.
+    data.evictedStepIds.clear();
+    data.evictedRunIds.clear();
     data.loaded = true;
     await this.finalizeStaleStepsForLoadedWorkspace(workspaceId, data);
   }
 
-  private replayLogLines(workspaceId: string, data: WorkspaceData, raw: string): void {
-    const lines = raw.split("\n");
-    for (const line of lines) {
-      if (!line.trim()) {
-        continue;
-      }
+  private replayLogLine(workspaceId: string, data: WorkspaceData, line: string): void {
+    if (!line.trim()) {
+      return;
+    }
 
-      try {
-        const entry = JSON.parse(line) as DevToolsLogEntry;
-        switch (entry.type) {
-          case "run": {
-            data.runs.set(entry.run.id, entry.run);
+    try {
+      const entry = JSON.parse(line) as DevToolsLogEntry;
+      switch (entry.type) {
+        case "run": {
+          // A second run line for the same id comes from createStep's
+          // self-heal after eviction; the original carries the run metadata.
+          if (data.runs.has(entry.run.id)) {
             break;
           }
-          case "step": {
-            data.steps.set(entry.step.id, applyStepBackwardCompatibilityDefaults(entry.step));
-            break;
-          }
-          case "step-update": {
-            const existing = data.steps.get(entry.stepId);
-            if (existing) {
-              data.steps.set(
-                entry.stepId,
-                applyStepBackwardCompatibilityDefaults({
-                  ...existing,
-                  ...entry.update,
-                })
-              );
-            }
-            break;
-          }
-          case "snapshot-meta": {
-            // A malformed generation would poison logGeneration: a string
-            // yields NaN (every comparison fails, the repair branch is
-            // skipped, appends are discarded on each restart) and an unsafe
-            // number like 1e100 stops incrementing (generation + 1 ===
-            // generation), so rotations reuse the generation and a stale
-            // live marker can pass as current. The next rotation writes
-            // generation + 1, so that increment must be safe too, or its
-            // snapshot would be ignored on the following load and the stale
-            // live log replayed. Ignore invalid metadata.
-            if (
-              Number.isSafeInteger(entry.generation) &&
-              Number.isSafeInteger(entry.generation + 1) &&
-              entry.generation >= 0
-            ) {
-              data.logGeneration = Math.max(data.logGeneration, entry.generation);
-            }
-            break;
-          }
-          case "log-meta":
-          case "log-retire": {
-            // Pairing is decided in loadFromDisk before replay; nothing to apply.
-            break;
-          }
-          default: {
-            log.warn("Skipping unknown devtools.jsonl entry type", {
-              workspaceId,
-            });
-          }
+          this.insertRun(data, entry.run, line.length);
+          break;
         }
-      } catch {
-        log.warn("Skipping corrupted devtools.jsonl line");
+        case "step": {
+          // Steps for runs already evicted during replay have no reader; skip them.
+          if (!data.runs.has(entry.step.runId)) {
+            break;
+          }
+          this.setStep(data, applyStepBackwardCompatibilityDefaults(entry.step), line.length);
+          break;
+        }
+        case "step-update": {
+          const existing = data.steps.get(entry.stepId);
+          if (existing) {
+            this.setStep(
+              data,
+              applyStepBackwardCompatibilityDefaults({
+                ...existing,
+                ...entry.update,
+              }),
+              this.updatedStepBytes(data, existing, entry.update, line.length)
+            );
+          }
+          break;
+        }
+        default: {
+          log.warn("Skipping unknown devtools.jsonl entry type", {
+            workspaceId,
+          });
+        }
       }
+    } catch {
+      log.warn("Skipping corrupted devtools.jsonl line");
     }
   }
 
@@ -887,10 +961,11 @@ export class DevToolsService extends EventEmitter {
       data.loaded,
       "DevToolsService.finalizeStaleStepsForLoadedWorkspace requires loaded workspace data"
     );
+    if (!data.replayComplete) {
+      return;
+    }
 
-    const staleSteps = Array.from(data.steps.values()).filter(
-      (step) => step.durationMs == null && step.error == null
-    );
+    const staleSteps = Array.from(data.steps.values()).filter(isStepInFlight);
     if (staleSteps.length === 0) {
       return;
     }
@@ -973,313 +1048,54 @@ export class DevToolsService extends EventEmitter {
     return next;
   }
 
-  private async appendToFile(workspaceId: string, entry: DevToolsLogEntry): Promise<void> {
+  /** `json` is the caller's serialized log entry, shared with retention accounting. */
+  private async appendToFile(workspaceId: string, json: string): Promise<void> {
+    // Capture the generation now: only clear() (generation bump) or
+    // removeWorkspaceData() (entry deleted) may cancel a queued write. The run
+    // or step may already be gone from memory when the write executes because
+    // retention eviction is memory-only, and the on-disk log must still get it.
+    const clearGeneration = this.workspaces.get(workspaceId)?.clearGeneration;
     return this.enqueueWrite(workspaceId, async () => {
-      // Defense-in-depth: skip stale writes after clear() by requiring current entities.
       const data = this.workspaces.get(workspaceId);
-      if (!data) {
-        return;
-      }
-      if (entry.type === "run" && !data.runs.has(entry.run.id)) {
-        return;
-      }
-      if (entry.type === "step" && !data.steps.has(entry.step.id)) {
-        return;
-      }
-      if (entry.type === "step-update" && !data.steps.has(entry.stepId)) {
+      if (!data || data.clearGeneration !== clearGeneration) {
         return;
       }
 
-      const filePath = this.getSessionFilePath(workspaceId);
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await this.appendWithMarkerRepair(data, filePath, `${JSON.stringify(entry)}\n`);
-
-      // The write queue serializes rotation with appends and clear().
-      const stats = await fs.stat(filePath);
-      if (stats.size > this.maxLogBytes) {
-        await this.rotateLog(workspaceId, data, filePath);
-      }
+      await this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
+        fs.appendFile(filePath, `${json}\n`, "utf-8")
+      );
     });
   }
 
   /**
-   * Rotation compacts in-memory state into a self-contained rotated snapshot
-   * instead of renaming the live file: the live file may hold step-updates
-   * whose base records came from the previous rotated file, so a rename chain
-   * would orphan them on the next rotation. Active runs (zero steps yet, or
-   * any in-progress step) are always retained so their upcoming steps and
-   * step-updates keep a persisted base record; completed runs fill the
-   * remaining cap newest-first. Dropped
-   * runs are also evicted from memory: a late createStep then self-heals by
-   * recreating the run record, and a late updateStep no-ops, so the live file
-   * never references entities missing from the snapshot.
+   * r64: devtools.jsonl commits recreate the session directory via mkdir,
+   * and with XUM_ALLOW_MULTIPLE_INSTANCES=1 a foreign backend's in-flight
+   * stream survives the remover's process-local cancellation entirely — its
+   * step finalization would resurrect the directory the remover just
+   * deleted. Run every directory-creating disk commit inside the same
+   * sessionDir target mutation lock removal's tombstone+delete critical
+   * section holds, and recheck the durable removal tombstone in-lock (same
+   * posture as SessionUsageService.recordHeadlessUsage). Dropping the entry
+   * is correct: debug logs for a removed workspace have no reader. Callers
+   * never hold other target locks here, so this single-key acquisition
+   * cannot ABBA with removal's sorted multi-key acquisition.
    */
-  private async rotateLog(
+  private async commitToSessionFileUnlessRemoved(
     workspaceId: string,
-    data: WorkspaceData,
-    filePath: string
+    write: (filePath: string) => Promise<void>
   ): Promise<void> {
-    const stepsByRun = new Map<string, DevToolsStep[]>();
-    for (const step of data.steps.values()) {
-      const list = stepsByRun.get(step.runId) ?? [];
-      list.push(step);
-      stepsByRun.set(step.runId, list);
-    }
-    // Zero-step runs are just-created: their createRun caller may still be
-    // awaiting the queued append, and their first steps are in flight, so
-    // evicting them would strand those operations without a base record.
-    const isActiveRun = (runId: string): boolean => {
-      const steps = stepsByRun.get(runId);
-      if (steps == null || steps.length === 0) {
-        return true;
-      }
-      return steps.some((step) => step.durationMs == null && step.error == null);
-    };
-
-    const runsNewestFirst = Array.from(data.runs.values()).sort((a, b) =>
-      b.startedAt.localeCompare(a.startedAt)
-    );
-    const retainedChunks: string[][] = [];
-    const retainedRunIds = new Set<string>();
-    let retainedBytes = 0;
-    for (const run of runsNewestFirst) {
-      const lines = [JSON.stringify({ type: "run", run } satisfies DevToolsLogEntry)];
-      for (const step of stepsByRun.get(run.id) ?? []) {
-        lines.push(JSON.stringify({ type: "step", step } satisfies DevToolsLogEntry));
-      }
-      const chunkBytes = lines.reduce(
-        (total, line) => total + Buffer.byteLength(line, "utf-8") + 1,
-        0
-      );
-      const overCap = retainedChunks.length > 0 && retainedBytes + chunkBytes > this.maxLogBytes;
-      // The newest run and active runs are retained even over the cap.
-      if (overCap && !isActiveRun(run.id)) {
-        continue;
-      }
-      retainedChunks.push(lines);
-      retainedRunIds.add(run.id);
-      retainedBytes += chunkBytes;
-    }
-    // Chronological order for readability; replay only needs base-before-update.
-    retainedChunks.reverse();
-
-    const frozenStepIds = new Set<string>();
-    for (const steps of stepsByRun.values()) {
-      for (const step of steps) {
-        frozenStepIds.add(step.id);
-      }
-    }
-    const frozenClearGeneration = data.clearGeneration;
-
-    const markerError = await this.commitSnapshotPair(workspaceId, data, filePath, retainedChunks);
-
-    // clear() during the snapshot I/O empties the maps and queues an empty
-    // snapshot commit behind this rotation, making every frozen retention
-    // decision stale. Anything now in the maps is a post-clear recreation
-    // that can reuse a frozen run ID with no steps inserted yet; evicting it
-    // would make its queued base append skip and strand the first post-clear
-    // step (createStep would then throw on the missing run).
-    if (data.clearGeneration !== frozenClearGeneration) {
-      if (markerError !== undefined) {
-        throw markerError;
-      }
-      return;
-    }
-
-    // Eviction is restricted to the decision set frozen above: overlapping
-    // provider calls can add runs and steps while commitSnapshotPair awaits
-    // filesystem I/O, and those entities were never considered for the
-    // snapshot, so deleting them would strand their in-flight operations.
-    // Reconciliation runs even when the live-marker write failed: the
-    // snapshot rename already committed the retention decision, so leaving
-    // dropped runs in memory would let later appends target runs whose
-    // records exist nowhere durable.
-    let repairError: Error | undefined;
-    const evictedRunIds: string[] = [];
-    for (const run of runsNewestFirst) {
-      // A clear landing during the repair await below supersedes the frozen
-      // decision set, exactly like the pre-loop check: later iterations
-      // would evict post-clear recreations or re-persist cleared history.
-      if (data.clearGeneration !== frozenClearGeneration) {
-        break;
-      }
-      if (retainedRunIds.has(run.id)) {
-        continue;
-      }
-      const liveRun = data.runs.get(run.id);
-      const midIoSteps = Array.from(data.steps.values()).filter(
-        (step) => step.runId === run.id && !frozenStepIds.has(step.id)
-      );
-      if (liveRun != null && midIoSteps.length > 0) {
-        // The run gained activity mid-I/O after losing its snapshot spot.
-        // Keep it and re-persist its base records into the fresh live file
-        // so the new steps (whose queued appends land next) stay replayable.
-        const lines = [JSON.stringify({ type: "run", run: liveRun } satisfies DevToolsLogEntry)];
-        for (const step of stepsByRun.get(run.id) ?? []) {
-          lines.push(JSON.stringify({ type: "step", step } satisfies DevToolsLogEntry));
+    await withTargetMutationLock(
+      this.config.rootDir,
+      path.join(this.config.sessionsDir, workspaceId),
+      async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+          log.debug("Skipping DevTools write for removed workspace", { workspaceId });
+          return;
         }
-        try {
-          await this.appendWithMarkerRepair(data, filePath, `${lines.join("\n")}\n`);
-        } catch (error) {
-          // Keep the run in memory and queue the base records as a pending
-          // repair: the queued step appends that motivated keeping this run
-          // must not land without them, or the next load would orphan the
-          // steps and drop the run. Replay is Map.set-idempotent, so a
-          // partially-written repair retried later is harmless. A clear that
-          // landed during this failed append already emptied the repair
-          // queue; requeueing these pre-clear base records would flush them
-          // on the next successful append and resurrect cleared history.
-          if (data.clearGeneration === frozenClearGeneration) {
-            data.pendingLiveRepairs.push(`${lines.join("\n")}\n`);
-          }
-          repairError ??= error instanceof Error ? error : new Error(String(error));
-        }
-        continue;
+        const filePath = this.getSessionFilePath(workspaceId);
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await write(filePath);
       }
-      evictedRunIds.push(run.id);
-      data.runs.delete(run.id);
-      for (const step of stepsByRun.get(run.id) ?? []) {
-        data.steps.delete(step.id);
-      }
-    }
-    if (evictedRunIds.length > 0) {
-      // Open DevTools panels must drop evicted run cards.
-      this.emitWorkspaceEvent(workspaceId, { type: "runs-evicted", runIds: evictedRunIds });
-    }
-    const firstError = markerError ?? repairError;
-    if (firstError !== undefined) {
-      throw firstError;
-    }
-  }
-
-  /**
-   * Commits a snapshot/live-log pair. Write-then-rename keeps the previous
-   * snapshot intact if the write is interrupted; rename replaces the
-   * destination in one step (POSIX rename, MOVEFILE_REPLACE_EXISTING on
-   * Windows), so no crash window exists where neither snapshot is on disk.
-   * The generation pair makes live-log retirement recoverable: if the
-   * process dies before the live file is rewritten, its stale generation
-   * tells the next load to skip it instead of resurrecting runs the snapshot
-   * deliberately dropped. clear() commits an empty snapshot through the same
-   * protocol so an interrupted clear stays cleared.
-   *
-   * A live-marker write failure after the rename is returned instead of
-   * thrown: the snapshot is committed at that point, so callers must finish
-   * reconciling in-memory state with it before propagating the failure.
-   */
-  private async commitSnapshotPair(
-    workspaceId: string,
-    data: WorkspaceData,
-    filePath: string,
-    chunks: string[][]
-  ): Promise<Error | undefined> {
-    const rotatedPath = this.getRotatedFilePath(workspaceId);
-    // The load guard rejects a generation whose own increment is unsafe, so
-    // the value written here must stay one increment below that ceiling or
-    // the next load would ignore this snapshot and replay the stale live
-    // log. Restart the sequence instead; pairing is by strict equality plus
-    // the retire sentinel, so a restart cannot mis-pair this commit's files.
-    const generation = Number.isSafeInteger(data.logGeneration + 2) ? data.logGeneration + 1 : 1;
-    const tmpPath = this.getRotatedTmpFilePath(workspaceId);
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    // Retire sentinel before the snapshot commit: if a crash leaves a
-    // markerless live file next to the renamed snapshot, this line marks it
-    // as an interrupted commit (snapshot wins) rather than a legacy
-    // pre-rotation rewrite (live wins). The live rewrite below discards it
-    // on success, and replay ignores it.
-    await this.appendToLiveFile(
-      data,
-      filePath,
-      `${JSON.stringify({ type: "log-retire", generation } satisfies DevToolsLogEntry)}\n`
     );
-    await fs.writeFile(
-      tmpPath,
-      [
-        `${JSON.stringify({ type: "snapshot-meta", generation } satisfies DevToolsLogEntry)}\n`,
-        ...chunks.map((lines) => `${lines.join("\n")}\n`),
-      ].join(""),
-      "utf-8"
-    );
-    await fs.rename(tmpPath, rotatedPath);
-    // The snapshot is committed once the rename lands: advance the in-memory
-    // generation before the live-marker write so a marker failure (e.g.
-    // ENOSPC) leaves the append path knowing a repair is needed.
-    data.logGeneration = generation;
-    try {
-      await this.writeLiveMarker(filePath, generation);
-      data.liveMarkerGeneration = generation;
-      // The marker rewrite replaced the whole file, discarding any torn tail.
-      data.liveTailMayBeTorn = false;
-    } catch (error) {
-      return error instanceof Error ? error : new Error(String(error));
-    }
-    return undefined;
-  }
-
-  /**
-   * Appends after repairing a lagging live marker: a snapshot committed but
-   * its live-marker write failed, so entries appended before the repair
-   * would be discarded as pre-snapshot on the next load. The stale content
-   * being truncated is already superseded by the committed snapshot.
-   */
-  private async appendWithMarkerRepair(
-    data: WorkspaceData,
-    filePath: string,
-    content: string
-  ): Promise<void> {
-    if (data.liveMarkerGeneration !== data.logGeneration) {
-      await this.writeLiveMarker(filePath, data.logGeneration);
-      data.liveMarkerGeneration = data.logGeneration;
-      // The marker rewrite replaced the whole file, discarding any torn tail.
-      data.liveTailMayBeTorn = false;
-    }
-    // Failed rotation-time base repairs must land before this append (see
-    // pendingLiveRepairs); a failure here rejects the append too, so a step
-    // can never be persisted ahead of its run's base records. Each retry
-    // keeps an unconditional leading newline: the failed attempt that
-    // queued it may have bypassed the torn-tail flag (it can fail between
-    // sub-writes), and duplicated records from a fully-written-but-rejected
-    // attempt are harmless because replay is Map.set-idempotent.
-    while (data.pendingLiveRepairs.length > 0) {
-      await this.appendToLiveFile(data, filePath, `\n${data.pendingLiveRepairs[0]}`);
-      data.pendingLiveRepairs.shift();
-    }
-    await this.appendToLiveFile(data, filePath, content);
-  }
-
-  /**
-   * All live-file appends go through this seal. A previously failed append
-   * may have written a partial fragment as the file's tail; appending
-   * directly onto it would merge the fragment with this content into one
-   * malformed line that replay skips, losing this record too. A leading
-   * newline instead seals the fragment as its own malformed line. A failure
-   * here may itself be partial, so it re-arms the seal.
-   */
-  private async appendToLiveFile(
-    data: WorkspaceData,
-    filePath: string,
-    content: string
-  ): Promise<void> {
-    const sealed = data.liveTailMayBeTorn ? `\n${content}` : content;
-    try {
-      await fs.appendFile(filePath, sealed, "utf-8");
-      data.liveTailMayBeTorn = false;
-    } catch (error) {
-      data.liveTailMayBeTorn = true;
-      throw error;
-    }
-  }
-
-  private async writeLiveMarker(filePath: string, generation: number): Promise<void> {
-    // Atomic tmp+rename: a crash mid-write must not leave an empty or
-    // partial live file, which the loader would misread as a legacy
-    // (pre-rotation) rewrite and skip the snapshot for.
-    const tmpPath = `${filePath}.tmp`;
-    await fs.writeFile(
-      tmpPath,
-      `${JSON.stringify({ type: "log-meta", generation } satisfies DevToolsLogEntry)}\n`,
-      "utf-8"
-    );
-    await fs.rename(tmpPath, filePath);
   }
 }

@@ -18,13 +18,17 @@
  * Keeping this pure (no React, no IPC) makes the non-trivial folding logic unit
  * testable and keeps the components dumb.
  */
+import { EvaluationStepResultSchema } from "@/common/types/evaluation";
 import {
   isActiveWorkflowRunStatus,
+  isTerminalWorkflowRunStatus,
   type StructuredTaskOutput,
+  type WorkflowPhaseManifest,
   type WorkflowResult,
   type WorkflowRunEvent,
   type WorkflowRunRecord,
   type WorkflowRunStatus,
+  type WorkflowStepRecord,
   type WorkflowStepStatus,
 } from "@/common/types/workflow";
 
@@ -34,6 +38,20 @@ export type WorkflowStepDisplayStatus = "running" | "completed" | "failed" | "in
 export interface WorkflowStepUsage {
   tokens?: number;
   costUsd?: number;
+}
+
+/**
+ * Display facts for an `evaluate()` step: the admitted selection and attempt
+ * (from the step record), the provider's response model id and token usage
+ * (from the committed result) and whether this run replayed a stored result.
+ * `modelString`/`responseModelId` are untrusted display text (React escaping only).
+ */
+export interface WorkflowStepEvaluationView {
+  modelString: string;
+  attempt: number;
+  responseModelId?: string;
+  usage?: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null };
+  cached: boolean;
 }
 
 export interface WorkflowStepView {
@@ -55,10 +73,46 @@ export interface WorkflowStepView {
   error?: string;
   /** Optional usage overlay resolved from the step's task workspace. */
   usage?: WorkflowStepUsage;
+  /** Present for `evaluate()` steps; such steps never have a task or workspace. */
+  evaluation?: WorkflowStepEvaluationView;
   /** Nested workflow run spawned by this step, when the step delegates to another workflow. */
   nestedWorkflowRunId?: string;
   nestedWorkflowName?: string;
   nestedWorkflowStatus?: Extract<WorkflowRunEvent, { type: "workflow" }>["status"];
+}
+
+/**
+ * Rail lifecycle for a phase, derived from the declared manifest (intent) merged
+ * with observed phase events (truth):
+ * - "pending": declared but not yet visited while the run is active.
+ * - "running"/"completed"/"failed"/"interrupted": visited; latest-visited phases
+ *   mirror the run status, earlier visited phases read as completed unless a
+ *   step in them failed.
+ * - "skipped"/"not-reached": declared but never visited once the run settled
+ *   (completed vs failed/interrupted).
+ * - "not-visited": the neutral terminal-unvisited state for INFERRED manifests,
+ *   which cannot distinguish mutually-exclusive branches from skipped work.
+ */
+export type WorkflowPhaseLifecycle =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "skipped"
+  | "not-reached"
+  | "not-visited";
+
+/** Lifecycles of phases that never emitted a phase event. */
+const UNVISITED_PHASE_LIFECYCLES: ReadonlySet<WorkflowPhaseLifecycle> = new Set([
+  "pending",
+  "skipped",
+  "not-reached",
+  "not-visited",
+]);
+
+export function isUnvisitedPhaseLifecycle(lifecycle: WorkflowPhaseLifecycle): boolean {
+  return UNVISITED_PHASE_LIFECYCLES.has(lifecycle);
 }
 
 export interface WorkflowPhaseView {
@@ -79,6 +133,16 @@ export interface WorkflowPhaseView {
   total: number;
   running: boolean;
   failed: boolean;
+  lifecycle: WorkflowPhaseLifecycle;
+  /**
+   * True for the phase the run entered most recently in EVENT order — the run's
+   * current (or, once terminal, final) position. `phases` is rail-ordered, so
+   * after `scope → verify → scope` this marks `scope` even though `verify` sits
+   * later in the array. Never set on the implicit "" bucket.
+   */
+  latest: boolean;
+  /** Declared fan-out marker from meta.phases (presentational). */
+  parallel?: boolean;
 }
 
 export interface WorkflowRunStats {
@@ -96,6 +160,7 @@ export interface WorkflowArgEntry {
   /** null for a single positional/primitive arg with no name. */
   key: string | null;
   value: string;
+  stages?: Array<{ name: string; role?: string; brief?: string }>;
 }
 
 export interface WorkflowRunView {
@@ -112,6 +177,25 @@ export interface WorkflowRunView {
   /** Last `error` event message — surfaces a run-level failure with no step error. */
   errorMessage: string | null;
   stats: WorkflowRunStats;
+}
+
+function projectStepEvaluation(
+  step: WorkflowStepRecord,
+  cached: boolean
+): WorkflowStepEvaluationView | undefined {
+  if (step.evaluation == null) {
+    return undefined;
+  }
+  // The committed result is authoritative for what the provider answered with;
+  // the admission only knows what was requested.
+  const result = EvaluationStepResultSchema.safeParse(step.result?.structuredOutput);
+  return {
+    modelString: step.evaluation.selection.modelString,
+    attempt: step.evaluation.attempt,
+    ...(result.success ? { responseModelId: result.data.model.responseModelId } : {}),
+    ...(result.success ? { usage: result.data.usage } : {}),
+    cached,
+  };
 }
 
 export interface ProjectWorkflowRunOptions {
@@ -149,12 +233,42 @@ export function stringifyWorkflowArgValue(value: unknown): string {
   }
 }
 
+function derivePlannedStages(value: unknown): WorkflowArgEntry["stages"] {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const items: unknown[] = value;
+  const stages: NonNullable<WorkflowArgEntry["stages"]> = [];
+  for (const item of items) {
+    if (
+      item == null ||
+      typeof item !== "object" ||
+      Array.isArray(item) ||
+      !("name" in item) ||
+      typeof item.name !== "string" ||
+      item.name.trim().length === 0
+    ) {
+      return undefined;
+    }
+    const role = "role" in item ? item.role : undefined;
+    const brief = "brief" in item ? item.brief : undefined;
+    if (
+      (role !== undefined && typeof role !== "string") ||
+      (brief !== undefined && typeof brief !== "string")
+    ) {
+      return undefined;
+    }
+    stages.push({ name: item.name, role, brief });
+  }
+  return stages;
+}
+
 function deriveArgEntries(args: unknown): WorkflowArgEntry[] {
   if (args != null && typeof args === "object" && !Array.isArray(args)) {
-    return Object.entries(args as Record<string, unknown>).map(([key, value]) => ({
-      key,
-      value: stringifyWorkflowArgValue(value),
-    }));
+    return Object.entries(args as Record<string, unknown>).map(([key, value]) => {
+      const entry: WorkflowArgEntry = { key, value: stringifyWorkflowArgValue(value) };
+      const stages = key === "stages" ? derivePlannedStages(value) : undefined;
+      if (stages != null) entry.stages = stages;
+      return entry;
+    });
   }
   const value = stringifyWorkflowArgValue(args);
   return value.length > 0 ? [{ key: null, value }] : [];
@@ -183,7 +297,10 @@ function buildPhaseView(
   label: string,
   detail: string | undefined,
   details: unknown,
-  steps: WorkflowStepView[]
+  steps: WorkflowStepView[],
+  lifecycle: WorkflowPhaseLifecycle,
+  latest: boolean,
+  parallel?: boolean
 ): WorkflowPhaseView {
   return {
     name,
@@ -195,11 +312,121 @@ function buildPhaseView(
     total: steps.length,
     running: steps.some((step) => step.status === "running"),
     failed: steps.some((step) => step.status === "failed"),
+    lifecycle,
+    latest,
+    ...(parallel === true ? { parallel: true } : {}),
   };
 }
 
+/**
+ * Collapse consecutive duplicate phase events (same name back-to-back) into one
+ * transition.
+ *
+ * Replay finding (verified empirically via interrupt + workflow_resume): the
+ * runner replays the script from the start and `phase()` re-appends its event
+ * unconditionally (WorkflowRunner has no phase-event dedup, unlike checkpointed
+ * agent steps). A resumed run's log therefore contains the ENTIRE phase walk
+ * again (e.g. plan → verify → plan → verify → finalize). Reconciliation absorbs
+ * that as loop re-entry — visited-set + latest-visited semantics with manifest
+ * order — while this collapse handles the same-phase-resume case (interrupt and
+ * resume inside one phase re-announces it back-to-back) and scripts announcing
+ * a phase twice in a row. This is also why per-phase iteration counters stay
+ * out of v1: entry counts would double after every resume.
+ */
+function collapsePhaseTransitions(events: readonly WorkflowRunEvent[]): string[] {
+  const transitions: string[] = [];
+  for (const event of events) {
+    if (event.type !== "phase") {
+      continue;
+    }
+    if (transitions.at(-1) !== event.name) {
+      transitions.push(event.name);
+    }
+  }
+  return transitions;
+}
+
+/**
+ * Merge the declared manifest order (intent) with observed phase transitions
+ * (truth). Declared phases always keep manifest order — out-of-order visits do
+ * NOT reorder the rail. A dynamic (observed-but-undeclared) phase is inserted
+ * immediately after its anchor: the most recent declared phase observed before
+ * its LATEST visit (`scope → detour → verify → detour` places `detour` after
+ * `verify`, where the run currently is); dynamic phases sharing an anchor keep
+ * the order of those latest visits, and a dynamic phase observed before any
+ * declared phase anchors at the head of the rail.
+ */
+function mergeManifestPhaseOrder(
+  manifest: WorkflowPhaseManifest,
+  transitions: readonly string[]
+): string[] {
+  const declaredNames = new Set(manifest.phases.map((phase) => phase.name));
+  const anchorByDynamic = new Map<string, string | null>();
+  let currentAnchor: string | null = null;
+  for (const name of transitions) {
+    if (declaredNames.has(name)) {
+      currentAnchor = name;
+      continue;
+    }
+    // Delete-then-set so re-entry moves the phase to the end of its (new) anchor group.
+    anchorByDynamic.delete(name);
+    anchorByDynamic.set(name, currentAnchor);
+  }
+  const dynamicByAnchor = new Map<string | null, string[]>();
+  for (const [name, anchor] of anchorByDynamic) {
+    const bucket = dynamicByAnchor.get(anchor);
+    if (bucket != null) {
+      bucket.push(name);
+    } else {
+      dynamicByAnchor.set(anchor, [name]);
+    }
+  }
+
+  const order: string[] = [...(dynamicByAnchor.get(null) ?? [])];
+  for (const phase of manifest.phases) {
+    order.push(phase.name);
+    order.push(...(dynamicByAnchor.get(phase.name) ?? []));
+  }
+  return order;
+}
+
+function derivePhaseLifecycle(input: {
+  name: string;
+  visited: ReadonlySet<string>;
+  latestVisited: string | null;
+  runStatus: WorkflowRunStatus;
+  hasFailedStep: boolean;
+  inferredProvenance: boolean;
+}): WorkflowPhaseLifecycle {
+  const isLatest = input.name === input.latestVisited;
+  if (input.visited.has(input.name)) {
+    // A failed step marks its phase regardless of position; the latest-visited
+    // phase of a failed run is also failed even without a failed step record.
+    if (input.hasFailedStep || (isLatest && input.runStatus === "failed")) {
+      return "failed";
+    }
+    if (isLatest && input.runStatus === "interrupted") {
+      return "interrupted";
+    }
+    if (isLatest && !isTerminalWorkflowRunStatus(input.runStatus)) {
+      return "running";
+    }
+    return "completed";
+  }
+  if (isActiveWorkflowRunStatus(input.runStatus)) {
+    return "pending";
+  }
+  // Terminal-unvisited. Inference cannot distinguish mutually-exclusive branches
+  // from genuinely skipped work, so inferred rails stay judgment-free.
+  if (input.inferredProvenance) {
+    return "not-visited";
+  }
+  return input.runStatus === "completed" ? "skipped" : "not-reached";
+}
+
 // Events that belong to a step. Steps are recorded via task events (agent steps) and also via
-// patch (apply-patch), workflow (nested-workflow), and legacy action/validation events. Phase
+// patch (apply-patch), workflow (nested-workflow), evaluation (`evaluate()`), and legacy
+// action/validation events. Phase
 // assignment keys off the first of ANY of these per stepId so every step lands in its phase.
 function stepBearingEventStepId(event: WorkflowRunEvent): string | null {
   switch (event.type) {
@@ -209,6 +436,7 @@ function stepBearingEventStepId(event: WorkflowRunEvent): string | null {
     case "patch":
     case "action":
     case "validation":
+    case "evaluation":
       return event.stepId;
     default:
       return null;
@@ -303,6 +531,10 @@ export function projectWorkflowRun(
   // the ungrouped bucket even when a phase was active.
   const stepFirstEventSeq = new Map<string, number>();
   const stepTitle = new Map<string, string>();
+  // Keyed by (stepId, inputHash) like the run store's step records: the same
+  // step id may be evaluated with different inputs, and only the replayed
+  // input's record is "cached".
+  const cachedEvaluationStepKeys = new Set<string>();
   const stepTaskEventIds = new Map<string, Set<string>>();
   const nestedWorkflowAttempts = getWorkflowChildAttempts(events);
   for (const event of events) {
@@ -321,9 +553,12 @@ export function projectWorkflowRun(
         stepTaskEventIds.set(stepId, new Set([event.taskId]));
       }
     }
+    if (event.type === "evaluation" && event.status === "cached") {
+      cachedEvaluationStepKeys.add(`${event.stepId}\0${event.inputHash}`);
+    }
     if (!stepTitle.has(stepId)) {
       if (
-        (event.type === "agent-step" || event.type === "task") &&
+        (event.type === "agent-step" || event.type === "task" || event.type === "evaluation") &&
         event.title != null &&
         event.title.length > 0
       ) {
@@ -379,6 +614,10 @@ export function projectWorkflowRun(
       result: step.result,
       error: step.error,
       usage,
+      evaluation: projectStepEvaluation(
+        step,
+        cachedEvaluationStepKeys.has(`${step.stepId}\0${step.inputHash}`)
+      ),
       nestedWorkflowRunId: nestedWorkflowEvent?.runId,
       nestedWorkflowName: nestedWorkflowEvent?.name,
       nestedWorkflowStatus: nestedWorkflowEvent?.status,
@@ -445,25 +684,58 @@ export function projectWorkflowRun(
     }
   }
 
+  // Declared manifest (hydrated onto the run's workflow descriptor) merged with
+  // observed events. Absent manifest → observed-only order, exactly as before.
+  const manifest = run.workflow.phaseManifest;
+  const transitions = collapsePhaseTransitions(events);
+  const visited = new Set(transitions);
+  const latestVisited = transitions.at(-1) ?? null;
+  const inferredProvenance = manifest?.provenance === "inferred";
+  const declaredByName = new Map(manifest?.phases.map((phase) => [phase.name, phase]) ?? []);
+  const orderedNames =
+    manifest != null ? mergeManifestPhaseOrder(manifest, transitions) : phaseOrder;
+
   const phases: WorkflowPhaseView[] = [];
-  for (const name of phaseOrder) {
+  for (const name of orderedNames) {
     const meta = phaseMeta.get(name);
+    const declared = declaredByName.get(name);
+    const phaseSteps = stepsByPhase.get(name) ?? [];
     phases.push(
       buildPhaseView(
         name,
-        meta?.label ?? name,
-        meta?.detail,
+        declared?.label ?? meta?.label ?? name,
+        meta?.detail ?? declared?.description,
         meta?.details,
-        stepsByPhase.get(name) ?? []
+        phaseSteps,
+        derivePhaseLifecycle({
+          name,
+          visited,
+          latestVisited,
+          runStatus: run.status,
+          hasFailedStep: phaseSteps.some((step) => step.status === "failed"),
+          inferredProvenance,
+        }),
+        name === latestVisited,
+        declared?.parallel
       )
     );
   }
   const ungrouped = stepsByPhase.get(null) ?? [];
   if (ungrouped.length > 0) {
     // Steps with no announced phase precede the named phases chronologically. When
-    // the run declares no phases at all, this is the sole flat group.
-    const label = phaseOrder.length === 0 ? "Steps" : "Other steps";
-    phases.unshift(buildPhaseView("", label, undefined, undefined, ungrouped));
+    // the run declares no phases at all, this is the sole flat group. The bucket
+    // holds real observed steps, so its lifecycle derives from them directly.
+    const label = orderedNames.length === 0 ? "Steps" : "Other steps";
+    const bucketLifecycle: WorkflowPhaseLifecycle = ungrouped.some(
+      (step) => step.status === "failed"
+    )
+      ? "failed"
+      : ungrouped.some((step) => step.status === "running")
+        ? "running"
+        : "completed";
+    phases.unshift(
+      buildPhaseView("", label, undefined, undefined, ungrouped, bucketLifecycle, false)
+    );
   }
 
   let result: WorkflowResult | null = null;
@@ -514,6 +786,30 @@ export function projectWorkflowRun(
       usage: usageTotal,
     },
   };
+}
+
+/**
+ * The phase a compact summary should name: the running phase, else the phase
+ * visited most recently in EVENT order, else the implicit step bucket. Never an
+ * unvisited rail node: before the first phase event a pending (or setup-failed)
+ * declared run must read as "no phase", not "phase N/N".
+ */
+export function getActiveWorkflowPhase(
+  phases: readonly WorkflowPhaseView[]
+): WorkflowPhaseView | null {
+  return (
+    // `latest` is the phase entered most recently in EVENT order: on an active run
+    // it is the one with lifecycle "running", on a terminal run the final position.
+    // It beats both rail order (`findLast` would name `verify` after a
+    // `scope → verify → scope` loop) and phases that merely still have a live step
+    // (`phase(A); agent(...); phase(B)` must read as B, not regress to "phase 1/N").
+    phases.find((phase) => phase.latest) ??
+    // Steps observed before any phase event sit in the "" bucket, which is
+    // chronologically first — so it is the position only when nothing else was
+    // visited, even while its steps are still running.
+    phases.find((phase) => phase.name === "") ??
+    null
+  );
 }
 
 /**

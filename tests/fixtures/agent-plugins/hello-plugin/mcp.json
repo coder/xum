@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "everything": {
+      "type": "stdio",
+      "command": "bunx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": { "DATA_DIR": "${PLUGIN_DATA}/d" }
+    },
+    "plugin-files": {
+      "type": "stdio",
+      "command": "bunx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${PLUGIN_ROOT}"]
+    },
+    "broken-entry": {
+      "type": "stdio"
+    }
+  }
+}

@@ -22,6 +22,34 @@ describe("subagentReportEnvelope", () => {
     expect(parseSubagentReportEnvelope(formatSubagentReportEnvelope(report))).toEqual(report);
   });
 
+  test("round-trips model and thinking level metadata", () => {
+    const report = {
+      taskId: "task-model-metadata",
+      agentType: "exec",
+      status: "in_progress" as const,
+      title: "Progress",
+      reportMarkdown: "Working on it",
+      model: "anthropic:claude-opus-4-6",
+      thinkingLevel: "high" as const,
+    };
+
+    expect(parseSubagentReportEnvelope(formatSubagentReportEnvelope(report))).toEqual(report);
+  });
+
+  test("drops malformed model/thinking metadata without rejecting the report", () => {
+    const parsed = parseSubagentReportEnvelope(`<mux_subagent_report>
+{"taskId":"t1","agentType":"exec","status":"completed","title":"Done","reportMarkdown":"Body","model":"","thinkingLevel":"turbo"}
+</mux_subagent_report>`);
+
+    expect(parsed).toEqual({
+      taskId: "t1",
+      agentType: "exec",
+      status: "completed",
+      title: "Done",
+      reportMarkdown: "Body",
+    });
+  });
+
   test("parses legacy envelopes without an explicit status as completed", () => {
     const legacy = `<mux_subagent_report>
 <task_id>legacy-task</task_id>

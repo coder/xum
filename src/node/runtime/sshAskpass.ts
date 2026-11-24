@@ -1,17 +1,19 @@
 import * as fs from "fs";
 import * as path from "path";
-import * as os from "os";
+import { getXumHome } from "@/common/constants/paths";
 import { log } from "@/node/services/log";
 
 const ASKPASS_SCRIPT = `#!/bin/sh
-# mux-askpass — SSH_ASKPASS helper for Mux
+# mux-askpass — SSH_ASKPASS helper for Xum
 # Each invocation is an independent request/response transaction identified
 # by a unique ID, so multiple prompts per SSH handshake are handled correctly.
 # Uses only regular files (no mkfifo) for cross-platform portability.
 req_id="$$.$(date +%s%N)"
 prompt_file="$MUX_ASKPASS_DIR/prompt.$req_id.txt"
 response_file="$MUX_ASKPASS_DIR/response.$req_id.txt"
-printf '%s' "$1" > "$prompt_file"
+# Write to a temp name, then mv: Xum's watcher must never read a half-written
+# prompt (#7498). The watcher ignores names that do not end in .txt.
+printf '%s' "$1" > "$prompt_file.tmp" && mv "$prompt_file.tmp" "$prompt_file" || exit 1
 # Poll for response file (60s timeout = 1200 × 50ms)
 i=0
 while [ "$i" -lt 1200 ]; do
@@ -28,9 +30,50 @@ exit 1
 
 let askpassPath: string | undefined;
 
+/** The folder that holds each session's prompt and answer files. */
+export function askpassSessionsRoot(): string {
+  return path.join(getXumHome(), "askpass");
+}
+
 function extractRequestId(filename: string): string | undefined {
   const match = /^prompt\.(.+)\.txt$/.exec(filename);
   return match?.[1];
+}
+
+/**
+ * Write the askpass answer under a temp name, then rename it into place.
+ *
+ * writeFile creates the file empty before it writes the text. The script polls
+ * for the file and then cats and deletes it, so a poll inside that window read
+ * an empty answer and deleted the real one: SSH got "" for a host-key or
+ * passphrase prompt (#7498). A rename is atomic, so the script sees either no
+ * file or the whole answer. The session cleanup removes a temp file left by a
+ * failed rename along with the rest of the directory.
+ */
+async function writeResponseFile(responseFile: string, text: string): Promise<void> {
+  const tempFile = `${responseFile}.tmp`;
+  // Exclusive create: the answer can be a password, and "wx" neither follows a link at the
+  // temp name nor writes into a file that is already there.
+  await fs.promises.rm(tempFile, { force: true });
+  await fs.promises.writeFile(tempFile, text, { flag: "wx", mode: 0o600 });
+  await fs.promises.rename(tempFile, responseFile);
+}
+
+/**
+ * File names a watcher event can point at. The script renames each prompt into
+ * place. Linux reports the rename under the final name. If a platform reports
+ * only the temp name (or no name), rescan the directory so the prompt is not
+ * missed. Returns [] when the directory is gone.
+ */
+async function promptCandidates(dir: string, filename: string | null): Promise<string[]> {
+  if (typeof filename === "string" && extractRequestId(filename) !== undefined) {
+    return [filename];
+  }
+  try {
+    return await fs.promises.readdir(dir);
+  } catch {
+    return [];
+  }
 }
 
 async function ensureAskpassScript(): Promise<string> {
@@ -43,7 +86,9 @@ async function ensureAskpassScript(): Promise<string> {
     }
   }
 
-  const dir = path.join(os.homedir(), ".mux", "bin");
+  // Write under the canonical home so a missing ~/.mux alias cannot create a
+  // split tree. Keep the mux-askpass filename stable for existing SSH sessions.
+  const dir = path.join(getXumHome(), "bin");
   await fs.promises.mkdir(dir, { recursive: true });
   askpassPath = path.join(dir, "mux-askpass");
   await fs.promises.writeFile(askpassPath, ASKPASS_SCRIPT, { mode: 0o755 });
@@ -86,7 +131,11 @@ export async function createAskpassSession(
   // Resolve script path before allocating temp resources.
   const scriptPath = await ensureAskpassScript();
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-askpass-"));
+  // Not in the temp folder: agent commands in the macOS sandbox can read and write it, so they
+  // could read an answer or plant a prompt there. The sandbox hides this folder (sandboxPaths.ts).
+  const root = askpassSessionsRoot();
+  await fs.promises.mkdir(root, { recursive: true, mode: 0o700 });
+  const dir = fs.mkdtempSync(path.join(root, "mux-askpass-"));
   const processed = new Set<string>();
   let closed = false;
 
@@ -106,12 +155,12 @@ export async function createAskpassSession(
     try {
       const promptText = await fs.promises.readFile(promptFile, "utf-8");
       const response = await onPrompt(promptText);
-      await fs.promises.writeFile(responseFile, response + "\n");
+      await writeResponseFile(responseFile, response + "\n");
     } catch (err) {
       log.debug("Askpass prompt handling failed:", err);
       // Write rejection to unblock askpass (best-effort)
       try {
-        await fs.promises.writeFile(responseFile, "no\n");
+        await writeResponseFile(responseFile, "no\n");
       } catch {
         /* askpass may already be gone */
       }
@@ -126,16 +175,7 @@ export async function createAskpassSession(
       if (closed) return;
 
       void (async () => {
-        let candidateFilenames: string[];
-        if (typeof filename === "string") {
-          candidateFilenames = [filename];
-        } else {
-          try {
-            candidateFilenames = await fs.promises.readdir(dir);
-          } catch {
-            return;
-          }
-        }
+        const candidateFilenames = await promptCandidates(dir, filename);
 
         for (const candidate of candidateFilenames) {
           const requestId = extractRequestId(candidate);

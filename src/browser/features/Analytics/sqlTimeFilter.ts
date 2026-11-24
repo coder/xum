@@ -2,7 +2,7 @@ import assert from "@/common/utils/assert";
 
 /**
  * Placeholder users can embed in saved-panel / SQL-explorer queries so the
- * dashboard's date-range selection (7D/30D/90D/All) applies to their own SQL.
+ * dashboard's date-range selection applies to their own SQL.
  * Before execution it is substituted with a boolean predicate on the events
  * `date` column (e.g. `(date >= DATE '2026-06-05')`), or `TRUE` when "All"
  * is selected, so the query stays valid for every range selection.

@@ -11,6 +11,7 @@ import { preloadTestModules, type TestEnvironment } from "../../ipc/setup";
 
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import type { StreamStartEvent } from "@/common/types/stream";
 
 import { createAppHarness, type AppHarness } from "../harness";
 
@@ -55,8 +56,8 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   return waitFor(
     () => {
       const textareas = Array.from(
-        container.querySelectorAll('textarea[aria-label="Message Claude"]')
-      ) as HTMLTextAreaElement[];
+        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
+      );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
       }
@@ -80,9 +81,7 @@ async function getComposerDockTextarea(container: HTMLElement): Promise<HTMLText
         throw new Error("Chat composer dock not found");
       }
 
-      const textarea = dock.querySelector(
-        'textarea[aria-label="Message Claude"]'
-      ) as HTMLTextAreaElement | null;
+      const textarea = dock.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]');
       if (!textarea) {
         throw new Error("Composer textarea not found");
       }
@@ -107,8 +106,8 @@ async function waitForSendModeMenuTrigger(container: HTMLElement): Promise<HTMLB
   return waitFor(
     () => {
       const buttons = Array.from(
-        container.querySelectorAll('button[aria-label="Send message"]')
-      ) as HTMLButtonElement[];
+        container.querySelectorAll<HTMLButtonElement>('button[aria-label="Send message"]')
+      );
       const trigger = [...buttons]
         .reverse()
         .find((button) => button.getAttribute("aria-haspopup") === "menu" && !button.disabled);
@@ -188,10 +187,14 @@ describe("Send dispatch modes (mock AI router)", () => {
       fireEvent.click(sendAfterTurnRow);
       await app.chat.expectStreamComplete();
 
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.status).toBe("paused");
-      });
+      // Backend round trip per poll: waitFor's default 1 s is too short under CI load (#5029).
+      await waitFor(
+        async () => {
+          const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+          expect(goal?.status).toBe("paused");
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }
@@ -201,7 +204,18 @@ describe("Send dispatch modes (mock AI router)", () => {
     const app = await createAppHarness({ branchPrefix: "queued-parallel-tool-step" });
 
     try {
+      // The send waits for workspace init, so the stream can start more than 1 s after the
+      // click: await its stream-start instead of racing it with waitFor's default (#6143).
+      const sourceStarted = new Promise<void>((resolve) => {
+        const onStart = (event: StreamStartEvent) => {
+          if (event.workspaceId !== app.workspaceId) return;
+          app.env.services.aiService.off("stream-start", onStart);
+          resolve();
+        };
+        app.env.services.aiService.on("stream-start", onStart);
+      });
       await app.chat.send("[mock:tool:parallel-step] Run both sibling tool calls");
+      await sourceStarted;
       await waitFor(() => {
         const state = workspaceStore.getWorkspaceSidebarState(app.workspaceId);
         if (!state.canInterrupt) {
@@ -214,8 +228,11 @@ describe("Send dispatch modes (mock AI router)", () => {
       const sendButton = await waitForSendModeMenuTrigger(app.view.container);
       fireEvent.click(sendButton);
       await waitFor(() => {
-        expect(app.view.container.textContent).toContain("Queued - Sending after step");
+        expect(app.view.container.textContent).toContain("Queued");
+        expect(app.view.container.textContent).toContain("Sends after this step");
       });
+      // The mock turn holds its tool calls until now, so the follow-up was queued mid-step.
+      app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
 
       await app.chat.expectTranscriptContains("parallel-step-a.txt");
       await app.chat.expectTranscriptContains("parallel-step-b.txt");
@@ -229,7 +246,7 @@ describe("Send dispatch modes (mock AI router)", () => {
     }
   }, 60_000);
 
-  test("pressing Enter on an empty composer sends the queued message now", async () => {
+  test("queued send keybinds update the boundary and can send immediately", async () => {
     const app = await createAppHarness({ branchPrefix: "queued-enter-send-now" });
 
     try {
@@ -263,8 +280,39 @@ describe("Send dispatch modes (mock AI router)", () => {
 
       await waitFor(() => {
         const textContent = app.view.container.textContent ?? "";
-        expect(textContent).toContain("Queued - Sending after turn");
-        expect(textContent).toContain("Send now");
+        expect(textContent).toContain("Queued");
+        expect(textContent).toContain("Sends after this turn");
+        expect(
+          app.view.container.querySelector('[data-component="QueuedMessageDispatchMenu"]') === null
+        ).toBe(true);
+      });
+
+      const queuedDispatchButton = app.view.container.querySelector<HTMLButtonElement>(
+        '[data-component="QueuedMessageStatus"]'
+      );
+      if (!queuedDispatchButton) {
+        throw new Error("Queued dispatch dropdown not found");
+      }
+      fireEvent.click(queuedDispatchButton);
+      const queuedDispatchMenu = await waitFor(() => {
+        const menu = app.view.container.querySelector<HTMLElement>(
+          '[data-component="QueuedMessageDispatchMenu"]'
+        );
+        expect(menu?.textContent).toContain("Send after step");
+        expect(menu?.textContent).toContain("Send after turn");
+        expect(menu?.textContent).toContain("Send now");
+        if (!menu) throw new Error("Queued dispatch menu not rendered");
+        return menu;
+      });
+      const sendAfterStepRow = Array.from(queuedDispatchMenu.querySelectorAll("button")).find(
+        (button) => button.textContent?.includes("Send after step")
+      );
+      if (!sendAfterStepRow) throw new Error("Queued Send after step action not found");
+      fireEvent.click(sendAfterStepRow);
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this step");
+        expect(app.view.container.textContent).not.toContain("Sends after this turn");
+        expect(app.view.container.textContent).toContain(queuedText);
       });
 
       const textarea = await getComposerDockTextarea(app.view.container);
@@ -273,18 +321,41 @@ describe("Send dispatch modes (mock AI router)", () => {
       });
 
       textarea.focus();
-      expect(fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 })).toBe(
-        false
-      );
-      // A fast second Enter press should be ignored while the send-now interrupt is in flight.
-      expect(fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 })).toBe(
-        false
-      );
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+      });
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this turn");
+      });
+
+      fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 });
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Sends after this step");
+      });
+
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+        shiftKey: true,
+      });
+      // A fast repeated send-now shortcut should be ignored while the interrupt is in flight.
+      fireEvent.keyDown(textarea, {
+        key: "Enter",
+        code: "Enter",
+        charCode: 13,
+        ctrlKey: true,
+        shiftKey: true,
+        repeat: true,
+      });
 
       await waitFor(
         () => {
-          const textContent = app.view.container.textContent ?? "";
-          expect(textContent).not.toContain("Queued - Sending after turn");
+          expect(app.view.container.textContent).not.toContain("Sends after this step");
         },
         { timeout: 30_000 }
       );
@@ -389,6 +460,7 @@ describe("Send dispatch modes (mock AI router)", () => {
 
       const manager = getBackgroundProcessManager(app.env);
 
+      await app.chat.startHeldToolTurn("keyboard send after turn source");
       const turnToolCallId = "bash-foreground-send-after-turn";
       let turnBackgrounded = false;
 
@@ -409,13 +481,23 @@ describe("Send dispatch modes (mock AI router)", () => {
 
       const turnEndMessage = "turn-end keyboard test";
       await app.chat.typeWithoutSending(turnEndMessage);
+      // stream-start precedes the source send's completion; wait until the composer can send.
+      await waitForSendModeMenuTrigger(app.view.container);
       let textarea = await getActiveTextarea(app.view.container);
       fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
 
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Queued");
+        expect(app.view.container.textContent).toContain("Sends after this turn");
+      });
+      expect(turnBackgrounded).toBe(false);
+      unregisterTurn();
+      app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
       await app.chat.expectTranscriptContains(`Mock response: ${turnEndMessage}`);
       await app.chat.expectStreamComplete();
       expect(turnBackgrounded).toBe(false);
 
+      await app.chat.startHeldToolTurn("keyboard send after step source");
       const stepToolCallId = "bash-foreground-send-after-step";
       let stepBackgrounded = false;
 
@@ -427,6 +509,7 @@ describe("Send dispatch modes (mock AI router)", () => {
         () => {
           stepBackgrounded = true;
           unregisterStep?.();
+          app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
         }
       );
 
@@ -436,6 +519,7 @@ describe("Send dispatch modes (mock AI router)", () => {
 
       const stepEndMessage = "tool-end test";
       await app.chat.typeWithoutSending(stepEndMessage);
+      await waitForSendModeMenuTrigger(app.view.container);
       textarea = await getActiveTextarea(app.view.container);
       fireEvent.keyDown(textarea, { key: "Enter" });
 

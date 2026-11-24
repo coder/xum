@@ -1,12 +1,24 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import * as net from "net";
-import { ServerService, computeNetworkBaseUrls, getTailscaleBindHosts } from "./serverService";
+import {
+  ServerService,
+  computeNetworkBaseUrls,
+  getTailscaleBindHosts,
+  setApiServerSettings,
+  setServerSshHost,
+} from "./serverService";
 import type { ORPCContext } from "@/node/orpc/context";
 import { Config } from "@/node/config";
 import { ServerLockDataSchema } from "./serverLockfile";
+import {
+  identityOf,
+  startFakeBackend,
+  startUnrelatedProcess,
+  unservedBaseUrl,
+} from "./testXumBackend";
 
 describe("ServerService", () => {
   test("initializes with null path", async () => {
@@ -78,20 +90,46 @@ describe("ServerService.startServer", () => {
     });
   }
 
+  test("refuses to start in session tape replay mode, which serves only desktop windows", async () => {
+    const service = new ServerService();
+    const saved = process.env.XUM_REPLAY_TAPES;
+    process.env.XUM_REPLAY_TAPES = JSON.stringify({ ws: "/tapes/ws.jsonl" });
+    try {
+      let thrownError: unknown = null;
+      try {
+        await service.startServer({
+          xumHome: tempDir,
+          context: stubContext,
+          authToken: "test-token",
+          port: 0,
+        });
+      } catch (err) {
+        thrownError = err;
+      }
+      expect((thrownError as Error | null)?.message).toMatch(/replay mode/);
+      expect(service.isServerRunning()).toBe(false);
+      // No lockfile either: nothing may advertise a server that does not exist.
+      expect(await fs.stat(path.join(tempDir, "server.lock")).catch(() => null)).toBeNull();
+    } finally {
+      if (saved === undefined) delete process.env.XUM_REPLAY_TAPES;
+      else process.env.XUM_REPLAY_TAPES = saved;
+    }
+  });
+
   test("cleans up server when lockfile acquisition fails", async () => {
     const service = new ServerService();
 
-    // Make muxHome a *file* (not a directory) so lockfile.acquire() fails reliably,
+    // Make xumHome a *file* (not a directory) so lockfile.acquire() fails reliably,
     // even when tests run as root (chmod-based tests don't fail for root).
-    const muxHomeFile = path.join(tempDir, "muxHome-not-a-dir");
-    await fs.writeFile(muxHomeFile, "not a directory");
+    const xumHomeFile = path.join(tempDir, "xumHome-not-a-dir");
+    await fs.writeFile(xumHomeFile, "not a directory");
 
     let thrownError: unknown = null;
 
     try {
       // Start server - this should fail when trying to write lockfile
       await service.startServer({
-        muxHome: muxHomeFile,
+        xumHome: xumHomeFile,
         context: stubContext,
         authToken: "test-token",
         port: 0, // random port
@@ -115,47 +153,203 @@ describe("ServerService.startServer", () => {
   test("does not delete another process's lockfile when start fails", async () => {
     const service = new ServerService();
 
-    // Create a lockfile simulating another running server (use our own PID so it appears "alive")
+    // Create a lockfile simulating another running server: a live pid that is not ours, and a
+    // xum backend that answers at its baseUrl.
+    const running = await startFakeBackend("xum");
+    const otherServer = startUnrelatedProcess();
     const lockPath = path.join(tempDir, "server.lock");
     const existingLockData = {
-      pid: process.pid,
-      baseUrl: "http://127.0.0.1:9999",
+      pid: otherServer.pid,
+      baseUrl: running.baseUrl,
       token: "other-server-token",
       startedAt: new Date().toISOString(),
     };
     await fs.writeFile(lockPath, JSON.stringify(existingLockData, null, 2));
 
-    // Try to start - should fail due to existing server
-    let thrownError: Error | null = null;
     try {
-      await service.startServer({
-        muxHome: tempDir,
+      // Try to start - should fail due to existing server
+      let thrownError: Error | null = null;
+      try {
+        await service.startServer({
+          xumHome: tempDir,
+          context: stubContext,
+          authToken: "test-token",
+          port: 0,
+        });
+      } catch (err) {
+        thrownError = err as Error;
+      }
+
+      expect(thrownError).not.toBeNull();
+      expect(thrownError!.message).toMatch(/already running/i);
+
+      // Critical: call stopServer (simulating cleanup in finally block)
+      await service.stopServer();
+
+      // Verify the OTHER process's lockfile was NOT deleted
+      const lockContent = await fs.readFile(lockPath, "utf-8");
+      const lockData = ServerLockDataSchema.parse(JSON.parse(lockContent));
+      expect(lockData.baseUrl).toBe(running.baseUrl);
+      expect(lockData.token).toBe("other-server-token");
+    } finally {
+      otherServer.kill();
+      await running.close();
+    }
+  });
+
+  test.skipIf(process.platform !== "linux")(
+    "start refuses next to a backend that is frozen (SIGSTOP), and replaces its lock once it is gone",
+    async () => {
+      const service = new ServerService();
+      const lockPath = path.join(tempDir, "server.lock");
+      const backend = startUnrelatedProcess();
+      // The frozen backend's lock: its process identity, and a port that nothing answers on.
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({
+          pid: backend.pid,
+          baseUrl: await unservedBaseUrl(),
+          token: "frozen-token",
+          startedAt: new Date().toISOString(),
+          identity: identityOf(backend.pid),
+        })
+      );
+      const start = () =>
+        service.startServer({
+          xumHome: tempDir,
+          context: stubContext,
+          authToken: "test-token",
+          port: 0,
+        });
+
+      process.kill(backend.pid, "SIGSTOP");
+      try {
+        const refused = await start().then(
+          () => null,
+          (error: unknown) => error
+        );
+        expect(refused instanceof Error ? refused.message : "").toMatch(/already running/i);
+        expect(
+          ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8"))).token
+        ).toBe("frozen-token");
+      } finally {
+        backend.kill();
+      }
+      await backend.exited;
+
+      // The backend is gone: the same lock is stale now, and start replaces it.
+      const info = await start();
+      try {
+        expect(info.baseUrl).not.toBe("");
+        expect(
+          ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8"))).token
+        ).toBe("test-token");
+      } finally {
+        await service.stopServer();
+      }
+    }
+  );
+
+  test("start replaces a lock whose pid an unrelated live process now holds", async () => {
+    const service = new ServerService();
+    const lockPath = path.join(tempDir, "server.lock");
+    const unrelated = startUnrelatedProcess();
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: unrelated.pid, // alive, but not a xum backend
+        baseUrl: await unservedBaseUrl(),
+        token: "dead-server-token",
+        startedAt: new Date().toISOString(),
+      })
+    );
+
+    try {
+      const info = await service.startServer({
+        xumHome: tempDir,
         context: stubContext,
         authToken: "test-token",
         port: 0,
       });
-    } catch (err) {
-      thrownError = err as Error;
+      try {
+        const lockData = ServerLockDataSchema.parse(
+          JSON.parse(await fs.readFile(lockPath, "utf-8"))
+        );
+        expect(lockData.pid).toBe(process.pid);
+        expect(lockData.baseUrl).toBe(info.baseUrl);
+      } finally {
+        await service.stopServer();
+      }
+    } finally {
+      unrelated.kill();
     }
+  });
 
-    expect(thrownError).not.toBeNull();
-    expect(thrownError!.message).toMatch(/already running/i);
+  test("start replaces a lock that an earlier run with this pid wrote", async () => {
+    // Each run of a container is pid 1: the old run's lock names the new run's own pid, and a
+    // xum backend (this run's own, once started) answers at the lock's baseUrl.
+    const service = new ServerService();
+    const lockPath = path.join(tempDir, "server.lock");
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        baseUrl: await unservedBaseUrl(),
+        token: "earlier-run-token",
+        startedAt: "2026-01-01T00:00:00.000Z",
+      })
+    );
 
-    // Critical: call stopServer (simulating cleanup in finally block)
-    await service.stopServer();
+    const info = await service.startServer({
+      xumHome: tempDir,
+      context: stubContext,
+      authToken: "test-token",
+      port: 0,
+    });
+    try {
+      const lockData = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8")));
+      expect(lockData.token).toBe("test-token");
+      expect(lockData.baseUrl).toBe(info.baseUrl);
+    } finally {
+      await service.stopServer();
+    }
+  });
 
-    // Verify the OTHER process's lockfile was NOT deleted
-    const lockContent = await fs.readFile(lockPath, "utf-8");
-    const lockData = ServerLockDataSchema.parse(JSON.parse(lockContent));
-    expect(lockData.baseUrl).toBe("http://127.0.0.1:9999");
-    expect(lockData.token).toBe("other-server-token");
+  test("start replaces the stale lock of a dead server", async () => {
+    const service = new ServerService();
+    const lockPath = path.join(tempDir, "server.lock");
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 999999999, // Not a live process
+        baseUrl: "http://127.0.0.1:9999",
+        token: "dead-server-token",
+        startedAt: new Date().toISOString(),
+      })
+    );
+
+    const info = await service.startServer({
+      xumHome: tempDir,
+      context: stubContext,
+      authToken: "test-token",
+      port: 0,
+    });
+
+    try {
+      const lockData = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8")));
+      expect(lockData.pid).toBe(process.pid);
+      expect(lockData.baseUrl).toBe(info.baseUrl);
+      expect(lockData.token).toBe("test-token");
+    } finally {
+      await service.stopServer();
+    }
   });
 
   test("successful start creates lockfile and server", async () => {
     const service = new ServerService();
 
     const info = await service.startServer({
-      muxHome: tempDir,
+      xumHome: tempDir,
       context: stubContext,
       authToken: "test-token",
       port: 0,
@@ -193,7 +387,7 @@ test("supports non-CLI allow-http-origin opt-in via MUX_SERVER_ALLOW_HTTP_ORIGIN
 
   try {
     const info = await service.startServer({
-      muxHome: tempDir,
+      xumHome: tempDir,
       context: stubContext,
       authToken: "",
       port: 0,
@@ -416,5 +610,118 @@ describe("computeNetworkBaseUrls", () => {
     expect(computeNetworkBaseUrls({ bindHost: "2001:db8::1", port: 3000 })).toEqual([
       "http://[2001:db8::1]:3000",
     ]);
+  });
+});
+
+describe("server settings writes (#4444)", () => {
+  let tempDir: string;
+  let config: Config;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "server-settings-test-"));
+    config = new Config(tempDir);
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("a failed SSH host write leaves the in-memory host unchanged", async () => {
+    const serverService = new ServerService();
+    serverService.setSshHost("old-host");
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+    const context = { config, serverService } as unknown as ORPCContext;
+
+    const error = await setServerSshHost(context, "new-host").catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toContain("EACCES");
+
+    expect(serverService.getSshHost()).toBe("old-host");
+  });
+
+  function fakeServer(options: { stopError?: Error; startErrors?: Error[] } = {}) {
+    const state = {
+      running: true,
+      stops: 0,
+      starts: [] as Array<{ host: string; port: number }>,
+    };
+    const startErrors = [...(options.startErrors ?? [])];
+    const serverService = {
+      isServerRunning: () => state.running,
+      stopServer: () => {
+        state.stops += 1;
+        if (options.stopError) return Promise.reject(options.stopError);
+        state.running = false;
+        return Promise.resolve();
+      },
+      startServer: (start: { host: string; port: number }) => {
+        state.starts.push({ host: start.host, port: start.port });
+        const error = startErrors.shift();
+        if (error) return Promise.reject(error);
+        state.running = true;
+        return Promise.resolve();
+      },
+      getApiAuthToken: () => "token",
+      getServerInfo: () => null,
+      getTailscaleBindHosts: () => [],
+    };
+    return { state, context: { config, serverService } as unknown as ORPCContext };
+  }
+
+  async function seedApiServerSettings(): Promise<void> {
+    await config.editConfig((value) => ({
+      ...value,
+      apiServerBindHost: "127.0.0.1",
+      apiServerPort: 4321,
+    }));
+  }
+
+  test("a failed settings write leaves a running server untouched (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer();
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("EACCES");
+    expect(state).toEqual({ running: true, stops: 0, starts: [] });
+    expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
+  });
+
+  test("a failed stop puts the previous settings back on disk (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer({ stopError: new Error("close failed") });
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("close failed");
+    // The old server is still up, so disk must describe it, not the requested settings.
+    expect(state.running).toBe(true);
+    expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
+    expect(config.loadConfigOrDefault().apiServerPort).toBe(4321);
+  });
+
+  test("a failed rollback write keeps the start error and still restarts the previous server (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer({ startErrors: [new Error("EADDRINUSE")] });
+    const realEdit = config.editConfig.bind(config);
+    spyOn(config, "editConfig")
+      .mockImplementationOnce(realEdit)
+      .mockImplementationOnce(() => Promise.reject(new Error("rollback write failed")));
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("EADDRINUSE");
+    expect(state.starts).toEqual([
+      { host: "0.0.0.0", port: 9999 },
+      { host: "127.0.0.1", port: 4321 },
+    ]);
+    expect(state.running).toBe(true);
   });
 });

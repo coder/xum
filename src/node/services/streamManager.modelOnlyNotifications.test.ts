@@ -1,16 +1,35 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { StreamManager } from "./streamManager";
+import type { LanguageModel } from "ai";
+
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import {
+  createStreamManagerForTests,
+  fakeStreamText,
+  onTurnEngineEvent,
+} from "./streamManager.testHarness";
 
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
+
+const model: LanguageModel = {
+  specificationVersion: "v3",
+  provider: "noop",
+  modelId: "model",
+  supportedUrls: {},
+  doGenerate: () => Promise.reject(new Error("Unexpected generation in notification test")),
+  doStream: () => Promise.reject(new Error("Unexpected stream in notification test")),
+};
 
 describe("StreamManager - model-only tool notifications", () => {
   let historyService: HistoryService;
   let historyCleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
+    ({ historyService, cleanup: historyCleanup } = await createTestHistoryService({
+      files: SessionFilesMemory,
+    }));
   });
 
   afterEach(async () => {
@@ -18,21 +37,6 @@ describe("StreamManager - model-only tool notifications", () => {
   });
 
   test("strips __mux_notifications before emitting tool-call-end", async () => {
-    const streamManager = new StreamManager(historyService);
-
-    // Avoid tokenizer worker usage in unit tests.
-    (streamManager as unknown as { tokenTracker: unknown }).tokenTracker = {
-      // eslint-disable-next-line @typescript-eslint/require-await
-      setModel: async () => undefined,
-      // eslint-disable-next-line @typescript-eslint/require-await
-      countTokens: async () => 0,
-    };
-
-    const events: Array<{ toolName?: string; result?: unknown }> = [];
-    streamManager.on("tool-call-end", (data: { toolName: string; result: unknown }) => {
-      events.push({ toolName: data.toolName, result: data.result });
-    });
-
     const mockStreamResult = {
       // eslint-disable-next-line @typescript-eslint/require-await
       fullStream: (async function* () {
@@ -61,71 +65,64 @@ describe("StreamManager - model-only tool notifications", () => {
       steps: Promise.resolve([]),
     };
 
-    const streamInfo = {
-      state: 2, // STREAMING
-      streamResult: mockStreamResult,
-      abortController: new AbortController(),
-      messageId: "test-message-1",
-      token: "test-token",
-      startTime: Date.now(),
-      model: "noop:model",
-      historySequence: 1,
+    // The default no-op token tracker avoids tokenizer workers in unit tests.
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText(() => mockStreamResult),
+    });
+    let completed = false;
+    onTurnEngineEvent(streamManager, "stream-end", () => {
+      completed = true;
+    });
+
+    const events: Array<{ toolName?: string; result?: unknown }> = [];
+    onTurnEngineEvent(
+      streamManager,
+      "tool-call-end",
+      (data: { toolName: string; result: unknown }) => {
+        events.push({ toolName: data.toolName, result: data.result });
+      }
+    );
+
+    await historyService.appendToHistory("test-workspace", {
+      id: "test-message-1",
+      role: "assistant",
+      metadata: { historySequence: 1, partial: true },
       parts: [],
-      lastPartialWriteTime: 0,
-      partialWritePromise: undefined,
-      partialWriteTimer: undefined,
-      processingPromise: Promise.resolve(),
-      softInterrupt: { pending: false },
-      runtimeTempDir: "", // Skip cleanup rm -rf
-      runtime: {},
-      cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-      cumulativeProviderMetadata: undefined,
-      lastStepUsage: undefined,
-      lastStepProviderMetadata: undefined,
-      toolModelUsages: [],
-    };
-
-    const method = Reflect.get(streamManager, "processStreamWithCleanup") as unknown;
-    expect(typeof method).toBe("function");
-
-    await (
-      method as (workspaceId: string, streamInfo: unknown, historySequence: number) => Promise<void>
-    ).call(streamManager, "test-workspace", streamInfo, 1);
+    });
+    const result = await streamManager.startStream({
+      workspaceId: "test-workspace",
+      messageId: "test-message-1",
+      model,
+      modelString: "noop:model",
+      messages: [{ role: "user", content: "hello" }],
+      system: undefined,
+      historySequence: 1,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      providedRuntimeTempDir: "", // Skip cleanup rm -rf
+    });
+    if (!result.success) throw new Error("Expected stream to start");
+    await result.data.completion;
+    expect(completed).toBe(true);
 
     const toolEnd = events.find((e) => e.toolName === "bash");
     expect(toolEnd).toBeDefined();
 
     expect(toolEnd?.result && typeof toolEnd.result === "object").toBe(true);
     expect("__mux_notifications" in (toolEnd!.result as Record<string, unknown>)).toBe(false);
+
+    // The row keeps the notes beside the output (never in it), so the next turn can resend
+    // the bytes this step sent.
+    const history = await historyService.getHistoryFromLatestBoundary("test-workspace");
+    if (!history.success) throw new Error(history.error);
+    const toolPart = history.data.at(-1)?.parts.find((part) => part.type === "dynamic-tool");
+    expect(toolPart).toMatchObject({
+      state: "output-available",
+      modelOnlyNotifications: ["<notification>hello</notification>"],
+    });
+    expect(toolPart && "output" in toolPart ? toolPart.output : undefined).toEqual({ ok: true });
   });
 
   test("persists orphan web_search tool-result when tool-call mapping is missing", async () => {
-    const streamManager = new StreamManager(historyService);
-
-    // Avoid tokenizer worker usage in unit tests.
-    (streamManager as unknown as { tokenTracker: unknown }).tokenTracker = {
-      // eslint-disable-next-line @typescript-eslint/require-await
-      setModel: async () => undefined,
-      // eslint-disable-next-line @typescript-eslint/require-await
-      countTokens: async () => 0,
-    };
-
-    const events: Array<{
-      toolName?: string;
-      result?: unknown;
-      providerExecuted?: boolean;
-    }> = [];
-    streamManager.on(
-      "tool-call-end",
-      (data: { toolName: string; result: unknown; providerExecuted?: boolean }) => {
-        events.push({
-          toolName: data.toolName,
-          result: data.result,
-          providerExecuted: data.providerExecuted,
-        });
-      }
-    );
-
     const mockStreamResult = {
       // eslint-disable-next-line @typescript-eslint/require-await
       fullStream: (async function* () {
@@ -154,39 +151,58 @@ describe("StreamManager - model-only tool notifications", () => {
       steps: Promise.resolve([]),
     };
 
-    const streamInfo = {
-      state: 2, // STREAMING
-      streamResult: mockStreamResult,
-      abortController: new AbortController(),
-      messageId: "test-message-orphan-web-search",
-      token: "test-token",
-      startTime: Date.now(),
-      model: "noop:model",
-      historySequence: 1,
+    // The default no-op token tracker avoids tokenizer workers in unit tests.
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText(() => mockStreamResult),
+    });
+    let completed = false;
+    onTurnEngineEvent(streamManager, "stream-end", () => {
+      completed = true;
+    });
+
+    const events: Array<{
+      toolName?: string;
+      result?: unknown;
+      providerExecuted?: boolean;
+    }> = [];
+    onTurnEngineEvent(
+      streamManager,
+      "tool-call-end",
+      (data: { toolName: string; result: unknown; providerExecuted?: boolean }) => {
+        events.push({
+          toolName: data.toolName,
+          result: data.result,
+          providerExecuted: data.providerExecuted,
+        });
+      }
+    );
+
+    await historyService.appendToHistory("test-workspace", {
+      id: "test-message-orphan-web-search",
+      role: "assistant",
+      metadata: { historySequence: 1, partial: true },
       parts: [],
-      lastPartialWriteTime: 0,
-      partialWritePromise: undefined,
-      partialWriteTimer: undefined,
-      processingPromise: Promise.resolve(),
-      softInterrupt: { pending: false },
-      runtimeTempDir: "", // Skip cleanup rm -rf
-      runtime: {},
-      cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-      cumulativeProviderMetadata: undefined,
-      lastStepUsage: undefined,
-      lastStepProviderMetadata: undefined,
-      toolModelUsages: [],
-    };
+    });
+    const result = await streamManager.startStream({
+      workspaceId: "test-workspace",
+      messageId: "test-message-orphan-web-search",
+      model,
+      modelString: "noop:model",
+      messages: [{ role: "user", content: "hello" }],
+      system: undefined,
+      historySequence: 1,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      providedRuntimeTempDir: "", // Skip cleanup rm -rf
+    });
+    if (!result.success) throw new Error("Expected stream to start");
+    await result.data.completion;
+    expect(completed).toBe(true);
 
-    const method = Reflect.get(streamManager, "processStreamWithCleanup") as unknown;
-    expect(typeof method).toBe("function");
-
-    await (
-      method as (workspaceId: string, streamInfo: unknown, historySequence: number) => Promise<void>
-    ).call(streamManager, "test-workspace", streamInfo, 1);
-
-    const webSearchPart = streamInfo.parts.find(
-      (part: { toolCallId?: string }) => part.toolCallId === "orphan-web-search-1"
+    // The committed assistant message is the persisted record of the stream.
+    const history = await historyService.getLastMessages("test-workspace", 1);
+    if (!history.success) throw new Error(history.error);
+    const webSearchPart = (history.data[0]?.parts ?? []).find(
+      (part) => "toolCallId" in part && part.toolCallId === "orphan-web-search-1"
     ) as
       | {
           state?: string;

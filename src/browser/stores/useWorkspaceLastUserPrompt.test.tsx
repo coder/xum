@@ -3,12 +3,12 @@ import "../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
-import { useWorkspaceLastUserPrompt, useWorkspaceStoreRaw } from "./WorkspaceStore";
+import { useWorkspaceLastUserPromptInfo, useWorkspaceStoreRaw } from "./WorkspaceStore";
 
 let cleanupDom: (() => void) | null = null;
 const workspaceId = "last-prompt-hook";
 
-describe("useWorkspaceLastUserPrompt", () => {
+describe("useWorkspaceLastUserPromptInfo", () => {
   beforeEach(() => {
     cleanupDom = installDom();
   });
@@ -23,20 +23,27 @@ describe("useWorkspaceLastUserPrompt", () => {
     const storeHook = renderHook(() => useWorkspaceStoreRaw());
     const store = storeHook.result.current;
     let caughtUp = options.caughtUp;
+    let snapshot = { displayed: null, historyEpoch: 1, isCaughtUp: caughtUp };
 
-    spyOn(store, "getWorkspaceLastUserPrompt").mockReturnValue(null);
-    spyOn(store, "getWorkspaceHistoryEpoch").mockReturnValue(1);
-    spyOn(store, "isWorkspaceTranscriptCaughtUp").mockImplementation(() => caughtUp);
-    const fetchPrompt = mock(() => Promise.resolve("prompt from disk"));
+    spyOn(store, "getWorkspaceLastUserPromptSnapshot").mockImplementation(() => snapshot);
+    const fetchPrompt = mock(() =>
+      Promise.resolve({ text: "prompt from disk", messageId: "prompt-from-disk" })
+    );
     spyOn(store, "fetchLastUserPromptFromHistory").mockImplementation(fetchPrompt);
 
-    return { fetchPrompt, setCaughtUp: (value: boolean) => (caughtUp = value) };
+    return {
+      fetchPrompt,
+      setCaughtUp: (value: boolean) => {
+        caughtUp = value;
+        snapshot = { ...snapshot, isCaughtUp: caughtUp };
+      },
+    };
   }
 
   it("does not scan history while the transcript is still hydrating", () => {
     const { fetchPrompt } = setupStore({ caughtUp: false });
 
-    const { result } = renderHook(() => useWorkspaceLastUserPrompt(workspaceId));
+    const { result } = renderHook(() => useWorkspaceLastUserPromptInfo(workspaceId));
 
     expect(fetchPrompt).not.toHaveBeenCalled();
     expect(result.current).toBeNull();
@@ -45,14 +52,14 @@ describe("useWorkspaceLastUserPrompt", () => {
   it("scans history once the transcript reports catch-up", async () => {
     const { fetchPrompt, setCaughtUp } = setupStore({ caughtUp: false });
 
-    const { result, rerender } = renderHook(() => useWorkspaceLastUserPrompt(workspaceId));
+    const { result, rerender } = renderHook(() => useWorkspaceLastUserPromptInfo(workspaceId));
     expect(fetchPrompt).not.toHaveBeenCalled();
 
     setCaughtUp(true);
     rerender();
 
     await waitFor(() => {
-      expect(result.current).toBe("prompt from disk");
+      expect(result.current).toEqual({ text: "prompt from disk", messageId: "prompt-from-disk" });
     });
     expect(fetchPrompt).toHaveBeenCalledTimes(1);
   });

@@ -4,7 +4,13 @@ const QUERY = "(prefers-reduced-motion: reduce)";
 
 // Cache the MediaQueryList at module level so subscribe/getSnapshot don't
 // create a new object on every call.
-const mql = typeof window !== "undefined" ? window.matchMedia(QUERY) : null;
+// Also require matchMedia itself: a window without it (a partial test DOM left behind by an
+// earlier file in a shared test process) made this module throw at import, poisoning every
+// later importer of the tool-renderer graph with "before initialization" errors.
+const mql =
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia(QUERY)
+    : null;
 
 function subscribe(callback: () => void): () => void {
   // eslint-disable-next-line @typescript-eslint/no-empty-function -- no matchMedia in SSR

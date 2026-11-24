@@ -141,6 +141,150 @@ const MIXED_EVENTS: TimelineEvent[] = [
   }),
 ];
 
+const CATEGORY_EVENTS: TimelineEvent[] = [
+  makeEvent("agent-blocker", "agent.event", 36, {
+    source: { system: "agent", key: "timeline-event:blocker" },
+    data: {
+      description: "PR #87 checks reached terminal state with six failures matching the baseline",
+      category: "blocker",
+    },
+    anchor: { toolCallId: "tool-timeline-event-blocker" },
+  }),
+  makeEvent("rule-blocker", "turn.completed", 35, {
+    status: "completed",
+    data: { durationMs: 60_000 },
+  }),
+  makeEvent("agent-milestone", "agent.event", 34, {
+    source: { system: "agent", key: "timeline-event:milestone" },
+    data: {
+      description: "Landed the retry backoff refactor with green checks",
+      category: "milestone",
+    },
+    anchor: { toolCallId: "tool-timeline-event-milestone" },
+  }),
+  makeEvent("rule-milestone", "turn.completed", 33, {
+    status: "completed",
+    data: { durationMs: 60_000 },
+  }),
+  makeEvent("agent-decision", "agent.event", 32, {
+    source: { system: "agent", key: "timeline-event:decision" },
+    data: {
+      description: "Chose client-side grouping over rewriting the append-only log",
+      category: "decision",
+    },
+    anchor: { toolCallId: "tool-timeline-event-decision" },
+  }),
+  makeEvent("rule-decision", "turn.completed", 31, {
+    status: "completed",
+    data: { durationMs: 60_000 },
+  }),
+  makeEvent("agent-handoff-2", "agent.event", 30, {
+    source: { system: "agent", key: "timeline-event:handoff-2" },
+    data: {
+      description: "Pushed mike/timeline and opened PR #4821",
+      category: "handoff",
+    },
+    anchor: { toolCallId: "tool-timeline-event-handoff-2" },
+  }),
+  makeEvent("rule-handoff-2", "turn.completed", 29, {
+    status: "completed",
+    data: { durationMs: 60_000 },
+  }),
+  makeEvent("agent-picked-up-2", "agent.event", 28, {
+    source: { system: "agent", key: "timeline-event:picked-up-2" },
+    data: {
+      description: "Picked up review feedback on the retry backoff",
+      category: "picked_up",
+    },
+    anchor: { toolCallId: "tool-timeline-event-picked-up-2" },
+  }),
+  makeEvent("rule-picked-up-2", "turn.completed", 27, {
+    status: "completed",
+    data: { durationMs: 60_000 },
+  }),
+  makeEvent("agent-uncategorized", "agent.event", 26, {
+    source: { system: "agent", key: "timeline-event:uncategorized" },
+    data: { description: "Recorded a note without a category" },
+    anchor: { toolCallId: "tool-timeline-event-uncategorized" },
+  }),
+];
+
+// Prompt-cache prefix breaks carry block metadata only (roles, types, tool names, sizes).
+const CACHE_BREAK_EVENTS: TimelineEvent[] = [
+  makeEvent("cache-break-turn", "cache.prefix_break", 25, {
+    data: {
+      model: "anthropic:claude-sonnet-5-5",
+      description:
+        "Prompt cache prefix broke in messages at block 6 of 7: user tool_result read_file (16820 chars) -> user tool_result read_file (12043 chars)",
+      promptCacheBreak: {
+        section: "messages",
+        boundary: "turn",
+        blockIndex: 6,
+        previousBlockCount: 7,
+        nextBlockCount: 7,
+        previous: { role: "user", type: "tool_result", length: 16_820, toolName: "read_file" },
+        next: { role: "user", type: "tool_result", length: 12_043, toolName: "read_file" },
+      },
+    },
+  }),
+  makeEvent("cache-break-rule-1", "turn.completed", 24, {
+    status: "completed",
+    data: { durationMs: 42_000 },
+  }),
+  makeEvent("cache-break-tools", "cache.prefix_break", 23, {
+    data: {
+      model: "anthropic:claude-opus-5-5",
+      description:
+        "Prompt cache prefix broke in tools at block 31 of 214: request system_options (93 chars) -> tool function mcp_search_issues (2418 chars)",
+      promptCacheBreak: {
+        section: "tools",
+        boundary: "turn",
+        blockIndex: 31,
+        previousBlockCount: 214,
+        nextBlockCount: 215,
+        previous: { role: "request", type: "system_options", length: 93 },
+        next: { role: "tool", type: "function", length: 2_418, toolName: "mcp_search_issues" },
+      },
+    },
+  }),
+  makeEvent("cache-break-rule-2", "turn.completed", 22, {
+    status: "completed",
+    data: { durationMs: 95_000 },
+  }),
+  makeEvent("cache-break-step", "cache.prefix_break", 21, {
+    data: {
+      model: "anthropic:claude-sonnet-5-5",
+      description:
+        "Prompt cache prefix broke in messages at block 12 of 13: assistant tool_use bash (240 chars) -> (end of request)",
+      promptCacheBreak: {
+        section: "messages",
+        boundary: "step",
+        blockIndex: 12,
+        previousBlockCount: 13,
+        nextBlockCount: 12,
+        previous: { role: "assistant", type: "tool_use", length: 240, toolName: "bash" },
+      },
+    },
+  }),
+  makeEvent("cache-break-options", "cache.prefix_break", 20, {
+    data: {
+      model: "anthropic:claude-opus-5-5",
+      description:
+        "Prompt cache prefix broke in messages at block 34 of 80: request message_options (174 chars) -> request message_options (173 chars); changed options: effort xhigh -> high",
+      promptCacheBreak: {
+        section: "messages",
+        boundary: "step",
+        blockIndex: 34,
+        previousBlockCount: 80,
+        nextBlockCount: 81,
+        previous: { role: "request", type: "message_options", length: 174 },
+        next: { role: "request", type: "message_options", length: 173 },
+        changedOptions: [{ key: "effort", previous: "xhigh", next: "high" }],
+      },
+    },
+  }),
+];
+
 const STORY_STORE: TimelineWorkspaceStore = {
   getWorkspaceState: () => ({ messages: [], muxMessages: [], hasOlderHistory: false }),
   loadOlderHistory: () => Promise.resolve("exhausted"),
@@ -148,7 +292,15 @@ const STORY_STORE: TimelineWorkspaceStore = {
   retryTimeline: () => undefined,
 };
 
+// Override the shared null preview so selecting the user-turn row demonstrates the
+// digest-vs-excerpt dedupe.
 const STORY_API = createMockORPCClient();
+STORY_API.workspace.timeline.preview = () =>
+  Promise.resolve({
+    role: "user",
+    textExcerpt:
+      "Add Timeline behavior coverage and responsive stories so the panel is validated at phone widths as well as desktop.",
+  });
 
 const meta = {
   title: "Features/RightSidebar/TimelinePanel",
@@ -219,6 +371,33 @@ export const Phone390: Story = {
     pixel: {
       matrix: { viewports: ["phone"] },
     },
+  },
+};
+
+export const PromptCacheBreaks: Story = {
+  args: {
+    workspaceId: `${WORKSPACE_ID}-cache-breaks`,
+    timeline: { ...populatedTimeline, events: CACHE_BREAK_EVENTS },
+    workspaceStore: STORY_STORE,
+  },
+};
+
+export const PromptCacheBreaksPhone390: Story = {
+  args: {
+    workspaceId: `${WORKSPACE_ID}-cache-breaks-phone`,
+    timeline: { ...populatedTimeline, events: CACHE_BREAK_EVENTS },
+    workspaceStore: STORY_STORE,
+  },
+  globals: Phone390.globals,
+  decorators: Phone390.decorators,
+  parameters: Phone390.parameters,
+};
+
+export const AgentEventCategories: Story = {
+  args: {
+    workspaceId: `${WORKSPACE_ID}-categories`,
+    timeline: { ...populatedTimeline, events: CATEGORY_EVENTS },
+    workspaceStore: STORY_STORE,
   },
 };
 

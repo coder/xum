@@ -1,11 +1,12 @@
-import * as fs from "fs/promises";
 import * as path from "path";
 
 import { mergeAdditionalSystemInstructions } from "@/common/utils/additionalSystemInstructions";
-import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import { isErrnoWithCode } from "@/node/utils/fs";
 
 interface SessionDirProvider {
-  getSessionDir(workspaceId: string): string;
+  sessionsDir: string;
 }
 
 export const ADDITIONAL_SYSTEM_CONTEXT_FILENAME = "additional-system-context.md";
@@ -26,19 +27,29 @@ export function getAdditionalSystemContextPath(
   config: SessionDirProvider,
   workspaceId: string
 ): string {
-  return path.join(config.getSessionDir(workspaceId), ADDITIONAL_SYSTEM_CONTEXT_FILENAME);
+  return path.join(config.sessionsDir, workspaceId, ADDITIONAL_SYSTEM_CONTEXT_FILENAME);
 }
 
 export function getAdditionalSystemContextDisabledPath(
   config: SessionDirProvider,
   workspaceId: string
 ): string {
-  return path.join(config.getSessionDir(workspaceId), ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME);
+  return path.join(
+    path.join(config.sessionsDir, workspaceId),
+    ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME
+  );
 }
 
-async function readContentFile(config: SessionDirProvider, workspaceId: string): Promise<string> {
+async function readContentFile(
+  config: SessionDirProvider,
+  workspaceId: string,
+  files: SessionFiles
+): Promise<string> {
   try {
-    return await fs.readFile(getAdditionalSystemContextPath(config, workspaceId), "utf-8");
+    return await files.promises.readFile(
+      getAdditionalSystemContextPath(config, workspaceId),
+      "utf-8"
+    );
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) {
       return "";
@@ -47,10 +58,14 @@ async function readContentFile(config: SessionDirProvider, workspaceId: string):
   }
 }
 
-async function readEnabledFlag(config: SessionDirProvider, workspaceId: string): Promise<boolean> {
+async function readEnabledFlag(
+  config: SessionDirProvider,
+  workspaceId: string,
+  files: SessionFiles
+): Promise<boolean> {
   // Default to enabled when the marker file is absent.
   try {
-    await fs.access(getAdditionalSystemContextDisabledPath(config, workspaceId));
+    await files.promises.access(getAdditionalSystemContextDisabledPath(config, workspaceId));
     return false;
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) {
@@ -62,11 +77,13 @@ async function readEnabledFlag(config: SessionDirProvider, workspaceId: string):
 
 export async function readAdditionalSystemContext(
   config: SessionDirProvider,
-  workspaceId: string
+  workspaceId: string,
+  /** The session files of the workspace (phase 5). Absent: the Node layer. */
+  files: SessionFiles = nodeSessionFiles
 ): Promise<AdditionalSystemContextRecord> {
   const [content, enabled] = await Promise.all([
-    readContentFile(config, workspaceId),
-    readEnabledFlag(config, workspaceId),
+    readContentFile(config, workspaceId, files),
+    readEnabledFlag(config, workspaceId, files),
   ]);
   return { content, enabled };
 }
@@ -74,25 +91,30 @@ export async function readAdditionalSystemContext(
 export async function writeAdditionalSystemContext(
   config: SessionDirProvider,
   workspaceId: string,
-  record: AdditionalSystemContextRecord
+  record: AdditionalSystemContextRecord,
+  /** The session files of the workspace (phase 5). Absent: the Node layer. */
+  files: SessionFiles = nodeSessionFiles
 ): Promise<void> {
   const filePath = getAdditionalSystemContextPath(config, workspaceId);
   const disabledPath = getAdditionalSystemContextDisabledPath(config, workspaceId);
-  await ensurePrivateDir(path.dirname(filePath));
+  await files.ensurePrivateDir(path.dirname(filePath));
 
   // Empty scratchpads should behave like missing files so fork/copy and prompt
   // injection don't carry around blank durable state. We also drop the
   // disabled marker so the next non-empty edit defaults to enabled.
   if (record.content.length === 0) {
-    await Promise.all([fs.rm(filePath, { force: true }), fs.rm(disabledPath, { force: true })]);
+    await Promise.all([
+      files.promises.rm(filePath, { force: true }),
+      files.promises.rm(disabledPath, { force: true }),
+    ]);
     return;
   }
 
-  await fs.writeFile(filePath, record.content, "utf-8");
+  await files.promises.writeFile(filePath, record.content, "utf-8");
   if (record.enabled) {
-    await fs.rm(disabledPath, { force: true });
+    await files.promises.rm(disabledPath, { force: true });
   } else {
-    await fs.writeFile(disabledPath, "", "utf-8");
+    await files.promises.writeFile(disabledPath, "", "utf-8");
   }
 }
 

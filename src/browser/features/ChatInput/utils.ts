@@ -1,17 +1,30 @@
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
-import { parseCommand } from "@/browser/utils/slashCommands/parser";
+import { parseCommand, tokenizeSlashCommandArguments } from "@/browser/utils/slashCommands/parser";
 import type { APIClient } from "@/browser/contexts/API";
 import {
   extractInlineSkillReferenceCandidates,
   resolveInlineSkillReferences,
+  type InlineSkillCandidate,
 } from "@/browser/utils/agentSkills/inlineSkillReferences";
 import { resolveSkillUserInvocable } from "@/common/orpc/schemas/agentSkill";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
+import {
+  findInvocableSkill,
+  resolveSkillReadIdentity,
+} from "@/common/utils/agentSkills/skillLookupName";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
+import {
+  buildMcpPromptBaseKey,
+  isMcpPromptCommandKey,
+} from "@/common/utils/tools/mcpPromptCommandKey";
 import type { ParsedRuntime } from "@/common/types/runtime";
 import {
   buildAgentSkillMetadata,
   dedupeAgentSkillRefs,
+  buildMcpPromptUserText,
+  dedupeMcpPromptRefs,
   type AgentSkillReference,
+  type MCPPromptReference,
   type MuxMessageMetadata,
 } from "@/common/types/message";
 import type { FilePart } from "@/common/orpc/types";
@@ -20,22 +33,58 @@ import type { ChatAttachment } from "@/browser/features/ChatInput/ChatAttachment
 export type CreationRuntimeValidationError =
   | { mode: "docker"; kind: "missingImage" }
   | { mode: "ssh"; kind: "missingHost" }
+  | { mode: "ssh"; kind: "missingProjectDir" }
   | { mode: "ssh"; kind: "missingCoderWorkspace" }
   | { mode: "ssh"; kind: "missingCoderTemplate" }
   | { mode: "ssh"; kind: "missingCoderPreset" };
 
 export interface SkillInvocation {
-  descriptor: AgentSkillDescriptor;
+  descriptor: InvocableSkill;
   userText: string;
   /** Trimmed text after the slash command (e.g. "123 high" for "/fix-issue 123 high"). */
   argumentText: string;
+}
+
+export interface MCPPromptInvocation {
+  descriptor: MCPPromptDescriptor;
+  userText: string;
+  arguments: Record<string, string>;
+}
+
+function mapPromptArguments(
+  descriptor: MCPPromptDescriptor,
+  input: string
+): { arguments: Record<string, string>; missingRequired?: string } {
+  const definitions = descriptor.arguments ?? [];
+  const tokens = tokenizeSlashCommandArguments(input);
+  const values: Record<string, string> = {};
+  let tokenIndex = 0;
+  for (const [index, definition] of definitions.entries()) {
+    // Skip an optional slot when the remaining tokens are needed by later
+    // required arguments, so `[optional, required]` maps one token to the
+    // required argument instead of reporting it missing.
+    const requiredAfter = definitions.slice(index + 1).filter((d) => d.required).length;
+    if (!definition.required && tokens.length - tokenIndex <= requiredAfter) {
+      continue;
+    }
+    const value =
+      index === definitions.length - 1
+        ? tokens.slice(tokenIndex).join(" ")
+        : (tokens[tokenIndex] ?? "");
+    if (!value) {
+      if (definition.required) return { arguments: values, missingRequired: definition.name };
+      continue;
+    }
+    values[definition.name] = value;
+    tokenIndex++;
+  }
+  return { arguments: values };
 }
 
 export type SkillResolutionTarget =
   | { kind: "project"; projectPath: string }
   | { kind: "workspace"; workspaceId: string; disableWorkspaceAgents?: boolean };
 
-// Unknown slash commands are used for agent-skill invocations (/{skillName} ...).
 type UnknownSlashCommand = Extract<ParsedCommand, { type: "unknown-command" }>;
 
 function isUnknownSlashCommand(value: ParsedCommand): value is UnknownSlashCommand {
@@ -44,7 +93,7 @@ function isUnknownSlashCommand(value: ParsedCommand): value is UnknownSlashComma
 
 export function buildSkillInvocationMetadata(
   rawCommand: string,
-  descriptor: AgentSkillDescriptor,
+  descriptor: InvocableSkill,
   argumentText: string
 ): MuxMessageMetadata {
   return buildAgentSkillMetadata({
@@ -64,10 +113,120 @@ function formatSkillInvocationText(skillName: string, userMessage: string): stri
   return userMessage ? `Using skill ${skillName}: ${userMessage}` : `Use skill ${skillName}`;
 }
 
+// parseCommand() trims before matching, so pasted or draft-restored text with
+// leading whitespace must be sliced from the same trimmed view or the command
+// falls through as literal text.
+function textAfterCommandPrefix(messageText: string, command: string): string {
+  return messageText.trimStart().slice(`/${command}`.length);
+}
+
+// Exact commandKey wins across the whole catalog; stableKey only recovers
+// drafts whose collision-suffixed key changed, so an alias must never shadow
+// another prompt's current commandKey.
+function findPromptDescriptor(
+  descriptors: MCPPromptDescriptor[],
+  command: string,
+  isEligible: (descriptor: MCPPromptDescriptor) => boolean = () => true
+): MCPPromptDescriptor | undefined {
+  return (
+    descriptors.find((descriptor) => descriptor.commandKey === command && isEligible(descriptor)) ??
+    descriptors.find((descriptor) => descriptor.stableKey === command && isEligible(descriptor))
+  );
+}
+
+async function loadMcpPromptDescriptors(options: {
+  descriptors: MCPPromptDescriptor[];
+  api: APIClient | null;
+  discovery: SkillResolutionTarget | null;
+  commandKeys: string[];
+  signal?: AbortSignal;
+}): Promise<MCPPromptDescriptor[] | null> {
+  const hasAllDescriptors = options.commandKeys.every(
+    (commandKey) => findPromptDescriptor(options.descriptors, commandKey) !== undefined
+  );
+  if (hasAllDescriptors || !options.api || options.discovery?.kind !== "workspace") {
+    return options.descriptors;
+  }
+
+  try {
+    return await options.api.workspace.mcp.prompts.list(
+      { workspaceId: options.discovery.workspaceId },
+      options.signal !== undefined ? { signal: options.signal } : undefined
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function resolveMcpPromptInvocation(options: {
+  messageText: string;
+  parsed: ParsedCommand;
+  descriptors: MCPPromptDescriptor[];
+  api: APIClient | null;
+  discovery: SkillResolutionTarget | null;
+  signal?: AbortSignal;
+}): Promise<{ invocation: MCPPromptInvocation | null; error?: string }> {
+  if (!isUnknownSlashCommand(options.parsed) || !isMcpPromptCommandKey(options.parsed.command)) {
+    return { invocation: null };
+  }
+
+  const command = options.parsed.command;
+  const afterPrefix = textAfterCommandPrefix(options.messageText, command);
+  if (afterPrefix.length > 0 && !/^\s/.test(afterPrefix)) return { invocation: null };
+
+  const descriptors = await loadMcpPromptDescriptors({
+    descriptors: options.descriptors,
+    api: options.api,
+    discovery: options.discovery,
+    commandKeys: [command],
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+  });
+  const descriptor = descriptors ? findPromptDescriptor(descriptors, command) : undefined;
+  if (!descriptor) {
+    // A new collision can orphan an unsuffixed key from an old draft. Block the
+    // send and offer current keys rather than treating it as plain text.
+    const baseMatches = (descriptors ?? []).filter(
+      (candidate) => buildMcpPromptBaseKey(candidate.serverName, candidate.promptName) === command
+    );
+    if (baseMatches.length > 0) {
+      const candidates = baseMatches.map((candidate) => `/${candidate.commandKey}`).join(" or ");
+      return {
+        invocation: null,
+        error: `'/${command}' no longer matches an MCP prompt key; did you mean ${candidates}?`,
+      };
+    }
+    // The mcp__ prefix is reserved, so an unresolvable command must block the
+    // send instead of falling through as literal text.
+    return {
+      invocation: null,
+      error:
+        descriptors === null
+          ? `Could not load MCP prompts to resolve '/${command}'; check the MCP server connection and try again.`
+          : `'/${command}' does not match any available MCP prompt.`,
+    };
+  }
+
+  const mapped = mapPromptArguments(descriptor, afterPrefix.trim());
+  if (mapped.missingRequired) {
+    return {
+      invocation: null,
+      error: `Missing required MCP prompt argument: ${mapped.missingRequired}`,
+    };
+  }
+  const argumentText = afterPrefix.trimStart();
+  return {
+    invocation: {
+      descriptor,
+      userText: buildMcpPromptUserText(descriptor.serverName, descriptor.promptName, argumentText),
+      arguments: mapped.arguments,
+    },
+  };
+}
+
 async function resolveSkillInvocation(options: {
   messageText: string;
   parsed: ParsedCommand;
-  agentSkillDescriptors: AgentSkillDescriptor[];
+  agentSkillDescriptors: InvocableSkill[];
   api: APIClient | null;
   discovery: SkillResolutionTarget | null;
 }): Promise<SkillInvocation | null> {
@@ -76,8 +235,7 @@ async function resolveSkillInvocation(options: {
   }
 
   const command = options.parsed.command;
-  const prefix = `/${command}`;
-  const afterPrefix = options.messageText.slice(prefix.length);
+  const afterPrefix = textAfterCommandPrefix(options.messageText, command);
   const hasSeparator = afterPrefix.length === 0 || /^\s/.test(afterPrefix);
 
   if (!hasSeparator) {
@@ -86,8 +244,9 @@ async function resolveSkillInvocation(options: {
 
   // user-invocable: false skills must be treated as nonexistent for typed /skill-name
   // invocation (they remain model-invocable via agent_skill_read).
-  let skill: AgentSkillDescriptor | undefined = options.agentSkillDescriptors.find(
-    (candidate) => candidate.name === command && candidate.userInvocable !== false
+  let skill: InvocableSkill | undefined = findInvocableSkill(
+    options.agentSkillDescriptors.filter((candidate) => candidate.userInvocable !== false),
+    command
   );
 
   if (!skill && options.api && options.discovery) {
@@ -107,7 +266,8 @@ async function resolveSkillInvocation(options: {
       // gate the local descriptor list already carries in normalized form.
       if (resolveSkillUserInvocable(pkg.frontmatter) !== false) {
         skill = {
-          name: pkg.frontmatter.name,
+          // A typed `pstack:tdd` must keep naming the plugin's skill.
+          name: resolveSkillReadIdentity({ name: command }, pkg.frontmatter.name),
           description: pkg.frontmatter.description,
           scope: pkg.scope,
         };
@@ -130,11 +290,35 @@ async function resolveSkillInvocation(options: {
 
 export async function parseCommandWithSkillInvocation(options: {
   messageText: string;
-  agentSkillDescriptors: AgentSkillDescriptor[];
+  agentSkillDescriptors: InvocableSkill[];
+  mcpPromptDescriptors?: MCPPromptDescriptor[];
   api: APIClient | null;
   discovery: SkillResolutionTarget | null;
-}): Promise<{ parsed: ParsedCommand; skillInvocation: SkillInvocation | null }> {
+  signal?: AbortSignal;
+}): Promise<{
+  parsed: ParsedCommand;
+  skillInvocation: SkillInvocation | null;
+  mcpPromptInvocation: MCPPromptInvocation | null;
+  error?: string;
+}> {
   const parsed = parseCommand(options.messageText);
+  const promptResolution = await resolveMcpPromptInvocation({
+    messageText: options.messageText,
+    parsed,
+    descriptors: options.mcpPromptDescriptors ?? [],
+    api: options.api,
+    discovery: options.discovery,
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+  });
+  if (promptResolution.invocation || promptResolution.error) {
+    return {
+      parsed: promptResolution.invocation ? null : parsed,
+      skillInvocation: null,
+      mcpPromptInvocation: promptResolution.invocation,
+      ...(promptResolution.error ? { error: promptResolution.error } : {}),
+    };
+  }
+
   const skillInvocation = await resolveSkillInvocation({
     messageText: options.messageText,
     parsed,
@@ -146,6 +330,7 @@ export async function parseCommandWithSkillInvocation(options: {
   return {
     parsed: skillInvocation == null ? parsed : null,
     skillInvocation,
+    mcpPromptInvocation: null,
   };
 }
 
@@ -162,9 +347,10 @@ export async function parseCommandWithSkillInvocation(options: {
 export async function resolveInlineSkillRefsForSend(options: {
   messageText: string;
   slashInvocation: SkillInvocation | null;
-  agentSkillDescriptors: AgentSkillDescriptor[];
+  agentSkillDescriptors: InvocableSkill[];
   api: APIClient | null;
   discovery: SkillResolutionTarget | null;
+  candidates?: InlineSkillCandidate[];
 }): Promise<AgentSkillReference[]> {
   const refs: AgentSkillReference[] = [];
 
@@ -173,7 +359,9 @@ export async function resolveInlineSkillRefsForSend(options: {
     refs.push({ skillName: descriptor.name, scope: descriptor.scope, source: "slash" });
   }
 
-  const candidates = extractInlineSkillReferenceCandidates(options.messageText);
+  const candidates = (
+    options.candidates ?? extractInlineSkillReferenceCandidates(options.messageText)
+  ).filter((candidate) => !isMcpPromptCommandKey(candidate.skillName));
   if (candidates.length > 0) {
     const inlineRefs = await resolveInlineSkillReferences({
       candidates,
@@ -185,6 +373,74 @@ export async function resolveInlineSkillRefsForSend(options: {
   }
 
   return dedupeAgentSkillRefs(refs);
+}
+
+export async function resolveMcpPromptRefsForSend(options: {
+  messageText: string;
+  slashInvocation: MCPPromptInvocation | null;
+  descriptors: MCPPromptDescriptor[];
+  api: APIClient | null;
+  discovery: SkillResolutionTarget | null;
+  candidates?: InlineSkillCandidate[];
+  signal?: AbortSignal;
+}): Promise<{ refs: MCPPromptReference[]; error?: string }> {
+  const refs: MCPPromptReference[] = [];
+  if (options.slashInvocation) {
+    const invocation = options.slashInvocation;
+    refs.push({
+      serverName: invocation.descriptor.serverName,
+      promptName: invocation.descriptor.promptName,
+      commandKey: invocation.descriptor.commandKey,
+      source: "slash",
+      arguments: invocation.arguments,
+    });
+  }
+
+  const candidates = (
+    options.candidates ?? extractInlineSkillReferenceCandidates(options.messageText)
+  ).filter((candidate) => isMcpPromptCommandKey(candidate.skillName));
+  if (candidates.length === 0) return { refs };
+
+  const descriptors = await loadMcpPromptDescriptors({
+    descriptors: options.descriptors,
+    api: options.api,
+    discovery: options.discovery,
+    commandKeys: candidates.map((candidate) => candidate.skillName),
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+  });
+  if (!descriptors) return { refs };
+
+  const isInlineInvocable = (descriptor: MCPPromptDescriptor) =>
+    !(descriptor.arguments ?? []).some((argument) => argument.required);
+  for (const candidate of candidates) {
+    const prompt = findPromptDescriptor(descriptors, candidate.skillName, isInlineInvocable);
+    if (!prompt) {
+      // Same orphaned-key ambiguity as the slash path: a new collision
+      // suffixed the keys, so block the send instead of dropping the ref.
+      const baseMatches = descriptors.filter(
+        (descriptor) =>
+          buildMcpPromptBaseKey(descriptor.serverName, descriptor.promptName) ===
+            candidate.skillName && isInlineInvocable(descriptor)
+      );
+      if (baseMatches.length > 0) {
+        const suggestions = baseMatches
+          .map((descriptor) => `$${descriptor.commandKey}`)
+          .join(" or ");
+        return {
+          refs: [],
+          error: `'$${candidate.skillName}' no longer matches an MCP prompt key; did you mean ${suggestions}?`,
+        };
+      }
+      continue;
+    }
+    refs.push({
+      serverName: prompt.serverName,
+      promptName: prompt.promptName,
+      commandKey: prompt.commandKey,
+      source: "inline",
+    });
+  }
+  return { refs: dedupeMcpPromptRefs(refs) };
 }
 
 /** Returns true when any ref's scope is "project" (used by creation flow to force disableWorkspaceAgents). */
@@ -221,7 +477,14 @@ export function validateCreationRuntime(
       return null;
     }
 
-    return runtime.host.trim() ? null : { mode: "ssh", kind: "missingHost" };
+    if (!runtime.host.trim()) {
+      return { mode: "ssh", kind: "missingHost" };
+    }
+    // SSH+None runs in an existing directory on the host, so it has nothing to create from.
+    if (runtime.workspaceIsolation === "none" && !(runtime.projectDir ?? "").trim()) {
+      return { mode: "ssh", kind: "missingProjectDir" };
+    }
+    return null;
   }
 
   return null;

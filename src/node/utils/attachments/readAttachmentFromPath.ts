@@ -8,15 +8,15 @@ import {
   normalizeAttachmentMediaType,
 } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import type { FileStat, Runtime } from "@/node/runtime/Runtime";
+import type { FileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { resolvePathWithinCwd } from "@/node/services/tools/fileCommon";
 import {
   isRasterAttachmentMediaType,
   resizeRasterImageAttachmentBufferIfNeeded,
 } from "@/node/utils/attachments/resizeRasterImageAttachment";
+import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/attachmentLimits";
 
-// This cap applies to both model attachments and display-only fallback files so
-// chat history never persists unexpectedly large base64 payloads.
-export const MAX_ATTACH_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
+export { MAX_ATTACH_FILE_SIZE_BYTES };
 
 export interface ReadAttachmentFromPathArgs {
   path: string;
@@ -25,6 +25,8 @@ export interface ReadAttachmentFromPathArgs {
   cwd: string;
   runtime: Runtime;
   abortSignal?: AbortSignal;
+  /** The workspace's additions to the agent sandbox policy (attach_file). */
+  sandbox?: FileToolSandboxContext;
 }
 
 export interface LoadedFileFromPath {
@@ -220,7 +222,13 @@ export async function readAttachFileFromPath(
     "attach_file requires a path"
   );
 
-  const { resolvedPath } = resolvePathWithinCwd(args.path, args.cwd, args.runtime);
+  const { resolvedPath } = await resolvePathWithinCwd(
+    args.path,
+    args.cwd,
+    args.runtime,
+    "read",
+    args.sandbox
+  );
   const fileStat = await statRegularFile(args, resolvedPath);
   const filename = getFallbackFilename(resolvedPath, args.filename);
   const mediaType = getSupportedAttachmentMediaType({

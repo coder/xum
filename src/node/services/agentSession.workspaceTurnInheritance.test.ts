@@ -1,0 +1,331 @@
+import { describe, expect, mock, test } from "bun:test";
+
+import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import { Ok } from "@/common/types/result";
+import type { StreamMessageOptions } from "@/node/services/aiService";
+
+import { inheritOpenWorkspaceTurnMetadata } from "./agentSession";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+
+const correlation = {
+  type: "workspace-turn-task",
+  taskHandleId: "wst_handle",
+  ownerWorkspaceId: "parentworkspace",
+  turnId: "turn",
+} as const;
+
+function turnPrompt(id: string): MuxMessage {
+  return createMuxMessage(id, "user", "Delegated prompt", { muxMetadata: correlation });
+}
+
+function cutAssistant(id: string): MuxMessage {
+  return createMuxMessage(id, "assistant", "Working...", {
+    finishReason: "tool-calls",
+    muxMetadata: correlation,
+  });
+}
+
+function wake(id: string): MuxMessage {
+  return createMuxMessage(id, "user", "A background bash monitor matched output.", {
+    muxMetadata: { type: "bash-monitor-wake", records: [] },
+  });
+}
+
+describe("inheritOpenWorkspaceTurnMetadata", () => {
+  test("wake after a queue-cut correlated assistant inherits the turn correlation", () => {
+    const messages = [turnPrompt("prompt"), cutAssistant("cut"), wake("wake")];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toEqual(correlation);
+  });
+
+  test("a hidden plan-review record after the cut does not close the turn", () => {
+    // Resolving a review thread appends a synthetic user row as the history tail; it is UI
+    // state, not a human turn, so the wake must still reach the correlated assistant.
+    const resolved = createMuxMessage("resolve", "user", "<mux_plan_review>...</mux_plan_review>", {
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec_1", threadId: "thr_1" },
+    });
+    const messages = [turnPrompt("prompt"), cutAssistant("cut"), resolved, wake("wake")];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toEqual(correlation);
+  });
+
+  test("chained wake continuations keep inheriting through inherited assistants", () => {
+    const messages = [
+      turnPrompt("prompt"),
+      cutAssistant("cut1"),
+      wake("wake1"),
+      cutAssistant("cut2"),
+      wake("wake2"),
+    ];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toEqual(correlation);
+  });
+
+  test("a correlated assistant that finished with stop closes the turn", () => {
+    const messages = [
+      turnPrompt("prompt"),
+      createMuxMessage("final", "assistant", "Final report", {
+        finishReason: "stop",
+        muxMetadata: correlation,
+      }),
+      wake("wake"),
+    ];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toBeUndefined();
+  });
+
+  test("a manual user prompt supersedes the open turn", () => {
+    const messages = [
+      turnPrompt("prompt"),
+      cutAssistant("cut"),
+      createMuxMessage("manual", "user", "User takes over"),
+      wake("wake"),
+    ];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toBeUndefined();
+  });
+
+  test("an uncorrelated assistant closes the chain", () => {
+    const messages = [
+      createMuxMessage("plain", "assistant", "Unrelated turn", { finishReason: "tool-calls" }),
+      wake("wake"),
+    ];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toBeUndefined();
+  });
+
+  test("a partial correlated assistant does not leave the turn open", () => {
+    const messages = [
+      turnPrompt("prompt"),
+      createMuxMessage("partial", "assistant", "Crashed mid-work", {
+        finishReason: "tool-calls",
+        partial: true,
+        muxMetadata: correlation,
+      }),
+      wake("wake"),
+    ];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toBeUndefined();
+  });
+
+  test("empty history yields no correlation", () => {
+    expect(inheritOpenWorkspaceTurnMetadata([])).toBeUndefined();
+  });
+
+  test("a compaction summary stamped with the turn correlation re-opens the chain", () => {
+    // On-send compaction consumed the wake: post-compaction history starts at
+    // the summary, which carries the pre-compaction correlation stamp.
+    const messages = [
+      createMuxMessage("summary", "assistant", "Compacted context", {
+        finishReason: "stop",
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "wake follow-up",
+            model: "anthropic:claude-sonnet-4-5",
+            agentId: "exec",
+            workspaceTurnMetadata: correlation,
+          },
+        },
+      }),
+      wake("wake"),
+    ];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toEqual(correlation);
+  });
+
+  test("an unstamped compaction summary closes the chain", () => {
+    const messages = [
+      createMuxMessage("summary", "assistant", "Compacted context", {
+        finishReason: "stop",
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "unrelated follow-up",
+            model: "anthropic:claude-sonnet-4-5",
+            agentId: "exec",
+          },
+        },
+      }),
+      wake("wake"),
+    ];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toBeUndefined();
+  });
+});
+
+describe("AgentSession workspace-turn correlation inheritance", () => {
+  async function sendAfterHistory(
+    history: MuxMessage[],
+    sendOptions: {
+      muxMetadata?: MuxMessageMetadata;
+    }
+  ): Promise<StreamMessageOptions["muxMetadata"]> {
+    let streamedMuxMetadata: StreamMessageOptions["muxMetadata"];
+    const streamMessage = mock((opts: StreamMessageOptions) => {
+      streamedMuxMetadata = opts.muxMetadata;
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+    });
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId: "workspace-turn-inheritance",
+      aiServiceOverrides: {
+        streamMessage,
+      },
+    });
+    try {
+      for (const message of history) {
+        await historyService.appendToHistory("workspace-turn-inheritance", message);
+      }
+
+      const result = await session.sendMessage("continuation", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+        ...(sendOptions.muxMetadata != null ? { muxMetadata: sendOptions.muxMetadata } : {}),
+      });
+      expect(result.success).toBe(true);
+      expect(streamMessage.mock.calls).toHaveLength(1);
+      return streamedMuxMetadata;
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  }
+
+  // A delegated turn that was cut at a tool boundary by a queued dispatch.
+  const queueCutHistory = () => [turnPrompt("delegated-prompt"), cutAssistant("cut")];
+
+  test("bash-monitor-wake continuation streams inherit the open turn correlation", async () => {
+    const streamed = await sendAfterHistory(queueCutHistory(), {
+      muxMetadata: { type: "bash-monitor-wake", records: [] },
+    });
+    expect(streamed).toEqual(correlation);
+  });
+
+  test("manual user messages after a queue cut do not inherit the correlation", async () => {
+    const streamed = await sendAfterHistory(queueCutHistory(), {});
+    expect(streamed).toBeUndefined();
+  });
+
+  test("a wake carrying a fresh continuation streams that correlation after the old turn closed", async () => {
+    const fresh = {
+      taskHandleId: "wst_reactivated",
+      ownerWorkspaceId: "parentworkspace",
+      turnId: "turn-2",
+    };
+    const closedTurn = [
+      turnPrompt("delegated-prompt"),
+      createMuxMessage("final", "assistant", "Final report", {
+        finishReason: "stop",
+        muxMetadata: correlation,
+      }),
+    ];
+    expect(
+      await sendAfterHistory(closedTurn, {
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+      })
+    ).toBeUndefined();
+    expect(
+      await sendAfterHistory(closedTurn, {
+        muxMetadata: { type: "bash-monitor-wake", records: [], workspaceTurn: fresh },
+      })
+    ).toEqual({ type: "workspace-turn-task", ...fresh });
+  });
+
+  test("workspace-turn correlation persists in startup retry options", async () => {
+    const workspaceId = "workspace-turn-retry-metadata";
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+    });
+    try {
+      const result = await session.sendMessage(
+        "Nested terminal report",
+        {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          muxMetadata: correlation,
+        },
+        { synthetic: true, agentInitiated: true }
+      );
+      expect(result.success).toBe(true);
+
+      const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(historyResult.success).toBe(true);
+      if (!historyResult.success) throw new Error("history read failed");
+      const userMessage = historyResult.data.find(
+        (message) =>
+          message.role === "user" &&
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "Nested terminal report"
+          )
+      );
+      expect(userMessage?.metadata?.retrySendOptions).toMatchObject({
+        muxMetadata: correlation,
+      });
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test.each(["history", "explicit"] as const)(
+    "on-send compaction consuming a wake stamps the %s correlation on the follow-up",
+    async (source) => {
+      const workspaceTurn =
+        source === "explicit"
+          ? {
+              taskHandleId: "wst_compaction_continuation",
+              ownerWorkspaceId: "parentworkspace",
+              turnId: "fresh-turn",
+            }
+          : undefined;
+      const workspaceId = "workspace-turn-compaction-stamp";
+      const { session, cleanup, historyService } = await createAgentSessionHarness({
+        workspaceId,
+      });
+      try {
+        await historyService.appendToHistory(workspaceId, turnPrompt("delegated-prompt"));
+        await historyService.appendToHistory(workspaceId, cutAssistant("cut"));
+
+        // Force the on-send compaction divert for the wake continuation.
+        const internals = session as unknown as {
+          contextController: { compactionMonitor: unknown };
+        };
+        internals.contextController.compactionMonitor = {
+          checkBeforeSend: mock(() => ({
+            shouldShowWarning: true,
+            shouldForceCompact: true,
+            usagePercentage: 99,
+            thresholdPercentage: 85,
+          })),
+          checkMidStream: mock(() => false),
+          resetForNewStream: mock(() => undefined),
+          noteUserTurn: mock(() => undefined),
+          noteAutoCompactionRequested: mock(() => undefined),
+          noteAutoCompactionCompleted: mock(() => undefined),
+          suppressRepeatedAutoCompaction: mock(() => false),
+        };
+
+        const result = await session.sendMessage(
+          "monitor wake",
+          {
+            model: "anthropic:claude-sonnet-4-5",
+            agentId: "exec",
+            muxMetadata: { type: "bash-monitor-wake", records: [], workspaceTurn },
+          },
+          { agentInitiated: true }
+        );
+        expect(result.success).toBe(true);
+
+        const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(historyResult.success).toBe(true);
+        if (!historyResult.success) throw new Error("history read failed");
+        const compactionRequest = historyResult.data.find(
+          (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+        );
+        const requestMeta = compactionRequest?.metadata?.muxMetadata;
+        if (requestMeta?.type !== "compaction-request") {
+          throw new Error("expected a persisted compaction request");
+        }
+        expect(requestMeta.parsed.followUpContent?.agentInitiated).toBe(true);
+        expect(requestMeta.parsed.followUpContent?.workspaceTurnMetadata).toEqual(
+          workspaceTurn == null ? correlation : { type: "workspace-turn-task", ...workspaceTurn }
+        );
+      } finally {
+        await session.dispose();
+        await cleanup();
+      }
+    }
+  );
+});

@@ -14,6 +14,8 @@ import { createRuntime } from "./runtimeFactory";
  * Matches the subset of FrontendWorkspaceMetadata / WorkspaceMetadata used at call sites.
  */
 export interface WorkspaceMetadataForRuntime {
+  /** Workspace id; devcontainers need it for the scratch mount (CreateRuntimeOptions). */
+  id?: string;
   runtimeConfig: RuntimeConfig;
   projectPath: string;
   name: string;
@@ -157,5 +159,6 @@ export function createRuntimeForWorkspace(metadata: WorkspaceMetadataForRuntime)
     projectPath: metadata.projectPath,
     workspaceName: metadata.name,
     workspacePath: metadata.namedWorkspacePath,
+    workspaceId: metadata.id,
   });
 }

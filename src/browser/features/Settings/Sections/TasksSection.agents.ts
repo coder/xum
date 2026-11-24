@@ -29,6 +29,9 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
     description: "History compaction (internal)",
     uiSelectable: false,
     subagentRunnable: false,
+    aiDefaults: {
+      cacheTtl: "5m",
+    },
   },
   {
     id: "desktop",
@@ -56,7 +59,11 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
         "task",
         "task_await",
         "task_list",
-        "task_terminate",
+        "task_send_message",
+        "task_retitle",
+        "task_stop",
+        "task_remove",
+        "task_workspace_lifecycle",
         "task_apply_git_patch",
         "propose_plan",
         "ask_user_question",
@@ -73,6 +80,9 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
     uiSelectable: false,
     subagentRunnable: true,
     base: "exec",
+    aiDefaults: {
+      cacheTtl: "5m",
+    },
   },
   {
     id: "name_workspace",
@@ -96,6 +106,18 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
       require: ["memory"],
     },
   },
+  {
+    id: "status_page",
+    scope: "built-in",
+    name: "Status Page",
+    description:
+      "Keeps the Agent interface status page current from the main agent's updates (internal)",
+    uiSelectable: false,
+    subagentRunnable: false,
+    tools: {
+      add: ["edit_page", "write_page"],
+    },
+  },
 ];
 
 function compareAgentsByName(a: AgentDefinitionDescriptor, b: AgentDefinitionDescriptor): number {
@@ -107,10 +129,15 @@ function compareAgentsByName(a: AgentDefinitionDescriptor, b: AgentDefinitionDes
 // via knownAgentIds below.
 function shouldShowAgentInTasksSettings(
   agent: AgentDefinitionDescriptor,
-  params: { portableDesktopEnabled: boolean; memoryConsolidationEnabled: boolean }
+  params: {
+    portableDesktopEnabled: boolean;
+    memoryConsolidationEnabled: boolean;
+    statusPageAgentEnabled: boolean;
+  }
 ): boolean {
   if (agent.id === "desktop") return params.portableDesktopEnabled;
   if (agent.id === "dream") return params.memoryConsolidationEnabled;
+  if (agent.id === "status_page") return params.statusPageAgentEnabled;
   return true;
 }
 
@@ -120,6 +147,8 @@ export function deriveTasksSectionAgentGroups(params: {
   portableDesktopEnabled: boolean;
   /** True only when both Agent Memory and Memory Consolidation experiments are on (mirrors the runtime gate in memoryConsolidationService). */
   memoryConsolidationEnabled: boolean;
+  /** True only when Artifacts, Agent interface view and Status page agent are all on (the runtime gate in statusPageAgentService). */
+  statusPageAgentEnabled: boolean;
 }): {
   uiAgents: AgentDefinitionDescriptor[];
   subagents: AgentDefinitionDescriptor[];

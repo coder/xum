@@ -8,6 +8,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { renderLegendLabel } from "./chartLegend";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import type { SpendOverTimeItem } from "@/browser/hooks/useAnalytics";
 import {
@@ -18,6 +19,7 @@ import {
   formatBucketLabel,
   formatBucketTooltipLabel,
   formatUsd,
+  formatUsdAxisTick,
 } from "./analyticsUtils";
 
 interface SpendChartProps {
@@ -25,6 +27,7 @@ interface SpendChartProps {
   loading: boolean;
   error: string | null;
   granularity: "hour" | "day" | "week";
+  timeZoneMode: "local" | "utc";
 }
 
 interface SpendChartRow {
@@ -75,7 +78,8 @@ export function SpendChart(props: SpendChartProps) {
           ? "Model-attributed weekly spend."
           : props.granularity === "hour"
             ? "Model-attributed hourly spend."
-            : "Model-attributed daily spend."}
+            : "Model-attributed daily spend."}{" "}
+        ({props.timeZoneMode === "utc" ? "UTC" : "local time"})
       </p>
 
       {props.loading ? (
@@ -100,7 +104,7 @@ export function SpendChart(props: SpendChartProps) {
               />
               <YAxis
                 tick={CHART_AXIS_TICK}
-                tickFormatter={(value: number) => formatUsd(Number(value))}
+                tickFormatter={(value: number) => formatUsdAxisTick(Number(value))}
                 width={64}
                 stroke={CHART_AXIS_STROKE}
               />
@@ -112,7 +116,7 @@ export function SpendChart(props: SpendChartProps) {
                 cursor={{ fill: "var(--color-hover)" }}
                 contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
               />
-              <Legend wrapperStyle={{ fontSize: "11px" }} />
+              <Legend wrapperStyle={{ fontSize: "11px" }} formatter={renderLegendLabel} />
               {models.map((model, index) => (
                 <Bar
                   key={model}

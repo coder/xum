@@ -1,13 +1,25 @@
 import React from "react";
-import { TerminalView } from "@/browser/components/TerminalView/TerminalView";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { getTerminalSessionId } from "@/browser/types/rightSidebar";
+
+// Code-split (T3, #5971): ghostty-web inlines its WASM, so keep it off the first load.
+const TerminalView = React.lazy(() =>
+  import("@/browser/components/TerminalView/TerminalView").then((m) => ({
+    default: m.TerminalView,
+  }))
+);
 
 interface TerminalTabProps {
   workspaceId: string;
   /** The tab type (e.g., "terminal:ws-123-1704567890") */
   tabType: TabType;
   visible: boolean;
+  /** Display name for this tab (OSC title or "Terminal N" fallback), shown by the badge overlay. */
+  tabName: string;
+  /** 0-based position among the tabset's terminal tabs, for the badge's {index} token. */
+  tabIndex: number;
   /** Called when terminal title changes (from shell OSC sequences) */
   onTitleChange?: (title: string) => void;
   /** Whether to auto-focus the terminal when it becomes visible (e.g., when opened via keybind) */
@@ -28,6 +40,7 @@ interface TerminalTabProps {
 export const TerminalTab: React.FC<TerminalTabProps> = (props) => {
   // Extract session ID from tab type - must exist (sessions created before tab added)
   const sessionId = getTerminalSessionId(props.tabType);
+  const metadata = useWorkspaceMetadata().workspaceMetadata.get(props.workspaceId);
 
   if (!sessionId) {
     // This should never happen - RightSidebar creates session before adding tab
@@ -39,15 +52,21 @@ export const TerminalTab: React.FC<TerminalTabProps> = (props) => {
   }
 
   return (
-    <TerminalView
-      workspaceId={props.workspaceId}
-      sessionId={sessionId}
-      visible={props.visible}
-      setDocumentTitle={false}
-      onTitleChange={props.onTitleChange}
-      onAutoFocusConsumed={props.onAutoFocusConsumed}
-      autoFocus={props.autoFocus ?? false}
-      onExit={props.onExit}
-    />
+    <LazyFeature name="Terminal" fallback={<div className="h-full w-full" />}>
+      <TerminalView
+        workspaceId={props.workspaceId}
+        sessionId={sessionId}
+        visible={props.visible}
+        setDocumentTitle={false}
+        onTitleChange={props.onTitleChange}
+        onAutoFocusConsumed={props.onAutoFocusConsumed}
+        autoFocus={props.autoFocus ?? false}
+        onExit={props.onExit}
+        workspaceName={metadata?.name ?? ""}
+        projectName={metadata?.projectName ?? ""}
+        tabName={props.tabName}
+        tabIndex={props.tabIndex}
+      />
+    </LazyFeature>
   );
 };

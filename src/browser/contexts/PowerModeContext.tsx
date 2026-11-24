@@ -8,10 +8,13 @@ import React, {
   type ReactNode,
 } from "react";
 
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  getUserPreferences,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { POWER_MODE_ENABLED_KEY } from "@/common/constants/storage";
 import {
   PowerModeEngine,
   type PowerModeBurstKind,
@@ -261,9 +264,8 @@ function getCaretViewportPosition(
 }
 
 export function PowerModeProvider(props: { children: ReactNode }) {
-  const [enabled, setEnabled] = usePersistedState(POWER_MODE_ENABLED_KEY, false, {
-    listener: true,
-  });
+  const enabled =
+    useUserPreferences((preferences) => preferences.appearance?.powerModeEnabled) ?? false;
 
   const engineRef = useRef(new PowerModeEngine());
   const mirrorRef = useRef<MirrorState | null>(null);
@@ -275,14 +277,15 @@ export function PowerModeProvider(props: { children: ReactNode }) {
 
       e.preventDefault();
       stopKeyboardPropagation(e);
-      setEnabled((prev) => !prev);
+      const wasEnabled = getUserPreferences().appearance?.powerModeEnabled ?? false;
+      updateUserPreferences({ appearance: { powerModeEnabled: !wasEnabled } });
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [setEnabled]);
+  }, []);
 
   useEffect(() => {
     const engine = engineRef.current;

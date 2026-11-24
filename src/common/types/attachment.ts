@@ -65,12 +65,34 @@ export interface CompletedReportsIndexAttachment {
   reports: CompletedReportEntry[];
 }
 
+/**
+ * Compact list of file paths the agent already read in summarized epochs
+ * (RLM mode only). Paths only — contents can be re-read on demand — so the
+ * model knows what it has already seen without re-reading everything.
+ */
+export interface ReadFilesReferenceAttachment {
+  type: "read_files_reference";
+  paths: string[];
+}
+
+/**
+ * Published artifacts (Artifacts M4): handles only (path, title), so after compaction the model
+ * still knows which artifacts exist and can republish or reread them. Rows written before
+ * versions were removed carry `latestVersion` and `label` instead of `title`.
+ */
+export interface ArtifactsIndexAttachment {
+  type: "artifacts_index";
+  artifacts: Array<{ path: string; title?: string }>;
+}
+
 export type PostCompactionAttachment =
   | PlanFileReferenceAttachment
   | TodoListAttachment
   | LoadedSkillsSnapshotAttachment
   | EditedFilesReferenceAttachment
-  | CompletedReportsIndexAttachment;
+  | CompletedReportsIndexAttachment
+  | ReadFilesReferenceAttachment
+  | ArtifactsIndexAttachment;
 
 /**
  * Exclusion state for post-compaction context items.

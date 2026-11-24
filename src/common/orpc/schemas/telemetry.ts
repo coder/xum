@@ -39,14 +39,16 @@ const TelemetryCommandTypeSchema = z.enum([
   "compact",
   "new",
   "fork",
+  "side",
   "vim",
+  "fast",
+  "ultrafast",
   "model",
   "mode",
   "plan",
   "providers",
   "goal",
   "workflow",
-  "btw",
 ]);
 
 // Individual event payload schemas
@@ -224,7 +226,6 @@ const ErrorOccurredPropertiesSchema = z.object({
 
 const ExperimentOverriddenPropertiesSchema = z.object({
   experimentId: z.string(),
-  assignedVariant: z.union([z.string(), z.boolean(), z.null()]),
   userChoice: z.boolean(),
 });
 

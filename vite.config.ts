@@ -3,61 +3,38 @@ import react from "@vitejs/plugin-react";
 import topLevelAwait from "vite-plugin-top-level-await";
 import svgr from "vite-plugin-svgr";
 import tailwindcss from "@tailwindcss/vite";
+import type { IncomingMessage } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH } from "./src/node/orpc/wsPaths";
 import { novncCompatPlugin } from "./src/vite/novncCompatPlugin";
+import { streamdownShikiLangsPlugin } from "./src/vite/streamdownShikiLangsPlugin";
+import { streamdownRehypeKatexPlugin } from "./src/vite/streamdownRehypeKatexPlugin";
+import { isDevServerHostAllowed, resolveViteDevServerEnv } from "./src/vite/devServerEnv";
+// React Compiler automatically optimizes React components through memoization.
+import { reactCompilerConfig } from "./src/vite/reactCompilerConfig";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const disableMermaid = process.env.VITE_DISABLE_MERMAID === "1";
 
-// Vite server configuration (for dev-server remote access)
-const devServerHost = process.env.MUX_VITE_HOST ?? "127.0.0.1"; // Secure by default
-const devServerPort = Number(process.env.MUX_VITE_PORT ?? "5173");
+const {
+  host: devServerHost,
+  port: devServerPort,
+  allowedHosts: devServerAllowedHosts,
+  previewPort,
+  backendHost: backendProxyHost,
+  backendPort: backendProxyPort,
+  backendSocket,
+  enableTutorialsInSandbox,
+} = resolveViteDevServerEnv(process.env);
 
-const devServerAllowedHosts = (() => {
-  const raw = process.env.MUX_VITE_ALLOWED_HOSTS?.trim();
-  if (raw) {
-    if (raw === "true" || raw === "all") {
-      return true;
-    }
+// Vite answers a disallowed Host with 403 on HTTP and on its own HMR socket, but its proxy forwards
+// WebSocket upgrades without that check. /orpc/ws is the whole backend API, so apply the check here
+// (`false` makes Vite end the upgrade with 404).
+const rejectDisallowedHost = (req: IncomingMessage) =>
+  isDevServerHostAllowed(req.headers.host, devServerAllowedHosts) ? undefined : false;
 
-    const parsed = raw
-      .split(",")
-      .map((host) => host.trim())
-      .filter(Boolean);
-
-    return parsed.length ? parsed : ["localhost", "127.0.0.1"];
-  }
-
-  // Default to localhost-only. For remote access, set MUX_VITE_ALLOWED_HOSTS (or
-  // the Makefile's VITE_ALLOWED_HOSTS).
-  const defaults = ["localhost", "127.0.0.1"];
-
-  // If the dev server is bound to a specific host (not a wildcard), include it so
-  // access works without extra configuration.
-  if (
-    devServerHost !== "127.0.0.1" &&
-    devServerHost !== "localhost" &&
-    devServerHost !== "0.0.0.0" &&
-    devServerHost !== "::"
-  ) {
-    defaults.push(devServerHost);
-  }
-
-  return defaults;
-})();
-
-const previewPort = Number(process.env.MUX_VITE_PREVIEW_PORT ?? "4173");
-
-const enableTutorialsInSandboxDefine = (() => {
-  const raw = process.env.MUX_ENABLE_TUTORIALS_IN_SANDBOX;
-  if (raw == null) {
-    return "null";
-  }
-
-  return JSON.stringify(raw === "1");
-})();
+const enableTutorialsInSandboxDefine =
+  enableTutorialsInSandbox == null ? "null" : JSON.stringify(enableTutorialsInSandbox === "1");
 
 function formatHostForUrl(host: string): string {
   const trimmed = host.trim();
@@ -78,23 +55,20 @@ function formatHostForUrl(host: string): string {
 
 // In dev-server mode we run the backend on a separate local port, but we want the
 // browser UI to talk to it via same-origin paths (single public port).
-const backendProxyHost = process.env.MUX_BACKEND_HOST ?? "127.0.0.1";
-const backendProxyPort = Number(process.env.MUX_BACKEND_PORT ?? "3000");
-const backendProxyTarget = `http://${formatHostForUrl(backendProxyHost)}:${backendProxyPort}`;
+//
+// With a backend socket (`make dev-server` on Linux and macOS) the proxy never uses that port: it is
+// free for any local account to bind while the backend restarts, and the browser's reconnect URL
+// carries the token. The socket sits in a private folder, so only this user's backend can answer.
+// `host` and `port` are placeholders: Node connects to `socketPath` and ignores them.
+const backendProxyTarget =
+  backendSocket !== undefined
+    ? { socketPath: backendSocket, host: "localhost", port: 0 }
+    : `http://${formatHostForUrl(backendProxyHost)}:${backendProxyPort}`;
 
 const alias: Record<string, string> = {
   "@": path.resolve(__dirname, "./src"),
-};
-
-if (disableMermaid) {
-  alias["mermaid"] = path.resolve(__dirname, "./src/mocks/mermaidStub.ts");
-}
-
-// React Compiler configuration
-// Automatically optimizes React components through memoization
-// See: https://react.dev/learn/react-compiler
-const reactCompilerConfig = {
-  target: "18", // Target React 18 (requires react-compiler-runtime package)
+  // Node-only SDK; see the stub for why browser bundles never load it.
+  "@ai-sdk/google-vertex": path.resolve(__dirname, "./src/common/mocks/googleVertexStub.ts"),
 };
 
 // Babel plugins configuration (shared between dev and production)
@@ -110,6 +84,8 @@ const basePlugins = [
   }),
   tailwindcss(),
   novncCompatPlugin(),
+  streamdownShikiLangsPlugin(),
+  streamdownRehypeKatexPlugin(),
 ];
 
 export default defineConfig(({ mode }) => {
@@ -141,6 +117,7 @@ export default defineConfig(({ mode }) => {
         input: {
           main: path.resolve(__dirname, "index.html"),
           terminal: path.resolve(__dirname, "terminal.html"),
+          desktop: path.resolve(__dirname, "desktop.html"),
         },
         output: {
           format: "es",
@@ -167,10 +144,16 @@ export default defineConfig(({ mode }) => {
       plugins: () => [topLevelAwait()],
     },
     server: {
-      host: devServerHost, // Configurable via MUX_VITE_HOST (defaults to 127.0.0.1 for security)
+      host: devServerHost, // Configurable via XUM_VITE_HOST (loopback by default)
       port: devServerPort,
       strictPort: true,
       allowedHosts: devServerAllowedHosts,
+
+      // Vite serves any file under its root at /@fs/<path> to whoever reaches its port, and a
+      // custom XUM_ROOT can sit inside the checkout. The dev backend's token lives in server.lock, and in
+      // server.lock.<pid>.tmp while the server writes it.
+      // `deny` replaces Vite's defaults, so they are repeated first.
+      fs: { deny: [".env", ".env.*", "*.{crt,pem}", "**/.git/**", "**/server.lock*"] },
 
       proxy: {
         "/orpc": {
@@ -179,16 +162,19 @@ export default defineConfig(({ mode }) => {
           // the public dev-server origin (localhost:5173) instead of 127.0.0.1:3000.
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         [BROWSER_BRIDGE_WS_PATH]: {
           target: backendProxyTarget,
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         [DESKTOP_WS_PATH]: {
           target: backendProxyTarget,
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         "/api": {
           target: backendProxyTarget,
@@ -242,7 +228,9 @@ export default defineConfig(({ mode }) => {
       host: "127.0.0.1",
       port: previewPort,
       strictPort: true,
-      allowedHosts: ["localhost", "127.0.0.1"],
+      // Preview inherits server.proxy, whose ws entries check devServerAllowedHosts, so preview's
+      // own HTTP check must use the same list.
+      allowedHosts: devServerAllowedHosts,
     },
     optimizeDeps: {
       // noVNC ships Babel-style CJS plus top-level await in lib/, which breaks esbuild

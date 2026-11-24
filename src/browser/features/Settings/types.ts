@@ -1,8 +1,5 @@
-import type { ReactNode } from "react";
+import type { SettingsSectionMeta } from "./settingsRegistry";
 
-export interface SettingsSection {
-  id: string;
-  label: string;
-  icon: ReactNode;
+export interface SettingsSection extends SettingsSectionMeta {
   component: React.ComponentType;
 }

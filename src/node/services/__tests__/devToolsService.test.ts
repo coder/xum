@@ -4,7 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import type { DevToolsEvent, DevToolsRun, DevToolsStep } from "@/common/types/devtools";
 import { Config } from "@/node/config";
-import { DevToolsService } from "@/node/services/devToolsService";
+import { DevToolsService, MAX_RETAINED_RUNS_PER_WORKSPACE } from "@/node/services/devToolsService";
 
 function makeRun(id: string, startedAt = "2025-06-01T00:00:00Z"): DevToolsRun {
   return { id, workspaceId: "ws-1", startedAt };
@@ -31,15 +31,13 @@ function makeStep(overrides: Partial<DevToolsStep> & { id: string; runId: string
     responseHeaders: null,
     rawResponse: null,
     rawChunks: null,
+    inputTransformations: null,
     ...rest,
   };
 }
 
 function createTestConfig(opts: { sessionsDir: string; enabled?: boolean }): Config {
-  const config = new Config(opts.sessionsDir);
-  spyOn(config, "getSessionDir").mockImplementation((workspaceId: string) =>
-    path.join(opts.sessionsDir, workspaceId)
-  );
+  const config = new Config(path.dirname(opts.sessionsDir));
   spyOn(config, "getLlmDebugLogsEnabled").mockImplementation(() => opts.enabled ?? true);
   return config;
 }
@@ -218,6 +216,28 @@ describe("DevToolsService", () => {
 
       expect(run1?.toolPolicy).toEqual(policy);
       expect(run2?.toolPolicy).toBeUndefined();
+    });
+
+    it("applies a turn's metadata to its refusal-fallback run until the turn clears it", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const metadataId = "turn-stream-token";
+      service.setPendingRunMetadata("ws-1", metadataId, {
+        requestHistorySequence: 7,
+        contextEpoch: "row-1",
+      });
+      // The fallback model has its own middleware, so its run is a second createRun with the
+      // same request metadata ID header.
+      await service.createRun("ws-1", makeRun("primary", "2025-06-01T00:00:00Z"), metadataId);
+      await service.createRun("ws-1", makeRun("fallback", "2025-06-01T00:00:10Z"), metadataId);
+      // Turn end (stream-end / error / abort): AIService clears the pending entry.
+      service.clearPendingRunMetadata("ws-1", metadataId);
+      await service.createRun("ws-1", makeRun("later", "2025-06-01T00:01:00Z"), metadataId);
+
+      const runs = await service.getRuns("ws-1");
+      const byId = (id: string) => runs.find((run) => run.id === id);
+      expect(byId("primary")).toMatchObject({ requestHistorySequence: 7, contextEpoch: "row-1" });
+      expect(byId("fallback")).toMatchObject({ requestHistorySequence: 7, contextEpoch: "row-1" });
+      expect(byId("later")?.requestHistorySequence).toBeUndefined();
     });
 
     it("stores pending metadata per metadata id for overlapping requests", async () => {
@@ -400,13 +420,7 @@ describe("DevToolsService", () => {
 
       expect(await service.getRuns("ws-1")).toEqual([]);
       expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
-      // Only the generation marker remains on disk.
-      expect(
-        (await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8"))
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => (JSON.parse(line) as { type: string }).type)
-      ).toEqual(["log-meta"]);
+      expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
     });
 
     it("removeWorkspaceData deletes the log file and in-memory state", async () => {
@@ -511,7 +525,7 @@ describe("DevToolsService", () => {
 
       const service = new DevToolsService(config);
 
-      const originalReadFile = fs.readFile;
+      const originalOpen = fs.open;
       let logReadCount = 0;
       let releaseReadGate!: () => void;
       const readGate = new Promise<void>((resolve) => {
@@ -523,17 +537,17 @@ describe("DevToolsService", () => {
         firstReadStartedResolve = resolve;
       });
 
-      const mockedReadFile = (async (...args: Parameters<typeof fs.readFile>) => {
+      const mockedOpen = (async (...args: Parameters<typeof fs.open>) => {
         const [filePath] = args;
         if (filePath === logPath) {
           logReadCount += 1;
           firstReadStartedResolve();
           await readGate;
         }
-        return originalReadFile(...args);
-      }) as typeof fs.readFile;
+        return originalOpen(...args);
+      }) as typeof fs.open;
 
-      const readFileSpy = spyOn(fs, "readFile").mockImplementation(mockedReadFile);
+      const openSpy = spyOn(fs, "open").mockImplementation(mockedOpen);
 
       try {
         const firstCreateStep = service.createStep(
@@ -553,7 +567,7 @@ describe("DevToolsService", () => {
         releaseReadGate();
         await Promise.all([firstCreateStep, secondCreateStep]);
       } finally {
-        readFileSpy.mockRestore();
+        openSpy.mockRestore();
       }
 
       const runWithSteps = await service.getRunWithSteps("ws-1", "run-1");
@@ -579,6 +593,7 @@ describe("DevToolsService", () => {
       delete (legacyStep as Record<string, unknown>).rawChunks;
       delete (legacyStep as Record<string, unknown>).requestHeaders;
       delete (legacyStep as Record<string, unknown>).responseHeaders;
+      delete (legacyStep as Record<string, unknown>).inputTransformations;
       const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
 
       await fs.mkdir(path.dirname(logPath), { recursive: true });
@@ -595,6 +610,40 @@ describe("DevToolsService", () => {
       expect(runWithSteps?.steps[0]?.requestHeaders).toBeNull();
       expect(runWithSteps?.steps[0]?.responseHeaders).toBeNull();
       expect(runWithSteps?.steps[0]?.rawChunks).toBeNull();
+      expect(runWithSteps?.steps[0]?.inputTransformations).toBeNull();
+    });
+
+    it("drops malformed input transformation entries when replaying persisted steps", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const run = makeRun("run-1");
+      const step = {
+        ...makeStep({ id: "step-1", runId: "run-1" }),
+        inputTransformations: [
+          {
+            type: "thinking_dropped",
+            path: "messages.1.content.0",
+            reason: "prefix_binding_mismatch",
+          },
+          { type: "thinking_dropped" },
+          "junk",
+        ],
+      };
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(
+        logPath,
+        `${JSON.stringify({ type: "run", run })}\n${JSON.stringify({ type: "step", step })}\n`,
+        "utf-8"
+      );
+
+      const runWithSteps = await new DevToolsService(config).getRunWithSteps("ws-1", "run-1");
+      expect(runWithSteps?.steps[0]?.inputTransformations).toEqual([
+        {
+          type: "thinking_dropped",
+          path: "messages.1.content.0",
+          reason: "prefix_binding_mismatch",
+        },
+      ]);
     });
 
     it("skips corrupted lines while replaying persisted logs", async () => {
@@ -618,17 +667,931 @@ describe("DevToolsService", () => {
       expect(runWithSteps?.steps[0]?.error).toBe("boom");
     });
 
-    it("clear leaves nothing replayable in the persisted file", async () => {
+    it("retains only the newest runs when the log holds more than the bound", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const total = MAX_RETAINED_RUNS_PER_WORKSPACE + 20;
+
+      const lines: string[] = [];
+      for (let index = 1; index <= total; index += 1) {
+        const runId = `run-${index}`;
+        const startedAt = new Date(Date.UTC(2025, 0, 1, 0, 0, index)).toISOString();
+        lines.push(JSON.stringify({ type: "run", run: makeRun(runId, startedAt) }));
+        lines.push(
+          JSON.stringify({
+            type: "step",
+            step: makeStep({ id: `step-${index}`, runId, startedAt }),
+          })
+        );
+      }
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config);
+      const runs = await service.getRuns("ws-1");
+
+      expect(runs).toHaveLength(MAX_RETAINED_RUNS_PER_WORKSPACE);
+      expect(runs[0]?.id).toBe(`run-${total}`);
+      expect(runs.at(-1)?.id).toBe(`run-${total - MAX_RETAINED_RUNS_PER_WORKSPACE + 1}`);
+      expect(runs.every((run) => run.stepCount === 1)).toBe(true);
+      expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+    });
+
+    it("evicts the oldest run and its steps when createRun exceeds the bound", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+
+      await service.createRun("ws-1", makeRun("run-oldest", "2025-01-01T00:00:00.000Z"));
+      await service.createStep("ws-1", makeStep({ id: "step-oldest", runId: "run-oldest" }));
+      for (let index = 1; index <= MAX_RETAINED_RUNS_PER_WORKSPACE; index += 1) {
+        const startedAt = new Date(Date.UTC(2025, 0, 2, 0, 0, index)).toISOString();
+        await service.createRun("ws-1", makeRun(`run-${index}`, startedAt));
+      }
+
+      const runs = await service.getRuns("ws-1");
+      expect(runs).toHaveLength(MAX_RETAINED_RUNS_PER_WORKSPACE);
+      expect(runs.some((run) => run.id === "run-oldest")).toBe(false);
+      expect(await service.getRunWithSteps("ws-1", "run-oldest")).toBeNull();
+
+      // Eviction is memory-only; the on-disk log keeps the full history.
+      const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+      expect(logContents).toContain("step-oldest");
+    });
+
+    describe("byte budget", () => {
+      const BUDGET_BYTES = 100_000;
+      const rawChunksOf = (bytes: number): unknown[] => [{ data: "x".repeat(bytes) }];
+      const bigStep = (index: number, bytes: number) =>
+        makeStep({ id: `step-${index}`, runId: `run-${index}`, rawChunks: rawChunksOf(bytes) });
+      const runAt = (index: number) =>
+        makeRun(`run-${index}`, new Date(Date.UTC(2025, 0, 1, 0, 0, index)).toISOString());
+      const runIds = async (service: DevToolsService) =>
+        (await service.getRuns("ws-1")).map((run) => run.id).sort();
+
+      it("evicts the oldest runs and their steps once retained bytes exceed the budget", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+
+        for (let index = 1; index <= 3; index += 1) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 40_000));
+        }
+        expect(await runIds(service)).toEqual(["run-2", "run-3"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+
+        // A single run larger than the whole budget still survives as the newest.
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-4"]);
+        expect((await service.getRunWithSteps("ws-1", "run-4"))?.steps.map((s) => s.id)).toEqual([
+          "step-4",
+        ]);
+
+        // Eviction is memory-only; the on-disk log keeps every entry.
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        for (let index = 1; index <= 4; index += 1) {
+          expect(logContents).toContain(`"run-${index}"`);
+          expect(logContents).toContain(`"step-${index}"`);
+        }
+      });
+
+      it("updateStep replaces the step's accounted size instead of adding to it", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", makeStep({ id: "step-2", runId: "run-2" }));
+
+        // Re-sending the same 60 KB payload must not count it twice (120 KB > budget).
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(60_000) });
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(60_000) });
+        expect(await runIds(service)).toEqual(["run-1", "run-2"]);
+
+        // Growing the same step past the budget evicts the older run, not the updated one.
+        await service.updateStep("ws-1", "step-2", { rawChunks: rawChunksOf(BUDGET_BYTES) });
+        expect(await runIds(service)).toEqual(["run-2"]);
+        const detail = await service.getRunWithSteps("ws-1", "run-2");
+        expect(detail?.steps[0]?.rawChunks).toEqual(rawChunksOf(BUDGET_BYTES));
+      });
+
+      it("still persists a run's queued entries when it is evicted before its append runs", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        // Hold the per-workspace write queue on its first disk append so run-1 is
+        // still pending when run-2's oversized step evicts it from memory.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const pendingWrites = [
+            service.createRun("ws-1", runAt(1)),
+            service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" })),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"run-1"');
+        expect(logContents).toContain('"step-1"');
+        expect(logContents).toContain('"run-2"');
+        expect(logContents).toContain('"step-2"');
+      });
+
+      it("evicts newer runs when the oldest in-flight run grows past the budget", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+        );
+        for (const index of [2, 3]) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 10_000));
+        }
+        expect(await runIds(service)).toEqual(["run-1", "run-2", "run-3"]);
+
+        // The oldest run is the one being written, so it is protected; the
+        // newer runs behind it must be evicted instead of nothing at all.
+        await service.updateStep("ws-1", "step-1", { rawChunks: rawChunksOf(BUDGET_BYTES + 1) });
+        expect(await runIds(service)).toEqual(["run-1"]);
+
+        // Accounting check: shrink run-1 again, then add a run that fits only if
+        // run-2/run-3 bytes were released (their ~20 KB would push this over).
+        await service.updateStep("ws-1", "step-1", { rawChunks: rawChunksOf(1_000) });
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, 85_000));
+        expect(await runIds(service)).toEqual(["run-1", "run-4"]);
+      });
+
+      it("emits runs-evicted with the dropped run ids so live subscribers release them", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const evictedBatches: string[][] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          if (event.type === "runs-evicted") {
+            evictedBatches.push(event.runIds);
+          }
+        });
+
+        for (const index of [1, 2]) {
+          await service.createRun("ws-1", runAt(index));
+          await service.createStep("ws-1", bigStep(index, 10_000));
+        }
+        expect(evictedBatches).toEqual([]);
+
+        // One oversized step pushes both older runs out in a single eviction pass.
+        await service.createRun("ws-1", runAt(3));
+        await service.createStep("ws-1", bigStep(3, BUDGET_BYTES + 1));
+        expect(evictedBatches).toEqual([["run-1", "run-2"]]);
+        expect(await runIds(service)).toEqual(["run-3"]);
+      });
+
+      it("never retains a self-healed step under a run evicted while its appends were queued", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", bigStep(1, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-1"]);
+
+        // Hold the write queue so the unknown run's self-heal is still pending
+        // while run-2's oversized step evicts the healed run.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        const lateStep = makeStep({
+          id: "step-unknown-late",
+          runId: "run-unknown",
+          rawChunks: rawChunksOf(30_000),
+        });
+        try {
+          const pendingWrites = [
+            service.createStep("ws-1", lateStep),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-unknown")).toBeNull();
+
+        // Every step-created is preceded by run-created for its run, and no step
+        // is announced for a run that is gone.
+        const announcedRuns = new Set<string>();
+        for (const event of events) {
+          if (event.type === "run-created") {
+            announcedRuns.add(event.run.id);
+          } else if (event.type === "step-created") {
+            expect(announcedRuns.has(event.step.runId)).toBe(true);
+          }
+        }
+        expect(
+          events.some((event) => event.type === "step-created" && event.step.id === lateStep.id)
+        ).toBe(false);
+
+        // Disk is authoritative: the healed run line and the late step line both landed.
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain(`"${lateStep.id}"`);
+
+        // Accounting: a leaked 30 KB orphan would push run-3 + run-4 (75 KB) over the
+        // 100 KB budget and evict run-3; without the leak both fit.
+        await service.createRun("ws-1", runAt(3));
+        await service.createStep("ws-1", bigStep(3, 30_000));
+        await service.createRun("ws-1", runAt(4));
+        await service.createStep("ws-1", bigStep(4, 45_000));
+        expect(await runIds(service)).toEqual(["run-3", "run-4"]);
+      });
+
+      it("does not emit step-updated for a step whose run was evicted while its append was queued", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+
+        // Hold the queue on step-1's update so run-2's oversized step evicts run-1
+        // before that update's append settles.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementationOnce(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const pendingWrites = [
+            service.updateStep("ws-1", "step-1", { durationMs: 77 }),
+            service.createRun("ws-1", runAt(2)),
+            service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1)),
+          ];
+          expect(await runIds(service)).toEqual(["run-2"]);
+          releaseQueue();
+          await Promise.all(pendingWrites);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        const evictedAt = events.findIndex(
+          (event) => event.type === "runs-evicted" && event.runIds.includes("run-1")
+        );
+        expect(evictedAt).toBeGreaterThan(-1);
+        const afterEviction = events.slice(evictedAt + 1);
+        expect(
+          afterEviction.some(
+            (event) =>
+              (event.type === "step-updated" || event.type === "step-created") &&
+              event.step.runId === "run-1"
+          )
+        ).toBe(false);
+        expect(
+          afterEviction.some((event) => event.type === "run-updated" && event.run.id === "run-1")
+        ).toBe(false);
+        // The update itself still reached disk (eviction is memory-only).
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"durationMs":77');
+      });
+
+      it("publishes nothing for a self-healed run when its step line fails to persist", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        await service.createRun("ws-1", runAt(1));
+
+        const originalAppendFile = fs.appendFile;
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+          if ((args[1] as string).includes('"type":"step"')) {
+            throw new Error("ENOSPC: no space left on device");
+          }
+          return originalAppendFile(...args);
+        });
+        let failure: unknown;
+        try {
+          // run-healed is not in memory, so createStep self-heals it first.
+          await service
+            .createStep("ws-1", makeStep({ id: "step-healed", runId: "run-healed" }))
+            .catch((error: unknown) => {
+              failure = error;
+            });
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain("ENOSPC");
+
+        expect(
+          events.some((event) => event.type === "run-created" && event.run.id === "run-healed")
+        ).toBe(false);
+        expect(events.some((event) => event.type === "step-created")).toBe(false);
+        // The unpersisted healed run and its step are rolled back, not left as ghosts.
+        expect(await runIds(service)).toEqual(["run-1"]);
+        expect(await service.getRunWithSteps("ws-1", "run-healed")).toBeNull();
+      });
+
+      describe("rollback when the append fails", () => {
+        const entryBytes = (entry: unknown) => JSON.stringify(entry).length;
+        const rejectAppendsContaining = (needle: string) => {
+          const originalAppendFile = fs.appendFile;
+          return spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+            if ((args[1] as string).includes(needle)) {
+              throw new Error("ENOSPC: no space left on device");
+            }
+            return originalAppendFile(...args);
+          });
+        };
+        const expectRejects = async (promise: Promise<void>) => {
+          let failure: unknown;
+          await promise.catch((error: unknown) => {
+            failure = error;
+          });
+          expect((failure as Error | undefined)?.message).toContain("ENOSPC");
+        };
+
+        it("createRun leaves memory and accounting untouched when its run line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          const step1 = bigStep(1, 40_000);
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", step1);
+
+          const spy = rejectAppendsContaining('"run-2"');
+          try {
+            await expectRejects(service.createRun("ws-1", runAt(2)));
+          } finally {
+            spy.mockRestore();
+          }
+          expect(await runIds(service)).toEqual(["run-1"]);
+
+          // Size run-3's step so everything fits the budget only if run-2's line
+          // was un-accounted: leaking it would evict run-1.
+          const retained =
+            entryBytes({ type: "run", run: runAt(1) }) +
+            entryBytes({ type: "step", step: step1 }) +
+            entryBytes({ type: "run", run: runAt(3) });
+          const leaked = entryBytes({ type: "run", run: runAt(2) });
+          const payload =
+            BUDGET_BYTES - retained - entryBytes({ type: "step", step: bigStep(3, 0) });
+          const step3 = bigStep(3, payload - Math.ceil(leaked / 2));
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", step3);
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
+
+        it("createStep leaves memory and accounting untouched when its step line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
+
+          const spy = rejectAppendsContaining('"step-1b"');
+          try {
+            await expectRejects(
+              service.createStep(
+                "ws-1",
+                makeStep({ id: "step-1b", runId: "run-1", rawChunks: rawChunksOf(50_000) })
+              )
+            );
+          } finally {
+            spy.mockRestore();
+          }
+          const detail = await service.getRunWithSteps("ws-1", "run-1");
+          expect(detail?.steps.map((step) => step.id)).toEqual(["step-1"]);
+          expect((await service.getRuns("ws-1"))[0]?.stepCount).toBe(1);
+
+          // A leaked 50 KB step would push run-1 + run-3 (55 KB) over budget.
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", bigStep(3, 55_000));
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
+
+        it("updateStep restores the previous step when its update line is not persisted", async () => {
+          const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          const original = makeStep({ id: "step-1", runId: "run-1", durationMs: null });
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep("ws-1", original);
+
+          const spy = rejectAppendsContaining('"type":"step-update"');
+          try {
+            await expectRejects(
+              service.updateStep("ws-1", "step-1", {
+                durationMs: 99,
+                rawChunks: rawChunksOf(50_000),
+              })
+            );
+          } finally {
+            spy.mockRestore();
+          }
+          expect((await service.getRunWithSteps("ws-1", "run-1"))?.steps[0]).toEqual(original);
+
+          await service.createRun("ws-1", runAt(3));
+          await service.createStep("ws-1", bigStep(3, 55_000));
+          expect(await runIds(service)).toEqual(["run-1", "run-3"]);
+        });
+      });
+
+      it("tracks only in-flight steps of an evicted run for late updates", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-done", runId: "run-1", stepNumber: 1, durationMs: 10 })
+        );
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-open", runId: "run-1", stepNumber: 2, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+        const lineCountBefore = (await fs.readFile(logPath, "utf-8")).split("\n").length;
+
+        // A finalized step can never be updated again, so it is not tracked.
+        await service.updateStep("ws-1", "step-done", { durationMs: 11 });
+        expect((await fs.readFile(logPath, "utf-8")).split("\n")).toHaveLength(lineCountBefore);
+
+        // The in-flight step's completing update lands...
+        await service.updateStep("ws-1", "step-open", { durationMs: 20 });
+        const afterCompletion = await fs.readFile(logPath, "utf-8");
+        expect(afterCompletion.split("\n")).toHaveLength(lineCountBefore + 1);
+        expect(afterCompletion).toContain('"stepId":"step-open","update":{"durationMs":20}');
+
+        // ...and releases the id: a second late update is skipped.
+        await service.updateStep("ws-1", "step-open", { durationMs: 21 });
+        expect((await fs.readFile(logPath, "utf-8")).split("\n")).toHaveLength(lineCountBefore + 1);
+      });
+
+      it("logs a late step of an evicted run to disk only, without resurrecting the run", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        const events: DevToolsEvent[] = [];
+        service.on("update:ws-1", (event: DevToolsEvent) => {
+          events.push(event);
+        });
+        const runA: DevToolsRun = {
+          ...runAt(1),
+          toolPolicy: [{ regex_match: "bash", action: "disable" }],
+          requestHistorySequence: 42,
+        };
+        await service.createRun("ws-1", runA);
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a1", runId: "run-1", stepNumber: 1, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+        const eventCountAfterEviction = events.length;
+
+        // run-1 is still streaming and logs another step after its eviction.
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a2", runId: "run-1", stepNumber: 2, durationMs: null })
+        );
+        await service.updateStep("ws-1", "step-a2", { durationMs: 20 });
+        await service.updateStep("ws-1", "step-a1", { durationMs: 10 });
+
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+        expect(events.slice(eventCountAfterEviction)).toEqual([]);
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        expect(logContents).toContain('"id":"step-a2"');
+        expect(logContents).toContain('"stepId":"step-a2","update":{"durationMs":20}');
+        expect(logContents).toContain('"stepId":"step-a1","update":{"durationMs":10}');
+        // No healed stand-in header was written for run-1.
+        expect(logContents.match(/"type":"run","run":\{"id":"run-1"/g)).toHaveLength(1);
+
+        // Restart with the default budget: the run comes back under its original
+        // header with both steps and their updates, in order.
+        const restarted = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+        const detail = await restarted.getRunWithSteps("ws-1", "run-1");
+        expect(detail?.run).toMatchObject(runA);
+        expect(detail?.steps.map((step) => [step.id, step.durationMs])).toEqual([
+          ["step-a1", 10],
+          ["step-a2", 20],
+        ]);
+        expect((await restarted.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
+      });
+
+      it("does not remember an evicted run's late step when clear() runs during its append", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-a1", runId: "run-1", stepNumber: 1, durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        // Hold the disk-only append of run-1's late step and clear() meanwhile.
+        const originalAppendFile = fs.appendFile;
+        let releaseQueue: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          releaseQueue = resolve;
+        });
+        const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+          await gate;
+          return originalAppendFile(...args);
+        });
+        try {
+          const lateStep = service.createStep(
+            "ws-1",
+            makeStep({ id: "step-a2", runId: "run-1", stepNumber: 2, durationMs: null })
+          );
+          // getRuns resolves once createStep has taken the disk-only branch and
+          // is parked on its queued append.
+          expect(await runIds(service)).toEqual(["run-2"]);
+          const cleared = service.clear("ws-1");
+          releaseQueue();
+          await Promise.all([lateStep, cleared]);
+          const appendsBeforeFinalize = appendFileSpy.mock.calls.length;
+
+          // The request finalizes after the user cleared the log.
+          await service.updateStep("ws-1", "step-a2", {
+            durationMs: 5,
+            rawChunks: rawChunksOf(10_000),
+          });
+          expect(appendFileSpy.mock.calls.length).toBe(appendsBeforeFinalize);
+        } finally {
+          appendFileSpy.mockRestore();
+        }
+
+        expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+        expect(await service.getRuns("ws-1")).toEqual([]);
+      });
+
+      it("persists updateStep to disk for a step whose run was evicted while in flight", async () => {
+        const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+          maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+        });
+        await service.createRun("ws-1", runAt(1));
+        await service.createStep(
+          "ws-1",
+          makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+        );
+        await service.createRun("ws-1", runAt(2));
+        await service.createStep("ws-1", bigStep(2, BUDGET_BYTES + 1));
+        expect(await runIds(service)).toEqual(["run-2"]);
+
+        const update: Partial<DevToolsStep> = {
+          durationMs: 1234,
+          output: { finishReason: "stop" },
+        };
+        await service.updateStep("ws-1", "step-1", update);
+
+        // Still evicted: the update must not resurrect the step in memory.
+        expect(await runIds(service)).toEqual(["run-2"]);
+        expect(await service.getRunWithSteps("ws-1", "run-1")).toBeNull();
+
+        const logContents = await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8");
+        const stepUpdates = logContents
+          .split("\n")
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line) as { type: string; stepId?: string; update?: unknown })
+          .filter((entry) => entry.type === "step-update");
+        expect(stepUpdates).toEqual([{ type: "step-update", stepId: "step-1", update }]);
+      });
+
+      it("retains only the newest runs that fit the budget when replaying a log", async () => {
+        const config = createTestConfig({ sessionsDir, enabled: true });
+        const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+        const lines: string[] = [];
+        for (let index = 1; index <= 5; index += 1) {
+          lines.push(JSON.stringify({ type: "run", run: runAt(index) }));
+          lines.push(JSON.stringify({ type: "step", step: bigStep(index, 40_000) }));
+        }
+        // An in-flight step finalized after its run was evicted: the update is
+        // persisted for a step the replay no longer retains and must be ignored.
+        lines.push(
+          JSON.stringify({ type: "step-update", stepId: "step-1", update: { durationMs: 5 } })
+        );
+        await fs.mkdir(path.dirname(logPath), { recursive: true });
+        await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+        const service = new DevToolsService(config, { maxRetainedBytesPerWorkspace: BUDGET_BYTES });
+        expect(await runIds(service)).toEqual(["run-4", "run-5"]);
+        expect((await service.getRunWithSteps("ws-1", "run-5"))?.steps.map((s) => s.id)).toEqual([
+          "step-5",
+        ]);
+        expect(await service.getRunWithSteps("ws-1", "run-3")).toBeNull();
+      });
+    });
+
+    it("applies a large final step-update on load so stale finalization leaves a completed step alone", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
+        JSON.stringify({
+          type: "step",
+          step: makeStep({ id: "step-1", runId: "run-1", durationMs: null }),
+        }),
+        JSON.stringify({
+          type: "step-update",
+          stepId: "step-1",
+          update: {
+            durationMs: 4321,
+            output: { finishReason: "stop" },
+            rawChunks: [{ data: "x".repeat(200_000) }],
+          },
+        }),
+      ];
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config);
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.durationMs).toBe(4321);
+      expect(detail?.steps[0]?.output).toEqual({ finishReason: "stop" });
+      expect((await service.getRuns("ws-1"))[0]?.isInProgress).toBe(false);
+
+      // The step completed on disk, so nothing is stale: no extra line is appended.
+      const contents = await fs.readFile(logPath, "utf-8");
+      expect(contents).not.toContain("Interrupted (stale)");
+      expect(contents.split("\n").filter((line) => line.trim().length > 0)).toHaveLength(
+        lines.length
+      );
+    });
+
+    it("keeps a single run whose many small lines exceed the budget, with every step applied", async () => {
+      const BUDGET_BYTES = 20_000;
+      const STEP_COUNT = 40;
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [JSON.stringify({ type: "run", run: makeRun("run-1") })];
+      for (let index = 1; index <= STEP_COUNT; index += 1) {
+        lines.push(
+          JSON.stringify({
+            type: "step",
+            step: makeStep({
+              id: `step-${index}`,
+              runId: "run-1",
+              stepNumber: index,
+              durationMs: null,
+              rawChunks: [{ data: "x".repeat(2_000) }],
+            }),
+          })
+        );
+        lines.push(
+          JSON.stringify({
+            type: "step-update",
+            stepId: `step-${index}`,
+            update: { durationMs: index },
+          })
+        );
+      }
+      expect(lines.join("\n").length).toBeGreaterThan(BUDGET_BYTES * 3);
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config, { maxRetainedBytesPerWorkspace: BUDGET_BYTES });
+      const runs = await service.getRuns("ws-1");
+      expect(runs.map((run) => run.id)).toEqual(["run-1"]);
+      expect(runs[0]?.stepCount).toBe(STEP_COUNT);
+
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps.map((step) => step.durationMs)).toEqual(
+        Array.from({ length: STEP_COUNT }, (_, index) => index + 1)
+      );
+    });
+
+    it("parses a line that spans several read chunks", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      // LOAD_CHUNK_BYTES is 1 MiB; a 2.5 MB payload forces the line across three reads.
+      const payload = "y".repeat(2_500_000);
+      const lines = [
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
+        JSON.stringify({
+          type: "step",
+          step: makeStep({ id: "step-1", runId: "run-1", rawChunks: [{ data: payload }] }),
+        }),
+        JSON.stringify({ type: "run", run: makeRun("run-2", "2025-06-02T00:00:00Z") }),
+      ];
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+      const service = new DevToolsService(config);
+      expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
+      const detail = await service.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.rawChunks).toEqual([{ data: payload }]);
+    });
+
+    it("skips stale finalization when replay fails before EOF so a completed step is not marked interrupted", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      const lines = [
+        JSON.stringify({ type: "run", run: makeRun("run-1") }),
+        JSON.stringify({
+          type: "step",
+          step: makeStep({ id: "step-1", runId: "run-1", durationMs: null }),
+        }),
+        JSON.stringify({ type: "step-update", stepId: "step-1", update: { durationMs: 4321 } }),
+      ];
+      const contents = `${lines.join("\n")}\n`;
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(logPath, contents, "utf-8");
+
+      // The first read delivers only the run and step lines; the next read fails,
+      // so replay stops before the step's completion update.
+      const cutBytes = Buffer.byteLength(`${lines[0]}\n${lines[1]}\n`, "utf-8");
+      const originalOpen = fs.open;
+      const openSpy = spyOn(fs, "open").mockImplementation((async (
+        ...args: Parameters<typeof fs.open>
+      ) => {
+        const handle = await originalOpen(...args);
+        if (args[0] !== logPath) {
+          return handle;
+        }
+        const realRead = handle.read.bind(handle);
+        let reads = 0;
+        handle.read = ((buffer: Buffer, offset: number, length: number, position: number) => {
+          reads += 1;
+          if (reads > 1) {
+            throw new Error("simulated read failure");
+          }
+          return realRead(buffer, offset, Math.min(length, cutBytes), position);
+        }) as typeof handle.read;
+        return handle;
+      }) as typeof fs.open);
+
+      try {
+        const service = new DevToolsService(config);
+        // Partial state is kept so the workspace stays usable...
+        expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-1"]);
+        expect((await service.getRunWithSteps("ws-1", "run-1"))?.steps[0]?.durationMs).toBeNull();
+        // ...but nothing is written over a step that may have completed on disk.
+        const afterPartialLoad = await fs.readFile(logPath, "utf-8");
+        expect(afterPartialLoad).toBe(contents);
+        expect(afterPartialLoad).not.toContain("Interrupted (stale)");
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      // A healthy restart sees the original completion, not a fabricated interruption.
+      const healthyService = new DevToolsService(config);
+      const detail = await healthyService.getRunWithSteps("ws-1", "run-1");
+      expect(detail?.steps[0]?.durationMs).toBe(4321);
+      expect(detail?.steps[0]?.error).toBeNull();
+    });
+
+    it("marks a workspace loaded after a failed load so createRun does not re-read the file", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(
+        logPath,
+        `${JSON.stringify({ type: "run", run: makeRun("run-persisted") })}\n`,
+        "utf-8"
+      );
+
+      const originalOpen = fs.open;
+      let logOpenCount = 0;
+      const openSpy = spyOn(fs, "open").mockImplementation((async (
+        ...args: Parameters<typeof fs.open>
+      ) => {
+        if (args[0] === logPath) {
+          logOpenCount += 1;
+          throw new RangeError("Invalid string length");
+        }
+        return originalOpen(...args);
+      }) as typeof fs.open);
+
+      try {
+        const service = new DevToolsService(config);
+        await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:01Z"));
+        await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:00:02Z"));
+
+        expect(logOpenCount).toBe(1);
+        expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-2", "run-1"]);
+        expect(logOpenCount).toBe(1);
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      // Appends kept working despite the failed load.
+      const logContents = await fs.readFile(logPath, "utf-8");
+      expect(logContents).toContain("run-persisted");
+      expect(logContents).toContain('"run-1"');
+      expect(logContents).toContain('"run-2"');
+    });
+
+    it("clear truncates persisted file", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       await service.createRun("ws-1", makeRun("run-1"));
       await service.clear("ws-1");
 
-      expect(
-        (await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8"))
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => (JSON.parse(line) as { type: string }).type)
-      ).toEqual(["log-meta"]);
+      expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+    });
+
+    it("does not append an update for a step that was cleared", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      await service.createRun("ws-1", makeRun("run-1"));
+      await service.createStep(
+        "ws-1",
+        makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+      );
+      await service.clear("ws-1");
+
+      // The request finalizes after the user cleared the log.
+      await service.updateStep("ws-1", "step-1", {
+        durationMs: 5,
+        rawChunks: [{ data: "x".repeat(10_000) }],
+      });
+
+      expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
+      expect(await service.getRuns("ws-1")).toEqual([]);
+    });
+
+    it("skips appends that were queued before clear()", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      // Hold the write queue on run-0's append so run-1's append is still
+      // queued (not executed) when clear() runs.
+      const originalAppendFile = fs.appendFile;
+      let releaseQueue: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+        await gate;
+        return originalAppendFile(...args);
+      });
+      let appendedJson: string[] = [];
+      try {
+        const run0 = service.createRun("ws-1", makeRun("run-0"));
+        const run1 = service.createRun("ws-1", makeRun("run-1"));
+        // getRuns resolves after both runs are in memory and their appends are queued.
+        expect((await service.getRuns("ws-1")).map((run) => run.id).sort()).toEqual([
+          "run-0",
+          "run-1",
+        ]);
+        const cleared = service.clear("ws-1");
+
+        releaseQueue();
+        await Promise.all([run0, run1, cleared]);
+        appendedJson = appendFileSpy.mock.calls.map((call) => call[1] as string);
+      } finally {
+        appendFileSpy.mockRestore();
+      }
+
+      // run-0's append was already executing; run-1's was still queued and must be dropped.
+      expect(appendedJson.some((json) => json.includes('"run-0"'))).toBe(true);
+      expect(appendedJson.some((json) => json.includes('"run-1"'))).toBe(false);
+      expect(await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8")).toBe("");
     });
   });
 
@@ -688,1274 +1651,6 @@ describe("DevToolsService", () => {
       }
 
       expect(events[5]).toEqual({ type: "cleared" });
-    });
-  });
-
-  describe("log rotation", () => {
-    function getRotatedLogPath(dir: string, workspaceId: string): string {
-      return `${getDevtoolsLogPath(dir, workspaceId)}.1`;
-    }
-
-    /** Makes the service's next live-marker write reject (simulated ENOSPC). */
-    function installMarkerWriteFailure(service: DevToolsService): { failNext: () => void } {
-      interface MarkerAccess {
-        writeLiveMarker(filePath: string, generation: number): Promise<void>;
-      }
-      const priv = service as unknown as MarkerAccess;
-      const originalWriteLiveMarker = priv.writeLiveMarker.bind(service);
-      let failNextMarkerWrite = false;
-      priv.writeLiveMarker = (filePath: string, generation: number) => {
-        if (failNextMarkerWrite) {
-          failNextMarkerWrite = false;
-          return Promise.reject(new Error("ENOSPC: simulated marker write failure"));
-        }
-        return originalWriteLiveMarker(filePath, generation);
-      };
-      return {
-        failNext: () => {
-          failNextMarkerWrite = true;
-        },
-      };
-    }
-
-    it("rotates the log exactly once when the cap is crossed and preserves line integrity", async () => {
-      const config = createTestConfig({ sessionsDir });
-      // Cap sized so run + step-1 crosses it but log-meta + step-2 does not.
-      const service = new DevToolsService(config, 400);
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-
-      await service.createRun("ws-1", makeRun("run-1"));
-      expect(await pathExists(rotatedPath)).toBe(false);
-
-      await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
-      expect(await pathExists(rotatedPath)).toBe(true);
-      // The live file is rewritten (not removed) so its generation marker
-      // pairs it with the snapshot.
-      const retiredLines = (await fs.readFile(logPath, "utf-8")).split("\n").filter(Boolean);
-      expect(retiredLines.map((line) => (JSON.parse(line) as { type: string }).type)).toEqual([
-        "log-meta",
-      ]);
-
-      const rotatedLines = (await fs.readFile(rotatedPath, "utf-8")).split("\n").filter(Boolean);
-      expect(rotatedLines.map((line) => (JSON.parse(line) as { type: string }).type)).toEqual([
-        "snapshot-meta",
-        "run",
-        "step",
-      ]);
-
-      await service.createStep("ws-1", makeStep({ id: "step-2", runId: "run-1" }));
-      const liveLines = (await fs.readFile(logPath, "utf-8")).split("\n").filter(Boolean);
-      expect(liveLines).toHaveLength(2);
-      expect((JSON.parse(liveLines[1]) as { step: { id: string } }).step.id).toBe("step-2");
-      expect((await fs.readFile(rotatedPath, "utf-8")).split("\n").filter(Boolean)).toEqual(
-        rotatedLines
-      );
-    });
-
-    it("replays the rotated file on load so history survives a restart", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 350);
-
-      await service.createRun("ws-1", makeRun("run-1"));
-      // Crossing the cap moves run-1 and step-1 into the rotated file; the
-      // step-update for step-1 lands in the fresh live file.
-      await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
-      await service.updateStep("ws-1", "step-1", { durationMs: 1234 });
-
-      // A fresh instance simulates an app restart after rotation.
-      const reloaded = new DevToolsService(config, 350);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-1"]);
-      const runWithSteps = await reloaded.getRunWithSteps("ws-1", "run-1");
-      expect(runWithSteps?.steps.map((step) => step.id)).toEqual(["step-1"]);
-      // The live-file step-update found its rotated base record.
-      expect(runWithSteps?.steps[0]?.durationMs).toBe(1234);
-    });
-
-    it("keeps history replayable across repeated rotations", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 350);
-
-      await service.createRun("ws-1", makeRun("run-1"));
-      // First rotation: run-1 and step-1 move into the rotated snapshot.
-      await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
-      // This update alone crosses the cap, forcing a second rotation while
-      // the live file holds only a step-update without its base records.
-      await service.updateStep("ws-1", "step-1", {
-        rawResponse: "x".repeat(400),
-        durationMs: 77,
-      });
-
-      const reloaded = new DevToolsService(config, 350);
-      const runWithSteps = await reloaded.getRunWithSteps("ws-1", "run-1");
-      expect(runWithSteps?.steps.map((step) => step.id)).toEqual(["step-1"]);
-      expect(runWithSteps?.steps[0]?.durationMs).toBe(77);
-      expect(runWithSteps?.steps[0]?.rawResponse).toBe("x".repeat(400));
-    });
-
-    it("retains only the newest runs that fit the cap when compacting", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 700);
-
-      await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:00Z"));
-      await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
-      await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:01:00Z"));
-      // Crossing the cap rotates; run-1 + step-1 + run-2 exceed 700 bytes, so
-      // only the newest run survives in the snapshot.
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-2", runId: "run-2", rawResponse: "y".repeat(400) })
-      );
-
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-2"]);
-    });
-
-    it("keeps an older zero-step run when rotation happens before its first step", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 700);
-
-      // run-pending has no steps yet when the cap is crossed (its caller may
-      // still be awaiting createRun, with steps in flight).
-      await service.createRun("ws-1", makeRun("run-pending", "2025-06-01T00:00:00Z"));
-      await service.createRun("ws-1", makeRun("run-new", "2025-06-01T00:01:00Z"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-new", runId: "run-new", rawResponse: "y".repeat(400) })
-      );
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-new", "run-pending"]);
-      // The retained record is the original, not a createStep self-heal stub.
-      expect(runs.find((run) => run.id === "run-pending")?.startedAt).toBe("2025-06-01T00:00:00Z");
-    });
-
-    it("keeps an older still-active run replayable when newer runs fill the cap", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 700);
-
-      await service.createRun("ws-1", makeRun("run-old", "2025-06-01T00:00:00Z"));
-      // In-progress step (no duration, no error) marks run-old as active.
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-old", runId: "run-old", durationMs: null })
-      );
-      await service.createRun("ws-1", makeRun("run-new", "2025-06-01T00:01:00Z"));
-      // Crossing the cap rotates while run-old is still streaming.
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-new", runId: "run-new", rawResponse: "y".repeat(400) })
-      );
-      // The active run's completion lands in the fresh live file.
-      await service.updateStep("ws-1", "step-old", { durationMs: 55 });
-
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-new", "run-old"]);
-      const oldRun = await reloaded.getRunWithSteps("ws-1", "run-old");
-      expect(oldRun?.steps[0]?.durationMs).toBe(55);
-    });
-
-    it("does not resurrect evicted runs from a live log orphaned by a rotation crash", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // Simulate a crash between the snapshot rename and the live-log
-      // rewrite: the snapshot (generation 2) already dropped run-evicted,
-      // but the pre-rotation live log (generation 1) still holds it.
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: 2 }),
-          JSON.stringify({ type: "run", run: makeRun("run-keep", "2025-06-01T00:01:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-      await fs.writeFile(
-        logPath,
-        [
-          JSON.stringify({ type: "log-meta", generation: 1 }),
-          JSON.stringify({ type: "run", run: makeRun("run-evicted", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      const runs = await service.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-keep"]);
-
-      // Load completed the interrupted retirement, so new appends pair with
-      // the snapshot and survive the next restart.
-      await service.createRun("ws-1", makeRun("run-after", "2025-06-01T00:02:00Z"));
-      const reloaded = new DevToolsService(config, 700);
-      const reloadedRuns = await reloaded.getRuns("ws-1");
-      expect(reloadedRuns.map((run) => run.id).sort()).toEqual(["run-after", "run-keep"]);
-    });
-
-    it("keeps runs and steps that arrive while snapshot I/O is in flight", async () => {
-      const config = createTestConfig({ sessionsDir });
-      // Cap sized so the oversized step triggers exactly one rotation and the
-      // mid-I/O appends stay under it (no second rotation evicting them).
-      const service = new DevToolsService(config, 1500);
-      type SnapshotFn = (...args: unknown[]) => Promise<void>;
-      const priv = service as unknown as { commitSnapshotPair: SnapshotFn };
-      const originalCommit = priv.commitSnapshotPair.bind(service);
-
-      await service.createRun("ws-1", makeRun("run-old", "2025-06-01T00:00:00Z"));
-      await service.createStep("ws-1", makeStep({ id: "step-old", runId: "run-old" }));
-      await service.createRun("ws-1", makeRun("run-new", "2025-06-01T00:01:00Z"));
-
-      // Overlapping provider calls land between the retention decision and
-      // the snapshot I/O completing: a brand-new run, plus a new step for
-      // run-old (which lost its snapshot spot to the cap).
-      let midIo: Promise<void> | undefined;
-      priv.commitSnapshotPair = async (...args: unknown[]) => {
-        priv.commitSnapshotPair = originalCommit;
-        midIo = Promise.all([
-          service.createRun("ws-1", makeRun("run-mid", "2025-06-01T00:02:00Z")),
-          service.createStep("ws-1", makeStep({ id: "step-mid-old", runId: "run-old" })),
-        ]).then(() => undefined);
-        await originalCommit(...args);
-      };
-      // Crossing the cap triggers rotation with the wrapped snapshot commit.
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-new", runId: "run-new", rawResponse: "y".repeat(2000) })
-      );
-      expect(midIo).toBeDefined();
-      await midIo;
-
-      const runs = await service.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-mid", "run-new", "run-old"]);
-
-      // Everything also survives a restart: mid-I/O entities landed in the
-      // fresh live file with their base records.
-      const reloaded = new DevToolsService(config, 700);
-      const reloadedRuns = await reloaded.getRuns("ws-1");
-      expect(reloadedRuns.map((run) => run.id).sort()).toEqual(["run-mid", "run-new", "run-old"]);
-      const oldRun = await reloaded.getRunWithSteps("ws-1", "run-old");
-      expect(oldRun?.steps.map((step) => step.id).sort()).toEqual(["step-mid-old", "step-old"]);
-    });
-
-    it("removeWorkspaceData removes an abandoned snapshot temp file", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 700);
-      const tmpPath = `${getRotatedLogPath(sessionsDir, "ws-1")}.tmp`;
-
-      await service.createRun("ws-1", makeRun("run-1"));
-      // Simulate a rotation interrupted between the tmp write and the rename.
-      await fs.writeFile(tmpPath, "orphaned snapshot\n", "utf-8");
-
-      await service.removeWorkspaceData("ws-1");
-      expect(await pathExists(tmpPath)).toBe(false);
-    });
-
-    it("treats an empty live log as a legacy clear and keeps later appends durable", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // Marker writes are atomic, so an empty live file next to a committed
-      // snapshot can only be a legacy binary's truncating clear; the
-      // snapshot must stay dropped and later appends must survive restarts.
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: 1 }),
-          JSON.stringify({ type: "run", run: makeRun("run-keep", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-      await fs.writeFile(logPath, "", "utf-8");
-
-      const service = new DevToolsService(config, 700);
-      await service.createRun("ws-1", makeRun("run-after", "2025-06-01T00:01:00Z"));
-
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-after"]);
-    });
-
-    it("keeps appends durable when the live log is missing next to a snapshot", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // Only a legacy binary's removal path deletes the live file while
-      // leaving the rotated snapshot; commits always create the live file
-      // (retire sentinel) before renaming the snapshot.
-      await fs.writeFile(
-        rotatedPath,
-        `${JSON.stringify({ type: "snapshot-meta", generation: 1 })}\n`,
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      await service.createRun("ws-1", makeRun("run-after", "2025-06-01T00:01:00Z"));
-
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-after"]);
-    });
-
-    it("evicts compacted-away runs from memory and notifies subscribers", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 700);
-      const events: DevToolsEvent[] = [];
-      service.on("update:ws-1", (event: DevToolsEvent) => {
-        events.push(event);
-      });
-
-      await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:00Z"));
-      await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
-      await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:01:00Z"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-2", runId: "run-2", rawResponse: "y".repeat(400) })
-      );
-
-      // The completed run-1 was dropped by compaction; memory agrees with disk.
-      const runs = await service.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-2"]);
-      // Open panels were told to drop the evicted card.
-      expect(events.filter((event) => event.type === "runs-evicted")).toEqual([
-        { type: "runs-evicted", runIds: ["run-1"] },
-      ]);
-    });
-
-    it("ignores a malformed snapshot generation instead of poisoning workspace state", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // A malformed metadata line must not set logGeneration to NaN, where
-      // the stale check would flag the live log but the repair branch
-      // (logGeneration > 0) would be skipped, discarding appends forever.
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: "bad" }),
-          JSON.stringify({ type: "run", run: makeRun("run-keep", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      await service.createRun("ws-1", makeRun("run-after", "2025-06-01T00:01:00Z"));
-
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-after", "run-keep"]);
-    });
-
-    it("repairs the live marker on the next append when the post-snapshot marker write fails", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 700);
-      const markerFailure = installMarkerWriteFailure(service);
-
-      await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:00Z"));
-      await service.createStep("ws-1", makeStep({ id: "step-1", runId: "run-1" }));
-      // This append crosses the cap; the snapshot rename lands but the
-      // live-marker write fails (transient ENOSPC).
-      markerFailure.failNext();
-      let thrownMessage = "";
-      try {
-        await service.createStep(
-          "ws-1",
-          makeStep({ id: "step-2", runId: "run-1", rawResponse: "y".repeat(700) })
-        );
-      } catch (error) {
-        thrownMessage = error instanceof Error ? error.message : String(error);
-      }
-      expect(thrownMessage).toContain("ENOSPC");
-
-      // The next append must repair the marker first; otherwise this run
-      // lands in a pre-snapshot live file and is discarded on restart.
-      await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:01:00Z"));
-
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-1", "run-2"]);
-    });
-
-    it("completes eviction and notifies subscribers when the live-marker write fails", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1000);
-      const markerFailure = installMarkerWriteFailure(service);
-      const events: DevToolsEvent[] = [];
-      service.on("update:ws-1", (event: DevToolsEvent) => {
-        events.push(event);
-      });
-
-      await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:00Z"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-1", runId: "run-1", durationMs: null })
-      );
-      await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:01:00Z"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-2", runId: "run-2", durationMs: null })
-      );
-
-      // Completing run-1 crosses the cap: the snapshot rename lands
-      // (dropping run-1) but the live-marker write fails.
-      markerFailure.failNext();
-      let thrownMessage = "";
-      try {
-        await service.updateStep("ws-1", "step-1", {
-          durationMs: 100,
-          rawResponse: "z".repeat(800),
-        });
-      } catch (error) {
-        thrownMessage = error instanceof Error ? error.message : String(error);
-      }
-      expect(thrownMessage).toContain("ENOSPC");
-
-      // The rename committed the retention decision, so the failed rotation
-      // must still evict run-1 from memory and notify subscribers; otherwise
-      // later appends can target a run whose records exist nowhere durable.
-      expect(events.filter((event) => event.type === "runs-evicted")).toEqual([
-        { type: "runs-evicted", runIds: ["run-1"] },
-      ]);
-      const runs = await service.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-2"]);
-    });
-
-    it("rejects an unsafe snapshot generation so a reused generation cannot resurrect dropped runs", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // Corruption Number.isInteger accepts but that cannot be incremented
-      // (1e100 + 1 === 1e100): every later rotation would reuse the
-      // generation, so a crash between the snapshot rename and the live
-      // rewrite leaves an old marker that still compares as current.
-      await fs.writeFile(
-        rotatedPath,
-        `${JSON.stringify({ type: "snapshot-meta", generation: 1e100 })}\n`,
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 1000);
-      const markerFailure = installMarkerWriteFailure(service);
-      await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:00Z"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-1", runId: "run-1", durationMs: null })
-      );
-      await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:01:00Z"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-2", runId: "run-2", durationMs: null })
-      );
-      // Rotation drops the completed run-1; the marker failure leaves the
-      // pre-rotation live file (which still holds run-1's records) in place.
-      markerFailure.failNext();
-      let thrownMessage = "";
-      try {
-        await service.updateStep("ws-1", "step-1", {
-          durationMs: 100,
-          rawResponse: "z".repeat(800),
-        });
-      } catch (error) {
-        thrownMessage = error instanceof Error ? error.message : String(error);
-      }
-      expect(thrownMessage).toContain("ENOSPC");
-
-      // Restart in that crash window: with the poisoned generation reused,
-      // the stale live file would pass as current and resurrect run-1. The
-      // large cap keeps load-time stale-step finalization from triggering
-      // another rotation that would re-evict it and mask the resurrection.
-      const reloaded = new DevToolsService(config, 1_000_000);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-2"]);
-    });
-
-    it("ignores an unsafe snapshot generation so later appends are not repeatedly discarded", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // If load accepted 1e100 into logGeneration, the marker repair would
-      // write a marker the stale check can never trust, so every restart
-      // would discard all appends since the corruption.
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: 1e100 }),
-          JSON.stringify({ type: "run", run: makeRun("run-keep", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      await service.createRun("ws-1", makeRun("run-after", "2025-06-01T00:01:00Z"));
-
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-after", "run-keep"]);
-    });
-
-    it("treats a live log with an unsafe marker generation as stale", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: 1 }),
-          JSON.stringify({ type: "run", run: makeRun("run-keep", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-      // A corrupt out-of-range marker generation must not vouch for the live
-      // file's currency: its dropped-run records would be resurrected.
-      await fs.writeFile(
-        logPath,
-        [
-          JSON.stringify({ type: "log-meta", generation: 1e100 }),
-          JSON.stringify({ type: "run", run: makeRun("run-dropped", "2025-06-01T00:01:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      const runs = await service.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-keep"]);
-    });
-
-    it("treats a live log whose marker generation exceeds the snapshot generation as stale", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: 1 }),
-          JSON.stringify({ type: "run", run: makeRun("run-keep", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-      // The protocol only creates matching pairs, so a finite higher marker
-      // means the live log belongs to a snapshot that is no longer on disk;
-      // replaying it beside the older snapshot could resurrect runs its own
-      // rotation had evicted.
-      await fs.writeFile(
-        logPath,
-        [
-          JSON.stringify({ type: "log-meta", generation: 2 }),
-          JSON.stringify({ type: "run", run: makeRun("run-dropped", "2025-06-01T00:01:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      const runs = await service.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-keep"]);
-    });
-
-    it("still loads the snapshot when the live-marker repair write fails, then repairs on the next append", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // A first rotation interrupted after the snapshot rename leaves the
-      // markerless pre-rotation live file ending in the retire sentinel:
-      // load must repair the marker, but a failing repair write must not
-      // block reading the already-replayed snapshot.
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: 1 }),
-          JSON.stringify({ type: "run", run: makeRun("run-keep", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-      await fs.writeFile(
-        logPath,
-        [
-          JSON.stringify({ type: "run", run: makeRun("run-keep", "2025-06-01T00:00:00Z") }),
-          JSON.stringify({ type: "log-retire", generation: 1 }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      const markerFailure = installMarkerWriteFailure(service);
-      markerFailure.failNext();
-      const runs = await service.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-keep"]);
-
-      // The marker generation was left lagging, so the next append rewrites
-      // the marker first and the appended run survives a restart.
-      await service.createRun("ws-1", makeRun("run-after", "2025-06-01T00:01:00Z"));
-      const reloaded = new DevToolsService(config, 700);
-      const reloadedRuns = await reloaded.getRuns("ws-1");
-      expect(reloadedRuns.map((run) => run.id).sort()).toEqual(["run-after", "run-keep"]);
-    });
-
-    it("rejects a snapshot generation with no safe increment so rotation cannot resurrect dropped runs", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // A corrupt MAX_SAFE_INTEGER generation passes Number.isSafeInteger,
-      // but the next rotation writes generation + 1 = 2^53 (unsafe): if a
-      // crash then leaves the old live log in place, a load that rejects the
-      // unsafe snapshot generation would treat the snapshot as absent and
-      // replay the stale live log, resurrecting the run it just evicted.
-      await fs.writeFile(
-        rotatedPath,
-        `${JSON.stringify({ type: "snapshot-meta", generation: Number.MAX_SAFE_INTEGER })}\n`,
-        "utf-8"
-      );
-      const evictable = makeRun("run-old", "2025-06-01T00:00:00Z");
-      const evictableStep = makeStep({ id: "step-old", runId: "run-old" });
-      await fs.writeFile(
-        logPath,
-        [
-          JSON.stringify({ type: "log-meta", generation: Number.MAX_SAFE_INTEGER }),
-          JSON.stringify({ type: "run", run: evictable }),
-          JSON.stringify({ type: "step", step: evictableStep }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      await service.createRun("ws-1", makeRun("run-new", "2025-06-01T00:01:00Z"));
-      // Crash window: rotation commits the snapshot (evicting run-old) but
-      // dies before rewriting the live file.
-      const markerFailure = installMarkerWriteFailure(service);
-      markerFailure.failNext();
-      await service
-        .createStep(
-          "ws-1",
-          makeStep({ id: "step-new", runId: "run-new", rawResponse: "y".repeat(400) })
-        )
-        .catch(() => undefined);
-
-      const reloaded = new DevToolsService(config, 700);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-new"]);
-    });
-
-    it("honors a clear performed by a downgraded pre-rotation binary", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const service = new DevToolsService(config, 1500);
-      await service.createRun("ws-1", makeRun("run-old"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-old", runId: "run-old", rawResponse: "y".repeat(2000) })
-      );
-      expect(await pathExists(getRotatedLogPath(sessionsDir, "ws-1"))).toBe(true);
-
-      // A pre-rotation binary clears by truncating only the live file; it
-      // does not know the rotated snapshot exists.
-      await fs.writeFile(logPath, "", "utf-8");
-
-      const reloaded = new DevToolsService(config, 1500);
-      expect(await reloaded.getRuns("ws-1")).toEqual([]);
-    });
-
-    it("replays a downgraded binary's post-clear runs instead of the rotated snapshot", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const service = new DevToolsService(config, 1500);
-      await service.createRun("ws-1", makeRun("run-old"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-old", runId: "run-old", rawResponse: "y".repeat(2000) })
-      );
-      expect(await pathExists(getRotatedLogPath(sessionsDir, "ws-1"))).toBe(true);
-
-      // After a legacy clear, the pre-rotation binary keeps appending
-      // markerless entries to the truncated live file.
-      const legacyRun = makeRun("run-legacy", "2025-06-02T00:00:00Z");
-      await fs.writeFile(logPath, `${JSON.stringify({ type: "run", run: legacyRun })}\n`, "utf-8");
-
-      const reloaded = new DevToolsService(config, 1500);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-legacy"]);
-    });
-
-    it("preserves a downgraded binary's writes appended after an interrupted snapshot commit", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // Crash after the gen-2 snapshot rename but before the live rewrite
-      // left the gen-1 live file ending in the retire sentinel; a downgraded
-      // binary then recorded run-legacy after it. Only a legacy writer
-      // appends entries after a sentinel, so the live history must win.
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: 2 }),
-          JSON.stringify({ type: "run", run: makeRun("run-snap", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-      await fs.writeFile(
-        logPath,
-        [
-          JSON.stringify({ type: "log-meta", generation: 1 }),
-          JSON.stringify({ type: "run", run: makeRun("run-live", "2025-06-01T00:01:00Z") }),
-          JSON.stringify({ type: "log-retire", generation: 2 }),
-          JSON.stringify({ type: "run", run: makeRun("run-legacy", "2025-06-02T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 1500);
-      const runs = await service.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-legacy", "run-live"]);
-    });
-
-    it("seals a partially written retire sentinel so the next append stays replayable", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1500);
-
-      await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:00Z"));
-
-      // Disk fills while rotation appends the retire sentinel: the first
-      // attempt lands only a fragment before rejecting (the live file's
-      // unterminated tail), and every retried rotation keeps failing, so
-      // the live file stays the only durable copy of later appends.
-      const realAppendFile = fs.appendFile;
-      let sentinelFailures = 0;
-      const appendSpy = spyOn(fs, "appendFile").mockImplementation(
-        async (file, content, options) => {
-          if (typeof content === "string" && content.includes('"log-retire"')) {
-            sentinelFailures += 1;
-            if (sentinelFailures === 1) {
-              await realAppendFile(file, content.slice(0, 12), options);
-            }
-            throw new Error("ENOSPC: simulated sentinel write failure");
-          }
-          return realAppendFile(file, content, options);
-        }
-      );
-      try {
-        await service
-          .createStep(
-            "ws-1",
-            makeStep({ id: "step-1", runId: "run-1", rawResponse: "y".repeat(2000) })
-          )
-          .catch(() => undefined);
-        expect(sentinelFailures).toBe(1);
-        // The next ordinary append must not merge with the fragment into one
-        // malformed line, or this run would be lost on the next load. Its
-        // rotation retry fails too (still over the cap), so the sealed live
-        // file is what the next load reads.
-        await service
-          .createRun("ws-1", makeRun("run-2", "2025-06-01T00:01:00Z"))
-          .catch(() => undefined);
-        expect(sentinelFailures).toBe(2);
-      } finally {
-        appendSpy.mockRestore();
-      }
-
-      const reloaded = new DevToolsService(config, 1500);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-1", "run-2"]);
-    });
-
-    it("emits the mutation event when a rotation commits but the marker write fails", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 700);
-      const events: DevToolsEvent[] = [];
-      service.on("update:ws-1", (event: DevToolsEvent) => {
-        events.push(event);
-      });
-      const markerFailure = installMarkerWriteFailure(service);
-
-      await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:00Z"));
-
-      // The step's own append crosses the cap; the rotation's snapshot rename
-      // commits the step durably before the live-marker write fails, so the
-      // rejected createStep must still tell open panels about the step.
-      markerFailure.failNext();
-      let rejected = false;
-      await service
-        .createStep(
-          "ws-1",
-          makeStep({ id: "step-1", runId: "run-1", rawResponse: "y".repeat(800) })
-        )
-        .catch(() => {
-          rejected = true;
-        });
-      expect(rejected).toBe(true);
-
-      const stepCreated = events.filter((event) => event.type === "step-created");
-      expect(stepCreated).toHaveLength(1);
-      expect(events.some((event) => event.type === "run-updated")).toBe(true);
-    });
-
-    it("notifies subscribers of a committed clear even when the live-marker write fails", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 50_000);
-      const events: DevToolsEvent[] = [];
-      service.on("update:ws-1", (event: DevToolsEvent) => {
-        events.push(event);
-      });
-
-      await service.createRun("ws-1", makeRun("run-1"));
-
-      // The empty snapshot rename commits the clear before the marker write
-      // fails, so panels must drop their run cards even though clear rejects.
-      const markerFailure = installMarkerWriteFailure(service);
-      markerFailure.failNext();
-      let clearError: Error | undefined;
-      try {
-        await service.clear("ws-1");
-      } catch (error) {
-        clearError = error instanceof Error ? error : new Error(String(error));
-      }
-      expect(clearError?.message).toContain("ENOSPC");
-      expect(events.filter((event) => event.type === "cleared")).toHaveLength(1);
-
-      // Restarts agree with the notification: the workspace is empty.
-      const reloaded = new DevToolsService(config, 50_000);
-      expect(await reloaded.getRuns("ws-1")).toEqual([]);
-    });
-
-    it("keeps a clear committed at the generation ceiling cleared across restarts", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      // The highest generation the load guard accepts: its own increment is
-      // still a safe integer, but the increment's increment is not, so a
-      // commit that blindly writes generation + 1 produces a snapshot the
-      // next load rejects.
-      const ceiling = Number.MAX_SAFE_INTEGER - 1;
-      await fs.writeFile(
-        rotatedPath,
-        `${JSON.stringify({ type: "snapshot-meta", generation: ceiling })}\n`,
-        "utf-8"
-      );
-      await fs.writeFile(
-        logPath,
-        [
-          JSON.stringify({ type: "log-meta", generation: ceiling }),
-          JSON.stringify({ type: "run", run: makeRun("run-stale", "2025-06-01T00:00:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 700);
-      expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-stale"]);
-
-      // Interrupt the clear's commit after the snapshot rename: the written
-      // generation must still pass the next load's guard, or the stale live
-      // log would be treated as current and resurrect run-stale.
-      const markerFailure = installMarkerWriteFailure(service);
-      markerFailure.failNext();
-      await service.clear("ws-1").catch(() => undefined);
-
-      const reloaded = new DevToolsService(config, 700);
-      expect(await reloaded.getRuns("ws-1")).toEqual([]);
-    });
-
-    it("does not let a malformed post-sentinel line discard the snapshot as legacy", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-      await fs.mkdir(path.dirname(logPath), { recursive: true });
-
-      await fs.writeFile(
-        rotatedPath,
-        [
-          JSON.stringify({ type: "snapshot-meta", generation: 2 }),
-          JSON.stringify({ type: "run", run: makeRun("run-kept", "2025-06-01T00:01:00Z") }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-      // An interrupted commit's live file: previous pair's marker, stale
-      // history, the new commit's retire sentinel, then torn lines that
-      // parse as JSON with a recognized type but a missing or gutted
-      // payload. Counting either as legacy evidence would clear the
-      // snapshot and replay lines that replay into nothing usable.
-      await fs.writeFile(
-        logPath,
-        [
-          JSON.stringify({ type: "log-meta", generation: 1 }),
-          JSON.stringify({ type: "run", run: makeRun("run-stale", "2025-06-01T00:00:00Z") }),
-          JSON.stringify({ type: "log-retire", generation: 2 }),
-          JSON.stringify({ type: "step-update" }),
-          JSON.stringify({ type: "run", run: { id: "x" } }),
-        ]
-          .map((line) => `${line}\n`)
-          .join(""),
-        "utf-8"
-      );
-
-      const service = new DevToolsService(config, 50_000);
-      expect((await service.getRuns("ws-1")).map((run) => run.id)).toEqual(["run-kept"]);
-    });
-
-    it("persists pending base records through the next append when the mid-I/O repair write fails", async () => {
-      const config = createTestConfig({ sessionsDir });
-      // Cap sized so the oversized step triggers exactly one rotation and
-      // run-old (completed) loses its snapshot spot to run-new.
-      const service = new DevToolsService(config, 1500);
-      type SnapshotFn = (...args: unknown[]) => Promise<void>;
-      type RepairFn = (data: unknown, filePath: string, content: string) => Promise<void>;
-      const priv = service as unknown as {
-        commitSnapshotPair: SnapshotFn;
-        appendWithMarkerRepair: RepairFn;
-      };
-      const originalCommit = priv.commitSnapshotPair.bind(service);
-      const originalRepair = priv.appendWithMarkerRepair.bind(service);
-
-      await service.createRun("ws-1", makeRun("run-old", "2025-06-01T00:00:00Z"));
-      await service.createStep("ws-1", makeStep({ id: "step-old", runId: "run-old" }));
-      await service.createRun("ws-1", makeRun("run-new", "2025-06-01T00:01:00Z"));
-
-      // run-old gains a step while snapshot I/O is in flight, so rotation
-      // must re-persist its base records into the fresh live file; that
-      // repair write fails once (simulated EIO).
-      let failedRepair = false;
-      priv.appendWithMarkerRepair = (data, filePath, content) => {
-        if (!failedRepair && content.startsWith('{"type":"run"') && content.includes("run-old")) {
-          failedRepair = true;
-          return Promise.reject(new Error("EIO: simulated repair append failure"));
-        }
-        return originalRepair(data, filePath, content);
-      };
-      let midIo: Promise<void> | undefined;
-      priv.commitSnapshotPair = async (...args: unknown[]) => {
-        priv.commitSnapshotPair = originalCommit;
-        midIo = service
-          .createStep("ws-1", makeStep({ id: "step-mid-old", runId: "run-old" }))
-          .then(() => undefined);
-        await originalCommit(...args);
-      };
-      await service
-        .createStep(
-          "ws-1",
-          makeStep({ id: "step-new", runId: "run-new", rawResponse: "y".repeat(2000) })
-        )
-        .catch(() => undefined);
-      expect(failedRepair).toBe(true);
-      expect(midIo).toBeDefined();
-      await midIo;
-
-      // The queued step append completed the pending base repair first, so
-      // run-old's records are durable and the run survives a restart.
-      const reloaded = new DevToolsService(config, 1500);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-new", "run-old"]);
-      const runWithSteps = await reloaded.getRunWithSteps("ws-1", "run-old");
-      expect(runWithSteps?.steps.map((step) => step.id).sort()).toEqual([
-        "step-mid-old",
-        "step-old",
-      ]);
-    });
-
-    it("recovers a pending base repair whose first attempt wrote a partial fragment", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1500);
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      type SnapshotFn = (...args: unknown[]) => Promise<void>;
-      type RepairFn = (data: unknown, filePath: string, content: string) => Promise<void>;
-      const priv = service as unknown as {
-        commitSnapshotPair: SnapshotFn;
-        appendWithMarkerRepair: RepairFn;
-      };
-      const originalCommit = priv.commitSnapshotPair.bind(service);
-      const originalRepair = priv.appendWithMarkerRepair.bind(service);
-
-      await service.createRun("ws-1", makeRun("run-old", "2025-06-01T00:00:00Z"));
-      await service.createStep("ws-1", makeStep({ id: "step-old", runId: "run-old" }));
-      await service.createRun("ws-1", makeRun("run-new", "2025-06-01T00:01:00Z"));
-
-      // The mid-I/O base repair writes only part of run-old's record before
-      // rejecting (disk full mid-write): the retry must not merge with that
-      // fragment into one malformed line, or the run stays lost after restart.
-      let failedRepair = false;
-      priv.appendWithMarkerRepair = async (data, filePath, content) => {
-        if (!failedRepair && content.startsWith('{"type":"run"') && content.includes("run-old")) {
-          failedRepair = true;
-          await fs.appendFile(filePath, content.slice(0, 30), "utf-8");
-          throw new Error("ENOSPC: simulated partial repair write");
-        }
-        return originalRepair(data, filePath, content);
-      };
-      let midIo: Promise<void> | undefined;
-      priv.commitSnapshotPair = async (...args: unknown[]) => {
-        priv.commitSnapshotPair = originalCommit;
-        midIo = service
-          .createStep("ws-1", makeStep({ id: "step-mid-old", runId: "run-old" }))
-          .then(() => undefined);
-        await originalCommit(...args);
-      };
-      await service
-        .createStep(
-          "ws-1",
-          makeStep({ id: "step-new", runId: "run-new", rawResponse: "y".repeat(2000) })
-        )
-        .catch(() => undefined);
-      expect(failedRepair).toBe(true);
-      expect(midIo).toBeDefined();
-      await midIo;
-      // The fragment really is on disk (unterminated), so this exercises the
-      // seal rather than a clean retry.
-      expect((await fs.readFile(logPath, "utf-8")).includes('{"type":"run"')).toBe(true);
-
-      const reloaded = new DevToolsService(config, 1500);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id).sort()).toEqual(["run-new", "run-old"]);
-      const runWithSteps = await reloaded.getRunWithSteps("ws-1", "run-old");
-      expect(runWithSteps?.steps.map((step) => step.id).sort()).toEqual([
-        "step-mid-old",
-        "step-old",
-      ]);
-    });
-
-    it("does not requeue pre-clear base records when a clear lands during the failed repair append", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1500);
-      type SnapshotFn = (...args: unknown[]) => Promise<void>;
-      type RepairFn = (data: unknown, filePath: string, content: string) => Promise<void>;
-      const priv = service as unknown as {
-        commitSnapshotPair: SnapshotFn;
-        appendWithMarkerRepair: RepairFn;
-      };
-      const originalCommit = priv.commitSnapshotPair.bind(service);
-      const originalRepair = priv.appendWithMarkerRepair.bind(service);
-
-      await service.createRun("ws-1", makeRun("run-old", "2025-06-01T00:00:00Z"));
-      await service.createStep("ws-1", makeStep({ id: "step-old", runId: "run-old" }));
-      await service.createRun("ws-1", makeRun("run-new", "2025-06-01T00:01:00Z"));
-
-      // clear() lands while reconciliation awaits run-old's failing base
-      // repair: the clear empties the repair queue, so the catch must not
-      // repopulate it with pre-clear records that the next successful
-      // append would flush into the post-clear live file.
-      let clearPromise: Promise<void> | undefined;
-      let failedRepair = false;
-      priv.appendWithMarkerRepair = (data, filePath, content) => {
-        if (!failedRepair && content.startsWith('{"type":"run"') && content.includes("run-old")) {
-          failedRepair = true;
-          clearPromise = service.clear("ws-1");
-          return Promise.reject(new Error("EIO: simulated repair append failure"));
-        }
-        return originalRepair(data, filePath, content);
-      };
-      let midIo: Promise<void> | undefined;
-      priv.commitSnapshotPair = async (...args: unknown[]) => {
-        priv.commitSnapshotPair = originalCommit;
-        midIo = service
-          .createStep("ws-1", makeStep({ id: "step-mid-old", runId: "run-old" }))
-          .catch(() => undefined);
-        await originalCommit(...args);
-      };
-      await service
-        .createStep(
-          "ws-1",
-          makeStep({ id: "step-new", runId: "run-new", rawResponse: "y".repeat(2000) })
-        )
-        .catch(() => undefined);
-      expect(failedRepair).toBe(true);
-      expect(clearPromise).toBeDefined();
-      await clearPromise!.catch(() => undefined);
-      await midIo;
-
-      // The first post-clear append flushes any queued repairs; cleared
-      // history must not ride along with it.
-      await service.createRun("ws-1", makeRun("run-after", "2025-06-01T00:02:00Z"));
-
-      const reloaded = new DevToolsService(config, 1500);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-after"]);
-    });
-
-    it("keeps a run recreated after a mid-rotation clear instead of evicting it", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1500);
-      type SnapshotFn = (...args: unknown[]) => Promise<void>;
-      const priv = service as unknown as {
-        commitSnapshotPair: SnapshotFn;
-        workspaces: Map<string, { runs: Map<string, unknown> }>;
-      };
-      const originalCommit = priv.commitSnapshotPair.bind(service);
-
-      await service.createRun("ws-1", makeRun("run-old", "2025-06-01T00:00:00Z"));
-      await service.createStep("ws-1", makeStep({ id: "step-old", runId: "run-old" }));
-      await service.createRun("ws-1", makeRun("run-new", "2025-06-01T00:01:00Z"));
-
-      // clear() lands while rotation awaits snapshot I/O, then the active
-      // middleware recreates run-old's frozen ID via createStep's self-heal.
-      // The recreated run has no steps in the maps yet (createStep awaits the
-      // queued run append first), so the frozen retention decision would
-      // otherwise evict it, skip its queued base append, and throw on the
-      // missing run when createStep resumes.
-      let clearPromise: Promise<void> | undefined;
-      let recreatePromise: Promise<void> | undefined;
-      priv.commitSnapshotPair = async (...args: unknown[]) => {
-        priv.commitSnapshotPair = originalCommit;
-        clearPromise = service.clear("ws-1");
-        recreatePromise = service.createStep(
-          "ws-1",
-          makeStep({ id: "step-post-clear", runId: "run-old", startedAt: "2025-06-01T00:02:00Z" })
-        );
-        while (!priv.workspaces.get("ws-1")?.runs.has("run-old")) {
-          await new Promise((resolve) => setTimeout(resolve, 1));
-        }
-        await originalCommit(...args);
-      };
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-new", runId: "run-new", rawResponse: "y".repeat(2000) })
-      );
-      expect(clearPromise).toBeDefined();
-      expect(recreatePromise).toBeDefined();
-      await clearPromise;
-      await recreatePromise;
-
-      // Post-clear state is exactly the recreated run and its step, durably.
-      const reloaded = new DevToolsService(config, 1500);
-      const runs = await reloaded.getRuns("ws-1");
-      expect(runs.map((run) => run.id)).toEqual(["run-old"]);
-      const runWithSteps = await reloaded.getRunWithSteps("ws-1", "run-old");
-      expect(runWithSteps?.steps.map((step) => step.id)).toEqual(["step-post-clear"]);
-    });
-
-    it("does not emit a step update after its run was evicted by that append's rotation", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1000);
-      const events: DevToolsEvent[] = [];
-      service.on("update:ws-1", (event: DevToolsEvent) => {
-        events.push(event);
-      });
-
-      await service.createRun("ws-1", makeRun("run-1", "2025-06-01T00:00:00Z"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-1", runId: "run-1", durationMs: null })
-      );
-      await service.createRun("ws-1", makeRun("run-2", "2025-06-01T00:01:00Z"));
-      await service.createStep(
-        "ws-1",
-        makeStep({ id: "step-2", runId: "run-2", durationMs: null })
-      );
-
-      // The final step-update completes run-1 and crosses the cap, so the
-      // rotation inside this very append evicts run-1 (run-2 stays active).
-      await service.updateStep("ws-1", "step-1", {
-        durationMs: 100,
-        rawResponse: "z".repeat(800),
-      });
-
-      expect(events.filter((event) => event.type === "runs-evicted")).toEqual([
-        { type: "runs-evicted", runIds: ["run-1"] },
-      ]);
-      // No step-updated may follow the eviction: subscribers would re-add
-      // the step that backend and disk no longer contain.
-      expect(events.filter((event) => event.type === "step-updated")).toEqual([]);
-    });
-
-    it("clear() leaves no replayable entries in either log file", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1);
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-
-      await service.createRun("ws-1", makeRun("run-1"));
-      expect(await pathExists(rotatedPath)).toBe(true);
-
-      await service.clear("ws-1");
-      const entryTypes = async (filePath: string) =>
-        (await fs.readFile(filePath, "utf-8"))
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => (JSON.parse(line) as { type: string }).type);
-      // Both files hold only generation markers (disk reclaimed, nothing replayable).
-      expect(await entryTypes(rotatedPath)).toEqual(["snapshot-meta"]);
-      expect(await entryTypes(getDevtoolsLogPath(sessionsDir, "ws-1"))).toEqual(["log-meta"]);
-      expect((await new DevToolsService(config, 1).getRuns("ws-1")).length).toBe(0);
-    });
-
-    it("an interrupted clear stays cleared after restart", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1);
-      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-
-      await service.createRun("ws-1", makeRun("run-1"));
-      const liveBeforeClear = await fs.readFile(logPath, "utf-8");
-      await service.clear("ws-1");
-      // Simulate a crash between clear's snapshot commit and its live-log
-      // rewrite: the pre-clear live content is still on disk.
-      await fs.writeFile(logPath, liveBeforeClear, "utf-8");
-
-      const reloaded = new DevToolsService(config, 1);
-      expect((await reloaded.getRuns("ws-1")).length).toBe(0);
-      expect(await pathExists(rotatedPath)).toBe(true);
-    });
-
-    it("removeWorkspaceData also removes the rotated file", async () => {
-      const config = createTestConfig({ sessionsDir });
-      const service = new DevToolsService(config, 1);
-      const rotatedPath = getRotatedLogPath(sessionsDir, "ws-1");
-
-      await service.createRun("ws-1", makeRun("run-1"));
-      expect(await pathExists(rotatedPath)).toBe(true);
-
-      await service.removeWorkspaceData("ws-1");
-      expect(await pathExists(rotatedPath)).toBe(false);
-      expect(await pathExists(getDevtoolsLogPath(sessionsDir, "ws-1"))).toBe(false);
     });
   });
 });

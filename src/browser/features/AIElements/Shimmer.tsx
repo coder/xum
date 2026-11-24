@@ -14,19 +14,11 @@ export interface TextShimmerProps {
 }
 
 /**
- * Shimmer text effect using CSS background-clip: text.
+ * Shimmer text effect using a transformed, masked duplicate of the label.
  *
- * Uses a gradient background clipped to text shape, animated via
- * background-position. This is much lighter than the previous
- * canvas + Web Worker approach:
- * - No JS animation loop
- * - No canvas rendering
- * - No worker message passing
- * - Browser handles animation natively
- *
- * Note: background-position isn't compositor-only, but for small text
- * elements like "Thinking..." the repaint cost is negligible compared
- * to the overhead of canvas/worker solutions.
+ * The sweep and its counter-translated text copy animate only `transform`,
+ * keeping the glyphs stationary while avoiding the per-frame paint work from
+ * animating a gradient's background-position in the streaming transcript.
  */
 const ShimmerComponent = ({
   children,
@@ -45,7 +37,10 @@ const ShimmerComponent = ({
         } as React.CSSProperties
       }
     >
-      {children}
+      <span className="shimmer-text-base">{children}</span>
+      <span aria-hidden="true" className="shimmer-text-sweep">
+        <span className="shimmer-text-sweep-copy">{children}</span>
+      </span>
     </Component>
   );
 };

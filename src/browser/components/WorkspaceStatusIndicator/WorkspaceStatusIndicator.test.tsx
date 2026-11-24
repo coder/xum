@@ -71,7 +71,8 @@ describe("WorkspaceStatusIndicator", () => {
 
     const icon = view.container.querySelector("svg");
     expect(icon).toBeTruthy();
-    expect(icon?.getAttribute("class") ?? "").toContain("animate-spin");
+    expect(icon?.getAttribute("class") ?? "").not.toContain("animate-spin");
+    expect(icon?.parentElement?.classList.contains("animate-spin")).toBe(true);
   });
 
   test("keeps the steady streaming layout free of the transient handoff slot", () => {
@@ -240,7 +241,7 @@ describe("WorkspaceStatusIndicator", () => {
     await waitFor(() => {
       expect(getModelDisplay()?.textContent ?? "").toContain(pendingDisplayName);
       expect(getModelDisplay()?.textContent ?? "").not.toContain(fallbackDisplayName);
-      expect(view.container.querySelector("[data-phase-slot]")).toBeNull();
+      expect(view.container.querySelector("[data-phase-slot]") === null).toBe(true);
       expect(view.container.textContent?.toLowerCase()).toContain("streaming");
       expect(view.container.textContent?.toLowerCase()).not.toContain("starting");
     });

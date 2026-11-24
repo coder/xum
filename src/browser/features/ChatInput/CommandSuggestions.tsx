@@ -4,19 +4,15 @@ import { cn } from "@/common/lib/utils";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
 import { FileIcon } from "@/browser/components/FileIcon/FileIcon";
 
-// Keys for navigating slash command suggestions.
-// Enter or Tab accepts the highlighted suggestion; Shift+Enter inserts a newline.
 export const COMMAND_SUGGESTION_KEYS = ["Tab", "Enter", "ArrowUp", "ArrowDown", "Escape"];
 
-// Keys for navigating file path (@mention) suggestions.
-//
-// Enter accepts the selected file path (then a subsequent Enter sends the message).
-export const FILE_SUGGESTION_KEYS = ["Tab", "Enter", "ArrowUp", "ArrowDown", "Escape"];
+const MENU_MAX_HEIGHT_PX = 200;
 
-/**
- * Highlight matching portions of text based on a query.
- * Performs case-insensitive substring matching and highlights all occurrences.
- */
+// floating-ui's engine check for WebKit.
+function isWebKit(): boolean {
+  return window.CSS.supports("-webkit-backdrop-filter", "none");
+}
+
 function HighlightedText({
   text,
   query,
@@ -26,7 +22,7 @@ function HighlightedText({
   query?: string;
   className?: string;
 }) {
-  if (!query || query.length === 0) {
+  if (!query) {
     return <span className={className}>{text}</span>;
   }
 
@@ -37,7 +33,6 @@ function HighlightedText({
   let matchIndex = lowerText.indexOf(lowerQuery);
 
   while (matchIndex !== -1) {
-    // Add non-matching prefix
     if (matchIndex > lastIndex) {
       parts.push(
         <span key={`text-${lastIndex}`} className="opacity-60">
@@ -45,7 +40,6 @@ function HighlightedText({
         </span>
       );
     }
-    // Add highlighted match
     parts.push(
       <span key={`match-${matchIndex}`} className="text-light">
         {text.slice(matchIndex, matchIndex + query.length)}
@@ -55,7 +49,6 @@ function HighlightedText({
     matchIndex = lowerText.indexOf(lowerQuery, lastIndex);
   }
 
-  // Add remaining non-matching suffix
   if (lastIndex < text.length) {
     parts.push(
       <span key={`text-${lastIndex}`} className="opacity-60">
@@ -67,7 +60,6 @@ function HighlightedText({
   return <span className={className}>{parts}</span>;
 }
 
-// Props interface
 interface CommandSuggestionsProps {
   suggestions: SlashSuggestion[];
   onSelectSuggestion: (suggestion: SlashSuggestion) => void;
@@ -75,15 +67,13 @@ interface CommandSuggestionsProps {
   isVisible: boolean;
   ariaLabel?: string;
   listId?: string;
-  /** Reference to the input element for portal positioning */
   anchorRef?: React.RefObject<HTMLElement | null>;
-  /** Query string to highlight in suggestions (for file path autocomplete) */
   highlightQuery?: string;
-  /** Whether suggestions are file paths (enables file icons) */
   isFileSuggestion?: boolean;
+  selectedIndex?: number;
+  onSelectedIndexChange?: (index: number) => void;
 }
 
-// Main component
 export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
   suggestions,
   onSelectSuggestion,
@@ -94,125 +84,118 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
   anchorRef,
   highlightQuery,
   isFileSuggestion = false,
+  selectedIndex: selectedIndexProp,
+  onSelectedIndexChange,
 }) => {
-  const [selectedIndex, setSelectedIndex] = useState(0);
-  const [position, setPosition] = useState<{ top: number; left: number; width: number } | null>(
-    null
-  );
-  const menuRef = useRef<HTMLDivElement>(null);
+  const [uncontrolledSelectedIndex, setUncontrolledSelectedIndex] = useState(0);
+  const selectedIndex = selectedIndexProp ?? uncontrolledSelectedIndex;
+  const isSelectionControlled = selectedIndexProp !== undefined && onSelectedIndexChange != null;
+  const setSelectedIndex = (next: React.SetStateAction<number>) => {
+    const resolved = typeof next === "function" ? next(selectedIndex) : next;
+    if (!isSelectionControlled) setUncontrolledSelectedIndex(resolved);
+    onSelectedIndexChange?.(resolved);
+  };
+  const [position, setPosition] = useState<{
+    bottomEdge: number;
+    left: number;
+    width: number;
+    maxHeight: number;
+  } | null>(null);
   const selectedRef = useRef<HTMLDivElement>(null);
   const previousSuggestionsRef = useRef<SlashSuggestion[]>(suggestions);
   const wasVisibleRef = useRef(isVisible);
 
-  // Keep selection stable while suggestions update (e.g. user keeps typing).
-  // We reset selection only when the menu becomes visible.
   useLayoutEffect(() => {
+    if (isSelectionControlled) return;
     const wasVisible = wasVisibleRef.current;
     wasVisibleRef.current = isVisible;
-
-    const prevSuggestions = previousSuggestionsRef.current;
+    const previousSuggestions = previousSuggestionsRef.current;
     previousSuggestionsRef.current = suggestions;
-
-    if (!isVisible || suggestions.length === 0) {
-      setSelectedIndex(0);
+    if (!isVisible || suggestions.length === 0 || !wasVisible) {
+      setUncontrolledSelectedIndex(0);
       return;
     }
-
-    // Menu just opened: default to the first suggestion.
-    if (!wasVisible) {
-      setSelectedIndex(0);
-      return;
-    }
-
-    // Preserve the previously-selected suggestion if it still exists; otherwise clamp.
-    setSelectedIndex((prevIndex) => {
-      const prevSelected = prevSuggestions[prevIndex];
-      if (prevSelected) {
-        const nextIndex = suggestions.findIndex((s) => s.id === prevSelected.id);
-        if (nextIndex !== -1) {
-          return nextIndex;
-        }
-      }
-      return Math.min(prevIndex, suggestions.length - 1);
+    setUncontrolledSelectedIndex((previousIndex) => {
+      const previousSelected = previousSuggestions[previousIndex];
+      const nextIndex = previousSelected
+        ? suggestions.findIndex((suggestion) => suggestion.id === previousSelected.id)
+        : -1;
+      return nextIndex >= 0 ? nextIndex : Math.min(previousIndex, suggestions.length - 1);
     });
-  }, [isVisible, suggestions]);
+  }, [isSelectionControlled, isVisible, suggestions]);
 
-  // Scroll selected item into view
   useLayoutEffect(() => {
     selectedRef.current?.scrollIntoView({ block: "nearest" });
   }, [selectedIndex]);
 
-  // Calculate position when using portal mode
   useLayoutEffect(() => {
     if (!anchorRef?.current || !isVisible) {
       setPosition(null);
       return;
     }
 
+    const viewport = window.visualViewport;
+    // WebKit reports client rects relative to the visual viewport, but `position: fixed` resolves
+    // against the layout viewport. They diverge while the iOS keyboard is open, so convert like
+    // floating-ui does (WebKit bug 257375).
+    const webKitViewport = viewport != null && isWebKit() ? viewport : null;
+
     const updatePosition = () => {
       const anchor = anchorRef.current;
       if (!anchor) return;
 
       const rect = anchor.getBoundingClientRect();
-      const menuHeight = menuRef.current?.offsetHeight ?? 200;
+      const bottomEdge = rect.top + (webKitViewport?.offsetTop ?? 0) - 8; // 8px gap above anchor
 
       setPosition({
-        top: rect.top - menuHeight - 8, // 8px gap above anchor
-        left: rect.left,
+        bottomEdge,
+        left: rect.left + (webKitViewport?.offsetLeft ?? 0),
         width: rect.width,
+        // Fit the menu between the top of the visible area and the input.
+        maxHeight: Math.max(
+          0,
+          Math.min(MENU_MAX_HEIGHT_PX, bottomEdge - (viewport?.offsetTop ?? 0))
+        ),
       });
     };
 
     updatePosition();
 
-    // Update on resize/scroll
     window.addEventListener("resize", updatePosition);
     window.addEventListener("scroll", updatePosition, true);
+    viewport?.addEventListener("resize", updatePosition);
+    viewport?.addEventListener("scroll", updatePosition);
     return () => {
       window.removeEventListener("resize", updatePosition);
       window.removeEventListener("scroll", updatePosition, true);
+      viewport?.removeEventListener("resize", updatePosition);
+      viewport?.removeEventListener("scroll", updatePosition);
     };
   }, [anchorRef, isVisible, suggestions]);
 
-  // Handle keyboard navigation
   useEffect(() => {
-    if (!isVisible || suggestions.length === 0) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case "ArrowDown":
-          e.preventDefault();
-          setSelectedIndex((i) => (i + 1) % suggestions.length);
-          break;
-        case "ArrowUp":
-          e.preventDefault();
-          setSelectedIndex((i) => (i - 1 + suggestions.length) % suggestions.length);
-          break;
-        case "Tab":
-          if (!e.shiftKey && suggestions.length > 0) {
-            e.preventDefault();
-            onSelectSuggestion(suggestions[selectedIndex]);
-          }
-          break;
-        case "Enter":
-          if (!e.shiftKey && suggestions.length > 0) {
-            e.preventDefault();
-            onSelectSuggestion(suggestions[selectedIndex]);
-          }
-          break;
-        case "Escape":
-          e.preventDefault();
-          e.stopPropagation();
-          onDismiss();
-          break;
+    if (isSelectionControlled || !isVisible || suggestions.length === 0) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const delta = event.key === "ArrowDown" ? 1 : -1;
+        setUncontrolledSelectedIndex(
+          (index) => (index + delta + suggestions.length) % suggestions.length
+        );
+      } else if ((event.key === "Tab" || event.key === "Enter") && !event.shiftKey) {
+        event.preventDefault();
+        const suggestion = suggestions[selectedIndex];
+        if (suggestion) onSelectSuggestion(suggestion);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onDismiss();
       }
     };
-
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [isVisible, suggestions, selectedIndex, onSelectSuggestion, onDismiss, isFileSuggestion]);
+  }, [isSelectionControlled, isVisible, onDismiss, onSelectSuggestion, selectedIndex, suggestions]);
 
-  // Click outside handler
   useEffect(() => {
     if (!isVisible) return;
 
@@ -227,16 +210,29 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [isVisible, onDismiss]);
 
-  if (!isVisible || suggestions.length === 0) {
-    return null;
+  const isOpen = isVisible && suggestions.length > 0;
+  const activeSuggestion = suggestions[selectedIndex] ?? suggestions[0];
+  // Focus stays in the composer, so screen readers hear the list only through this live region
+  // (#5962). It stays mounted while the list is closed: a region that appears together with its
+  // text is not announced reliably. It renders in document.body because the composer dock sits in
+  // the transcript scrollport, where the transcript's loading status must stay the only status.
+  const status = createPortal(
+    <div role="status" className="sr-only">
+      {isOpen && activeSuggestion
+        ? `${activeSuggestion.display}, ${suggestions.indexOf(activeSuggestion) + 1} of ${suggestions.length}`
+        : ""}
+    </div>,
+    document.body
+  );
+
+  if (!isOpen) {
+    return status;
   }
 
-  const activeSuggestion = suggestions[selectedIndex] ?? suggestions[0];
   const resolvedListId = listId ?? `command-suggestions-list`;
 
   const content = (
     <div
-      ref={menuRef}
       id={resolvedListId}
       role="listbox"
       aria-label={ariaLabel}
@@ -245,19 +241,20 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
       }
       data-command-suggestions
       className={cn(
-        "bg-separator border-border-light z-[1010] flex max-h-[200px] flex-col overflow-y-auto rounded border shadow-[0_-4px_12px_rgba(0,0,0,0.4)]",
-        // Use absolute positioning relative to parent when not in portal mode
+        "bg-separator border-border-light z-[1010] flex flex-col overflow-y-auto rounded border shadow-[0_-4px_12px_rgba(0,0,0,0.4)]",
         !anchorRef && "absolute right-0 bottom-full left-0 mb-2"
       )}
       style={
         anchorRef && position
           ? {
               position: "fixed",
-              top: position.top,
+              // Pinning the bottom edge lets the menu grow upward without measuring its height.
+              bottom: `calc(100% - ${position.bottomEdge}px)`,
               left: position.left,
               width: position.width,
+              maxHeight: position.maxHeight,
             }
-          : undefined
+          : { maxHeight: MENU_MAX_HEIGHT_PX }
       }
     >
       {suggestions.map((suggestion, index) => (
@@ -303,10 +300,11 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
     </div>
   );
 
-  // Use portal when anchorRef is provided (to escape overflow:hidden containers)
-  if (anchorRef) {
-    return createPortal(content, document.body);
-  }
-
-  return content;
+  return (
+    <>
+      {status}
+      {/* Use portal when anchorRef is provided (to escape overflow:hidden containers) */}
+      {anchorRef ? createPortal(content, document.body) : content}
+    </>
+  );
 };

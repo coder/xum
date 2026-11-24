@@ -14,7 +14,13 @@ export interface LayoutStackItem<
 }
 
 export type TranscriptTailStackItem = LayoutStackItem<"transcript-tail">;
-export type ChatInputDecorationStackItem = LayoutStackItem<"composer-decoration">;
+export type ChatInputDecorationStackItem = LayoutStackItem<"composer-decoration"> & {
+  /**
+   * Render even before async decoration data is ready, for synchronous chat state
+   * that must stay visible during hydration.
+   */
+  readonly revealBeforeReady?: boolean;
+};
 
 function createLayoutStackItem<Lane extends LayoutStackLaneKind>(
   layoutLane: Lane,
@@ -32,7 +38,16 @@ export function createTranscriptTailStackItem(item: LayoutStackItemInit): Transc
 }
 
 export function createChatInputDecorationStackItem(
-  item: LayoutStackItemInit
+  item: LayoutStackItemInit & { revealBeforeReady?: boolean }
 ): ChatInputDecorationStackItem {
   return createLayoutStackItem("composer-decoration", item);
+}
+
+export function selectVisibleChatInputDecorations(
+  items: readonly ChatInputDecorationStackItem[],
+  revealDeferredDecorations: boolean
+): readonly ChatInputDecorationStackItem[] {
+  return revealDeferredDecorations
+    ? items
+    : items.filter((item) => item.revealBeforeReady === true);
 }

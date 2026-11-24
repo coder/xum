@@ -6,18 +6,20 @@
  *
  * Telemetry is enabled by default, including in development mode.
  * It is automatically disabled in CI, test environments, and automation contexts
- * (NODE_ENV=test, CI, MUX_E2E=1, JEST_WORKER_ID, etc.).
- * Users can manually disable telemetry by setting MUX_DISABLE_TELEMETRY=1.
+ * (NODE_ENV=test, CI, XUM_E2E=1, JEST_WORKER_ID, etc.).
+ * Users can manually disable telemetry by setting XUM_DISABLE_TELEMETRY=1.
  *
  * Uses posthog-node which batches events and flushes asynchronously.
  */
 
+import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { PostHog } from "posthog-node";
 import { randomUUID } from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
-import { getMuxHome } from "@/common/constants/paths";
+import { getXumHome } from "@/common/constants/paths";
 import { VERSION } from "@/version";
 import type { TelemetryEventPayload, BaseTelemetryProperties } from "@/common/telemetry/payload";
 
@@ -73,8 +75,11 @@ function isCIEnvironment(env: NodeJS.ProcessEnv): boolean {
  */
 function isTelemetryDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
   return (
-    env.MUX_DISABLE_TELEMETRY === "1" ||
-    env.MUX_E2E === "1" ||
+    resolveXumEnvironmentValue("DISABLE_TELEMETRY", env) === "1" ||
+    resolveXumEnvironmentValue("E2E", env) === "1" ||
+    // Session tape replay (perf harness): replayed activity is not real usage, and the PostHog
+    // client would be network egress from a replay run.
+    isSessionTapeReplayConfigured(env) ||
     env.NODE_ENV === "test" ||
     env.JEST_WORKER_ID !== undefined ||
     env.VITEST !== undefined ||
@@ -105,7 +110,7 @@ async function getElectronIsPackaged(isElectron: boolean): Promise<boolean | nul
   }
 
   try {
-    // eslint-disable-next-line no-restricted-syntax -- Electron is unavailable in `mux server`; avoid top-level import
+    // eslint-disable-next-line no-restricted-syntax -- Electron is unavailable in `xum server`; avoid top-level import
     const { app } = await import("electron");
     return app.isPackaged;
   } catch {
@@ -132,15 +137,7 @@ export class TelemetryService {
   private client: PostHog | null = null;
   private distinctId: string | null = null;
   private featureFlagVariants: Record<string, string | boolean> = {};
-  private readonly muxHome: string;
-
-  getPostHogClient(): PostHog | null {
-    return this.client;
-  }
-
-  getDistinctId(): string | null {
-    return this.distinctId;
-  }
+  private readonly xumHome: string;
 
   /**
    * Check if telemetry is enabled.
@@ -151,13 +148,13 @@ export class TelemetryService {
   }
 
   /**
-   * Check if telemetry was explicitly disabled by the user via MUX_DISABLE_TELEMETRY=1.
+   * Check if telemetry was explicitly disabled by the user via XUM_DISABLE_TELEMETRY=1.
    * This is different from isEnabled() which also returns false in dev mode.
    * Used to gate features like link sharing that should only be hidden when
-   * the user explicitly opts out of mux services.
+   * the user explicitly opts out of xum services.
    */
   isExplicitlyDisabled(): boolean {
-    return process.env.MUX_DISABLE_TELEMETRY === "1";
+    return resolveXumEnvironmentValue("DISABLE_TELEMETRY", process.env) === "1";
   }
 
   /**
@@ -187,8 +184,8 @@ export class TelemetryService {
 
     this.featureFlagVariants[key] = variant;
   }
-  constructor(muxHome?: string) {
-    this.muxHome = muxHome ?? getMuxHome();
+  constructor(xumHome?: string) {
+    this.xumHome = xumHome ?? getXumHome();
   }
 
   /**
@@ -219,7 +216,7 @@ export class TelemetryService {
 
     this.client = new PostHog(DEFAULT_POSTHOG_KEY, {
       host: DEFAULT_POSTHOG_HOST,
-      // Avoid geo-IP enrichment (we don't need coarse location for mux telemetry)
+      // Avoid geo-IP enrichment (we don't need coarse location for xum telemetry)
       disableGeoip: true,
     });
 
@@ -228,10 +225,10 @@ export class TelemetryService {
 
   /**
    * Load existing distinct ID or create a new one.
-   * Persisted in ~/.mux/telemetry_id for cross-session identity.
+   * Persisted in ~/.xum/telemetry_id for cross-session identity.
    */
   private async loadOrCreateDistinctId(): Promise<string> {
-    const idPath = path.join(this.muxHome, TELEMETRY_ID_FILE);
+    const idPath = path.join(this.xumHome, TELEMETRY_ID_FILE);
 
     try {
       // Try to read existing ID
@@ -248,7 +245,7 @@ export class TelemetryService {
 
     try {
       // Ensure directory exists
-      await fs.mkdir(this.muxHome, { recursive: true });
+      await fs.mkdir(this.xumHome, { recursive: true });
       await fs.writeFile(idPath, newId, "utf-8");
     } catch {
       // Silently ignore persistence failures
@@ -275,19 +272,6 @@ export class TelemetryService {
    * Track a telemetry event.
    * Events are silently ignored when disabled.
    */
-
-  async getFeatureFlag(key: string): Promise<boolean | string | undefined> {
-    if (isTelemetryDisabledByEnv(process.env) || !this.client || !this.distinctId) {
-      return undefined;
-    }
-
-    try {
-      // `getFeatureFlag` will automatically emit $feature_flag_called.
-      return await this.client.getFeatureFlag(key, this.distinctId, { disableGeoip: true });
-    } catch {
-      return undefined;
-    }
-  }
   capture(payload: TelemetryEventPayload): void {
     if (isTelemetryDisabledByEnv(process.env) || !this.client || !this.distinctId) {
       return;

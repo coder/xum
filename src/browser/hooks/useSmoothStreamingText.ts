@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { sliceAtGraphemeBoundary } from "@/browser/utils/streaming/graphemePrefix";
 import { SmoothTextEngine } from "@/browser/utils/streaming/SmoothTextEngine";
 
 export interface UseSmoothStreamingTextOptions {
@@ -21,50 +22,18 @@ export interface UseSmoothStreamingTextResult {
   isCaughtUp: boolean;
 }
 
-const graphemeSegmenter =
-  typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
-    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
-    : null;
-
-function sliceAtGraphemeBoundary(text: string, maxCodeUnitLength: number): string {
-  if (maxCodeUnitLength <= 0) {
-    return "";
-  }
-
-  if (maxCodeUnitLength >= text.length) {
-    return text;
-  }
-
-  if (graphemeSegmenter) {
-    let safeEnd = 0;
-
-    for (const segment of graphemeSegmenter.segment(text)) {
-      const segmentEnd = segment.index + segment.segment.length;
-      if (segmentEnd > maxCodeUnitLength) {
-        break;
-      }
-      safeEnd = segmentEnd;
-    }
-
-    return text.slice(0, safeEnd);
-  }
-
-  let safeEnd = 0;
-  for (const codePoint of Array.from(text)) {
-    const codePointEnd = safeEnd + codePoint.length;
-    if (codePointEnd > maxCodeUnitLength) {
-      break;
-    }
-    safeEnd = codePointEnd;
-  }
-
-  return text.slice(0, safeEnd);
-}
-
 export function useSmoothStreamingText(
   options: UseSmoothStreamingTextOptions
 ): UseSmoothStreamingTextResult {
-  const engineRef = useRef(new SmoothTextEngine());
+  const engineRef = useRef<SmoothTextEngine | null>(null);
+  if (engineRef.current === null) {
+    engineRef.current = new SmoothTextEngine();
+    // Text present when the row mounts was already delivered: a chat switch-back or a bundle
+    // toggle remounts a row that is still streaming, and re-typing it from empty flashed an
+    // empty or short row (#5555). A non-streaming update reveals it whole; only later growth is
+    // smoothed. A stream key change below still resets to empty, so this applies once.
+    engineRef.current.update(options.fullText, false, options.bypassSmoothing);
+  }
   const previousStreamKeyRef = useRef(options.streamKey);
 
   if (previousStreamKeyRef.current !== options.streamKey) {
@@ -94,6 +63,7 @@ export function useSmoothStreamingText(
   // Frame callback stored as a ref so effects don't depend on it, preventing
   // teardown/restart of the RAF loop on every text delta. Reads from refs and
   // the stable engine instance, so the captured closure is always correct.
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const frameRef = useRef<FrameRequestCallback>(null!);
   frameRef.current = (timestampMs: number) => {
     if (previousTimestampRef.current !== null) {

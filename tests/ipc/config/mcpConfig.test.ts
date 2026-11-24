@@ -37,8 +37,15 @@ if (shouldRunIntegrationTests()) {
 }
 
 // Shared types for MCP content parsing
-type MediaItem = { type: "media"; data: string; mediaType: string };
-type TextItem = { type: "text"; text: string };
+interface MediaItem {
+  type: "media";
+  data: string;
+  mediaType: string;
+}
+interface TextItem {
+  type: "text";
+  text: string;
+}
 
 function isMediaItem(item: unknown): item is MediaItem {
   return (
@@ -149,7 +156,7 @@ describeIntegration("MCP global configuration", () => {
       const initial = await client.mcp.list({ projectPath: repoPath });
       expect(initial).toEqual({});
 
-      // Add server (writes to global <muxHome>/mcp.jsonc)
+      // Add server (writes to global <xumHome>/mcp.jsonc)
       const addResult = await client.mcp.add({
         name: "chrome-devtools",
         command: CHROME_DEVTOOLS_MCP_NPX,
@@ -269,6 +276,7 @@ describeIntegration("MCP global configuration", () => {
             transport: "stdio",
             command: globalCommand,
             disabled: false,
+            configLayer: "global",
           },
         });
       } finally {

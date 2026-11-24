@@ -18,10 +18,16 @@ const Tooltip = TooltipPrimitive.Root;
 
 const TooltipTrigger = TooltipPrimitive.Trigger;
 
+// Tooltips often sit above dense controls such as the chat composer, so the shared surface uses
+// stronger elevation and typographic hierarchy than the surrounding chrome without becoming a card.
 const TOOLTIP_SURFACE_CLASSNAME = [
-  "bg-modal-bg text-foreground z-[9999] max-w-80 rounded px-[10px] py-[6px]",
-  "text-[11px] font-normal font-sans text-left whitespace-normal break-words",
-  "border border-separator-light shadow-[0_2px_8px_rgba(0,0,0,0.4)]",
+  "bg-tooltip-bg text-tooltip-foreground border-tooltip-border shadow-tooltip z-[9999]",
+  "max-w-[min(20rem,calc(100vw-1rem))] rounded-lg border px-3 py-2",
+  "font-sans text-xs leading-[1.45] font-normal text-left whitespace-normal break-words",
+  "[&_strong]:text-content-primary [&_strong]:font-semibold",
+  "[&_kbd]:bg-surface-secondary [&_kbd]:text-content-primary [&_kbd]:border-tooltip-border",
+  "[&_kbd]:rounded [&_kbd]:border [&_kbd]:px-1.5 [&_kbd]:py-0.5 [&_kbd]:font-mono [&_kbd]:text-[10px]",
+  "[&_code]:bg-surface-secondary [&_code]:text-content-primary [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5",
 ].join(" ");
 
 function getTextContent(node: React.ReactNode): string {
@@ -54,7 +60,13 @@ const TooltipArrow = React.forwardRef<
   React.ElementRef<typeof TooltipPrimitive.Arrow>,
   React.ComponentPropsWithoutRef<typeof TooltipPrimitive.Arrow>
 >(({ className, ...props }, ref) => (
-  <TooltipPrimitive.Arrow ref={ref} className={cn("fill-modal-bg", className)} {...props} />
+  <TooltipPrimitive.Arrow
+    ref={ref}
+    width={12}
+    height={6}
+    className={cn("fill-tooltip-bg", className)}
+    {...props}
+  />
 ));
 TooltipArrow.displayName = TooltipPrimitive.Arrow.displayName;
 
@@ -63,26 +75,33 @@ const TooltipContent = React.forwardRef<
   React.ComponentPropsWithoutRef<typeof TooltipPrimitive.Content> & {
     showArrow?: boolean;
   }
->(({ className, sideOffset = 8, showArrow = true, children, ...props }, ref) => (
-  <TooltipPrimitive.Portal>
-    <TooltipPrimitive.Content
-      ref={ref}
-      sideOffset={sideOffset}
-      className={cn(
-        TOOLTIP_SURFACE_CLASSNAME,
-        "animate-in fade-in-0 zoom-in-95",
-        "data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95",
-        "data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2",
-        "data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
-        className
-      )}
-      {...props}
-    >
-      {children}
-      {showArrow && <TooltipArrow />}
-    </TooltipPrimitive.Content>
-  </TooltipPrimitive.Portal>
-));
+>(
+  (
+    { className, sideOffset = 10, collisionPadding = 8, showArrow = true, children, ...props },
+    ref
+  ) => (
+    <TooltipPrimitive.Portal>
+      <TooltipPrimitive.Content
+        ref={ref}
+        sideOffset={sideOffset}
+        collisionPadding={collisionPadding}
+        className={cn(
+          TOOLTIP_SURFACE_CLASSNAME,
+          "origin-[var(--radix-tooltip-content-transform-origin)]",
+          "animate-in fade-in-0 zoom-in-95 duration-150 ease-out",
+          "data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=closed]:duration-100",
+          "data-[side=bottom]:slide-in-from-top-1 data-[side=left]:slide-in-from-right-1",
+          "data-[side=right]:slide-in-from-left-1 data-[side=top]:slide-in-from-bottom-1",
+          className
+        )}
+        {...props}
+      >
+        {children}
+        {showArrow && <TooltipArrow />}
+      </TooltipPrimitive.Content>
+    </TooltipPrimitive.Portal>
+  )
+);
 TooltipContent.displayName = TooltipPrimitive.Content.displayName;
 
 interface TooltipIfPresentProps extends Omit<

@@ -1,24 +1,56 @@
 import React from "react";
-import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
+import assert from "@/common/utils/assert";
+import { sumSessionCostUsage, useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
 import {
   sumUsageHistory,
   formatCostWithDollar,
   getTotalCost,
   type ChatUsageDisplay,
 } from "@/common/utils/tokens/usageAggregator";
-import { normalizeToCanonical, formatModelStringForDisplay } from "@/common/utils/ai/models";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { formatModelStringForDisplay } from "@/common/utils/ai/models";
+import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { TOKEN_COMPONENT_COLORS, formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
+import { getSessionCacheHealth } from "@/common/utils/tokens/cacheHealth";
+import { PromptCacheHealth } from "./PromptCacheHealth";
 
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import type { UsageViewMode } from "@/common/config/schemas/userPreferences";
 
-type ViewMode = "last-request" | "session";
-
-const VIEW_MODE_OPTIONS: Array<ToggleOption<ViewMode>> = [
+const VIEW_MODE_OPTIONS: Array<ToggleOption<UsageViewMode>> = [
   { value: "session", label: "Session" },
   { value: "last-request", label: "Last Request" },
 ];
+
+export function mergeUsageByModel(
+  a: Record<string, ChatUsageDisplay> | undefined,
+  b: Record<string, ChatUsageDisplay> | undefined
+): Map<string, ChatUsageDisplay> {
+  const merged = new Map<string, ChatUsageDisplay>(Object.entries(a ?? {}));
+  for (const [model, entry] of Object.entries(b ?? {})) {
+    const existing = merged.get(model);
+    const sum = existing ? sumUsageHistory([existing, entry]) : entry;
+    assert(sum, "mergeUsageByModel: sum of two usages must exist");
+    merged.set(model, sum);
+  }
+  return merged;
+}
+
+/** The session cost already includes this spend: the note only says how much came from it. */
+export function SubagentCostNote(props: { total?: ChatUsageDisplay; count?: number }) {
+  const cost = props.total ? getTotalCost(props.total) : undefined;
+  if (cost === undefined || cost <= 0 || props.count === undefined) {
+    return null;
+  }
+  return (
+    <div data-testid="cost-subagents" className="text-muted counter-nums -mt-2 mb-1 text-[11px]">
+      Includes {formatCostWithDollar(cost)} from {props.count} open sub-agent
+      {props.count === 1 ? "" : "s"}
+    </div>
+  );
+}
 
 interface CostsTabProps {
   workspaceId: string;
@@ -26,28 +58,35 @@ interface CostsTabProps {
 
 const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>("costsTab:viewMode", "session");
+  const { config: providersConfig } = useProvidersConfig();
+  const viewMode =
+    useUserPreferences((preferences) => preferences.ui?.costsTabViewMode) ?? "session";
 
-  // Session usage for cost calculation
-  // Uses sessionTotal (pre-computed) + liveCostUsage (cumulative during streaming)
-  const sessionUsage = React.useMemo(() => {
-    const parts: ChatUsageDisplay[] = [];
-    if (usage.sessionTotal) parts.push(usage.sessionTotal);
-    if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
-    return parts.length > 0 ? sumUsageHistory(parts) : undefined;
-  }, [usage.sessionTotal, usage.liveCostUsage]);
+  const sessionUsage = sumSessionCostUsage(usage);
+  const sessionCacheHealth = getSessionCacheHealth(usage);
 
   // Per-model session costs. Live streaming usage is not yet folded into the
   // persisted byModel record, so merge it into the active model's bucket to
   // keep rows consistent with the session total above.
   const sessionModelRows = (() => {
-    const merged = new Map<string, ChatUsageDisplay>(Object.entries(usage.sessionByModel ?? {}));
+    // Open sub-agents count toward the session total above, so their models do too.
+    const merged = mergeUsageByModel(usage.sessionByModel, usage.subagentByModel);
     const liveModel = usage.liveCostUsage?.model;
     if (usage.liveCostUsage && liveModel) {
-      const key = normalizeToCanonical(liveModel);
+      // Same ledger key as the backend and WorkspaceStore deltas: live Coder
+      // usage keys on the stream's request-pinned metadata identity
+      // (liveMetadataModel) — re-resolving the raw coder:<instance>/<model>
+      // against a mid-stream-refreshed providers config could re-key or
+      // split the row from the backend's bucket. Non-Coder models keep the
+      // canonical normalizeUsageModelKey.
+      const key =
+        liveModel.startsWith("coder:") && usage.liveMetadataModel
+          ? usage.liveMetadataModel
+          : normalizeUsageModelKey(liveModel, providersConfig);
       const existing = merged.get(key);
       merged.set(
         key,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         existing ? sumUsageHistory([existing, usage.liveCostUsage])! : usage.liveCostUsage
       );
     }
@@ -73,7 +112,8 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   if (!hasCostData) {
     return (
       <div className="text-light font-primary text-[13px] leading-relaxed">
-        <div className="text-secondary px-5 py-10 text-center">
+        {/* text-muted: text-secondary is below WCAG AA here in the dark themes (#6010). */}
+        <div className="text-muted px-5 py-10 text-center">
           <p>No messages yet.</p>
           <p>Send a message to see cost statistics.</p>
         </div>
@@ -173,7 +213,9 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                   <ToggleGroup
                     options={VIEW_MODE_OPTIONS}
                     value={viewMode}
-                    onChange={setViewMode}
+                    onChange={(costsTabViewMode) =>
+                      updateUserPreferences({ ui: { costsTabViewMode } })
+                    }
                   />
                 </div>
                 <span className="text-muted flex items-center gap-1 text-xs tabular-nums">
@@ -190,6 +232,9 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                   )}
                 </span>
               </div>
+              {viewMode === "session" && (
+                <SubagentCostNote total={usage.subagentTotal} count={usage.subagentCount} />
+              )}
               <div className="relative w-full">
                 <div className="bg-border-light flex h-1.5 w-full overflow-hidden rounded-[3px]">
                   {cachedCostPercentage > 0 && (
@@ -314,6 +359,13 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                 ))}
               </tbody>
             </table>
+          )}
+          {sessionCacheHealth && (
+            // The session row counts the whole tree. The turn rows are this workspace's own turns.
+            <PromptCacheHealth
+              session={sessionCacheHealth}
+              turns={usage.recentTurnCacheHealth ?? []}
+            />
           )}
         </div>
       </div>

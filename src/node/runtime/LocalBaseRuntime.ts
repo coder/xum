@@ -1,8 +1,9 @@
-import { spawn } from "child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "child_process";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
-import { Readable, Writable } from "stream";
+import type { Readable } from "stream";
+import { Writable } from "stream";
 
 import type {
   Runtime,
@@ -17,6 +18,8 @@ import type {
   WorkspaceForkResult,
   InitLogger,
   EnsureReadyResult,
+  ReadFileOptions,
+  RuntimeLocation,
 } from "./Runtime";
 import { RuntimeError as RuntimeErrorClass } from "./Runtime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
@@ -25,11 +28,264 @@ import { shellQuote } from "@/common/utils/shell";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { DisposableProcess, forceCloseStdio, killProcessTree } from "@/node/utils/disposableExec";
 import { expandTilde } from "./tildeExpansion";
-import { getInitHookPath, createLineBufferedLoggers } from "./initHook";
+import {
+  createLineBufferedLoggers,
+  findInitHookRelativePath,
+  runWorkspaceInitHook,
+} from "./initHook";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
-import { sanitizeMuxChildEnv } from "./childProcessEnv";
+import { localExecEnv, stripSandboxedChildEnv } from "./childProcessEnv";
+import {
+  agentSandboxDenialsAfterExit,
+  wrapForAgentSandbox,
+  type AgentSandboxWrap,
+  type WrapForAgentSandboxOptions,
+} from "./sandbox/macosSandbox";
+import {
+  agentSandboxApplies,
+  agentSandboxSettingsFor,
+  anyAgentSandboxEnabled,
+  buildStrictestAgentSandboxPolicy,
+  type AgentSandboxPolicy,
+  type AgentSandboxPolicyInput,
+} from "./sandbox/agentSandboxTargets";
+import { isPathAtOrUnder, PROTECTED_BASH } from "./sandbox/sandboxPaths";
+import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
+import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
+import {
+  getSelfIdentity,
+  linuxBirth,
+  type HolderEvidence,
+} from "@/node/utils/concurrency/processLiveness";
+
+/**
+ * Acquire a regular file for ReadFileOptions.requireRegularFile.
+ *
+ * O_NONBLOCK makes open() of a writer-less FIFO return at once instead of
+ * blocking in the kernel (which would park a libuv worker that no abort can
+ * release); it has no effect on reads of a regular file. The type check is an
+ * fstat on the descriptor we just acquired, so whatever the path points at
+ * afterwards cannot change what is streamed.
+ *
+ * Ownership: this function owns the handle until the stream is created; on
+ * classification failure or an abort observed before hand-off it closes the
+ * handle itself. After hand-off the stream owns it (autoClose on end/error/
+ * destroy) and nothing else may close it.
+ */
+async function openRegularFileStream(
+  filePath: string,
+  resolvedPath: string,
+  abortSignal?: AbortSignal
+): Promise<Readable> {
+  // O_NONBLOCK is undefined on Windows; a plain open is the best we can do there.
+  const nonblock = fs.constants.O_NONBLOCK ?? 0;
+  const handle = await fsPromises.open(resolvedPath, fs.constants.O_RDONLY | nonblock);
+  try {
+    if (abortSignal?.aborted) {
+      throw new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io");
+    }
+    const stat = await handle.stat();
+    if (abortSignal?.aborted) {
+      throw new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io");
+    }
+    if (!stat.isFile()) {
+      throw new RuntimeErrorClass(`${filePath} is not a regular file`, "file_io");
+    }
+    // Inside the try so a construction failure still closes the handle; once
+    // this returns, the stream owns the handle (autoClose).
+    return handle.createReadStream({ autoClose: true });
+  } catch (err) {
+    await handle.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
+ * Wrap a (possibly lazily acquired) node Readable as a pull-based web stream
+ * with abort and cancel plumbing. `acquire` runs inside start(); a failure
+ * there surfaces as a file_io RuntimeError on the stream.
+ */
+function wrapNodeReadable(
+  filePath: string,
+  acquire: () => Readable | Promise<Readable>,
+  abortSignal?: AbortSignal
+): ReadableStream<Uint8Array> {
+  // Set once acquisition succeeds; abort/cancel arriving earlier are replayed
+  // right after acquisition so the source is never left open.
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let cancelled = false;
+
+  // r19: honor caller aborts (kernel deadline, workspace removal), not just
+  // consumer cancellation — a FIFO or blocked network-mounted file can
+  // stall before yielding enough bytes for a consumer-side ceiling to
+  // cancel, leaving the pending read and its fd blocked forever. Aborting
+  // cancels the inner reader, which destroys the node stream and settles
+  // the pinned READ. It cannot release a kernel-blocked OPEN — only the
+  // nonblocking acquisition in openRegularFileStream avoids that.
+  const onAbort = () => {
+    void reader?.cancel(abortSignal?.reason).catch(() => undefined);
+  };
+  if (abortSignal?.aborted) {
+    onAbort();
+  } else {
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+  }
+  const cleanupAbortForwarder = () => {
+    abortSignal?.removeEventListener("abort", onAbort);
+  };
+
+  // Pull-based (not an eager start loop): consumers control the read rate
+  // (backpressure), and cancellation can reach the source — the old eager
+  // loop had no cancel callback, so a cancelled wrapper (e.g. mux.load's
+  // byte ceiling on /dev/zero) abandoned the reader and leaked the open
+  // file handle (r18).
+  return new ReadableStream<Uint8Array>({
+    start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
+      try {
+        const nodeStream = await acquire();
+        const webStream = nodeReadableToWeb(nodeStream);
+        reader = webStream.getReader();
+        if (cancelled || abortSignal?.aborted) {
+          // Landed while acquiring (reader did not exist yet): release the source now.
+          void reader.cancel(abortSignal?.reason).catch(() => undefined);
+        }
+      } catch (err) {
+        cleanupAbortForwarder();
+        controller.error(
+          err instanceof RuntimeErrorClass
+            ? err
+            : new RuntimeErrorClass(
+                `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
+                "file_io",
+                err
+              )
+        );
+      }
+    },
+    pull: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
+      try {
+        // start() either set the reader or errored the stream (pull is not called then).
+        if (!reader) {
+          throw new Error("reader missing after start");
+        }
+        const { done, value } = await reader.read();
+        // reader.cancel() settles a pinned read as {done: true}; surface
+        // the abort as an error rather than a clean EOF so consumers do
+        // not mistake a truncated read for the whole file.
+        if (abortSignal?.aborted) {
+          cleanupAbortForwarder();
+          controller.error(new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io"));
+          return;
+        }
+        if (done) {
+          cleanupAbortForwarder();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        cleanupAbortForwarder();
+        controller.error(
+          new RuntimeErrorClass(
+            `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
+            "file_io",
+            err
+          )
+        );
+      }
+    },
+    cancel: async (reason: unknown) => {
+      cancelled = true;
+      cleanupAbortForwarder();
+      // Destroys the underlying node stream and closes the fd.
+      await reader?.cancel(reason);
+    },
+  });
+}
+
+/**
+ * Temp root of every host-local runtime (tempDir()): /tmp on Unix, TEMP on Windows.
+ * Deliberately not os.tmpdir(): that follows TMPDIR (macOS /var/folders/...), and host-local
+ * background-process records must live under one root that every backend on the host derives
+ * the same way (localBgRecordsRoot in backgroundProcessExecutor).
+ */
+export function localRuntimeTempRoot(): string {
+  return process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
+}
+
+/** Capture host-local evidence without substituting the owner's birth. */
+export function getLocalProcessEvidence(pid: number | undefined): HolderEvidence | undefined {
+  if (pid === undefined) return undefined;
+  return { pid, identity: { ...getSelfIdentity(), birth: linuxBirth(pid) } };
+}
+
+function throwIfAbortedBeforeExec(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new RuntimeErrorClass("Operation aborted before execution", "exec");
+  }
+}
+
+/**
+ * Spawns `bash -c script` through `start`, or sandbox-exec when `sandboxed` is set, and frees the
+ * sandbox registration when the process fails to start, and when it ends unless `keepNetwork`
+ * takes that over (ExecOptions.keepSandboxNetwork).
+ */
+function spawnWithSandbox<T extends ChildProcess>(
+  sandboxed: AgentSandboxWrap | null,
+  input: {
+    bashPath: string;
+    script: string;
+    env: NodeJS.ProcessEnv;
+    keepNetwork?: (release: () => void) => void;
+  },
+  start: (command: string, args: string[], env: NodeJS.ProcessEnv) => T
+): T {
+  if (sandboxed === null) return start(input.bashPath, ["-c", input.script], input.env);
+  let proc: T;
+  try {
+    // Only the keys srt and sandboxToolEnv() add go on top of Xum's own env, so srt cannot
+    // bring back a key that Xum strips.
+    proc = start(sandboxed.command, sandboxed.args, {
+      ...stripSandboxedChildEnv(input.env),
+      ...sandboxed.env,
+    });
+  } catch (error) {
+    sandboxed.dispose();
+    throw error;
+  }
+  proc.once("error", sandboxed.dispose);
+  if (input.keepNetwork === undefined) proc.once("exit", sandboxed.dispose);
+  else input.keepNetwork(sandboxed.dispose);
+  return proc;
+}
+
+function sandboxDenialsField(
+  sandboxed: AgentSandboxWrap | null
+): Pick<ExecStream, "sandboxDenials"> {
+  if (sandboxed === null) return {};
+  return {
+    sandboxDenials: (failed: boolean) => agentSandboxDenialsAfterExit(sandboxed.commandId, failed),
+  };
+}
+
+function killInitHook(proc: ChildProcess): void {
+  if (proc.pid !== undefined) {
+    killProcessTree(proc.pid);
+    return;
+  }
+  try {
+    proc.kill("SIGKILL");
+  } catch {
+    // ignore
+  }
+}
+
+// The PATH of Xum's own commands outside the agent sandbox: macOS System Integrity Protection
+// keeps these folders read-only, also for extraWritePaths. /usr/local/bin is not one of them
+// (Homebrew on Intel owns it).
+const SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
@@ -50,13 +306,83 @@ import { sanitizeMuxChildEnv } from "./childProcessEnv";
  * - renameWorkspace()
  * - forkWorkspace()
  */
+
 export abstract class LocalBaseRuntime implements Runtime {
+  /** Runtime.location. A prototype getter, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- a readonly field is set by the constructor, so Object.create(X.prototype) doubles (mcpServerManager.test.ts) would read undefined
+  get location(): RuntimeLocation {
+    return "local";
+  }
+
+  /**
+   * The config path of the project whose agent resource limit binds this runtime's commands, or
+   * undefined when it is not known; those commands get only the limit that all projects share.
+   */
+  protected agentCgroupProjectPath(): string | undefined {
+    return undefined;
+  }
+
+  /** This runtime's workspace checkout, when it is known. */
+  protected sandboxCheckoutRoot(): string | undefined {
+    return undefined;
+  }
+
+  /**
+   * `roots`, plus the checkout when the command works in it: the cwd of a workspace for a
+   * sub-project is a folder inside the checkout, and git and edits there need the rest of it.
+   */
+  private withCheckoutRoot(cwd: string, roots: readonly string[] | undefined): string[] {
+    const listed = [...(roots ?? [])];
+    const checkout = this.sandboxCheckoutRoot();
+    if (checkout === undefined) return listed;
+    const inCheckout = [cwd, ...listed].some((root) =>
+      isPathAtOrUnder(path.resolve(root), path.resolve(checkout))
+    );
+    return inCheckout ? [...listed, checkout] : listed;
+  }
+
+  /**
+   * The bash and the env of a call that opts out of an agent sandbox that applies: approved bash
+   * calls, MCP servers and Xum's own commands. Bash sources the file that BASH_ENV names before
+   * the script, and it defines the exported bash functions (`BASH_FUNC_git%%`) whatever BASH_ENV
+   * and PATH are, and either can run a file that a sandboxed command wrote in the workspace (Codex
+   * review), so no opt-out keeps them. Each runs PROTECTED_BASH, and Xum's fixed scripts also skip
+   * the inherited PATH, which can hold a folder that sandboxed commands write (an activated
+   * <workspace>/.venv/bin), so a planted `rm` or `bash` never runs unsandboxed. This holds while the sandbox is on for any project: a
+   * sandboxed command of one project can write those files for a call of another, and a runtime
+   * for a new worktree's path finds no project at all (Codex review).
+   */
+  private sandboxOptOut(
+    cwd: string,
+    options: ExecOptions
+  ): { bashPath: string; env: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv } {
+    const inherited = { bashPath: getBashPath(), env: (env: NodeJS.ProcessEnv) => env };
+    if (options.sandbox === undefined) return inherited;
+    if (
+      !this.sandboxOnAnywhere() &&
+      !agentSandboxApplies(this, { cwd, otherProjectPaths: options.sandboxProjectPaths })
+    ) {
+      return inherited;
+    }
+    const withoutBashStartup = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
+      ...Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("BASH_FUNC_"))),
+      BASH_ENV: "",
+    });
+    if (options.sandbox === "off") return { bashPath: PROTECTED_BASH, env: withoutBashStartup };
+    return {
+      bashPath: PROTECTED_BASH,
+      env: (env) => ({ ...withoutBashStartup(env), PATH: SYSTEM_PATH }),
+    };
+  }
+
+  private sandboxOnAnywhere(): boolean {
+    return this.location === "local" && process.platform === "darwin" && anyAgentSandboxEnabled();
+  }
+
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
     const startTime = performance.now();
 
-    if (options.abortSignal?.aborted) {
-      throw new RuntimeErrorClass("Operation aborted before execution", "exec");
-    }
+    throwIfAbortedBeforeExec(options.abortSignal);
 
     // Use the specified working directory (must be a specific workspace path)
     const cwd = options.cwd;
@@ -66,15 +392,14 @@ export abstract class LocalBaseRuntime implements Runtime {
     try {
       await fsPromises.access(cwd);
     } catch (err) {
-      throw new RuntimeErrorClass(
-        `Working directory does not exist: ${cwd}`,
-        "exec",
-        err instanceof Error ? err : undefined
-      );
+      throw new RuntimeErrorClass(`Working directory does not exist: ${cwd}`, "exec", err);
     }
+    // An abort during the check above fires no listener (none is added until after the spawn), so
+    // without this second check the process would start and run to its end after the abort.
+    throwIfAbortedBeforeExec(options.abortSignal);
 
-    const bashPath = getBashPath();
-    const spawnCommand = bashPath;
+    const optOut = this.sandboxOptOut(cwd, options);
+    const bashPath = optOut.bashPath;
 
     // Match RemoteRuntime behavior: ensure non-interactive env vars are set inside the shell.
     //
@@ -85,40 +410,67 @@ export abstract class LocalBaseRuntime implements Runtime {
       .map(([key, value]) => buildShellExport(key, value))
       .join("\n");
 
-    const spawnArgs = ["-c", `${nonInteractivePrelude}\n${command}`];
+    // Expand host-side with the same semantics as local file I/O: expandTilde
+    // routes ~/.xum (and legacy homes) through getXumHome, which in-shell $HOME
+    // expansion would miss (XUM_ROOT, dev suffix), and relative values resolve
+    // against the exec cwd, matching the shell's $PWD when the exports run.
+    const pathEnvPrelude = Object.entries(options.pathEnv ?? {})
+      .map(([key, value]) => buildShellExport(key, path.resolve(cwd, expandTilde(value))))
+      .join("\n");
+    const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`;
 
-    const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-    const mergedEnv = sanitizeMuxChildEnv({ ...process.env, ...(options.env ?? {}) });
-    const basePath =
-      (options.env?.PATH && options.env.PATH.length > 0
-        ? mergedEnv.PATH
-        : (mergedEnv.PATH ?? mergedEnv.Path)) ?? defaultPath;
-    const effectivePath = basePath;
-
-    const childProcess = spawn(spawnCommand, spawnArgs, {
-      cwd,
-      env: {
-        ...mergedEnv,
-        ...NON_INTERACTIVE_ENV_VARS,
-        PATH: effectivePath,
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-      // CRITICAL: Spawn as detached process group leader to enable cleanup of background processes.
-      // When a bash script spawns background processes (e.g., `sleep 100 &`), we need to kill
-      // the entire process group (including all backgrounded children) via process.kill(-pid).
-      // NOTE: detached:true does NOT cause bash to wait for background jobs when using 'exit' event
-      // instead of 'close' event. The 'exit' event fires when bash exits, ignoring background children.
-      detached: true,
-      // Prevent console window from appearing on Windows (WSL bash spawns steal focus otherwise)
-      windowsHide: true,
+    const callerEnv = options.env ?? {};
+    const { env: mergedEnv, path: effectivePath } = localExecEnv(callerEnv, options.hostEnv);
+    const childEnv = optOut.env({
+      ...mergedEnv,
+      ...NON_INTERACTIVE_ENV_VARS,
+      PATH: effectivePath,
     });
+
+    // Null when the sandbox is off, not on macOS, or the caller opts out. Throws (and runs
+    // nothing) when the sandbox applies but cannot start: it never falls back to running
+    // unsandboxed.
+    const sandboxed = await this.wrapForSandbox(cwd, script, {
+      bashPath,
+      abortSignal: options.abortSignal,
+      optOut: options.sandbox !== undefined,
+      workspaceRoots: options.sandboxRoots,
+      readPaths: options.sandboxReadPaths,
+      scratchDir: callerEnv.XUM_SCRATCH_DIR,
+      pathEnv: effectivePath,
+      otherProjectPaths: options.sandboxProjectPaths,
+      env: childEnv,
+    });
+
+    const childProcess = spawnWithSandbox(
+      sandboxed,
+      { bashPath, script, env: childEnv, keepNetwork: options.keepSandboxNetwork },
+      (spawnCommand, spawnArgs, env): ChildProcessWithoutNullStreams =>
+        spawn(spawnCommand, spawnArgs, {
+          cwd,
+          env,
+          stdio: ["pipe", "pipe", "pipe"],
+          // CRITICAL: Spawn as detached process group leader to enable cleanup of background processes.
+          // When a bash script spawns background processes (e.g., `sleep 100 &`), we need to kill
+          // the entire process group (including all backgrounded children) via process.kill(-pid).
+          // NOTE: detached:true does NOT cause bash to wait for background jobs when using 'exit' event
+          // instead of 'close' event. The 'exit' event fires when bash exits, ignoring background children.
+          detached: true,
+          // Prevent console window from appearing on Windows (WSL bash spawns steal focus otherwise)
+          windowsHide: true,
+        })
+    );
+
+    const localProcess = getLocalProcessEvidence(childProcess.pid);
 
     // Wrap in DisposableProcess for automatic cleanup
     const disposable = new DisposableProcess(childProcess);
 
-    // Convert Node.js streams to Web Streams
-    const stdout = Readable.toWeb(childProcess.stdout) as unknown as ReadableStream<Uint8Array>;
-    const stderr = Readable.toWeb(childProcess.stderr) as unknown as ReadableStream<Uint8Array>;
+    // Convert Node.js streams to Web Streams. Not Readable.toWeb: on Bun 1.4.3 it can throw an
+    // uncaught error when the bash tool cancels a reader on output overflow (nodeReadableToWeb).
+    const stdout = nodeReadableToWeb(childProcess.stdout);
+    const stderr = nodeReadableToWeb(childProcess.stderr);
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdin = Writable.toWeb(childProcess.stdin) as unknown as WritableStream<Uint8Array>;
 
     // No stream cleanup in DisposableProcess - streams close naturally when process exits
@@ -206,45 +558,94 @@ export abstract class LocalBaseRuntime implements Runtime {
       void exitCode.catch(() => undefined).finally(() => clearTimeout(timeoutHandle));
     }
 
-    return { stdout, stderr, stdin, exitCode, duration };
+    return {
+      stdout,
+      stderr,
+      stdin,
+      exitCode,
+      duration,
+      localProcess,
+      ...sandboxDenialsField(sandboxed),
+    };
   }
 
-  readFile(filePath: string, _abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before reading (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
-    const nodeStream = fs.createReadStream(expandedPath);
-
-    // Handle errors by wrapping in a transform
-    const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
-
-    return new ReadableStream<Uint8Array>({
-      async start(controller: ReadableStreamDefaultController<Uint8Array>) {
-        try {
-          const reader = webStream.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-          controller.close();
-        } catch (err) {
-          controller.error(
-            new RuntimeErrorClass(
-              `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
-              "file_io",
-              err instanceof Error ? err : undefined
-            )
-          );
-        }
-      },
+  agentSandboxPolicy(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null {
+    // Devcontainer commands run in the container, which the macOS sandbox does not cover.
+    if (this.location !== "local" || process.platform !== "darwin") return null;
+    const settings = agentSandboxSettingsFor(
+      this.agentCgroupProjectPath(),
+      input.otherProjectPaths
+    );
+    if (settings === null) return null;
+    return buildStrictestAgentSandboxPolicy(settings, {
+      ...input,
+      workspaceRoots: this.withCheckoutRoot(input.cwd, input.workspaceRoots),
     });
+  }
+
+  /** The sandboxed spawn of `script` in `cwd`, or null; see wrapForAgentSandbox(). */
+  protected async wrapForSandbox(
+    cwd: string,
+    script: string,
+    options: WrapForAgentSandboxOptions
+  ): Promise<AgentSandboxWrap | null> {
+    if (this.location !== "local") return null;
+    try {
+      const sandboxed = await wrapForAgentSandbox(this.agentCgroupProjectPath(), cwd, script, {
+        ...options,
+        workspaceRoots: this.withCheckoutRoot(cwd, options.workspaceRoots),
+      });
+      // Nothing spawns it, so nothing else frees its network list registration.
+      if (options.abortSignal?.aborted) sandboxed?.dispose();
+      throwIfAbortedBeforeExec(options.abortSignal);
+      return sandboxed;
+    } catch (error) {
+      if (error instanceof RuntimeErrorClass) throw error;
+      throwIfAbortedBeforeExec(options.abortSignal);
+      throw new RuntimeErrorClass(getErrorMessage(error), "exec", error);
+    }
+  }
+
+  /** wrapForSandbox() for the init hook, which logs a sandbox that cannot start and runs nothing. */
+  private async wrapInitHookForSandbox(
+    workspacePath: string,
+    script: string,
+    initLogger: InitLogger,
+    options: WrapForAgentSandboxOptions
+  ): Promise<{ ok: true; sandboxed: AgentSandboxWrap | null } | { ok: false }> {
+    try {
+      return { ok: true, sandboxed: await this.wrapForSandbox(workspacePath, script, options) };
+    } catch (error) {
+      initLogger.logStderr(`Error running init hook: ${getErrorMessage(error)}`);
+      initLogger.logComplete(options.abortSignal?.aborted ? EXIT_CODE_ABORTED : -1);
+      return { ok: false };
+    }
+  }
+
+  readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
+    const resolvedPath = path.resolve(expandTilde(filePath));
+    if (options?.requireRegularFile) {
+      return wrapNodeReadable(
+        filePath,
+        () => openRegularFileStream(filePath, resolvedPath, abortSignal),
+        abortSignal
+      );
+    }
+    // Default: exactly the historical fs.createReadStream(path). FIFOs, devices
+    // and sockets keep their native semantics here, including a kernel-blocking
+    // open() on a writer-less FIFO — callers that cannot tolerate that opt in
+    // to requireRegularFile above.
+    const nodeStream = fs.createReadStream(resolvedPath);
+    return wrapNodeReadable(filePath, () => nodeStream, abortSignal);
   }
 
   writeFile(filePath: string, _abortSignal?: AbortSignal): WritableStream<Uint8Array> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before writing (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
+    const canonicalPath = path.resolve(expandTilde(filePath));
     let tempPath: string;
     let writer: WritableStreamDefaultWriter<Uint8Array>;
     let resolvedPath: string;
@@ -254,13 +655,12 @@ export abstract class LocalBaseRuntime implements Runtime {
       async start() {
         // Resolve symlinks to write through them (preserves the symlink)
         try {
-          resolvedPath = await fsPromises.realpath(expandedPath);
+          resolvedPath = await fsPromises.realpath(canonicalPath);
           // Save original permissions to restore after write
           const stat = await fsPromises.stat(resolvedPath);
           originalMode = stat.mode;
         } catch {
-          // If file doesn't exist, use the expanded path and default permissions
-          resolvedPath = expandedPath;
+          resolvedPath = canonicalPath;
           originalMode = undefined;
         }
 
@@ -291,7 +691,7 @@ export abstract class LocalBaseRuntime implements Runtime {
           throw new RuntimeErrorClass(
             `Failed to write file ${filePath}: ${getErrorMessage(err)}`,
             "file_io",
-            err instanceof Error ? err : undefined
+            err
           );
         }
       },
@@ -313,10 +713,9 @@ export abstract class LocalBaseRuntime implements Runtime {
 
   async stat(filePath: string, _abortSignal?: AbortSignal): Promise<FileStat> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before stat (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
+    const resolvedPath = path.resolve(expandTilde(filePath));
     try {
-      const stats = await fsPromises.stat(expandedPath);
+      const stats = await fsPromises.stat(resolvedPath);
       return {
         size: stats.size,
         modifiedTime: stats.mtime,
@@ -326,7 +725,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       throw new RuntimeErrorClass(
         `Failed to stat ${filePath}: ${getErrorMessage(err)}`,
         "file_io",
-        err instanceof Error ? err : undefined
+        err
       );
     }
   }
@@ -335,14 +734,14 @@ export abstract class LocalBaseRuntime implements Runtime {
     if (abortSignal?.aborted) {
       throw new RuntimeErrorClass("Operation aborted before directory creation", "file_io");
     }
-    const expandedPath = expandTilde(dirPath);
+    const resolvedPath = path.resolve(expandTilde(dirPath));
     try {
-      await fsPromises.mkdir(expandedPath, { recursive: true });
+      await fsPromises.mkdir(resolvedPath, { recursive: true });
     } catch (err) {
       throw new RuntimeErrorClass(
         `Failed to create directory ${dirPath}: ${getErrorMessage(err)}`,
         "file_io",
-        err instanceof Error ? err : undefined
+        err
       );
     }
   }
@@ -397,13 +796,11 @@ export abstract class LocalBaseRuntime implements Runtime {
    * Uses OS temp dir on local systems.
    */
   tempDir(): Promise<string> {
-    // Use /tmp on Unix, or OS temp dir on Windows
-    const isWindows = process.platform === "win32";
-    return Promise.resolve(isWindows ? (process.env.TEMP ?? "C:\\Temp") : "/tmp");
+    return Promise.resolve(localRuntimeTempRoot());
   }
 
-  getMuxHome(): string {
-    return "~/.mux";
+  getXumHome(): string {
+    return "~/.xum";
   }
 
   /**
@@ -413,23 +810,37 @@ export abstract class LocalBaseRuntime implements Runtime {
     return Promise.resolve({ ready: true });
   }
 
+  protected initLocalWorkspace(params: WorkspaceInitParams, runtimeType: "local" | "worktree") {
+    return runWorkspaceInitHook({
+      params,
+      runtimeType,
+      findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
+      runHook: ({ hookRelativePath, xumEnv, initLogger, abortSignal }) =>
+        this.runInitHook(
+          params.workspacePath,
+          this.normalizePath(hookRelativePath, params.workspacePath),
+          xumEnv,
+          initLogger,
+          abortSignal
+        ),
+    });
+  }
+
   /**
-   * Helper to run .mux/init hook if it exists and is executable.
+   * Helper to run .xum/init hook if it exists and is executable.
    * Shared between WorktreeRuntime and LocalRuntime.
    * @param workspacePath - Path to the workspace directory
-   * @param muxEnv - MUX_ environment variables (from getMuxEnv)
+   * @param xumEnv - Canonical XUM_ variables plus legacy MUX_ aliases
    * @param initLogger - Logger for streaming output
    * @param abortSignal - Optional abort signal
    */
   protected async runInitHook(
     workspacePath: string,
-    muxEnv: Record<string, string>,
+    hookPath: string,
+    xumEnv: Record<string, string>,
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    // Hook path is derived from MUX_PROJECT_PATH in muxEnv
-    const projectPath = muxEnv.MUX_PROJECT_PATH;
-    const hookPath = getInitHookPath(projectPath);
     initLogger.logStep(`Running init hook: ${hookPath}`);
 
     if (abortSignal?.aborted) {
@@ -437,39 +848,41 @@ export abstract class LocalBaseRuntime implements Runtime {
       return;
     }
 
-    // Create line-buffered loggers
     const loggers = createLineBufferedLoggers(initLogger);
+    const bashPath = getBashPath();
+    const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${shellQuote(hookPath)}`;
+    const hookEnv: NodeJS.ProcessEnv = { ...process.env, ...xumEnv };
+    // The init hook is agent-reachable (a repo file), so it runs in the sandbox like bash does.
+    const wrap = await this.wrapInitHookForSandbox(workspacePath, script, initLogger, {
+      bashPath,
+      abortSignal,
+      // No scratchDir: the init hook gets none from Xum, so an XUM_SCRATCH_DIR here is a secret.
+      pathEnv: hookEnv.PATH,
+      env: hookEnv,
+    });
+    if (!wrap.ok) return;
 
     return new Promise<void>((resolve) => {
-      const bashPath = getBashPath();
-      const proc = spawn(bashPath, ["-c", shellQuote(hookPath)], {
-        cwd: workspacePath,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          ...muxEnv,
-        },
-        // Prevent console window from appearing on Windows
-        windowsHide: true,
-        // Spawn as a detached process group leader so we can reliably cancel the hook.
-        detached: true,
-      });
+      const proc = spawnWithSandbox(
+        wrap.sandboxed,
+        { bashPath, script, env: hookEnv },
+        (command, args, env) =>
+          spawn(command, args, {
+            cwd: workspacePath,
+            stdio: ["ignore", "pipe", "pipe"],
+            env,
+            // Prevent console window from appearing on Windows
+            windowsHide: true,
+            // Spawn as a detached process group leader so we can reliably cancel the hook.
+            detached: true,
+          })
+      );
 
       let aborted = false;
 
       const onAbort = () => {
         aborted = true;
-
-        if (proc.pid !== undefined) {
-          killProcessTree(proc.pid);
-          return;
-        }
-
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // ignore
-        }
+        killInitHook(proc);
       };
 
       abortSignal?.addEventListener("abort", onAbort, { once: true });

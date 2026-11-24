@@ -1,9 +1,13 @@
 import type { Secret } from "@/common/types/secrets";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { getProjects } from "@/common/utils/multiProject";
-import type { Config } from "@/node/config";
+import { getProjects, isMultiProject } from "@/common/utils/multiProject";
+import type { Config, SecretsStore } from "@/node/config";
+import { secretsForWorkspace } from "@/node/utils/projectTrust";
 
-export function mergeMultiProjectSecrets(metadata: WorkspaceMetadata, config: Config): Secret[] {
+export function mergeMultiProjectSecrets(
+  metadata: WorkspaceMetadata,
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">
+): Secret[] {
   const projects = getProjects(metadata);
   const primaryProject = projects.find((project) => project.projectPath === metadata.projectPath);
   const orderedProjects = primaryProject
@@ -18,7 +22,7 @@ export function mergeMultiProjectSecrets(metadata: WorkspaceMetadata, config: Co
 
   // Primary project secrets win on collisions so multi-project bash/AI keep single-project precedence.
   for (const project of orderedProjects) {
-    const secrets = config.getEffectiveSecrets(project.projectPath);
+    const secrets = secretsStore.getEffectiveSecrets(project.projectPath);
     for (const secret of secrets) {
       if (seen.has(secret.key)) {
         continue;
@@ -29,4 +33,18 @@ export function mergeMultiProjectSecrets(metadata: WorkspaceMetadata, config: Co
   }
 
   return merged;
+}
+
+/**
+ * The secrets a workspace's commands get: every project's for a multi-project workspace, and
+ * none for an SSH+None workspace whose host directory is not trusted (`secretsForWorkspace`).
+ */
+export function workspaceSecrets(
+  metadata: WorkspaceMetadata,
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">,
+  config: Pick<Config, "loadConfigOrDefault">
+): Secret[] {
+  return isMultiProject(metadata)
+    ? mergeMultiProjectSecrets(metadata, secretsStore)
+    : secretsForWorkspace(secretsStore, config, metadata.projectPath, metadata.runtimeConfig);
 }

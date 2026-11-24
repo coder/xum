@@ -27,7 +27,7 @@ if (shouldRunIntegrationTests()) {
 }
 
 // Test both providers with their respective models
-const PROVIDER_CONFIGS: Array<[string, string]> = [
+const PROVIDER_CONFIGS: [string, string][] = [
   ["openai", KNOWN_MODELS.GPT.providerModelId],
   ["anthropic", KNOWN_MODELS.HAIKU.providerModelId],
 ];

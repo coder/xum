@@ -15,6 +15,7 @@
  * 4. Exits with code 1 when the target transcript shifts after it is visible or when the
  *    composer disappears during a workspace open.
  */
+import { randomBytes } from "crypto";
 import fs from "fs/promises";
 import net from "net";
 import os from "os";
@@ -24,11 +25,6 @@ import { chromium, type Page } from "playwright";
 import sharp from "sharp";
 
 import { prepareDemoProject } from "../tests/e2e/utils/demoProject";
-
-interface WorkspaceSeed {
-  workspaceId: string;
-  marker: string;
-}
 
 interface SwitchFrameSample {
   frame: number;
@@ -174,7 +170,7 @@ async function openWorkspace(
 
 async function sendMessage(page: Page, text: string): Promise<void> {
   const input = page.getByRole("textbox", {
-    name: /Message Claude|Edit your last message/,
+    name: /^(Message|Edit message)$/,
   });
   await input.waitFor({ state: "visible", timeout: 60_000 });
   await input.fill(text);
@@ -404,17 +400,19 @@ async function main() {
   const backendPort = await getFreePort();
   let vitePort = await getFreePort();
   while (vitePort === backendPort) vitePort = await getFreePort();
+  // The dev-server backend requires a token. Choose it here so the page can present it.
+  const authToken = randomBytes(32).toString("hex");
   const child = spawn("make", ["dev-server"], {
     cwd: process.cwd(),
     stdio: ["ignore", "ignore", "ignore"],
     env: {
       ...process.env,
+      XUM_DEV_SERVER_AUTH_TOKEN: authToken,
       MUX_ROOT: muxRoot,
       MUX_MOCK_AI: "1",
       BACKEND_PORT: String(backendPort),
       VITE_PORT: String(vitePort),
       MUX_ENABLE_TUTORIALS_IN_SANDBOX: "0",
-      VITE_ALLOWED_HOSTS: "all",
       NODE_ENV: "development",
     },
   });
@@ -432,17 +430,9 @@ async function main() {
     const browser = await chromium.launch({ headless: true });
     try {
       const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
-      await page.goto(`http://127.0.0.1:${vitePort}`, { waitUntil: "domcontentloaded" });
-      await page.evaluate(() => {
-        localStorage.setItem(
-          "tutorialState",
-          JSON.stringify({
-            disabled: false,
-            completed: { settings: true, creation: true, workspace: true },
-          })
-        );
+      await page.goto(`http://127.0.0.1:${vitePort}/?token=${authToken}`, {
+        waitUntil: "domcontentloaded",
       });
-      await page.reload({ waitUntil: "domcontentloaded" });
 
       await waitForProjectPage(page);
       const trunkBranch = readTrunkBranch(demoProject.projectPath);

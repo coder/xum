@@ -1,0 +1,152 @@
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import type { CreationDraftExecution } from "@/common/orpc/schemas/drafts";
+import type { ProjectConfig } from "@/common/types/project";
+import {
+  normalizeRuntimeEnablement,
+  RUNTIME_MODE,
+  type ParsedRuntime,
+  type RuntimeEnablement,
+} from "@/common/types/runtime";
+import {
+  DEFAULT_ISOLATION,
+  isolationEquals,
+  nearestSupportedIsolation,
+  resolveEnabledIsolation,
+  type IsolationChoice,
+} from "@/common/types/isolation";
+import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
+
+/** Whether the project's Settings → Runtimes overrides replace the global runtime settings. */
+function hasProjectRuntimeOverrides(project: ProjectConfig | undefined): project is ProjectConfig {
+  return (
+    project?.runtimeOverridesEnabled === true ||
+    Boolean(project?.runtimeEnablement) ||
+    project?.defaultIsolation !== undefined
+  );
+}
+
+/** The runtimes a project's creation offers: its Settings → Runtimes overrides, else the global ones. */
+export function projectRuntimeEnablement(
+  project: ProjectConfig | undefined,
+  global: RuntimeEnablement
+): RuntimeEnablement {
+  return hasProjectRuntimeOverrides(project)
+    ? normalizeRuntimeEnablement(project.runtimeEnablement)
+    : global;
+}
+
+/**
+ * The isolation a new workspace in the project starts with: its Settings default (the project's
+ * override, else the global one), resolved against the isolations the project's Settings enable.
+ * This is the rule Settings → Runtimes shows, so the draft starts on the same pair instead of on a
+ * disabled one that the creation controls would then replace with a Local fallback.
+ */
+export function projectDefaultIsolation(
+  project: ProjectConfig | undefined,
+  globalDefault: IsolationChoice | null | undefined,
+  globalEnablement: RuntimeEnablement
+): IsolationChoice {
+  const configured =
+    (hasProjectRuntimeOverrides(project) ? project.defaultIsolation : undefined) ??
+    globalDefault ??
+    DEFAULT_ISOLATION;
+  return (
+    resolveEnabledIsolation(configured, projectRuntimeEnablement(project, globalEnablement)) ??
+    nearestSupportedIsolation(configured)
+  );
+}
+
+/** Whether `choice` is what new workspaces in the project already start with. */
+export function isProjectDefaultIsolation(
+  project: ProjectConfig | undefined,
+  globalDefault: IsolationChoice | null | undefined,
+  globalEnablement: RuntimeEnablement,
+  choice: IsolationChoice
+): boolean {
+  return isolationEquals(projectDefaultIsolation(project, globalDefault, globalEnablement), choice);
+}
+
+/**
+ * The config.updateRuntimeEnablement payload that makes `choice` the project's default, as the
+ * creation page's "Set as default" saves it. A project default is a Settings → Runtimes project
+ * override; a project without overrides inherits the global enabled isolations, so they are copied
+ * in: turning the override on to save a default must not re-enable what Settings turned off.
+ */
+export function projectDefaultIsolationUpdate(
+  projectPath: string,
+  project: ProjectConfig | undefined,
+  choice: IsolationChoice,
+  globalEnablement: RuntimeEnablement
+): {
+  projectPath: string;
+  defaultIsolation: IsolationChoice;
+  runtimeOverridesEnabled: true;
+  runtimeEnablement?: RuntimeEnablement;
+} {
+  return {
+    projectPath,
+    defaultIsolation: choice,
+    runtimeOverridesEnabled: true,
+    ...(hasProjectRuntimeOverrides(project) ? {} : { runtimeEnablement: { ...globalEnablement } }),
+  };
+}
+
+/** A project agent exists only in its project; built-in and global agents exist everywhere. */
+function portableAgent(agent: CreationDraftExecution["agent"] | undefined) {
+  return agent?.scope === "project" ? null : (agent ?? null);
+}
+
+/** Local and Worktree need no host, so they travel where the target's Settings allow them. */
+function portableRuntime(
+  runtime: ParsedRuntime | null | undefined,
+  enablement: RuntimeEnablement | null
+): ParsedRuntime | null {
+  if (!runtime || !enablement) return null;
+  const hostless = runtime.mode === RUNTIME_MODE.LOCAL || runtime.mode === RUNTIME_MODE.WORKTREE;
+  return hostless && enablement[runtime.mode] ? runtime : null;
+}
+
+/**
+ * The execution choices that stay valid in the target project. Choices tied to the old project
+ * (a project agent, the trunk branch, an SSH or container host) reset, so a draft never sends to
+ * another project's host. Scratch (no enablement) runs no runtime.
+ */
+function choicesForTarget(
+  execution: CreationDraftExecution | null,
+  enablement: RuntimeEnablement | null
+): CreationDraftExecution {
+  return {
+    agent: portableAgent(execution?.agent),
+    runtime: portableRuntime(execution?.runtime, enablement),
+    trunkBranch: null,
+  };
+}
+
+/**
+ * Moves a creation draft to the scope picked in its composer (a project, a sub-project or
+ * Scratch). Only fields change: the id, text, attachments, manual name and AI choices stay, and
+ * no project's defaults are written. Returns the project to open the draft in.
+ */
+export function changeCreationDraftProject(
+  draftId: string,
+  scope: string,
+  projects: Map<string, ProjectConfig>,
+  globalEnablement: RuntimeEnablement
+): string {
+  const store = getCreationDraftStore();
+  const draft = store.getView(draftId).draft;
+  // Scratch is not a configured project, so it resolves to itself with no sub-project.
+  const target = resolveWorkspaceCreationScope(scope, projects);
+  if (!draft) return target.projectPath;
+  const targetConfig = projects.get(target.projectPath);
+  // A sub-project switch keeps the parent repository, so its runtime and trunk still apply.
+  const execution =
+    target.projectPath === draft.projectPath
+      ? draft.execution
+      : choicesForTarget(
+          draft.execution,
+          targetConfig ? projectRuntimeEnablement(targetConfig, globalEnablement) : null
+        );
+  store.update(draftId, { ...target, execution });
+  return target.projectPath;
+}

@@ -10,22 +10,28 @@ import {
   CircleX,
   ClipboardCheck,
   Forward,
+  Handshake,
   HeartPulse,
   Inbox,
   Layers,
   ListTodo,
   Map,
   MessageSquare,
+  Milestone,
+  OctagonAlert,
   PackageCheck,
+  PackageOpen,
   Radar,
   RefreshCcw,
   RotateCcw,
+  Scale,
   Send,
   Settings2,
   Sparkles,
   Target,
   Timer,
   Trash2,
+  Unlink,
   WandSparkles,
   Workflow,
   type LucideIcon,
@@ -36,6 +42,7 @@ import {
   type TimelineEvent,
   type TimelineEventKind,
 } from "@/common/orpc/schemas/timeline";
+import { describeChangedOptions } from "@/common/utils/ai/promptCacheChangedOption";
 import { capitalize } from "@/common/utils/capitalize";
 import { classifyMachineTurnPromptKind } from "@/common/utils/machineTurnPrompts";
 
@@ -95,9 +102,112 @@ const TIMELINE_PRESENTATION: Record<TimelineEventKind, TimelinePresentation> = {
   "agent.event": { label: "Agent event", icon: Sparkles, category: "agent" },
   "agent.plan_proposed": { label: "Plan proposed", icon: Map, category: "agent" },
   "agent.notified": { label: "Notification sent", icon: Bell, category: "agent" },
+  "cache.prefix_break": { label: "Prompt cache prefix break", icon: Unlink, category: "context" },
 };
 
+/**
+ * Scheduler machinery rather than narrative: wakes, dispatch churn, and heartbeats record how the
+ * loop kept moving, not what the work accomplished, so the panel collapses contiguous stretches
+ * into one expandable group instead of rendering each row.
+ */
+const MACHINERY_KINDS: ReadonlySet<string> = new Set<TimelineEventKind>([
+  "turn.monitor_wake",
+  "turn.background_wake",
+  "turn.synthetic",
+  "goal.continuation_dispatched",
+  "heartbeat.dispatched",
+  "heartbeat.skipped",
+]);
+
+export function isMachineryKind(kind: string): boolean {
+  return MACHINERY_KINDS.has(kind);
+}
+
+interface TimelineRowTint {
+  row: string;
+  icon: string;
+  badge: string;
+}
+
+const DEFAULT_AGENT_TINT: TimelineRowTint = {
+  row: "border-ask-mode/25 bg-ask-mode-alpha",
+  icon: "border-ask-mode/40 text-ask-mode",
+  badge: "border-ask-mode/30 text-ask-mode",
+};
+
+// Attention-worthy categories get their own hue so a blocker reads differently from a milestone at
+// a glance. Routine categories (picked_up) and uncategorized events keep the generic agent tint.
+const AGENT_EVENT_TINTS: Partial<Record<string, TimelineRowTint>> = {
+  milestone: {
+    row: "border-success/25 bg-success/10",
+    icon: "border-success/40 text-success-text",
+    badge: "border-success/30 text-success-text",
+  },
+  decision: {
+    row: "border-info/25 bg-info/10",
+    icon: "border-info/40 text-info",
+    badge: "border-info/30 text-info",
+  },
+  blocker: {
+    row: "border-danger/25 bg-danger/10",
+    icon: "border-danger/40 text-danger",
+    badge: "border-danger/30 text-danger",
+  },
+  handoff: {
+    row: "border-warning/25 bg-warning/10",
+    icon: "border-warning/40 text-warning",
+    badge: "border-warning/30 text-warning",
+  },
+};
+
+export function getAgentEventTint(category: string | undefined): TimelineRowTint {
+  return (category != null ? AGENT_EVENT_TINTS[category] : undefined) ?? DEFAULT_AGENT_TINT;
+}
+
+// Category glyphs pair with the tints above; events without a recognized category keep the
+// generic agent.event icon.
+const AGENT_EVENT_ICONS: Partial<Record<string, LucideIcon>> = {
+  milestone: Milestone,
+  decision: Scale,
+  blocker: OctagonAlert,
+  handoff: Handshake,
+  picked_up: PackageOpen,
+};
+
+export function getAgentEventIcon(category: string | undefined): LucideIcon | undefined {
+  return category != null ? AGENT_EVENT_ICONS[category] : undefined;
+}
+
 const knownKinds = new Set<string>(TIMELINE_EVENT_KINDS);
+
+const timeFormatter = new Intl.DateTimeFormat(undefined, {
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+const dayFormatter = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+});
+
+/** Row timestamp as the Timeline tab renders it (also used by the transcript card's preview). */
+export function formatTimelineTime(timestamp: number): string {
+  return timeFormatter.format(timestamp);
+}
+
+/** Day-group header label as the Timeline tab renders it. */
+export function getTimelineDayLabel(timestamp: number): string {
+  const date = new Date(timestamp);
+  const today = new Date();
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const dayOffset = Math.round((startOfToday - startOfDate) / 86_400_000);
+
+  if (dayOffset === 0) return "Today";
+  if (dayOffset === 1) return "Yesterday";
+  return dayFormatter.format(date);
+}
 
 export function getTimelinePresentation(kind: string): TimelinePresentation {
   if (knownKinds.has(kind)) {
@@ -124,7 +234,49 @@ export function getTimelineEventKind(event: TimelineEvent): string {
 
 // A descriptive event payload reads better as the row title than the generic kind label.
 export function getTimelineEventTitle(event: TimelineEvent): string {
-  return event.data?.description ?? getTimelinePresentation(getTimelineEventKind(event)).label;
+  return eventDescription(event) ?? getTimelinePresentation(getTimelineEventKind(event)).label;
+}
+
+// A prompt-cache break's description repeats its structured fields in one long line; the row
+// shows those fields below a short title instead.
+function eventDescription(event: TimelineEvent): string | undefined {
+  return getPromptCacheBreakView(event)?.title ?? event.data?.description;
+}
+
+type PromptCacheBreakData = NonNullable<NonNullable<TimelineEvent["data"]>["promptCacheBreak"]>;
+type PromptCacheBlockData = PromptCacheBreakData["previous"];
+
+/** A prompt-cache break as readable rows: no block text exists in the event, only metadata. */
+export interface PromptCacheBreakView {
+  title: string;
+  /** Turn or step boundary, and how many blocks of the previous request still matched. */
+  position: string;
+  /** The first differing block of the previous and of the next request. */
+  before: string;
+  after: string;
+  /** The request options that changed, when the break is in an options block. */
+  changedOptions: string | undefined;
+}
+
+function describeCacheBlock(block: PromptCacheBlockData | undefined): string {
+  if (block == null) return "Request ended here";
+  return [block.role, block.type, block.toolName, `${block.length.toLocaleString()} chars`]
+    .filter((part) => part != null && part !== "")
+    .join(" · ");
+}
+
+export function getPromptCacheBreakView(event: TimelineEvent): PromptCacheBreakView | null {
+  const cacheBreak = event.data?.promptCacheBreak;
+  if (cacheBreak == null) return null;
+  // `blockIndex` is the first differing block, so it also counts the blocks that still matched.
+  const matched = `${cacheBreak.blockIndex.toLocaleString()} of ${cacheBreak.previousBlockCount.toLocaleString()} blocks matched`;
+  return {
+    title: `Prompt cache broke in ${cacheBreak.section}`,
+    position: `${capitalize(cacheBreak.boundary)} boundary · ${matched}`,
+    before: describeCacheBlock(cacheBreak.previous),
+    after: describeCacheBlock(cacheBreak.next),
+    changedOptions: describeChangedOptions(cacheBreak.changedOptions),
+  };
 }
 
 /**

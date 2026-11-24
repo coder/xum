@@ -1,7 +1,54 @@
+import type { z } from "zod";
+import type {
+  MCPConfigProblemSchema,
+  MCPConnectionRefSchema,
+  MCPServerIdentitySchema,
+  MCPToolCallDisplaySchema,
+} from "@/common/orpc/schemas/mcp";
+
+/** A part of mcp.jsonc that Xum skipped (MCPConfigProblemSchema). */
+export type MCPConfigProblem = z.infer<typeof MCPConfigProblemSchema>;
+
 /** Supported MCP server transports. */
 export type MCPServerTransport = "stdio" | "http" | "sse" | "auto";
 
+/** Server-reported, display-only identity (MCP `Implementation`); see MCPServerIdentitySchema. */
+export type MCPServerIdentity = z.infer<typeof MCPServerIdentitySchema>;
+
+/** Credential-free description of the configured connection an identity was seen on. */
+export type MCPConnectionRef = z.infer<typeof MCPConnectionRefSchema>;
+
+/** Host-authored per-tool-call identity snapshot frozen on the tool part. */
+export type MCPToolCallDisplay = z.infer<typeof MCPToolCallDisplaySchema>;
+
+export type MCPToolCallDisplaySource = MCPToolCallDisplay["source"];
+
 export type MCPHeaderValue = string | { secret: string };
+
+/**
+ * UI-safe provenance for servers contributed by an Agent Plugin
+ * (agent-plugins experiment). Presence marks the server as a read-only
+ * config entry: never editable and never persisted into mcp.jsonc.
+ */
+export interface MCPServerPluginProvenance {
+  pluginName: string;
+  /** Server name as declared in the plugin's mcp.json (the map key is the instance key). */
+  serverName: string;
+  sourceScope: "project" | "global";
+  /**
+   * Human-readable installation location, e.g. ".xum/plugins/demo". Same-name
+   * plugins can be installed in sibling containers of one scope (.mux vs
+   * .agents), so the UI needs this discriminator to tell instances apart.
+   */
+  sourceLocation: string;
+  /** Canonical managed owner; retained even if its registry row later disappears. */
+  componentPolicy?: { registryPath: string; name: string };
+  /**
+   * Consent fingerprint of this exact server definition (componentConsent.ts, #6498), set where the
+   * plugin's config is loaded. A managed server starts only when the user reviewed this value.
+   */
+  consentFingerprint?: string;
+}
 
 export interface MCPServerBaseInfo {
   transport: MCPServerTransport;
@@ -12,16 +59,74 @@ export interface MCPServerBaseInfo {
    * If not set, all tools are exposed.
    */
   toolAllowlist?: string[];
+  /** Present when this server comes from an Agent Plugin. */
+  plugin?: MCPServerPluginProvenance;
+  /**
+   * Display-only, set by the mcp.list API: the user config layer whose entry
+   * won (and so owns `disabled`). Never persisted or read by the runtime.
+   */
+  configLayer?: "global" | "project";
 }
 
 /** stdio server definition (local process). */
 export interface MCPStdioServerInfo extends MCPServerBaseInfo {
   transport: "stdio";
   command: string;
+  /**
+   * Argv appended to `command`. When set (even empty), launch composes the
+   * shell command by quoting `command` and each element; when unset, `command`
+   * is treated as a raw shell string (legacy mcp.jsonc behavior).
+   */
+  args?: string[];
+  /** Extra environment variables injected into the server process. */
+  env?: Record<string, string>;
+  /**
+   * Host variable names whose values launch copies into the server env (Codex
+   * `.mcp.json` `env_vars`). Unset names are skipped, and `env` wins on a clash.
+   */
+  forwardEnv?: string[];
+  /** Working directory; defaults to the workspace path when unset. */
+  cwd?: string;
+}
+
+/**
+ * OAuth settings a plugin's mcp.json declares (OpenAI `com.openai.auth` or the
+ * Codex `.mcp.json` dialect). Backend-only: never accepted from mcp.jsonc,
+ * and never holds a client secret. Unset fields fall back to discovery + DCR.
+ */
+export interface MCPServerOAuthConfig {
+  /** A registered client; skips dynamic client registration. */
+  clientId?: string;
+  tokenEndpointAuthMethod?: "none" | "client_secret_basic" | "client_secret_post";
+  /**
+   * Discovery always supplies the authorization and token endpoints (#6142 tracks verified
+   * overrides). `authorizationServerBase` changes where authorization-server metadata is
+   * fetched (its issuer must be that URL). `registrationUrl` replaces the discovered
+   * registration endpoint only when it is that endpoint or sits under the issuer URL (dynamic
+   * registration only).
+   */
+  discovery?: { authorizationServerBase?: string; registrationUrl?: string };
+  /** Sent on every request. */
+  baseScopes?: string[];
+  /** Replaces the discovered default scopes ([] requests none). */
+  defaultScopes?: string[];
+  /** RFC 8707 resource indicator. */
+  resource?: string;
+  /**
+   * Where the Codex `.mcp.json` client secret lives. The OAuth service
+   * re-reads the value from this consented file per flow and keeps it in
+   * memory (RFC 8252 §8.5: a native-app secret is not confidential, but Xum
+   * still never persists, logs or displays it).
+   */
+  clientSecretSource?: { pluginRoot: string; mcpConfigPath: string; serverName: string };
 }
 
 /** HTTP-based server definition. */
 export interface MCPHttpServerInfo extends MCPServerBaseInfo {
+  /** Backend-only provenance; never accepted from mcp.jsonc. */
+  managed?: "claude-design";
+  /** Backend-only plugin OAuth settings (see MCPServerOAuthConfig). */
+  oauth?: MCPServerOAuthConfig;
   transport: "http" | "sse" | "auto";
   url: string;
   /** Optional headers (string literal or reference to a project secret key). */
@@ -33,6 +138,7 @@ export type MCPServerInfo = MCPStdioServerInfo | MCPHttpServerInfo;
 
 export interface MCPConfig {
   servers: Record<string, MCPServerInfo>;
+  enabledPluginServers: string[];
 }
 
 /**
@@ -54,7 +160,16 @@ export interface BearerChallenge {
 
 /** Result of testing an MCP server connection */
 export type MCPTestResult =
-  | { success: true; tools: string[] }
+  | {
+      success: true;
+      tools: string[];
+      /** MCP protocol revision negotiated during the test connection. */
+      protocolVersion?: string;
+      /** Identity the server reported during the handshake, when it did. */
+      serverInfo?: MCPServerIdentity;
+      /** Host-decoded PNG, kept in renderer memory only. */
+      icon?: string;
+    }
   | { success: false; error: string; oauthChallenge?: BearerChallenge };
 
 /** Cached test result with timestamp for age display */
@@ -66,9 +181,9 @@ export interface CachedMCPTestResult {
 /**
  * Per-workspace MCP overrides.
  *
- * Stored per-workspace in <workspace>/.mux/mcp.local.jsonc (workspace-local and intended to be gitignored).
+ * Stored per-workspace in <workspace>/.xum/mcp.local.jsonc (workspace-local and intended to be gitignored).
  *
- * Legacy note: older mux versions stored these overrides in ~/.mux/config.json under each workspace entry.
+ * Legacy note: older Mux versions stored these overrides in ~/.mux/config.json under each workspace entry.
  * Newer versions migrate those values into the workspace-local file on first read/write.
  */
 export interface WorkspaceMCPOverrides {
@@ -86,7 +201,7 @@ export interface WorkspaceMCPOverrides {
 
   /**
    * Per-server tool allowlist.
-   * Key: server name (from .mux/mcp.jsonc)
+   * Key: server name (from .xum/mcp.jsonc)
    * Value: raw MCP tool names (NOT namespaced)
    *
    * If omitted for a server => expose all tools from that server.

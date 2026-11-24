@@ -12,21 +12,25 @@ import {
   BookOpen,
   Brain,
   CircleCheck,
+  Cpu,
   Database,
   FileText,
   GitCommit,
   Globe,
   GraduationCap,
   Hand,
+  History,
   Keyboard,
   Layers,
   LayoutGrid,
-  Lightbulb,
+  LayoutPanelTop,
   MessageCircleQuestion,
   Monitor,
   Move,
   MousePointerClick,
+  MessageSquareMore,
   Paperclip,
+  PanelRight,
   Info,
   List,
   Pencil,
@@ -36,6 +40,7 @@ import {
   ScanEye,
   Square,
   Target,
+  Trash2,
   Wrench,
 } from "lucide-react";
 import { EmojiIcon } from "@/browser/components/icons/EmojiIcon/EmojiIcon";
@@ -110,7 +115,7 @@ const getStatusColor = (status: string) => {
     case "executing":
       return "text-pending";
     case "completed":
-      return "text-success";
+      return "text-success-text";
     case "failed":
       return "text-danger";
     case "interrupted":
@@ -250,11 +255,18 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   // LayoutGrid (a 2×2 catalog of tiles) reads as "the index of skills you can pick
   // from" — distinct from the GraduationCap used when reading a single skill.
   agent_skill_list: LayoutGrid,
-  advisor: Lightbulb,
+  // Cpu reads as "the models (compute) you can pick from"; distinct from the
+  // Brain glyph used for the memory tool.
+  models_list: Cpu,
   ask_user_question: MessageCircleQuestion,
   file_read: BookOpen,
+  session_history: History,
+  // A model-requested fresh window: the same "start over" affordance as workflow_resume.
+  new_context: RotateCcw,
   memory: Brain,
   attach_file: Paperclip,
+  // Publishing shows the file in the Artifacts tab of the right sidebar.
+  artifact: PanelRight,
   desktop_screenshot: Monitor,
   desktop_move_mouse: Move,
   desktop_click: MousePointerClick,
@@ -263,6 +275,7 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   desktop_scroll: ArrowDownUp,
   desktop_type: Keyboard,
   desktop_key_press: Keyboard,
+  computer: Monitor,
   file_edit_insert: Pencil,
   file_edit_replace_string: Pencil,
   file_edit_replace_lines: Pencil,
@@ -276,6 +289,10 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   review_pane_update: Sparkles,
   review_pane_get: ScanEye,
   analytics_query: Database,
+  task_retitle: Pencil,
+  task_stop: Square,
+  task_remove: Trash2,
+  task_send_message: MessageSquareMore,
   task_apply_git_patch: GitCommit,
   // Layers (stacked planes) reads as "manage the stack of child workspaces" — matches the
   // WorkspaceLifecycleToolCall card's glyph.
@@ -286,6 +303,11 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   // Activity (ECG line) rather than HeartPulse: it matches the scanning pulse-trace
   // motif inside the HeartbeatToolCall card. The config menu uses HeartPulse.
   heartbeat: Activity,
+  // Sparkles matches the icon the Timeline tab feed renders on agent.event rows, which is
+  // exactly where a timeline_event call lands.
+  timeline_event: Sparkles,
+  // A page with a header panel: the update lands on the status page the main pane shows.
+  status_update: LayoutPanelTop,
 };
 
 export const ToolIcon: React.FC<ToolIconProps> = ({ toolName, emoji, emojiSpin, className }) => {

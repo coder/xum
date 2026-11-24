@@ -8,19 +8,20 @@ import userEvent from "@testing-library/user-event";
 
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { getModelKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
+import { setupProviders } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 const OPENAI_MODEL = KNOWN_MODELS.GPT.id;
-// Use Haiku 4.5 as the model that caps at HIGH (4 levels, no xhigh).
-// Opus 4.6 and Sonnet 4.6 support xhigh so they can't be used to test clamping behavior.
-const CAPPED_MODEL = "anthropic:claude-haiku-4-5";
+// A curated model that caps at HIGH (off..high, no xhigh). The model picker only lists curated
+// models of configured providers, so this must be a KNOWN_MODELS entry and the test configures a
+// dummy DeepSeek key (CI provides only Anthropic/OpenAI keys). Haiku moved to 5.5, which has xhigh.
+const CAPPED_MODEL = KNOWN_MODELS.DEEPSEEK_V4_PRO.id;
 
 async function openModelSelector(container: HTMLElement): Promise<HTMLInputElement> {
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR));
@@ -61,16 +62,13 @@ async function selectModel(
   fireEvent.click(option);
 
   await waitFor(() => {
-    const persisted = readPersistedState(getModelKey(workspaceId), "");
+    const persisted = getWorkspaceAiSelection(workspaceId).model;
     if (persisted !== model) {
       throw new Error(`Expected model ${model} but got ${persisted}`);
     }
   });
 
-  // Wait for the UI to reflect the new model. This guards against race conditions
-  // where backend metadata updates can temporarily revert localStorage (and thus
-  // the displayed model) when switching models rapidly.
-  // Use the exact display name that the UI will show.
+  // Wait for the UI to reflect the new model, using the exact display name the UI shows.
   const expectedDisplayName = modelDisplayName.toLowerCase();
   await waitFor(
     () => {
@@ -90,7 +88,7 @@ async function selectModel(
   // prevents races when the test immediately interacts with thinking controls.
   await waitFor(
     () => {
-      const group = container.querySelector('[data-component="ThinkingSliderGroup"]');
+      const group = container.querySelector('[data-component="ThinkingSelectorGroup"]');
       const thinkingLabel = group?.querySelector("[data-thinking-label]");
       if (!thinkingLabel?.textContent) {
         throw new Error("Waiting for thinking controls to stabilize");
@@ -101,36 +99,29 @@ async function selectModel(
 }
 
 async function setThinkingToXHigh(container: HTMLElement): Promise<void> {
-  await waitFor(
-    async () => {
-      const group = container.querySelector('[data-component="ThinkingSliderGroup"]');
-      if (!group) {
-        throw new Error("ThinkingSliderGroup not found");
-      }
+  const trigger = await waitFor(() => {
+    const match = container.querySelector<HTMLButtonElement>("[data-thinking-selector-trigger]");
+    if (!match) {
+      throw new Error("Thinking selector trigger not found");
+    }
+    return match;
+  });
+  fireEvent.click(trigger);
 
-      const labelButton = group.querySelector(
-        "button[data-thinking-label]"
-      ) as HTMLButtonElement | null;
-      if (!labelButton) {
-        throw new Error("Thinking label button not found");
-      }
-
-      const label = labelButton.textContent?.trim()?.toUpperCase();
-      if (label === "XHIGH") {
-        return;
-      }
-
-      fireEvent.click(labelButton);
-      throw new Error(`Cycling thinking level, currently at: ${label ?? "<missing>"}`);
-    },
-    { timeout: 10000, interval: 200 }
-  );
+  const option = await waitFor(() => {
+    const menu = container.querySelector<HTMLElement>('[data-component="ThinkingSelectorMenu"]');
+    if (!menu) {
+      throw new Error("Thinking selector menu not found");
+    }
+    return within(menu).getByRole("option", { name: "Extra High" });
+  });
+  fireEvent.click(option);
 }
 
 async function expectThinkingLabel(container: HTMLElement, expected: string): Promise<void> {
   await waitFor(
     () => {
-      const group = container.querySelector('[data-component="ThinkingSliderGroup"]');
+      const group = container.querySelector('[data-component="ThinkingSelectorGroup"]');
       const label = group?.querySelector("[data-thinking-label]");
       const text = label?.textContent?.trim();
       if (text !== expected) {
@@ -143,7 +134,10 @@ async function expectThinkingLabel(container: HTMLElement, expected: string): Pr
 
 describeIntegration("Thinking level persistence", () => {
   test("keeps XHIGH preference when switching away and back", async () => {
-    const harness = await createAppHarness({ branchPrefix: "thinking" });
+    const harness = await createAppHarness({
+      branchPrefix: "thinking",
+      beforeRenderEnvironment: (env) => setupProviders(env, { deepseek: { apiKey: "dummy" } }),
+    });
 
     try {
       await selectModel(harness.view.container, harness.workspaceId, OPENAI_MODEL);

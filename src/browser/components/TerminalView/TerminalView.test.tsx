@@ -1,12 +1,19 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
+import type { ReactNode } from "react";
+import { APIProvider } from "@/browser/contexts/API";
+import * as RealGhosttyModule from "ghostty-web";
+import * as RealTerminalRouterContextModule from "@/browser/terminal/TerminalRouterContext";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 
 interface TerminalSubscribeCallbacks {
   onOutput: (data: string) => void;
-  onScreenState: (state: string) => void;
+  onScreenState: (state: string, options?: { replace: boolean }) => void;
   onExit: (code: number) => void;
 }
 
@@ -25,6 +32,7 @@ interface MockRouter {
     typeof mock<(sessionId: string, callbacks: TerminalSubscribeCallbacks) => () => void>
   >;
   resize: ReturnType<typeof mock<(sessionId: string, cols: number, rows: number) => Promise<void>>>;
+  syncSize: ReturnType<typeof mock<(sessionId: string, cols: number, rows: number) => void>>;
   sendInput: ReturnType<typeof mock<(sessionId: string, data: string) => void>>;
 }
 
@@ -33,6 +41,9 @@ let mockRouter: MockRouter;
 let subscribeCallbacks: TerminalSubscribeCallbacks[] = [];
 let terminalInstances: MockTerminal[] = [];
 let unsubscribeMock: ReturnType<typeof mock<() => void>>;
+
+// ghostty-web's open() focuses the terminal, at once and again after a timeout.
+let focusOnOpen = false;
 
 const initMock = mock(() => Promise.resolve());
 const terminalOnExitMock = mock(
@@ -49,13 +60,22 @@ class MockTerminal {
   cols = 80;
   rows = 24;
   options: MockTerminalOptions;
+  calls: string[] = [];
   clear = mock(() => undefined);
-  write = mock((_data: string) => undefined);
+  reset = mock(() => {
+    this.calls.push("reset");
+  });
+  write = mock((data: string) => {
+    this.calls.push(`write:${data}`);
+  });
   resize = mock((cols: number, rows: number) => {
     this.cols = cols;
     this.rows = rows;
   });
-  blur = mock(() => undefined);
+  textarea: HTMLTextAreaElement | null = null;
+  blur = mock(() => {
+    this.textarea?.blur();
+  });
   focus = mock(() => undefined);
   dispose = mock(() => undefined);
 
@@ -67,7 +87,13 @@ class MockTerminal {
   loadAddon = mock((_addon: unknown) => undefined);
 
   open(container: HTMLElement): void {
-    container.append(document.createElement("textarea"));
+    const textarea = document.createElement("textarea");
+    this.textarea = textarea;
+    container.append(textarea);
+    if (focusOnOpen) {
+      textarea.focus();
+      setTimeout(() => textarea.focus(), 0);
+    }
   }
 
   attachCustomKeyEventHandler = mock((_handler: (ev: KeyboardEvent) => boolean) => undefined);
@@ -96,24 +122,15 @@ class MockFitAddon {
   proposeDimensions = mock(() => ({ cols: 80, rows: 24 }));
 }
 
+// Restore the real modules after this suite so the stubs below cannot leak into later files.
+restoreModulesAfterSuite([
+  ["ghostty-web", { ...RealGhosttyModule }],
+  ["@/browser/terminal/TerminalRouterContext", { ...RealTerminalRouterContextModule }],
+]);
 void mock.module("ghostty-web", () => ({
   init: initMock,
   Terminal: MockTerminal,
   FitAddon: MockFitAddon,
-}));
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: {
-      terminal: {
-        onExit: terminalOnExitMock,
-      },
-    },
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
 }));
 
 void mock.module("@/browser/terminal/TerminalRouterContext", () => ({
@@ -121,6 +138,8 @@ void mock.module("@/browser/terminal/TerminalRouterContext", () => ({
 }));
 
 import { TerminalView } from "./TerminalView";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
 
 function createRouter(): MockRouter {
   unsubscribeMock = mock(() => undefined);
@@ -132,8 +151,21 @@ function createRouter(): MockRouter {
       return unsubscribeMock;
     }),
     resize: mock((_sessionId: string, _cols: number, _rows: number) => Promise.resolve()),
+    syncSize: mock((_sessionId: string, _cols: number, _rows: number) => undefined),
     sendInput: mock((_sessionId: string, _data: string) => undefined),
   };
+}
+
+// Inject the client through the real provider; mocking the API module leaks process-wide
+// into later suites.
+const apiClient = createTestApiClient({
+  terminal: {
+    onExit: terminalOnExitMock,
+  },
+});
+
+function APIWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={apiClient}>{props.children}</APIProvider>;
 }
 
 function renderTerminal(onExit: (exitCode: number) => void) {
@@ -145,7 +177,8 @@ function renderTerminal(onExit: (exitCode: number) => void) {
       setDocumentTitle={false}
       autoFocus={false}
       onExit={onExit}
-    />
+    />,
+    { wrapper: APIWrapper }
   );
 }
 
@@ -155,13 +188,70 @@ describe("TerminalView", () => {
     mockRouter = createRouter();
     subscribeCallbacks = [];
     terminalInstances = [];
+    focusOnOpen = false;
   });
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     cleanupDom?.();
     cleanupDom = null;
     mock.restore();
+  });
+
+  // After a reconnect the router sends the full screen again. Written on top of the old screen,
+  // the scrollback would repeat, so a replacing screen starts from an empty terminal.
+  test("a screen that replaces the old one is written after a full VT reset", async () => {
+    renderTerminal(mock((_exitCode: number) => undefined));
+    await waitFor(() => expect(mockRouter.subscribe).toHaveBeenCalledTimes(1));
+    const terminal = terminalInstances[0];
+    expect(terminal?.calls).toEqual(["write:initial screen"]);
+
+    act(() => subscribeCallbacks[0]?.onScreenState("screen after reconnect", { replace: true }));
+    // One write: a full reset (RIS) in the VT, then the screen. Never Terminal.reset(), which
+    // frees ghostty's WASM terminal while other parts of ghostty-web still use it.
+    expect(terminal?.calls).toEqual(["write:initial screen", "write:\x1bcscreen after reconnect"]);
+    expect(terminal?.reset).toHaveBeenCalledTimes(0);
+    // The view keeps its one subscription: no new subscribe, no clear.
+    expect(mockRouter.subscribe).toHaveBeenCalledTimes(1);
+    expect(terminal?.clear).toHaveBeenCalledTimes(1);
+  });
+
+  // After the switch the client stays the same while Xum reconnects, so the exit stream fails
+  // with ConnectionLostError instead of being aborted by a new client: that is not an exit.
+  test.each([...GAP_MODES])("a lost connection does not end the terminal (%s)", async (mode) => {
+    let exitSubscriptions = 0;
+    const harness = createConnectionHarness(mode, () => ({
+      terminal: {
+        onExit: () => {
+          exitSubscriptions += 1;
+          return Promise.resolve(
+            (async function* (): AsyncGenerator<number, void, unknown> {
+              await new Promise(() => undefined); // the process keeps running
+              yield 0;
+            })()
+          );
+        },
+      },
+    }));
+    const onExit = mock((_exitCode: number) => undefined);
+    render(
+      <TerminalView
+        workspaceId="workspace-1"
+        sessionId="terminal-1"
+        visible
+        setDocumentTitle={false}
+        autoFocus={false}
+        onExit={onExit}
+      />,
+      { wrapper: harness.Wrapper }
+    );
+    await waitFor(() => expect(exitSubscriptions).toBe(1));
+
+    await harness.drop();
+    harness.reconnect();
+    await waitFor(() => expect(exitSubscriptions).toBe(2));
+    expect(onExit).not.toHaveBeenCalled();
   });
 
   test("keeps the router subscription stable when onExit changes", async () => {
@@ -203,5 +293,107 @@ describe("TerminalView", () => {
     expect(firstOnExit).toHaveBeenCalledTimes(0);
     expect(secondOnExit).toHaveBeenCalledTimes(1);
     expect(secondOnExit.mock.calls[0]?.[0]).toBe(7);
+  });
+
+  // A terminal that must not take focus hands back the focus ghostty-web takes as it opens it:
+  // left on the page body, keystrokes would reach the chat (as after the right sidebar's toggle
+  // expands a sidebar that shows a terminal).
+  test("a terminal opened without autoFocus leaves focus where it was", async () => {
+    focusOnOpen = true;
+    const toggle = document.createElement("button");
+    document.body.append(toggle);
+    toggle.focus();
+
+    renderTerminal(mock((_exitCode: number) => undefined));
+    await waitFor(() => expect(mockRouter.subscribe).toHaveBeenCalledTimes(1));
+    // Past ghostty-web's delayed focus.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+
+    expect(document.activeElement).toBe(toggle);
+  });
+
+  // The container stays visibility:hidden ("Connecting...") until the first screen state, and a
+  // browser drops focus from a hidden element, so autofocus must wait for it (T3, #5971).
+  test("keeps autofocus pending until the terminal shows its first screen", async () => {
+    // The focus path checks `instanceof HTMLTextAreaElement`; installDom does not expose it.
+    const previousTextArea = globalThis.HTMLTextAreaElement;
+    globalThis.HTMLTextAreaElement = window.HTMLTextAreaElement;
+    try {
+      mockRouter.subscribe = mock((_sessionId: string, callbacks: TerminalSubscribeCallbacks) => {
+        subscribeCallbacks.push(callbacks);
+        return unsubscribeMock;
+      });
+      const onAutoFocusConsumed = mock(() => undefined);
+      const view = render(
+        <TerminalView
+          workspaceId="workspace-1"
+          sessionId="terminal-1"
+          visible
+          setDocumentTitle={false}
+          autoFocus
+          onAutoFocusConsumed={onAutoFocusConsumed}
+        />,
+        { wrapper: APIWrapper }
+      );
+
+      await waitFor(() => expect(mockRouter.subscribe).toHaveBeenCalledTimes(1));
+      // Give the focus retry loop a few frames while the screen is still hidden.
+      await act(() => new Promise((resolve) => setTimeout(resolve, 100)));
+      expect(onAutoFocusConsumed).not.toHaveBeenCalled();
+
+      act(() => subscribeCallbacks[0].onScreenState(""));
+
+      await waitFor(() => expect(onAutoFocusConsumed).toHaveBeenCalledTimes(1));
+      expect(document.activeElement).toBe(view.container.querySelector("textarea"));
+    } finally {
+      globalThis.HTMLTextAreaElement = previousTextArea;
+    }
+  });
+
+  test("renders the badge overlay with substituted template when enabled", async () => {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: {
+        appearance: { terminalBadgeConfig: { ...DEFAULT_TERMINAL_BADGE_CONFIG, enabled: true } },
+      },
+    });
+
+    const view = render(
+      <TerminalView
+        workspaceId="workspace-1"
+        sessionId="terminal-1"
+        visible
+        setDocumentTitle={false}
+        autoFocus={false}
+        workspaceName="my-feature"
+        projectName="xum"
+        tabName="Terminal 2"
+      />,
+      { wrapper: APIWrapper }
+    );
+
+    await waitFor(() => {
+      expect(view.container.textContent).toContain("my-feature · Terminal 2");
+    });
+  });
+
+  test("renders no badge overlay by default", async () => {
+    const view = render(
+      <TerminalView
+        workspaceId="workspace-1"
+        sessionId="terminal-1"
+        visible
+        setDocumentTitle={false}
+        autoFocus={false}
+        workspaceName="my-feature"
+        projectName="xum"
+        tabName="Terminal 2"
+      />,
+      { wrapper: APIWrapper }
+    );
+
+    await waitFor(() => {
+      expect(mockRouter.subscribe).toHaveBeenCalledTimes(1);
+    });
+    expect(view.container.textContent).not.toContain("my-feature");
   });
 });

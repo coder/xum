@@ -2,21 +2,34 @@ import type { AgentSkillDescriptor, SkillName } from "@/common/types/agentSkill"
 import type { AvailableWorkflow } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import type { ApprovedCopiesReads } from "@/node/services/agentPlugins/approvedCopies";
+import {
+  listPluginWorkflowFiles,
+  SKILL_WORKFLOW_ENTRY,
+} from "@/node/services/agentPlugins/workflowFiles";
 import { getBuiltInSkillDescriptors } from "@/node/services/agentSkills/builtInSkillDefinitions";
+import type { SkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
 
 import { buildWorkflowScriptDescriptor } from "./WorkflowService";
 import { parseWorkflowMetadata, summarizeWorkflowArgs } from "./workflowMetadata";
-import { resolveWorkflowScript } from "./workflowScriptResolver";
+import { resolveWorkflowPhaseManifest } from "./workflowPhaseManifest";
+import { discoverWorkflowPlugins, resolveWorkflowScript } from "./workflowScriptResolver";
 
 /** Conventional entry file for a workflow-bearing skill (e.g. deep-research). */
-const WORKFLOW_SKILL_ENTRY = "workflow.js";
+const WORKFLOW_SKILL_ENTRY = SKILL_WORKFLOW_ENTRY;
 
 export interface DiscoverWorkflowScriptsInput {
   runtime: Runtime;
   workspacePath: string;
+  /** Inclusive checkout/repository boundary for inherited project skills. */
+  projectSearchRoot?: string;
   projectTrusted: boolean;
+  skillStorageContext?: SkillStorageContext;
+  /** Builds the host-local runtimes of skill discovery. */
+  runtimeFactory: RuntimeFactory;
 }
 
 /**
@@ -26,7 +39,7 @@ export interface DiscoverWorkflowScriptsInput {
  * attempting to resolve it — a skill that resolves is a workflow; anything that
  * throws (no entry, or project trust missing) is skipped.
  *
- * Standalone `.mux/workflows/*.js` files are intentionally not enumerated here:
+ * Standalone `.xum/workflows/*.js` files are intentionally not enumerated here:
  * they're an advanced, trust-gated path still launchable from chat. Skill-based
  * workflows cover the common case.
  */
@@ -51,31 +64,92 @@ export async function discoverWorkflowScripts(
   // readAgentSkill resolves by precedence (project > global > built-in) when names collide.
   getBuiltInSkillDescriptors().forEach(addSkill);
   try {
-    (await discoverAgentSkills(input.runtime, input.workspacePath)).forEach(addSkill);
+    const skillCtx = input.skillStorageContext;
+    (
+      await discoverAgentSkills(
+        skillCtx?.runtime ?? input.runtime,
+        skillCtx?.workspacePath ?? input.workspacePath,
+        skillCtx != null
+          ? {
+              roots: skillCtx.roots,
+              containment: skillCtx.containment,
+              runtimeFactory: input.runtimeFactory,
+            }
+          : {
+              runtimeFactory: input.runtimeFactory,
+              projectSearchRoot: input.projectSearchRoot,
+              // #6426: default roots include project plugin skills only in a trusted project.
+              projectPluginsTrusted: input.projectTrusted,
+              containment: {
+                kind: "runtime",
+                root: input.projectSearchRoot ?? input.workspacePath,
+              },
+            }
+      )
+    ).skills.forEach(addSkill);
   } catch (error) {
     log.warn(`Workflow script discovery: failed to enumerate skills: ${getErrorMessage(error)}`);
   }
 
-  const available: AvailableWorkflow[] = [];
-  for (const skillName of skillNames) {
+  const approvedCopiesReads: ApprovedCopiesReads = new Map();
+  const tryPush = async (available: AvailableWorkflow[], scriptPath: string): Promise<void> => {
     try {
       const resolved = await resolveWorkflowScript({
-        scriptPath: `skill://${skillName}/${WORKFLOW_SKILL_ENTRY}`,
+        scriptPath,
         runtime: input.runtime,
         workspacePath: input.workspacePath,
+        projectSearchRoot: input.projectSearchRoot,
         projectTrusted: input.projectTrusted,
+        skillStorageContext: input.skillStorageContext,
+        approvedCopiesReads,
+        runtimeFactory: input.runtimeFactory,
       });
+      const descriptor = buildWorkflowScriptDescriptor(resolved);
+      // Pre-run phase preview. An invalid meta.phases declaration must not hide
+      // the script from the launcher: surface a warning instead (run creation
+      // rejects with the same enumerated issues).
+      const manifestOutcome = resolveWorkflowPhaseManifest(resolved.source, resolved.sourceHash);
+      if (manifestOutcome.kind === "manifest") {
+        descriptor.phaseManifest = manifestOutcome.manifest;
+      }
       available.push({
-        descriptor: buildWorkflowScriptDescriptor(resolved),
+        descriptor,
         scriptPath: resolved.canonicalScriptPath,
         args: summarizeWorkflowArgs(parseWorkflowMetadata(resolved.source)) ?? [],
+        ...(manifestOutcome.kind === "invalid"
+          ? { phaseManifestWarning: manifestOutcome.warning }
+          : {}),
       });
     } catch {
       // Skip non-workflow skills (no workflow.js), untrusted project skills, AND scripts whose
       // arg metadata fails to parse/summarize — keeping the whole body in the per-skill catch so
       // one malformed workflow can't abort discovery and hide every other workflow.
-      continue;
     }
+  };
+
+  const available: AvailableWorkflow[] = [];
+  for (const skillName of skillNames) {
+    await tryPush(available, `skill://${skillName}/${WORKFLOW_SKILL_ENTRY}`);
+  }
+
+  // Agent Plugins: standalone workflows/ contributions, addressed as
+  // plugin://<name>/<file>.js. Same per-script failure isolation as skills.
+  try {
+    const plugins = await discoverWorkflowPlugins(input);
+    const seenPluginNames = new Set<string>();
+    for (const plugin of plugins) {
+      if (plugin.workflowsDir == null) continue;
+      // The resolver picks the first plugin matching a name, so duplicate
+      // names in lower-precedence containers cannot contribute here either.
+      if (seenPluginNames.has(plugin.name)) continue;
+      seenPluginNames.add(plugin.name);
+
+      for (const fileName of await listPluginWorkflowFiles(plugin.workflowsDir)) {
+        await tryPush(available, `plugin://${plugin.name}/${fileName}`);
+      }
+    }
+  } catch (error) {
+    log.warn(`Workflow script discovery: failed to enumerate plugins: ${getErrorMessage(error)}`);
   }
 
   available.sort((a, b) => a.descriptor.name.localeCompare(b.descriptor.name));

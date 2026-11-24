@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { cn } from "@/common/lib/utils";
-import { formatCompactNumber, formatUsd } from "@/browser/features/Analytics/analyticsUtils";
+import { formatResultNumber } from "@/browser/features/Analytics/analyticsUtils";
 import { HeaderButton } from "../Shared/ToolPrimitives";
 import { isNumericType } from "./chartHeuristics";
 import type { ChartType, ColumnMeta, DrillDownContext } from "./types";
@@ -48,16 +48,7 @@ function formatCellValue(column: ColumnMeta, value: unknown): string {
       return "—";
     }
 
-    const normalizedName = column.name.toLowerCase();
-    if (normalizedName.includes("cost") || normalizedName.includes("usd")) {
-      return formatUsd(value);
-    }
-
-    if (normalizedName.includes("token")) {
-      return value.toLocaleString();
-    }
-
-    return formatCompactNumber(value);
+    return formatResultNumber(column.name, value);
   }
 
   return stringifyCellValue(value);

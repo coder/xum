@@ -1,10 +1,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
 import {
+  getAutoRoutingPick,
+  getPendingAiSelection,
+  markAiSelectionIntent,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import {
   consumeWorkspaceModelChange,
+  setAutoRoutingChoice,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
+import { getProjectScopeId } from "@/common/constants/storage";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 
 let workspaceCounter = 0;
 
@@ -15,6 +26,7 @@ function nextWorkspaceId(): string {
 
 describe("modelChange", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -22,9 +34,47 @@ describe("modelChange", () => {
   });
 
   afterEach(() => {
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
+  });
+
+  test("an explicit user pick turns Auto off; sync keeps it", () => {
+    const workspaceId = nextWorkspaceId();
+
+    setAutoRoutingChoice(workspaceId, "model", true);
+    setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "sync");
+    expect(getAutoRouting(workspaceId, "model")).toBe(true);
+
+    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "user");
+    expect(getAutoRouting(workspaceId, "model")).toBe(false);
+  });
+
+  test("a legacy workspace id that starts with __ records the pick as unsent", () => {
+    const legacyId = "__proj-main";
+    setWorkspaceModelWithOrigin(legacyId, "openai:gpt-5.2-codex", "user");
+    expect(getPendingAiSelection(legacyId, "exec", "model")).toBe("openai:gpt-5.2-codex");
+  });
+
+  test("a project without its own agent records Auto picks for the inherited global agent", () => {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { ai: { globalDefaults: { agentId: "plan" } } },
+    });
+    const scopeId = getProjectScopeId("/model-change-project");
+    setAutoRoutingChoice(scopeId, "model", true);
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    expect(getAutoRoutingPick(scopeId, "plan", "model")).toBe(true);
+  });
+
+  test("records routing picks for the selected agent only", () => {
+    const workspaceId = nextWorkspaceId();
+    setWorkspaceAgentPick(workspaceId, "plan");
+
+    setAutoRoutingChoice(workspaceId, "thinkingLevel", true);
+    setAutoRoutingChoice(workspaceId, "model", true);
+    setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
+
+    expect(getAutoRouting(workspaceId, "thinkingLevel", "plan")).toBe(true);
+    expect(getAutoRouting(workspaceId, "model", "plan")).toBe(false);
+    expect(getAutoRouting(workspaceId, "thinkingLevel", "exec")).toBe(false);
   });
 
   test("does not record explicit entries for no-op model changes", () => {
@@ -32,7 +82,7 @@ describe("modelChange", () => {
     const model = "openai:gpt-5.2-codex";
     const otherModel = "anthropic:claude-sonnet-4-5";
 
-    setWorkspaceModelWithOrigin(workspaceId, model, "sync");
+    markAiSelectionIntent(workspaceId, "model", model);
 
     // Simulate user selecting the already-active model.
     setWorkspaceModelWithOrigin(workspaceId, model, "user");
@@ -78,5 +128,31 @@ describe("modelChange", () => {
     // Rapid A→B: if we observe A while tracking B, keep the pending B entry.
     expect(consumeWorkspaceModelChange(workspaceId, firstModel)).toBeNull();
     expect(consumeWorkspaceModelChange(workspaceId, secondModel)).toBe("user");
+  });
+
+  test("tracks switches between a Coder gateway entry and the direct model as explicit", () => {
+    const workspaceId = nextWorkspaceId();
+    const directModel = "openai:claude-opus-4-1";
+    const coderModel = "coder:openai/claude-opus-4-1";
+
+    setWorkspaceModelWithOrigin(workspaceId, directModel, "sync");
+
+    // Name-only canonicalization collapsed these into the same identity, so
+    // the explicit entry was dropped and the warning path saw a background sync.
+    setWorkspaceModelWithOrigin(workspaceId, coderModel, "user");
+
+    expect(consumeWorkspaceModelChange(workspaceId, coderModel)).toBe("user");
+  });
+
+  test("still collapses non-Coder gateway aliases when tracking explicit changes", () => {
+    const workspaceId = nextWorkspaceId();
+    const canonicalModel = "openai:gpt-5.2-codex";
+    const gatewayAlias = "openrouter:openai/gpt-5.2-codex";
+
+    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "sync");
+    setWorkspaceModelWithOrigin(workspaceId, canonicalModel, "user");
+
+    // A persisted rewrite to the gateway alias must still consume the entry.
+    expect(consumeWorkspaceModelChange(workspaceId, gatewayAlias)).toBe("user");
   });
 });

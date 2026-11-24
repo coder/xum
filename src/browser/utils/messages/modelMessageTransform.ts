@@ -3,13 +3,15 @@
  * This operates on already-converted ModelMessages from Vercel AI SDK.
  */
 
-import type { ModelMessage, AssistantModelMessage, ToolModelMessage } from "ai";
-import type { MuxMessage } from "@/common/types/message";
-import type { EditedFileAttachment } from "@/node/services/agentSession";
+import type { ModelMessage, AssistantModelMessage, ToolModelMessage, UserModelMessage } from "ai";
+import {
+  isContextBudgetWarningMessage,
+  type MuxMessage,
+  type MuxReasoningPart,
+} from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
-import { findLatestCompactionBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
 import { renderAttachmentsToContentWithBudget } from "./attachmentRenderer";
 
 /**
@@ -138,7 +140,7 @@ export function injectAgentTransition(
   // Find the index of the last user message
   let lastUserIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") {
+    if (messages[i].role === "user" && !isContextBudgetWarningMessage(messages[i])) {
       lastUserIndex = i;
       break;
     }
@@ -206,74 +208,29 @@ ${planContent}
   return result;
 }
 
-/**
- * Inject file change notifications as a synthetic user message.
- * When files are modified externally (by user or linter), append a notification at the end
- * so the model is aware of changes without busting the system message cache.
- *
- * @param messages The conversation history
- * @param changedFileAttachments Files that were modified externally
- * @returns Messages with file change notification appended if any files changed
- */
-export function injectFileChangeNotifications(
-  messages: MuxMessage[],
-  changedFileAttachments?: EditedFileAttachment[]
-): MuxMessage[] {
-  if (!changedFileAttachments || changedFileAttachments.length === 0) {
-    return messages;
-  }
-
-  const notice = changedFileAttachments
-    .map(
-      (att) =>
-        `Note: ${att.filename} was modified, either by the user or by a linter.\n` +
-        `This change was intentional, so make sure to take it into account as you proceed ` +
-        `(i.e., don't revert it unless the user asks you to). Here are the relevant changes:\n${att.snippet}`
-    )
-    .join("\n\n");
-
-  const syntheticMessage: MuxMessage = {
-    id: `file-change-${Date.now()}`,
-    role: "user",
-    parts: [{ type: "text", text: `<system-file-update>\n${notice}\n</system-file-update>` }],
-    metadata: {
-      timestamp: Date.now(),
-      synthetic: true,
-    },
-  };
-
-  return [...messages, syntheticMessage];
-}
-
-function findLatestLegacyCompactionSummaryIndex(messages: MuxMessage[]): number {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i];
-    if (message.role !== "assistant") {
-      continue;
-    }
-
-    const compacted = message.metadata?.compacted;
-    if (compacted === undefined || compacted === false) {
-      continue;
-    }
-
-    return i;
-  }
-
-  return -1;
-}
+// NOTE: File-change notifications are no longer injected at request time.
+// AgentSession appends the <system-file-update> row durably to chat.jsonl at
+// turn start (see createFileChangeNotificationMessage in fileChangeTracker.ts),
+// keeping the provider request a pure function of the session log.
 
 /**
  * Inject post-compaction attachments as a synthetic user message.
  * When compaction occurs, this injects a message containing plan file content
  * and/or edited files to preserve context that would otherwise be lost.
  *
- * The message is inserted AFTER the compaction summary message to ensure
- * the model receives this context for the next turn.
+ * The message goes right before the newest user message (Token Budget warning rows
+ * excepted, as in injectAgentTransition), or last without one. It is request-only and comes
+ * back every TURNS_BETWEEN_ATTACHMENTS turns for the whole segment, so it must not sit
+ * early in the history: placed after the compaction summary, it rewrote the cached history
+ * after the summary on the turn it appeared and again on the next turn, when it was gone.
+ * Here every row before the current turn's request stays byte-identical, and every step of
+ * the turn rebuilds the same position (the tool loop appends after the request). The model
+ * sees the same shape as before: the attachments, then the user's request (provider
+ * transforms merge the two user messages, attachments first).
  *
  * @param messages The conversation history
  * @param attachments Post-compaction attachments (plan file, loaded skills, edited files)
- * @returns Messages with attachments injected after compaction summary
+ * @returns Messages with the attachments injected before the newest user message
  */
 export function injectPostCompactionAttachments(
   messages: MuxMessage[],
@@ -283,37 +240,10 @@ export function injectPostCompactionAttachments(
     return messages;
   }
 
-  const durableCompactionIndex = findLatestCompactionBoundaryIndex(messages);
-  // Durable boundaries are authoritative for current histories. Legacy histories
-  // only have metadata.compacted, so fall back to that marker when needed.
-  const compactionIndex =
-    durableCompactionIndex !== -1
-      ? durableCompactionIndex
-      : findLatestLegacyCompactionSummaryIndex(messages);
-
-  if (compactionIndex === -1) {
-    // No compaction message found - this shouldn't happen if attachments are provided,
-    // but append at end as a fallback
-    const syntheticMessage: MuxMessage = {
-      id: `post-compaction-${Date.now()}`,
-      role: "user",
-      parts: [
-        {
-          type: "text",
-          text: renderAttachmentsToContentWithBudget(attachments, {
-            maxChars: MAX_POST_COMPACTION_INJECTION_CHARS,
-          }),
-        },
-      ],
-      metadata: {
-        timestamp: Date.now(),
-        synthetic: true,
-      },
-    };
-    return [...messages, syntheticMessage];
-  }
-
-  // Insert the synthetic message immediately after the compaction summary
+  const newestUserIndex = messages.findLastIndex(
+    (message) => message.role === "user" && !isContextBudgetWarningMessage(message)
+  );
+  const index = newestUserIndex === -1 ? messages.length : newestUserIndex;
   const syntheticMessage: MuxMessage = {
     id: `post-compaction-${Date.now()}`,
     role: "user",
@@ -326,14 +256,11 @@ export function injectPostCompactionAttachments(
       },
     ],
     metadata: {
-      timestamp: messages[compactionIndex].metadata?.timestamp ?? Date.now(),
+      timestamp: messages[index]?.metadata?.timestamp ?? Date.now(),
       synthetic: true,
     },
   };
-
-  const result = [...messages];
-  result.splice(compactionIndex + 1, 0, syntheticMessage);
-  return result;
+  return [...messages.slice(0, index), syntheticMessage, ...messages.slice(index)];
 }
 
 /**
@@ -531,6 +458,20 @@ function filterReasoningOnlyMessages(messages: ModelMessage[]): ModelMessage[] {
 
     return hasNonReasoningContent;
   });
+}
+
+/**
+ * Drop every replayed reasoning part, and the assistant rows that held only
+ * reasoning (Sonnet 5.5 `between_tools`, #5086).
+ */
+export function stripAnthropicReasoning(messages: ModelMessage[]): ModelMessage[] {
+  return filterReasoningOnlyMessages(
+    messages.map((msg) =>
+      msg.role === "assistant" && typeof msg.content !== "string"
+        ? { ...msg, content: msg.content.filter((part) => part.type !== "reasoning") }
+        : msg
+    )
+  );
 }
 
 /**
@@ -887,15 +828,15 @@ function stripUnsignedAnthropicReasoning(messages: ModelMessage[]): ModelMessage
       return msg;
     }
 
-    // Filter out reasoning parts without anthropic.signature in providerOptions
+    // Keep reasoning the SDK can replay: signed `thinking` blocks and
+    // `redacted_thinking` blocks (redactedData, no signature). Dropping a replayable
+    // block would move every later block off the prefix it was signed against.
     const content = assistantMsg.content.filter((part) => {
       if (part.type !== "reasoning") {
         return true;
       }
-      // Check for anthropic.signature in providerOptions
-      const anthropicMeta = (part.providerOptions as { anthropic?: { signature?: string } })
-        ?.anthropic;
-      return anthropicMeta?.signature != null;
+      const anthropicMeta = anthropicReasoningMeta(part);
+      return anthropicMeta?.signature != null || anthropicMeta?.redactedData != null;
     });
 
     const result: typeof assistantMsg = { ...assistantMsg, content };
@@ -920,11 +861,38 @@ function stripUnsignedAnthropicReasoning(messages: ModelMessage[]): ModelMessage
   });
 }
 
+type AnthropicReasoningMeta = NonNullable<MuxReasoningPart["providerOptions"]>["anthropic"];
+
+function anthropicReasoningMeta(part: {
+  providerOptions?: Record<string, unknown>;
+}): AnthropicReasoningMeta | undefined {
+  return part.providerOptions?.anthropic as AnthropicReasoningMeta | undefined;
+}
+
+/**
+ * Whether `part` continues the reasoning block that `lastPart` belongs to.
+ * Anthropic signs the LAST streamed part of each thinking block, so a signed
+ * part closes its block: merging the next part into it would fuse two blocks
+ * under one signature and invalidate every later block (preserved thinking).
+ * A redacted_thinking block is one opaque part and never merges either way.
+ */
+function continuesReasoningBlock(
+  lastPart: { providerOptions?: Record<string, unknown>; signature?: string },
+  part: { providerOptions?: Record<string, unknown> }
+): boolean {
+  const lastMeta = anthropicReasoningMeta(lastPart);
+  if (lastMeta?.signature != null || lastMeta?.redactedData != null || lastPart.signature) {
+    return false;
+  }
+  return anthropicReasoningMeta(part)?.redactedData == null;
+}
+
 /**
  * Coalesce consecutive parts of the same type within each message.
  * Streaming creates many individual text/reasoning parts; merge them for easier debugging.
  * Also reduces JSON overhead when sending messages to the API.
- * Tool calls remain atomic (not merged).
+ * Tool calls remain atomic (not merged). Reasoning merges only within one
+ * provider block (see continuesReasoningBlock).
  */
 function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
   return messages.map((msg) => {
@@ -953,26 +921,33 @@ function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
         continue;
       }
 
-      // Merge consecutive reasoning parts (extended thinking)
-      if (part.type === "reasoning" && lastPart?.type === "reasoning") {
+      // Merge consecutive reasoning parts of one block (extended thinking)
+      if (
+        part.type === "reasoning" &&
+        lastPart?.type === "reasoning" &&
+        continuesReasoningBlock(lastPart, part)
+      ) {
         lastPart.text += part.text;
-        // Preserve signature from later parts - during streaming, the signature
-        // arrives at the end and is attached to the last reasoning part.
-        // Cast needed because AI SDK's ReasoningPart doesn't have signature,
-        // but our MuxReasoningPart (which flows through convertToModelMessages) does.
-        const partWithSig = part as typeof part & {
-          signature?: string;
-          providerOptions?: { anthropic?: { signature?: string } };
-        };
-        const lastWithSig = lastPart as typeof lastPart & {
-          signature?: string;
-          providerOptions?: { anthropic?: { signature?: string } };
-        };
+        // Streaming splits one reasoning block across many parts and replay
+        // metadata can land on any of them: Anthropic signatures arrive on the
+        // LAST part of a run, while OpenAI/xAI itemId/encrypted content attach
+        // to the FIRST (and itemId may repeat on later deltas). Merge per
+        // provider namespace so a later partial object cannot clobber fields
+        // accumulated earlier (e.g. reasoningEncryptedContent under ZDR).
+        if (part.providerOptions) {
+          const existing = lastPart.providerOptions ?? {};
+          const merged: NonNullable<typeof lastPart.providerOptions> = { ...existing };
+          for (const [provider, fields] of Object.entries(part.providerOptions)) {
+            merged[provider] = { ...existing[provider], ...fields };
+          }
+          lastPart.providerOptions = merged;
+        }
+        // The legacy top-level `signature` field predates providerOptions and
+        // survives here only for defensiveness (conversion strips it upstream).
+        const partWithSig = part as typeof part & { signature?: string };
+        const lastWithSig = lastPart as typeof lastPart & { signature?: string };
         if (partWithSig.signature) {
           lastWithSig.signature = partWithSig.signature;
-        }
-        if (partWithSig.providerOptions) {
-          lastWithSig.providerOptions = partWithSig.providerOptions;
         }
         continue;
       }
@@ -987,54 +962,103 @@ function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
     };
   });
 }
+type UserContentParts = Exclude<UserModelMessage["content"], string>;
+
+/** A user message's parts; a string is one text part. */
+function userPartsOf(content: UserModelMessage["content"]): UserContentParts {
+  return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
+
 /**
  * Merge consecutive user messages with newline separators.
  * When filtering removes assistant messages, we can end up with consecutive user messages.
  * Anthropic requires alternating user/assistant, so we merge them.
+ *
+ * Each message keeps its parts in their order (text, a PNG, then an SVG inlined as text stays in
+ * that order). The separator goes only between the merged messages: where the earlier one ends
+ * in text and the later one starts with text, the two join with a newline. Next to a file there
+ * is nothing to join, so no separator is added.
  */
 function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] {
   const merged: ModelMessage[] = [];
 
   for (const msg of messages) {
-    if (msg.role === "user" && merged.length > 0 && merged[merged.length - 1].role === "user") {
-      // Consecutive user message - merge with previous
-      const prevMsg = merged[merged.length - 1];
-
-      // Get text content from both messages
-      const prevText = Array.isArray(prevMsg.content)
-        ? (prevMsg.content.find((c) => c.type === "text")?.text ?? "")
-        : prevMsg.content;
-
-      const currentText = Array.isArray(msg.content)
-        ? (msg.content.find((c) => c.type === "text")?.text ?? "")
-        : typeof msg.content === "string"
-          ? msg.content
-          : "";
-
-      // Merge with newline prefix
-      const mergedText = prevText + "\n" + currentText;
-
-      // Collect file/image parts from both messages
-      const prevImageParts = Array.isArray(prevMsg.content)
-        ? prevMsg.content.filter((c) => c.type === "file")
-        : [];
-      const currentImageParts = Array.isArray(msg.content)
-        ? msg.content.filter((c) => c.type === "file")
-        : [];
-
-      // Update the previous message with merged text and all image parts
-      merged[merged.length - 1] = {
-        role: "user",
-        content: [
-          { type: "text" as const, text: mergedText },
-          ...prevImageParts,
-          ...currentImageParts,
-        ],
-      };
-    } else {
-      // Not consecutive user message, add as-is
+    const prevMsg = merged.at(-1);
+    if (msg.role !== "user" || prevMsg?.role !== "user") {
       merged.push(msg);
+      continue;
     }
+    const parts = [...userPartsOf(prevMsg.content)];
+    const next = userPartsOf(msg.content);
+    const last = parts.at(-1);
+    const first = next.at(0);
+    if (last?.type === "text" && first?.type === "text") {
+      parts[parts.length - 1] = { ...last, text: `${last.text}\n${first.text}` };
+      parts.push(...next.slice(1));
+    } else {
+      parts.push(...next);
+    }
+    merged[merged.length - 1] = { role: "user", content: parts };
+  }
+
+  return merged;
+}
+
+type AssistantContentArray = Exclude<AssistantModelMessage["content"], string>;
+
+/** True when the content is plain text: a string, or an array of only text parts. */
+function isTextOnlyAssistantContent(content: AssistantModelMessage["content"]): boolean {
+  if (typeof content === "string") return true;
+  return content.every((part) => part.type === "text");
+}
+
+/**
+ * Merge a text-only assistant message into a directly preceding assistant
+ * message. Synthetic assistant rows (branch summaries; potentially other
+ * generated notices) can land right after a streamed assistant turn, and
+ * Anthropic requires alternating user/assistant roles. Deliberately narrow:
+ * the INCOMING message must be text-only, and the previous message must not
+ * end in tool calls (their tool-result adjacency must stay intact — a
+ * tool-call assistant message is followed by a tool message, so those pairs
+ * never reach this merge anyway). Reasoning parts already in the previous
+ * message are preserved ahead of the appended text.
+ */
+function mergeConsecutiveAssistantTextMessages(messages: ModelMessage[]): ModelMessage[] {
+  const merged: ModelMessage[] = [];
+
+  for (const msg of messages) {
+    const prev = merged[merged.length - 1];
+    if (
+      msg.role === "assistant" &&
+      prev?.role === "assistant" &&
+      isTextOnlyAssistantContent(msg.content) &&
+      (typeof prev.content === "string" || !prev.content.some((part) => part.type === "tool-call"))
+    ) {
+      // Preserve the original text parts verbatim instead of re-joining them
+      // into one string: rebuilding parts as plain {type,text} would discard
+      // part-level providerOptions (e.g. cacheControl) carried by the folded
+      // row. Only the message envelope of the merged-away row is dropped.
+      // Empty and whitespace-only text parts are filtered from BOTH sides —
+      // the previous row can itself carry one (extended thinking preserves
+      // signed-reasoning rows whose text part is empty, and an interrupted
+      // stream can persist a whitespace-only delta) and Anthropic rejects
+      // text blocks without non-whitespace content; non-text parts
+      // (reasoning) pass through with their providerOptions.
+      const dropEmptyText = <T extends { type: string; text?: unknown }>(part: T) =>
+        part.type !== "text" || (typeof part.text === "string" && part.text.trim().length > 0);
+      const currentParts: AssistantContentArray =
+        typeof msg.content === "string"
+          ? msg.content.trim().length > 0
+            ? [{ type: "text", text: msg.content }]
+            : []
+          : msg.content.filter(dropEmptyText);
+      const prevParts: AssistantContentArray =
+        typeof prev.content === "string" ? [{ type: "text", text: prev.content }] : prev.content;
+      const prevContent: AssistantContentArray = prevParts.filter(dropEmptyText);
+      merged[merged.length - 1] = { ...prev, content: [...prevContent, ...currentParts] };
+      continue;
+    }
+    merged.push(msg);
   }
 
   return merged;
@@ -1057,7 +1081,12 @@ function ensureAnthropicThinkingBeforeToolCalls(messages: ModelMessage[]): Model
 
     const content = assistantMsg.content;
     const hasToolCall = content.some((part) => part.type === "tool-call");
-    if (!hasToolCall) {
+    // A message that already starts with thinking meets the API rule (manual thinking: the
+    // final assistant turn must start with a thinking block). Keep its block order: with
+    // interleaved thinking, text can sit between two thinking blocks, and moving a block
+    // edits the prefix every later block is bound to (#5887). Preserved thinking: "send it
+    // back unchanged ... in the order received".
+    if (!hasToolCall || content[0]?.type === "reasoning") {
       result.push(msg);
       continue;
     }
@@ -1164,6 +1193,8 @@ export function transformModelMessages(
   provider: string,
   options?: {
     anthropicThinkingEnabled?: boolean;
+    /** Drop every replayed reasoning part (Sonnet 5.5 `between_tools`, #5086). */
+    anthropicStripReasoning?: boolean;
   }
 ): ModelMessage[] {
   // Pass 0: Coalesce consecutive parts to reduce JSON overhead from streaming (applies to all providers)
@@ -1193,7 +1224,9 @@ export function transformModelMessages(
       const signedReasoning = stripUnsignedAnthropicReasoning(taskAwaitCoalesced);
       reasoningHandled = ensureAnthropicThinkingBeforeToolCalls(signedReasoning);
     } else {
-      reasoningHandled = filterReasoningOnlyMessages(taskAwaitCoalesced);
+      reasoningHandled = options?.anthropicStripReasoning
+        ? stripAnthropicReasoning(taskAwaitCoalesced)
+        : filterReasoningOnlyMessages(taskAwaitCoalesced);
     }
   } else {
     // Unknown provider: no reasoning handling
@@ -1203,7 +1236,13 @@ export function transformModelMessages(
   // Pass 5: Merge consecutive user messages (applies to all providers)
   const merged = mergeConsecutiveUserMessages(reasoningHandled);
 
-  return merged;
+  // Pass 6: Merge text-only synthetic assistant rows (branch summaries) into
+  // a preceding assistant turn — Anthropic rejects consecutive assistant
+  // messages just as it rejects consecutive user messages. Anthropic-only:
+  // other providers accept adjacent assistant rows, and an unconditional
+  // merge would change provider-request bytes for histories that contain
+  // them outside this path (recovery, imported history).
+  return provider === "anthropic" ? mergeConsecutiveAssistantTextMessages(merged) : merged;
 }
 
 /**
@@ -1289,68 +1328,4 @@ export function validateAnthropicCompliance(messages: ModelMessage[]): {
   }
 
   return { valid: true };
-}
-
-function hasAnthropicThinkingSignature(part: { providerOptions?: unknown } | undefined): boolean {
-  const providerOptions = part?.providerOptions as
-    | { anthropic?: { signature?: unknown } }
-    | undefined;
-  return (
-    typeof providerOptions?.anthropic?.signature === "string" &&
-    providerOptions.anthropic.signature.length > 0
-  );
-}
-
-/**
- * Anthropic Extended Thinking self-healing check.
- *
- * When Anthropic `thinking` is enabled, the API requires that assistant messages containing
- * tool calls begin with a thinking block. The AI SDK only replays thinking blocks when the
- * reasoning part includes a valid Anthropic signature.
- *
- * If we have tool-call messages but no signed reasoning to replay, Anthropic rejects the
- * request with errors like:
- * "Expected thinking or redacted_thinking, but found tool_use."
- *
- * In that case, the safest fallback is to disable thinking for the request.
- */
-export function getAnthropicThinkingDisableReason(messages: ModelMessage[]): string | undefined {
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg.role !== "assistant") {
-      continue;
-    }
-
-    // String-only assistant messages never contain tool calls.
-    if (typeof msg.content === "string") {
-      continue;
-    }
-
-    // Treat unsigned reasoning as absent (the AI SDK will drop it).
-    const content = msg.content.filter(
-      (part) => part.type !== "reasoning" || hasAnthropicThinkingSignature(part)
-    );
-
-    const hasToolCall = content.some((part) => part.type === "tool-call");
-    if (!hasToolCall) {
-      continue;
-    }
-
-    const firstPart = content[0];
-    if (!firstPart) {
-      // Shouldn't happen, but defensively treat it as unsupported.
-      return `Message ${i}: tool-call assistant message became empty after stripping unsigned reasoning`;
-    }
-
-    if (firstPart.type !== "reasoning") {
-      return `Message ${i}: tool-call assistant message does not start with signed reasoning (starts with ${firstPart.type})`;
-    }
-
-    if (!hasAnthropicThinkingSignature(firstPart)) {
-      // Shouldn't happen because we filtered, but keep error message explicit.
-      return `Message ${i}: assistant message starts with reasoning but is missing anthropic.signature`;
-    }
-  }
-
-  return undefined;
 }

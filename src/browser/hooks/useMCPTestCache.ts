@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { getOwn } from "@/common/utils/getOwn";
 import type { CachedMCPTestResult, MCPTestResult } from "@/common/types/mcp";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -8,11 +9,16 @@ type CachedResults = Record<string, CachedMCPTestResult>;
 /**
  * Hook for managing MCP server test results cache.
  * Persists results to localStorage, shared across Settings and WorkspaceMCPModal.
+ *
+ * Pass `workspaceId` when the listing is workspace-scoped: plugin server keys
+ * are deliberately stable across worktrees of a project, but their tool lists
+ * follow each workspace's own checkout, so results cached from one branch must
+ * not leak into another workspace's modal.
  */
-export function useMCPTestCache(projectPath: string) {
+export function useMCPTestCache(projectPath: string, workspaceId?: string) {
   const storageKey = useMemo(
-    () => (projectPath ? getMCPTestResultsKey(projectPath) : ""),
-    [projectPath]
+    () => (projectPath ? getMCPTestResultsKey(projectPath, workspaceId) : ""),
+    [projectPath, workspaceId]
   );
 
   const [cache, setCache] = useState<CachedResults>(() =>
@@ -57,7 +63,7 @@ export function useMCPTestCache(projectPath: string) {
   /** Get tools for a server (returns null if not cached or failed) */
   const getTools = useCallback(
     (name: string): string[] | null => {
-      const cached = cache[name];
+      const cached = getOwn(cache, name);
       if (cached?.result.success) {
         return cached.result.tools;
       }

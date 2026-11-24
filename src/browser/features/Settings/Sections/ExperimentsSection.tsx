@@ -1,10 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { SettingsAnchor, SettingsOpenSettingContext } from "../Components/SettingsLayout";
+import { experimentAnchorId } from "../settingsRegistry";
 import { AlertTriangle, Info } from "lucide-react";
-import {
-  useExperiment,
-  useExperimentValue,
-  useRemoteExperimentValue,
-} from "@/browser/contexts/ExperimentsContext";
+import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   getExperimentList,
   getExperimentPlatformRestrictionLabel,
@@ -26,21 +24,37 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import type { ApiServerStatus, DesktopPrereqStatus } from "@/common/orpc/types";
 import { Input } from "@/browser/components/Input/Input";
-import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
-import { AdvisorToolExperimentConfig } from "./AdvisorToolExperimentConfig";
-import { HeartbeatDefaultsControls } from "./HeartbeatSection";
+import { useOptionalSettings } from "@/browser/contexts/SettingsContext";
+import {
+  SETTINGS_SECTION_META,
+  SETTING_DEFINITIONS,
+  subExperimentsOf,
+  type SettingId,
+} from "../settingsRegistry";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
 // Sub-experiments of Agent Memory: hidden from the flat list and rendered in a
 // nested panel under the parent toggle, since they are no-ops while memory is off.
-const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
-  EXPERIMENT_IDS.MEMORY_HOT_SET,
-  EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
-];
+const MEMORY_SUB_EXPERIMENT_IDS = subExperimentsOf(EXPERIMENT_IDS.MEMORY);
 
-type SettingsConfig = Awaited<ReturnType<APIClient["config"]["getConfig"]>>;
+// Sub-experiments of Programmatic Tool Calling: same nesting treatment — RLM
+// mode is a no-op while PTC is off (code_execution is never assembled).
+const PTC_SUB_EXPERIMENT_IDS = subExperimentsOf(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+
+// Sub-experiments of Artifacts: the Agent interface view shows an artifact, so it is a no-op
+// while Artifacts is off.
+const ARTIFACTS_SUB_EXPERIMENT_IDS = subExperimentsOf(EXPERIMENT_IDS.ARTIFACTS);
+
+// Every sub-experiment: hidden from the flat list, since each renders under its parent row.
+const NESTED_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
+  ...MEMORY_SUB_EXPERIMENT_IDS,
+  ...PTC_SUB_EXPERIMENT_IDS,
+  ...ARTIFACTS_SUB_EXPERIMENT_IDS,
+];
 
 interface ExperimentRowProps {
   experimentId: ExperimentId;
@@ -49,11 +63,12 @@ interface ExperimentRowProps {
   disabled?: boolean;
   availabilityMessage?: string | null;
   onToggle?: (enabled: boolean) => void;
+  /** Beside the switch: the button that opens this experiment's options (ExperimentConfigButton). */
+  action?: React.ReactNode;
 }
 
 function ExperimentRow(props: ExperimentRowProps) {
   const [enabled, setEnabled] = useExperiment(props.experimentId);
-  const remote = useRemoteExperimentValue(props.experimentId);
   const telemetry = useTelemetry();
   const { availabilityMessage, disabled = false, onToggle, experimentId } = props;
 
@@ -63,16 +78,22 @@ function ExperimentRow(props: ExperimentRowProps) {
         return;
       }
 
-      setEnabled(value);
+      // Dependent settings (the LAN bind reset) change only once the write is saved.
+      setEnabled(value)
+        .then(() => onToggle?.(value))
+        .catch(() => undefined);
       // Track the override for analytics
-      telemetry.experimentOverridden(experimentId, remote?.value ?? null, value);
-      onToggle?.(value);
+      telemetry.experimentOverridden(experimentId, value);
     },
-    [disabled, setEnabled, telemetry, experimentId, remote?.value, onToggle]
+    [disabled, setEnabled, telemetry, experimentId, onToggle]
   );
 
   return (
-    <div className="flex items-center justify-between py-3">
+    // Anchored so a settings search result for this experiment scrolls to it.
+    <SettingsAnchor
+      id={experimentAnchorId(experimentId)}
+      className="-mx-2 flex items-center justify-between rounded-md px-2 py-3"
+    >
       <div className="flex-1 pr-4">
         <div className="text-foreground text-sm font-medium">{props.name}</div>
         <div className="text-muted mt-0.5 text-xs">{props.description}</div>
@@ -83,13 +104,50 @@ function ExperimentRow(props: ExperimentRowProps) {
           </div>
         )}
       </div>
-      <Switch
-        checked={enabled}
-        disabled={disabled}
-        onCheckedChange={handleToggle}
-        aria-label={`Toggle ${props.name}`}
-        title={availabilityMessage ?? undefined}
-      />
+      <div className="flex shrink-0 items-center gap-3">
+        {props.action}
+        <Switch
+          checked={enabled}
+          disabled={disabled}
+          onCheckedChange={handleToggle}
+          aria-label={`Toggle ${props.name}`}
+          title={availabilityMessage ?? undefined}
+        />
+      </div>
+    </SettingsAnchor>
+  );
+}
+
+function isPortableDesktopBinaryMissing(status: DesktopPrereqStatus | null): boolean {
+  return !status?.available && status?.reason === "binary_not_found";
+}
+
+/** The warning's buttons. Offline they are disabled: they could not reach the server. */
+function PortableDesktopWarningActions(props: {
+  loading: boolean;
+  restarting: boolean;
+  onCheckAgain: () => void;
+  onRestart: () => void;
+}) {
+  const offline = useLiveAPI() == null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={props.onCheckAgain}
+        disabled={props.restarting || offline}
+      >
+        {props.loading ? "Checking…" : "Check again"}
+      </Button>
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={props.onRestart}
+        disabled={props.loading || props.restarting || offline}
+      >
+        {props.restarting ? "Restarting…" : "Restart Xum"}
+      </Button>
     </div>
   );
 }
@@ -115,9 +173,9 @@ export function PortableDesktopExperimentWarning() {
     setError(null);
 
     try {
-      // This warning lives on /settings/experiments, where selectedWorkspace is intentionally
-      // URL-derived and null. Probe the machine-level desktop prerequisite instead of a
-      // workspace-scoped capability so the warning still renders on settings routes.
+      // Settings can open with no workspace behind it (cold links, project pages). Probe the
+      // machine-level desktop prerequisite instead of a workspace-scoped capability so the
+      // warning renders regardless of the background page.
       const nextStatus = await api.desktop.getPrereqStatus();
       if (requestIdRef.current !== requestId) {
         return;
@@ -125,7 +183,8 @@ export function PortableDesktopExperimentWarning() {
 
       setPrereqStatus(nextStatus);
     } catch (e) {
-      if (requestIdRef.current !== requestId) {
+      // A lost connection is no check failure: the reconnect checks again.
+      if (requestIdRef.current !== requestId || isConnectionLostError(e)) {
         return;
       }
 
@@ -140,10 +199,13 @@ export function PortableDesktopExperimentWarning() {
   useEffect(() => {
     if (!enabled || !api) {
       requestIdRef.current += 1;
-      setPrereqStatus(null);
       setLoading(false);
       setRestarting(false);
-      setError(null);
+      // Offline (`!api`), keep the shown status: the reconnect checks again.
+      if (!enabled) {
+        setPrereqStatus(null);
+        setError(null);
+      }
       return;
     }
 
@@ -173,7 +235,7 @@ export function PortableDesktopExperimentWarning() {
     }
   }, [api]);
 
-  const isBinaryMissing = !prereqStatus?.available && prereqStatus?.reason === "binary_not_found";
+  const isBinaryMissing = isPortableDesktopBinaryMissing(prereqStatus);
 
   if (!enabled || !isBinaryMissing) {
     return null;
@@ -195,31 +257,20 @@ export function PortableDesktopExperimentWarning() {
             >
               {PORTABLE_DESKTOP_INSTALL_URL}
             </a>{" "}
-            to enable this feature. If you installed it into a location that mux can already see,
-            choose Check again. If you changed PATH after mux launched, restart mux to pick it up.
+            to enable this feature. If you installed it into a location that xum can already see,
+            choose Check again. If you changed PATH after xum launched, restart xum to pick it up.
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={() => {
-                void loadPrereqStatus();
-              }}
-              disabled={restarting}
-            >
-              {loading ? "Checking…" : "Check again"}
-            </Button>
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={() => {
-                void handleRestart();
-              }}
-              disabled={loading || restarting}
-            >
-              {restarting ? "Restarting…" : "Restart Mux"}
-            </Button>
-          </div>
+          {/* Offline the kept warning stays, but its buttons are disabled. */}
+          <PortableDesktopWarningActions
+            loading={loading}
+            restarting={restarting}
+            onCheckAgain={() => {
+              void loadPrereqStatus();
+            }}
+            onRestart={() => {
+              void handleRestart();
+            }}
+          />
           {error && <div className="text-[11px]">{error}</div>}
         </div>
       </div>
@@ -227,6 +278,8 @@ export function PortableDesktopExperimentWarning() {
   );
 }
 
+// The LAN/VPN bind controls render in Settings → Server access (LanAccessGroup), not here. They
+// stay in this file so the component keeps its history.
 const TAILSCALE_BIND_HOST_MODE_PREFIX = "tailscale:";
 
 type BindHostMode =
@@ -254,7 +307,7 @@ function formatTailscaleBindHostLabel(host: ApiServerStatus["tailscaleBindHosts"
   return `Tailscale ${host.interfaceName} (${host.address}, ${protocol})`;
 }
 
-function ConfigurableBindUrlControls() {
+export function ConfigurableBindUrlControls() {
   const enabled = useExperimentValue(EXPERIMENT_IDS.CONFIGURABLE_BIND_URL);
   const { api } = useAPI();
 
@@ -416,7 +469,7 @@ function ConfigurableBindUrlControls() {
   if (!api) {
     return (
       <div className="bg-background-secondary px-4 py-3">
-        <div className="text-muted text-xs">Connect to mux to configure this setting.</div>
+        <div className="text-muted text-xs">Connect to xum to configure this setting.</div>
       </div>
     );
   }
@@ -436,7 +489,7 @@ function ConfigurableBindUrlControls() {
   return (
     <div className="bg-background-secondary space-y-4 px-4 py-3">
       <div className="text-warning text-xs">
-        Exposes mux’s API server to your LAN/VPN. Devices on your local network can connect if they
+        Exposes xum’s API server to your LAN/VPN. Devices on your local network can connect if they
         have the auth token. Traffic is unencrypted HTTP; enable only on trusted networks (Tailscale
         recommended).
       </div>
@@ -445,7 +498,7 @@ function ConfigurableBindUrlControls() {
         <div className="flex items-center justify-between gap-4">
           <div>
             <div className="text-foreground text-sm">Bind host</div>
-            <div className="text-muted text-xs">Where mux listens for HTTP + WS connections</div>
+            <div className="text-muted text-xs">Where xum listens for HTTP + WS connections</div>
           </div>
           <Select value={hostMode} onValueChange={(value) => setHostMode(value as BindHostMode)}>
             <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-64 cursor-pointer rounded-md border px-3 text-sm transition-colors">
@@ -492,7 +545,7 @@ function ConfigurableBindUrlControls() {
           <div>
             <div className="text-foreground text-sm">Port</div>
             <div className="text-muted text-xs">
-              Use a fixed port to avoid changing URLs each time mux restarts
+              Use a fixed port to avoid changing URLs each time xum restarts
             </div>
           </div>
           <Select value={portMode} onValueChange={(value) => setPortMode(value as PortMode)}>
@@ -523,15 +576,15 @@ function ConfigurableBindUrlControls() {
 
         <div className="flex items-center justify-between gap-4">
           <div>
-            <div className="text-foreground text-sm">Serve mux web UI</div>
+            <div className="text-foreground text-sm">Serve xum web UI</div>
             <div className="text-muted text-xs">
-              Serve the mux web interface at / (browser mode)
+              Serve the xum web interface at / (browser mode)
             </div>
           </div>
           <Switch
             checked={serveWebUi}
             onCheckedChange={(value) => setServeWebUi(value)}
-            aria-label="Toggle serving mux web UI"
+            aria-label="Toggle serving xum web UI"
           />
         </div>
 
@@ -640,7 +693,7 @@ function ConfigurableBindUrlControls() {
             </>
           ) : (
             <div className="text-muted text-xs">
-              Web UI serving is disabled (enable “Serve mux web UI” and Apply to access /).
+              Web UI serving is disabled (enable “Serve xum web UI” and Apply to access /).
             </div>
           )}
 
@@ -659,6 +712,49 @@ function ConfigurableBindUrlControls() {
   );
 }
 
+/**
+ * Experiments only turns features on and off. Options of an enabled experiment live in the
+ * section they belong to; this row links there.
+ */
+// The first control of each experiment's moved configuration: the link scrolls to it, since it
+// can sit far down its section (Auto routing is below the model lists).
+const EXPERIMENT_CONFIG_SETTINGS: Partial<Record<ExperimentId, SettingId>> = {
+  [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: "lan-bind",
+  [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: "dream-cost-ceiling",
+  [EXPERIMENT_IDS.ARTIFACTS]: "artifacts-cdn",
+  [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: "auto-routing",
+};
+
+/**
+ * Opens the section that holds an enabled experiment's options, shown beside its switch. The
+ * section's own nav icon says where it goes. A narrow section (a phone) shows the icon alone,
+ * by container width rather than viewport, and the name stays the button's accessible name.
+ */
+function ExperimentConfigButton(props: { experimentId: ExperimentId }) {
+  const enabled = useExperimentValue(props.experimentId);
+  const settings = useOptionalSettings();
+  const openSetting = useContext(SettingsOpenSettingContext);
+  const settingId = EXPERIMENT_CONFIG_SETTINGS[props.experimentId];
+  if (!enabled || !settingId) return null;
+  const sectionId = SETTING_DEFINITIONS[settingId].section;
+  const section = SETTINGS_SECTION_META.find((meta) => meta.id === sectionId);
+  // Outside the page (a lone section story) there is no row focus to hand over: open the section.
+  if (!section || (!openSetting && !settings)) return null;
+  const open = () => (openSetting ? openSetting(settingId) : settings?.setActiveSection(sectionId));
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={open}
+      aria-label={`Configure in ${section.label}`}
+      className="text-content-secondary hover:text-content-primary gap-1.5 @max-md:px-2"
+    >
+      {section.icon}
+      <span className="@max-md:hidden">{section.label}</span>
+    </Button>
+  );
+}
+
 interface ExperimentSettingsPanelProps {
   children: React.ReactNode;
 }
@@ -667,13 +763,23 @@ function ExperimentSettingsPanel(props: ExperimentSettingsPanelProps) {
   return <div className="bg-background-secondary px-4 py-3">{props.children}</div>;
 }
 
-// Renders the Agent Memory sub-experiment toggles as a nested list. Extracted so
-// the nested-config call site mirrors its siblings (AdvisorToolExperimentConfig,
-// HeartbeatDefaultsControls) instead of inlining the map in the section render.
-function MemorySubExperimentRows() {
+/** Status page agent does nothing without Agent interface view, so it shows only under it. */
+function visibleArtifactsSubExperimentIds(agentInterfaceEnabled: boolean): readonly ExperimentId[] {
+  return agentInterfaceEnabled
+    ? ARTIFACTS_SUB_EXPERIMENT_IDS
+    : ARTIFACTS_SUB_EXPERIMENT_IDS.filter(
+        (id) => id !== EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT
+      );
+}
+
+// Renders a parent experiment's sub-experiment toggles as a nested list.
+// Extracted so the nested-config call sites mirror their siblings
+// (AutoModelRoutingExperimentConfig) instead of inlining the map in the
+// section render.
+function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
   return (
     <div className="divide-border-light divide-y">
-      {MEMORY_SUB_EXPERIMENT_IDS.map((subId) => {
+      {props.experimentIds.map((subId) => {
         const subExp = EXPERIMENTS[subId];
         return (
           <ExperimentRow
@@ -681,6 +787,7 @@ function MemorySubExperimentRows() {
             experimentId={subId}
             name={subExp.name}
             description={subExp.description}
+            action={<ExperimentConfigButton experimentId={subId} />}
           />
         );
       })}
@@ -691,54 +798,18 @@ function MemorySubExperimentRows() {
 export function ExperimentsSection() {
   const allExperiments = getExperimentList();
   const { api } = useAPI();
-  const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const settingsConfigRequestRef = useRef<{
-    api: APIClient;
-    request: Promise<SettingsConfig>;
-  } | null>(null);
-
-  useEffect(() => {
-    settingsConfigRequestRef.current = null;
-  }, [api]);
-
-  const loadExperimentSettingsConfig = useCallback(() => {
-    if (!api) {
-      return Promise.reject(new Error("Cannot load settings config before API connection."));
-    }
-
-    const cachedRequest = settingsConfigRequestRef.current;
-    if (cachedRequest?.api === api) {
-      return cachedRequest.request;
-    }
-
-    const request = api.config.getConfig();
-    settingsConfigRequestRef.current = { api, request };
-    request.then(
-      () => {
-        if (settingsConfigRequestRef.current?.request === request) {
-          settingsConfigRequestRef.current = null;
-        }
-      },
-      () => {
-        if (settingsConfigRequestRef.current?.request === request) {
-          settingsConfigRequestRef.current = null;
-        }
-      }
-    );
-    return request;
-  }, [api]);
-
+  const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const artifactsSubExperimentIds = visibleArtifactsSubExperimentIds(
+    useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE)
+  );
   // Only show user-overridable experiments (non-overridable ones are hidden since users can't
-  // change them). Memory sub-experiments render nested under the Agent Memory row instead.
+  // change them). Sub-experiments render nested under their parent row instead.
   const experiments = useMemo(
     () =>
       allExperiments.filter(
-        (exp) =>
-          exp.showInSettings !== false &&
-          exp.userOverridable === true &&
-          !MEMORY_SUB_EXPERIMENT_IDS.includes(exp.id)
+        (exp) => exp.showInSettings !== false && !NESTED_SUB_EXPERIMENT_IDS.includes(exp.id)
       ),
     [allExperiments]
   );
@@ -759,7 +830,8 @@ export function ExperimentsSection() {
   );
 
   return (
-    <div className="space-y-2">
+    // A container, so each row's configure button can drop its label at a narrow width.
+    <div className="@container space-y-2">
       <p className="text-muted mb-4 text-xs">
         Experimental features that are still in development. Enable at your own risk.
       </p>
@@ -783,24 +855,24 @@ export function ExperimentsSection() {
                     ? handleConfigurableBindUrlToggle
                     : undefined
                 }
+                action={<ExperimentConfigButton experimentId={exp.id} />}
               />
-              {exp.id === EXPERIMENT_IDS.ADVISOR_TOOL && advisorToolEnabled && (
-                <AdvisorToolExperimentConfig />
-              )}
-              {exp.id === EXPERIMENT_IDS.WORKSPACE_HEARTBEATS && workspaceHeartbeatsEnabled && (
-                <ExperimentSettingsPanel>
-                  <HeartbeatDefaultsControls
-                    loadConfig={api ? loadExperimentSettingsConfig : undefined}
-                  />
-                </ExperimentSettingsPanel>
-              )}
               {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
                 <ExperimentSettingsPanel>
-                  <MemorySubExperimentRows />
+                  <SubExperimentRows experimentIds={MEMORY_SUB_EXPERIMENT_IDS} />
+                </ExperimentSettingsPanel>
+              )}
+              {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING && ptcEnabled && (
+                <ExperimentSettingsPanel>
+                  <SubExperimentRows experimentIds={PTC_SUB_EXPERIMENT_IDS} />
+                </ExperimentSettingsPanel>
+              )}
+              {exp.id === EXPERIMENT_IDS.ARTIFACTS && artifactsEnabled && (
+                <ExperimentSettingsPanel>
+                  <SubExperimentRows experimentIds={artifactsSubExperimentIds} />
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}
-              {exp.id === EXPERIMENT_IDS.CONFIGURABLE_BIND_URL && <ConfigurableBindUrlControls />}
             </React.Fragment>
           );
         })}

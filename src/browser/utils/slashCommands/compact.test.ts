@@ -173,12 +173,12 @@ describe("compact command parser", () => {
   });
 
   it("resolves model abbreviations case-sensitively", () => {
-    const result = parseCommand("/compact -m codex");
+    const result = parseCommand("/compact -m sol");
     expect(result).toEqual({
       type: "compact",
       maxOutputTokens: undefined,
       continueMessage: undefined,
-      model: KNOWN_MODELS.GPT_53_CODEX.id,
+      model: KNOWN_MODELS.GPT.id,
     });
   });
 

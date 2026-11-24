@@ -1,5 +1,7 @@
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type { ModelFallbacks } from "@/common/config/schemas/appConfigOnDisk";
 
 /**
@@ -9,31 +11,142 @@ import type { ModelFallbacks } from "@/common/config/schemas/appConfigOnDisk";
 export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
 
 /**
- * Default refusal-fallback chains shipped with the app. Fable 5 safeguards
- * may refuse requests the current Opus tier can serve, so retrying on Opus is
- * the sensible out-of-the-box behavior.
+ * Refusal-fallback chains that the one-time seed passes add to EXISTING
+ * configs. Fable safeguards may refuse requests the Opus tier can serve, so
+ * retrying on Opus is the sensible out-of-the-box behavior.
+ *
+ * The target is pinned to the literal Opus 5 id rather than KNOWN_MODELS.OPUS.id:
+ * Opus 5.5 (the current `opus` alias) ships the same safeguard classifiers as
+ * Fable 5.1, so it is not a proven refusal-recovery target, and pinning keeps
+ * fresh installs and already-seeded configs on identical bytes without a
+ * chain-target migration. Revisit once Opus 5.5 refusal behavior is known.
+ * Opus 5 is also one of Anthropic's permitted server-side fallback targets for
+ * Fable 5.2 (https://platform.claude.com/docs/en/models/fable-5-2/whats-new-fable-5-2).
  *
  * Seeded into the config exactly once, guarded by
- * migrations.defaultModelFallbacksSeeded — on versions that know the flag,
- * user edits or deletions of these chains are never overridden by updates.
- * (Versions predating the flag strip it on save, so a downgrade→save→
+ * migrations.defaultModelFallbacksSeededFable52 (each earlier fable alias move
+ * has its own flag, see LEGACY_DEFAULT_MODEL_FALLBACKS) — on versions that know
+ * the flag, user edits or deletions of these chains are never overridden by
+ * updates. (Versions predating the flag strip it on save, so a downgrade→save→
  * re-upgrade round-trip re-seeds a deleted chain; bounded to re-adding this
  * benign, re-deletable default.)
  */
+export const SEEDED_MODEL_FALLBACKS: ModelFallbacks = {
+  [KNOWN_MODELS.FABLE.id]: { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Default refusal-fallback chains for fresh installs: the seeded chains plus
+ * chains added after the seed flags shipped. Those later chains reach fresh
+ * installs only; existing configs get no migration and no new flag, and users
+ * add them by hand (docs/config/models.mdx). Maintainer decision on #5087.
+ * (The fable chain is not such a later chain: it keeps the existing `fable`
+ * alias fallback alive across alias moves, so it is seeded.)
+ *
+ * Sonnet 5.5 → Sonnet 5 mirrors Anthropic's own server-side fallback for
+ * Sonnet 5.5's cyber safeguards. Both ids are pinned literals, not
+ * KNOWN_MODELS.SONNET: a later `sonnet` alias move must not retarget the chain.
+ */
 export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
-  [KNOWN_MODELS.FABLE.id]: { models: [KNOWN_MODELS.OPUS.id] },
+  ...SEEDED_MODEL_FALLBACKS,
+  "anthropic:claude-sonnet-5-5": { models: ["anthropic:claude-sonnet-5"] },
+};
+
+/**
+ * Default chain of the Fable 5 era, seeded by the original seed pass
+ * (migrations.defaultModelFallbacksSeeded). A build whose FABLE is Fable 5
+ * trusts that flag for this key, so every pass that claims the flag also
+ * carries this chain and a downgrade keeps refusal fallback.
+ */
+export const FABLE_5_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Default chain of the Fable 5.1 era, seeded by the
+ * migrations.defaultModelFallbacksSeededFable51 pass. Same downgrade reasoning
+ * as FABLE_5_DEFAULT_MODEL_FALLBACKS, for builds whose FABLE is Fable 5.1.
+ */
+export const FABLE_5_1_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  "anthropic:claude-fable-5-1": { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Legacy default chains for earlier fable ids, seeded alongside
+ * DEFAULT_MODEL_FALLBACKS on fresh installs. Fresh installs mark every seed
+ * flag, so a downgrade to an older build would skip its own seed; carrying
+ * these chains keeps the old build's refusal fallback intact.
+ */
+export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  ...FABLE_5_DEFAULT_MODEL_FALLBACKS,
+  ...FABLE_5_1_DEFAULT_MODEL_FALLBACKS,
 };
 // Deep-freeze: entries are spread by reference into live configs (fresh-install
 // defaults, seed merge). Accidental in-place mutation must crash fast instead
 // of silently corrupting the process-wide default.
-for (const entry of Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS))) {
+for (const entry of [
+  ...Object.values(Object.freeze(SEEDED_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(FABLE_5_DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(FABLE_5_1_DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(LEGACY_DEFAULT_MODEL_FALLBACKS)),
+]) {
   Object.freeze(entry);
   Object.freeze(entry.models);
 }
 
 /**
+ * Sanitize one persisted fallback model string. Coder gateway strings stay
+ * VERBATIM: name-based canonicalization would rewrite coder:openai/<model> to
+ * openai:<model> even when the instance is cross-typed ({name: "openai",
+ * type: "anthropic"}), merging a gateway-scoped chain into the direct
+ * provider's — and sanitize runs on every config read, where instance
+ * metadata may be temporarily missing (logged out), so a metadata-aware
+ * rewrite here could silently corrupt stored keys. Metadata-aware
+ * canonicalization happens at lookup/editor time (normalizeFallbackModelKey).
+ */
+export function sanitizeFallbackModelString(model: string): string {
+  const trimmed = model.trim();
+  return trimmed.startsWith("coder:") ? trimmed : normalizeToCanonical(trimmed);
+}
+
+/**
+ * Metadata-aware fallback key for a model selection. Coder strings on the
+ * default canonical routes (coder:anthropic/x, coder:openai/x) share their
+ * chain with the direct provider ONLY when the instance metadata agrees with
+ * the name (name === type, the default convention). Cross-typed instances
+ * ({name: "openai", type: "anthropic"}) and shadowed prefixes keep the
+ * gateway-scoped key: their refusal behavior is a property of the gateway
+ * selection, not of the direct provider the name resembles.
+ */
+export function normalizeFallbackModelKey(
+  modelString: string,
+  providersConfig?: Record<string, unknown> | null
+): string {
+  const trimmed = modelString.trim();
+  if (!trimmed.startsWith("coder:")) {
+    return normalizeToCanonical(trimmed);
+  }
+  const canonical = normalizeToCanonical(trimmed);
+  if (canonical === trimmed) {
+    return trimmed; // non-canonical instance names are already gateway-scoped
+  }
+  const coderSection = providersConfig?.coder;
+  if (isCustomProviderConfig(coderSection)) {
+    return trimmed; // custom provider shadows the prefix; raw IS the identity
+  }
+  const wire = resolveCoderWireCanonicalModel(
+    trimmed.slice("coder:".length),
+    coderSection as { discoveredProviders?: unknown; additionalProviders?: unknown } | undefined
+  );
+  const canonicalOrigin = canonical.slice(0, canonical.indexOf(":"));
+  return wire?.providerType === canonicalOrigin ? canonical : trimmed;
+}
+
+/**
  * Sanitize one fallback chain relative to its source model: canonicalize every
- * entry, drop self-fallbacks and duplicates, and cap the length. Used both when
+ * entry (Coder strings stay gateway-scoped, see sanitizeFallbackModelString),
+ * drop self-fallbacks and duplicates, and cap the length. Used both when
  * persisting from the settings editor (strict-on-write) and when resolving at
  * request time (lenient-on-read, so malformed config self-heals instead of
  * breaking sends).
@@ -42,14 +155,14 @@ export function sanitizeModelFallbackChain(
   sourceModel: string,
   models: readonly unknown[]
 ): string[] {
-  const canonicalSource = normalizeToCanonical(sourceModel).trim();
+  const canonicalSource = sanitizeFallbackModelString(sourceModel);
   const seen = new Set<string>();
   const chain: string[] = [];
   for (const model of models) {
     if (typeof model !== "string") {
       continue;
     }
-    const canonical = normalizeToCanonical(model).trim();
+    const canonical = sanitizeFallbackModelString(model);
     if (!canonical || canonical === canonicalSource || seen.has(canonical)) {
       continue;
     }
@@ -70,13 +183,22 @@ export function sanitizeModelFallbackChain(
  */
 export function resolveModelFallbackChain(
   modelFallbacks: ModelFallbacks | undefined,
-  modelString: string
+  modelString: string,
+  providersConfig?: Record<string, unknown> | null
 ): string[] {
   if (!modelFallbacks) {
     return [];
   }
 
-  const canonicalSource = normalizeToCanonical(modelString).trim();
+  // Raw-first: an explicit gateway-scoped chain always wins for that exact
+  // selection (and stays reachable even when instance metadata is missing).
+  // The metadata-aware key then lets default-typed canonical-route Coder
+  // selections share the direct provider's chain, while cross-typed ones do
+  // NOT fall through to it.
+  const rawSource = modelString.trim();
+  const canonicalSource = modelFallbacks[rawSource]
+    ? rawSource
+    : normalizeFallbackModelKey(modelString, providersConfig);
   const entry = modelFallbacks[canonicalSource];
   if (!entry || entry.enabled === false || !Array.isArray(entry.models)) {
     return [];
@@ -98,7 +220,7 @@ export function resolveModelFallbackChain(
 export function sanitizeModelFallbacks(modelFallbacks: ModelFallbacks): ModelFallbacks {
   const next: ModelFallbacks = {};
   for (const [sourceModel, entry] of Object.entries(modelFallbacks)) {
-    const canonicalSource = normalizeToCanonical(sourceModel).trim();
+    const canonicalSource = sanitizeFallbackModelString(sourceModel);
     if (!canonicalSource || !entry || !Array.isArray(entry.models)) {
       continue;
     }

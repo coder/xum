@@ -1,3 +1,5 @@
+import type { ReviewNoteData } from "@/common/types/review";
+
 /**
  * Format a review lineRange string for compact display.
  *
@@ -21,4 +23,11 @@ export function formatLineRangeCompact(lineRange: string): string {
 
   // Fallback: return as-is
   return lineRange;
+}
+
+/** Header label for a review card: `path:L10-12`, or the artifact path for an artifact comment. */
+export function formatReviewLocationLabel(data: ReviewNoteData, compact = false): string {
+  if (data.artifact != null) return data.filePath;
+  const range = `L${formatLineRangeCompact(data.lineRange)}`;
+  return compact ? range : `${data.filePath}:${range}`;
 }

@@ -1,17 +1,16 @@
+import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
-import * as path from "path";
 
 import { Config } from "@/node/config";
 import { SessionTimingService } from "./sessionTimingService";
 import type { TelemetryService } from "./telemetryService";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 
-function createMockTelemetryService(): Pick<TelemetryService, "capture" | "getFeatureFlag"> {
+function createMockTelemetryService(): Pick<TelemetryService, "capture"> {
   return {
     capture: mock(() => undefined),
-    getFeatureFlag: mock(() => Promise.resolve(undefined)),
   };
 }
 
@@ -20,7 +19,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 describe("SessionTimingService", () => {
   let tempDir: string;
   let config: Config;
-  let telemetry: Pick<TelemetryService, "capture" | "getFeatureFlag">;
+  let telemetry: Pick<TelemetryService, "capture">;
   let service: SessionTimingService;
 
   beforeEach(async () => {
@@ -366,7 +365,7 @@ describe("SessionTimingService", () => {
       expect(result.session?.responseCount).toBe(1);
 
       const timingFilePath = path.join(
-        config.getSessionDir(parentWorkspaceId),
+        path.join(config.sessionsDir, parentWorkspaceId),
         "session-timing.json"
       );
       const raw = await fs.readFile(timingFilePath, "utf-8");
@@ -382,7 +381,7 @@ describe("SessionTimingService", () => {
     emitCompletedStreamWithOneTool({ workspaceId, messageId, model, reasoningTokens: 2 });
     await service.waitForIdle(workspaceId);
 
-    const filePath = path.join(config.getSessionDir(workspaceId), "session-timing.json");
+    const filePath = path.join(config.sessionsDir, workspaceId, "session-timing.json");
     const raw = await fs.readFile(filePath, "utf-8");
     const parsed = JSON.parse(raw) as unknown;
     expect(typeof parsed).toBe("object");
@@ -442,7 +441,10 @@ describe("SessionTimingService", () => {
 
     await service.waitForIdle(workspaceId);
 
-    const timingFilePath = path.join(config.getSessionDir(workspaceId), "session-timing.json");
+    const timingFilePath = path.join(
+      path.join(config.sessionsDir, workspaceId),
+      "session-timing.json"
+    );
     const beforeRaw = await fs.readFile(timingFilePath, "utf-8");
     const beforeSnapshot = await service.getSnapshot(workspaceId);
 

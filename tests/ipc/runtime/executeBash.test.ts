@@ -23,7 +23,8 @@ async function executeBashUntilReady(
   timeoutMs = 5000
 ): Promise<ExecuteBashResult> {
   let lastResult: ExecuteBashResult | null = null;
-  let lastFailure: string | null = null;
+  // Widened explicitly: assignments inside the waitFor callback are invisible to narrowing.
+  let lastFailure = null as string | null;
 
   const ready = await waitFor(async () => {
     try {

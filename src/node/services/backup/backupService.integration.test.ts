@@ -1,0 +1,925 @@
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as jsonc from "jsonc-parser";
+import { Config } from "@/node/config";
+import * as disposableExec from "@/node/utils/disposableExec";
+import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
+import { backupCachePath } from "./gitRepo";
+import { BackupService } from "./backupService";
+import { MAX_BACKUP_FILE_BYTES, REDACTED_BACKUP_VALUE } from "./payload";
+import { pinToShelf } from "@/node/services/artifactShelf";
+import { ProjectService } from "@/node/services/projectService";
+import { projectMemoryDirName } from "@/node/services/memoryService";
+import { runGit, writeFixtureFile } from "./testHelpers";
+
+const SECRET_FILES = [
+  "providers.jsonc",
+  "secrets.json",
+  "mcp-oauth.json",
+  "server.lock",
+  "serverAuthSessions.json",
+];
+const DECOY = "DECOY_SECRET_MUST_NOT_LEAK";
+
+/**
+ * Exercises the service against a real bare repository and a real MUX_ROOT, so the
+ * secret-exclusion invariant is asserted on bytes that actually reached a remote.
+ */
+describe("BackupService against a real repository", () => {
+  let tempDir: string;
+  let muxRoot: string;
+  let originPath: string;
+  let config: Config;
+  let service: BackupService;
+  let settings: SettingsBackupInput;
+
+  function createService(): BackupService {
+    return new BackupService(config, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
+      payload: createBackupPayloadStore({ config }),
+    });
+  }
+
+  /** A service whose safety snapshot runs `afterSnapshot` once it is written. */
+  function createServiceRacingSnapshot(afterSnapshot: () => Promise<void>): BackupService {
+    const payload = createBackupPayloadStore({ config });
+    return new BackupService(config, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
+      payload: {
+        ...payload,
+        async writeSafetySnapshot(snapshotRoot, contents) {
+          await payload.writeSafetySnapshot(snapshotRoot, contents);
+          await afterSnapshot();
+        },
+      },
+    });
+  }
+
+  async function pushOrThrow(target: BackupService = service) {
+    const pushed = await target.push(settings);
+    if (!pushed.success) throw new Error(pushed.error.message);
+    return pushed;
+  }
+
+  async function cloneOrigin(name: string): Promise<string> {
+    const target = path.join(tempDir, name);
+    await runGit(["clone", "--quiet", originPath, target]);
+    return target;
+  }
+
+  async function listFiles(root: string): Promise<string[]> {
+    const entries = await fs.readdir(root, { recursive: true, withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)))
+      .filter((file) => !file.startsWith(".git/"))
+      .sort();
+  }
+
+  // #4417: a first push once stalled past the 5 s test timeout, and the IO_ERROR it returned
+  // after teardown could not say which git child it was waiting on. Report every spawn still
+  // running at teardown, and any that took over a second, so a recurrence names the command.
+  const runningSpawns = new Map<number, { command: string; startedAt: number }>();
+  let spawnCount = 0;
+  let execSpy: { mockRestore: () => void } | undefined;
+
+  beforeEach(() => {
+    const realExecFileAsync = disposableExec.execFileAsync;
+    execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation((file, args, options) => {
+      const id = spawnCount++;
+      const startedAt = Date.now();
+      const command = [file, ...args].join(" ");
+      runningSpawns.set(id, { command, startedAt });
+      const spawned = realExecFileAsync(file, args, options);
+      const settled = () => {
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs > 1_000) {
+          console.warn(`[#4417] slow spawn (${elapsedMs} ms): ${command}`);
+        }
+        runningSpawns.delete(id);
+      };
+      // Observes the caller's promise; the caller still receives and handles the original.
+      void spawned.result.then(settled, settled);
+      return spawned;
+    });
+  });
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-backup-e2e-"));
+    muxRoot = path.join(tempDir, "mux-root");
+    originPath = path.join(tempDir, "origin.git");
+    await fs.mkdir(muxRoot, { recursive: true });
+    await runGit(["init", "--bare", "--initial-branch=main", originPath]);
+    // Header values stay local: a repository other people may read is the usual reason to
+    // back up at all, and it lets the fixture below carry a literal token without every push
+    // stopping for approval.
+    settings = { repoUrl: originPath, branch: "main", path: "mux", includeMcpHeaders: false };
+    config = new Config(muxRoot);
+    service = createService();
+
+    await writeFixtureFile(muxRoot, "AGENTS.md", "global instructions\n");
+    await writeFixtureFile(muxRoot, "agents/reviewer.md", "reviewer agent\n");
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "demo skill\n");
+    await writeFixtureFile(muxRoot, "memory/global/note.md", "remembered fact\n");
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      `{
+  // Deploy token: comment-secret-abc123
+  "servers": {
+    "literal": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer abc123" }
+    },
+    "referenced": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": { "secret": "MCP_TOKEN" } }
+    }
+  }
+}
+`
+    );
+    for (const secretFile of SECRET_FILES) {
+      await writeFixtureFile(muxRoot, secretFile, `${DECOY}\n`);
+    }
+  });
+
+  afterEach(async () => {
+    const now = Date.now();
+    for (const { command, startedAt } of runningSpawns.values()) {
+      console.warn(`[#4417] still running at teardown (${now - startedAt} ms): ${command}`);
+    }
+    runningSpawns.clear();
+    execSpy?.mockRestore();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("pushes the portable payload and leaks no secret file", async () => {
+    const pushed = await pushOrThrow();
+    expect(pushed.success).toBe(true);
+
+    const clone = await cloneOrigin("verify");
+    const files = await listFiles(clone);
+    expect(files).toEqual([
+      "mux/AGENTS.md",
+      "mux/agents/reviewer.md",
+      "mux/manifest.json",
+      "mux/mcp.jsonc",
+      "mux/memory/global/note.md",
+      "mux/preferences.json",
+      "mux/skills/demo/SKILL.md",
+    ]);
+
+    const contents = await Promise.all(
+      files.map((file) => fs.readFile(path.join(clone, file), "utf-8"))
+    );
+    expect(contents.join("\n")).not.toContain(DECOY);
+    for (const secretFile of SECRET_FILES) {
+      expect(files.some((file) => path.posix.basename(file) === secretFile)).toBe(false);
+    }
+  });
+
+  it("keeps MCP URLs while leaving header values out of the backup", async () => {
+    const pushed = await pushOrThrow();
+    expect(pushed.data.redactions).toEqual([
+      "servers.literal.headers",
+      "servers.referenced.headers",
+    ]);
+
+    const clone = await cloneOrigin("verify");
+    const mcp = await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8");
+    expect(mcp).not.toContain("Bearer abc123");
+    expect(mcp).not.toContain("MCP_TOKEN");
+    expect(mcp).toContain(REDACTED_BACKUP_VALUE);
+    expect(mcp).toContain('"url": "https://example.com/mcp"');
+    // A comment is prose no projection can inspect, so it is not published at all.
+    expect(mcp).not.toContain("comment-secret-abc123");
+  });
+
+  it("publishes header values once selected and approved, and restores them elsewhere", async () => {
+    const withHeaders = { ...settings, includeMcpHeaders: true };
+    const blocked = await service.push(withHeaders);
+    expect(blocked.success).toBe(false);
+    if (blocked.success) throw new Error("Expected the literal header to need approval");
+    expect(blocked.error.code).toBe("SECRET_DETECTED");
+    expect(blocked.error.files).toEqual(["mcp.jsonc"]);
+
+    const pushed = await service.push(withHeaders, {
+      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
+    });
+    expect(pushed.success).toBe(true);
+    if (!pushed.success) throw new Error(pushed.error.message);
+    expect(pushed.data.redactions).toEqual([]);
+    const clone = await cloneOrigin("verify");
+    const mcp = await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8");
+    expect(mcp).toContain("Bearer abc123");
+    expect(mcp).toContain('"secret": "MCP_TOKEN"');
+
+    // A fresh install gets the literal value; the reference names a secret it does not hold.
+    const freshRoot = path.join(tempDir, "fresh-root");
+    await fs.mkdir(freshRoot, { recursive: true });
+    const freshConfig = new Config(freshRoot);
+    const freshService = new BackupService(freshConfig, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(freshRoot, "backup-cache") }),
+      payload: createBackupPayloadStore({ config: freshConfig }),
+    });
+    const restored = await freshService.restore(withHeaders);
+    expect(restored.success).toBe(true);
+    const restoredMcp = jsonc.parse(
+      await fs.readFile(path.join(freshRoot, "mcp.jsonc"), "utf-8")
+    ) as {
+      servers: Record<string, { headers?: unknown }>;
+    };
+    expect(restoredMcp.servers.literal.headers).toEqual({ Authorization: "Bearer abc123" });
+    expect(restoredMcp.servers.referenced.headers).toBeUndefined();
+  });
+
+  it("does not create a second commit when nothing changed", async () => {
+    await pushOrThrow();
+    const commitsAfterFirst = await runGit([
+      "--git-dir",
+      originPath,
+      "rev-list",
+      "--count",
+      "main",
+    ]);
+
+    const second = await pushOrThrow();
+    expect(second.data.changed).toBe(false);
+    expect(await runGit(["--git-dir", originPath, "rev-list", "--count", "main"])).toBe(
+      commitsAfterFirst
+    );
+  });
+
+  it("blocks a push when a backed-up file contains a token, and proceeds once allowed", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "AGENTS.md",
+      "token ghp_123456789012345678901234567890123456\n"
+    );
+
+    const blocked = await service.push(settings);
+    expect(blocked.success).toBe(false);
+    if (blocked.success) throw new Error("Expected the secret scan to block the push");
+    expect(blocked.error.code).toBe("SECRET_DETECTED");
+    expect(blocked.error.files).toContain("AGENTS.md");
+    expect(await runGit(["--git-dir", originPath, "rev-list", "--count", "--all"])).toBe("0");
+
+    const allowed = await service.push(settings, {
+      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
+    });
+    expect(allowed.success).toBe(true);
+  });
+
+  it("gates a low-entropy MCP URL credential until the exact payload is approved", async () => {
+    const url = "https://user:hunter2@example.com/mcp?api_key=abc123";
+    await writeFixtureFile(muxRoot, "mcp.jsonc", JSON.stringify({ servers: { private: { url } } }));
+
+    const blocked = await service.push(settings);
+    expect(blocked.success).toBe(false);
+    if (blocked.success) throw new Error("Expected the URL credential gate to block the push");
+    expect(blocked.error.code).toBe("SECRET_DETECTED");
+    expect(blocked.error.files).toEqual(["mcp.jsonc"]);
+    expect(await runGit(["--git-dir", originPath, "rev-list", "--count", "--all"])).toBe("0");
+
+    const allowed = await service.push(settings, {
+      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
+    });
+    expect(allowed.success).toBe(true);
+    const clone = await cloneOrigin("url-credential-verify");
+    expect(await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8")).toContain(url);
+  });
+
+  it("requires exact-payload approval before publishing an MCP command", async () => {
+    const command = "npx private-mcp";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { private: { command } } })
+    );
+
+    const blocked = await service.push(settings);
+    expect(blocked.success).toBe(false);
+    if (blocked.success)
+      throw new Error("Expected the MCP command approval gate to block the push");
+    expect(blocked.error.code).toBe("SECRET_DETECTED");
+    expect(blocked.error.files).toEqual(["mcp.jsonc"]);
+    expect(await runGit(["--git-dir", originPath, "rev-list", "--count", "--all"])).toBe("0");
+
+    const allowed = await service.push(settings, {
+      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
+    });
+    expect(allowed.success).toBe(true);
+    const clone = await cloneOrigin("command-credential-verify");
+    expect(await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8")).toContain(command);
+  });
+
+  it("removes a safety snapshot that could not be written", async () => {
+    await pushOrThrow();
+
+    const payloadStore = createBackupPayloadStore({ config });
+    const failing = new BackupService(config, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
+      payload: {
+        ...payloadStore,
+        writeSafetySnapshot: async (snapshotRoot) => {
+          // Half-written, which is the state that matters: an unredacted partial copy.
+          await fs.mkdir(snapshotRoot, { recursive: true });
+          await fs.writeFile(path.join(snapshotRoot, "AGENTS.md"), "partial\n", "utf-8");
+          throw new Error("disk full");
+        },
+      },
+    });
+
+    const failed = await failing.restore(settings);
+
+    expect(failed.success).toBe(false);
+    const cacheRoot = path.join(muxRoot, "backup-cache");
+    const snapshots = (await fs.readdir(cacheRoot).catch(() => [])).filter((entry) =>
+      entry.startsWith("restore-")
+    );
+    expect(snapshots).toEqual([]);
+  });
+
+  it("refuses to clone the git cache through a symlinked cache directory", async () => {
+    // The cache holds the local payload, including files still awaiting the user's approval.
+    const outside = path.join(tempDir, "outside-git-cache");
+    await fs.mkdir(outside, { recursive: true });
+    await fs.rm(path.join(muxRoot, "backup-cache"), { recursive: true, force: true });
+    await fs.symlink(outside, path.join(muxRoot, "backup-cache"));
+
+    const refused = await service.push(settings);
+
+    expect(refused.success).toBe(false);
+    expect(await fs.readdir(outside)).toEqual([]);
+  });
+
+  it("refuses a pre-created per-repository cache symlink even when its target is a real clone", async () => {
+    // The clone the link points at has the right origin, so the origin check accepts it and only
+    // the link itself gives it away.
+    await pushOrThrow();
+    const cacheRoot = path.join(muxRoot, "backup-cache");
+    const cachePath = backupCachePath(cacheRoot, settings.repoUrl, settings.branch);
+    const outside = path.join(tempDir, "outside-clone");
+    await fs.rename(cachePath, outside);
+    await fs.symlink(outside, cachePath);
+    await writeFixtureFile(muxRoot, "AGENTS.md", "changed after the link went in\n");
+
+    const refused = await service.push(settings);
+
+    expect(refused.success).toBe(false);
+    expect(await fs.readFile(path.join(outside, "mux/AGENTS.md"), "utf-8")).not.toContain(
+      "changed after the link went in"
+    );
+  });
+
+  it("refuses to write a safety snapshot through a symlinked cache directory", async () => {
+    await pushOrThrow();
+
+    // The git cache lives elsewhere so the symlink below only affects the snapshot.
+    const outside = path.join(tempDir, "outside-cache");
+    await fs.mkdir(outside, { recursive: true });
+    await fs.rm(path.join(muxRoot, "backup-cache"), { recursive: true, force: true });
+    await fs.symlink(outside, path.join(muxRoot, "backup-cache"));
+    const linked = new BackupService(config, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(tempDir, "git-cache") }),
+      payload: createBackupPayloadStore({ config }),
+    });
+
+    const refused = await linked.restore(settings);
+
+    expect(refused.success).toBe(false);
+    expect(await fs.readdir(outside)).toEqual([]);
+  });
+
+  it("restores a push whose source had two names for one file", async () => {
+    await pushOrThrow();
+
+    // Collection publishes both names, so this push is one the same source must be able to
+    // restore. The write path severs the link, giving each name its own recorded content.
+    await fs.rm(path.join(muxRoot, "agents/reviewer.md"));
+    await fs.link(path.join(muxRoot, "AGENTS.md"), path.join(muxRoot, "agents/reviewer.md"));
+
+    const restored = await service.restore(settings);
+
+    expect(restored.success).toBe(true);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect(await fs.readFile(path.join(muxRoot, "agents/reviewer.md"), "utf-8")).toBe(
+      "reviewer agent\n"
+    );
+  });
+
+  it("restores files, keeps local-only files, and records the restored commit", async () => {
+    const pushed = await pushOrThrow();
+
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+    await writeFixtureFile(muxRoot, "agents/local-only.md", "local only\n");
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    // mcp.jsonc is reported too: the local file's comment is not in the payload, so restoring
+    // it really does change the file even though every value round-trips.
+    expect(restored.data.changedFiles).toEqual(["AGENTS.md", "mcp.jsonc"]);
+    expect(restored.data.localOnlyFiles).toEqual(["agents/local-only.md"]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect(await fs.readFile(path.join(muxRoot, "agents/local-only.md"), "utf-8")).toBe(
+      "local only\n"
+    );
+
+    expect(await fs.readFile(path.join(restored.data.snapshotPath, "AGENTS.md"), "utf-8")).toBe(
+      "locally edited\n"
+    );
+    expect(service.getSettings()?.lastRestoredCommit).toBe(pushed.data.commit);
+  });
+
+  it("previews and restores around a backed-up skill whose local folder is now a symlink", async () => {
+    // A skill pushed as a real folder, then replaced locally by a symlink into a shared skills
+    // store (`~/.xum/skills/gh-stack -> ~/.agents/skills/gh-stack`), once failed every preview
+    // and restore with "Refusing to follow symlink 'skills/gh-stack/SKILL.md'".
+    await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "backed-up skill\n");
+    await pushOrThrow();
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    await fs.rm(path.join(muxRoot, "skills/gh-stack"), { recursive: true });
+    await fs.symlink(sharedSkill, path.join(muxRoot, "skills/gh-stack"));
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      "skills/gh-stack/SKILL.md"
+    );
+    // The linked folder is collected now, and the backup holds the same path.
+    expect(preview.data.localOnlyFiles).not.toContain("skills/gh-stack/SKILL.md");
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(restored.data.localOnlyFiles).not.toContain("skills/gh-stack/SKILL.md");
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(path.join(muxRoot, "skills/gh-stack"))).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedSkill, "SKILL.md"), "utf-8")).toBe("shared skill\n");
+  });
+
+  it("backs up a skill folder linked in from a shared skills store (#7775)", async () => {
+    // `~/.xum/skills/gh-stack -> ~/.agents/skills/gh-stack`: the skill is the user's, kept in
+    // a store other tools read too, and a push that skipped the link dropped it from the backup.
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    await writeFixtureFile(sharedSkill, "references/usage.md", "shared reference\n");
+    await fs.symlink(sharedSkill, path.join(muxRoot, "skills/gh-stack"));
+
+    await pushOrThrow();
+
+    const clone = await cloneOrigin("verify-linked-skill");
+    const files = await listFiles(clone);
+    expect(files).toContain("mux/skills/gh-stack/SKILL.md");
+    expect(files).toContain("mux/skills/gh-stack/references/usage.md");
+    expect(await fs.readFile(path.join(clone, "mux/skills/gh-stack/SKILL.md"), "utf-8")).toBe(
+      "shared skill\n"
+    );
+  });
+
+  it("previews and restores a linked skill as unchanged on the machine that pushed it", async () => {
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    const linkPath = path.join(muxRoot, "skills/gh-stack");
+    await fs.symlink(sharedSkill, linkPath);
+    await pushOrThrow();
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(preview.data.pushChanges).toEqual([]);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      "skills/gh-stack/SKILL.md"
+    );
+    expect(preview.data.localOnlyFiles).toEqual([]);
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.localOnlyFiles).toEqual([]);
+    expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedSkill, "SKILL.md"), "utf-8")).toBe("shared skill\n");
+  });
+
+  it("restores past a linked skill that is too large to back up", async () => {
+    // Restore never writes under a skill link, so its snapshot must not try to copy one: a
+    // shared skill over the backup limits would otherwise fail every restore.
+    await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "backed-up skill\n");
+    await pushOrThrow();
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    await fs.writeFile(
+      path.join(sharedSkill, "model.bin"),
+      Buffer.alloc(MAX_BACKUP_FILE_BYTES + 1)
+    );
+    const linkPath = path.join(muxRoot, "skills/gh-stack");
+    await fs.rm(linkPath, { recursive: true });
+    await fs.symlink(sharedSkill, linkPath);
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+  });
+
+  it("restores a linked skill as a real folder where the link is absent", async () => {
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    const linkPath = path.join(muxRoot, "skills/gh-stack");
+    await fs.symlink(sharedSkill, linkPath);
+    await pushOrThrow();
+    await fs.rm(linkPath);
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped ?? []).toEqual([]);
+    expect((await fs.lstat(linkPath)).isDirectory()).toBe(true);
+    expect(await fs.readFile(path.join(linkPath, "SKILL.md"), "utf-8")).toBe("shared skill\n");
+  });
+
+  it("leaves a skipped symlink destination alone when it becomes a file after the snapshot", async () => {
+    await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "backed-up skill\n");
+    await pushOrThrow();
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    const linkPath = path.join(muxRoot, "skills/gh-stack");
+    await fs.rm(linkPath, { recursive: true });
+    await fs.symlink(sharedSkill, linkPath);
+
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(linkPath);
+      await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "written after snapshot\n");
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(await fs.readFile(path.join(linkPath, "SKILL.md"), "utf-8")).toBe(
+      "written after snapshot\n"
+    );
+  });
+
+  /** A registered project whose memory folder was pushed as a real folder and is now a link. */
+  async function linkMatchedProjectMemory(): Promise<{ memoryDir: string; sharedMemory: string }> {
+    const projectPath = path.join(tempDir, "projects", "rocket");
+    await fs.mkdir(projectPath, { recursive: true });
+    const created = await new ProjectService(config).create(projectPath);
+    if (!created.success) throw new Error(created.error);
+    const memoryDir = `memory/project/${projectMemoryDirName(created.data.normalizedPath)}`;
+    await writeFixtureFile(muxRoot, `${memoryDir}/notes.md`, "backed-up memory\n");
+    settings = { ...settings, includeProjects: true };
+    await pushOrThrow();
+    const sharedMemory = path.join(tempDir, "shared-memory");
+    await writeFixtureFile(sharedMemory, "notes.md", "shared memory\n");
+    await fs.rm(path.join(muxRoot, memoryDir), { recursive: true });
+    await fs.symlink(sharedMemory, path.join(muxRoot, memoryDir));
+    return { memoryDir, sharedMemory };
+  }
+
+  it("previews and restores around a matched project whose local memory folder is now a symlink", async () => {
+    const { memoryDir, sharedMemory } = await linkMatchedProjectMemory();
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      `${memoryDir}/notes.md`
+    );
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(path.join(muxRoot, memoryDir))).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedMemory, "notes.md"), "utf-8")).toBe("shared memory\n");
+  });
+
+  it("leaves a memory folder alone when it becomes a symlink while the core settings restore", async () => {
+    const { memoryDir, sharedMemory } = await linkMatchedProjectMemory();
+    const linkPath = path.join(muxRoot, memoryDir);
+    await fs.rm(linkPath);
+    await fs.cp(sharedMemory, linkPath, { recursive: true });
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+    const editConfig = config.editConfig.bind(config);
+    let swapped = false;
+    const spy = spyOn(config, "editConfig").mockImplementation(async (...args) => {
+      if (!swapped) {
+        swapped = true;
+        await fs.rm(linkPath, { recursive: true });
+        await fs.symlink(sharedMemory, linkPath);
+      }
+      return await editConfig(...args);
+    });
+    try {
+      const restored = await service.restore(settings);
+      if (!restored.success) throw new Error(restored.error.message);
+      expect(swapped).toBe(true);
+      expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+      expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+        "global instructions\n"
+      );
+      expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+      expect(await fs.readFile(path.join(sharedMemory, "notes.md"), "utf-8")).toBe(
+        "shared memory\n"
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("leaves a skipped symlinked memory folder alone when it becomes a folder after the snapshot", async () => {
+    const { memoryDir } = await linkMatchedProjectMemory();
+    const linkPath = path.join(muxRoot, memoryDir);
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(linkPath);
+      await writeFixtureFile(muxRoot, `${memoryDir}/notes.md`, "written after snapshot\n");
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(await fs.readFile(path.join(linkPath, "notes.md"), "utf-8")).toBe(
+      "written after snapshot\n"
+    );
+  });
+
+  /** A global pin pushed as a real shelf entry whose local entry folder is now a link. */
+  async function linkPinnedShelfEntry(): Promise<{ entryPath: string; sharedEntry: string }> {
+    const shelfRoot = path.join(muxRoot, "artifacts");
+    const pinned = await pinToShelf({
+      shelfRoot,
+      scopeDir: path.join(shelfRoot, "global"),
+      relPath: "report.md",
+      bytes: Buffer.from("backed-up report\n"),
+      meta: {
+        sourceWorkspaceId: "ws-1",
+        title: "report.md",
+        kind: "markdown",
+        pinnedAtMs: 1,
+        pinnedBy: "user",
+      },
+    });
+    if (!pinned.success) throw new Error(pinned.error);
+    settings = { ...settings, includeGlobalArtifacts: true };
+    await pushOrThrow();
+    const entryPath = path.join(shelfRoot, "global", pinned.name);
+    const sharedEntry = path.join(tempDir, "shared-artifacts", pinned.name);
+    await fs.mkdir(path.dirname(sharedEntry), { recursive: true });
+    await fs.rename(entryPath, sharedEntry);
+    await writeFixtureFile(sharedEntry, "report.md", "shared report\n");
+    await fs.symlink(sharedEntry, entryPath);
+    return { entryPath, sharedEntry };
+  }
+
+  const PINNED_ENTRY_FILES = [
+    "artifacts/global/report.md/meta.json",
+    "artifacts/global/report.md/report.md",
+  ];
+
+  it("previews and restores around a pinned artifact whose local shelf entry is now a symlink", async () => {
+    const { entryPath, sharedEntry } = await linkPinnedShelfEntry();
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      PINNED_ENTRY_FILES[1]
+    );
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe("shared report\n");
+  });
+
+  it("leaves a skipped symlinked shelf entry alone when it becomes a folder after the snapshot", async () => {
+    const { entryPath } = await linkPinnedShelfEntry();
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(entryPath);
+      await writeFixtureFile(entryPath, "report.md", "written after snapshot\n");
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect(await fs.readFile(path.join(entryPath, "report.md"), "utf-8")).toBe(
+      "written after snapshot\n"
+    );
+  });
+
+  it("leaves a shelf entry alone when it becomes a symlink after the snapshot", async () => {
+    const { entryPath, sharedEntry } = await linkPinnedShelfEntry();
+    await fs.rm(entryPath);
+    await fs.cp(sharedEntry, entryPath, { recursive: true });
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(entryPath, { recursive: true });
+      await fs.symlink(sharedEntry, entryPath);
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe("shared report\n");
+  });
+
+  it("leaves a shelf entry alone when it becomes a symlink while the core settings restore", async () => {
+    const { entryPath, sharedEntry } = await linkPinnedShelfEntry();
+    await fs.rm(entryPath);
+    await fs.cp(sharedEntry, entryPath, { recursive: true });
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+    const editConfig = config.editConfig.bind(config);
+    let swapped = false;
+    const spy = spyOn(config, "editConfig").mockImplementation(async (...args) => {
+      if (!swapped) {
+        swapped = true;
+        await fs.rm(entryPath, { recursive: true });
+        await fs.symlink(sharedEntry, entryPath);
+      }
+      return await editConfig(...args);
+    });
+    try {
+      const restored = await service.restore(settings);
+      if (!restored.success) throw new Error(restored.error.message);
+      expect(swapped).toBe(true);
+      expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+      expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+        "global instructions\n"
+      );
+      expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
+      expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe(
+        "shared report\n"
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
+    // The backup was pushed while the default managed path was still `mux/`.
+    const pushed = await pushOrThrow();
+
+    // A post-rename client points the default `xum/` path at the same repository.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally diverged\n");
+    settings = { ...settings, path: "xum/" };
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.commit).toBe(pushed.data.commit);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+
+    // Pushing through the renamed settings updates mux/ in place instead of forking xum/.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "updated after rename\n");
+    await pushOrThrow();
+    const clone = await cloneOrigin("after-rename");
+    const files = await listFiles(clone);
+    expect(files).toContain("mux/AGENTS.md");
+    expect(files.some((file) => file.startsWith("xum/"))).toBe(false);
+    expect(await fs.readFile(path.join(clone, "mux/AGENTS.md"), "utf-8")).toBe(
+      "updated after rename\n"
+    );
+  });
+
+  it("reports an empty repository as reachable and bootstraps its first commit", async () => {
+    const validated = await service.validate(settings);
+    if (!validated.success) throw new Error(validated.error.message);
+    expect(validated.data.empty).toBe(true);
+
+    const pushed = await pushOrThrow();
+    expect(pushed.success).toBe(true);
+    expect(await runGit(["--git-dir", originPath, "rev-parse", "refs/heads/main"])).toMatch(
+      /^[0-9a-f]{40}$/
+    );
+  });
+
+  it("previews an empty repository without erroring and refuses to restore from it", async () => {
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.restoreChanges).toEqual([]);
+    expect(preview.data.pushChanges.length).toBeGreaterThan(0);
+
+    const restored = await service.restore(settings);
+    expect(restored.success).toBe(false);
+    if (restored.success) throw new Error("Expected an empty repository to block restore");
+    expect(restored.error.code).toBe("INVALID_BACKUP");
+    expect(restored.error.message).not.toContain("ENOENT");
+  });
+
+  it("refuses to restore when the branch has commits but no backup payload", async () => {
+    const clone = path.join(tempDir, "seed");
+    await runGit(["clone", "--quiet", originPath, clone]);
+    await fs.writeFile(path.join(clone, "README.md"), "unrelated repository\n", "utf-8");
+    await runGit(["-C", clone, "add", "README.md"]);
+    await runGit([
+      "-C",
+      clone,
+      "-c",
+      "user.email=uat@example.com",
+      "-c",
+      "user.name=UAT",
+      "commit",
+      "--quiet",
+      "-m",
+      "unrelated",
+    ]);
+    await runGit(["-C", clone, "push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+
+    const restored = await service.restore(settings);
+    expect(restored.success).toBe(false);
+    if (restored.success) throw new Error("Expected a missing payload to block restore");
+    expect(restored.error.code).toBe("INVALID_BACKUP");
+    expect(restored.error.message).not.toContain("ENOENT");
+  });
+
+  it("rejects a managed path that targets the git directory", async () => {
+    const saved = await service.saveSettings({ ...settings, path: ".git" });
+    expect(saved.success).toBe(false);
+  });
+
+  it("surfaces an unreachable remote as an expected error", async () => {
+    const missing = { ...settings, repoUrl: path.join(tempDir, "does-not-exist.git") };
+    const validated = await service.validate(missing);
+    expect(validated.success).toBe(false);
+  });
+
+  it("round-trips the project bundle and reimports a project at a different path", async () => {
+    // Source machine: one registered project with memory.
+    const projectPath = path.join(tempDir, "projects", "rocket");
+    await fs.mkdir(projectPath, { recursive: true });
+    const projectService = new ProjectService(config);
+    const created = await projectService.create(projectPath);
+    if (!created.success) throw new Error(created.error);
+    const sourceDir = projectMemoryDirName(created.data.normalizedPath);
+    await writeFixtureFile(muxRoot, `memory/project/${sourceDir}/notes.md`, "rocket memory\n");
+
+    const withProjects = { ...settings, includeProjects: true };
+    const pushed = await service.push(withProjects);
+    expect(pushed.success).toBe(true);
+
+    const clone = await cloneOrigin("bundle-verify");
+    const files = await listFiles(clone);
+    expect(files).toContain("mux/project-bundle/manifest.json");
+    expect(files).toContain(`mux/project-bundle/memory/project/${sourceDir}/notes.md`);
+    // The core manifest stays bundle-free so an old build's reader ignores the sidecar.
+    const coreManifest = await fs.readFile(path.join(clone, "mux", "manifest.json"), "utf-8");
+    expect(coreManifest).not.toContain("project-bundle");
+
+    // Target machine: a fresh Xum root restoring from the same repository.
+    const otherRoot = path.join(tempDir, "other-root");
+    await fs.mkdir(otherRoot, { recursive: true });
+    const otherConfig = new Config(otherRoot);
+    const otherService = new BackupService(otherConfig, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(otherRoot, "backup-cache") }),
+      payload: createBackupPayloadStore({ config: otherConfig }),
+    });
+    otherService.setProjectService(new ProjectService(otherConfig));
+
+    const preview = await otherService.preview(withProjects);
+    expect(preview.success).toBe(true);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.projectImports).toHaveLength(1);
+    const candidate = preview.data.projectImports[0];
+    expect(candidate.sourcePath).toBe(created.data.normalizedPath);
+
+    const movedPath = path.join(tempDir, "projects", "rocket-moved");
+    await fs.mkdir(movedPath, { recursive: true });
+    const restored = await otherService.restore(withProjects, {
+      projectImports: [{ token: candidate.token, targetPath: movedPath }],
+    });
+    expect(restored.success).toBe(true);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.projectImportResults[0]?.status).toBe("imported");
+
+    const rekeyedDir = projectMemoryDirName(path.resolve(movedPath));
+    expect(rekeyedDir).not.toBe(sourceDir);
+    expect(
+      await fs.readFile(path.join(otherRoot, "memory", "project", rekeyedDir, "notes.md"), "utf-8")
+    ).toBe("rocket memory\n");
+    expect(otherConfig.loadConfigOrDefault().projects.has(path.resolve(movedPath))).toBe(true);
+  });
+});

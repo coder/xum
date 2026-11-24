@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 import type { AssistedReviewHunk, DiffHunk } from "@/common/types/review";
+import { normalizeAssistedReviewHunks } from "@/common/utils/review/assistedReview";
 import {
-  buildReviewDiffPathFilter,
   buildReviewDiffPathFilterSpecs,
   countUnreadAssistedHunks,
   getEffectiveReviewFrontendFilters,
   getEffectiveReviewIncludeUncommitted,
-  normalizeReviewPanelAssistedHunks,
+  getReviewPanelPathContext,
 } from "./ReviewPanel";
 
 function hunk(overrides: Partial<DiffHunk>): DiffHunk {
@@ -51,23 +51,26 @@ describe("countUnreadAssistedHunks", () => {
   });
 });
 
-describe("normalizeReviewPanelAssistedHunks", () => {
+describe("getReviewPanelPathContext", () => {
   test("keeps primary project-relative pins while matching cwd-relative fallbacks", () => {
-    const pathContext = {
-      projectPath: "/repo/app",
-      executionRootPath: "/repo/app/packages/api",
-    };
-    const assisted = normalizeReviewPanelAssistedHunks({
-      assistedHunks: [
-        { path: "src/agent.ts", range: { start: 2, end: 4 }, comment: "ambiguous" },
-        { path: "packages/api/src/already-rooted.ts", comment: "project-relative" },
-      ],
+    const pathContext = getReviewPanelPathContext({
       workspaceMetadata: {
         projectPath: "/repo/app",
         subProjectPath: "/repo/app/packages/api",
       },
       projectPath: "/repo/app",
     });
+    expect(pathContext).toEqual({
+      projectPath: "/repo/app",
+      executionRootPath: "/repo/app/packages/api",
+    });
+    const assisted = normalizeAssistedReviewHunks(
+      [
+        { path: "src/agent.ts", range: { start: 2, end: 4 }, comment: "ambiguous" },
+        { path: "packages/api/src/already-rooted.ts", comment: "project-relative" },
+      ],
+      pathContext
+    );
 
     expect(assisted).toEqual([
       { path: "src/agent.ts", range: { start: 2, end: 4 }, comment: "ambiguous" },
@@ -84,9 +87,17 @@ describe("normalizeReviewPanelAssistedHunks", () => {
   });
 });
 
-describe("buildReviewDiffPathFilter", () => {
+describe("buildReviewDiffPathFilterSpecs single-project", () => {
+  function singleProjectPathFilter(
+    params: Omit<Parameters<typeof buildReviewDiffPathFilterSpecs>[0], "projectPath">
+  ): string {
+    const specs = buildReviewDiffPathFilterSpecs({ ...params, projectPath: "/repo" });
+    expect(specs).toHaveLength(1);
+    return specs[0].pathFilter;
+  }
+
   test("assisted mode fetches agent-pinned files instead of the stale selected file", () => {
-    const pathFilter = buildReviewDiffPathFilter({
+    const pathFilter = singleProjectPathFilter({
       isImmersive: false,
       assistedOnly: true,
       assistedHunks: [
@@ -96,21 +107,19 @@ describe("buildReviewDiffPathFilter", () => {
       selectedFilePath: "src/user-selected.ts",
       selectedDiffPath: "src/user-selected.ts",
       workspaceMetadata: null,
-      repoRootProjectPath: "/repo",
     });
 
     expect(pathFilter).toBe(" -- 'src/agent.ts'");
   });
 
   test("non-assisted mode preserves the selected file pathspec", () => {
-    const pathFilter = buildReviewDiffPathFilter({
+    const pathFilter = singleProjectPathFilter({
       isImmersive: false,
       assistedOnly: false,
       assistedHunks: [{ path: "src/agent.ts" }],
       selectedFilePath: "src/user-selected.ts",
       selectedDiffPath: "src/user-selected.ts",
       workspaceMetadata: null,
-      repoRootProjectPath: "/repo",
     });
 
     expect(pathFilter).toBe(" -- 'src/user-selected.ts'");

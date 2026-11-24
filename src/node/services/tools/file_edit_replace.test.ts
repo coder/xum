@@ -3,16 +3,14 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { createFileEditReplaceStringTool } from "./file_edit_replace_string";
-import { createFileEditReplaceLinesTool } from "./file_edit_replace_lines";
 import type {
   FileEditReplaceStringToolArgs,
   FileEditReplaceStringToolResult,
-  FileEditReplaceLinesToolArgs,
-  FileEditReplaceLinesToolResult,
 } from "@/common/types/tools";
 import type { ToolExecutionOptions } from "ai";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { getTestDeps } from "./testHelpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Mock ToolCallOptions for testing
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -37,13 +35,6 @@ const executeStringReplace = async (
   return (await tool.execute!(args, mockToolCallOptions)) as FileEditReplaceStringToolResult;
 };
 
-const executeLinesReplace = async (
-  tool: ReturnType<typeof createFileEditReplaceLinesTool>,
-  args: FileEditReplaceLinesToolArgs
-): Promise<FileEditReplaceLinesToolResult> => {
-  return (await tool.execute!(args, mockToolCallOptions)) as FileEditReplaceLinesToolResult;
-};
-
 describe("file_edit_replace_string tool", () => {
   let testDir: string;
   let testFilePath: string;
@@ -60,6 +51,7 @@ describe("file_edit_replace_string tool", () => {
   it("should apply a single edit successfully", async () => {
     await setupFile(testFilePath, "Hello world\nThis is a test\nGoodbye world");
     const tool = createFileEditReplaceStringTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -85,6 +77,7 @@ describe("file_edit_replace_string tool", () => {
   it("matches LF args against a CRLF file and preserves CRLF", async () => {
     await setupFile(testFilePath, "Hello world\r\nThis is a test\r\nGoodbye world\r\n");
     const tool = createFileEditReplaceStringTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -109,6 +102,7 @@ describe("file_edit_replace_string tool", () => {
     const original = "Hello world\n";
     await setupFile(testFilePath, original);
     const tool = createFileEditReplaceStringTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -131,6 +125,7 @@ describe("file_edit_replace_string tool", () => {
     const original = "repeat\nrepeat\n";
     await setupFile(testFilePath, original);
     const tool = createFileEditReplaceStringTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -147,68 +142,5 @@ describe("file_edit_replace_string tool", () => {
 
     expect(result.success).toBe(false);
     expect(await readFile(testFilePath)).toBe(original);
-  });
-});
-
-describe("file_edit_replace_lines tool", () => {
-  let testDir: string;
-  let testFilePath: string;
-
-  beforeEach(async () => {
-    testDir = await fs.mkdtemp(path.join(os.tmpdir(), "fileEditReplace-test-"));
-    testFilePath = path.join(testDir, "test.txt");
-  });
-
-  afterEach(async () => {
-    await fs.rm(testDir, { recursive: true, force: true });
-  });
-
-  it("should replace a line range successfully", async () => {
-    await setupFile(testFilePath, "line1\nline2\nline3\nline4");
-    const tool = createFileEditReplaceLinesTool({
-      ...getTestDeps(),
-      cwd: testDir,
-      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
-      runtimeTempDir: "/tmp",
-    });
-
-    const payload: FileEditReplaceLinesToolArgs = {
-      path: "test.txt", // Use relative path
-      start_line: 2,
-      end_line: 3,
-      new_lines: ["LINE2", "LINE3"],
-    };
-
-    const result = await executeLinesReplace(tool, payload);
-
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.lines_replaced).toBe(2);
-      expect(result.line_delta).toBe(0);
-    }
-
-    expect(await readFile(testFilePath)).toBe("line1\nLINE2\nLINE3\nline4");
-  });
-
-  it("preserves CRLF when replacing lines in a CRLF file", async () => {
-    await setupFile(testFilePath, "line1\r\nline2\r\nline3\r\nline4");
-    const tool = createFileEditReplaceLinesTool({
-      ...getTestDeps(),
-      cwd: testDir,
-      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
-      runtimeTempDir: "/tmp",
-    });
-
-    const payload: FileEditReplaceLinesToolArgs = {
-      path: "test.txt",
-      start_line: 2,
-      end_line: 3,
-      new_lines: ["LINE2", "LINE3"],
-    };
-
-    const result = await executeLinesReplace(tool, payload);
-
-    expect(result.success).toBe(true);
-    expect(await readFile(testFilePath)).toBe("line1\r\nLINE2\r\nLINE3\r\nline4");
   });
 });

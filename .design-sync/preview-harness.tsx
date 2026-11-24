@@ -1,28 +1,26 @@
 // Lightweight provider harness for isolated design-sync previews. Renders a
 // single component with the contexts it needs WITHOUT the app shell (AppLoader),
 // so previews stay thin (no shiki/mermaid/full-app graph). Providers are shimmed
-// to window.Mux (barrel exports them) so they share React-context identity with
+// to window.Xum (barrel exports them) so they share React-context identity with
 // the bundled components; the mock client bundles from source (it's data, not
 // identity-sensitive). Owned previews in .design-sync/previews/<Name>.tsx import
 // this via a relative path.
 //
 // Only the providers the design bundle can afford under the 5 MB cap are wired:
-// theme, API, experiments, policy, settings, tooltip. The workspace/router/
+// theme, API, settings, tooltip. The workspace/router/
 // project chain is intentionally omitted (it pushes the bundle over cap) — a
 // component that hard-requires those contexts is handled in its own preview.
 import { useRef, type ReactNode } from "react";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { AboutDialogProvider } from "@/browser/contexts/AboutDialogContext";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 
-// Mux's globals.css (bundled into the design system's CSS) pins the document to
+// Xum's globals.css (bundled into the design system's CSS) pins the document to
 // the viewport: `html,body,#root,#storybook-root{height:100vh;min-height:100vh}`
 // so the Electron app fills its window. Inside an isolated preview that rule is
 // actively harmful: the Design System gallery embeds each card in an iframe and
@@ -54,19 +52,15 @@ export function MuxPreviewShell(props: MuxPreviewShellProps) {
       <style>{PREVIEW_HEIGHT_RESET}</style>
       <ThemeProvider>
         <APIProvider client={client}>
-          <ExperimentsProvider>
-            <PolicyProvider>
-              <RouterProvider>
-                <ProjectProvider>
-                  <SettingsProvider>
-                    <AboutDialogProvider>
-                      <TooltipProvider>{props.children}</TooltipProvider>
-                    </AboutDialogProvider>
-                  </SettingsProvider>
-                </ProjectProvider>
-              </RouterProvider>
-            </PolicyProvider>
-          </ExperimentsProvider>
+          <RouterProvider>
+            <ProjectProvider>
+              <SettingsProvider>
+                <AboutDialogProvider>
+                  <TooltipProvider>{props.children}</TooltipProvider>
+                </AboutDialogProvider>
+              </SettingsProvider>
+            </ProjectProvider>
+          </RouterProvider>
         </APIProvider>
       </ThemeProvider>
     </>

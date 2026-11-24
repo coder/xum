@@ -50,12 +50,124 @@ const compactNumberFormatter = new Intl.NumberFormat("en-US", {
 });
 
 const BUCKET_TIME_COMPONENT_PATTERN = /(?:^|[ T])\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?/;
+const BUCKET_DATE_TIME_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?/;
+
+function parseBucketWallTime(bucket: string): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+} | null {
+  const match = BUCKET_DATE_TIME_PATTERN.exec(bucket);
+  if (!match) {
+    return null;
+  }
+
+  const [, year, month, day, hour, minute] = match;
+  return {
+    year: Number(year),
+    month: Number(month),
+    day: Number(day),
+    hour: Number(hour),
+    minute: Number(minute),
+  };
+}
+
+function formatBucketWallTime(bucket: string): string | null {
+  const parts = parseBucketWallTime(bucket);
+  if (!parts) {
+    return null;
+  }
+
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+  if (!Number.isFinite(date.getTime())) {
+    return null;
+  }
+
+  return (
+    date.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      timeZone: "UTC",
+    }) +
+    `, ${parts.hour % 12 || 12}:${String(parts.minute).padStart(2, "0")} ${parts.hour >= 12 ? "PM" : "AM"}`
+  );
+}
 
 export function formatUsd(amount: number): string {
   if (!Number.isFinite(amount)) {
     return "$0.00";
   }
   return usdFormatter.format(amount);
+}
+
+/**
+ * Spend axis tick label. Below $1, cent rounding gave small-spend axes repeated labels
+ * ("$0.01, $0.01, $0.00"), so sub-dollar ticks keep two digits past the first non-zero one.
+ */
+export function formatUsdAxisTick(amount: number): string {
+  const magnitude = Math.abs(amount);
+  if (!Number.isFinite(amount) || magnitude === 0 || magnitude >= 1) {
+    return formatUsd(amount);
+  }
+  // 20 is the widest maximumFractionDigits every Intl engine accepts. A lower cap brought the
+  // repeated labels back for sub-microdollar spend (per-token prices reach that scale).
+  const fractionDigits = Math.min(20, Math.max(2, Math.ceil(-Math.log10(magnitude)) + 2));
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: fractionDigits,
+  }).format(amount);
+}
+
+// Epoch milliseconds from 2001-09-09 to 2286-11-20: the range the events `timestamp` column
+// (Date.now()) can hold. Outside it a timestamp-named number is a count or seconds, not a date.
+const EPOCH_MS_MIN = 1e12;
+const EPOCH_MS_MAX = 1e13;
+
+// Epoch-ms columns of the analytics schema (src/common/analytics/schemaSql.ts) that the name rule
+// below misses. A closed list of the schema's own columns: widening the name pattern found one
+// more column per review round and did not converge (#5790).
+const SCHEMA_EPOCH_MS_COLUMNS: ReadonlySet<string> = new Set(["rolled_up_at_ms"]);
+
+function isEpochMsTimestamp(normalizedName: string, value: number): boolean {
+  return (
+    (normalizedName.includes("timestamp") ||
+      normalizedName.endsWith("_at") ||
+      SCHEMA_EPOCH_MS_COLUMNS.has(normalizedName)) &&
+    Number.isInteger(value) &&
+    value >= EPOCH_MS_MIN &&
+    value < EPOCH_MS_MAX
+  );
+}
+
+function formatLocalDateTime(epochMs: number): string {
+  const date = new Date(epochMs);
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}
+
+/** A finite number cell in a SQL result table. */
+export function formatResultNumber(columnName: string, value: number): string {
+  assert(Number.isFinite(value), "formatResultNumber expects a finite number");
+  const normalizedName = columnName.toLowerCase();
+  // Compact notation turned epoch-ms timestamps into "1.8T" (#5768).
+  if (isEpochMsTimestamp(normalizedName, value)) {
+    return formatLocalDateTime(value);
+  }
+  if (normalizedName.includes("cost") || normalizedName.includes("usd")) {
+    return formatUsd(value);
+  }
+  if (normalizedName.includes("token")) {
+    return value.toLocaleString();
+  }
+  return formatCompactNumber(value);
 }
 
 export function formatPercent(ratio: number): string {
@@ -74,6 +186,22 @@ export function formatCompactNumber(value: number): string {
   return compactNumberFormatter.format(value);
 }
 
+// Agent breakdown key for headless usage rows (queries.ts getAgentCostBreakdown).
+const HEADLESS_AGENT_PREFIX = "headless:";
+
+/**
+ * Agent breakdown label. Headless sources ("headless:workspace_status") read as background work
+ * ("workspace status (background)"). Any source gets this generic label, so a new source needs
+ * no code here.
+ */
+export function formatAgentLabel(agentId: string): string {
+  if (!agentId.startsWith(HEADLESS_AGENT_PREFIX)) {
+    return agentId;
+  }
+  const source = agentId.slice(HEADLESS_AGENT_PREFIX.length).replace(/[_-]+/g, " ").trim();
+  return source.length > 0 ? `${source} (background)` : "background";
+}
+
 export function formatProjectDisplayName(projectPath: string): string {
   assert(typeof projectPath === "string", "projectPath must be a string");
   const pathSegments = projectPath.split(/[\\/]/).filter(Boolean);
@@ -81,18 +209,14 @@ export function formatProjectDisplayName(projectPath: string): string {
 }
 
 export function formatBucketLabel(bucket: string): string {
+  const includesTime = BUCKET_TIME_COMPONENT_PATTERN.test(bucket);
+  if (includesTime) {
+    return formatBucketWallTime(bucket) ?? bucket;
+  }
+
   const parsedDate = new Date(bucket);
   if (!Number.isFinite(parsedDate.getTime())) {
     return bucket;
-  }
-
-  const includesTime = BUCKET_TIME_COMPONENT_PATTERN.test(bucket);
-  if (includesTime) {
-    return parsedDate.toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-    });
   }
 
   // Date-only buckets (YYYY-MM-DD) are UTC midnight. Render with

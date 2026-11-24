@@ -4,17 +4,16 @@
  * Used by RetryBarrier to offer "Compact & retry" when we hit context limits.
  */
 
-import { isModelAllowedByPolicy } from "@/browser/utils/policyUi";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isModelAvailable } from "@/common/routing";
-import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import {
-  isGatewayModelAccessibleFromAuthoritativeCatalog,
+  createGatewayRouting,
   isProviderModelAccessibleFromAuthoritativeCatalog,
 } from "@/common/utils/providers/gatewayModelCatalog";
-import { getModelStats } from "@/common/utils/tokens/modelStats";
+import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
 
 export interface CompactionSuggestion {
   kind: "preferred" | "higher_context";
@@ -39,22 +38,16 @@ function buildIsConfigured(
     providersConfig?.[provider]?.isEnabled !== false;
 }
 
-function buildIsGatewayModelAccessible(
-  providersConfig: ProvidersConfigMap | null
-): (gateway: string, modelId: string) => boolean {
-  return (gateway: string, modelId: string) =>
-    isGatewayModelAccessibleFromAuthoritativeCatalog(
-      gateway,
-      modelId,
-      providersConfig?.[gateway]?.models
-    );
-}
-
 function buildIsAuthoritativeProviderModelAccessible(
   providersConfig: ProvidersConfigMap | null
 ): (modelString: string) => boolean {
   return (modelString: string) => {
-    const normalized = normalizeToCanonical(modelString);
+    // Raw-first: a canonical-named Coder instance (coder:openai/<model>) must
+    // check the coder catalog, not the direct provider that name-only
+    // canonicalization would produce — the instance TYPE decides the upstream.
+    const normalized = modelString.startsWith("coder:")
+      ? modelString
+      : normalizeToCanonical(modelString);
     const colonIndex = normalized.indexOf(":");
     if (colonIndex <= 0 || colonIndex >= normalized.length - 1) {
       return true;
@@ -65,7 +58,9 @@ function buildIsAuthoritativeProviderModelAccessible(
     return isProviderModelAccessibleFromAuthoritativeCatalog(
       provider,
       providerModelId,
-      providersConfig?.[provider]?.models
+      providersConfig?.[provider]?.models,
+      providersConfig?.[provider]?.discoveredModels,
+      providersConfig?.[provider]?.removedModels
     );
   };
 }
@@ -77,7 +72,6 @@ export interface CompactionRouteOptions {
 
 export interface CompactionAvailabilityOptions extends CompactionRouteOptions {
   providersConfig: ProvidersConfigMap | null;
-  policy?: EffectivePolicy | null;
 }
 
 export function getExplicitCompactionSuggestion(
@@ -90,9 +84,14 @@ export function getExplicitCompactionSuggestion(
     return null;
   }
 
-  const normalized = normalizeToCanonical(modelId);
+  // Raw-first: keep coder:<instance>/<model> identities intact so catalog
+  // and routing checks validate the Coder gateway entry itself. A
+  // cross-typed instance ({name:"openai", type:"anthropic"}) canonicalizes by
+  // NAME to the direct provider, so canonical-first checks would reject an
+  // available Coder compaction model (or validate an unrelated direct one).
+  const normalized = modelId.startsWith("coder:") ? modelId : normalizeToCanonical(modelId);
   const isConfigured = buildIsConfigured(options.providersConfig);
-  const isGatewayModelAccessible = buildIsGatewayModelAccessible(options.providersConfig);
+  const gatewayRouting = createGatewayRouting(options.providersConfig);
   const isAuthoritativeProviderModelAccessible = buildIsAuthoritativeProviderModelAccessible(
     options.providersConfig
   );
@@ -106,7 +105,8 @@ export function getExplicitCompactionSuggestion(
       options.routePriority,
       options.routeOverrides,
       isConfigured,
-      isGatewayModelAccessible
+      gatewayRouting.isGatewayModelAccessible,
+      gatewayRouting.resolveGatewayModelId
     )
   ) {
     return null;
@@ -114,12 +114,9 @@ export function getExplicitCompactionSuggestion(
 
   const colonIndex = normalized.indexOf(":");
 
-  // Validate against policy if provided
-  if (!isModelAllowedByPolicy(options.policy ?? null, normalized)) {
-    return null;
-  }
-
-  const stats = getModelStats(normalized);
+  // Metadata-aware stats: coder identities resolve through the instance type
+  // (and mappedToModel overrides) to their upstream catalog entry.
+  const stats = getModelStatsResolved(normalized, options.providersConfig);
 
   // Prefer a stable alias for built-in known models.
   const known = Object.values(KNOWN_MODELS).find((m) => m.id === normalized);
@@ -154,7 +151,7 @@ export function getHigherContextCompactionSuggestion(
 
   let best: CompactionSuggestion | null = null;
   const isConfigured = buildIsConfigured(options.providersConfig);
-  const isGatewayModelAccessible = buildIsGatewayModelAccessible(options.providersConfig);
+  const gatewayRouting = createGatewayRouting(options.providersConfig);
 
   for (const known of Object.values(KNOWN_MODELS)) {
     if (
@@ -163,14 +160,10 @@ export function getHigherContextCompactionSuggestion(
         options.routePriority,
         options.routeOverrides,
         isConfigured,
-        isGatewayModelAccessible
+        gatewayRouting.isGatewayModelAccessible,
+        gatewayRouting.resolveGatewayModelId
       )
     ) {
-      continue;
-    }
-
-    // Skip models blocked by policy
-    if (!isModelAllowedByPolicy(options.policy ?? null, known.id)) {
       continue;
     }
 

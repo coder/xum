@@ -4,11 +4,16 @@ import { cleanup, render } from "@testing-library/react";
 import { installDom } from "../../../../../tests/ui/dom";
 import type { GoalSnapshot } from "@/common/types/goal";
 import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
 // The label subscribes to the workspace sidebar store to surface the
 // "active goal" accent. Mocking the hook keeps these tests focused on the
 // label's CSS behavior without spinning up a real workspace store.
 let mockedSidebarState: WorkspaceSidebarState | null = null;
+// The partial store stub below drops every other export; restore the real module after this
+// suite so later files see the full WorkspaceStore.
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }]]);
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useOptionalWorkspaceSidebarState: () => mockedSidebarState,
   useWorkspaceUsage: () => ({
@@ -64,7 +69,7 @@ describe("GoalTabLabel", () => {
     // The outer span owns the accent class; absence guards against
     // accidentally lighting the tab for inactive / history-only / empty
     // workspaces.
-    expect(container.querySelector(".text-success")).toBeNull();
+    expect(container.querySelector(".text-success-text")).toBeNull();
   });
 
   test("renders with goal-green accent when the workspace has a live active goal", () => {
@@ -72,7 +77,7 @@ describe("GoalTabLabel", () => {
 
     const { container } = render(<GoalTabLabel workspaceId="w1" />);
 
-    expect(container.querySelector(".text-success")).not.toBeNull();
+    expect(container.querySelector(".text-success-text")).not.toBeNull();
   });
 
   test("uses warning amber accent for paused goals (active but not auto-running)", () => {
@@ -87,7 +92,7 @@ describe("GoalTabLabel", () => {
     const { container } = render(<GoalTabLabel workspaceId="w1" />);
 
     expect(container.querySelector(".text-warning")).not.toBeNull();
-    expect(container.querySelector(".text-success")).toBeNull();
+    expect(container.querySelector(".text-success-text")).toBeNull();
   });
 
   test("uses warning amber accent for budget-limited goals", () => {
@@ -99,7 +104,7 @@ describe("GoalTabLabel", () => {
     const { container } = render(<GoalTabLabel workspaceId="w1" />);
 
     expect(container.querySelector(".text-warning")).not.toBeNull();
-    expect(container.querySelector(".text-success")).toBeNull();
+    expect(container.querySelector(".text-success-text")).toBeNull();
   });
 
   test("does not accent complete goals", () => {
@@ -109,7 +114,7 @@ describe("GoalTabLabel", () => {
 
     const { container } = render(<GoalTabLabel workspaceId="w1" />);
 
-    expect(container.querySelector(".text-success")).toBeNull();
+    expect(container.querySelector(".text-success-text")).toBeNull();
     expect(container.querySelector(".text-warning")).toBeNull();
   });
 
@@ -121,6 +126,6 @@ describe("GoalTabLabel", () => {
     // Pending goals haven't been committed to disk yet — treating them as
     // "active" would briefly flash the accent during a stream and then
     // un-flash once persistence lands. Mirrors `useActiveGoalCount`.
-    expect(container.querySelector(".text-success")).toBeNull();
+    expect(container.querySelector(".text-success-text")).toBeNull();
   });
 });

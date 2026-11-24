@@ -144,12 +144,14 @@ export const BlockedNeedsAction: Story = {
       targets: [
         { workspaceId: "feature-billing-webhooks-experiment-very-long-id-001" },
         { workspaceId: "4a92f76fbf" },
+        { workspaceId: "c81d3e02b7" },
       ],
     },
     status: "completed",
     defaultExpanded: true,
     result: {
       results: [
+        // Historical (pre-#3950) row: archives now refuse instead, as in the last row.
         {
           status: "requires_confirmation",
           action: "archive",
@@ -166,6 +168,15 @@ export const BlockedNeedsAction: Story = {
           workspaceId: "4a92f76fbf",
           displayName: "Running cleanup follow-up",
           activeTaskIds: ["wst_4a92f76fbf01"],
+        },
+        {
+          status: "error",
+          action: "archive",
+          workspaceId: "c81d3e02b7",
+          displayName: "Notes spike",
+          paths: ["docs/drafts/really-long-directory-name-for-overflow-checks/notes.md"],
+          error:
+            "Archiving would permanently delete the untracked files listed in paths, because the snapshot archive behavior cannot preserve them. Ask the user to archive this workspace manually.",
         },
       ],
     },

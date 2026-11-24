@@ -1,3 +1,4 @@
+import * as path from "path";
 import {
   shouldRunIntegrationTests,
   createTestEnvironment,
@@ -17,8 +18,7 @@ import {
 } from "../helpers";
 import { createStreamCollector } from "../streamCollector";
 import type { WorkspaceInitEvent } from "@/common/orpc/types";
-import { isInitOutput, isInitEnd, isInitStart } from "@/common/orpc/types";
-import * as path from "path";
+import { isInitOutput, isInitEnd, isInitProgress, isInitStart } from "@/common/orpc/types";
 import * as os from "os";
 import * as fs from "fs/promises";
 import { exec } from "child_process";
@@ -31,7 +31,9 @@ import {
 } from "../../runtime/test-fixtures/ssh-fixture";
 import type { RuntimeConfig } from "../../../src/common/types/runtime";
 import { sshConnectionPool } from "../../../src/node/runtime/sshConnectionPool";
+import type { InitStatus } from "../../../src/node/services/initStateManager";
 import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool";
+import { initOutputLines, runWatchedSshTest, type SshStepContext } from "../sshStepWatchdog";
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -319,6 +321,370 @@ describeIntegration("Workspace init hook", () => {
   );
 
   test.concurrent(
+    "streams checkout progress to a subscriber that attaches after create() resolves",
+    async () => {
+      // The renderer only subscribes once create() has announced the workspace, so
+      // checkout progress emitted before that point can never reach the creation card.
+      const env = await createTestEnvironment();
+      const tempGitRepo = await createTempGitRepoWithInitHook({
+        exitCode: 0,
+        stdoutLines: ["hook ran"],
+      });
+
+      try {
+        const branchName = generateBranchName("checkout-progress");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await collectInitEvents(env, createResult.metadata.id, 10000);
+
+        const progressEvents = initEvents.filter(isInitProgress);
+        expect(progressEvents.at(-1)).toMatchObject({ label: "Updating files", percent: 100 });
+
+        // The checkout must be complete before the hook runs against it.
+        const lines = initEvents.filter(isInitOutput).map((e) => e.line);
+        const materializedAt = lines.indexOf("Worktree created successfully");
+        const hookAt = lines.findIndex((line) => line.includes("Running init hook:"));
+        expect(materializedAt).toBeGreaterThanOrEqual(0);
+        expect(hookAt).toBeGreaterThan(materializedAt);
+        expect(lines).toContain("hook ran");
+        await fs.access(path.join(createResult.metadata.namedWorkspacePath, "README.md"));
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "announces the workspace before the origin fetch and fetches in the background init",
+    async () => {
+      // On a remote server the origin fetch takes seconds; create() must not wait for it,
+      // or the browser sits on a locked composer until the network answers.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-origin-"));
+      const barePath = path.join(remoteDir, "origin.git");
+      const pusherPath = path.join(remoteDir, "pusher");
+      const fetchStarted = path.join(remoteDir, "fetch-started");
+      const fetchRelease = path.join(remoteDir, "fetch-release");
+      const uploadPack = path.join(remoteDir, "gated-upload-pack.sh");
+
+      try {
+        const trunk = (
+          await execAsync("git rev-parse --abbrev-ref HEAD", { cwd: tempGitRepo })
+        ).stdout.trim();
+        await execAsync(`git clone --quiet --bare "${tempGitRepo}" "${barePath}"`);
+        await execAsync(`git remote add origin "${barePath}" && git fetch --quiet origin`, {
+          cwd: tempGitRepo,
+        });
+        // origin gains a commit the project's origin/<trunk> ref has not seen yet.
+        await execAsync(`git clone --quiet "${barePath}" "${pusherPath}"`);
+        await execAsync(
+          'git config user.email "test@example.com" && git config user.name "Test User" && ' +
+            `git commit --allow-empty -qm "remote-only" && git push --quiet origin HEAD:${trunk}`,
+          { cwd: pusherPath }
+        );
+        const remoteHead = (
+          await execAsync(`git rev-parse ${trunk}`, { cwd: barePath })
+        ).stdout.trim();
+        await fs.writeFile(
+          uploadPack,
+          `#!/bin/sh\n: > "${fetchStarted}"\nwhile [ ! -e "${fetchRelease}" ]; do sleep 0.05; done\nexec git upload-pack "$@"\n`,
+          { mode: 0o755 }
+        );
+        await execAsync(`git config remote.origin.uploadpack "${uploadPack}"`, {
+          cwd: tempGitRepo,
+        });
+
+        const branchName = generateBranchName("announce-before-fetch");
+        // Resolves while the gated fetch is still held: nothing releases it until afterwards.
+        const createResult = await createWorkspace(env, tempGitRepo, branchName, trunk);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = collectInitEvents(env, createResult.metadata.id, 20000);
+        const deadline = Date.now() + 10000;
+        const started = () =>
+          fs.access(fetchStarted).then(
+            () => true,
+            () => false
+          );
+        while (Date.now() < deadline && !(await started())) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await fs.writeFile(fetchRelease, "");
+
+        const lines = (await initEvents).filter(isInitOutput).map((e) => e.line);
+        const fetchAt = lines.indexOf(`Fetching latest from origin/${trunk}...`);
+        expect(fetchAt).toBeGreaterThanOrEqual(0);
+        expect(lines.indexOf("Worktree created successfully")).toBeGreaterThan(fetchAt);
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+        expect((await execAsync("git rev-parse HEAD", { cwd: workspacePath })).stdout.trim()).toBe(
+          remoteHead
+        );
+        await fs.access(path.join(workspacePath, "README.md"));
+      } finally {
+        await fs.writeFile(fetchRelease, "");
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+        await cleanupTempGitRepo(remoteDir);
+      }
+    },
+    30000
+  );
+
+  test.concurrent(
+    "prunes committed plugin overrides after the deferred checkout and before the hook",
+    async () => {
+      // A repository that tracks .xum/mcp.local.jsonc materializes committed plugin enables
+      // into every fresh worktree; the sanitization that used to run at registration must
+      // now run once the files exist, and still ahead of the repo-controlled hook.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({
+        exitCode: 0,
+        customScript: "cat .xum/mcp.local.jsonc > hook-saw-overrides",
+      });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      await execAsync("git add -A && git commit -m 'track plugin overrides'", {
+        cwd: tempGitRepo,
+      });
+
+      try {
+        const branchName = generateBranchName("deferred-sanitize");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        await collectInitEvents(env, createResult.metadata.id, 10000);
+
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+        const pruned = JSON.parse(
+          await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf8")
+        ) as { enabledServers: string[] };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        expect(
+          JSON.parse(await fs.readFile(path.join(workspacePath, "hook-saw-overrides"), "utf8"))
+        ).toEqual(pruned);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "reports a failed deferred checkout on the card and keeps the workspace",
+    async () => {
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.writeFile(path.join(tempGitRepo, ".gitattributes"), "README.md filter=fail\n");
+      await execAsync(
+        "git add -A && git commit -m 'require checkout filter' && git config filter.fail.smudge 'exit 1' && git config filter.fail.required true",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-checkout-failure");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await waitForInitEnd(env, createResult.metadata.id, 10000);
+        const endEvent = initEvents.find(isInitEnd);
+        expect(endEvent?.exitCode).toBe(-1);
+        const errorLines = initEvents
+          .filter((e): e is Extract<WorkspaceInitEvent, { type: "init-output" }> => isInitOutput(e))
+          .filter((e) => e.isError === true)
+          .map((e) => e.line);
+        expect(
+          errorLines.filter((line) => line.includes("smudge filter fail failed"))
+        ).toHaveLength(1);
+        expect(
+          initEvents.filter(isInitOutput).some((e) => e.line.includes("Running init hook"))
+        ).toBe(false);
+        // Like a remote sync failure, the workspace stays so the user can inspect and remove it.
+        const client = resolveOrpcClient(env);
+        const info = await client.workspace.getInfo({ workspaceId: createResult.metadata.id });
+        expect(info?.id).toBe(createResult.metadata.id);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "prunes committed plugin overrides even when materialization fails after the checkout",
+    async () => {
+      // A broken submodule fails materialization after the tracked override file is on
+      // disk, and the workspace stays usable after a failed init, so the prune must not
+      // depend on materialization succeeding.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      await fs.writeFile(
+        path.join(tempGitRepo, ".gitmodules"),
+        '[submodule "dep"]\n\tpath = dep\n\turl = /nonexistent/dep.git\n'
+      );
+      await execAsync(
+        "git add -A && git update-index --add --cacheinfo 160000,4b825dc642cb6eb9a060e54bf8d69288fbee4904,dep && git commit -m 'broken submodule'",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-sanitize-after-failure");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await waitForInitEnd(env, createResult.metadata.id, 10000);
+        expect(initEvents.find(isInitEnd)?.exitCode).toBe(-1);
+
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+        const pruned = JSON.parse(
+          await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf8")
+        ) as { enabledServers: string[] };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        const client = resolveOrpcClient(env);
+        const info = await client.workspace.getInfo({ workspaceId: createResult.metadata.id });
+        expect(info?.id).toBe(createResult.metadata.id);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "archiving during a deferred checkout parks a complete, sanitized checkout",
+    async () => {
+      // Archive aborts a running init but keeps the checkout registered (default behaviour),
+      // and unarchiving does not rerun init, so the checkout must finish and prune committed
+      // plugin enables before the workspace is parked.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      // README.md sorts after .xum/, so the override is on disk while its smudge filter stalls.
+      await fs.writeFile(path.join(tempGitRepo, ".gitattributes"), "README.md filter=slow\n");
+      await execAsync(
+        "git add -A && git commit -m 'slow checkout' && git config filter.slow.smudge 'sleep 5; cat'",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-archive");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+        const workspaceId = createResult.metadata.id;
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+
+        // Archive once the checkout has written the override but is still stalled on README.md.
+        const overridePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          try {
+            await fs.access(overridePath);
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        const client = resolveOrpcClient(env);
+        const archiveResult = await client.workspace.archive({ workspaceId });
+        expect(archiveResult.success).toBe(true);
+
+        const pruned = JSON.parse(await fs.readFile(overridePath, "utf8")) as {
+          enabledServers: string[];
+        };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        expect(await fs.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe("test\n");
+        const { stdout } = await execAsync("git symbolic-ref HEAD", { cwd: workspacePath });
+        expect(stdout.trim()).toBe(`refs/heads/${branchName}`);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    20000
+  );
+
+  test.concurrent(
+    "archiving once the files have landed stops the rest of materialization",
+    async () => {
+      // Only the file checkout may outlive an archive; what follows it (here a trusted
+      // post-checkout hook standing in for submodule or fast-forward work) must stop instead
+      // of holding the archive for as long as it runs.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      const hookStarted = path.join(tempGitRepo, ".git", "post-checkout-started");
+      await fs.writeFile(
+        path.join(tempGitRepo, ".git", "hooks", "post-checkout"),
+        `#!/bin/sh\n: > "${hookStarted}"\nsleep 600\n`,
+        { mode: 0o755 }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-archive-after-checkout");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+        const workspaceId = createResult.metadata.id;
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          try {
+            await fs.access(hookStarted);
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        const client = resolveOrpcClient(env);
+        const archiveResult = await client.workspace.archive({ workspaceId });
+        expect(archiveResult.success).toBe(true);
+
+        expect(await fs.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe("test\n");
+        const { stdout: head } = await execAsync("git symbolic-ref HEAD", { cwd: workspacePath });
+        expect(head.trim()).toBe(`refs/heads/${branchName}`);
+        const { stdout: status } = await execAsync("git status --porcelain", {
+          cwd: workspacePath,
+        });
+        expect(status).toBe("");
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    20000
+  );
+
+  test.concurrent(
     "should persist init state to disk for replay across page reloads",
     async () => {
       const env = await createTestEnvironment();
@@ -341,7 +707,10 @@ describeIntegration("Workspace init hook", () => {
         await waitForInitComplete(env, workspaceId, 5000);
 
         // Verify init-status.json exists on disk
-        const initStatusPath = path.join(env.config.getSessionDir(workspaceId), "init-status.json");
+        const initStatusPath = path.join(
+          path.join(env.config.sessionsDir, workspaceId),
+          "init-status.json"
+        );
         const statusExists = await fs
           .access(initStatusPath)
           .then(() => true)
@@ -350,22 +719,29 @@ describeIntegration("Workspace init hook", () => {
 
         // Read and verify persisted state
         const statusContent = await fs.readFile(initStatusPath, "utf-8");
-        const status = JSON.parse(statusContent);
+        const status = JSON.parse(statusContent) as InitStatus;
         expect(status.status).toBe("success");
         expect(status.exitCode).toBe(0);
 
         // Should include workspace creation logs + hook output
         expect(status.lines).toEqual(
-          expect.arrayContaining([
-            { line: "Creating git worktree...", isError: false, timestamp: expect.any(Number) },
+          expect.arrayContaining<Record<string, unknown>>([
+            {
+              line: "Creating git worktree...",
+              isError: false,
+              step: true,
+              timestamp: expect.any(Number),
+            },
             {
               line: "Worktree created successfully",
               isError: false,
+              step: true,
               timestamp: expect.any(Number),
             },
-            expect.objectContaining({
+            expect.objectContaining<Record<string, unknown>>({
               line: expect.stringMatching(/Running init hook:/),
               isError: false,
+              step: true,
             }),
             { line: "Installing dependencies", isError: false, timestamp: expect.any(Number) },
             { line: "Done!", isError: false, timestamp: expect.any(Number) },
@@ -473,8 +849,8 @@ describeIntegration("Init Queue - Runtime Matrix", () => {
   // Reset SSH connection pool state before each test to prevent backoff from one
   // test affecting subsequent tests. This allows tests to run concurrently.
   beforeEach(() => {
-    sshConnectionPool.clearAllHealth();
-    ssh2ConnectionPool.clearAllHealth();
+    sshConnectionPool.clearAllHealthForTests();
+    ssh2ConnectionPool.clearAllHealthForTests();
   });
 
   // Test matrix: Run tests for both local and SSH runtimes
@@ -497,6 +873,11 @@ describeIntegration("Init Queue - Runtime Matrix", () => {
 
       // Timeouts vary by runtime type
       const testTimeout = type === "ssh" ? 90000 : 30000;
+      // #6588: ssh runs fail before jest's limit with the step they hung in (sshStepWatchdog.ts).
+      const watched = (body: (ctx: SshStepContext) => Promise<void>) => async (): Promise<void> => {
+        if (type !== "ssh") return body({ step: "setup", initLines: () => [] });
+        await runWatchedSshTest(testTimeout - 10_000, () => sshConfig, body);
+      };
       const streamTimeout = type === "ssh" ? 30000 : 15000;
 
       // Skip SSH tests if Docker is not available
@@ -504,7 +885,7 @@ describeIntegration("Init Queue - Runtime Matrix", () => {
 
       test(
         "file_read should wait for init hook before executing (even when init fails)",
-        async () => {
+        watched(async (ctx) => {
           if (!shouldRunSSH()) {
             console.log("Skipping SSH test - Docker not available");
             return;
@@ -524,12 +905,14 @@ exit 1
           });
 
           try {
+            ctx.step = "set up providers";
             await setupProviders(env, { anthropic: { apiKey: getApiKey("ANTHROPIC_API_KEY") } });
             const branchName = generateBranchName();
             const runtimeConfig = getRuntimeConfig(branchName);
             const client = resolveOrpcClient(env);
 
             // Create workspace to trigger init hook
+            ctx.step = "create workspace";
             const result = await createWorkspace(
               env,
               repoPath,
@@ -542,14 +925,17 @@ exit 1
             expect(workspaceId).toBeTruthy();
 
             // Set up collector to track events
+            ctx.step = "subscribe";
             const collector = createStreamCollector(client, workspaceId!);
             collector.start();
+            ctx.initLines = () => initOutputLines(collector);
             await collector.waitForSubscription(5000);
 
             // FIRST MESSAGE: Send message that requires file read
             // This should wait for init to complete before file operations can happen
             // Use Haiku for faster responses - this test is about init queue, not model capability
             const firstMessageStart = Date.now();
+            ctx.step = "first message (waits for init)";
             await client.workspace.sendMessage({
               workspaceId: workspaceId!,
               message: "Read the README.md file and tell me what it says.",
@@ -560,6 +946,7 @@ exit 1
             });
 
             // Wait for stream to complete
+            ctx.step = "first stream-end";
             await collector.waitForEvent("stream-end", streamTimeout);
             const firstMessageEnd = Date.now();
             const firstMessageDuration = firstMessageEnd - firstMessageStart;
@@ -576,11 +963,14 @@ exit 1
             const failedInitEvent = initEndEvents.find((e) => e.exitCode === 1);
             expect(failedInitEvent).toBeDefined();
 
-            // Clear collector for second message
+            // Clear collector for second message. Keep the init lines for the watchdog first.
+            const initLines = initOutputLines(collector);
+            ctx.initLines = () => initLines;
             collector.clear();
 
             // SECOND MESSAGE: Send another message
             // Init is already complete (even though it failed), so no init wait
+            ctx.step = "second message";
             await client.workspace.sendMessage({
               workspaceId: workspaceId!,
               message: "What is 2 + 2?",
@@ -591,14 +981,16 @@ exit 1
             });
 
             // Wait for stream to complete - proves second message also works
+            ctx.step = "second stream-end";
             await collector.waitForEvent("stream-end", streamTimeout);
 
             collector.stop();
           } finally {
+            ctx.step = "clean up the test environment";
             await cleanupTestEnvironment(env);
             await cleanupTempGitRepo(repoPath);
           }
-        },
+        }),
         testTimeout
       );
     }

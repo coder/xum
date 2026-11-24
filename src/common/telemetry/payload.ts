@@ -278,9 +278,9 @@ export interface CompactionCompletedPayload {
  * Note: Only tracks that a key was set, never the actual value
  */
 export interface ProviderConfiguredPayload {
-  /** Provider name (e.g., 'anthropic', 'openai', 'mux-gateway') */
+  /** Provider name (e.g., 'anthropic', 'openai', 'openrouter') */
   provider: string;
-  /** Key type that was configured (e.g., 'apiKey', 'couponCode', 'baseUrl') */
+  /** Key type that was configured (e.g., 'apiKey', 'baseUrl') */
   keyType: string;
 }
 
@@ -294,13 +294,15 @@ export type TelemetryCommandType =
   | "compact"
   | "new"
   | "fork"
+  | "side"
   | "vim"
+  | "fast"
+  | "ultrafast"
   | "model"
   | "mode"
   | "plan"
   | "providers"
   | "goal"
-  | "btw"
   | "workflow";
 
 /**
@@ -351,8 +353,6 @@ export interface ErrorOccurredPayload {
 export interface ExperimentOverriddenPayload {
   /** Experiment identifier (e.g., 'agent-browser') */
   experimentId: string;
-  /** The variant PostHog assigned (null if not remote-controlled) */
-  assignedVariant: string | boolean | null;
   /** What the user chose (true = enabled, false = disabled) */
   userChoice: boolean;
 }

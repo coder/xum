@@ -1,0 +1,188 @@
+import { describe, expect, it, mock } from "bun:test";
+import type { ToolExecutionOptions } from "ai";
+
+import { Ok, type Result } from "@/common/types/result";
+import type { TaskService } from "@/node/services/taskService";
+import { createTaskRemoveTool } from "./task_remove";
+import { TestTempDir, createTestToolConfig } from "./testHelpers";
+
+const toolOptions: ToolExecutionOptions<unknown> = {
+  toolCallId: "test-call-id",
+  messages: [],
+  context: undefined,
+};
+
+describe("task_remove tool", () => {
+  it("removes nested inactive children deepest-first", async () => {
+    using tempDir = new TestTempDir("test-task-remove-order");
+    const calls: string[] = [];
+    const removeOwnedTaskWorkspace = mock(
+      (_ownerWorkspaceId: string, taskId: string): Promise<Result<unknown, string>> => {
+        calls.push(taskId);
+        return Promise.resolve(
+          Ok({ status: "removed", action: "remove", taskId, workspaceId: taskId })
+        );
+      }
+    );
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [
+        { taskId: "parent", depth: 1 },
+        { taskId: "child", depth: 2 },
+      ]),
+      removeInactiveDescendantAgentTask: removeOwnedTaskWorkspace,
+    } as unknown as TaskService;
+    const tool = createTaskRemoveTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "root" }),
+      taskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["parent", "child"] }, toolOptions)
+    );
+
+    expect(calls).toEqual(["child", "parent"]);
+    expect(result).toEqual({
+      results: [
+        { status: "removed", taskId: "child", workspaceId: "child" },
+        { status: "removed", taskId: "parent", workspaceId: "parent" },
+      ],
+    });
+  });
+
+  it("asks the service to refuse lossy removals and returns the blocking paths", async () => {
+    using tempDir = new TestTempDir("test-task-remove-lossy");
+    const refused = { status: "error", taskId: "child", paths: ["notes.txt"], error: "refused" };
+    const removeOwnedTaskWorkspace = mock((_owner: string, _taskId: string, _options?: unknown) =>
+      Promise.resolve(Ok({ ...refused, action: "remove" }))
+    );
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [{ taskId: "child", depth: 1 }]),
+      removeInactiveDescendantAgentTask: removeOwnedTaskWorkspace,
+    } as unknown as TaskService;
+    const tool = createTaskRemoveTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "root" }),
+      taskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["child"] }, toolOptions)
+    );
+
+    // task_remove is model-driven, so it must opt into the refusal (#4723); the user cascade does not.
+    expect(removeOwnedTaskWorkspace).toHaveBeenCalledWith("root", "child", {
+      lossyWorkPolicy: "refuse",
+    });
+    expect(result).toEqual({ results: [refused] });
+  });
+
+  it("passes the force policy only when the call sets force, and returns what a forced removal deleted", async () => {
+    using tempDir = new TestTempDir("test-task-remove-force");
+    const forced = {
+      status: "removed",
+      action: "remove",
+      taskId: "child",
+      workspaceId: "child",
+      paths: ["notes.txt"],
+      deletedWork: "Deleted 1 commit(s). Checkout: /w/child. Branch: child.",
+    };
+    const removeOwnedTaskWorkspace = mock((_owner: string, _taskId: string, _options?: unknown) =>
+      Promise.resolve(Ok(forced))
+    );
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [{ taskId: "child", depth: 1 }]),
+      removeInactiveDescendantAgentTask: removeOwnedTaskWorkspace,
+    } as unknown as TaskService;
+    const tool = createTaskRemoveTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "root" }),
+      taskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["child"], force: true }, toolOptions)
+    );
+
+    expect(removeOwnedTaskWorkspace).toHaveBeenLastCalledWith("root", "child", {
+      lossyWorkPolicy: "force",
+    });
+    const { action: _action, ...forwarded } = forced;
+    expect(result).toEqual({ results: [forwarded] });
+
+    // Only `force: true` forces: false and null (strict-mode providers send null) refuse.
+    for (const force of [false, null]) {
+      await Promise.resolve(tool.execute!({ task_ids: ["child"], force }, toolOptions));
+      expect(removeOwnedTaskWorkspace).toHaveBeenLastCalledWith("root", "child", {
+        lossyWorkPolicy: "refuse",
+      });
+    }
+  });
+
+  it("returns what a forced removal may have deleted when the removal fails", async () => {
+    using tempDir = new TestTempDir("test-task-remove-force-failed");
+    const failed = {
+      status: "error",
+      taskId: "child",
+      workspaceId: "child",
+      paths: ["notes.txt"],
+      deletedWork: "The removal failed, and it may have deleted 1 commit(s). Branch: child.",
+      error: "Failed to remove workspace: disk full",
+    };
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [{ taskId: "child", depth: 1 }]),
+      removeInactiveDescendantAgentTask: mock(() =>
+        Promise.resolve(Ok({ ...failed, action: "remove" }))
+      ),
+    } as unknown as TaskService;
+    const tool = createTaskRemoveTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "root" }),
+      taskService,
+    });
+
+    expect(
+      await Promise.resolve(tool.execute!({ task_ids: ["child"], force: true }, toolOptions))
+    ).toEqual({ results: [failed] });
+  });
+
+  it("surfaces active and scope outcomes without removing", async () => {
+    using tempDir = new TestTempDir("test-task-remove-outcomes");
+    const removeOwnedTaskWorkspace = mock(
+      (_ownerWorkspaceId: string, taskId: string): Promise<Result<unknown, string>> =>
+        Promise.resolve(
+          Ok(
+            taskId === "active"
+              ? { status: "active", action: "remove", taskId: "active", workspaceId: "active" }
+              : { status: "invalid_scope", action: "remove", taskId }
+          )
+        )
+    );
+    const taskService = {
+      listDescendantAgentTasks: mock(() => []),
+      removeInactiveDescendantAgentTask: removeOwnedTaskWorkspace,
+    } as unknown as TaskService;
+    const tool = createTaskRemoveTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "root" }),
+      taskService,
+    });
+
+    expect(
+      await Promise.resolve(tool.execute!({ task_ids: ["active", "foreign"] }, toolOptions))
+    ).toEqual({
+      results: [
+        { status: "active", taskId: "active", workspaceId: "active" },
+        { status: "invalid_scope", taskId: "foreign" },
+      ],
+    });
+  });
+
+  it("rejects plan-mode removal", () => {
+    using tempDir = new TestTempDir("test-task-remove-plan");
+    const tool = createTaskRemoveTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "root" }),
+      planFileOnly: true,
+      taskService: {} as unknown as TaskService,
+    });
+
+    expect(Promise.resolve(tool.execute!({ task_ids: ["child"] }, toolOptions))).rejects.toThrow(
+      "task_remove is not available in plan mode"
+    );
+  });
+});

@@ -18,10 +18,13 @@ import {
 import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
 import { formatBytes } from "@/common/utils/formatBytes";
 
+import { OpenAsArtifactButton } from "@/browser/features/RightSidebar/ArtifactsTab/OpenAsArtifactButton";
+
 interface FileReadToolCallProps {
   args: FileReadToolArgs;
   result?: FileReadToolResult;
   status?: ToolStatus;
+  workspaceId?: string;
 }
 
 /**
@@ -63,6 +66,7 @@ export const FileReadToolCall: React.FC<FileReadToolCallProps> = ({
   args,
   result,
   status = "pending",
+  workspaceId,
 }) => {
   const { expanded, toggleExpanded } = useToolExpansion();
 
@@ -79,6 +83,7 @@ export const FileReadToolCall: React.FC<FileReadToolCallProps> = ({
         <div className="text-text flex max-w-96 min-w-0 items-center gap-1.5">
           <FileIcon filePath={filePath} className="text-[15px] leading-none" />
           <span className="font-monospace truncate">{filePath}</span>
+          <OpenAsArtifactButton workspaceId={workspaceId} path={filePath} relativeTo="tool-cwd" />
         </div>
         {result && result.success && parsedContent && (
           <span className="text-secondary ml-2 text-[10px] whitespace-nowrap">

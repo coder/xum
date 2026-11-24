@@ -15,18 +15,6 @@ export const MOCK_TOOL_FLOW_PROMPTS = {
   USER_NOTIFY: "[mock:tool:notify] Notify me that the task is complete",
 } as const;
 
-export const MOCK_ERROR_PROMPTS = {
-  TRIGGER_RATE_LIMIT: "[mock:error:rate-limit] Trigger rate limit error",
-  TRIGGER_API_ERROR: "[mock:error:api] Trigger API error",
-  TRIGGER_NETWORK_ERROR: "[mock:error:network] Trigger network error",
-} as const;
-
-export const MOCK_ERROR_MESSAGES = {
-  RATE_LIMIT: "Rate limit exceeded. Please retry after 60 seconds.",
-  API_ERROR: "Internal server error occurred while processing the request.",
-  NETWORK_ERROR: "Network connection lost. Please check your internet connection.",
-} as const;
-
 export const MOCK_REVIEW_PROMPTS = {
   SUMMARIZE_BRANCHES: "[mock:review:branches] Let's summarize the current branches.",
   OPEN_ONBOARDING_DOC: "[mock:review:open-doc] Open the onboarding doc.",
@@ -38,4 +26,5 @@ export const MOCK_SLASH_COMMAND_PROMPTS = {
     "[mock:model-status] Please confirm which model is currently active for this conversation.",
 } as const;
 
-export const MOCK_COMPACTION_SUMMARY_PREFIX = "Mock compaction summary:";
+/** Streams for ~18 s so perf scenarios can switch between chats that stay mid-stream. */
+export const MOCK_LONG_STREAM_PROMPT = "[mock:long-stream] Keep streaming for a while";

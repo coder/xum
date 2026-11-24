@@ -1,6 +1,16 @@
-import { getModelKey } from "@/common/constants/storage";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { readPersistedString, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { isNonWorkspaceScopeId } from "@/common/constants/storage";
+import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
+import {
+  readScopeAgentId,
+  readScopedAiDefault,
+  writeScopedAiDefault,
+} from "@/browser/utils/scopedAiDefaults";
+import {
+  markAiSelectionIntent,
+  setAutoRoutingPick,
+  type AutoRoutingDimension,
+} from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
 
@@ -13,17 +23,24 @@ interface ExplicitModelChange {
 // User request: keep origin tracking in-memory so UI-only warnings don't add persistence complexity.
 const pendingExplicitChanges = new Map<string, ExplicitModelChange>();
 
-const normalizeExplicitModel = (model: string): string => normalizeToCanonical(model).trim();
+// Coder identities stay raw so switches between coder:<instance>/<model> and the
+// direct <provider>:<model> are tracked as explicit actions; other gateway
+// aliases (openrouter:openai/x) still collapse so persisted rewrites keep matching.
+const normalizeExplicitModel = (model: string): string => modelSelectionEqualityKey(model);
+
+const isWorkspaceScope = (scopeId: string): boolean => !isNonWorkspaceScopeId(scopeId);
 
 export function recordWorkspaceModelChange(
   workspaceId: string,
   model: string,
-  origin: ModelChangeOrigin
+  origin: ModelChangeOrigin,
+  current = isWorkspaceScope(workspaceId)
+    ? getWorkspaceAiSelection(workspaceId).model
+    : readScopedAiDefault(workspaceId, "model")
 ): void {
   if (origin === "sync") return;
 
   const normalized = normalizeExplicitModel(model);
-  const current = readPersistedString(getModelKey(workspaceId));
   const normalizedCurrent = current ? normalizeExplicitModel(current) : null;
 
   // Avoid leaving stale explicit-change entries when the effective model doesn't change
@@ -72,5 +89,22 @@ export function setWorkspaceModelWithOrigin(
   origin: ModelChangeOrigin
 ): void {
   recordWorkspaceModelChange(workspaceId, model, origin);
-  updatePersistedState(getModelKey(workspaceId), model);
+  // A workspace pick stays in memory until a send persists it into workspace metadata.
+  if (!isWorkspaceScope(workspaceId)) {
+    writeScopedAiDefault(workspaceId, "model", model);
+  } else if (origin === "user") {
+    markAiSelectionIntent(workspaceId, "model", model);
+  }
+  if (origin === "user") {
+    setAutoRoutingChoice(workspaceId, "model", false);
+  }
+}
+
+/** Records an unsent Auto pick for the scope's selected agent. */
+export function setAutoRoutingChoice(
+  scopeId: string,
+  dimension: AutoRoutingDimension,
+  active: boolean
+): void {
+  setAutoRoutingPick(scopeId, readScopeAgentId(scopeId), dimension, active);
 }

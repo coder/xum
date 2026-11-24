@@ -65,10 +65,10 @@ export function goalStatusLabel(status: GoalStatus): string {
 //     band color matches the Goals-tab header tone and the sidebar tab
 //     label accent for the same status.
 const STATUS_BADGE_CLASSES: Record<GoalStatus, string> = {
-  active: "bg-success/10 text-success border-success/40",
+  active: "bg-success/10 text-success-text border-success/40",
   paused: "bg-warning-overlay text-warning border-warning/40",
   budget_limited: "bg-warning-overlay text-warning border-warning/40",
-  complete: "bg-success/10 text-success border-success/40",
+  complete: "bg-success/10 text-success-text border-success/40",
 };
 
 interface GoalStatusBadgeProps {

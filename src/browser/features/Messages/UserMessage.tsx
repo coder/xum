@@ -1,5 +1,5 @@
 import React from "react";
-import { APIContext } from "@/browser/contexts/API";
+import { APIContext, liveClientOf } from "@/browser/contexts/API";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { cn } from "@/common/lib/utils";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -9,41 +9,37 @@ import {
 } from "@/browser/features/ChatInput/stagedAttachments";
 import type { ButtonConfig } from "./MessageWindow";
 import { MessageWindow } from "./MessageWindow";
+import { useOptionalMessageListContext } from "./MessageListContext";
 import { UserMessageContent } from "./UserMessageContent";
 import { GoalSyntheticMessageContent } from "./GoalSyntheticMessageContent";
-import { BashMonitorWakeMessageContent } from "./BashMonitorWakeMessageContent";
 import {
   formatSubagentStructuredOutput,
   parseSubagentReportEnvelope,
   SubagentReportMessageContent,
 } from "./SubagentReportMessageContent";
+import { parseSubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
+import { SubagentFailureMessageContent } from "./SubagentFailureMessageContent";
 import { TerminalOutput } from "./TerminalOutput";
+import { ArtifactInteractionPill } from "./ArtifactInteractionPill";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { copyToClipboard } from "@/browser/utils/clipboard";
+import { createDownloadRetryCache } from "@/browser/utils/downloadFile";
 import {
   buildEditingStateFromDisplayed,
   canEditDisplayedUserMessage,
   type EditingMessageState,
 } from "@/browser/utils/chatEditing";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   Bot,
   ChevronLeft,
   ChevronRight,
   Clipboard,
   ClipboardCheck,
-  MessageCircleQuestion,
   Pencil,
-  Radar,
   Target,
 } from "lucide-react";
-import {
-  SIDE_QUESTION_HEADER_CLASS,
-  SIDE_QUESTION_MESSAGE_WINDOW_CLASS,
-  SIDE_QUESTION_USER_BLOCK_CLASS,
-} from "./sideQuestionStyles";
 
 function base64ToBlob(dataBase64: string, mediaType: string): Blob {
   const binary = atob(dataBase64);
@@ -52,17 +48,6 @@ function base64ToBlob(dataBase64: string, mediaType: string): Blob {
     bytes[i] = binary.charCodeAt(i);
   }
   return new Blob([bytes], { type: mediaType });
-}
-
-function downloadBlob(blob: Blob, filename: string): void {
-  const blobUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = blobUrl;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
 /** Navigation info for navigating between user messages */
@@ -80,28 +65,35 @@ interface UserMessageProps {
   className?: string;
   onEdit?: (message: EditingMessageState) => void;
   isCompacting?: boolean;
+  editSendPending?: boolean;
   clipboardWriteText?: (data: string) => Promise<void>;
   /** Navigation info for backward/forward between user messages */
   navigation?: UserMessageNavigation;
 }
+
+// Module-level so all messages share one retry slot, bounding retained
+// staged-attachment bytes to a single blob renderer-wide (iOS share-sheet
+// retries only ever target the most recent tap).
+const stagedDownloads = createDownloadRetryCache();
 
 export const UserMessage: React.FC<UserMessageProps> = ({
   message,
   className,
   onEdit,
   isCompacting,
+  editSendPending,
   clipboardWriteText = copyToClipboard,
   navigation,
 }) => {
   const isSynthetic = message.isSynthetic === true;
   const isGoalContinuation = message.isGoalContinuation === true;
   const isBudgetLimitWrapup = message.isBudgetLimitWrapup === true;
-  const bashMonitorWake = message.bashMonitorWake;
   const content = message.content;
   const visibleContent = stripStagedAttachmentNotice(content);
   // Only backend-authored synthetic messages may opt into protocol-aware presentation. A user who
   // types a lookalike envelope should continue to see an ordinary escaped user message.
   const subagentReport = isSynthetic ? parseSubagentReportEnvelope(content) : null;
+  const subagentFailure = isSynthetic ? parseSubagentFailureEnvelope(content) : null;
   const structuredOutputJson = subagentReport
     ? formatSubagentStructuredOutput(subagentReport)
     : undefined;
@@ -111,43 +103,69 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         ...(structuredOutputJson ? [`Structured output:\n${structuredOutputJson}`] : []),
       ].join("\n\n")
     : visibleContent;
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const isMobileTouch =
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
 
   const apiState = React.useContext(APIContext);
-  const api = apiState?.api ?? null;
+  // The live client only: offline, the download reports its own error.
+  const api = apiState == null ? null : liveClientOf(apiState);
   const workspaceContext = useOptionalWorkspaceContext();
-  const workspaceId = workspaceContext?.selectedWorkspace?.workspaceId ?? null;
+  // Prefer the transcript's own workspace: a /side chat transcript renders next to the routed
+  // (selected) workspace, so the selection would download, cache-key, and guard against the wrong
+  // workspace. The selection remains the fallback outside a chat transcript.
+  const messageListContext = useOptionalMessageListContext();
+  const workspaceId =
+    messageListContext?.workspaceId ?? workspaceContext?.selectedWorkspace?.workspaceId ?? null;
 
-  const handleDownloadStagedAttachment = async (attachment: DisplayStagedAttachment) => {
-    if (api == null || workspaceId == null) {
-      console.warn("Cannot download staged attachment without an active workspace connection.");
-      return;
-    }
+  // Tracks the workspace this message currently renders for (null once
+  // unmounted), so an in-flight download fetch can detect that the user
+  // navigated away and must not fire a share sheet for the old workspace.
+  const activeWorkspaceIdRef = React.useRef<string | null>(workspaceId);
+  React.useEffect(() => {
+    activeWorkspaceIdRef.current = workspaceId;
+    return () => {
+      activeWorkspaceIdRef.current = null;
+    };
+  }, [workspaceId]);
 
-    const result = await api.workspace.downloadStagedAttachment({
-      workspaceId,
-      stagedPath: attachment.stagedPath,
-    });
-    if (!result.success) {
-      console.error("Failed to download staged attachment:", result.error);
-      return;
-    }
+  // Forked workspaces copy staged attachments under the same relative path,
+  // so the cache key needs the workspaceId to avoid serving another
+  // workspace's bytes after navigation.
+  const handleDownloadStagedAttachment = (attachment: DisplayStagedAttachment) =>
+    stagedDownloads.download(
+      `${workspaceId ?? ""}:${attachment.stagedPath}`,
+      async () => {
+        if (api == null || workspaceId == null) {
+          console.warn("Cannot download staged attachment without an active workspace connection.");
+          return null;
+        }
 
-    downloadBlob(
-      base64ToBlob(result.data.dataBase64, result.data.mediaType),
-      result.data.filename || attachment.filename
+        const result = await api.workspace.downloadStagedAttachment({
+          workspaceId,
+          stagedPath: attachment.stagedPath,
+        });
+        if (!result.success) {
+          console.error("Failed to download staged attachment:", result.error);
+          return null;
+        }
+
+        return {
+          blob: base64ToBlob(result.data.dataBase64, result.data.mediaType),
+          filename: result.data.filename || attachment.filename,
+        };
+      },
+      () => activeWorkspaceIdRef.current === workspaceId
     );
-  };
 
   console.assert(
     typeof clipboardWriteText === "function",
     "UserMessage expects clipboardWriteText to be a callable function."
   );
 
-  // Check if this is a local command output
   const isLocalCommandOutput =
     content.startsWith("<local-command-stdout>") && content.endsWith("</local-command-stdout>");
 
@@ -183,7 +201,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Previous message",
             onClick: hasPrev
-              ? () => navigation.onNavigate(navigation.prevUserMessageId!)
+              ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                () => navigation.onNavigate(navigation.prevUserMessageId!)
               : undefined,
             disabled: !hasPrev,
             icon: <ChevronLeft className={!hasPrev ? "opacity-30" : undefined} />,
@@ -197,7 +216,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Next message",
             onClick: hasNext
-              ? () => navigation.onNavigate(navigation.nextUserMessageId!)
+              ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                () => navigation.onNavigate(navigation.nextUserMessageId!)
               : undefined,
             disabled: !hasNext,
             icon: <ChevronRight className={!hasNext ? "opacity-30" : undefined} />,
@@ -210,13 +230,15 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Edit",
             onClick: handleEdit,
-            disabled: isCompacting,
+            disabled: isCompacting === true || editSendPending === true,
             icon: <Pencil />,
             tooltip: isCompacting
               ? isMobileTouch
                 ? "Cannot edit while compacting"
                 : `Cannot edit while compacting (${formatKeybind(vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL)} to cancel)`
-              : undefined,
+              : editSendPending
+                ? "Cannot edit while an edit is sending"
+                : undefined,
           },
         ]
       : []),
@@ -242,25 +264,33 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         goal continuation
       </span>
     );
-  } else if (bashMonitorWake) {
-    label = (
-      <span className="bg-muted/20 text-muted flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
-        <Radar aria-hidden="true" className="h-3 w-3" />
-        monitor wake
-      </span>
-    );
   } else if (subagentReport) {
     const isInProgress = subagentReport.status === "in_progress";
     label = (
       <span
         className={cn(
           "flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase",
-          isInProgress ? "bg-backgrounded/10 text-backgrounded" : "bg-success/10 text-success"
+          isInProgress ? "bg-backgrounded/10 text-backgrounded" : "bg-success/10 text-success-text"
         )}
       >
         <Bot aria-hidden="true" className="h-3 w-3" />
         {isInProgress ? "subagent update" : "subagent report"}
       </span>
+    );
+  } else if (subagentFailure) {
+    label = (
+      <span className="bg-muted/20 text-muted flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
+        <Bot aria-hidden="true" className="h-3 w-3" />
+        subagent
+      </span>
+    );
+  } else if (message.artifactInteraction != null) {
+    // Human input from an artifact: a full-opacity user bubble with a label opening the artifact.
+    label = (
+      <ArtifactInteractionPill
+        interaction={message.artifactInteraction}
+        workspaceId={workspaceId}
+      />
     );
   } else if (isSynthetic) {
     label = (
@@ -269,16 +299,10 @@ export const UserMessage: React.FC<UserMessageProps> = ({
       </span>
     );
   }
-  // /btw side-question rows keep the normal user bubble (background,
-  // border, right-alignment) and add a small "Side question" header above
-  // it plus a thin left stripe on the wrapper. We deliberately do NOT
-  // bypass MessageWindow here — the user feedback was that an aside
-  // should read inline with the chat aesthetic, not as a distinct block.
-  const isSideQuestion = message.isSideQuestion === true;
   const syntheticClassName = cn(
     className,
-    isSynthetic && !subagentReport && "opacity-70",
-    subagentReport && "ml-0 w-full",
+    isSynthetic && !subagentReport && !subagentFailure && "opacity-70",
+    (subagentReport ?? subagentFailure) && "ml-0 w-full",
     (isGoalContinuation || isBudgetLimitWrapup) && "italic"
   );
 
@@ -292,12 +316,10 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         kind={isBudgetLimitWrapup ? "budget-limit" : "continuation"}
       />
     );
-  } else if (bashMonitorWake) {
-    renderedContent = (
-      <BashMonitorWakeMessageContent content={content} records={bashMonitorWake.records} />
-    );
   } else if (subagentReport) {
     renderedContent = <SubagentReportMessageContent report={subagentReport} />;
+  } else if (subagentFailure) {
+    renderedContent = <SubagentFailureMessageContent failure={subagentFailure} />;
   } else {
     renderedContent = (
       <UserMessageContent
@@ -306,6 +328,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         agentSkillSnapshot={message.agentSkill?.snapshot}
         inlineSkillSnapshots={message.inlineSkillSnapshots}
         reviews={message.reviews}
+        artifactInteraction={message.artifactInteraction}
         fileParts={message.fileParts}
         onDownloadStagedAttachment={(attachment) => void handleDownloadStagedAttachment(attachment)}
         variant="sent"
@@ -313,37 +336,15 @@ export const UserMessage: React.FC<UserMessageProps> = ({
     );
   }
 
-  const messageWindow = (
+  return (
     <MessageWindow
       label={label}
       message={message}
       buttons={buttons}
-      // For /btw rows the outer wrapper owns spacing around the pair.
-      className={cn(syntheticClassName, isSideQuestion && SIDE_QUESTION_MESSAGE_WINDOW_CLASS)}
+      className={syntheticClassName}
       variant="user"
     >
       {renderedContent}
     </MessageWindow>
   );
-
-  // /btw side-question: wrap the normal user bubble in a thin-stripe block
-  // and prepend a small "Side question" header. The bubble's right-align
-  // and styling is unchanged — only the surrounding chrome differs.
-  if (isSideQuestion) {
-    return (
-      <div
-        className={cn(SIDE_QUESTION_USER_BLOCK_CLASS, className)}
-        data-message-block
-        data-side-question
-      >
-        <div className={SIDE_QUESTION_HEADER_CLASS}>
-          <MessageCircleQuestion aria-hidden="true" className="h-3 w-3" />
-          Side question
-        </div>
-        {messageWindow}
-      </div>
-    );
-  }
-
-  return messageWindow;
 };

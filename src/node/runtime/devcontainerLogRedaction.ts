@@ -1,4 +1,4 @@
-export const SENSITIVE_REMOTE_ENV_KEYS = new Set([
+const SENSITIVE_REMOTE_ENV_KEYS = new Set([
   "GH_TOKEN",
   "GITHUB_TOKEN",
   "GH_ENTERPRISE_TOKEN",

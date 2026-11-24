@@ -3,11 +3,16 @@ import { cleanup, render } from "@testing-library/react";
 
 import { installDom } from "../../../../../tests/ui/dom";
 import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
 // The label subscribes to the workspace sidebar store to surface a live count
 // of active workflow runs. Mock the hook so these tests stay focused on the
 // badge's gating without a real workspace store.
 let mockedSidebarState: WorkspaceSidebarState | null = null;
+// The partial store stub below drops every other export; restore the real module after this
+// suite so later files see the full WorkspaceStore.
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }]]);
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useOptionalWorkspaceSidebarState: () => mockedSidebarState,
   useWorkspaceUsage: () => ({ sessionTotal: null, liveCostUsage: null }),
@@ -43,7 +48,7 @@ describe("WorkflowsTabLabel", () => {
 
     expect(getByText("Workflows")).toBeTruthy();
     // No active-run accent when the workspace has nothing running.
-    expect(container.querySelector(".text-accent")).toBeNull();
+    expect(container.querySelector(".text-accent-text")).toBeNull();
   });
 
   test("shows the active-run count badge when runs are in flight", () => {
@@ -51,7 +56,7 @@ describe("WorkflowsTabLabel", () => {
 
     const { container, getByText } = render(<WorkflowsTabLabel workspaceId="w1" />);
 
-    const badge = container.querySelector(".text-accent");
+    const badge = container.querySelector(".text-accent-text");
     expect(badge).not.toBeNull();
     expect(getByText("3")).toBeTruthy();
   });
@@ -62,6 +67,6 @@ describe("WorkflowsTabLabel", () => {
     const { container, getByText } = render(<WorkflowsTabLabel workspaceId="w1" />);
 
     expect(getByText("Workflows")).toBeTruthy();
-    expect(container.querySelector(".text-accent")).toBeNull();
+    expect(container.querySelector(".text-accent-text")).toBeNull();
   });
 });

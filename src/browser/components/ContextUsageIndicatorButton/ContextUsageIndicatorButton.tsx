@@ -4,13 +4,14 @@ import { TokenMeter } from "@/browser/features/RightSidebar/TokenMeter";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "../Dialog/Dialog";
 import {
   HorizontalThresholdSlider,
+  getAutoCompactionLabel,
+  getEffectiveThreshold,
   type AutoCompactionConfig,
 } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { Switch } from "../Switch/Switch";
 import { formatTokens, type TokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
 import { cn } from "@/common/lib/utils";
 import { Toggle1MContext } from "../Toggle1MContext/Toggle1MContext";
-import { Tooltip, TooltipContent, TooltipTrigger } from "../Tooltip/Tooltip";
 import { COMPOSER_COMPACT_HIDE_CLASS, COMPOSER_CONTROL_HEIGHT_CLASS } from "@/constants/layout";
 
 /** Compact threshold tick mark for the button view */
@@ -38,6 +39,11 @@ interface ContextUsageIndicatorButtonProps {
   idleCompaction?: IdleCompactionConfig;
   /** Current model ID — used to show 1M context toggle for supported models */
   model?: string;
+  /**
+   * False while the workspace's chat history still replays. Usage comes from that history, so
+   * empty `data` then means "not loaded yet", not "no usage" (#6101). Omitted means loaded.
+   */
+  historyLoaded?: boolean;
 }
 
 /** Tick marks with vertical lines attached to the meter */
@@ -63,40 +69,56 @@ const PercentTickMarks: React.FC = () => {
   );
 };
 
+function getUsageSliderHint(config: AutoCompactionConfig): string {
+  if (!config.setThreshold) {
+    return getAutoCompactionLabel(config);
+  }
+  return config.rolloverEnabled
+    ? `${getAutoCompactionLabel(config)} · Drag blue slider to adjust`
+    : "Drag blue slider to adjust usage-based auto-compaction";
+}
+
 /** Unified auto-compact settings panel */
 const AutoCompactSettings: React.FC<{
   data: TokenMeterData;
+  /** Usage text for the header, from getContextUsageLabels. */
+  summary: string;
+  /** Usage not loaded yet: `data` is empty for lack of data, so hide the limit warning too. */
+  loading: boolean;
   usageConfig?: AutoCompactionConfig;
   idleConfig?: IdleCompactionConfig;
   model?: string;
-}> = ({ data, usageConfig, idleConfig, model }) => {
-  const [idleInputValue, setIdleInputValue] = React.useState(idleConfig?.hours?.toString() ?? "24");
+}> = (props) => {
+  const [idleInputValue, setIdleInputValue] = React.useState(
+    props.idleConfig?.hours?.toString() ?? "24"
+  );
 
   // Sync idle input when external hours change
   React.useEffect(() => {
-    setIdleInputValue(idleConfig?.hours?.toString() ?? "24");
-  }, [idleConfig?.hours]);
+    setIdleInputValue(props.idleConfig?.hours?.toString() ?? "24");
+  }, [props.idleConfig?.hours]);
 
-  const totalDisplay = formatTokens(data.totalTokens);
-  const maxDisplay = data.maxTokens ? ` / ${formatTokens(data.maxTokens)}` : "";
-  const percentageDisplay = data.maxTokens ? ` (${data.totalPercentage.toFixed(1)}%)` : "";
-
-  const showUsageSlider = Boolean(usageConfig && data.maxTokens);
-  const isIdleEnabled = idleConfig?.hours !== null && idleConfig?.hours !== undefined;
+  const showUsageSlider = Boolean(props.usageConfig && props.data.maxTokens);
+  const isIdleEnabled = props.idleConfig?.hours !== null && props.idleConfig?.hours !== undefined;
 
   const handleIdleToggle = (enabled: boolean) => {
-    if (!idleConfig) return;
+    if (!props.idleConfig) return;
     const parsed = parseInt(idleInputValue, 10);
-    idleConfig.setHours(enabled ? (Number.isNaN(parsed) || parsed < 1 ? 24 : parsed) : null);
+    props.idleConfig.setHours(enabled ? (Number.isNaN(parsed) || parsed < 1 ? 24 : parsed) : null);
   };
 
   const handleIdleBlur = (e: React.FocusEvent<HTMLInputElement>) => {
-    if (!idleConfig) return;
+    if (!props.idleConfig) return;
     const val = parseInt(e.target.value, 10);
-    if (!isNaN(val) && val >= 1 && val !== idleConfig.hours && idleConfig.hours !== null) {
-      idleConfig.setHours(val);
+    if (
+      !isNaN(val) &&
+      val >= 1 &&
+      val !== props.idleConfig.hours &&
+      props.idleConfig.hours !== null
+    ) {
+      props.idleConfig.setHours(val);
     } else if (e.target.value === "" || isNaN(val) || val < 1) {
-      setIdleInputValue(idleConfig.hours?.toString() ?? "24");
+      setIdleInputValue(props.idleConfig.hours?.toString() ?? "24");
     }
   };
 
@@ -106,15 +128,11 @@ const AutoCompactSettings: React.FC<{
       <div>
         <div className="flex items-baseline justify-between">
           <span className="text-foreground font-medium">Context Usage</span>
-          <span className="text-muted text-xs">
-            {totalDisplay}
-            {maxDisplay}
-            {percentageDisplay}
-          </span>
+          <span className="text-muted text-xs">{props.summary}</span>
         </div>
-        {showUsageSlider && (
-          <div className="text-muted mt-1 text-[10px]">
-            Drag blue slider to adjust usage-based auto-compaction
+        {showUsageSlider && props.usageConfig && (
+          <div className="text-muted counter-nums mt-1 text-[10px]">
+            {getUsageSliderHint(props.usageConfig)}
           </div>
         )}
       </div>
@@ -122,17 +140,19 @@ const AutoCompactSettings: React.FC<{
       {/* Token meter with threshold slider + tick marks */}
       <div>
         <div className="relative w-full py-1.5">
-          <TokenMeter segments={data.segments} orientation="horizontal" />
-          {showUsageSlider && usageConfig && <HorizontalThresholdSlider config={usageConfig} />}
+          <TokenMeter segments={props.data.segments} orientation="horizontal" />
+          {showUsageSlider && props.usageConfig && (
+            <HorizontalThresholdSlider config={props.usageConfig} />
+          )}
         </div>
         {showUsageSlider && <PercentTickMarks />}
       </div>
 
       {/* 1M context toggle for supported Anthropic models */}
-      {model && <Toggle1MContext model={model} />}
+      {props.model && <Toggle1MContext model={props.model} />}
 
       {/* Idle-based auto-compact */}
-      {idleConfig && (
+      {props.idleConfig && (
         <div className="border-separator-light border-t pt-2">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-1">
@@ -169,7 +189,7 @@ const AutoCompactSettings: React.FC<{
       )}
 
       {/* Warning for unknown model limits */}
-      {!data.maxTokens && (
+      {!props.data.maxTokens && !props.loading && (
         <div className="text-subtle text-[10px] italic">
           Unknown model limits - showing relative usage only
         </div>
@@ -177,126 +197,117 @@ const AutoCompactSettings: React.FC<{
 
       {/* Persistence note */}
       <div className="text-muted border-separator-light border-t pt-2 text-[10px]">
-        Usage threshold saved per model{idleConfig && "; idle timer saved per project"}
+        Usage threshold saved per model{props.idleConfig && "; idle timer saved per project"}
       </div>
     </div>
   );
 };
 
-export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonProps> = ({
-  data,
-  autoCompaction,
-  idleCompaction,
-  model,
-}) => {
-  const isAutoCompactionEnabled = autoCompaction && autoCompaction.threshold < 100;
-  const idleHours = idleCompaction?.hours;
+/**
+ * Button and dialog labels; a null `compactLabel` means usage is not loaded yet, so neither the
+ * button nor the dialog shows a number.
+ */
+function getContextUsageLabels(
+  data: TokenMeterData,
+  historyLoaded: boolean | undefined
+): { ariaLabel: string; compactLabel: string | null; summary: string } {
+  // Cached rows or the pre-replay snapshot already carry usage and show it at once.
+  if (historyLoaded === false && data.totalTokens === 0) {
+    return { ariaLabel: "Context usage: loading", compactLabel: null, summary: "Loading" };
+  }
+  const total = formatTokens(data.totalTokens);
+  if (!data.maxTokens) {
+    return {
+      ariaLabel: `Context usage: ${total} (unknown limit)`,
+      compactLabel: total,
+      summary: total,
+    };
+  }
+  const summary = `${total} / ${formatTokens(data.maxTokens)} (${data.totalPercentage.toFixed(1)}%)`;
+  return {
+    ariaLabel: `Context usage: ${summary}`,
+    compactLabel: `${Math.round(data.totalPercentage)}%`,
+    summary,
+  };
+}
+
+export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonProps> = (props) => {
+  const idleHours = props.idleCompaction?.hours;
   const isIdleCompactionEnabled = idleHours !== null && idleHours !== undefined;
 
   // Show nothing only if no tokens AND no idle compaction config to display
   // (idle compaction settings should always be accessible when the prop is passed)
-  if (data.totalTokens === 0 && !idleCompaction) return null;
+  if (props.data.totalTokens === 0 && !props.idleCompaction) return null;
 
-  const ariaLabel = data.maxTokens
-    ? `Context usage: ${formatTokens(data.totalTokens)} / ${formatTokens(data.maxTokens)} (${data.totalPercentage.toFixed(
-        1
-      )}%)`
-    : `Context usage: ${formatTokens(data.totalTokens)} (unknown limit)`;
-
-  const compactLabel = data.maxTokens
-    ? `${Math.round(data.totalPercentage)}%`
-    : formatTokens(data.totalTokens);
-
-  const hoverUsageSummary = data.maxTokens
-    ? `Context ${formatTokens(data.totalTokens)} / ${formatTokens(data.maxTokens)} (${data.totalPercentage.toFixed(1)}%)`
-    : `Context ${formatTokens(data.totalTokens)} (unknown limit)`;
-  const hoverAutoSummary = autoCompaction
-    ? autoCompaction.threshold < 100
-      ? `Auto ${autoCompaction.threshold}%`
-      : "Auto off"
-    : null;
-  const hoverIdleSummary = idleCompaction
-    ? isIdleCompactionEnabled
-      ? `Idle ${idleHours}h`
-      : "Idle off"
-    : null;
-  const hoverSummary = [hoverUsageSummary, hoverAutoSummary, hoverIdleSummary]
-    .filter((part): part is string => part !== null)
-    .join(" · ");
+  const { ariaLabel, compactLabel, summary } = getContextUsageLabels(
+    props.data,
+    props.historyLoaded
+  );
 
   return (
     <Dialog>
-      {/*
-        Keep a hover-only one-line summary so users can quickly see compaction stats
-        without reopening the full click-based settings dialog.
-      */}
-      <Tooltip delayDuration={200} disableHoverableContent>
-        <TooltipTrigger asChild>
-          <DialogTrigger asChild>
-            <button
-              aria-label={ariaLabel}
-              aria-haspopup="dialog"
-              className={cn(
-                "border-border-light hover:bg-hover focus-visible:ring-accent flex cursor-pointer items-center gap-1.5 rounded-md border px-1.5 focus-visible:ring-1",
-                COMPOSER_CONTROL_HEIGHT_CLASS
-              )}
-              type="button"
+      <DialogTrigger asChild>
+        <button
+          aria-label={ariaLabel}
+          aria-haspopup="dialog"
+          className={cn(
+            "border-border-light hover:bg-hover focus-visible:ring-accent flex cursor-pointer items-center gap-1.5 rounded-md border px-1.5 focus-visible:ring-1",
+            COMPOSER_CONTROL_HEIGHT_CLASS
+          )}
+          type="button"
+        >
+          {/* Keep this control scannable: usage is already conveyed by the meter + percentage, and
+            click opens the detailed compaction settings without a competing hover interaction. */}
+          {isIdleCompactionEnabled && (
+            <span className={COMPOSER_COMPACT_HIDE_CLASS}>
+              <Hourglass className="text-muted h-3 w-3" />
+            </span>
+          )}
+
+          {/* Narrow composers keep the percentage only: a 56px meter reads as an empty bar at
+            low usage while starving the model and agent labels next to it. */}
+          {props.data.totalTokens > 0 ? (
+            <div
+              data-context-usage-meter
+              className={cn("relative h-3 w-14", COMPOSER_COMPACT_HIDE_CLASS)}
             >
-              {/* Idle compaction indicator */}
-              {isIdleCompactionEnabled && (
-                <span
-                  title={`Auto-compact after ${idleHours}h idle`}
-                  className={COMPOSER_COMPACT_HIDE_CLASS}
-                >
-                  <Hourglass className="text-muted h-3 w-3" />
-                </span>
-              )}
-
-              <span className={cn("text-muted text-[11px]", COMPOSER_COMPACT_HIDE_CLASS)}>
-                Context
-              </span>
-
-              {/* Narrow composers keep the percentage only: a 56px meter reads as an empty bar at
-                low usage while starving the model and agent labels next to it. */}
-              {data.totalTokens > 0 ? (
-                <div
-                  data-context-usage-meter
-                  className={cn("relative h-3 w-14", COMPOSER_COMPACT_HIDE_CLASS)}
-                >
-                  <TokenMeter
-                    segments={data.segments}
-                    orientation="horizontal"
-                    className="h-3"
-                    trackClassName="bg-surface-quaternary"
-                  />
-                  {isAutoCompactionEnabled && (
-                    <CompactThresholdIndicator threshold={autoCompaction.threshold} />
-                  )}
-                </div>
-              ) : (
-                /* Empty meter placeholder - allows access to settings with no usage */
-                <div
-                  data-context-usage-meter
-                  className={cn(
-                    "bg-surface-quaternary relative h-3 w-14 rounded-full",
-                    COMPOSER_COMPACT_HIDE_CLASS
-                  )}
+              <TokenMeter
+                segments={props.data.segments}
+                orientation="horizontal"
+                className="h-3"
+                trackClassName="bg-surface-quaternary"
+              />
+              {props.autoCompaction && props.autoCompaction.threshold < 100 && (
+                <CompactThresholdIndicator
+                  threshold={getEffectiveThreshold(props.autoCompaction)}
                 />
               )}
+            </div>
+          ) : (
+            /* Empty meter placeholder - allows access to settings with no usage */
+            <div
+              data-context-usage-meter
+              className={cn(
+                "bg-surface-quaternary relative h-3 w-14 rounded-full",
+                COMPOSER_COMPACT_HIDE_CLASS
+              )}
+            />
+          )}
 
+          <span
+            data-context-usage-percent
+            className="text-muted counter-nums text-[10px] font-medium"
+          >
+            {/* Static on purpose: the placeholder only stands in for the number (no pulse). */}
+            {compactLabel ?? (
               <span
-                data-context-usage-percent
-                className="text-muted counter-nums text-[10px] font-medium"
-              >
-                {compactLabel}
-              </span>
-            </button>
-          </DialogTrigger>
-        </TooltipTrigger>
-        <TooltipContent side="top" showArrow={false} className="whitespace-nowrap">
-          {hoverSummary}
-        </TooltipContent>
-      </Tooltip>
+                aria-hidden
+                className="bg-surface-quaternary inline-block h-2 w-[3ch] rounded"
+              />
+            )}
+          </span>
+        </button>
+      </DialogTrigger>
 
       {/*
         Keep compaction controls in a dialog so auto + idle settings stay open
@@ -320,10 +331,12 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
           <div>• Add a followup message on the next line</div>
         </div>
         <AutoCompactSettings
-          data={data}
-          usageConfig={autoCompaction}
-          idleConfig={idleCompaction}
-          model={model}
+          data={props.data}
+          summary={summary}
+          loading={compactLabel === null}
+          usageConfig={props.autoCompaction}
+          idleConfig={props.idleCompaction}
+          model={props.model}
         />
       </DialogContent>
     </Dialog>

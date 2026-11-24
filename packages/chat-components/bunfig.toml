@@ -1,0 +1,4 @@
+# bun reads only the bunfig.toml of the directory it runs in, so this repeats the release-age
+# floor of the repository's bunfig.toml for this directory's bun.lock.
+[install]
+minimumReleaseAge = 604800

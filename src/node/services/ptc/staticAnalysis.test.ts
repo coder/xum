@@ -3,13 +3,66 @@
  */
 
 import { describe, test, expect, afterAll } from "bun:test";
-import { analyzeCode, disposeAnalysisContext } from "./staticAnalysis";
+import {
+  analyzeCode,
+  disposeAnalysisContextForTests,
+  normalizeMultilineStrings,
+} from "./staticAnalysis";
+import { MAX_MULTILINE_STRING_PARSE_CHARACTERS } from "@/constants/codeExecution";
 
 afterAll(() => {
-  disposeAnalysisContext();
+  disposeAnalysisContextForTests();
 });
 
 describe("staticAnalysis", () => {
+  describe("multiline string normalization", () => {
+    test.each([
+      'return "first\\nsecond";',
+      "return 'first\\\nsecond';",
+      'return /["\']/g.test("quote");',
+      '// "not a string\nreturn 1;',
+      "/* 'not a string\n */ return 1;",
+      'return `"first\nsecond" ${1 + 2}`;',
+      'return String.raw`"first\nsecond"`;',
+      'return "first\u2028second\u2029third";',
+    ])("leaves valid JavaScript byte-for-byte unchanged: %j", async (code) => {
+      expect(normalizeMultilineStrings(code)).toBe(code);
+      expect((await analyzeCode(code)).valid).toBe(true);
+    });
+
+    test.each([
+      'return "unfinished',
+      'return "unfinished\n',
+      'return "unfinished\n\\',
+      "return `unfinished\n",
+      "const x = {",
+    ])("does not invent missing delimiters: %j", async (code) => {
+      expect(normalizeMultilineStrings(code)).toBe(code);
+      expect((await analyzeCode(code)).valid).toBe(false);
+    });
+
+    test("does not reject valid code exceeding the normalization budget", async () => {
+      const code = "/*" + "x".repeat(MAX_MULTILINE_STRING_PARSE_CHARACTERS) + "*/ return 42;";
+      expect(normalizeMultilineStrings(code)).toBe(code);
+      expect((await analyzeCode(code)).valid).toBe(true);
+    });
+
+    test("bounds repeated parsing and leaves excess repairs to fail syntax validation", async () => {
+      const code = '"a\nb";\n'.repeat(1000);
+      const normalized = normalizeMultilineStrings(code);
+      expect(normalized).not.toBe(code);
+      expect((await analyzeCode(normalized)).valid).toBe(false);
+    });
+
+    test("is idempotent after repairing multiple strings", async () => {
+      const code = "return \"a\nb\" + 'c\nd';";
+      const normalized = normalizeMultilineStrings(code);
+      expect(normalized).not.toBe(code);
+      expect(normalizeMultilineStrings(normalized)).toBe(normalized);
+      expect((await analyzeCode(normalized)).valid).toBe(true);
+    });
+  });
+
   describe("syntax validation", () => {
     test("valid code passes", async () => {
       const result = await analyzeCode(`
@@ -46,6 +99,24 @@ describe("staticAnalysis", () => {
       `);
       expect(result.valid).toBe(false);
       expect(result.errors[0].type).toBe("syntax");
+    });
+
+    test.each([
+      'return "first\nsecond";',
+      "return 'first\nsecond';",
+      'return "first\r\nsecond";',
+      'return "unfinished',
+    ])("rejects unnormalized unterminated strings: %j", async (code) => {
+      const result = await analyzeCode(code);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toMatchObject({ type: "syntax", line: 1 });
+    });
+
+    test("reports the location of unrelated syntax errors", async () => {
+      const result = await analyzeCode('const s = "valid string";\nreturn @;');
+      expect(result.valid).toBe(false);
+      expect(result.errors[0]).toMatchObject({ type: "syntax", line: 2 });
     });
 
     test("await expression gives clear error message", async () => {

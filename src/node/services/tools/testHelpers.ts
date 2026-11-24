@@ -3,13 +3,26 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "path";
 import * as os from "os";
 import type { ToolExecutionOptions } from "ai";
+import { z } from "zod";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
+import { TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { Config } from "@/node/config";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
-import type { MuxToolScope } from "@/common/types/toolScope";
+import type { XumToolScope } from "@/common/types/toolScope";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+
+/**
+ * A tool's advertised input schema as the Zod schema Xum builds it from. The AI
+ * SDK types `inputSchema` as `FlexibleSchema`, which has no `parse`/`safeParse`.
+ */
+export function zodInputSchemaOf(tool: { inputSchema: unknown }): z.ZodType {
+  const schema = tool.inputSchema;
+  if (!(schema instanceof z.ZodType)) throw new Error("Expected a Zod input schema");
+  return schema;
+}
 
 export class TestTempDir implements Disposable {
   public readonly path: string;
@@ -26,6 +39,28 @@ export class TestTempDir implements Disposable {
 }
 
 export const TEST_GLOBAL_WORKSPACE_ID = "workspace-global";
+
+/**
+ * The background-process wrapper records its exit with `echo $? > exit_code`, so the marker
+ * exists, empty, from the redirect's create until the write, and a slow host can stretch that
+ * gap. A status read in the gap sees an empty marker and reports "running": wait for the code,
+ * not for the file or a fixed time. The poll runs until a deadline (a count of polls stretches
+ * with host load, a deadline does not) and returns "" when it passes, so a test that calls it
+ * needs its own timeout above `timeoutMs`.
+ */
+export async function readExitCodeWhenWritten(
+  outputDir: string,
+  timeoutMs = 20_000
+): Promise<string> {
+  const exitCodePath = path.join(outputDir, "exit_code");
+  const deadline = Date.now() + timeoutMs;
+  let content = await fsPromises.readFile(exitCodePath, "utf-8").catch(() => "");
+  while (content.trim() === "" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    content = await fsPromises.readFile(exitCodePath, "utf-8").catch(() => "");
+  }
+  return content.trim();
+}
 
 export const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -50,6 +85,15 @@ interface SkillFixtureOptions {
   files?: Record<string, string>;
 }
 
+export function restoreXumRoot(previousXumRoot: string | undefined): void {
+  if (previousXumRoot === undefined) {
+    delete process.env.XUM_ROOT;
+    return;
+  }
+
+  process.env.XUM_ROOT = previousXumRoot;
+}
+
 export function restoreMuxRoot(previousMuxRoot: string | undefined): void {
   if (previousMuxRoot === undefined) {
     delete process.env.MUX_ROOT;
@@ -71,10 +115,10 @@ export async function withMuxRoot(muxRoot: string, callback: () => Promise<void>
 }
 
 export async function createWorkspaceSessionDir(
-  muxHome: string,
+  xumHome: string,
   workspaceId: string
 ): Promise<string> {
-  const workspaceSessionDir = path.join(muxHome, "sessions", workspaceId);
+  const workspaceSessionDir = path.join(xumHome, "sessions", workspaceId);
   await fsPromises.mkdir(workspaceSessionDir, { recursive: true });
   return workspaceSessionDir;
 }
@@ -127,11 +171,11 @@ export async function writeSkill(
 }
 
 export async function writeGlobalSkill(
-  muxHome: string,
+  xumHome: string,
   name: string,
   options?: SkillFixtureOptions
 ): Promise<void> {
-  await writeSkill(path.join(muxHome, "skills"), name, options);
+  await writeSkill(path.join(xumHome, "skills"), name, options);
 }
 
 export async function writeProjectSkill(
@@ -139,18 +183,18 @@ export async function writeProjectSkill(
   name: string,
   options?: SkillFixtureOptions
 ): Promise<void> {
-  await writeSkill(path.join(projectRoot, ".mux", "skills"), name, options);
+  await writeSkill(path.join(projectRoot, ".xum", "skills"), name, options);
 }
 
-export async function writeSkillWithReference(muxHome: string, name: string): Promise<void> {
-  await writeGlobalSkill(muxHome, name, {
+export async function writeSkillWithReference(xumHome: string, name: string): Promise<void> {
+  await writeGlobalSkill(xumHome, name, {
     description: "fixture",
     files: { "references/foo.txt": "fixture" },
   });
 }
 
 interface RemotePathMappedRuntimeOptions {
-  muxHome?: string;
+  xumHome?: string;
   resolveToRemotePath?: boolean;
 }
 
@@ -158,7 +202,7 @@ export class RemotePathMappedRuntime extends LocalRuntime {
   private readonly localBase: string;
   private readonly remoteBase: string;
   private readonly localHomeForTildeRoot: string | null;
-  private readonly muxHomeOverride: string | null;
+  private readonly xumHomeOverride: string | null;
   private readonly resolveToRemotePath: boolean;
   public resolvePathCallCount = 0;
 
@@ -166,7 +210,7 @@ export class RemotePathMappedRuntime extends LocalRuntime {
     super(localBase);
     this.localBase = path.resolve(localBase);
     this.remoteBase = remoteBase === "/" ? remoteBase : remoteBase.replace(/\/+$/u, "");
-    this.muxHomeOverride = options?.muxHome ?? null;
+    this.xumHomeOverride = options?.xumHome ?? null;
     this.resolveToRemotePath = options?.resolveToRemotePath ?? true;
 
     if (this.remoteBase === "~") {
@@ -231,8 +275,8 @@ export class RemotePathMappedRuntime extends LocalRuntime {
     return path.posix.join(this.remoteBase, path.basename(projectPath), workspaceName);
   }
 
-  override getMuxHome(): string {
-    return this.muxHomeOverride ?? super.getMuxHome();
+  override getXumHome(): string {
+    return this.xumHomeOverride ?? super.getXumHome();
   }
 
   override normalizePath(targetPath: string, basePath: string): string {
@@ -296,7 +340,7 @@ export class RemotePathMappedRuntime extends LocalRuntime {
   }
 }
 
-export class TrueRemotePathMappedRuntime extends RemoteRuntime {
+export class TrueRemotePathMappedRuntime extends TestRemoteRuntime {
   private readonly delegate: RemotePathMappedRuntime;
   private readonly remoteBase: string;
 
@@ -306,22 +350,8 @@ export class TrueRemotePathMappedRuntime extends RemoteRuntime {
     this.delegate = new RemotePathMappedRuntime(localBase, remoteBase);
   }
 
-  protected readonly commandPrefix = "TestRemoteRuntime";
-
-  protected spawnRemoteProcess(): Promise<SpawnResult> {
-    throw new Error("spawnRemoteProcess should not be called");
-  }
-
-  protected getBasePath(): string {
+  protected override getBasePath(): string {
     return this.remoteBase;
-  }
-
-  protected quoteForRemote(targetPath: string): string {
-    return `'${targetPath.replaceAll("'", "'\\''")}'`;
-  }
-
-  protected cdCommand(cwd: string): string {
-    return `cd ${this.quoteForRemote(cwd)}`;
   }
 
   override exec(
@@ -364,30 +394,6 @@ export class TrueRemotePathMappedRuntime extends RemoteRuntime {
   override ensureDir(dirPath: string): ReturnType<LocalRuntime["ensureDir"]> {
     return this.delegate.ensureDir(dirPath);
   }
-
-  override createWorkspace(_params: Parameters<LocalRuntime["createWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override initWorkspace(_params: Parameters<LocalRuntime["initWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override renameWorkspace(
-    _projectPath: string,
-    _oldWorkspaceName: string,
-    _newWorkspaceName: string
-  ) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override deleteWorkspace(_projectPath: string, _workspaceName: string, _deleteBranch: boolean) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override forkWorkspace(_params: Parameters<LocalRuntime["forkWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
 }
 
 let testConfig: Config | null = null;
@@ -409,13 +415,44 @@ export function createIsolatedAgentSkillsRoots(root: string) {
   };
 }
 
+/**
+ * Typed partial WorkspaceTurnManager for tool tests. Only the methods a test passes exist;
+ * calling any other method throws, so an unexpected workspace-turn call fails loudly.
+ */
+export function createFakeWorkspaceTurnManager(
+  methods: Partial<WorkspaceTurnManager> = {}
+): WorkspaceTurnManager {
+  return methods as WorkspaceTurnManager;
+}
+
+/**
+ * Stubs `runtime`'s macOS agent sandbox policy: `workspace` is open except `denyWrite`, and the
+ * file that the command environment's HF_TOKEN_PATH names is hidden, as the real policy hides it.
+ */
+export function stubSandboxHidingTokenPath(
+  runtime: LocalRuntime,
+  workspace: string,
+  denyWrite: string[] = []
+): void {
+  runtime.agentSandboxPolicy = (input) => ({
+    writeRoots: [workspace],
+    gitCommonDirs: [],
+    denyWrite,
+    denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+    allowRead: [workspace],
+    network: "allowlist",
+    allowedHosts: [],
+    allowLocalBinding: true,
+  });
+}
+
 export function createTestToolConfig(
   tempDir: string,
   options?: {
     workspaceId?: string;
     sessionsDir?: string;
     runtime?: Runtime;
-    muxScope?: MuxToolScope;
+    xumScope?: XumToolScope;
   }
 ): ToolConfiguration {
   return {
@@ -424,10 +461,14 @@ export function createTestToolConfig(
     runtime: options?.runtime ?? new LocalRuntime(tempDir),
     runtimeTempDir: tempDir,
     workspaceId: options?.workspaceId ?? "test-workspace",
-    muxScope: options?.muxScope ?? {
+    xumScope: options?.xumScope ?? {
       type: "global",
-      muxHome: tempDir,
+      xumHome: tempDir,
     },
+    // Production always wires a WorkspaceTurnManager next to TaskService; task tools require
+    // it up front. Tests that exercise workspace turns override this with the methods they use.
+    workspaceTurnManager: createFakeWorkspaceTurnManager(),
+    sessionLocks: nodeSessionLocks,
   };
 }
 

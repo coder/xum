@@ -1,6 +1,10 @@
 import React from "react";
 import { FileText } from "lucide-react";
-import type { InlineSkillSnapshotMap, ReviewNoteDataForDisplay } from "@/common/types/message";
+import type {
+  ArtifactInteractionMetadata,
+  InlineSkillSnapshotMap,
+  ReviewNoteDataForDisplay,
+} from "@/common/types/message";
 import type { FilePart } from "@/common/orpc/schemas";
 import {
   parseStagedAttachmentNotice,
@@ -14,9 +18,12 @@ import {
   HoverCardTrigger,
 } from "@/browser/components/HoverCard/HoverCard";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { downloadBlob } from "@/browser/utils/downloadFile";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { AgentSkillBadge } from "./AgentSkillBadge";
 import { buildAgentSkillSnapshotMarkdown } from "./agentSkillSnapshotMarkdown";
+import { formatArtifactInteractionMarkdown } from "./artifactInteractionMarkdown";
+import { stripReviewBlocksForDisplay } from "@/common/types/review";
 
 interface UserMessageContentProps {
   content: string;
@@ -28,6 +35,8 @@ interface UserMessageContentProps {
   agentSkillSnapshot?: { frontmatterYaml?: string; body?: string };
   inlineSkillSnapshots?: InlineSkillSnapshotMap;
   reviews?: ReviewNoteDataForDisplay[];
+  /** Sent from an artifact (M5b): the body comes from this metadata, not the tag text. */
+  artifactInteraction?: ArtifactInteractionMetadata;
   fileParts?: FilePart[];
   onDownloadStagedAttachment?: (attachment: DisplayStagedAttachment) => void;
   /** Controls styling: "sent" for full styling, "queued" for muted preview */
@@ -41,13 +50,14 @@ const markdownStyles: Record<UserMessageContentProps["variant"], React.CSSProper
     wordBreak: "break-word",
   },
   queued: {
-    color: "var(--color-subtle)",
-    fontFamily: "var(--font-monospace)",
-    fontSize: "12px",
-    lineHeight: "16px",
+    // Queued follow-ups are still user-authored prose, so keep them readable instead of
+    // styling the preview like subdued terminal output.
+    color: "var(--color-text-light)",
+    fontFamily: "inherit",
+    fontSize: "13px",
+    lineHeight: "18px",
     overflowWrap: "break-word",
     wordBreak: "break-word",
-    opacity: 0.9,
   },
 };
 
@@ -109,9 +119,11 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
   const hasReviews = reviews.length > 0;
 
   // Strip model-only attachment/review tags from text when displaying alongside rich UI blocks.
-  const textContent = hasReviews
-    ? parsedStagedNotice.text.replace(/<review>[\s\S]*?<\/review>\s*/g, "").trim()
-    : parsedStagedNotice.text;
+  const textContent = props.artifactInteraction
+    ? formatArtifactInteractionMarkdown(props.artifactInteraction)
+    : hasReviews
+      ? stripReviewBlocksForDisplay(parsedStagedNotice.text)
+      : parsedStagedNotice.text;
 
   // Check if content starts with the command prefix
   const shouldHighlightPrefix =
@@ -137,6 +149,9 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
           style={markdownStyles[props.variant]}
           inlineSkillSnapshots={props.inlineSkillSnapshots}
           preserveLineBreaks
+          // The maintainer's call (#5698): a user bubble shows the text as typed, so raw HTML
+          // (even allowed tags like <details>) renders as literal text. Markdown still renders.
+          renderRawHtml={false}
         />
       );
     }
@@ -187,6 +202,7 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
             style={markdownStyles[props.variant]}
             inlineSkillSnapshots={props.inlineSkillSnapshots}
             preserveLineBreaks
+            renderRawHtml={false}
           />
         )}
       </div>
@@ -241,24 +257,19 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
 
                   event.preventDefault();
 
-                  const blobUrl = URL.createObjectURL(blob);
-
                   if (isDesktopMode()) {
                     // In desktop mode, new windows are routed via shell.openExternal.
                     // blob: URLs are tied to this renderer and won't resolve externally,
                     // so download the file in-app instead.
-                    const link = document.createElement("a");
-                    link.href = blobUrl;
-                    link.download =
+                    void downloadBlob(
+                      blob,
                       part.filename ??
-                      (baseMediaType === "application/pdf" ? "attachment.pdf" : "attachment");
-                    document.body.appendChild(link);
-                    link.click();
-                    link.remove();
-                    setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+                        (baseMediaType === "application/pdf" ? "attachment.pdf" : "attachment")
+                    );
                     return;
                   }
 
+                  const blobUrl = URL.createObjectURL(blob);
                   window.open(blobUrl, "_blank", "noopener,noreferrer");
 
                   // Keep the blob URL alive long enough for the new tab to load.
