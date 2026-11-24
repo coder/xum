@@ -5,6 +5,7 @@ import * as os from "os";
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
+import { GitPatchArtifactService } from "@/node/services/gitPatchArtifactService";
 import {
   readSubagentReportArtifact,
   upsertSubagentReportArtifact,
@@ -3447,6 +3448,38 @@ describe("TaskService", () => {
       assert(archived, `Expected workspace ${workspaceId} to exist in test config`);
     }
 
+    async function seedSkippedPatchArtifact(
+      config: Config,
+      parentWorkspaceId: string,
+      childTaskId: string
+    ): Promise<void> {
+      await subagentGitPatchArtifacts.upsertSubagentGitPatchArtifact({
+        locks: nodeSessionLocks,
+        workspaceId: parentWorkspaceId,
+        workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
+        childTaskId,
+        updater: () => ({
+          childTaskId,
+          parentWorkspaceId,
+          createdAtMs: Date.now(),
+          status: "skipped",
+          projectArtifacts: [
+            {
+              projectPath: path.join(rootDir, "repo"),
+              projectName: "repo",
+              storageKey: "repo",
+              status: "skipped",
+              commitCount: 0,
+            },
+          ],
+          readyProjectCount: 0,
+          failedProjectCount: 0,
+          skippedProjectCount: 1,
+          totalCommitCount: 0,
+        }),
+      });
+    }
+
     async function setupReportedTaskChain(options?: {
       preserveSubagentsUntilArchive?: boolean;
       taskChain?: ReportedTaskNode[];
@@ -3555,6 +3588,9 @@ describe("TaskService", () => {
         ],
       });
 
+      // An exec leaf needs a terminal patch artifact, or cleanup defers it as a
+      // failed generation write.
+      await seedSkippedPatchArtifact(config, workflowTaskId, childTaskId);
       expect(await internal.canCleanupReportedTask(childTaskId)).toEqual({
         ok: true,
         parentWorkspaceId: workflowTaskId,
@@ -3564,6 +3600,103 @@ describe("TaskService", () => {
       expect(remove.mock.calls.map((call) => call[0])).toEqual([childTaskId, workflowTaskId]);
       expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
       expect(findWorkspaceInConfig(config, workflowTaskId)).toBeUndefined();
+    });
+
+    async function setupWorkflowOwnedExecLeaf() {
+      const workflowTaskId = "workflow-222";
+      const childTaskId = "child-333";
+      const setup = await setupReportedTaskChain({
+        taskChain: [
+          {
+            id: workflowTaskId,
+            directoryName: "workflow-task",
+            name: "agent_explore_workflow",
+            agentType: "explore",
+            taskStatus: "reported",
+            workflowTask: { runId: "wfr_cleanup", stepId: "review" },
+          },
+          {
+            id: childTaskId,
+            directoryName: "child-task",
+            name: "agent_exec_child",
+            agentType: "exec",
+            taskStatus: "reported",
+          },
+        ],
+      });
+      return { ...setup, workflowTaskId, childTaskId };
+    }
+
+    test("cleanup defers a patch-eligible leaf whose patch artifact is missing", async () => {
+      const { internal, workflowTaskId, childTaskId } = await setupWorkflowOwnedExecLeaf();
+      // No artifact for an editing-capable task means the pending-marker write
+      // failed: deleting the workspace would destroy work nothing records.
+      const eligibility = spyOn(
+        GitPatchArtifactService.prototype,
+        "shouldGeneratePatchForTask"
+      ).mockResolvedValue(true);
+      try {
+        expect(await internal.canCleanupReportedTask(childTaskId)).toEqual({
+          ok: false,
+          reason: "patch_artifact_missing",
+        });
+        eligibility.mockResolvedValue(false);
+        expect(await internal.canCleanupReportedTask(childTaskId)).toMatchObject({
+          ok: true,
+          parentWorkspaceId: workflowTaskId,
+        });
+      } finally {
+        eligibility.mockRestore();
+      }
+    });
+
+    test("cleanup defers a leaf whose uncommitted changes were not captured until applied", async () => {
+      const { config, internal, workflowTaskId, childTaskId } = await setupWorkflowOwnedExecLeaf();
+      const seedArtifact = async (appliedAtMs?: number): Promise<void> => {
+        await subagentGitPatchArtifacts.upsertSubagentGitPatchArtifact({
+          locks: nodeSessionLocks,
+          workspaceId: workflowTaskId,
+          workspaceSessionDir: path.join(config.sessionsDir, workflowTaskId),
+          childTaskId,
+          updater: () => ({
+            childTaskId,
+            parentWorkspaceId: workflowTaskId,
+            createdAtMs: Date.now(),
+            status: "ready",
+            projectArtifacts: [
+              {
+                projectPath: path.join(rootDir, "repo"),
+                projectName: "repo",
+                storageKey: "repo",
+                status: "ready",
+                commitCount: 1,
+                hadUncommittedChanges: true,
+                worktreePatchSkippedReason: "diff exceeded the capture cap",
+                ...(appliedAtMs != null ? { appliedAtMs } : {}),
+              },
+            ],
+            readyProjectCount: 1,
+            failedProjectCount: 0,
+            skippedProjectCount: 0,
+            totalCommitCount: 1,
+          }),
+        });
+      };
+
+      // The child worktree holds the only copy of the uncaptured changes.
+      await seedArtifact();
+      expect(await internal.canCleanupReportedTask(childTaskId)).toEqual({
+        ok: false,
+        reason: "uncaptured_changes_unrecovered",
+      });
+
+      // Applying requires acknowledge_uncaptured_changes, so an applied
+      // project means the user accepted the omission.
+      await seedArtifact(Date.now());
+      expect(await internal.canCleanupReportedTask(childTaskId)).toMatchObject({
+        ok: true,
+        parentWorkspaceId: workflowTaskId,
+      });
     });
 
     test("startup recovery leaves preserved descendants alone before archive", async () => {

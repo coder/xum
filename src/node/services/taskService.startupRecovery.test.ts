@@ -5,6 +5,7 @@ import * as fsPromises from "fs/promises";
 import { type ProjectsConfig } from "@/node/config";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
 import { upsertSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
+import { GitPatchArtifactService } from "@/node/services/gitPatchArtifactService";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { defaultModel } from "@/common/utils/ai/models";
 import type { StreamEndEvent } from "@/common/types/stream";
@@ -38,6 +39,14 @@ import {
   removeWorkspaceFromTestConfig,
 } from "@/node/services/taskService.shared.testHarness";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+
+function spyOnPatchEligibility(eligible: boolean) {
+  const spy = spyOn(
+    GitPatchArtifactService.prototype,
+    "shouldGeneratePatchForTask"
+  ).mockResolvedValue(eligible);
+  return { [Symbol.dispose]: () => spy.mockRestore() };
+}
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -1613,6 +1622,9 @@ describe("TaskService", () => {
   });
 
   test("startup cleanup confirms a snapshot-eligible task on fresh config before removing it", async () => {
+    // These exec tasks model a finished patch generation; without the spy the cleanup gate would
+    // defer them for having no patch artifact on disk.
+    using _noPatchEligibility = spyOnPatchEligibility(false);
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     const parentWorkspaceId = "parent-cleanup-live";
@@ -1683,6 +1695,9 @@ describe("TaskService", () => {
   });
 
   test("startup cleanup continues from the parent the live confirmation saw after a re-parent", async () => {
+    // These exec tasks model a finished patch generation; without the spy the cleanup gate would
+    // defer them for having no patch artifact on disk.
+    using _noPatchEligibility = spyOnPatchEligibility(false);
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     const rootWorkspaceId = "parent-cleanup-reparent-root";

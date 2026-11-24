@@ -5,6 +5,7 @@ import type { SubagentGitPatchArtifact } from "@/common/utils/tools/toolDefiniti
 import {
   getSubagentGitPatchArtifactsFilePath,
   getSubagentGitPatchMboxPath,
+  getSubagentGitPatchWorktreePatchPath,
   readSubagentGitPatchArtifactsFile,
 } from "./subagentGitPatchArtifacts";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
@@ -176,5 +177,29 @@ describe("WorkspaceService remove rolls child patch artifacts into the parent", 
         .stat(path.dirname(getSubagentGitPatchMboxPath(parentDir, "task-none", storageKey)))
         .catch(() => null)
     ).toBeNull();
+  });
+
+  test("copies a worktree-only artifact and points its worktree patch at the parent", async () => {
+    const childPatch = getSubagentGitPatchWorktreePatchPath(childDir, "task-wt", storageKey);
+    const entry = artifact("task-wt", childDir, 10, null);
+    entry.projectArtifacts = entry.projectArtifacts.map((project) => ({
+      ...project,
+      commitCount: 0,
+      hadUncommittedChanges: true,
+      worktreePatchPath: childPatch,
+    }));
+    await writeIndex(childDir, [entry]);
+    await writeMbox(childPatch, "uncommitted diff");
+
+    await removeChild();
+
+    const parentPatch = getSubagentGitPatchWorktreePatchPath(parentDir, "task-wt", storageKey);
+    expect(await fsPromises.readFile(parentPatch, "utf8")).toBe("uncommitted diff");
+    const merged = (await readSubagentGitPatchArtifactsFile(parentDir)).artifactsByChildTaskId[
+      "task-wt"
+    ];
+    expect(merged?.projectArtifacts.map((project) => project.worktreePatchPath)).toEqual([
+      parentPatch,
+    ]);
   });
 });
