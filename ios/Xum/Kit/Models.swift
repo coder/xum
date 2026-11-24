@@ -158,6 +158,7 @@ enum ModelName {
         "anthropic:claude-fable-5-2", "anthropic:claude-mythos-5-2",
         "openai:gpt-6.2-sol", "openai:gpt-6-luna", "openai:gpt-6.2-astra",
         "google:gemini-3.1-pro-preview", "google:gemini-3.8-flash", "google:gemini-4-argon", "google:gemini-4-carbon",
+        "google:gemini-4-neon",
         "xai:grok-4.7", "deepseek:deepseek-v4-pro", "deepseek:deepseek-v4-flash", "moonshotai:kimi-k3",
         "meta:muse-wonder-1.0", "zai:glm-5.3-flash",
     ]
@@ -190,7 +191,7 @@ enum ModelName {
             "claude-fable-5-2": 1_000_000, "claude-mythos-5-2": 1_000_000,
             "gpt-6.2-sol": 922_000, "gpt-6-luna": 922_000, "gpt-6.2-astra": 922_000,
             "gemini-3.1-pro-preview": 1_048_576, "gemini-3.8-flash": 1_048_576, "gemini-4-argon": 1_048_576,
-            "gemini-4-carbon": 1_048_576, "grok-4.7": 500_000, "deepseek-v4-pro": 1_000_000,
+            "gemini-4-carbon": 1_048_576, "gemini-4-neon": 1_048_576, "grok-4.7": 500_000, "deepseek-v4-pro": 1_000_000,
             "deepseek-v4-flash": 1_000_000, "kimi-k3": 1_048_576, "muse-wonder-1.0": 1_048_576,
             "glm-5.3-flash": 1_048_576,
         ]

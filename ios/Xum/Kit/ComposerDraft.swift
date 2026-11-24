@@ -170,6 +170,19 @@ final class ComposerDraft {
         setText(Self.join(restored, text))
     }
 
+    /// The text a send carries, as the web composer makes it from its input (#5695): a slash
+    /// command fully trimmed, else only leading blank lines and trailing whitespace go, so a first
+    /// line's indentation (pasted code) stays. The draft takes the input itself, so the backend
+    /// finds it whole.
+    static func messageText(_ input: String) -> String {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("/") { return trimmed }
+        var s = Substring(input)
+        while let nl = s.firstIndex(where: \.isNewline), s[..<nl].allSatisfy(\.isWhitespace) { s = s[s.index(after: nl)...] }
+        while let last = s.last, last.isWhitespace { s = s.dropLast() }
+        return String(s)
+    }
+
     static func join(_ a: String, _ b: String) -> String {
         a.isEmpty ? b : b.isEmpty ? a : a + "\n\n" + b
     }
@@ -208,7 +221,8 @@ final class ComposerDraft {
 
     // MARK: - Sending
 
-    /// Takes `message` out of the composer and sends it. Returns once the draft holds the send
+    /// Takes `message` (the composer text at the tap, as the web's pending send keeps it) out of
+    /// the composer and sends it as `messageText`. Returns once the draft holds the send
     /// (the composer is usable again at once); throws only when nothing was taken. Whether the
     /// backend accepted it arrives later through the draft, and `onNotAccepted` says why it did not.
     func send(message: String, options: [String: JSONValue]) async throws {
@@ -237,7 +251,7 @@ final class ComposerDraft {
         var request: [String: JSONValue] = options
         request.removeValue(forKey: "sendId")
         let pending = PendingSend(sendId: sendId, receiverId: receiver, text: message,
-                                  request: ["message": .string(message), "options": .object(request)])
+                                  request: ["message": .string(Self.messageText(message)), "options": .object(request)])
         let visible = text
         writeTask?.cancel()
         issuing.insert(sendId)

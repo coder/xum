@@ -137,6 +137,20 @@ struct ComposerDraftTests {
         server.finishSend()
     }
 
+    @Test func theDraftTakesTheTypedTextAndTheRequestCarriesItTrimmed() async throws {
+        let server = FakeServer()
+        let d = draft(server)
+        d.setText("\n  hello \n")
+        try await d.send(message: d.text, options: [:])
+        await settle()
+        let begun = try #require(server.bodies("drafts/beginSend").first)
+        // The backend removes the take from the composer text, so it must be that text whole.
+        #expect(begun["pendingSend"]?["text"]?.string == "\n  hello \n")
+        #expect(begun["pendingSend"]?["request"]?["message"]?.string == "  hello")
+        #expect(server.bodies("workspace/sendMessage").first?["message"]?.string == "  hello")
+        server.finishSend()
+    }
+
     @Test func anInFlightSendIsNeverLookedUp() async throws {
         let server = FakeServer()
         let d = draft(server)

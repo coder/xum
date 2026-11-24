@@ -438,8 +438,10 @@ struct ChatView: View {
     }
 
     private func send(_ store: ChatStore) {
-        let text = store.draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        // The draft takes the text as typed and trims what it sends, as the web composer does:
+        // a trimmed take would not match the composer text the backend removes it from.
+        let text = store.draft.text
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         // The draft takes the text out of the composer and puts it back if it was not sent.
         Task { try? await store.send(text, model: modelId, agentId: agent, thinking: thinking) }
     }

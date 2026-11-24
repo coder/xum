@@ -57,8 +57,10 @@ final class AppModel {
     func loadModels() async -> Bool {
         guard let c = servers.currentClient else { return true }
         let serverID = servers.currentID
-        guard let providers = try? await c.call("providers/getConfig") else { return false }
-        let serverDefault = (try? await c.call("config/getConfig"))?["defaultModel"]?.string
+        // Both or neither: without the server's default, the previous server's could stay picked.
+        guard let providers = try? await c.call("providers/getConfig"),
+              let config = try? await c.call("config/getConfig") else { return false }
+        let serverDefault = config["defaultModel"]?.string
         // A switch while these calls ran started a newer load for the new server.
         guard servers.currentID == serverID else { return true }
         var models = ModelName.catalog(providers: providers)
