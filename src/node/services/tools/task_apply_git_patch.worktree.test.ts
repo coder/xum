@@ -447,6 +447,52 @@ describe("task_apply_git_patch uncommitted-changes (worktree) patches", () => {
     expect(artifactAfterRetry?.projectArtifacts[0]?.appliedPartial).toBeUndefined();
   }, 20_000);
 
+  it("completes via the reverse check after the user committed an applied deletion", async () => {
+    const harness = await setupSingleRepoHarness();
+
+    await fsPromises.rm(path.join(harness.childRepo, "README.md"));
+    const worktreeFields = await writeWorktreePatchFile({
+      sessionDir: harness.sessionDir,
+      childTaskId: harness.childTaskId,
+      storageKey: "project",
+      childRepo: harness.childRepo,
+    });
+
+    await writePatchArtifact({
+      sessionDir: harness.sessionDir,
+      workspaceId: harness.currentWorkspaceId,
+      childTaskId: harness.childTaskId,
+      projectArtifacts: [
+        {
+          projectPath: harness.targetRepo,
+          projectName: "project",
+          storageKey: "project",
+          status: "ready",
+          commitCount: 0,
+          hadUncommittedChanges: true,
+          appliedPartial: true,
+          appliedPartialStage: "commits-applied",
+          ...worktreeFields,
+        },
+      ],
+    });
+
+    // The interrupted apply deleted the file and the user then committed
+    // that deletion: the path now exists neither in HEAD nor on disk.
+    execSync("git rm -q README.md", { cwd: harness.targetRepo });
+    execSync('git -c user.name=test -c user.email=test@example.com commit -qm "drop readme"', {
+      cwd: harness.targetRepo,
+    });
+
+    const tool = createApplyTool(harness);
+    const result = (await tool.execute!({ task_id: harness.childTaskId }, mockToolCallOptions)) as {
+      success: boolean;
+      projectResults: Array<{ status: string; note?: string }>;
+    };
+    expect(result.success).toBe(true);
+    expect(result.projectResults[0]?.note).toContain("already present in the worktree");
+  }, 20_000);
+
   it("fails a replay-safe retry when the applied uncommitted changes were discarded", async () => {
     const harness = await setupSingleRepoHarness();
 

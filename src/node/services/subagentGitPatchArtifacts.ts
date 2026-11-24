@@ -649,9 +649,18 @@ export async function markSubagentGitPatchArtifactApplied(params: {
     propagateWriteErrors: true,
     update: (file) => {
       const existing = file.artifactsByChildTaskId[params.childTaskId] ?? null;
-      if (!existing) {
-        updated = null;
-        return;
+      // The self-healing read may have dropped a malformed target entry.
+      // Throwing before the write keeps the caller from running git am (or
+      // reporting completion) without a durable record. A malformed sibling
+      // is still dropped, so one bad entry cannot brick every apply.
+      if (
+        !existing?.projectArtifacts.some((artifact) =>
+          matchesProjectArtifactProjectPathForUpdate(artifact, params.projectPath)
+        )
+      ) {
+        throw new Error(
+          `Could not record patch application: no artifact for task ${params.childTaskId} and project ${params.projectPath}`
+        );
       }
 
       updated = normalizeSubagentGitPatchArtifact({
@@ -790,7 +799,7 @@ async function readLocalPatchApplyStateFile(
     // may hide a recorded partial application.
     throw new Error(`Could not read local patch apply state: ${getErrorMessage(error)}`);
   }
-  if (parsed == null || typeof parsed !== "object") {
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Could not read local patch apply state: not a JSON object");
   }
   // A newer build may move partial or completion records; reading its file

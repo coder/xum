@@ -948,15 +948,16 @@ async function buildIndexReverseCheckCommand(params: {
   const chunkSize = 200;
   const addCommands: string[] = [];
   for (let i = 0; i < patchPaths.length; i += chunkSize) {
-    const pathspecs = patchPaths
+    const quotedPaths = patchPaths
       .slice(i, i + chunkSize)
-      .map((filePath) => shellQuote(`:(literal)${filePath}`))
+      .map((filePath) => shellQuote(filePath))
       .join(" ");
-    // -f: a patch path the target ignores must still be compared. A path that
-    // exists neither in HEAD nor on disk fails the pathspec match, which
-    // correctly means the patch content is not present.
+    // update-index takes plain paths (no pathspec magic), ignores .gitignore,
+    // and skips a path that exists neither in HEAD nor on disk, so the
+    // reverse apply alone decides whether an absent path (a deletion the
+    // user has since committed) matches the patch.
     addCommands.push(
-      `GIT_INDEX_FILE="$TMP_INDEX" ${params.gitPrefix}git add -A -f -- ${pathspecs}`
+      `GIT_INDEX_FILE="$TMP_INDEX" ${params.gitPrefix}git update-index --add --remove -- ${quotedPaths}`
     );
   }
   const command = [
@@ -2856,6 +2857,11 @@ async function applyWorktreeOnlyProjectPatch(params: {
   const clearPartialAndMarkApplied = async (
     completionHeadSha: string | null | undefined
   ): Promise<string | undefined> => {
+    // A completion without its HEAD reads as a legacy record, which
+    // revalidation accepts unchecked; keep the partial marker instead.
+    if (completionHeadSha == null) {
+      return "could not read the target HEAD after applying";
+    }
     try {
       if (!params.isReplay) {
         // Marking without `partial` clears an earlier appliedPartial flag.
@@ -2866,7 +2872,7 @@ async function applyWorktreeOnlyProjectPatch(params: {
           childTaskId: params.taskId,
           projectPath: params.projectArtifact.projectPath,
           appliedAtMs: Date.now(),
-          ...(completionHeadSha != null ? { appliedHeadSha: completionHeadSha } : {}),
+          appliedHeadSha: completionHeadSha,
         });
       } else {
         // Replay success is recorded target-locally; the shared ancestor
@@ -2882,7 +2888,7 @@ async function applyWorktreeOnlyProjectPatch(params: {
           projectPath: params.projectArtifact.projectPath,
           record: null,
           completedAtMs: Date.now(),
-          ...(completionHeadSha != null ? { completedHeadSha: completionHeadSha } : {}),
+          completedHeadSha: completionHeadSha,
         });
       }
       return undefined;

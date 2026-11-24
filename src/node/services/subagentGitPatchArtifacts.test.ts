@@ -357,6 +357,46 @@ describe("subagentGitPatchArtifacts", () => {
     expect(thrownMessage).toContain("unsupported version 2");
   });
 
+  test("readLocalPatchPartialApply fails closed on an array-shaped state file", async () => {
+    await fsPromises.writeFile(
+      path.join(testDir, "subagent-patches-local-apply.json"),
+      "[]",
+      "utf-8"
+    );
+
+    let thrownMessage = "";
+    try {
+      await readLocalPatchPartialApply({
+        workspaceSessionDir: testDir,
+        childTaskId: "task_x",
+        projectPath: "/repo",
+      });
+    } catch (error) {
+      thrownMessage = error instanceof Error ? error.message : String(error);
+    }
+    expect(thrownMessage).toContain("not a JSON object");
+  });
+
+  test("markSubagentGitPatchArtifactApplied rejects a missing target instead of resolving null", async () => {
+    // The caller would otherwise run git am without its in-progress marker.
+    let thrownMessage = "";
+    try {
+      await markSubagentGitPatchArtifactApplied({
+        locks: nodeSessionLocks,
+        workspaceId: "parent-1",
+        workspaceSessionDir: testDir,
+        childTaskId: "child-missing",
+        projectPath: "/tmp/project-a",
+        appliedAtMs: 456,
+        partial: true,
+        partialStage: "am-started",
+      });
+    } catch (error) {
+      thrownMessage = error instanceof Error ? error.message : String(error);
+    }
+    expect(thrownMessage).toContain("no artifact for task child-missing");
+  });
+
   test("readLocalPatchPartialApply degrades a corrupted record to a conservative marker", async () => {
     // The entry's presence is the evidence of partial application (clears
     // delete the key); dropping it for a corrupt appliedAtMs would let the
