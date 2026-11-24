@@ -305,6 +305,9 @@ describe("settingsProjection", () => {
           "openai:gpt-c": { models: ["openai:gpt-c"] },
         },
       ],
+      // Sources and targets no model selection can match.
+      ["modelFallbacks", { garbage: { models: ["openai:gpt-b"] } }],
+      ["modelFallbacks", { "openai:gpt-a": { models: ["garbage"] } }],
       ["autoModelRouting", { tiers: [tier, tier] }],
       [
         "autoModelRouting",

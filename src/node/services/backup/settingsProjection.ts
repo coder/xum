@@ -117,13 +117,20 @@ function isCanonical(key: BackedUpSettingsKey, value: unknown): boolean {
  * Per-key on-disk schemas rather than one picked object: the on-disk schema is passthrough,
  * which would carry any key of a repository-controlled document into the config. Where
  * normalization keeps values lookups can never match, the schema is tightened: a per-model
- * floor needs a model-string key.
+ * floor needs a model-string key, and a fallback chain model-string sources and targets.
  */
+const isModelString = (model: string) => normalizeOptionalModelString(model) === model;
+
 const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = {
   minThinkingLevelByModel: AppConfigOnDiskSchema.shape.minThinkingLevelByModel
     .unwrap()
+    .refine((value) => Object.keys(value).every(isModelString)),
+  modelFallbacks: AppConfigOnDiskSchema.shape.modelFallbacks
+    .unwrap()
     .refine((value) =>
-      Object.keys(value).every((model) => normalizeOptionalModelString(model) === model)
+      Object.entries(value).every(
+        ([source, chain]) => isModelString(source) && chain.models.every(isModelString)
+      )
     ),
 };
 
