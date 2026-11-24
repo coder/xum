@@ -98,19 +98,10 @@ export type DevToolsEvent =
   | { type: "run-updated"; run: DevToolsRunSummary }
   | { type: "step-created"; step: DevToolsStep }
   | { type: "step-updated"; step: DevToolsStep }
-  | { type: "runs-evicted"; runIds: string[] }
   | { type: "cleared" };
 
-/**
- * One line in devtools.jsonl — append-only log format. The meta entries pair
- * a rotated snapshot with the live log written after it: loading skips a live
- * log whose generation predates the snapshot's, so a crash between the
- * snapshot rename and the live-log rewrite cannot resurrect evicted runs.
- */
+/** One line in devtools.jsonl — append-only log format. */
 export type DevToolsLogEntry =
   | { type: "run"; run: DevToolsRun }
   | { type: "step"; step: DevToolsStep }
-  | { type: "step-update"; stepId: string; update: Partial<DevToolsStep> }
-  | { type: "snapshot-meta"; generation: number }
-  | { type: "log-meta"; generation: number }
-  | { type: "log-retire"; generation: number };
+  | { type: "step-update"; stepId: string; update: Partial<DevToolsStep> };

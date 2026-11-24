@@ -100,14 +100,24 @@ export function handleStringReplace(
     newContent = parts.join(newStringCoerced);
     editsApplied = occurrences;
   } else {
-    // Rebuild from the pre-split parts so matching cannot resume inside
-    // just-inserted text when new_string contains old_string.
-    const countToReplace = Math.max(replaceCount, 0);
-    const tail = parts.slice(countToReplace + 1);
-    newContent =
-      parts.slice(0, countToReplace + 1).join(newStringCoerced) +
-      (tail.length > 0 ? oldStringToMatch + tail.join(oldStringToMatch) : "");
-    editsApplied = countToReplace;
+    let replacedCount = 0;
+    let currentContent = originalContent;
+
+    for (let i = 0; i < replaceCount; i++) {
+      const index = currentContent.indexOf(oldStringToMatch);
+      if (index === -1) {
+        break;
+      }
+
+      currentContent =
+        currentContent.substring(0, index) +
+        newStringCoerced +
+        currentContent.substring(index + oldStringToMatch.length);
+      replacedCount++;
+    }
+
+    newContent = currentContent;
+    editsApplied = replacedCount;
   }
 
   return {
