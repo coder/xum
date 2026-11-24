@@ -2905,8 +2905,8 @@ export class SSHRuntime extends RemoteRuntime {
     // object the backfill could not restore, and a failed lazy fetch is
     // classified as missing-objects below so the slow path repairs it.
     const warmBaseRepoPromisorHealPreamble = [
-      `if [ "$(git --git-dir=${baseRepoPathArg} config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then`,
-      `  git --git-dir=${baseRepoPathArg} config --local --unset-all remote.origin.partialclonefilter 2>/dev/null || true`,
+      // The unset is the claim against sibling status fetches healing the same repo.
+      `if [ "$(git --git-dir=${baseRepoPathArg} config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ] && git --git-dir=${baseRepoPathArg} config --local --unset-all remote.origin.partialclonefilter 2>/dev/null; then`,
       `  xum_base_missing=$(git --git-dir=${baseRepoPathArg} rev-list --objects --missing=print --all --reflog 2>/dev/null | sed -n 's/^?//p')`,
       `  [ -z "$xum_base_missing" ] || printf '%s\\n' "$xum_base_missing" | git --git-dir=${baseRepoPathArg} -c protocol.version=2 fetch origin --stdin --no-tags --no-recurse-submodules --no-write-fetch-head >/dev/null 2>&1 || true`,
       `fi`,

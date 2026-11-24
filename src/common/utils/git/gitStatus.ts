@@ -228,67 +228,55 @@ export GIT_SSH_COMMAND="\${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostK
 # recoverable partial clone into one whose checkouts fail with "unable to read
 # sha1 file". The backfill is best-effort and runs once: after the filter is
 # gone the repo is no worse than any partial clone.
-if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then
-  COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-  if [ -n "$COMMON_DIR" ]; then
-    # Sibling worktrees share repo config, so a lock keeps them from starting
-    # concurrent backfills. "ln -s" creates the lock and its timestamp in one
-    # atomic step, so no reader can see a lock without a timestamp. A lock
-    # left by a heal killed before it removed the filter expires after an
-    # hour.
-    NOW=$(date +%s)
-    HEAL_LOCK="$COMMON_DIR/xum-promisor-heal.lock"
-    LOCK_TS=$(readlink "$HEAL_LOCK" 2>/dev/null || echo 0)
-    case "$LOCK_TS" in ''|*[!0-9]*) LOCK_TS=0 ;; esac
-    if [ -L "$HEAL_LOCK" ] && [ $((NOW - LOCK_TS)) -gt 3600 ]; then
-      rm -f "$HEAL_LOCK"
+#
+# Sibling worktrees share repo config and can run this script at once. The
+# unset is the claim: git rewrites the config under config.lock and looks for
+# the key while holding it, so exactly one run removes the filter and gets
+# exit 0; the others find the key gone or the lock taken and skip the
+# backfill.
+if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ] &&
+    git config --local --unset-all remote.origin.partialclonefilter 2>/dev/null; then
+  echo "HEAL: removed partial-clone filter; backfilling missing objects"
+  # Locally reachable objects the repo does not have, one OID per line.
+  # When rev-list fails (e.g. a ref names a commit the repo lacks) a
+  # sentinel is printed instead, so stage 2 still runs.
+  xum_missing_objects() {
+    if xum_rl_out=$(git rev-list --objects --missing=print --all --reflog 2>/dev/null); then
+      printf '%s\\n' "$xum_rl_out" | sed -n 's/^?//p'
+    else
+      echo "enumeration-failed"
     fi
-    if ln -s "$NOW" "$HEAL_LOCK" 2>/dev/null; then
-      echo "HEAL: removing partial-clone filter and backfilling missing objects"
-      git config --local --unset-all remote.origin.partialclonefilter 2>/dev/null
-      # Locally reachable objects the repo does not have, one OID per line.
-      # When rev-list fails (e.g. a ref names a commit the repo lacks) a
-      # sentinel is printed instead, so stage 2 still runs.
-      xum_missing_objects() {
-        if xum_rl_out=$(git rev-list --objects --missing=print --all --reflog 2>/dev/null); then
-          printf '%s\\n' "$xum_rl_out" | sed -n 's/^?//p'
-        else
-          echo "enumeration-failed"
-        fi
-      }
-      MISSING=$(xum_missing_objects)
-      # Stage 1: batch-fetch exactly the missing objects by OID. Downloads
-      # only the gaps (a --refetch re-sends the whole repo) and works on
-      # hosts whose git predates --refetch (2.36), e.g. Ubuntu 22.04's 2.34.
-      # OID wants ride the same server capability the repo's lazy fetch
-      # already depends on (this is a batched lazy fetch).
-      if [ -n "$MISSING" ] && [ "$MISSING" != "enumeration-failed" ]; then
-        printf '%s\\n' "$MISSING" | git -c protocol.version=2 \\
-            fetch origin \\
-            --stdin \\
-            --no-tags \\
-            --no-recurse-submodules \\
-            --no-write-fetch-head \\
-            2>&1
-        MISSING=$(xum_missing_objects)
-      fi
-      # Stage 2: full --refetch (git >= 2.36, hence feature-detected) for
-      # servers that refuse OID wants: it negotiates as if the repo had
-      # nothing, so the server re-sends every object reachable from its
-      # current refs, including previously filtered-out blobs.
-      if [ -n "$MISSING" ] && git fetch -h 2>&1 | grep -q refetch; then
-        git -c protocol.version=2 \\
-            fetch origin \\
-            --refetch \\
-            --no-filter \\
-            --prune \\
-            --no-tags \\
-            --no-recurse-submodules \\
-            --no-write-fetch-head \\
-            2>&1
-      fi
-      rm -f "$HEAL_LOCK"
-    fi
+  }
+  MISSING=$(xum_missing_objects)
+  # Stage 1: batch-fetch exactly the missing objects by OID. Downloads
+  # only the gaps (a --refetch re-sends the whole repo) and works on
+  # hosts whose git predates --refetch (2.36), e.g. Ubuntu 22.04's 2.34.
+  # OID wants ride the same server capability the repo's lazy fetch
+  # already depends on (this is a batched lazy fetch).
+  if [ -n "$MISSING" ] && [ "$MISSING" != "enumeration-failed" ]; then
+    printf '%s\\n' "$MISSING" | git -c protocol.version=2 \\
+        fetch origin \\
+        --stdin \\
+        --no-tags \\
+        --no-recurse-submodules \\
+        --no-write-fetch-head \\
+        2>&1
+    MISSING=$(xum_missing_objects)
+  fi
+  # Stage 2: full --refetch (git >= 2.36, hence feature-detected) for
+  # servers that refuse OID wants: it negotiates as if the repo had
+  # nothing, so the server re-sends every object reachable from its
+  # current refs, including previously filtered-out blobs.
+  if [ -n "$MISSING" ] && git fetch -h 2>&1 | grep -q refetch; then
+    git -c protocol.version=2 \\
+        fetch origin \\
+        --refetch \\
+        --no-filter \\
+        --prune \\
+        --no-tags \\
+        --no-recurse-submodules \\
+        --no-write-fetch-head \\
+        2>&1
   fi
 fi
 

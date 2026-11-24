@@ -1,4 +1,4 @@
-import { mkdtemp, rm, symlink, unlink, writeFile } from "fs/promises";
+import { mkdtemp, rm, writeFile } from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "child_process";
@@ -214,39 +214,6 @@ describe("GIT_FETCH_SCRIPT", () => {
         run("git config --local --get remote.origin.partialclonefilter || echo GONE", workspaceDir)
       ).toBe("GONE");
       expect(run("git config --local --get remote.origin.promisor", workspaceDir)).toBe("true");
-    } finally {
-      await rm(tempDir, { recursive: true, force: true });
-    }
-  }, 20000);
-
-  test("skips the heal while a sibling holds a fresh lock and takes over a stale one", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "mux-git-heal-lock-"));
-    const originDir = path.join(tempDir, "origin.git");
-    const workspaceDir = path.join(tempDir, "workspace");
-    const lockPath = path.join(workspaceDir, ".git", "xum-promisor-heal.lock");
-
-    const run = (cmd: string, cwd?: string) =>
-      execSync(cmd, { cwd, stdio: "pipe" }).toString().trim();
-
-    try {
-      run(`git init --bare ${originDir}`);
-      run(`git clone ${originDir} ${workspaceDir}`);
-      run("git config --local remote.origin.promisor true", workspaceDir);
-      run("git config --local remote.origin.partialclonefilter blob:none", workspaceDir);
-
-      const nowSecs = Math.floor(Date.now() / 1000);
-      await symlink(String(nowSecs), lockPath);
-      expect(run(GIT_FETCH_SCRIPT, workspaceDir)).not.toContain("HEAL:");
-      expect(run("git config --local --get remote.origin.partialclonefilter", workspaceDir)).toBe(
-        "blob:none"
-      );
-
-      await unlink(lockPath);
-      await symlink(String(nowSecs - 2 * 3600), lockPath);
-      expect(run(GIT_FETCH_SCRIPT, workspaceDir)).toContain("HEAL:");
-      expect(
-        run("git config --local --get remote.origin.partialclonefilter || echo GONE", workspaceDir)
-      ).toBe("GONE");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
