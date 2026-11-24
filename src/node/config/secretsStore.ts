@@ -8,6 +8,8 @@ import { log } from "@/node/services/log";
 import { ensurePrivateDirSync } from "@/node/utils/fs";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 
+const GLOBAL_SECRETS_KEY = "__global__";
+
 export class SecretsStore {
   readonly rootDir: string;
   private readonly secretsFile: string;
@@ -16,8 +18,6 @@ export class SecretsStore {
     this.rootDir = rootDir ?? getXumHome();
     this.secretsFile = path.join(this.rootDir, "secrets.json");
   }
-
-  private static readonly GLOBAL_SECRETS_KEY = "__global__";
 
   private static normalizeSecretsProjectPath(projectPath: string): string {
     return stripTrailingSlashes(projectPath);
@@ -131,7 +131,7 @@ export class SecretsStore {
 
     for (const [rawKey, rawValue] of Object.entries(record)) {
       let key = rawKey;
-      if (rawKey !== SecretsStore.GLOBAL_SECRETS_KEY) {
+      if (rawKey !== GLOBAL_SECRETS_KEY) {
         const normalizedKey = SecretsStore.normalizeSecretsProjectPath(rawKey);
         key = normalizedKey || rawKey;
       }
@@ -226,7 +226,7 @@ export class SecretsStore {
       const rawBucketEntries: unknown[] = [];
       for (const [rawKey, rawValue] of Object.entries(raw)) {
         const mappedKey =
-          rawKey === SecretsStore.GLOBAL_SECRETS_KEY
+          rawKey === GLOBAL_SECRETS_KEY
             ? rawKey
             : SecretsStore.normalizeSecretsProjectPath(rawKey) || rawKey;
         if (mappedKey !== bucketKey) {
@@ -286,14 +286,12 @@ export class SecretsStore {
    */
   getGlobalSecrets(): Secret[] {
     const config = this.loadSecretsConfig();
-    return config[SecretsStore.GLOBAL_SECRETS_KEY] ?? [];
+    return config[GLOBAL_SECRETS_KEY] ?? [];
   }
 
   /** Update global secrets (not project-scoped). */
   updateGlobalSecrets(secrets: Secret[]): Promise<void> {
-    return Effect.runPromise(
-      this.updateSecretsBucketEffect(SecretsStore.GLOBAL_SECRETS_KEY, secrets)
-    );
+    return Effect.runPromise(this.updateSecretsBucketEffect(GLOBAL_SECRETS_KEY, secrets));
   }
 
   /**
@@ -307,12 +305,12 @@ export class SecretsStore {
     const normalizedProjectPath =
       SecretsStore.normalizeSecretsProjectPath(projectPath) || projectPath;
     const config = this.loadSecretsConfig();
-    const globalSecrets = config[SecretsStore.GLOBAL_SECRETS_KEY] ?? [];
+    const globalSecrets = config[GLOBAL_SECRETS_KEY] ?? [];
     const projectSecrets = config[normalizedProjectPath] ?? [];
 
     // Keep global reference resolution synchronous so getEffectiveSecrets remains fast and side-effect free.
     const globalRawByKey = new Map<string, Secret["value"]>();
-    for (const globalSecret of config[SecretsStore.GLOBAL_SECRETS_KEY] ?? []) {
+    for (const globalSecret of config[GLOBAL_SECRETS_KEY] ?? []) {
       if (!globalSecret || typeof globalSecret.key !== "string") {
         continue;
       }

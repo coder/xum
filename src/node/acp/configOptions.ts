@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclientprotocol/sdk";
-import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { AgentDefinitionFrontmatter } from "@/common/types/agentDefinition";
 import { getThinkingOptionLabel, isThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
@@ -274,10 +274,7 @@ export async function buildConfigOptions(
       type: "select",
       category: "model",
       currentValue: currentAiSettings.model,
-      options: buildModelSelectOptions(
-        currentAiSettings.model,
-        config.hiddenModels ?? DEFAULT_HIDDEN_MODELS
-      ),
+      options: buildModelSelectOptions(currentAiSettings.model, config.hiddenModels ?? []),
     },
     {
       id: THINKING_LEVEL_CONFIG_ID,

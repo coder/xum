@@ -1,19 +1,17 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
-// Pinned to the exact version streamdown pins, so the repair applied here in static mode matches
-// what Streamdown's streaming mode applies. Bump both together.
-import remend from "remend";
-import type { Element, Root, RootContent, Text } from "hast";
+import type { Element, ElementContent, Root, RootContent, Text } from "hast";
 import type { Pluggable, Plugin } from "unified";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import remarkBreaks from "remark-breaks";
-import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { harden } from "rehype-harden";
-import "katex/dist/katex.min.css";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+import { MATH_CLASS_NAMES, SHIKI_THEME, useKatexPlugins, withKatex } from "./mathRendering";
 import { normalizeMarkdown } from "./MarkdownStyles";
+import { repairIncompleteMarkdownTail } from "./repairIncompleteMarkdownTail";
 import { markdownComponents } from "./MarkdownComponents";
 import { INTERNAL_INLINE_SKILL_HREF_PREFIX, remarkInlineSkillLinks } from "./inlineSkillMarkdown";
 
@@ -37,11 +35,25 @@ interface MarkdownCoreProps {
   preserveLineBreaks?: boolean;
   /**
    * Render in Streamdown's static mode, i.e. without transition-deferred block updates, even
-   * while repairing incomplete markdown. Static mode skips Streamdown's own repair, so it is
-   * applied here instead. Used while the transcript backfill starves React transitions.
+   * while repairing incomplete markdown. MarkdownCore does the repair itself in both modes.
+   * Used while the transcript backfill starves React transitions.
    */
   renderSynchronously?: boolean;
+  /**
+   * Parse allowed raw HTML (e.g. `<details>`) as elements. Default: true. User bubbles pass
+   * false so they show the text as typed: every raw HTML tag renders as literal text (#5698).
+   */
+  renderRawHtml?: boolean;
+  /**
+   * Show a file (memory file, AGENTS.md) that must stay inert when it opens: raw HTML renders as
+   * text, images are blocked unless inlined as data: URLs, relative links are blocked, since
+   * nothing resolves them against the file's folder, and Mermaid fences show as code. Overrides
+   * renderRawHtml. Default: false.
+   */
+  filePreview?: boolean;
 }
+
+type HardenOptions = Parameters<typeof harden>[0];
 
 // Plugin arrays are defined at module scope to maintain stable references.
 // Streamdown treats new array references as changes requiring full re-parse.
@@ -76,12 +88,17 @@ const sanitizeSchema = {
   protocols: {
     ...defaultSchema.protocols,
     href: [...(defaultSchema.protocols?.href ?? []), INTERNAL_INLINE_SKILL_SANITIZE_PROTOCOL],
+    // SECURITY AUDIT: data: must survive sanitize for rehype-harden's allowDataImages to take
+    // effect (it only ever keeps data:image/ URLs on images). Without this, every data image
+    // was stripped here first, which also broke relative images in Markdown artifacts, which
+    // are inlined as data: URLs.
+    src: [...(defaultSchema.protocols?.src ?? []), "data"],
   },
   attributes: {
     ...defaultSchema.attributes,
     // SECURITY AUDIT: Raw CSS can conceal copied text. Only semantic Markdown classes are allowed.
     // KaTeX adds its trusted classes and styles after sanitization.
-    code: [["className", /^language-./, "math-inline", "math-display"]],
+    code: [["className", /^language-./, ...MATH_CLASS_NAMES]],
   },
 };
 
@@ -157,6 +174,50 @@ const rehypePreserveUnknownRawHtml: Plugin<[], Root> = () => {
   };
 };
 
+// User bubbles show what the user typed: every raw HTML node becomes text (#5698). Its newlines
+// become <br>, as remarkBreaks does for the markdown text around it (user bubbles always
+// preserve line breaks), so a multiline block keeps its lines. A block of raw HTML sits directly
+// under the root; it gets its own paragraph so it keeps the gap of the blank line around it.
+function rawHtmlAsTextNodes(raw: RawHtmlNode): ElementContent[] {
+  const nodes: ElementContent[] = [];
+  raw.value.split("\n").forEach((line, index) => {
+    if (index > 0) {
+      nodes.push({ type: "element", tagName: "br", properties: {}, children: [] });
+      nodes.push({ type: "text", value: "\n" });
+    }
+    if (line.length > 0) nodes.push({ type: "text", value: line });
+  });
+  return nodes;
+}
+
+function rawHtmlChildrenAsText(parent: MutableHastParent, isRoot: boolean): void {
+  const children = parent.children as MutableHastNode[];
+  parent.children = children.flatMap((child): MutableHastNode[] => {
+    if (isRawHtmlNode(child)) {
+      const nodes = rawHtmlAsTextNodes(child);
+      return isRoot
+        ? [
+            {
+              type: "element",
+              tagName: "p",
+              properties: {},
+              children: nodes,
+              position: child.position,
+            },
+          ]
+        : nodes;
+    }
+    if (isMutableHastParent(child)) rawHtmlChildrenAsText(child, false);
+    return [child];
+  }) as typeof parent.children;
+}
+
+const rehypeRawHtmlAsText: Plugin<[], Root> = () => {
+  return (tree) => {
+    rawHtmlChildrenAsText(tree, true);
+  };
+};
+
 // Sanitization prefixes IDs. Keep generated footnote links paired with those safe IDs.
 const rehypeFootnoteLinks: Plugin<[], Root> = () => (tree) => {
   const visit = (node: Root | RootContent) => {
@@ -174,28 +235,95 @@ const rehypeFootnoteLinks: Plugin<[], Root> = () => (tree) => {
   visit(tree);
 };
 
+const HARDEN_OPTIONS: HardenOptions = {
+  // SECURITY: Treat markdown content as untrusted. We rely on rehype-harden to
+  // block dangerous URL schemes (e.g. javascript:, file:, vbscript:, data: in
+  // links). Data images are allowed explicitly below.
+  allowedImagePrefixes: ["*", "/"],
+  allowedLinkPrefixes: ["*"],
+  allowedProtocols: [INTERNAL_INLINE_SKILL_HREF_PREFIX],
+  // rehype-harden requires a defaultOrigin when any allowlist is provided.
+  // We use a stable placeholder origin so relative URLs can be resolved.
+  defaultOrigin: "https://xum.invalid",
+  allowDataImages: true,
+};
+
+// SECURITY: opening a file preview must not contact any host, so no image URL is allowed (data:
+// images still render). With no defaultOrigin, relative links fail to parse and are blocked
+// instead of resolving against the placeholder origin.
+const FILE_PREVIEW_HARDEN_OPTIONS: HardenOptions = {
+  allowedImagePrefixes: [],
+  allowedLinkPrefixes: ["*"],
+  allowedProtocols: [INTERNAL_INLINE_SKILL_HREF_PREFIX],
+  allowDataImages: true,
+};
+
+// Everything after raw HTML parsing, shared by the lists below. withKatex appends KaTeX.
+function rehypePluginsAfterRawHtml(hardenOptions: HardenOptions): Pluggable[] {
+  return [
+    [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
+    rehypeFootnoteLinks,
+    [harden, hardenOptions], // Additional URL filtering for links and images
+  ];
+}
+
 const REHYPE_PLUGINS: Pluggable[] = [
   rehypePreserveUnknownRawHtml,
   rehypeRaw, // Parse HTML elements first
-  [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
-  rehypeFootnoteLinks,
-  [
-    harden, // Additional URL filtering for links and images
-    {
-      // SECURITY: Treat markdown content as untrusted. We rely on rehype-harden to
-      // block dangerous URL schemes (e.g. javascript:, file:, vbscript:, data: in
-      // links). Data images are allowed explicitly below.
-      allowedImagePrefixes: ["*", "/"],
-      allowedLinkPrefixes: ["*"],
-      allowedProtocols: [INTERNAL_INLINE_SKILL_HREF_PREFIX],
-      // rehype-harden requires a defaultOrigin when any allowlist is provided.
-      // We use a stable placeholder origin so relative URLs can be resolved.
-      defaultOrigin: "https://xum.invalid",
-      allowDataImages: true,
-    },
-  ],
-  [rehypeKatex, { errorColor: "var(--color-muted-foreground)" }], // Render math
+  ...rehypePluginsAfterRawHtml(HARDEN_OPTIONS),
 ];
+
+// No rehypeRaw: no raw node is left to parse. Sanitize and harden still run.
+const REHYPE_PLUGINS_RAW_HTML_AS_TEXT: Pluggable[] = [
+  rehypeRawHtmlAsText,
+  ...rehypePluginsAfterRawHtml(HARDEN_OPTIONS),
+];
+
+// SECURITY: a rendered Mermaid diagram is an SVG that can load images and styles from any URL,
+// past the URL rules above, so a file preview shows a mermaid fence as plain code instead.
+const rehypeMermaidAsCode: Plugin<[], Root> = () => (tree) => {
+  const visit = (node: Root | RootContent) => {
+    if (
+      node.type === "element" &&
+      node.tagName === "code" &&
+      Array.isArray(node.properties.className)
+    ) {
+      node.properties.className = node.properties.className.filter(
+        (name) => name !== "language-mermaid"
+      );
+    }
+    if ("children" in node) node.children.forEach(visit);
+  };
+  visit(tree);
+};
+
+const REHYPE_PLUGINS_FILE_PREVIEW: Pluggable[] = [
+  rehypeRawHtmlAsText,
+  rehypeMermaidAsCode,
+  ...rehypePluginsAfterRawHtml(FILE_PREVIEW_HARDEN_OPTIONS),
+];
+
+function selectRehypePlugins(renderRawHtml: boolean, filePreview: boolean): Pluggable[] {
+  if (filePreview) return REHYPE_PLUGINS_FILE_PREVIEW;
+  return renderRawHtml ? REHYPE_PLUGINS : REHYPE_PLUGINS_RAW_HTML_AS_TEXT;
+}
+
+// Matches every input that renders as math: `$$` (remark-math, with single-dollar math off), a
+// fence with the info string `math` (rehype-katex renders language-math code), and raw HTML code
+// with a math class (sanitizeSchema allows these), including a class rehype-raw decodes from a
+// character reference. A false positive costs one chunk load; a false negative shows TeX source,
+// so the pattern errs wide. The bounded class scan keeps the test linear.
+const MATH_HINT = new RegExp(
+  String.raw`\$\$|[\`~]{3}[ \t]*math|class\s*=[^>&]{0,200}&|` + MATH_CLASS_NAMES.join("|"),
+  "i"
+);
+
+export function markdownMayContainMath(markdown: string): boolean {
+  return MATH_HINT.test(markdown);
+}
+
+// Evaluating this chunk publishes the KaTeX plugins (see mathRendering); it renders nothing.
+const KatexLoader = React.lazy(() => import("./katexRehypePlugin"));
 
 /**
  * Core markdown rendering component that handles all markdown processing.
@@ -210,23 +338,35 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
     parseIncompleteMarkdown = false,
     preserveLineBreaks = false,
     renderSynchronously = false,
+    renderRawHtml = true,
+    filePreview = false,
   }) => {
-    const repairInStaticMode = parseIncompleteMarkdown && renderSynchronously;
     // Memoize the normalized content to avoid recalculating on every render.
-    // Streaming mode runs remend on the children it receives; do the same after normalizing so a
-    // synchronous render looks identical to the streaming one it stands in for.
+    // Repair unclosed syntax here, in the last block only, for both modes: Streamdown's own repair
+    // runs remend on the whole text on every change, which stalled long live replies (#5655). The
+    // static and streaming renders get the same text, so switching between them never changes it.
     const normalizedContent = useMemo(() => {
       const normalized = normalizeMarkdown(content);
-      return repairInStaticMode ? remend(normalized) : normalized;
-    }, [content, repairInStaticMode]);
+      return parseIncompleteMarkdown ? repairIncompleteMarkdownTail(normalized) : normalized;
+    }, [content, parseIncompleteMarkdown]);
+
+    // Once a row has math it keeps the KaTeX plugin, so a streaming row never flips back to the
+    // plain render (and never scans again). Setting state during render is React's pattern here.
+    const [hasMath, setHasMath] = useState(false);
+    if (!hasMath && markdownMayContainMath(normalizedContent)) setHasMath(true);
+    const katex = useKatexPlugins(hasMath);
+    const rehypePlugins = selectRehypePlugins(renderRawHtml, filePreview);
 
     return (
       <>
         <Streamdown
           components={markdownComponents}
           remarkPlugins={preserveLineBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS}
-          rehypePlugins={REHYPE_PLUGINS}
-          parseIncompleteMarkdown={parseIncompleteMarkdown}
+          rehypePlugins={katex ? withKatex(rehypePlugins, katex.plugins) : rehypePlugins}
+          shikiTheme={katex?.shikiTheme ?? SHIKI_THEME}
+          // The text is already repaired above. In streamdown 2.0 this prop only gates its
+          // whole-text remend call (MarkdownCore.test.tsx fails if an upgrade changes that).
+          parseIncompleteMarkdown={false}
           // Use "static" mode for completed content to bypass useTransition() deferral.
           // After ORPC migration, async event boundaries let React deprioritize transitions indefinitely.
           mode={parseIncompleteMarkdown && !renderSynchronously ? "streaming" : "static"}
@@ -235,6 +375,12 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
         >
           {normalizedContent}
         </Streamdown>
+        {hasMath && (
+          // Until the chunk loads the row keeps its plain render. If it fails, Reload shows below.
+          <LazyFeature name="Math rendering">
+            <KatexLoader />
+          </LazyFeature>
+        )}
         {children}
       </>
     );

@@ -9,6 +9,24 @@ export const FNV_OFFSET_BASIS = 0x811c9dc5;
 const FNV_PRIME = 0x01000193;
 export const MISSING_TIMESTAMP = -1;
 
+/**
+ * Prior-row order of both fingerprint twins. It must be a total order: persisted metadata is not
+ * schema-checked, so a sequence can be NaN, Infinity or a string, and `NaN || tiebreak` made the
+ * old comparator inconsistent. Array.prototype.sort leaves the result of an inconsistent
+ * comparator to the engine, and on Bun 1.4.3 the same call site sorted such rows differently once
+ * the JIT optimized it. Non-finite sequences therefore sort after every finite one, then by id.
+ */
+export function comparePriorHistoryOrder(
+  leftSequence: number,
+  leftId: string,
+  rightSequence: number,
+  rightId: string
+): number {
+  const leftFinite = Number.isFinite(leftSequence);
+  if (leftFinite !== Number.isFinite(rightSequence)) return leftFinite ? -1 : 1;
+  return (leftFinite ? leftSequence - rightSequence : 0) || leftId.localeCompare(rightId);
+}
+
 export function updateFnv1a(hash: number, value: string): number {
   let next = hash >>> 0;
   for (let index = 0; index < value.length; index += 1) {
@@ -59,8 +77,8 @@ export function computePriorHistoryFingerprint(
     return undefined;
   }
 
-  priorEntries.sort(
-    (left, right) => left.historySequence - right.historySequence || left.id.localeCompare(right.id)
+  priorEntries.sort((left, right) =>
+    comparePriorHistoryOrder(left.historySequence, left.id, right.historySequence, right.id)
   );
 
   let hash = FNV_OFFSET_BASIS;

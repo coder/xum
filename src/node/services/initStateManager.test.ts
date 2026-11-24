@@ -9,6 +9,8 @@ import type { WorkspaceInitEvent } from "@/common/orpc/types";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { workspaceUseLeasesFor } from "./workspaceUseLeases";
+import { Err } from "@/common/types/result";
+import { SessionFileManager } from "@/node/utils/sessionFile";
 
 describe("InitStateManager", () => {
   let tempDir: string;
@@ -288,6 +290,49 @@ describe("InitStateManager", () => {
       expect(events.map((event) => event.type)).toEqual(["init-start", "init-output", "init-end"]);
     });
 
+    // #5391 item 3: a new startInit can begin while a replay judges a crashed run's record. The
+    // replay must not overwrite the new run's "running" record with its "error".
+    it("leaves a new init's record alone when it starts during the replay of a crashed run", async () => {
+      const workspaceId = "test-workspace";
+      manager.startInit(workspaceId, "/path/to/hook");
+      let crashed = await manager.readInitStatus(workspaceId);
+      for (let attempt = 0; crashed === null && attempt < 100; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        crashed = await manager.readInitStatus(workspaceId);
+      }
+      expect(crashed?.status).toBe("running");
+      manager.clearInMemoryState(workspaceId);
+
+      // The replay re-reads the record after its probes (the second read). Start the new init
+      // right before that read returns the crashed run's record, and let its write land first.
+      const store = (
+        manager as unknown as { store: { readPersisted: (id: string) => Promise<unknown> } }
+      ).store;
+      const readPersisted = store.readPersisted.bind(store);
+      let reads = 0;
+      const readSpy = spyOn(store, "readPersisted").mockImplementation(async (id: string) => {
+        reads++;
+        if (reads !== 2) return readPersisted(id);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        manager.startInit(workspaceId, "/path/to/new-hook");
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const current = (await readPersisted(id)) as { hookPath?: string } | null;
+          if (current?.hookPath === "/path/to/new-hook") break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        return crashed;
+      });
+      try {
+        await manager.replayInit(workspaceId);
+      } finally {
+        readSpy.mockRestore();
+      }
+
+      const persisted = await manager.readInitStatus(workspaceId);
+      expect(persisted?.status).toBe("running");
+      expect(persisted?.hookPath).toBe("/path/to/new-hook");
+    });
+
     // #4801, from the other backend's perspective: backend A (manager) runs the init; backend B
     // (its own Config and InitStateManager on the same root) opens the workspace meanwhile.
     describe("while another backend on the same root runs the init", () => {
@@ -337,6 +382,27 @@ describe("InitStateManager", () => {
 
         await managerB.replayInit(workspaceId);
         expect((await managerB.readInitStatus(workspaceId))?.status).toBe("success");
+      });
+
+      it("leaves it running when that backend's final status write failed", async () => {
+        spyOn(SessionFileManager.prototype, "write").mockResolvedValueOnce(Err("disk full"));
+        await manager.endInit(workspaceId, 0);
+        // A still reports success in memory; the record lock keeps B from replaying it as failed.
+        await managerB.replayInit(workspaceId);
+        expect((await managerB.readInitStatus(workspaceId))?.status).toBe("running");
+        manager.clearInMemoryState(workspaceId);
+      });
+
+      // #4918: A's init record lock outlives its init lease, but not its in-memory state.
+      it("finalizes it once that backend dropped the init without ending it", async () => {
+        manager.clearInMemoryState(workspaceId);
+        // clearInMemoryState does not await the lock's release.
+        for (let attempt = 0; attempt < 100; attempt++) {
+          await managerB.replayInit(workspaceId);
+          if ((await managerB.readInitStatus(workspaceId))?.status !== "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect((await managerB.readInitStatus(workspaceId))?.status).toBe("error");
       });
     });
 

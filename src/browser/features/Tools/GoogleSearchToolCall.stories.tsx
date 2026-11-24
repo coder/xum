@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { waitFor, within } from "@storybook/test";
+import { waitFor, within } from "storybook/test";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { GoogleSearchToolCall } from "@/browser/features/Tools/GoogleSearchToolCall";
 import { lightweightMeta } from "@/browser/stories/meta.js";

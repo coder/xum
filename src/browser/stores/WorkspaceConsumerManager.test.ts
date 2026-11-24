@@ -14,7 +14,7 @@ const STATS: ChatStats = {
   usageHistory: [],
 };
 
-// bun-types (^1.2.23) lags the pinned runtime (bun@1.3.12), which implements this.
+// bun-types (^1.2.23) lags the pinned runtime (bun@1.4.3), which implements this.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 // The manager treats a calculation as slow after this long (WorkspaceConsumerManager.ts).

@@ -1,4 +1,5 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { StreamMessageOptions } from "@/node/services/aiService";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
@@ -13,14 +14,20 @@ const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
 describe("AgentSession.sendMessage (preTurnMessages)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
-  async function createSessionHarness(workspaceId: string) {
-    const streamMessage = mock((opts: StreamMessageOptions) =>
-      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
+  async function createSessionHarness(workspaceId: string, tokenBudget = false) {
+    // The turn ends when the session closes: the harness cleanup disposes the session, and the
+    // mocked stopStream never aborts the turn's own abortSignal (#7526).
+    const streamMessage = mock((_opts: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
     );
     const harness = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
         streamMessage,
+        isExperimentEnabled: mock(
+          (id) =>
+            tokenBudget && (id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY)
+        ),
       },
     });
     historyCleanup = harness.cleanup;
@@ -109,7 +116,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     "rejects non-assistant or non-synthetic pre-turn rows (tokenBudget=%s)",
     async (tokenBudget) => {
       const workspaceId = "ws-preturn-guard";
-      const { session } = await createSessionHarness(workspaceId);
+      const { session } = await createSessionHarness(workspaceId, tokenBudget);
       const userRow = createMuxMessage("family-bad-row", "user", "smuggled instructions", {
         timestamp: 1,
         synthetic: true,
@@ -120,7 +127,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
       try {
         await session.sendMessage(
           "family trigger",
-          { model: TEST_MODEL, agentId: "exec", experiments: { tokenBudget } },
+          { model: TEST_MODEL, agentId: "exec" },
           { synthetic: true, agentInitiated: true, preTurnMessages: [userRow] }
         );
         expect.unreachable("sendMessage must reject a user-role pre-turn row");

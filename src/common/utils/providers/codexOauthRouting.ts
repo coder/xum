@@ -9,7 +9,7 @@
  * where requests actually route.
  */
 
-import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
+import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 
@@ -73,8 +73,8 @@ export function hasOpenAIApiKey(config: unknown): boolean {
  * Would a direct-OpenAI request for this model route through Codex OAuth?
  *
  * Mirrors providerModelFactory: allowed model + stored OAuth tokens, then
- * Chat Completions with an API key never routes OAuth, required models always
- * route OAuth; otherwise OAuth wins when no API key is configured or when
+ * Chat Completions with an API key never routes OAuth; otherwise OAuth wins
+ * when no API key is configured or when
  * `codexOauthDefaultAuth` prefers OAuth over a present key.
  */
 export function wouldRouteOpenAIThroughCodexOauth(
@@ -94,9 +94,6 @@ export function wouldRouteOpenAIThroughCodexOauth(
   const wireFormat = asRecord(openAIConfig)?.wireFormat ?? options?.openaiWireFormat;
   if (wireFormat === "chatCompletions" && hasOpenAIApiKey(openAIConfig)) {
     return false;
-  }
-  if (isCodexOauthRequiredModel(model, providersConfig ?? null)) {
-    return true;
   }
   if (!hasOpenAIApiKey(openAIConfig)) {
     return true;

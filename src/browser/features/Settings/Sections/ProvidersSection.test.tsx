@@ -4,25 +4,21 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
-import type { APIClient } from "@/browser/contexts/API";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as ActualModelPreferenceRepairModule from "@/browser/utils/modelPreferenceRepair";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
-import * as ActualPolicyContextModule from "@/browser/contexts/PolicyContext";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import type {
   AddCustomProviderInput,
   ProviderConfigInfo,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 
-let repairRemovedProviderMock = mock(
-  (_provider: string, _workspaceIds: Iterable<string>) => undefined
-);
+let repairRemovedProviderMock = mock((_provider: string) => undefined);
 
 // Snapshot the real exports before any mock below replaces them: the namespace import is a live
 // binding, so restoring from it would republish the mock into later test files.
@@ -40,10 +36,8 @@ void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
 );
 
 void mock.module("@/browser/utils/modelPreferenceRepair", () => ({
-  repairLocalModelPreferencesForRemovedProvider: (
-    provider: string,
-    workspaceIds: Iterable<string>
-  ) => repairRemovedProviderMock(provider, workspaceIds),
+  repairLocalModelPreferencesForRemovedProvider: (provider: string) =>
+    repairRemovedProviderMock(provider),
 }));
 
 let providersConfigMock: ProvidersConfigMap | null = null;
@@ -82,23 +76,16 @@ void mock.module("@/browser/hooks/useRouting", () => ({
   }),
 }));
 
-// Restore the real contexts after this suite; the stubs below would otherwise leak into later
-// suites that render the real PolicyProvider/WorkspaceProvider (PolicyContext/AgentContext tests).
+// Restore the real context after this suite; the stubs below would otherwise leak into later
+// suites that render the real WorkspaceProvider (AgentContext tests).
 restoreModulesAfterSuite([
-  ["@/browser/contexts/PolicyContext", { ...ActualPolicyContextModule }],
   ["@/browser/contexts/WorkspaceContext", { ...ActualWorkspaceContextModule }],
 ]);
-void mock.module("@/browser/contexts/PolicyContext", () => ({
-  usePolicy: () => ({
-    status: { state: "disabled" as const },
-    policy: null,
-  }),
-}));
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceContext =
-  require("@/browser/contexts/WorkspaceContext?real=1") as typeof WorkspaceContextModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Snapshot the real exports before the mock below. Do not load a second copy with
+// require("...?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so the copy would
+// replace WorkspaceContext.test.tsx's coverage of WorkspaceContext.tsx in the shard.
+const actualWorkspaceContext = { ...ActualWorkspaceContextModule };
 
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   ...actualWorkspaceContext,
@@ -202,8 +189,8 @@ function patchProviderMethods(client: APIClient, providersConfig: ProvidersConfi
   };
 }
 
-function renderProvidersSection() {
-  const providersConfig = createProvidersConfig();
+function renderProvidersSection(extraProviders: ProvidersConfigMap = {}) {
+  const providersConfig = { ...createProvidersConfig(), ...extraProviders };
   providersConfigMock = providersConfig;
   const client = setupSettingsStory({ providersConfig: {} });
   const providerMocks = patchProviderMethods(client, providersConfig);
@@ -214,6 +201,30 @@ function renderProvidersSection() {
   );
 
   return { ...view, ...providerMocks, providersConfig };
+}
+
+/** As renderProvidersSection, while Xum reconnects with the last client kept (after the switch). */
+function renderProvidersSectionOffline() {
+  const providersConfig = createProvidersConfig();
+  providersConfigMock = providersConfig;
+  const client = setupSettingsStory({ providersConfig: {} });
+  const providerMocks = patchProviderMethods(client, providersConfig);
+  const offline = {
+    status: "reconnecting" as const,
+    api: client,
+    error: null,
+    attempt: 1,
+    authenticate: () => undefined,
+    retry: () => undefined,
+  };
+  const view = render(
+    <SettingsSectionStory setup={() => client}>
+      <APIContext.Provider value={offline}>
+        <ProvidersSection />
+      </APIContext.Provider>
+    </SettingsSectionStory>
+  );
+  return { ...view, ...providerMocks };
 }
 
 function getProviderCard(button: HTMLElement): HTMLElement {
@@ -233,9 +244,7 @@ describe("ProvidersSection", () => {
     void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
       createSelectPrimitiveDouble()
     );
-    repairRemovedProviderMock = mock(
-      (_provider: string, _workspaceIds: Iterable<string>) => undefined
-    );
+    repairRemovedProviderMock = mock((_provider: string) => undefined);
     providersConfigMock = null;
     providersRefreshMock.mockClear();
     updateOptimisticallyMock.mockClear();
@@ -284,6 +293,75 @@ describe("ProvidersSection", () => {
     expect(within(customCard).getByText("Base URL")).toBeTruthy();
   });
 
+  test("refuses an invalid session header name and saves a valid one", async () => {
+    const view = renderProvidersSection();
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+
+    const field = within(getProviderCard(customButton)).getByText("Session header").parentElement;
+    if (!field) throw new Error("Session header field not found");
+    fireEvent.click(within(field).getByRole("button", { name: "Set" }));
+    const input = within(field).getByRole("textbox");
+
+    // Saving an auth header name would send the workspace id as credentials.
+    await userEvent.type(input, "Authorization{Enter}");
+    expect(within(field).getByText(/cannot be "Authorization"/)).toBeTruthy();
+    expect(view.setProviderConfig).not.toHaveBeenCalled();
+
+    await userEvent.type(input, "x-opencode-session{Enter}", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: "Authorization".length,
+    });
+    expect(view.setProviderConfig).toHaveBeenCalledWith({
+      provider: CUSTOM_PROVIDER_ID,
+      keyPath: ["sessionHeader"],
+      value: "x-opencode-session",
+    });
+  });
+
+  test("shows saved Google Vertex AI settings from the provider status", async () => {
+    const view = renderProvidersSection({
+      "google-vertex": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        googleVertex: { project: "my-gcp-project", location: "us-central1", keyFilenameSet: true },
+      },
+    });
+    const vertexButton = await view.findByRole("button", { name: /Google Vertex AI/ });
+
+    fireEvent.click(vertexButton);
+
+    const vertexCard = getProviderCard(vertexButton);
+    expect(within(vertexCard).getByText("my-gcp-project")).toBeTruthy();
+    expect(within(vertexCard).getByText("us-central1")).toBeTruthy();
+    // The key file is set (masked); the express mode API key is not.
+    expect(within(vertexCard).getAllByText("••••••••")).toHaveLength(1);
+    expect(within(vertexCard).getByText("Not set")).toBeTruthy();
+    // Nothing here comes from env vars, the key file included.
+    expect(within(vertexCard).queryByText("Set by env vars.")).toBeNull();
+  });
+
+  test("shows Google Vertex AI settings that come from env vars", async () => {
+    const view = renderProvidersSection({
+      "google-vertex": {
+        apiKeySet: false,
+        apiKeySource: "env",
+        isEnabled: true,
+        isConfigured: true,
+        googleVertex: { envProject: "env-project", keyFilenameSet: false, envKeyFilenameSet: true },
+      },
+    });
+    const vertexButton = await view.findByRole("button", { name: /Google Vertex AI/ });
+
+    fireEvent.click(vertexButton);
+
+    const vertexCard = getProviderCard(vertexButton);
+    expect(within(vertexCard).getByText("env-project")).toBeTruthy();
+    // One note each for the env project, the env key file and the env express mode API key.
+    expect(within(vertexCard).getAllByText("Set by env vars.")).toHaveLength(3);
+  });
+
   test("persists API format changes for an existing custom provider", async () => {
     const view = renderProvidersSection();
     const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
@@ -306,7 +384,7 @@ describe("ProvidersSection", () => {
   test("resyncs from the backend when API format persistence fails", async () => {
     const view = renderProvidersSection();
     view.setProviderConfig.mockImplementationOnce(() =>
-      Promise.resolve({ success: false as const, error: "policy denied" })
+      Promise.resolve({ success: false as const, error: "write failed" })
     );
 
     const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
@@ -410,7 +488,7 @@ describe("ProvidersSection", () => {
       });
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: "Add custom provider" })).toBeNull();
+      expect(view.queryByRole("button", { name: "Add custom provider" }) === null).toBe(true);
     });
     expect(view.getByRole("button", { name: "Add provider" })).toBeTruthy();
   });
@@ -433,7 +511,7 @@ describe("ProvidersSection", () => {
       expect(view.addCustomProvider).toHaveBeenCalled();
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: "Add custom provider" })).toBeNull();
+      expect(view.queryByRole("button", { name: "Add custom provider" }) === null).toBe(true);
     });
     expect(view.queryByText("Failed to add custom provider.")).toBeNull();
     expect(
@@ -441,6 +519,21 @@ describe("ProvidersSection", () => {
         "Provider added, but refreshing the provider list failed. It may appear after reopening settings."
       )
     ).toBeTruthy();
+  });
+
+  // Offline the kept client's write would fail, and the optimistic value would look saved: the
+  // provider toggle must be disabled and must not write.
+  test("disables the provider toggle and writes nothing while reconnecting", async () => {
+    const view = renderProvidersSectionOffline();
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+    fireEvent.click(openAiButton);
+
+    const toggle = within(getProviderCard(openAiButton)).getByRole("switch", {
+      name: "Toggle openai provider",
+    });
+    expect(toggle.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(toggle);
+    expect(view.setProviderConfig).not.toHaveBeenCalled();
   });
 
   test("shows and persists the OpenAI WebSocket transport toggle", async () => {
@@ -486,6 +579,53 @@ describe("ProvidersSection", () => {
         keyPath: ["webSocketTransportEnabled"],
         value: "",
       });
+    });
+  });
+
+  test.each([
+    { name: "on", initial: false, persisted: true },
+    { name: "off (removes the key)", initial: true, persisted: "" },
+  ])("persists the cyber model setting when toggled $name", async (testCase) => {
+    const view = renderProvidersSection();
+    if (testCase.initial) view.providersConfig.openai.cyberModelEnabled = true;
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+
+    fireEvent.click(openAiButton);
+
+    const cyberToggle = within(getProviderCard(openAiButton)).getByRole("switch", {
+      name: /Enable cyber model/i,
+    });
+    expect(cyberToggle.getAttribute("aria-checked")).toBe(String(testCase.initial));
+
+    fireEvent.click(cyberToggle);
+
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledWith({
+        provider: "openai",
+        keyPath: ["cyberModelEnabled"],
+        value: testCase.persisted,
+      });
+    });
+  });
+
+  test("keeps the cyber model setting on and resyncs when turning it off fails to persist", async () => {
+    const view = renderProvidersSection();
+    view.providersConfig.openai.cyberModelEnabled = true;
+    view.setProviderConfig.mockImplementationOnce(() =>
+      Promise.resolve({ success: false as const, error: "write failed" })
+    );
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+    fireEvent.click(openAiButton);
+
+    fireEvent.click(
+      within(getProviderCard(openAiButton)).getByRole("switch", { name: /Enable cyber model/i })
+    );
+
+    await waitFor(() => {
+      expect(providersRefreshMock).toHaveBeenCalled();
+    });
+    expect(updateOptimisticallyMock).not.toHaveBeenCalledWith("openai", {
+      cyberModelEnabled: undefined,
     });
   });
 
@@ -584,7 +724,7 @@ describe("ProvidersSection", () => {
       expect(view.removeCustomProvider).toHaveBeenCalledWith({ provider: CUSTOM_PROVIDER_ID });
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: /Acme OpenAI/ })).toBeNull();
+      expect(view.queryByRole("button", { name: /Acme OpenAI/ }) === null).toBe(true);
     });
     expect(
       await view.findByText(
@@ -606,7 +746,7 @@ describe("ProvidersSection", () => {
       expect(view.removeCustomProvider).toHaveBeenCalledWith({ provider: CUSTOM_PROVIDER_ID });
     });
     expect(confirmMock).toHaveBeenCalledTimes(1);
-    expect(repairRemovedProviderMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, expect.any(Set));
+    expect(repairRemovedProviderMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID);
   });
 
   test("invalidates queued format writes when the provider is removed", async () => {
@@ -719,6 +859,7 @@ describe("ProvidersSection", () => {
       setSecretsProjectPath: () => undefined,
       instructionsProjectPath: null,
       setInstructionsProjectPath: () => undefined,
+      openedWithoutSection: false,
     }));
 
     const view = render(
@@ -734,6 +875,60 @@ describe("ProvidersSection", () => {
       setProvidersStartCoderLogin,
     };
   }
+
+  test("Coder model routing offers same-type instances and persists the selection", async () => {
+    const providersConfig = createProvidersConfig();
+    providersConfig.coder = {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      deploymentUrl: "https://coder.example.com",
+      coderOauthSet: true,
+      discoveredProviders: [
+        { name: "anthropic-bedrock", type: "anthropic" },
+        { name: "openai-azure", type: "openai" },
+        { name: "agents-google", type: "google" },
+      ],
+      canonicalRoutes: { openai: "openai-removed", google: "agents-google" },
+    };
+    providersConfigMock = providersConfig;
+    const client = setupSettingsStory({ providersConfig: {} });
+    const { setProviderConfig } = patchProviderMethods(client, providersConfig);
+    const view = render(
+      <SettingsSectionStory setup={() => client}>
+        <ProvidersSection />
+      </SettingsSectionStory>
+    );
+
+    fireEvent.click(await view.findByRole("button", { name: /^Coder/ }));
+
+    // A mapping to an instance the deployment no longer lists stays visible as stale.
+    expect(await view.findByText(/openai-removed is not a known OpenAI provider/)).toBeTruthy();
+    // "Routes to" follows the mappings: Google is added, the stale OpenAI mapping drops OpenAI.
+    expect(view.getByText("Anthropic, Google")).toBeTruthy();
+
+    fireEvent.pointerDown(view.getByRole("combobox", { name: "Anthropic Coder provider" }));
+    expect(view.queryByRole("button", { name: "openai-azure" })).toBeNull();
+    fireEvent.click(await view.findByRole("button", { name: "anthropic-bedrock" }));
+
+    await waitFor(() => {
+      expect(setProviderConfig).toHaveBeenCalledWith({
+        provider: "coder",
+        keyPath: ["canonicalRoutes", "anthropic"],
+        value: "anthropic-bedrock",
+      });
+    });
+
+    // A rejected write must restore the persisted mappings over the optimistic one.
+    providersRefreshMock.mockClear();
+    setProviderConfig.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+    fireEvent.pointerDown(view.getByRole("combobox", { name: "Google Coder provider" }));
+    fireEvent.click(
+      await view.findByRole("button", { name: "Default (not routed through Coder)" })
+    );
+    expect(await view.findByText("Saving model routing failed: connection lost")).toBeTruthy();
+    expect(providersRefreshMock).toHaveBeenCalledTimes(1);
+  });
 
   test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
     // Regression: the "Settings: Login with Coder" palette command passes a

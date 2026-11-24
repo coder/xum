@@ -1,5 +1,15 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  spyOn,
+  setDefaultTimeout,
+  beforeEach,
+  afterEach,
+} from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fsPromises from "fs/promises";
 import {
   TASK_CREATE_WAIT_WARNING_MS,
@@ -12,6 +22,7 @@ import {
   type WorkspaceMetadataOptions,
 } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
+import type { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
   getSubagentReportArtifactPath,
@@ -20,6 +31,7 @@ import {
 } from "@/node/services/subagentReportArtifacts";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
+  TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
   taskRecoveryPromptDedupeKey,
   taskRecoveryPromptDedupePrefix,
 } from "@/constants/agentMessaging";
@@ -29,6 +41,7 @@ import { WorkflowRunner } from "@/node/services/workflows/WorkflowRunner";
 import { WorkflowTaskServiceAdapter } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { log } from "@/node/services/log";
+import * as tokenizerModule from "@/node/utils/main/tokenizer";
 import { Ok, Err, type Result } from "@/common/types/result";
 import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
@@ -54,10 +67,12 @@ import {
   findWorkspaceInConfig,
   projectWorkspace,
   saveWorkspaces,
+  startStopAwaitingRelease,
   streamAbort,
   streamEnd,
   stubStableIds,
   testTaskSettings,
+  workspaceTurnManagerFor,
 } from "@/node/services/taskService.testHarness";
 import {
   createTaskServiceHarness,
@@ -65,6 +80,20 @@ import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+
+// These tests drive real stores, file locks and AgentSessions, and the Stop test runs two real
+// WorkflowRunner passes. Each takes about a second or less on an idle machine, but their CPU time
+// stretches with CPU contention (a loaded CI runner or developer host), and Bun's 5 s default then
+// fails tests that are not broken. A timed-out test also keeps running after its teardown and
+// fails the next test, so one slow test can show up as several failures.
+setDefaultTimeout(30_000);
+
+// Deadline of the polling helpers (waitUntil, waitForOutcomeKind). They wait for work that real
+// stores, locks and config writes do, and CPU contention stretches that work, so a short fixed
+// deadline fails tests that are not broken. It stays below the file's test timeout, so a real hang
+// fails with the helper's label instead of as an unlabelled test timeout.
+const POLL_DEADLINE_MS = 20_000;
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -251,6 +280,64 @@ describe("TaskService", () => {
         expect(t.child()?.taskStatus).toBe("running");
       }
     );
+
+    test("an awaiting_report task whose cut successor is pending runs again and defers", async () => {
+      const t = await setupChildTask({ taskStatus: "awaiting_report" });
+      t.receiptFake.register("entry-1", "pending");
+
+      await streamEnd(
+        t.taskService,
+        cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+      );
+
+      // The pending continuation owns the turn: the task runs again and nothing is prompted.
+      expect(t.child()?.taskStatus).toBe("running");
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskRecoveryAttempts).toBeUndefined();
+      expect(t.receiptFake.receipts.get("entry-1")).toMatchObject({
+        sourceHandled: true,
+        disposed: false,
+      });
+    });
+
+    // A Stop or reactivation can land while the stream end awaits its reads: the second cut-source
+    // check, right before the continuation classification, discards the cut. The bump lands in
+    // the inactive-workflow-owner read, which a cut stream always awaits (the plan-like probe is
+    // skipped for a stream that has no final response or propose_plan result).
+    test("a stop epoch bump during the stream end's reads discards the cut instead of deferring it", async () => {
+      // awaiting_report: a deferral would also set the task running again.
+      const t = await setupChildTask({ taskStatus: "awaiting_report" });
+      t.receiptFake.register("entry-1", "pending");
+      const internal = t.taskService as unknown as {
+        interruptTaskRecoveryForInactiveWorkflowOwner: (...args: unknown[]) => Promise<boolean>;
+      };
+      const realRead = internal.interruptTaskRecoveryForInactiveWorkflowOwner.bind(t.taskService);
+      let bumps = 0;
+      const read = spyOn(
+        internal,
+        "interruptTaskRecoveryForInactiveWorkflowOwner"
+      ).mockImplementation(async (...args) => {
+        bumps++;
+        t.taskService.bumpWorkspaceStopEpoch(t.childId);
+        return await realRead(...args);
+      });
+
+      try {
+        await streamEnd(
+          t.taskService,
+          cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+        );
+      } finally {
+        read.mockRestore();
+      }
+
+      expect(bumps).toBe(1);
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskStatus).toBe("awaiting_report");
+      // Disposed and handled, so released; a deferral would have kept it undisposed.
+      expect(t.receiptFake.overrides.disposeQueueCut).toHaveBeenCalledTimes(1);
+      expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+    });
 
     test.each<QueueCutSuccessorState>([
       "pending",
@@ -644,6 +731,7 @@ describe("TaskService", () => {
       const t = await setupChildTask();
       t.receiptFake.register("late-source-entry", "prestream-failed");
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: t.parentId,
         workspaceSessionDir: path.join(t.config.sessionsDir, t.parentId),
         childTaskId: t.childId,
@@ -721,6 +809,8 @@ describe("TaskService", () => {
       expect(internal).toMatchObject({
         queueDedupeKey: taskRecoveryPromptDedupeKey(t.childId, "timeout-finalization"),
         removableQueueDedupeKey: true,
+        // An automatic report prompt: it cannot create or replace the child's goal.
+        taskTurnKind: "required_report",
       });
     });
 
@@ -851,6 +941,9 @@ describe("TaskService", () => {
             );
           }),
           buildMemorySessionContext: mock(() => Promise.resolve(null)),
+          isExperimentEnabled: mock(
+            (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+          ),
         },
       });
       const { session } = sessionHarness;
@@ -898,6 +991,15 @@ describe("TaskService", () => {
         (
           taskService as unknown as { workspaceEventLocks: MutexMap<string> }
         ).workspaceEventLocks.withLock(childId, () => Promise.resolve());
+      // This test checks how stream ends are classified, not token counts. The token budget
+      // requires a real encoding (contextBudgetCounting.ts), and loading it starts a worker thread
+      // that parses a large encoding table. That is the largest CPU cost in this test, and under
+      // heavy CPU contention it ran past even a 30 s timeout. A fake tokenizer keeps the budget
+      // path and skips the worker.
+      const tokenizerSpy = spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue({
+        encoding: "fake-4",
+        countTokens: (text: string) => Promise.resolve(Math.ceil(text.length / 4)),
+      });
 
       try {
         // Turn 1: the child works until the settled step crosses the budget warning.
@@ -906,18 +1008,17 @@ describe("TaskService", () => {
             await session.sendMessage("Research the topic and report.", {
               model: childModel,
               agentId: "exec",
-              experiments: { tokenBudget: true },
             })
           ).success
         ).toBe(true);
         await waitForRequest(1);
         const budgetStep: SettledStepBudget = {
           model: childModel,
-          usage: { inputTokens: 85_000, outputTokens: 10, totalTokens: 85_010 },
+          usage: { inputTokens: 90_000, outputTokens: 10, totalTokens: 90_010 },
           toolResultChars: 0,
           imageParts: 0,
           sessionHistoryAvailable: true,
-          memoryWritable: true,
+          newContextAvailable: true,
         };
         const budgetOutcome = await requests[0].onStepSettled?.(budgetStep);
         expect(budgetOutcome?.decision).toBe("warn");
@@ -1014,6 +1115,7 @@ describe("TaskService", () => {
         expect(session.getQueueCutReceipt(continuationEntryId!)).toBeUndefined();
         expect(session.getQueueCutReceipt(queuedInputCause!.entryId)).toBeUndefined();
       } finally {
+        tokenizerSpy.mockRestore();
         await session.dispose();
         await sessionHarness.cleanup();
       }
@@ -1085,7 +1187,7 @@ describe("TaskService", () => {
   }
 
   async function waitUntil(condition: () => boolean, label: string): Promise<void> {
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + POLL_DEADLINE_MS;
     while (!condition()) {
       if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -1098,7 +1200,7 @@ describe("TaskService", () => {
     taskId: string,
     kind: string
   ): Promise<void> {
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + POLL_DEADLINE_MS;
     for (;;) {
       const outcome = await taskService.readAttemptOutcome(taskId, {
         requestingWorkspaceId: rootId,
@@ -1315,13 +1417,13 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
       const restoreTimers = shortenTerminationTimers();
       try {
-        const stopping = taskService.stopDescendantAgentTask(rootId, childId);
+        const stopping = startStopAwaitingRelease(taskService, rootId, childId);
         await waitUntil(() => pending.has(grandchildId), "the hung grandchild stop to be issued");
         // Global mutex free while the grandchild's stop hangs.
         const lock = await taskService.acquireTaskCreationLock();
         await lock[Symbol.asyncDispose]();
-        const stopped = await stopping;
-        expect(stopped.success).toBe(true);
+        // The cleanup gave up on the hung stop; the Stop now waits for the latch (#6727).
+        const { stopped } = await stopping;
         expect(clearQueue.mock.calls.filter((call) => call[0] === grandchildId)).toHaveLength(1);
         expect(clearQueue.mock.calls.filter((call) => call[0] === childId)).toHaveLength(1);
         expect(stopStream.mock.calls.filter((call) => call[0] === grandchildId)).toHaveLength(1);
@@ -1330,7 +1432,60 @@ describe("TaskService", () => {
         pending.get(grandchildId)!.resolve(Ok(undefined));
         await new Promise((resolve) => setTimeout(resolve, 0));
         expect(taskService.isWorkspaceStopInProgress(grandchildId)).toBe(false);
+        expect((await stopped).success).toBe(true);
       } finally {
+        restoreTimers();
+      }
+    });
+
+    // #6727: the Stop waits for its latches, but never past its deadline (40 s from the Stop's
+    // start). A hung stop holds the latch. When the Stop enters its release wait, the clock moves
+    // to 5 ms before the deadline and then runs on in real time, so the wait arms a 5 ms timer,
+    // wakes at the deadline and returns (#6864: the order no longer rests on microtask timing).
+    test("a Stop whose latch never drops still resolves at its release deadline", async () => {
+      const childId = "task-release-deadline";
+      const { config } = await setupTree([childId]);
+      const { stopStream, pending } = controlledStopStream(new Set([childId]));
+      // The clock jumps 1 s when the Stop's cleanup reaches the hung stop, so a deadline taken at
+      // the release wait (not at the Stop's start) would show.
+      const realNow = Date.now.bind(Date);
+      let offsetMs = 0;
+      const jumpingStopStream = mock((...args: Parameters<typeof stopStream>) => {
+        if (args[0] === childId) offsetMs += 1_000;
+        return stopStream(...args);
+      });
+      const { aiService } = createAIServiceMocks(config, {
+        stopStream: jumpingStopStream,
+        isStreaming: mock(() => true),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      // Shortened: the hung stop's own cleanup bounds. The release wait's timer is the 5 ms below.
+      const restoreTimers = shortenTerminationTimers();
+      const clock = spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
+      try {
+        const before = Date.now();
+        let deadlineMs: number | undefined;
+        const { stopped } = await startStopAwaitingRelease(taskService, rootId, childId, {
+          onWait: (deadline) => {
+            deadlineMs = deadline;
+            offsetMs = deadline - 5 - realNow();
+          },
+        });
+        // The deadline is 40 s from the Stop's start: before the 1 s jump.
+        expect(deadlineMs).toBeGreaterThanOrEqual(
+          before + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS
+        );
+        expect(deadlineMs).toBeLessThan(
+          before + 1_000 + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS
+        );
+        expect((await stopped).success).toBe(true);
+        // Resolved at the deadline: the hung stop still holds the latch.
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
+        pending.get(childId)!.resolve(Ok(undefined));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
+      } finally {
+        clock.mockRestore();
         restoreTimers();
       }
     });
@@ -1453,17 +1608,12 @@ describe("TaskService", () => {
         const restoreEdit = removeEntryOnFirstConfigWrite(config, childId);
         const restoreTimers = shortenTerminationTimers();
         try {
-          if (cascade === "stop") {
-            const stopped = await taskService.stopDescendantAgentTask(rootId, childId);
-            expect(stopped).toEqual({ success: true, data: { stoppedTaskIds: [grandchildId] } });
-          } else {
-            // The hung child stop is reported as a timeout (its workspace is kept in place).
-            const terminated = await taskService.terminateDescendantAgentTask(rootId, childId);
-            expect(terminated.success).toBe(false);
-            if (!terminated.success) {
-              expect(terminated.error).toContain(`Timed out stopping task stream (${childId})`);
-            }
-          }
+          // The Stop waits for the latches below to drop (#6727), so its result is checked after
+          // them. The terminate returns first.
+          const result =
+            cascade === "stop"
+              ? (await startStopAwaitingRelease(taskService, rootId, childId)).stopped
+              : Promise.resolve(await taskService.terminateDescendantAgentTask(rootId, childId));
           restoreEdit();
           expect(findWorkspaceInConfig(config, childId)).toBeUndefined();
           // No status was left to persist for the vanished child, yet its captured owner is
@@ -1476,6 +1626,16 @@ describe("TaskService", () => {
           pending.get(childId)!.resolve(Ok(undefined));
           await new Promise((resolve) => setTimeout(resolve, 0));
           expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
+          const settled = await result;
+          const outcome = settled.success
+            ? { stopped: settled.data }
+            : { timedOut: settled.error.includes(`Timed out stopping task stream (${childId})`) };
+          expect(outcome).toEqual(
+            cascade === "stop"
+              ? { stopped: { stoppedTaskIds: [grandchildId] } }
+              : // The hung child stop is reported as a timeout (its workspace is kept in place).
+                { timedOut: true }
+          );
         } finally {
           restoreEdit();
           restoreTimers();
@@ -1630,6 +1790,7 @@ describe("TaskService", () => {
       markdown: string
     ) {
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: ownerId,
         workspaceSessionDir: path.join(config.sessionsDir, ownerId),
         childTaskId: taskId,
@@ -1693,6 +1854,68 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
         kind: "live",
         executionId: taskId,
+      });
+    });
+
+    test("a workspace that is not an agent task is indeterminate, even with a report in the requester's session dir", async () => {
+      const { config } = await setupTree([]);
+      // A report keyed by the root's id: the agent-task check must decide before any artifact read.
+      await persistReport(config, unrelatedParentId, rootId, "not a task report");
+      const { taskService } = createTaskServiceHarness(config);
+      expect(
+        await taskService.readAttemptOutcome(rootId, { requestingWorkspaceId: unrelatedParentId })
+      ).toEqual({ kind: "indeterminate", reason: "workspace is not an agent task" });
+    });
+
+    test("a live workspace turn registration is live under its handle, ahead of interrupted config", async () => {
+      const taskId = "task-outcome-live-registration";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      const registration = spyOn(
+        workspaceTurnManagerFor(taskService),
+        "getLiveWorkspaceTurnRegistration"
+      ).mockImplementation((workspaceId) =>
+        workspaceId === taskId
+          ? { handleId: "wst_live_turn", ownerWorkspaceId: rootId, accepted: true }
+          : undefined
+      );
+      try {
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "live",
+          executionId: "wst_live_turn",
+        });
+      } finally {
+        registration.mockRestore();
+      }
+    });
+
+    test("paired: an owned settled attempt whose row is gone proves no report only through a session dir", async () => {
+      const taskId = "task-outcome-owned-rowless";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      await waitForOutcomeKind(taskService, taskId, "terminal-no-report");
+      // The row disappears outside this process (no TaskService path drops its ownership).
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          project.workspaces = project.workspaces.filter((entry) => entry.id !== taskId);
+        }
+        return cfg;
+      });
+      // No requester and no row: nothing names where a report would be, so nothing is proven.
+      expect(await taskService.readAttemptOutcome(taskId)).toEqual({
+        kind: "indeterminate",
+        reason: "attempt settled but no session directory names where its report would be",
+      });
+      // The requester's session dir positively holds no report: the owned settlement decides.
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+        code: "no-record",
       });
     });
 
@@ -1912,9 +2135,11 @@ describe("TaskService", () => {
         });
         const owned = (
           taskService as unknown as {
-            ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
+            attemptLedger: {
+              ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
+            };
           }
-        ).ownedAttemptByTaskId.get(taskId);
+        ).attemptLedger.ownedAttemptByTaskId.get(taskId);
         expect(owned?.attemptId).toBe(entry?.taskAttemptId);
         expect(owned?.receiptEligible).toBe(false);
       } finally {
@@ -1922,7 +2147,7 @@ describe("TaskService", () => {
       }
     });
 
-    test("failed reactivation leaves a concurrently reawakened attempt owned", async () => {
+    test("a resume racing a reactivation loses; one after the failed reactivation stays owned", async () => {
       const taskId = "task-outcome-reactivation-superseded";
       const { config } = await setupTree([
         {
@@ -1938,12 +2163,12 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
-      let reawaken: Promise<boolean> | undefined;
+      let racing: ReturnType<TaskService["reawakenInterruptedTask"]> | undefined;
       const metadata = spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(() => {
-        // Direct input can reawaken while the rejected task send is awaiting metadata. Its
-        // identity CAS serializes on the task-creation lock createWorkspaceTurn holds here, so
-        // it completes right after the rejected send releases it.
-        reawaken = taskService.markInterruptedTaskRunning(taskId);
+        // Direct input arrives while the reactivation's send is awaiting metadata: its attempt
+        // is published but not yet handed to a send, so the resume must not rotate it (it
+        // cannot know the launch will fail).
+        racing = taskService.reawakenInterruptedTask(taskId);
         return Promise.resolve(Err("owner metadata unavailable"));
       });
       try {
@@ -1955,7 +2180,12 @@ describe("TaskService", () => {
             "tool-end"
           )
         ).toMatchObject({ success: false, error: { code: "send_failed" } });
-        expect(await reawaken).toBe(true);
+        expect(await racing).toEqual({
+          kind: "refused",
+          message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
+        });
+        // The failed reactivation leaves nothing live: the user's retry reawakens and owns.
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
           kind: "live",
           executionId: taskId,
@@ -2044,7 +2274,7 @@ describe("TaskService", () => {
       const internals = taskService as unknown as {
         inspectAttemptOutcome: (taskId: string, options: unknown) => Promise<unknown>;
         workspaceEventLocks: { withLock: <T>(key: string, op: () => Promise<T>) => Promise<T> };
-        attemptSettlementListenersByTaskId: Map<string, Set<unknown>>;
+        attemptLedger: { attemptSettlementListenersByTaskId: Map<string, Set<unknown>> };
       };
       const inspect = spyOn(internals, "inspectAttemptOutcome");
       const gate = Promise.withResolvers<void>();
@@ -2076,7 +2306,9 @@ describe("TaskService", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       // Late acquisitions are no-ops: no read, no leaked subscription.
       expect(inspect).not.toHaveBeenCalled();
-      expect(internals.attemptSettlementListenersByTaskId.get(taskId)?.size ?? 0).toBe(0);
+      expect(
+        internals.attemptLedger.attemptSettlementListenersByTaskId.get(taskId)?.size ?? 0
+      ).toBe(0);
       // The lock is usable again and a normal read works.
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
     });
@@ -2094,7 +2326,7 @@ describe("TaskService", () => {
       const restoreTimers = shortenTerminationTimers();
       try {
         expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-        await taskService.stopDescendantAgentTask(rootId, taskId);
+        const { stopped } = await startStopAwaitingRelease(taskService, rootId, taskId);
         expect(pending.has(taskId)).toBe(true);
         expect(
           await taskService.waitForAttemptSettlement(taskId, { timeoutMs: 20, ...requesting })
@@ -2130,12 +2362,13 @@ describe("TaskService", () => {
         });
         pending.get(taskId)!.resolve(Ok(undefined));
         expect(await waiting).toMatchObject({ kind: "terminal-no-report" });
+        expect((await stopped).success).toBe(true);
         // Subscriptions do not leak past the wait.
         const listeners = (
           taskService as unknown as {
-            attemptSettlementListenersByTaskId: Map<string, Set<unknown>>;
+            attemptLedger: { attemptSettlementListenersByTaskId: Map<string, Set<unknown>> };
           }
-        ).attemptSettlementListenersByTaskId;
+        ).attemptLedger.attemptSettlementListenersByTaskId;
         expect(listeners.get(taskId)?.size ?? 0).toBe(0);
         expect(listeners.get(legacyId)?.size ?? 0).toBe(0);
       } finally {
@@ -2144,9 +2377,11 @@ describe("TaskService", () => {
     });
 
     interface AttemptLedgerInternals {
-      ownedAttemptByTaskId: Map<string, { generation: number }>;
-      attemptSettlementByTaskId: Map<string, { attempt: { generation: number } }>;
-      completedReportsByTaskId: Map<string, unknown>;
+      attemptLedger: {
+        ownedAttemptByTaskId: Map<string, { generation: number }>;
+        attemptSettlementByTaskId: Map<string, { attempt: { generation: number } }>;
+      };
+      waiters: { completedReportsByTaskId: Map<string, unknown> };
       shouldAllowLegacyInvalidWorkflowOutputSchema: (...args: unknown[]) => Promise<boolean>;
     }
     const ledgerInternals = (taskService: TaskService) =>
@@ -2182,13 +2417,15 @@ describe("TaskService", () => {
         const { taskService } = createTaskServiceHarness(config);
         const internals = ledgerInternals(taskService);
         expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-        const attempt = internals.ownedAttemptByTaskId.get(taskId);
+        const attempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
         expect(attempt).toBeDefined();
         if (statusAtStreamEnd === "interrupted") {
           // Stopped before its stream ended: the no-report receipt is retained until the report
           // that follows makes it redundant.
           await taskService.terminateAllDescendantAgentTasks(rootId);
-          expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
+          expect(internals.attemptLedger.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(
+            attempt
+          );
           expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
             kind: "terminal-no-report",
           });
@@ -2197,12 +2434,12 @@ describe("TaskService", () => {
         await streamEnd(taskService, reportStreamEnd(taskId, "final answer"));
 
         expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
-        expect(internals.ownedAttemptByTaskId.has(taskId)).toBe(false);
-        expect(internals.attemptSettlementByTaskId.has(taskId)).toBe(false);
+        expect(internals.attemptLedger.ownedAttemptByTaskId.has(taskId)).toBe(false);
+        expect(internals.attemptLedger.attemptSettlementByTaskId.has(taskId)).toBe(false);
         const reported = { kind: "reported", report: { reportMarkdown: "final answer" } };
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
         // Not just the in-memory cache: the persisted artifact answers, here and in a fresh process.
-        internals.completedReportsByTaskId.clear();
+        internals.waiters.completedReportsByTaskId.clear();
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
         const { taskService: freshService } = createTaskServiceHarness(config);
         expect(await freshService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
@@ -2224,7 +2461,7 @@ describe("TaskService", () => {
         const internals = ledgerInternals(taskService);
         expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
         await taskService.terminateAllDescendantAgentTasks(rootId);
-        const firstAttempt = internals.ownedAttemptByTaskId.get(taskId);
+        const firstAttempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
         expect(firstAttempt).toBeDefined();
 
         const blocked = Promise.withResolvers<void>();
@@ -2277,7 +2514,7 @@ describe("TaskService", () => {
           }
           // The user resumes the (still interrupted) task while the older report is in flight.
           expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-          const secondAttempt = internals.ownedAttemptByTaskId.get(taskId);
+          const secondAttempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
           const secondAttemptId = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
           expect(secondAttempt).toBeDefined();
           expect(secondAttempt).not.toBe(firstAttempt);
@@ -2304,7 +2541,7 @@ describe("TaskService", () => {
             taskAttemptId: secondAttemptId,
           });
           expect(waiterOutcome).toBeUndefined();
-          expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(secondAttempt);
+          expect(internals.attemptLedger.ownedAttemptByTaskId.get(taskId)).toBe(secondAttempt);
           expect(
             await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), taskId)
           ).toBeNull();
@@ -2328,13 +2565,13 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config);
       const internals = ledgerInternals(taskService);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-      const attempt = internals.ownedAttemptByTaskId.get(taskId);
+      const attempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
       expect(attempt).toBeDefined();
 
       await streamEnd(taskService, reportStreamEnd(taskId, "lost report"));
 
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
-      expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
+      expect(internals.attemptLedger.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
       // A fresh process has no durable report to classify from.
       const { taskService: freshService } = createTaskServiceHarness(config);
       expect((await freshService.readAttemptOutcome(taskId, requesting)).kind).toBe(
@@ -2351,7 +2588,7 @@ describe("TaskService", () => {
       const internals = ledgerInternals(taskService);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      const attempt = internals.ownedAttemptByTaskId.get(taskId);
+      const attempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
       expect(attempt).toBeDefined();
 
       // Cut short by the stop: no explicit `stop` finish, so nothing is promoted to a report.
@@ -2364,8 +2601,8 @@ describe("TaskService", () => {
       });
 
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
-      expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
-      expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
+      expect(internals.attemptLedger.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
+      expect(internals.attemptLedger.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
@@ -2454,14 +2691,33 @@ describe("TaskService", () => {
         }
         return originalSetTimeout(handler, timeout);
       }) as typeof setTimeout);
-      const mutexQueue = (taskService as unknown as { mutex: { queue: unknown[] } }).mutex.queue;
+      const mutex = (taskService as unknown as { mutex: AsyncMutex }).mutex;
       const held = await taskService.acquireTaskCreationLock();
+      // Signal when the reservation queues behind the held lock, instead of polling for it under a
+      // fixed deadline: its read-only preparation runs first, and under CPU contention that can
+      // outlast any fixed deadline. acquire() pushes its waiter before it returns its promise.
+      const blocked = Promise.withResolvers<void>();
+      const acquire = mutex.acquire.bind(mutex);
+      const acquireSpy = spyOn(mutex, "acquire").mockImplementation(() => {
+        const pending = acquire();
+        blocked.resolve();
+        return pending;
+      });
       try {
         const controller = new AbortController();
         const creating = taskService.createMany([spawnArgs(rootId)], {
           abortSignal: controller.signal,
         });
-        await waitUntil(() => mutexQueue.length > 0, "the reservation to block on the mutex");
+        // A createMany that returns before it reaches the mutex would leave `blocked` pending until
+        // the file's test timeout, and a timed-out test skips this finally, so the spies below
+        // would stay installed for the rest of the file. Fail at once, with a label, instead.
+        const reached = await Promise.race([
+          blocked.promise.then(() => "blocked" as const),
+          creating.then(() => "returned" as const),
+        ]);
+        if (reached !== "blocked") {
+          throw new Error("createMany returned before it blocked on the mutex");
+        }
         warningHandler?.();
         expect(
           warned.some(
@@ -2480,6 +2736,7 @@ describe("TaskService", () => {
         }
       } finally {
         await held[Symbol.asyncDispose]();
+        acquireSpy.mockRestore();
         timerSpy.mockRestore();
         warnSpy.mockRestore();
       }
@@ -2869,9 +3126,9 @@ describe("TaskService", () => {
         expect(await taskService.markInterruptedTaskRunning(spawnedId)).toBe(true);
         const owned = (
           taskService as unknown as {
-            ownedAttemptByTaskId: Map<string, { abortSignal?: AbortSignal }>;
+            attemptLedger: { ownedAttemptByTaskId: Map<string, { abortSignal?: AbortSignal }> };
           }
-        ).ownedAttemptByTaskId.get(spawnedId);
+        ).attemptLedger.ownedAttemptByTaskId.get(spawnedId);
         expect(owned?.abortSignal).toBeUndefined();
       }
     );

@@ -4,7 +4,6 @@ import {
 } from "@/node/services/agentPlugins/registry";
 import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
 import { ClaudeDesignService } from "@/node/services/claudeDesignService";
-import * as os from "os";
 import * as path from "path";
 import { Context, Effect, Layer } from "effect";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -22,16 +21,22 @@ import {
 import { AIService } from "@/node/services/aiService";
 import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
+import { localBgRecordsRoot } from "@/node/services/backgroundProcessExecutor";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive, EffectRunnerTag } from "@/node/services/di/effectRunner";
+import { HostClockLive, HostClockTag } from "@/node/services/di/hostClockLive";
 import {
   AI,
   AutoModelRouterTag,
   BackgroundProcessManagerTag,
   ConfigTag,
   ContextManagement,
+  DesktopNotificationsTag,
+  RuntimeFactoryTag,
+  HostFilesTag,
+  HostPathsTag,
   Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
@@ -46,7 +51,9 @@ import {
   Provider,
   ProvidersConfigStoreTag,
   SecretsStoreTag,
+  SessionFilesTag,
   SessionLocatorTag,
+  SessionLocksTag,
   SessionUsage,
   StreamManagerTag,
   Task,
@@ -54,9 +61,14 @@ import {
   TerminalAttentionStoreTag,
   TurnRequestBuilderBindingsTag,
   Workspace,
+  WorkspaceExternalEditorsTag,
   WorkspaceGoal,
+  WorkspaceLifecycleGatesTag,
   WorkspaceMcpOverrides,
+  WorkspaceNamingTag,
   WorkspaceTurnManagerTag,
+  WorkspaceWorkflowRunsTag,
+  WorkspaceOperationAdmissionTag,
   type CoreRootTags,
   type CoreTags,
   type StoreTags,
@@ -69,18 +81,27 @@ import { InitStateManager } from "@/node/services/initStateManager";
 import { log } from "@/node/services/log";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
+import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
-import { MemoryService, type MemoryChangeEvent } from "@/node/services/memoryService";
+import { MemoryService } from "@/node/services/memoryService";
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
+import { McpAppResultStore } from "@/node/services/mcpAppResultStore";
 import { StreamManager } from "@/node/services/streamManager";
 import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
+import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
+import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { secretsForWorkspace } from "@/node/utils/projectTrust";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -129,6 +150,7 @@ export type CoreInputTags =
   | StoreTags
   | CoreOptionsTag
   | EffectRunnerTag
+  | HostClockTag
   | AppFiberScopeTag
   | MemoryMeta
   | WorkspaceMcpOverrides;
@@ -169,7 +191,13 @@ export const WorkspaceMcpOverridesDefaultLive: Layer.Layer<
 
 export const HistoryLive = Layer.effect(
   History,
-  Effect.map(SessionLocatorTag, (sessionLocator) => new HistoryService(sessionLocator))
+  Effect.gen(function* () {
+    return new HistoryService(
+      yield* SessionLocatorTag,
+      yield* SessionFilesTag,
+      yield* SessionLocksTag
+    );
+  })
 );
 
 export const InitStateManagerLive = Layer.effect(
@@ -180,32 +208,31 @@ export const InitStateManagerLive = Layer.effect(
 export const ProviderLive = Layer.effect(
   Provider,
   Effect.gen(function* () {
-    const opts = yield* CoreOptionsTag;
     return new ProviderService(
       yield* ConfigTag,
-      opts.policyService,
       yield* ProvidersConfigStoreTag,
       yield* FileLeaseManagerTag
     );
   })
 );
 
-// Auto model routing (auto-model-routing experiment): prompts are third-party egress,
-// so the evaluation model is gated by the same provider policy as chat models.
+// Auto model routing (auto-model-routing experiment).
 export const AutoModelRouterLive = Layer.effect(
   AutoModelRouterTag,
   Effect.gen(function* () {
-    const opts = yield* CoreOptionsTag;
     return new AutoModelRouter({
       providersConfigStore: yield* ProvidersConfigStoreTag,
-      policyService: opts.policyService,
     });
   })
 );
 
-export const BackgroundProcessManagerLive = Layer.sync(
+export const BackgroundProcessManagerLive = Layer.effect(
   BackgroundProcessManagerTag,
-  () => new BackgroundProcessManager(path.join(os.tmpdir(), "mux-bashes"))
+  Effect.gen(function* () {
+    // Same root as local spawns, their name lock, and every gate (localBgRecordsRoot), not
+    // os.tmpdir(): on macOS that is /var/folders/..., where other backends never looked.
+    return new BackgroundProcessManager(localBgRecordsRoot(), yield* HostClockTag);
+  })
 );
 
 // Headless evaluation (workflow `evaluate()`): no dependencies — the caller
@@ -243,6 +270,46 @@ export const TerminalAttentionStoreLive = Layer.effect(
 // also exposed so ServiceContainer can share it with HeartbeatService. Its
 // consumer is registered by `CoreWiringLive` once Task/Workspace exist.
 export const IdleDispatcherLive = Layer.sync(IdleDispatcherTag, () => new IdleDispatcher());
+
+/** One shared instance per graph: WorkspaceService and the services split out of it read it. */
+export const WorkspaceLifecycleGatesLive = Layer.sync(
+  WorkspaceLifecycleGatesTag,
+  () => new WorkspaceLifecycleGates()
+);
+
+/** Built on the shared lifecycle gates, so an open sees WorkspaceService's archive state. */
+export const WorkspaceExternalEditorsLive = Layer.effect(
+  WorkspaceExternalEditorsTag,
+  Effect.gen(function* () {
+    const config = yield* ConfigTag;
+    return new WorkspaceExternalEditors({
+      config,
+      files: yield* HostFilesTag,
+      leases: workspaceUseLeasesFor(config),
+      gates: yield* WorkspaceLifecycleGatesTag,
+    });
+  })
+);
+
+/** WorkspaceService's naming claims; no dependencies, one instance per graph. */
+export const WorkspaceNamingLive = Layer.sync(WorkspaceNamingTag, () => new WorkspaceNaming());
+
+/** WorkspaceService's workflow-run activity cache; reads only the config. */
+export const WorkspaceWorkflowRunsLive = Layer.effect(
+  WorkspaceWorkflowRunsTag,
+  Effect.map(ConfigTag, (config) => new WorkspaceWorkflowRuns({ config }))
+);
+
+/** Archive admission of non-send operations; built on the shared lifecycle gates. */
+export const WorkspaceOperationAdmissionLive = Layer.effect(
+  WorkspaceOperationAdmissionTag,
+  Effect.gen(function* () {
+    return new WorkspaceOperationAdmission({
+      config: yield* ConfigTag,
+      gates: yield* WorkspaceLifecycleGatesTag,
+    });
+  })
+);
 
 /** One mutable record per graph build (`sync`, not `succeed`); filled by `CoreWiringLive`. */
 export const TurnRequestBuilderBindingsLive = Layer.sync(
@@ -298,9 +365,10 @@ export const StreamManagerLive = Layer.effect(
       yield* EffectRunnerTag,
       // The stream engine is the AppFiberScope's occupant: dispose() closes the
       // scope before the explicit teardown steps, which aborts and awaits every
-      // in-flight stream (StreamManager.superviseEngine).
+      // in-flight stream (TurnRegistry.superviseEngine).
       yield* AppFiberScopeTag,
-      yield* ToolCallDisplayRegistryTag
+      yield* ToolCallDisplayRegistryTag,
+      { hostClock: yield* HostClockTag }
     );
   })
 );
@@ -323,14 +391,19 @@ export const AILive = Layer.effect(
       yield* BackgroundProcessManagerTag,
       yield* SessionUsage,
       yield* WorkspaceMcpOverrides,
-      opts.policyService,
       opts.telemetryService,
       opts.devToolsService,
       opts.experimentsService,
       yield* StreamManagerTag,
       yield* TurnRequestBuilderBindingsTag,
       yield* ProvidersConfigStoreTag,
-      yield* SecretsStoreTag
+      yield* SecretsStoreTag,
+      {
+        desktopNotifications: yield* DesktopNotificationsTag,
+        runtimeFactory: yield* RuntimeFactoryTag,
+        hostFiles: yield* HostFilesTag,
+        hostPaths: yield* HostPathsTag,
+      }
     );
   })
 );
@@ -364,8 +437,7 @@ export const MCPConfigLive = Layer.effect(
     const config = yield* ConfigTag;
     // MCP: allow callers to override which Config provides server definitions
     const mcpConfig = opts.mcpConfig ?? config;
-    // Agent Plugins (agent-plugins experiment): read-only plugin MCP servers are
-    // merged into listings; without an ExperimentsService the provider is inert.
+    // Agent Plugins: read-only plugin MCP servers are merged into listings.
     return new MCPConfigService(mcpConfig, {
       claudeDesign: new ClaudeDesignService({
         rootDir: mcpConfig.rootDir,
@@ -376,12 +448,7 @@ export const MCPConfigLive = Layer.effect(
         isEnabled: () =>
           opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) === true,
       }),
-      agentPluginsMcpProvider: createAgentPluginsMcpProvider({
-        xumHome: mcpConfig.rootDir,
-        isEnabled: () =>
-          opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS) === true,
-      }),
-      policyService: opts.policyService,
+      agentPluginsMcpProvider: createAgentPluginsMcpProvider({ xumHome: mcpConfig.rootDir }),
       telemetryService: opts.telemetryService,
       workspaceMetadataProvider: yield* AI,
     });
@@ -399,50 +466,46 @@ export const MCPServerManagerLive = Layer.effect(
     const config = yield* ConfigTag;
     const mcpConfig = opts.mcpConfig ?? config;
     const workspaceMcpOverridesService = yield* WorkspaceMcpOverrides;
-    return new MCPServerManager(
-      yield* MCPConfig,
-      {
-        // A plugin update/uninstall in a sibling process (desktop app alongside
-        // `xum server`) bumps the installer's mutation epoch; managers retire
-        // cached plugin instances before serving them again. The sibling's
-        // uninstall also pruned plugin keys from workspace override files, so
-        // the sweep refreshes cached override snapshots from disk.
-        config,
-        telemetryService: opts.telemetryService,
-        pluginInvalidation: {
-          keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
-          readComponentPolicy: () =>
-            readPluginMcpPolicy(path.join(mcpConfig.rootDir, PLUGIN_REGISTRY_FILE_NAME)),
-          tryAcquireComponentPolicyLock: (options) =>
-            acquirePluginMutationLock(mcpConfig.rootDir, { timeoutMs: 0, ...options }),
-          readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),
-          // Bounded/cancellable like the send path's own read: a distrusted or
-          // cold serve re-reads through here, and an unreachable SSH/Docker
-          // parent must not pin the send for the remote command timeout.
-          readWorkspaceOverrides: async (workspaceId, options) => {
-            const read = await workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
-              timeoutMs: options?.timeoutMs ?? MCP_OVERRIDES_READ_TIMEOUT_MS,
-              ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-            });
-            // undefined = not disk-authoritative; the manager keeps its fallbacks.
-            return read.authoritative ? read.overrides : undefined;
-          },
-          // A sibling backend's override save/prune bumps this; the manager
-          // refreshes or evicts its cached snapshots on the next serve.
-          readOverridesEpoch: () => readWorkspaceOverridesEpochToken(mcpConfig.rootDir),
-          // Served tool calls fence their dispatch against sibling-process
-          // override writes with the writer's own lock.
-          acquireOverridesLock: (options) =>
-            workspaceMcpOverridesService.acquireExclusiveLock(options),
+    return new MCPServerManager(yield* MCPConfig, {
+      // A plugin update/uninstall in a sibling process (desktop app alongside
+      // `xum server`) bumps the installer's mutation epoch; managers retire
+      // cached plugin instances before serving them again. The sibling's
+      // uninstall also pruned plugin keys from workspace override files, so
+      // the sweep refreshes cached override snapshots from disk.
+      config,
+      telemetryService: opts.telemetryService,
+      pluginInvalidation: {
+        keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
+        readComponentPolicy: () =>
+          readPluginMcpPolicy(path.join(mcpConfig.rootDir, PLUGIN_REGISTRY_FILE_NAME)),
+        tryAcquireComponentPolicyLock: (options) =>
+          acquirePluginMutationLock(mcpConfig.rootDir, { timeoutMs: 0, ...options }),
+        readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),
+        // Bounded/cancellable like the send path's own read: a distrusted or
+        // cold serve re-reads through here, and an unreachable SSH/Docker
+        // parent must not pin the send for the remote command timeout.
+        readWorkspaceOverrides: async (workspaceId, options) => {
+          const read = await workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
+            timeoutMs: options?.timeoutMs ?? MCP_OVERRIDES_READ_TIMEOUT_MS,
+            ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+          });
+          // undefined = not disk-authoritative; the manager keeps its fallbacks.
+          return read.authoritative ? read.overrides : undefined;
         },
-        ...opts.mcpServerManagerOptions,
-        // After the spread: the registry is a shared dependency the core graph
-        // owns (the stream manager consumes what the MCP manager publishes), so
-        // a caller-supplied instance must not silently split the two.
-        toolCallDisplayRegistry: yield* ToolCallDisplayRegistryTag,
+        // A sibling backend's override save/prune bumps this; the manager
+        // refreshes or evicts its cached snapshots on the next serve.
+        readOverridesEpoch: () => readWorkspaceOverridesEpochToken(mcpConfig.rootDir),
+        // Served tool calls fence their dispatch against sibling-process
+        // override writes with the writer's own lock.
+        acquireOverridesLock: (options) =>
+          workspaceMcpOverridesService.acquireExclusiveLock(options),
       },
-      opts.policyService
-    );
+      ...opts.mcpServerManagerOptions,
+      // After the spread: the registry is a shared dependency the core graph
+      // owns (the stream manager consumes what the MCP manager publishes), so
+      // a caller-supplied instance must not silently split the two.
+      toolCallDisplayRegistry: yield* ToolCallDisplayRegistryTag,
+    });
   })
 );
 
@@ -486,7 +549,6 @@ export const WorkspaceLive = Layer.effect(
       yield* ExtensionMetadata,
       yield* BackgroundProcessManagerTag,
       yield* SessionUsage,
-      opts.policyService,
       opts.telemetryService,
       opts.experimentsService,
       opts.sessionTimingService,
@@ -496,7 +558,13 @@ export const WorkspaceLive = Layer.effect(
       yield* DesktopInputCoordinatorTag,
       yield* EffectRunnerTag,
       yield* AppFiberScopeTag,
-      yield* AutoModelRouterTag
+      yield* AutoModelRouterTag,
+      yield* HostClockTag,
+      yield* WorkspaceLifecycleGatesTag,
+      yield* WorkspaceExternalEditorsTag,
+      yield* WorkspaceNamingTag,
+      yield* WorkspaceWorkflowRunsTag,
+      yield* WorkspaceOperationAdmissionTag
     );
   })
 );
@@ -619,6 +687,19 @@ export const CoreWiringLive: Layer.Layer<
 
     turnRequestBuilderBindings.mcpServerManager = mcpServerManager;
     streamManager.setMCPServerManager(mcpServerManager);
+    // Plugin hooks read their own MCP servers' structured settings. Core wiring, not desktop:
+    // the headless roots (`xum run`, `xum workflow`) build only CoreLive.
+    agentPluginHookService.setSettingsProvider((workspaceId, keyPrefix, timeoutMs) =>
+      mcpServerManager.getSettingsForPluginHooks(workspaceId, keyPrefix, timeoutMs)
+    );
+    // MCP Apps views (mcp-apps experiment): host-only raw results live in the session dir.
+    mcpServerManager.setMcpApps({
+      isEnabled: () => aiService.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS),
+      store: new McpAppResultStore(
+        (workspaceId) => path.join(config.sessionsDir, workspaceId),
+        config.rootDir
+      ),
+    });
     // Recorded prompt options can hold stale secret snapshots, so prompt refreshes
     // resolve credentials from current configuration.
     mcpServerManager.setSecretsResolver(async (workspaceId, projectPath) => {
@@ -627,7 +708,7 @@ export const CoreWiringLive: Layer.Layer<
       const secrets =
         metadata && isMultiProject(metadata)
           ? mergeMultiProjectSecrets(metadata, secretsStore)
-          : secretsStore.getEffectiveSecrets(projectPath);
+          : secretsForWorkspace(secretsStore, config, projectPath, metadata?.runtimeConfig);
       return secretsToRecord(secrets);
     });
 
@@ -647,25 +728,8 @@ export const CoreWiringLive: Layer.Layer<
     };
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
     workspaceService.setSharedWorkspaceMemoryStore(memoryService);
-    // Workspace-scope change events carry the memory OWNER (task-tree root);
-    // every live session resolving to that owner reads the same notebook.
-    memoryService.on("change", (event: MemoryChangeEvent) => {
-      if (event.scope !== "workspace" || event.workspaceId === "") return;
-      // One config snapshot for the whole pass: cold owner lookups would
-      // otherwise parse the config once per live session, synchronously.
-      let cfg: ReturnType<typeof config.loadConfigOrDefault> | undefined;
-      const snapshot = () => (cfg ??= config.loadConfigOrDefault());
-      workspaceService.invalidateMemoryContextWhere(
-        (workspaceId) =>
-          memoryService.resolveWorkspaceMemoryOwnerId(workspaceId, snapshot) === event.workspaceId
-      );
-    });
-    // Ownership itself changed (an owner was removed while its sub-agents
-    // live on): those sessions' cached contexts still describe the old store.
-    memoryService.on("ownersInvalidated", (workspaceIds: string[]) => {
-      const affected = new Set(workspaceIds);
-      workspaceService.invalidateMemoryContextWhere((workspaceId) => affected.has(workspaceId));
-    });
+    // Memory writes (own, sibling or Dream) no longer invalidate live sessions:
+    // the memory context is frozen per context window (AgentSession, #5248).
     if (opts.devToolsService) {
       // DevTools debug-log cleanup when workspaces are archived/removed.
       workspaceService.setDevToolsService(opts.devToolsService);
@@ -680,6 +744,16 @@ export const CoreWiringLive: Layer.Layer<
     workspaceService.setWorkspaceGoalService(workspaceGoalService);
     workspaceGoalService.setOnActivityChange((workspaceId, snapshot) => {
       workspaceService.emitWorkspaceActivity(workspaceId, snapshot);
+    });
+    // TaskService owns sub-agent turns: it gates and continues a child goal's user resume.
+    workspaceGoalService.setChildGoalResumeHooks({
+      getResumeRefusal: (workspaceId) => taskService.getChildGoalResumeRefusal(workspaceId),
+      captureActivationAttempt: (workspaceId) =>
+        taskService.captureChildGoalActivationAttempt(workspaceId),
+      isActivationAllowed: (workspaceId, attemptId) =>
+        taskService.isChildGoalActivationAllowed(workspaceId, attemptId),
+      getTurnModel: (workspaceId) => taskService.getChildGoalTurnModel(workspaceId),
+      onGoalResumed: (workspaceId) => taskService.continueResumedChildGoal(workspaceId),
     });
     // Wire user-initiated `promoteUpcomingGoal` through `interruptStream`
     // so promoting mid-stream cleanly aborts the in-flight turn before
@@ -711,6 +785,10 @@ export const CoreWiringLive: Layer.Layer<
       executeGoalContinuation: (input) => workspaceService.executeGoalContinuation(input),
       getKickoffSendOptions: (workspaceId) =>
         workspaceService.getGoalContinuationKickoffSendOptions(workspaceId),
+      refuseUnavailableAgent: (workspaceId, options, isCurrent) =>
+        workspaceService.refuseUnavailableGoalTurnAgent(workspaceId, options, isCurrent),
+      abandonGoalAutoRetry: (workspaceId, goalId) =>
+        workspaceService.abandonGoalAutoRetry(workspaceId, goalId),
     });
   })
 );
@@ -733,9 +811,18 @@ const S1 = Layer.mergeAll(
   TerminalAttentionStoreLive,
   DesktopInputCoordinatorLive,
   IdleDispatcherLive,
+  WorkspaceLifecycleGatesLive,
+  WorkspaceNamingLive,
+  WorkspaceWorkflowRunsLive,
   TurnRequestBuilderBindingsLive
 );
-const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));
+// WorkspaceExternalEditorsLive and WorkspaceOperationAdmissionLive read S1's WorkspaceLifecycleGatesTag.
+const S2a = Layer.mergeAll(
+  SessionUsageLive,
+  WorkspaceGoalLive,
+  WorkspaceExternalEditorsLive,
+  WorkspaceOperationAdmissionLive
+).pipe(Layer.provideMerge(S1));
 const S2b = StreamManagerLive.pipe(Layer.provideMerge(S2a));
 const S3 = AILive.pipe(Layer.provideMerge(S2b));
 const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive, ContextManagementLive).pipe(
@@ -802,8 +889,10 @@ export function CoreRootLive(opts: CoreServicesOptions): Layer.Layer<CoreRootTag
     fileLeaseManager,
     ...coreOptions
   } = opts;
+  const runner = EffectRunnerLive.pipe(Layer.provideMerge(StoresFromCoreOptionsLive(opts)));
+  // HostClockLive reads the Clock that the runner captured: one clock for both.
   const runtimeSeams = AppFiberScopeLive.pipe(
-    Layer.provideMerge(EffectRunnerLive.pipe(Layer.provideMerge(StoresFromCoreOptionsLive(opts))))
+    Layer.provideMerge(HostClockLive.pipe(Layer.provideMerge(runner)))
   );
   return CoreLive.pipe(
     // True siblings: both derive from the config alone.

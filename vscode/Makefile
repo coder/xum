@@ -17,8 +17,8 @@ help: ## Show this help message
 # Sentinel file to track when dependencies are installed
 # Only installs devDependencies (esbuild, vsce, etc.) - no runtime deps needed
 node_modules/.installed: package.json bun.lock
-	@echo "Extension dependencies out of date or missing, running bun install..."
-	@bun install
+	@echo "Extension dependencies out of date or missing, running bun install --frozen-lockfile..."
+	@bun install --frozen-lockfile
 	@touch node_modules/.installed
 
 # The webview imports the root's generated version module. Phony like the root's `version`
@@ -32,7 +32,7 @@ build: node_modules/.installed version ## Build VS Code extension (.vsix)
 	@echo "Building VS Code extension with esbuild..."
 	@rm -rf out mux-0.1.0.vsix
 	@bun run compile
-	@npx @vscode/vsce package --no-dependencies
+	@./node_modules/.bin/vsce package --no-dependencies
 	@echo "✓ Extension packaged: mux-0.1.0.vsix (bundle size: ~27 KB)"
 
 ## Install extension locally

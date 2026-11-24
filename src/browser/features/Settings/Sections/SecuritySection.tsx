@@ -1,6 +1,8 @@
 import { useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { ShieldCheck, ShieldOff } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAPI } from "@/browser/contexts/API";
 
@@ -21,6 +23,7 @@ export function SecuritySection() {
     try {
       setPendingPath(projectPath);
       await api.projects.setTrust({ projectPath, trusted: !currentlyTrusted });
+      publishProjectTrustChanged();
       await refreshProjects();
     } catch {
       // Best-effort — config refresh will reflect actual state
@@ -35,6 +38,7 @@ export function SecuritySection() {
   return (
     <div className="flex flex-col gap-6">
       <div>
+        <SettingsMark id="project-trust" />
         <h3 className="text-foreground mb-1 text-sm font-medium">Project Trust</h3>
         <p className="text-muted text-xs">
           Trusted projects can run hooks and scripts from the repository. Untrusted projects have
@@ -54,7 +58,7 @@ export function SecuritySection() {
                 className="border-border-medium flex items-center gap-3 rounded-md border px-3 py-2"
               >
                 {trusted ? (
-                  <ShieldCheck className="text-success size-4 shrink-0" />
+                  <ShieldCheck className="text-success-text size-4 shrink-0" />
                 ) : (
                   <ShieldOff className="text-muted size-4 shrink-0" />
                 )}

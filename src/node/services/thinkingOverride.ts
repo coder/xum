@@ -12,9 +12,11 @@
  * Node-runtime-local: carries a callback, so it does not belong in
  * src/common/types (never crosses IPC).
  */
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ModelMessage } from "ai";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type { SystemSectionRecords } from "@/common/types/message";
 
 /** What an Auto-routed stream is running on right now, as StreamManager's stream state has it. */
 export interface LiveTurnRouting {
@@ -24,6 +26,11 @@ export interface LiveTurnRouting {
 }
 
 export interface ActiveTurnThinkingOverride {
+  /**
+   * Independent chat-local speed pick, read at each model invocation. Sharing the
+   * turn holder gives it the same admission/cleanup lifetime without touching Auto thinking.
+   */
+  serviceTier?: ServiceTier;
   /** Raw level requested mid-turn; consumed at the next prepareStep (incl. step 1). */
   pending?: ThinkingLevel;
   /**
@@ -34,6 +41,11 @@ export interface ActiveTurnThinkingOverride {
   manual?: boolean;
   /** Effective level after the most recent successful application. */
   applied?: ThinkingLevel;
+  /**
+   * Set when the turn published a Token Budget stage (#5286): its first provider request is the
+   * payload the stage counted, so `pending` waits until after that request.
+   */
+  holdBeforeFirstRequest?: boolean;
   /** Sink wired by StreamManager to the owning streamInfo (metadata). */
   onApplied?: (level: ThinkingLevel) => void;
   /**
@@ -58,8 +70,13 @@ export interface RebuiltThinkingProviderOptions {
   providerOptions: Record<string, unknown>;
 }
 
+/**
+ * `beforeFirstStep`: no provider request of this turn has been prepared yet, so the
+ * level resolves as at turn start (Sonnet 5.5 "off" can still send `between_tools`).
+ */
 export type RebuildProviderOptionsForThinkingLevel = (
-  level: ThinkingLevel
+  level: ThinkingLevel,
+  beforeFirstStep?: boolean
 ) => RebuiltThinkingProviderOptions | null;
 
 /**
@@ -68,10 +85,16 @@ export type RebuildProviderOptionsForThinkingLevel = (
  * the pre-construction quiescence fold). Message preparation is
  * thinking-level-dependent, so an options-only rebuild would send messages
  * transformed for the wrong mode. Returns the fully prepared first-step
- * messages; implementations also emit a superseding turn envelope so replay
- * matches the wire request.
+ * messages (and their volatile-tail record); implementations also emit a
+ * superseding turn envelope so replay matches the wire request.
  */
 export type RebuildFirstStepForThinkingLevel = (
   effectiveLevel: ThinkingLevel,
   providerOptions: Record<string, unknown>
-) => Promise<ModelMessage[]>;
+) => Promise<{
+  messages: ModelMessage[];
+  /** The rebuilt request's records for the turn's row (MuxMetadata.volatileSystemTail etc.). */
+  systemRecords?: SystemSectionRecords;
+  /** Its system content's token count, tail rows included (MuxMetadata.systemMessageTokens). */
+  systemMessageTokens?: number;
+}>;

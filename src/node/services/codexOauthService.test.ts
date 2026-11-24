@@ -1,6 +1,12 @@
 import type { ProvidersConfigStore } from "@/node/config";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 
+import {
+  CODEX_OAUTH_BROWSER_REDIRECT_URI,
+  CODEX_OAUTH_DEVICE_TOKEN_POLL_URL,
+  CODEX_OAUTH_DEVICE_USERCODE_URL,
+  CODEX_OAUTH_TOKEN_URL,
+} from "@/common/constants/codexOAuth";
 import type { Result } from "@/common/types/result";
 import { Ok } from "@/common/types/result";
 import type { ProvidersConfig } from "@/node/config";
@@ -118,6 +124,19 @@ function mockFetch(fn: (input: RequestInfo | URL, init?: RequestInit) => Promise
       // no-op in tests
     },
   }) as typeof fetch;
+}
+
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  return input instanceof URL ? input.href : input.url;
+}
+
+// The service sends JSON strings or URLSearchParams form bodies.
+function requestBodyText(init?: RequestInit): string {
+  const body = init?.body;
+  if (typeof body === "string") return body;
+  if (body instanceof URLSearchParams) return body.toString();
+  throw new Error("unexpected request body type");
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +468,360 @@ describe("CodexOauthService", () => {
       if (result.success) {
         expect(result.data.refresh).toBe("rt_keep_me");
       }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Desktop flow: loopback callback -> code exchange
+  // -------------------------------------------------------------------------
+
+  describe("desktop flow callback", () => {
+    // Answers the token endpoint with `tokenResponse` and rejects every other
+    // URL. The test hits the loopback callback with `originalFetch` directly.
+    function mockTokenEndpoint(tokenResponse: () => Response): URLSearchParams[] {
+      const bodies: URLSearchParams[] = [];
+      mockFetch((input, init) => {
+        if (requestUrl(input) === CODEX_OAUTH_TOKEN_URL) {
+          bodies.push(new URLSearchParams(requestBodyText(init)));
+          return Promise.resolve(tokenResponse());
+        }
+        return Promise.reject(new Error(`unexpected fetch ${requestUrl(input)}`));
+      });
+      return bodies;
+    }
+
+    async function startFlowAndCallback(): Promise<{
+      result: Result<void, string>;
+      status: number;
+    }> {
+      const start = await service.startDesktopFlow();
+      if (!start.success) throw new Error(start.error);
+      const callback = await originalFetch(
+        `${CODEX_OAUTH_BROWSER_REDIRECT_URI}?state=${start.data.flowId}&code=code_from_browser`
+      );
+      const result = await service.waitForDesktopFlow(start.data.flowId, { timeoutMs: 5000 });
+      return { result, status: callback.status };
+    }
+
+    it("exchanges the callback code, persists the tokens and focuses the window", async () => {
+      const bodies = mockTokenEndpoint(() =>
+        mockRefreshResponse({
+          access_token: "at_desktop",
+          refresh_token: "rt_desktop",
+          expires_in: 3600,
+          id_token: fakeJwt({ chatgpt_account_id: "acct_desktop" }),
+        })
+      );
+
+      const before = Date.now();
+      const { result, status } = await startFlowAndCallback();
+
+      expect(result).toEqual(Ok(undefined));
+      expect(status).toBe(200);
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0].get("code")).toBe("code_from_browser");
+      expect(bodies[0].get("redirect_uri")).toBe(CODEX_OAUTH_BROWSER_REDIRECT_URI);
+      expect(bodies[0].get("code_verifier")).toBeTruthy();
+      const stored = deps.providersConfig.openai?.codexOauth as CodexOauthAuth;
+      expect(stored).toMatchObject({
+        access: "at_desktop",
+        refresh: "rt_desktop",
+        accountId: "acct_desktop",
+      });
+      expect(stored.expires).toBeGreaterThanOrEqual(before + 3_600_000);
+      expect(deps.focusCalls).toBe(1);
+    });
+
+    it("fails the flow and the browser page when the token exchange is rejected", async () => {
+      mockTokenEndpoint(() => new Response("bad code", { status: 400 }));
+
+      const { result, status } = await startFlowAndCallback();
+
+      expect(result).toEqual({
+        success: false,
+        error: "Codex OAuth exchange failed (400): bad code",
+      });
+      expect(status).toBe(400);
+      expect(deps.setConfigValueCalls).toHaveLength(0);
+      expect(deps.focusCalls).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Device flow
+  // -------------------------------------------------------------------------
+
+  describe("device flow", () => {
+    interface DeviceEndpoints {
+      userCode?: () => Response;
+      poll?: () => Response;
+      token?: () => Response;
+    }
+
+    // Every endpoint the device flow calls, with a successful default reply.
+    // Records request bodies per endpoint so tests can check what was sent.
+    function mockDeviceEndpoints(endpoints: DeviceEndpoints = {}): Record<string, string[]> {
+      const calls: Record<string, string[]> = { userCode: [], poll: [], token: [] };
+      mockFetch((input, init) => {
+        const url = requestUrl(input);
+        const body = requestBodyText(init);
+        if (url === CODEX_OAUTH_DEVICE_USERCODE_URL) {
+          calls.userCode.push(body);
+          return Promise.resolve(
+            endpoints.userCode?.() ??
+              mockRefreshResponse({
+                device_auth_id: "dev_auth_1",
+                user_code: "ABCD-EFGH",
+                interval: 1,
+                expires_in: 600,
+              })
+          );
+        }
+        if (url === CODEX_OAUTH_DEVICE_TOKEN_POLL_URL) {
+          calls.poll.push(body);
+          return Promise.resolve(
+            endpoints.poll?.() ??
+              mockRefreshResponse({ authorization_code: "dev_code", code_verifier: "dev_verifier" })
+          );
+        }
+        if (url === CODEX_OAUTH_TOKEN_URL) {
+          calls.token.push(body);
+          return Promise.resolve(
+            endpoints.token?.() ??
+              mockRefreshResponse({
+                access_token: fakeJwt({ chatgpt_account_id: "acct_device" }),
+                refresh_token: "rt_device",
+                expires_in: "7200",
+              })
+          );
+        }
+        return Promise.reject(new Error(`unexpected fetch ${url}`));
+      });
+      return calls;
+    }
+
+    async function runDeviceFlow(opts?: { timeoutMs?: number }): Promise<Result<void, string>> {
+      const start = await service.startDeviceFlow();
+      if (!start.success) throw new Error(start.error);
+      return service.waitForDeviceFlow(start.data.flowId, opts);
+    }
+
+    async function startError(): Promise<string> {
+      const start = await service.startDeviceFlow();
+      if (start.success) throw new Error("expected startDeviceFlow to fail");
+      return start.error;
+    }
+
+    it("returns the user code and verify URL, and normalizes the poll interval", async () => {
+      const calls = mockDeviceEndpoints({
+        userCode: () =>
+          mockRefreshResponse({ device_auth_id: "d", user_code: "WXYZ", interval: "2.7" }),
+      });
+
+      const start = await service.startDeviceFlow();
+
+      expect(start.success).toBe(true);
+      if (!start.success) return;
+      expect(start.data).toMatchObject({
+        userCode: "WXYZ",
+        // The page the user opens to enter the code (an external contract).
+        verifyUrl: "https://auth.openai.com/codex/device",
+        intervalSeconds: 2,
+      });
+      // The registered public client ID (an external contract).
+      expect(JSON.parse(calls.userCode[0])).toEqual({ client_id: "app_EMoamEEZ73f0CkXaXp7hrann" });
+    });
+
+    it("clamps a sub-second interval to 1 and defaults a missing interval and lifetime", async () => {
+      mockDeviceEndpoints({
+        userCode: () => mockRefreshResponse({ device_auth_id: "d", user_code: "U", interval: 0 }),
+      });
+      const clamped = await service.startDeviceFlow();
+      expect(clamped.success && clamped.data.intervalSeconds).toBe(1);
+
+      mockDeviceEndpoints({
+        userCode: () => mockRefreshResponse({ device_auth_id: "d", user_code: "U" }),
+      });
+      const defaulted = await service.startDeviceFlow();
+      expect(defaulted.success && defaulted.data.intervalSeconds).toBe(5);
+      // A missing expires_in falls back to the default lifetime, so the flow
+      // is still alive to poll and complete.
+      if (!defaulted.success) return;
+      expect(await service.waitForDeviceFlow(defaulted.data.flowId)).toEqual(Ok(undefined));
+    });
+
+    it("reports user-code request failures", async () => {
+      mockDeviceEndpoints({ userCode: () => new Response("boom", { status: 500 }) });
+      expect(await startError()).toBe("Codex OAuth device auth request failed (500): boom");
+
+      mockDeviceEndpoints({ userCode: () => new Response("", { status: 503 }) });
+      expect(await startError()).toBe("Codex OAuth device auth request failed (503)");
+
+      mockDeviceEndpoints({ userCode: () => mockRefreshResponse({ device_auth_id: "d" }) });
+      expect(await startError()).toContain("missing required fields");
+
+      mockDeviceEndpoints({ userCode: () => new Response("[1]", { status: 200 }) });
+      expect(await startError()).toContain("invalid JSON payload");
+
+      mockFetch(() => Promise.reject(new Error("network down")));
+      expect(await startError()).toBe("Codex OAuth device auth request failed: network down");
+    });
+
+    it("returns an error when waiting for an unknown flow", async () => {
+      expect(await service.waitForDeviceFlow("missing")).toEqual({
+        success: false,
+        error: "OAuth flow not found",
+      });
+    });
+
+    it("polls with the device code, exchanges it and persists the tokens", async () => {
+      const calls = mockDeviceEndpoints();
+
+      const before = Date.now();
+      const result = await runDeviceFlow();
+
+      expect(result).toEqual(Ok(undefined));
+      expect(JSON.parse(calls.poll[0])).toEqual({
+        device_auth_id: "dev_auth_1",
+        user_code: "ABCD-EFGH",
+      });
+      const exchange = new URLSearchParams(calls.token[0]);
+      expect(exchange.get("code")).toBe("dev_code");
+      expect(exchange.get("code_verifier")).toBe("dev_verifier");
+      expect(exchange.get("redirect_uri")).toBe("https://auth.openai.com/deviceauth/callback");
+      const stored = deps.providersConfig.openai?.codexOauth as CodexOauthAuth;
+      expect(stored).toMatchObject({ refresh: "rt_device", accountId: "acct_device" });
+      expect(stored.expires).toBeGreaterThanOrEqual(before + 7_200_000);
+      expect(deps.focusCalls).toBe(1);
+    });
+
+    it("fails the flow without persisting when polling or the exchange fails", async () => {
+      const cases: Array<{ endpoints: DeviceEndpoints; error: string }> = [
+        {
+          endpoints: { poll: () => new Response("nope", { status: 500 }) },
+          error: "Codex OAuth device token poll failed (500): nope",
+        },
+        {
+          endpoints: { poll: () => new Response("not json", { status: 200 }) },
+          error: "Codex OAuth device token poll returned invalid JSON",
+        },
+        {
+          endpoints: { poll: () => mockRefreshResponse({ authorization_code: "c" }) },
+          error: "Codex OAuth device token poll response missing required fields",
+        },
+        {
+          endpoints: { token: () => new Response("", { status: 401 }) },
+          error: "Codex OAuth exchange failed (401)",
+        },
+        {
+          endpoints: { token: () => new Response("[]", { status: 200 }) },
+          error: "Codex OAuth exchange returned an invalid JSON payload",
+        },
+        {
+          endpoints: { token: () => new Response("{", { status: 200 }) },
+          error: "Codex OAuth exchange failed: ",
+        },
+        {
+          endpoints: { token: () => mockRefreshResponse({ refresh_token: "r", expires_in: 1 }) },
+          error: "Codex OAuth exchange response missing access_token",
+        },
+        {
+          endpoints: { token: () => mockRefreshResponse({ access_token: "a", expires_in: 1 }) },
+          error: "Codex OAuth exchange response missing refresh_token",
+        },
+        {
+          endpoints: {
+            token: () => mockRefreshResponse({ access_token: "a", refresh_token: "r" }),
+          },
+          error: "Codex OAuth exchange response missing expires_in",
+        },
+      ];
+
+      for (const testCase of cases) {
+        mockDeviceEndpoints(testCase.endpoints);
+        const result = await runDeviceFlow();
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          // The JSON-parse case carries the runtime's parser message after the prefix.
+          expect(result.error.startsWith(testCase.error)).toBe(true);
+        }
+      }
+      expect(deps.setConfigValueCalls).toHaveLength(0);
+      expect(deps.focusCalls).toBe(0);
+    });
+
+    it("reports a poll request that throws", async () => {
+      mockFetch((input) => {
+        if (requestUrl(input) === CODEX_OAUTH_DEVICE_TOKEN_POLL_URL) {
+          return Promise.reject(new Error("socket hang up"));
+        }
+        return Promise.resolve(
+          mockRefreshResponse({ device_auth_id: "d", user_code: "U", expires_in: 600 })
+        );
+      });
+
+      expect(await runDeviceFlow()).toEqual({
+        success: false,
+        error: "Device authorization failed: socket hang up",
+      });
+    });
+
+    // Pending poll replies (403/404). `firstPoll` resolves once the first
+    // poll request is sent, so tests act on a real signal, not a sleep.
+    function mockPendingPoll(status: number) {
+      let firstPollSent: () => void = () => undefined;
+      const firstPoll = new Promise<void>((resolve) => {
+        firstPollSent = resolve;
+      });
+      const calls = mockDeviceEndpoints({
+        poll: () => {
+          firstPollSent();
+          return new Response("", { status });
+        },
+      });
+      return { calls, firstPoll };
+    }
+
+    it("keeps the flow pending on 403 and 404 until the wait times out", async () => {
+      // Both statuses mean "the user has not approved yet", not a failure.
+      for (const status of [403, 404]) {
+        const { calls, firstPoll } = mockPendingPoll(status);
+        const start = await service.startDeviceFlow();
+        if (!start.success) throw new Error(start.error);
+
+        const wait = service.waitForDeviceFlow(start.data.flowId, { timeoutMs: 50 });
+        await firstPoll;
+
+        expect(await wait).toEqual({
+          success: false,
+          error: "Timed out waiting for device authorization",
+        });
+        // The next poll comes only after the wait has timed out, so only one was sent.
+        expect(calls.poll).toHaveLength(1);
+        expect(calls.token).toHaveLength(0);
+      }
+    });
+
+    it("cancelling stops a pending flow", async () => {
+      const { calls, firstPoll } = mockPendingPoll(403);
+      const start = await service.startDeviceFlow();
+      if (!start.success) throw new Error(start.error);
+
+      const wait = service.waitForDeviceFlow(start.data.flowId);
+      await firstPoll;
+      await service.cancelDeviceFlow(start.data.flowId);
+
+      expect(await wait).toEqual({ success: false, error: "OAuth flow cancelled" });
+      expect(calls.token).toHaveLength(0);
+    });
+
+    it("expires the flow when the device code has no lifetime left", async () => {
+      const calls = mockDeviceEndpoints({
+        userCode: () => mockRefreshResponse({ device_auth_id: "d", user_code: "U", expires_in: 0 }),
+      });
+
+      expect(await runDeviceFlow()).toEqual({ success: false, error: "Device code expired" });
+      expect(calls.token).toHaveLength(0);
     });
   });
 });

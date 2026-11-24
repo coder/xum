@@ -96,6 +96,25 @@ describe("WorkspaceService goal-defaults override", () => {
     expect(storedGoalDefaults()).toBeUndefined();
   });
 
+  test("clearing removes a stored record whose fields are all null", async () => {
+    // A hand-edited or older config can hold a record with every field null.
+    // It is still a record, so clearing must write and drop it, not skip as a no-op.
+    const allNull = {
+      defaultBudgetCents: null,
+      defaultTurnCap: null,
+      alwaysRequireExplicitBudget: null,
+    };
+    await saveWorkspaces(harness.config, TEST_PROJECT_PATH, [
+      { ...createWorkspace(), goalDefaults: allNull },
+    ]);
+    expect(service.getWorkspaceGoalDefaults(TEST_WORKSPACE_ID)).toEqual(allNull);
+
+    const result = await service.setWorkspaceGoalDefaults(TEST_WORKSPACE_ID, allNull);
+    expect(result.success).toBe(true);
+    expect(service.getWorkspaceGoalDefaults(TEST_WORKSPACE_ID)).toBeNull();
+    expect(storedGoalDefaults()).toBeUndefined();
+  });
+
   test("no-op writes are short-circuited (no saveConfig call)", async () => {
     const editConfig = spyOn(harness.config, "editConfig");
     await service.setWorkspaceGoalDefaults(TEST_WORKSPACE_ID, {

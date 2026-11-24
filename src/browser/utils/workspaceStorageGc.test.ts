@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
+import { act, cleanup, renderHook } from "@testing-library/react";
 
-import { subscribePersistedStateWrites } from "@/browser/hooks/usePersistedState";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   collectOrphanedWorkspaceStorage,
   resetWorkspaceStorageGcForTests,
@@ -10,14 +12,12 @@ import {
   GLOBAL_SCOPE_ID,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   getDraftScopeId,
-  getInputKey,
+  getAutoExpandPrefsKey,
   getMCPTestResultsKey,
   getPendingScopeId,
   getProjectScopeId,
   getReviewStateKey,
   getTerminalTitlesKey,
-  getThinkingLevelByModelKey,
-  getThinkingLevelKey,
 } from "@/common/constants/storage";
 
 const KNOWN_ID = "0123456789";
@@ -45,6 +45,7 @@ function remaining(keys: readonly string[]): string[] {
 
 describe("collectOrphanedWorkspaceStorage", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -52,31 +53,28 @@ describe("collectOrphanedWorkspaceStorage", () => {
   });
 
   afterEach(() => {
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    cleanup();
+    restoreDomGlobals();
   });
 
   test("removes only keys of unknown stable workspace ids", async () => {
     const orphaned = [
-      getInputKey(ORPHAN_ID),
+      getAutoExpandPrefsKey(ORPHAN_ID),
       getReviewStateKey(ORPHAN_ID),
       getTerminalTitlesKey(ORPHAN_ID),
       getMCPTestResultsKey("/repo", ORPHAN_ID),
     ];
     const kept = [
-      getInputKey(KNOWN_ID),
+      getAutoExpandPrefsKey(KNOWN_ID),
       getMCPTestResultsKey("/repo", KNOWN_ID),
       // The drafts map is not authoritative, so creation-draft keys are never collected.
-      getInputKey(MAPPED_DRAFT),
-      getInputKey(UNMAPPED_DRAFT),
-      getInputKey(getPendingScopeId("/repo")),
-      getThinkingLevelKey(getProjectScopeId("/repo")),
-      getThinkingLevelKey(GLOBAL_SCOPE_ID),
-      // Legacy global key sharing a registered prefix.
-      getThinkingLevelByModelKey("openai:gpt-5"),
+      getAutoExpandPrefsKey(MAPPED_DRAFT),
+      getAutoExpandPrefsKey(UNMAPPED_DRAFT),
+      getAutoExpandPrefsKey(getPendingScopeId("/repo")),
+      getAutoExpandPrefsKey(getProjectScopeId("/repo")),
+      getAutoExpandPrefsKey(GLOBAL_SCOPE_ID),
       // Legacy (non-stable) workspace id format.
-      getInputKey("myproject-feature-branch"),
+      getAutoExpandPrefsKey("myproject-feature-branch"),
       getMCPTestResultsKey("/repo", "myproject-feature-branch"),
       // Project-level MCP results.
       getMCPTestResultsKey("/repo"),
@@ -99,29 +97,29 @@ describe("collectOrphanedWorkspaceStorage", () => {
 
   // Mounted usePersistedState consumers must observe the removal, or they would keep showing
   // (and could write back) the deleted value.
-  test("notifies persisted-state write listeners for every removed key", async () => {
-    seed([getInputKey(ORPHAN_ID), getInputKey(KNOWN_ID)]);
-    const removedKeys: string[] = [];
-    const unsubscribe = subscribePersistedStateWrites((event) => {
-      if (event.newValue == null) removedKeys.push(event.key);
-    });
+  test("mounted persisted-state hooks fall back to their defaults for removed keys", async () => {
+    seed([getAutoExpandPrefsKey(ORPHAN_ID), getAutoExpandPrefsKey(KNOWN_ID)]);
+    const mount = (key: string) =>
+      renderHook(() => usePersistedState(key, "default", { listener: true }));
+    const orphan = mount(getAutoExpandPrefsKey(ORPHAN_ID));
+    const known = mount(getAutoExpandPrefsKey(KNOWN_ID));
+    expect(orphan.result.current[0]).toBe("value");
 
-    try {
-      await collectOrphanedWorkspaceStorage({
+    await act(() =>
+      collectOrphanedWorkspaceStorage({
         listKnownWorkspaceIds: () => Promise.resolve([KNOWN_ID]),
-      });
-    } finally {
-      unsubscribe();
-    }
+      })
+    );
 
-    expect(removedKeys).toEqual([getInputKey(ORPHAN_ID)]);
+    expect(orphan.result.current[0]).toBe("default");
+    expect(known.result.current[0]).toBe("value");
   });
 
   test.each([
     ["rejects", () => Promise.reject(new Error("config unreadable"))],
     ["resolves a malformed list", () => Promise.resolve(undefined as unknown as string[])],
   ])("removes nothing when the known-id endpoint %s", async (_name, listKnownWorkspaceIds) => {
-    const keys = [getInputKey(ORPHAN_ID), getMCPTestResultsKey("/repo", ORPHAN_ID)];
+    const keys = [getAutoExpandPrefsKey(ORPHAN_ID), getMCPTestResultsKey("/repo", ORPHAN_ID)];
     seed(keys);
 
     let failed = false;
@@ -134,7 +132,7 @@ describe("collectOrphanedWorkspaceStorage", () => {
   });
 
   test("runs at most once per session, even after a failed run", async () => {
-    seed([getInputKey(ORPHAN_ID)]);
+    seed([getAutoExpandPrefsKey(ORPHAN_ID)]);
     await collectOrphanedWorkspaceStorage({
       listKnownWorkspaceIds: () => Promise.reject(new Error("backend unavailable")),
     }).catch(() => undefined);
@@ -143,23 +141,25 @@ describe("collectOrphanedWorkspaceStorage", () => {
     await collectOrphanedWorkspaceStorage({ listKnownWorkspaceIds });
 
     expect(listKnownWorkspaceIds).not.toHaveBeenCalled();
-    expect(remaining([getInputKey(ORPHAN_ID)])).toEqual([getInputKey(ORPHAN_ID)]);
+    expect(remaining([getAutoExpandPrefsKey(ORPHAN_ID)])).toEqual([
+      getAutoExpandPrefsKey(ORPHAN_ID),
+    ]);
   });
 
   // The backend may enumerate before a workspace created in this session is persisted; that
   // workspace's keys are written after the snapshot and must survive.
   test("never removes keys written after the candidate snapshot", async () => {
-    const createdLaterKey = getInputKey("abcdef0123");
-    seed([getInputKey(ORPHAN_ID)]);
+    const createdLaterKey = getAutoExpandPrefsKey("abcdef0123");
+    seed([getAutoExpandPrefsKey(ORPHAN_ID)]);
 
     await collectOrphanedWorkspaceStorage({
       listKnownWorkspaceIds: () => {
-        localStorage.setItem(createdLaterKey, JSON.stringify("new draft"));
+        localStorage.setItem(createdLaterKey, JSON.stringify("new value"));
         return Promise.resolve([]);
       },
     });
 
-    expect(localStorage.getItem(getInputKey(ORPHAN_ID))).toBeNull();
+    expect(localStorage.getItem(getAutoExpandPrefsKey(ORPHAN_ID))).toBeNull();
     expect(localStorage.getItem(createdLaterKey)).not.toBeNull();
   });
 });

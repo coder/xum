@@ -7,6 +7,7 @@
  */
 
 import { tool } from "ai";
+import { nodeClock } from "@/node/utils/hostClock";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { Tool } from "ai";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
@@ -535,7 +536,7 @@ export async function createCodeExecutionTool(
   // mount override keep their current descriptions byte-identical.
   const kernelFirstPreamble =
     kernel && options?.kernelFirst === true
-      ? `**Kernel-first workflow:** this is your primary tool — other tools are \`mux.*\` calls inside it. Write complete programs: batch ALL steps of a task — every file load, transformation, and check — into a single call using loops and in-code error handling (try/catch), instead of one tool call per code_execution; split into separate calls only when a later step genuinely depends on your own review of intermediate output. Persist state in \`vars\` across calls and turns; nested results stay in the kernel (you see compact {tool, ok, bytes} summaries), and an oversized return value comes back as {handle, preview, size} — read or slice the full value at its handle in a follow-up call${
+      ? `**Kernel-first workflow:** this is your primary tool for the bridged tools listed below; call separately exposed tools (including file edits) directly. Write complete programs: batch related bridged steps of a task — every file load, transformation, and check — into a single call using loops and in-code error handling (try/catch), instead of one tool call per code_execution; split into separate calls only when a later step genuinely depends on your own review of intermediate output. Persist state in \`vars\` across calls and turns; nested results stay in the kernel (you see compact {tool, ok, bytes} summaries), and an oversized return value comes back as {handle, preview, size} — read or slice the full value at its handle in a follow-up call${
           "task" in bridgeableTools
             ? "; spawn sub-agents with `xum.task_spawn(...)` and collect their reports with `xum.events()`"
             : ""
@@ -544,10 +545,15 @@ export async function createCodeExecutionTool(
 `
       : "";
 
+  // PTC is exclusive-only: bridged tools are removed from the model-visible
+  // set, so "When to use" must say code_execution is the ONLY route. The old
+  // supplement-era wording ("prefer for 2+ calls") implied single calls go
+  // direct, so the first bash call of nearly every transcript failed with
+  // "Model tried to call unavailable tool 'bash'" before the model adapted.
   const codeExecutionTool = tool({
     description: `${kernelFirstPreamble}Execute sandboxed JavaScript to batch tools and transform outputs.
 
-**When to use:** Prefer this tool when making 2+ tool calls, especially when later calls depend on earlier results. Reduces round-trip latency.
+**When to use:** The \`xum.*\` tools below are reachable ONLY through this tool; they are not top-level tools, so calling one directly by name fails. Use this tool even for a single call (\`return xum.<tool>(args)\`), and batch multiple calls into one script, especially when later calls depend on earlier results.
 
 **Available tools (TypeScript definitions):**
 \`\`\`typescript
@@ -569,7 +575,8 @@ ${xumTypes}
       { code, timeout_secs },
       { abortSignal, toolCallId }
     ): Promise<PTCExecutionResult> => {
-      const execStartTime = Date.now();
+      // Wall clock on purpose: QuickJSRuntime measures duration_ms with Date.now() (#7282).
+      const execStartTime = nodeClock.nowMs();
 
       const { toolBridge: activeBridge, withMount: activeMount, loadFile: activeLoadFile } = state;
 
@@ -596,7 +603,7 @@ ${xumTypes}
           error: `Code analysis failed:\n${errorMessages.join("\n")}`,
           toolCalls: [],
           consoleOutput: [],
-          duration_ms: Date.now() - execStartTime,
+          duration_ms: nodeClock.nowMs() - execStartTime,
         };
       }
 
@@ -697,7 +704,7 @@ ${xumTypes}
           // their media/display-file bytes stripped from sandbox-visible
           // values by the bridge; re-attach the originals on this result so
           // the request path delivers media to the model as real attachments
-          // (extractToolMediaAsUserMessages) and the UI renders both kinds
+          // (extractToolMediaAsUserMessagesFromModelMessages) and the UI renders both kinds
           // from the carrier. Drain even for failed evals: received parts are
           // still valid, and leaving them pending would let them leak into a
           // later eval on this runtime.
@@ -768,7 +775,8 @@ ${xumTypes}
                 result.consoleOutput.push({
                   level: "warn",
                   args: [`[kernel] ${persistError.message}`],
-                  timestamp: Date.now(),
+                  // Record time: wall clock until #7282 moves its consumers to HostClock.
+                  timestamp: nodeClock.nowMs(),
                 });
               }
               // Foreign-instance conflict (r68): the eval may have READ stale

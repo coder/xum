@@ -276,7 +276,7 @@ function dogfoodPrompt(p, retryIssues) {
     "Task: DOGFOOD phase '" + p.key + " — " + p.title + "' end to end as a real user would, and collect reviewer-grade evidence.",
     "",
     "The implementation is on HEAD. Run 'bun install' if node_modules is missing.",
-    "Read the dev-server-sandbox skill (agent_skill_read name: dev-server-sandbox) for isolated-instance setup: pinned MUX_ROOT + free ports via make dev-server; enable llmDebugLogs in the sandbox config.json to capture devtools.jsonl.",
+    "Read the dev-server-sandbox skill (agent_skill_read name: dev-server-sandbox) for isolated-instance setup: pinned MUX_ROOT + free ports via make dev-server; enable llmDebugLogs in the sandbox config.json to capture devtools.jsonl. The sandbox backend requires a token (skill Auth section, never in a command line); 'bun run debug send-message' runs in process and needs none.",
     "DRIVING TURNS HEADLESSLY: 'bun run debug send-message' is display-only and CANNOT send messages — do not waste time on it. Drive real turns through the dev server's oRPC API (WebSocket): e.g. workspace.createScratch / workspace.sendMessage / config.updateLlmDebugLogs; a small bun script using the oRPC client from src/browser/contexts (or raw WS per src/node/orpc/server.ts) works. Alternatively drive the web UI with agent-browser against the Vite URL. This environment is headless: transcripts and file excerpts are the expected evidence; screenshots via agent-browser only if visual proof is strictly required.",
     "",
     "## Dogfood script",

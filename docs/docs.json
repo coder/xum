@@ -37,7 +37,6 @@
                 "pages": ["config/models", "config/providers"]
               },
               "getting-started/why-parallelize",
-              "getting-started/mux-gateway",
               "reference/cli"
             ]
           },
@@ -46,7 +45,9 @@
             "pages": [
               "workspaces",
               "workspaces/scratch-chats",
+              "workspaces/artifacts",
               "workspaces/fork",
+              "workspaces/side-chats",
               "workspaces/xumignore",
               {
                 "group": "Compaction",
@@ -72,7 +73,7 @@
               },
               {
                 "group": "Hooks",
-                "pages": ["hooks/init", "hooks/tools", "hooks/environment-variables"]
+                "pages": ["hooks/init", "hooks/lifecycle", "hooks/tools", "hooks/plugins", "hooks/environment-variables"]
               }
             ]
           },
@@ -85,15 +86,17 @@
               "agents/plan-mode",
               "agents/system-prompt",
               "agents/prompting-tips",
-              "agents/best-of-n"
+              "agents/best-of-n",
+              "agents/computer-use"
             ]
           },
           {
             "group": "Configuration",
             "pages": [
               "config/mcp-servers",
-              "config/policy-file",
               "config/project-secrets",
+              "config/agent-resource-limits",
+              "config/agent-sandbox",
               "config/agentic-git-identity",
               "config/keybinds",
               "config/notifications",
@@ -120,6 +123,8 @@
             "pages": [
               "reference/mux-compatibility",
               "reference/debugging",
+              "reference/profiling",
+              "reference/code-benchmarks",
               "reference/telemetry",
               "reference/storybook",
               "reference/benchmarking",
@@ -127,6 +132,7 @@
               "adr/0004-cli-goal-runs-are-not-strict-goal-aliases",
               "adr/0005-token-budget-context-windows",
               "adr/0006-agent-led-context-handoff",
+              "adr/0007-session-memory-is-the-rollover-checkpoint",
               "AGENTS"
             ]
           }
@@ -147,8 +153,6 @@
   },
   "redirects": [
     { "source": "/why-parallelize", "destination": "/getting-started/why-parallelize" },
-    { "source": "/mux-codes", "destination": "/getting-started/mux-gateway" },
-    { "source": "/getting-started/mux-codes", "destination": "/getting-started/mux-gateway" },
     { "source": "/workspaces/muxignore", "destination": "/workspaces/xumignore" },
     { "source": "/fork", "destination": "/workspaces/fork" },
     { "source": "/init-hooks", "destination": "/hooks/init" },

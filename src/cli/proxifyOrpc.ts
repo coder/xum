@@ -656,6 +656,11 @@ function createProcedureProxy(
       // trpc-cli reads the legacy singular field, oRPC >=1.14 `call()` reads the array.
       inputSchema: enhancedInputSchema,
       inputSchemas: enhancedInputSchema === undefined ? undefined : [enhancedInputSchema],
+      // The server already validated the output. The RPC wire drops undefined object keys, so
+      // re-validating the received value rejects valid replies: Ok(undefined) arrives as
+      // { success: true } and fails ResultSchema(z.void()) (#7854).
+      outputSchema: undefined,
+      outputSchemas: [],
       // Keep the original middlewares empty for the proxy - we don't need them
       // since the server will run its own middleware chain
       middlewares: [],

@@ -1,4 +1,6 @@
 import * as path from "node:path";
+import { resolveTurnAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { getSendProviderOptions } from "@/common/utils/ai/chatServiceTier";
 import { agentPluginHookService } from "./agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "./agentPlugins/mcpConfig";
 import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
@@ -12,26 +14,32 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import {
+  anthropicBetweenToolsRouteAvailable,
   buildProviderOptions,
   buildRequestHeaders,
   isAnthropic1MEffectivelyEnabled,
+  resolveRequestProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
-import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
+import {
+  assistantThinkingLevels,
+  enforceThinkingPolicy,
+  resolveBetweenToolsThinkingLevel,
+} from "@/common/utils/thinking/policy";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import type { Config } from "@/node/config";
-import {
-  createRuntimeContextForWorkspace,
-  resolveWorkspaceRootPath,
-} from "@/node/runtime/runtimeHelpers";
+import { resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
 import type { AgentSessionAIService } from "./agentSession";
 import { resolveAgentForStream } from "./agentResolution";
 import {
   resolveAgentBody,
   getSkipScopesAboveForKnownScope,
 } from "./agentDefinitions/agentDefinitionsService";
+import { resolveChainAgentCacheTtl } from "./agentDefinitions/resolveNodeAgentAiSettings";
 import type { ContinuousCompactionContext } from "./continuousCompactor";
 import { looksLikeRawJsonObject } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
@@ -45,6 +53,11 @@ export async function summarizeContinuousCompaction(args: {
   aiService: AgentSessionAIService;
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   head: MuxMessage[];
+  /**
+   * Rows searched for the thinking-repair receipt: the whole segment, head included. Required
+   * so a caller cannot silently fall back to the head alone (#5996).
+   */
+  receiptRows: MuxMessage[];
   signal: AbortSignal;
   context: ContinuousCompactionContext;
   baseOptions: SendMessageOptions;
@@ -75,7 +88,8 @@ export async function summarizeContinuousCompaction(args: {
   const metadata = await args.aiService.getWorkspaceMetadata(args.workspaceId);
   if (!metadata.success) throw new Error(metadata.error);
   args.signal.throwIfAborted();
-  const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata.data);
+  const runtimeFactory = args.aiService.runtimeFactory;
+  const { runtime, workspacePath } = runtimeFactory.createRuntimeContextForWorkspace(metadata.data);
   const pluginContext = resolveAgentPluginsMcpContext(
     metadata.data,
     resolveWorkspaceRootPath(metadata.data, runtime)
@@ -85,32 +99,44 @@ export async function summarizeContinuousCompaction(args: {
     workspaceId: args.workspaceId,
     sessionDir,
     journal: sharedDurableEventJournal(sessionDir),
-    enabled: args.aiService.isAgentPluginsEnabled?.() === true,
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
+    projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
   });
+  const sandboxEnv = await args.aiService.getWorkspaceSandboxEnv(metadata.data);
   args.signal.throwIfAborted();
+  const cfg = args.config.loadConfigOrDefault();
   const agent = await resolveAgentForStream({
     workspaceId: args.workspaceId,
     metadata: metadata.data,
     runtime,
     workspacePath,
+    runtimeFactory,
     requestedAgentId: "compact",
     disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
     callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
-    cfg: args.config.loadConfigOrDefault(),
+    cfg,
     emitError: () => undefined,
-    includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
+    sandboxEnv,
   });
   if (!agent.success) throw new Error(`Cannot resolve compact agent: ${agent.error.type}`);
+  // A summary is a Compact run, so it keeps Compact's prompt-cache TTL (its built-in 5m under a
+  // global 1h) as a /compact turn does.
+  const agentCacheTtl = resolveChainAgentCacheTtl(
+    agent.data.effectiveAgentId,
+    cfg.agentAiDefaults,
+    agent.data.agentAiSettingsChain
+  );
   const system = await resolveAgentBody(
     agent.data.agentDiscoveryRuntime,
     agent.data.agentDiscoveryPath,
     agent.data.agentDefinition.id,
     {
-      includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
       skipScopesAbove: getSkipScopesAboveForKnownScope(agent.data.agentDefinition.scope),
+      projectPluginsTrusted: agent.data.projectPluginsTrusted,
+      runtimeFactory,
+      sandboxEnv,
     }
   );
   args.signal.throwIfAborted();
@@ -118,24 +144,56 @@ export async function summarizeContinuousCompaction(args: {
     workspaceId: args.workspaceId,
     agentInitiated: true,
     thinkingLevel: initialThinkingLevel,
-    providerOptions: options.providerOptions,
+    // Summaries run at the chat's speed, not the provider-wide one.
+    providerOptions: getSendProviderOptions(options),
+    getAnthropicCacheTtlOverride: () => agentCacheTtl,
   });
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {
     args.signal.throwIfAborted();
-    const thinkingLevel = enforceThinkingPolicy(
-      created.data.optionsModelString,
-      coerceThinkingLevel(options.thinkingLevel) ?? "off",
-      undefined,
-      created.data.optionsProvidersConfig
+    // Resolve Sonnet 5.5 "off" (between_tools or low adaptive, #5086) before message
+    // preparation so the prepared messages and the provider options agree.
+    const thinkingLevel = resolveBetweenToolsThinkingLevel(
+      resolveModelForMetadata(
+        created.data.optionsModelString,
+        created.data.optionsProvidersConfig ?? null
+      ),
+      enforceThinkingPolicy(
+        created.data.optionsModelString,
+        coerceThinkingLevel(options.thinkingLevel) ?? "off",
+        undefined,
+        created.data.optionsProvidersConfig
+      ),
+      anthropicBetweenToolsRouteAvailable(
+        created.data.optionsModelString,
+        created.data.optionsRouteProvider,
+        created.data.optionsProvidersConfig
+      ),
+      assistantThinkingLevels(sliceMessagesForProviderFromLatestContextBoundary(args.head))
     );
     const prepared = prepareProviderRequestMessages(
       args.head,
       created.data.wireProviderName,
       thinkingLevel
     );
+    const providerOptions = buildProviderOptions(
+      created.data.optionsModelString,
+      thinkingLevel,
+      // The provider-visible rows: buildProviderOptions re-runs the #5086 effort pin,
+      // which must see the same boundary-sliced history as the resolution above.
+      prepared.providerRequestMessages,
+      undefined,
+      created.data.optionsMuxProviderOptions,
+      args.workspaceId,
+      undefined,
+      created.data.optionsProvidersConfig,
+      created.data.optionsRouteProvider,
+      undefined,
+      options.reasoningMode
+    );
     const messages = await prepareMessagesForProvider({
       messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+      replayReceiptMessages: args.receiptRows,
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
       postCompactionAttachments: null,
@@ -143,7 +201,22 @@ export async function summarizeContinuousCompaction(args: {
       effectiveThinkingLevel: thinkingLevel,
       modelString: created.data.optionsModelString,
       providersConfig: created.data.optionsProvidersConfig,
+      // Routes without the Anthropic cache fetch wrapper, such as OpenRouter, send the markers
+      // written here as they are, so they need the TTL a /compact turn's markers get.
+      anthropicCacheTtl: resolveTurnAnthropicCacheTtl({
+        agentCacheTtl,
+        modelString: created.data.optionsModelString,
+        providersConfig: created.data.optionsProvidersConfig,
+        muxProviderOptions: created.data.optionsMuxProviderOptions,
+        providerOptions,
+      }),
       workspaceId: args.workspaceId,
+      toolCallReplayNamespace: resolveRequestProviderOptionsNamespaceKey(
+        created.data.wireProviderName,
+        created.data.optionsModelString,
+        created.data.optionsProvidersConfig,
+        created.data.optionsRouteProvider
+      ),
     });
     messages.push({
       role: "user",
@@ -184,19 +257,9 @@ export async function summarizeContinuousCompaction(args: {
       tools: Object.keys(assembleContext.tools).length > 0 ? assembleContext.tools : undefined,
       messages,
       abortSignal: args.signal,
-      providerOptions: buildProviderOptions(
-        created.data.optionsModelString,
-        thinkingLevel,
-        args.head,
-        undefined,
-        created.data.optionsMuxProviderOptions,
-        args.workspaceId,
-        undefined,
-        created.data.optionsProvidersConfig,
-        created.data.optionsRouteProvider,
-        undefined,
-        options.reasoningMode
-      ) as NonNullable<Parameters<typeof streamText>[0]["providerOptions"]>,
+      providerOptions: providerOptions as NonNullable<
+        Parameters<typeof streamText>[0]["providerOptions"]
+      >,
       headers: buildRequestHeaders(
         created.data.optionsModelString,
         created.data.optionsMuxProviderOptions,

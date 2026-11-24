@@ -1,7 +1,11 @@
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useRef, useSyncExternalStore } from "react";
 import { getStorageChangeEvent } from "@/common/constants/events";
-import { getPersistedKeyKind } from "@/common/constants/storage";
+import {
+  MAX_PERSISTED_KEY_CHARS,
+  getPersistedKeyKind,
+  getPersistedKeyRegistration,
+} from "@/common/constants/storage";
 
 type SetValue<T> = T | ((prev: T) => T);
 
@@ -9,31 +13,6 @@ interface Subscriber {
   callback: () => void;
   componentId: string;
   listener: boolean;
-}
-
-export type PersistedStateWriteSource = "local" | "backend";
-
-export interface PersistedStateWriteEvent {
-  key: string;
-  newValue: unknown;
-  source: PersistedStateWriteSource;
-}
-
-type PersistedStateWriteListener = (event: PersistedStateWriteEvent) => void;
-
-const writeListeners = new Set<PersistedStateWriteListener>();
-
-export function subscribePersistedStateWrites(listener: PersistedStateWriteListener): () => void {
-  writeListeners.add(listener);
-  return () => {
-    writeListeners.delete(listener);
-  };
-}
-
-function notifyWriteListeners(event: PersistedStateWriteEvent): void {
-  for (const listener of writeListeners) {
-    listener(event);
-  }
 }
 
 const subscribersByKey = new Map<string, Set<Subscriber>>();
@@ -53,13 +32,13 @@ function addSubscriber(key: string, subscriber: Subscriber): () => void {
   };
 }
 
-function notifySubscribers(key: string, origin?: string, includeNonListeners = false) {
+function notifySubscribers(key: string, origin?: string) {
   const subs = subscribersByKey.get(key);
   if (!subs) return;
 
   for (const sub of subs) {
-    // If listener=false, only react to this hook instance or explicit cache hydration.
-    if (!includeNonListeners && !sub.listener) {
+    // If listener=false, only react to this hook instance.
+    if (!sub.listener) {
       if (!origin || origin !== sub.componentId) continue;
     }
     sub.callback();
@@ -92,7 +71,7 @@ function reportWriteFailureOnce(key: string, error: unknown): void {
 
 /**
  * Free space by removing registry `cache` keys (refetchable data such as LRU cache entries and
- * cached plan content). Drafts, review data and preferences are never evicted: losing them is the
+ * cached backend lists). Drafts, review data and preferences are never evicted: losing them is the
  * failure this eviction exists to prevent. Returns how many keys were removed.
  */
 function evictCacheKeys(storage: Storage): number {
@@ -107,35 +86,149 @@ function evictCacheKeys(storage: Storage): number {
   return cacheKeys.length;
 }
 
+const keysWithReportedRefusals = new Set<string>();
+
 /**
- * The single low-level localStorage write for persisted state. null/undefined remove the key.
- * On QuotaExceededError it evicts cache keys and retries once. Returns false when the value could
- * not be stored; callers skip change notifications then, because nothing changed on disk.
+ * Serialized values of registered keys that were over their budget, kept for this session only.
+ * Budgets bound what reaches localStorage, but refusing such a write outright froze the UI that
+ * wrote it (a split or terminal tab that never appears, a file filter stuck on the old file),
+ * because owners render the stored value. Every reader here serves this value instead, so the
+ * app keeps working; localStorage keeps the last value that fit, which a reload restores.
+ * A later successful write, a removal, or a cross-tab change of the key drops the entry.
+ */
+const overBudgetValuesByStorage = new WeakMap<Storage, Map<string, string>>();
+
+/** Over-budget session values of the current localStorage (per storage so none leak into another). */
+function getOverBudgetSessionValues(): Map<string, string> {
+  const storage = window.localStorage;
+  let values = overBudgetValuesByStorage.get(storage);
+  if (!values) {
+    values = new Map();
+    overBudgetValuesByStorage.set(storage, values);
+  }
+  return values;
+}
+
+/** The value readers observe for `key`: an over-budget session value, else localStorage. */
+function getStoredRaw(key: string): string | null {
+  return getOverBudgetSessionValues().get(key) ?? window.localStorage.getItem(key);
+}
+
+interface BudgetViolation {
+  reason: string;
+  /** Registered key whose value is over its budget: kept in memory instead of refused. */
+  overValueBudget: boolean;
+}
+
+/**
+ * Why a write of `serialized` to `key` breaks the key registry's budgets, or null when it fits.
+ * Budgets keep localStorage bounded: without them one growing value or unregistered key family
+ * can fill the shared origin quota (see PERSISTED_KEY_REGISTRY).
+ */
+function getBudgetViolation(key: string, serialized: string): BudgetViolation | null {
+  if (key.length > MAX_PERSISTED_KEY_CHARS) {
+    return {
+      reason: `key is ${key.length} chars, over the ${MAX_PERSISTED_KEY_CHARS}-char key cap`,
+      overValueBudget: false,
+    };
+  }
+  const registration = getPersistedKeyRegistration(key);
+  if (!registration) {
+    return {
+      reason: "key is not registered in PERSISTED_KEY_REGISTRY (src/common/constants/storage.ts)",
+      overValueBudget: false,
+    };
+  }
+  if (serialized.length > registration.maxValueChars) {
+    return {
+      reason:
+        `value is ${serialized.length} chars, over its ${registration.maxValueChars}-char ` +
+        "budget; it is kept in memory for this session only",
+      overValueBudget: true,
+    };
+  }
+  return null;
+}
+
+/**
+ * Budget violations are logged instead of thrown: an exception would break the component that
+ * wrote it. A refusal (unregistered or overlong key) is a bug to fix, so it is an error. An
+ * over-budget value still works for the session and can happen in heavy but normal use (e.g. very
+ * many terminal tabs), so it is only a warning. Tests assert both through the return value, the
+ * stored value and these logs.
+ */
+function reportBudgetViolationOnce(key: string, violation: BudgetViolation): void {
+  if (keysWithReportedRefusals.has(key)) return;
+  keysWithReportedRefusals.add(key);
+  // Oversized keys are refused too; don't echo a multi-kilobyte key into the console.
+  const shownKey = key.length > 200 ? `${key.slice(0, 200)}...` : key;
+  if (violation.overValueBudget) {
+    console.warn(
+      `Not persisting localStorage key "${shownKey}": ${violation.reason} (further warnings for this key are not logged)`
+    );
+    return;
+  }
+  console.error(
+    `Refused localStorage write to "${shownKey}": ${violation.reason} (further refusals for this key are not logged)`
+  );
+}
+
+/**
+ * The single low-level localStorage write for persisted state. null/undefined remove the key;
+ * removal is always allowed so legacy cleanups work for keys that are no longer registered.
+ * Writes to unregistered keys (or keys over the length cap) are refused; a value over its key's
+ * budget is kept in memory only (see overBudgetValuesByStorage). On QuotaExceededError it evicts
+ * cache keys and retries once. Returns true when readers now observe the new value; false when
+ * it was refused or could not be stored, and callers skip change notifications then.
  */
 function writePersistedValue(key: string, newValue: unknown): boolean {
-  const storage = window.localStorage;
   if (newValue === undefined || newValue === null) {
-    storage.removeItem(key);
+    getOverBudgetSessionValues().delete(key);
+    window.localStorage.removeItem(key);
     return true;
   }
+  return writeSerializedValue(key, JSON.stringify(newValue)) !== "failed";
+}
 
-  const serialized = JSON.stringify(newValue);
+/**
+ * Outcome of a write: on disk, in memory for this session only (over its budget), or not stored
+ * at all (refused, or the quota was full even after evicting caches).
+ */
+type WriteOutcome = "stored" | "session" | "failed";
+
+/** Store an already-serialized value (see writePersistedValue for the quota handling). */
+function writeSerializedValue(key: string, serialized: string): WriteOutcome {
+  const violation = getBudgetViolation(key, serialized);
+  if (violation !== null) {
+    reportBudgetViolationOnce(key, violation);
+    if (!violation.overValueBudget) return "failed";
+    getOverBudgetSessionValues().set(key, serialized);
+    return "session";
+  }
+  return storeSerializedValue(key, serialized);
+}
+
+/** setItem with the quota handling (evict caches, retry once); no budget checks. */
+function storeSerializedValue(key: string, serialized: string): WriteOutcome {
+  const storage = window.localStorage;
   try {
     storage.setItem(key, serialized);
-    return true;
+    getOverBudgetSessionValues().delete(key);
+    return "stored";
   } catch (error) {
     if (!isQuotaExceededError(error) || evictCacheKeys(storage) === 0) {
       reportWriteFailureOnce(key, error);
-      return false;
+      return "failed";
     }
   }
 
   try {
     storage.setItem(key, serialized);
-    return true;
+    getOverBudgetSessionValues().delete(key);
+    return "stored";
   } catch (retryError) {
     reportWriteFailureOnce(key, retryError);
-    return false;
+    return "failed";
   }
 }
 
@@ -151,12 +244,27 @@ function ensureStorageListenerInstalled() {
 
   window.addEventListener("storage", (e: StorageEvent) => {
     if (!e.key) return;
+    // Another tab's value wins over this tab's in-memory over-budget value.
+    getOverBudgetSessionValues().delete(e.key);
     // Cross-tab update: only listener=true subscribers should react.
     notifySubscribers(e.key);
   });
 
   storageListenerInstalled = true;
 }
+/**
+ * Whether localStorage can be used. Browsers that deny storage access throw from the
+ * window.localStorage getter itself; reads run in render paths (state initializers), so they fall
+ * back to their defaults instead of throwing.
+ */
+function isLocalStorageReadable(): boolean {
+  try {
+    return typeof window !== "undefined" && Boolean(window.localStorage);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Read a persisted state value from localStorage (non-hook version)
  * Mirrors the reading logic from usePersistedState
@@ -166,12 +274,12 @@ function ensureStorageListenerInstalled() {
  * @returns The parsed value or defaultValue
  */
 export function readPersistedState<T>(key: string, defaultValue: T): T {
-  if (typeof window === "undefined" || !window.localStorage) {
+  if (!isLocalStorageReadable()) {
     return defaultValue;
   }
 
   try {
-    const storedValue = window.localStorage.getItem(key);
+    const storedValue = getStoredRaw(key);
     if (storedValue === null || storedValue === "undefined") {
       return defaultValue;
     }
@@ -182,6 +290,20 @@ export function readPersistedState<T>(key: string, defaultValue: T): T {
   }
 }
 
+/** Every persisted key starting with `prefix` (e.g. to migrate a family of legacy keys). */
+export function listPersistedKeys(prefix: string): string[] {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return [];
+  }
+  const storage = window.localStorage;
+  const keys: string[] = [];
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index);
+    if (key?.startsWith(prefix)) keys.push(key);
+  }
+  return keys;
+}
+
 /**
  * Read a persisted string value from localStorage.
  *
@@ -189,11 +311,11 @@ export function readPersistedState<T>(key: string, defaultValue: T): T {
  * strings (not JSON) by legacy code.
  */
 export function readPersistedString(key: string): string | undefined {
-  if (typeof window === "undefined" || !window.localStorage) {
+  if (!isLocalStorageReadable()) {
     return undefined;
   }
 
-  const storedValue = window.localStorage.getItem(key);
+  const storedValue = getStoredRaw(key);
   if (storedValue === null || storedValue === "undefined") {
     return undefined;
   }
@@ -232,6 +354,131 @@ export function listPersistedStateKeys(prefixes: readonly string[]): string[] {
 }
 
 /**
+ * Read a stored value exactly as written (no JSON parsing), or null when absent/unavailable.
+ * For keys whose on-disk format must stay raw so older builds can still read them.
+ */
+export function readPersistedRawString(key: string): string | null {
+  // The availability check is inside the try: browsers that deny storage access throw from the
+  // window.localStorage getter itself, and callers (e.g. the auth token read during render) expect
+  // null then.
+  try {
+    if (typeof window === "undefined" || !window.localStorage) {
+      return null;
+    }
+    return getStoredRaw(key);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Store `value` verbatim (no JSON encoding) through the shared write path. Used for raw-format
+ * keys and for copying already-serialized values (workspace fork). Does not notify subscribers:
+ * raw keys have no hook consumers, and fork copies target a scope nothing has mounted yet.
+ * Returns true only when the value reached localStorage. A value over its budget is still kept
+ * in memory for this session but reports false: callers copy or save durable data (a workspace
+ * migration deletes the source afterwards), so a session-only copy is not a success.
+ */
+export function writePersistedRawString(key: string, value: string): boolean {
+  try {
+    // Inside the try for the same reason as readPersistedRawString.
+    if (typeof window === "undefined" || !window.localStorage) {
+      return false;
+    }
+    return writeSerializedValue(key, value) === "stored";
+  } catch (error) {
+    reportWriteFailureOnce(key, error);
+    return false;
+  }
+}
+
+/**
+ * Copy an existing value of a legacy migration-only key (registered with maxValueChars 0) verbatim,
+ * e.g. to a workspace fork. Features never write these keys, so they have no budget; a fork still
+ * needs the source's not-yet-imported legacy data so its own one-time import finds it. The data
+ * already exists, so a copy cannot grow it beyond one more copy until that import removes it.
+ * Returns true only when the value reached localStorage.
+ */
+export function copyLegacyPersistedRawString(key: string, value: string): boolean {
+  try {
+    if (!isLocalStorageReadable()) return false;
+    const registration = getPersistedKeyRegistration(key);
+    if (registration?.maxValueChars !== 0 || key.length > MAX_PERSISTED_KEY_CHARS) {
+      reportBudgetViolationOnce(key, {
+        reason: "only registered legacy keys (maxValueChars 0) can be copied without a budget",
+        overValueBudget: false,
+      });
+      return false;
+    }
+    return storeSerializedValue(key, value) === "stored";
+  } catch (error) {
+    reportWriteFailureOnce(key, error);
+    return false;
+  }
+}
+
+/**
+ * Remove many keys in one pass (startup cleanups, workspace deletion, orphan GC), then notify
+ * hook subscribers once per key so mounted consumers do not write a stale value back. Unlike
+ * updatePersistedState it dispatches no per-key window CustomEvent: the only
+ * key-specific window listeners (sidebar last-read keys of listed workspaces, resizable sidebar
+ * widths, experiment flags) never watch keys these callers remove.
+ */
+export function removePersistedStateKeys(keys: readonly string[]): void {
+  if (typeof window === "undefined" || !window.localStorage || keys.length === 0) {
+    return;
+  }
+  const storage = window.localStorage;
+  // Absent keys are skipped so callers that pass every possible key (workspace deletion) do not
+  // wake subscribers for values that never existed.
+  const removed = keys.filter(
+    (key) => storage.getItem(key) !== null || getOverBudgetSessionValues().has(key)
+  );
+  for (const key of removed) {
+    getOverBudgetSessionValues().delete(key);
+    storage.removeItem(key);
+  }
+  for (const key of removed) {
+    notifySubscribers(key);
+  }
+}
+
+const persistedStateStorageViews = new WeakMap<Storage, Storage>();
+
+/**
+ * A read view of the persisted state, or null outside a browser. Only for reads and identity
+ * checks by code that takes an injectable Storage (tests pass their own); writes must go through
+ * updatePersistedState/removePersistedStateKeys. getItem returns what the helpers' readers
+ * return, including a session-only over-budget value, so a caller never reads an older on-disk
+ * value than the one the user just set. The view is stable per Storage, so identity checks
+ * against it work.
+ */
+export function getPersistedStateStorage(): Storage | null {
+  if (!isLocalStorageReadable()) {
+    return null;
+  }
+  const storage = window.localStorage;
+  let view = persistedStateStorageViews.get(storage);
+  if (!view) {
+    const refuseWrite = (): never => {
+      throw new Error("Write persisted state through the persisted-state helpers");
+    };
+    view = {
+      get length() {
+        return storage.length;
+      },
+      key: (index) => storage.key(index),
+      getItem: (key) => getStoredRaw(key),
+      setItem: refuseWrite,
+      removeItem: refuseWrite,
+      clear: refuseWrite,
+    };
+    persistedStateStorageViews.set(storage, view);
+  }
+  return view;
+}
+
+/**
  * Update a persisted state value from outside the hook.
  * This is useful when you need to update state from a different component/context
  * that doesn't have access to the setter (e.g., command palette updating workspace state).
@@ -262,8 +509,6 @@ export function updatePersistedState<T>(
       return false;
     }
 
-    notifyWriteListeners({ key, newValue, source: "local" });
-
     // Notify same-tab subscribers (usePersistedState) immediately.
     notifySubscribers(key);
 
@@ -277,28 +522,6 @@ export function updatePersistedState<T>(
   } catch (error) {
     reportWriteFailureOnce(key, error);
     return false;
-  }
-}
-
-export function syncPersistedStateFromBackend(key: string, newValue: unknown): void {
-  if (typeof window === "undefined" || !window.localStorage) {
-    return;
-  }
-
-  try {
-    if (!writePersistedValue(key, newValue)) {
-      return;
-    }
-
-    notifyWriteListeners({ key, newValue, source: "backend" });
-    notifySubscribers(key, undefined, true);
-
-    const customEvent = new CustomEvent(getStorageChangeEvent(key), {
-      detail: { key, newValue, source: "backend" },
-    });
-    window.dispatchEvent(customEvent);
-  } catch (error) {
-    reportWriteFailureOnce(key, error);
   }
 }
 
@@ -353,7 +576,7 @@ export function usePersistedState<T>(
     }
 
     try {
-      const raw = window.localStorage.getItem(key);
+      const raw = getStoredRaw(key);
 
       if (raw === null || raw === "undefined") {
         if (snapshotRef.current?.key === key && snapshotRef.current.raw === null) {
@@ -399,8 +622,6 @@ export function usePersistedState<T>(
         if (!writePersistedValue(key, newValue)) {
           return;
         }
-
-        notifyWriteListeners({ key, newValue, source: "local" });
 
         // Notify hook subscribers synchronously (keeps UI responsive).
         notifySubscribers(key, componentIdRef.current);

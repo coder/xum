@@ -8,9 +8,8 @@ import * as path from "path";
  * (backend refuses when off), one-run-at-a-time-per-workspace locking
  * (concurrent invocations are REJECTED, not queued — an explicit /refine has
  * nothing to gain from running twice over the same trajectory), trajectory
- * assembly (recent chat.jsonl + timeline events when the Timeline experiment
- * is on), model resolution, journal-row correlation, and the completion chat
- * message.
+ * assembly (recent chat.jsonl + timeline events), model resolution,
+ * journal-row correlation, and the completion chat message.
  *
  * v1 tradeoff (intentional, no proposal/approval UI): edits are auto-applied
  * and the summary row points at the r6 rollback paths ("bun run debug
@@ -26,7 +25,7 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import type { LanguageModel, Tool } from "ai";
 
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { ExperimentId } from "@/common/constants/experiments";
 import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
@@ -49,17 +48,13 @@ import {
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import {
-  buildAbandonedBranchTranscript,
-  isRlmModeEnabled,
-  type RlmExperimentFlags,
-} from "@/node/services/branchSummary";
+import { buildAbandonedBranchTranscript, isRlmModeEnabled } from "@/node/services/branchSummary";
 import {
   findLatestContextBoundaryIndex,
   isDurableContextResetBoundaryMarker,
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
   isWorkspaceRemovalTombstoned,
   refineApplyLockPath,
@@ -100,6 +95,8 @@ import {
   resolveProjectSkillWriteTargetPath,
 } from "@/node/services/tools/agent_skill_write";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { createRefineSummaryMessageId } from "@/node/services/utils/messageIds";
 
 // Types derive from the oRPC schemas (z.infer single source) so node-side
@@ -336,21 +333,12 @@ export class RefineService {
     private readonly options: RefineServiceOptions = {}
   ) {}
 
-  private enabled(experiments?: RlmExperimentFlags): boolean {
-    // RLM is a sub-experiment of Programmatic Tool Calling; both machine
-    // overrides must be on. Explicit renderer flags ride the request with the
-    // same authority as send options.experiments (r32): persisting overrides
-    // to the backend is asynchronous/best-effort, so a backend-only predicate
-    // could refuse /refine while the same workspace is already running with
-    // the RLM kernel the renderer sees.
-    return isRlmModeEnabled(experiments, (id) => this.experiments.isExperimentEnabled(id));
+  private enabled(): boolean {
+    return isRlmModeEnabled((id) => this.experiments.isExperimentEnabled(id));
   }
 
-  async run(
-    workspaceId: string,
-    experiments?: RlmExperimentFlags
-  ): Promise<Result<RefineRecord, string>> {
-    if (!this.enabled(experiments)) {
+  async run(workspaceId: string): Promise<Result<RefineRecord, string>> {
+    if (!this.enabled()) {
       return Err("rlm-mode experiment is disabled (enable Programmatic Tool Calling + RLM Mode)");
     }
     if (this.inFlight.has(workspaceId)) {
@@ -410,10 +398,9 @@ export class RefineService {
      * that only its own renderer displayed, so binding approval to the
      * newest transcript row would apply edits this user never audited.
      */
-    approvedProposalHash: string,
-    experiments?: RlmExperimentFlags
+    approvedProposalHash: string
   ): Promise<Result<RefineRecord, string>> {
-    if (!this.enabled(experiments)) {
+    if (!this.enabled()) {
       return Err("rlm-mode experiment is disabled (enable Programmatic Tool Calling + RLM Mode)");
     }
     if (this.inFlight.has(workspaceId)) {
@@ -447,9 +434,10 @@ export class RefineService {
     // two processes could both capture an empty attempted set and double-
     // apply a non-idempotent edit. Short acquisition timeout: a held lock
     // means another apply is running, mirror the in-process rejection.
-    let applyLock: Awaited<ReturnType<typeof acquireProcessFileLock>>;
+    let applyLock: ProcessFileLock;
     try {
-      applyLock = await acquireProcessFileLock({
+      // The history service's SessionLocks (phase 4): the same layer as removal's refine lock.
+      applyLock = await this.historyService.locks.acquireProcessFileLock({
         // r66: session-dir-external (see refineApplyLockPath) — removal holds
         // this same lock across its tombstone+delete critical section, so an
         // in-flight apply completes before the deletion and a late one
@@ -1042,6 +1030,7 @@ export class RefineService {
 
       const result = await runRefinePass({
         model: modelResult.data.model,
+        pricingModel: modelResult.data.metadataModel,
         memoryService: this.memoryService,
         metaService: this.metaService,
         ctx,
@@ -1111,9 +1100,9 @@ export class RefineService {
       // overwritten by that stale spread — the new proposal row would remain
       // in chat with a hash that no longer matches the file, losing the new
       // edits and failing later applies closed.
-      let stagingLock: Awaited<ReturnType<typeof acquireProcessFileLock>>;
+      let stagingLock: ProcessFileLock;
       try {
-        stagingLock = await acquireProcessFileLock({
+        stagingLock = await this.historyService.locks.acquireProcessFileLock({
           // r66: session-dir-external (see refineApplyLockPath).
           lockPath: refineApplyLockPath(this.config.rootDir, workspaceId),
           timeoutMs: this.options.applyLockTimeoutMs ?? REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
@@ -1253,9 +1242,17 @@ export class RefineService {
     }
   }
 
+  /**
+   * The history's file and lock layers: the journal that the turn (aiService) and this service's
+   * skill-write tool write, so the seq baseline and the staged rows come from one journal (#7326).
+   */
+  private journalLayers(): { files: SessionFiles; locks: SessionLocks } {
+    return { files: this.historyService.files, locks: this.historyService.locks };
+  }
+
   /** Newest journal seq, or -1 for a fresh/absent journal. */
   private async readMaxJournalSeq(sessionDir: string): Promise<number> {
-    const events = await sharedDurableEventJournal(sessionDir).read();
+    const events = await sharedDurableEventJournal(sessionDir, this.journalLayers()).read();
     return events.reduce((max, event) => Math.max(max, event.seq), -1);
   }
 
@@ -1272,7 +1269,7 @@ export class RefineService {
   ): Promise<Array<{ row: RefinementEvent; toolCallId: string }>> {
     if (toolCallIds.length === 0) return [];
     const callIds = new Set(toolCallIds);
-    const rows = await listRefinements(sessionDir);
+    const rows = await listRefinements(sessionDir, this.journalLayers());
     const matched: Array<{ row: RefinementEvent; toolCallId: string }> = [];
     for (const row of rows) {
       if (row.seq <= baselineSeq || row.workspaceId !== workspaceId) continue;
@@ -1481,6 +1478,8 @@ export class RefineService {
         runtimeTempDir: os.tmpdir(),
         workspaceSessionDir: sessionDir,
         workspaceId,
+        sessionLocks: this.historyService.locks,
+        sessionFiles: this.historyService.files,
         xumScope: {
           type: "project",
           xumHome: this.config.rootDir,
@@ -1500,12 +1499,11 @@ export class RefineService {
     }
   }
 
-  /** Timeline digest when the Timeline experiment is on; undefined otherwise. */
+  /** Timeline digest when a timeline service is wired; undefined otherwise. */
   private async buildTimelineText(
     workspaceId: string,
     sinceTs?: number
   ): Promise<string | undefined> {
-    if (!this.experiments.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE)) return undefined;
     if (this.options.timelineService === undefined) return undefined;
     try {
       const page = await this.options.timelineService.list(workspaceId, {

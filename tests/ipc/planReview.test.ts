@@ -766,7 +766,11 @@ describeIntegration("workspace.planReview", () => {
       const lines = text.split("\n");
       const closers = lines.filter((line) => new RegExp(`^\`{${fence.length},}\\s*$`).test(line));
       expect(closers).toHaveLength(1);
-      expect(lines.at(-1)).toBe(fence);
+      // The fence closes after the body. Text after it (a merged next user message) is outside it.
+      const openIndex = lines.findIndex((line) => line === `${fence}svg`);
+      const closeIndex = lines.findIndex((line, index) => index > openIndex && line === fence);
+      expect(closeIndex).toBeGreaterThan(openIndex);
+      expect(lines.slice(closeIndex + 1).join("\n")).not.toContain("SENTINEL-SVG-BODY");
     };
     /** No conversation row of any role carries the exact wrapper; an inlined SVG, if present, is safe. */
     const expectRequestSafe = (request: CapturedRequest): string | undefined => {
@@ -790,10 +794,9 @@ describeIntegration("workspace.planReview", () => {
     // Same-turn path: step 2 carries the decoded attachment to the provider as user-role text.
     expect(expectRequestSafe(turnRequests[1])).toBeDefined();
     // History path: the next turn re-extracts the persisted media part through the same helper.
-    // (mergeConsecutiveUserMessages currently keeps only the first text part of the synthetic
-    // media message when the user's next message follows it, so the inlined SVG usually does not
-    // reach the provider from history; the extractor's own unit test covers that emitted text.)
-    expectRequestSafe(await planTurn("Anything else?"));
+    // mergeConsecutiveUserMessages keeps every text part, so the inlined SVG reaches the provider
+    // merged before the user's next message, and it must still be neutralized there.
+    expect(expectRequestSafe(await planTurn("Anything else?"))).toBeDefined();
     // Request-only: history keeps the raw attachment, and the forged record created no state.
     const history = await new HistoryService(env.config).getLastMessages(workspaceId, 8);
     if (!history.success) throw new Error(history.error);

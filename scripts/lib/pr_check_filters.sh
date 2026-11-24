@@ -4,11 +4,19 @@
 visual_check_jq_defs() {
   cat <<'JQ'
 def check_text($field): (.[$field] // "" | tostring | ascii_downcase);
+# A PR author names the jobs and workflows of its own Actions runs, so a check run counts as
+# visual review only with both names of Pixel's real job. Only repo writers and installed apps
+# can post a status context, so a status keeps the name and link rules. A check run can still
+# copy both names: GitHub's required checks gate the merge, and the gates print how many
+# checks they ignored.
 def is_visual_review_check:
-  (check_text("workflow") == "pixel")
-  or (check_text("name") == "visual regression testing")
-  or (check_text("name") | startswith("pixel /"))
-  or (check_text("link") | contains("pixel.coder.com"));
+  if .kind == "status" then
+    (check_text("name") == "visual regression testing")
+    or (check_text("name") | startswith("pixel /"))
+    or (check_text("link") | contains("pixel.coder.com"))
+  else
+    (check_text("workflow") == "pixel") and (check_text("name") == "visual regression testing")
+  end;
 def is_failed_check:
   (.bucket | IN("fail", "cancel"))
   or (.state | IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"));
@@ -17,17 +25,47 @@ def is_pending_check:
   or (.state | IN("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"));
 def is_passing_check:
   (.bucket == "pass") or (.state == "SUCCESS");
+def is_skipped_check: .state | IN("SKIPPED", "NEUTRAL");
 def is_unready_check: is_failed_check or is_pending_check;
+# One statusCheckRollup context, as selected by check_context_graphql_fields.
+def normalize_check($oid):
+  if .__typename == "CheckRun" then
+    {id, kind: "check_run", name, state: (if .status == "COMPLETED" then .conclusion // "PENDING" else .status end),
+     link: .detailsUrl, description: "", workflow: (.checkSuite.workflowRun.workflow.name // ""),
+     suite: .checkSuite.id}
+  elif .__typename == "StatusContext" then
+    {id, kind: "status", name: .context, state, link: .targetUrl, description, workflow: ""}
+  else error("Unknown check context") end
+  | .commit = $oid
+  | .bucket = (if .state == "CANCELLED" then "cancel"
+    elif is_failed_check then "fail" elif is_passing_check then "pass"
+    elif is_skipped_check then "skipping"
+    else "pending" end);
+# A field of another type than GitHub's schema gives it (a name that is an array, say) prints as fixed
+# text: @tsv fails on such a value, and jq then quotes the start of it in its message.
+def text_or($default): if . == null then $default elif type == "string" then . else "<not text>" end;
 def check_line:
   [
-    (.name // "<unnamed>"),
-    (.bucket // "<unknown>"),
-    (.state // "<unknown>"),
-    (.link // ""),
-    (.description // ""),
-    (.commit // "")
+    (.name | text_or("<unnamed>")),
+    (.bucket | text_or("<unknown>")),
+    (.state | text_or("<unknown>")),
+    (.link | text_or("")),
+    (.description | text_or("")),
+    (.commit | text_or(""))
   ] | @tsv;
 JQ
+}
+
+# The fields normalize_check reads from one statusCheckRollup context node.
+check_context_graphql_fields() {
+  cat <<'GRAPHQL'
+__typename
+... on CheckRun {
+  id name status conclusion detailsUrl
+  checkSuite { id workflowRun { workflow { name } } }
+}
+... on StatusContext { id context state targetUrl description }
+GRAPHQL
 }
 
 # shellcheck disable=SC2016 # These are GraphQL variables, not shell variables.
@@ -76,14 +114,7 @@ fetch_pr_checks() {
               statusCheckRollup {
                 contexts(first: 100, after: $endCursor) {
                   pageInfo { hasNextPage endCursor }
-                  nodes {
-                    __typename
-                    ... on CheckRun {
-                      id name status conclusion detailsUrl
-                      checkSuite { id workflowRun { workflow { name } } }
-                    }
-                    ... on StatusContext { id context state targetUrl description }
-                  }
+                  nodes { '"$(check_context_graphql_fields)"' }
                 }
               }
             }
@@ -100,20 +131,7 @@ fetch_pr_checks() {
         or (.[-1].data.repository.object.statusCheckRollup |
           . != null and .contexts.pageInfo.hasNextPage != false)
       then error("Incomplete check pagination")
-      else [ .[].data.repository.object.statusCheckRollup.contexts.nodes[]? |
-        if .__typename == "CheckRun" then
-          {id, name, state: (if .status == "COMPLETED" then .conclusion // "PENDING" else .status end),
-           link: .detailsUrl, description: "", workflow: (.checkSuite.workflowRun.workflow.name // ""),
-           suite: .checkSuite.id}
-        elif .__typename == "StatusContext" then
-          {id, name: .context, state, link: .targetUrl, description, workflow: ""}
-        else error("Unknown check context") end
-        | .commit = $oid
-        | .bucket = (if .state == "CANCELLED" then "cancel"
-          elif is_failed_check then "fail" elif is_passing_check then "pass"
-          elif .state == "SKIPPED" or .state == "NEUTRAL" then "skipping"
-          else "pending" end)
-      ] end
+      else [ .[].data.repository.object.statusCheckRollup.contexts.nodes[]? | normalize_check($oid) ] end
     ' <<<"$pages") || return 1
     checks=$(printf '%s\n%s\n' "$checks" "$normalized" | jq -cs 'add') || return 1
   done

@@ -28,10 +28,13 @@
  *   Keep dynamic imports inside the functions that need them.
  * - Computed loaders, such as a `createRequire()` result or `require(variable)`, are
  *   invisible to the import graph.
+ * `make check-startup-imports-runtime` (scripts/check-startup-imports-runtime.ts) covers
+ * both for the desktop main process after a build.
  *
  * Run: bun scripts/check-startup-imports.ts
  */
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import { builtinModules } from "node:module";
 import * as path from "node:path";
 import * as esbuild from "esbuild";
@@ -46,26 +49,38 @@ export interface StartupEntry {
    * "commonjs" (tsc output, `require` branch) or "bundle" (bundled, `import` branch).
    */
   output: EntryOutput;
+  /** Build output the runtime actually loads, relative to the project root. */
+  dist: string;
 }
 
 export type EntryOutput = "commonjs" | "bundle";
 
+// The registration test in check-startup-imports.test.ts fails when package.json
+// `main`/`bin` or a BrowserWindow `preload:` script points at a build output that is not
+// some entry's `dist`. It cannot cheaply detect worker threads (e.g.
+// src/node/utils/main/workerPool.ts, the analytics worker) or CLI subcommand modules:
+// whether those start before the splash screen is runtime control flow, and worker
+// threads have their own module registry, so neither this static guard nor the runtime
+// check sees them. Register new ones here by hand.
 export const STARTUP_ENTRIES: readonly StartupEntry[] = [
   {
     entry: "src/cli/index.ts",
     reason: "CLI shim; runs before every subcommand and the desktop app",
     output: "commonjs",
+    dist: "dist/cli/index.js",
   },
   {
     entry: "src/desktop/main.ts",
     reason: "Electron main process before the splash screen (loadServices() loads the rest)",
     output: "commonjs",
+    dist: "dist/desktop/main.js",
   },
   {
     entry: "src/desktop/preload.ts",
     reason: "renderer preload script",
     // Makefile builds dist/preload.js with `bun build`, not tsc.
     output: "bundle",
+    dist: "dist/preload.js",
   },
 ];
 
@@ -83,6 +98,12 @@ export const BANNED_PACKAGES: readonly string[] = [
   "@openrouter/ai-sdk-provider",
   "ollama-ai-provider-v2",
   "typescript",
+  // Load only once services run (~170 ms together plus the zod-built schema modules);
+  // desktop main imports them lazily in loadServices() so they stay after the splash (#4423).
+  "effect",
+  "zod",
+  // The macOS agent sandbox (srt and its zod 3); only agent commands need it.
+  "@anthropic-ai/sandbox-runtime",
 ];
 
 export interface EagerImportViolation {
@@ -118,7 +139,7 @@ const RUNTIME_PROVIDED_PACKAGES = new Set(["electron"]);
 const CJS_RESOLVE = Symbol("cjs-resolve");
 
 /** Owning package of a resolved node_modules path ("node_modules/@a/b/x.js" -> "@a/b"). */
-function packageNameOfFile(file: string): string {
+export function packageNameOfFile(file: string): string {
   return packageNameOf(file.split("node_modules/").pop()!);
 }
 
@@ -156,6 +177,12 @@ export async function analyzeStartupImports(options: {
   assert(path.isAbsolute(options.rootDir), "rootDir must be absolute");
   assert(options.entries.length > 0, "at least one entry is required");
 
+  // esbuild reports importer paths through the real filesystem, so a symlinked root
+  // (macOS temp dirs: mkdtemp returns /var/folders/..., esbuild resolves importers to
+  // /private/var/folders/...) would make path.relative produce ../..-littered project
+  // paths that never match the metafile keys. Compare against the real root instead.
+  const rootDir = realpathSync(options.rootDir);
+
   // esbuild lists imports it elided (type-only or unused bindings) in the metafile as
   // unresolved externals without calling onResolve. Record the banned imports that were
   // really resolved so elided ones are not mistaken for eager loads. The kind is part of
@@ -163,8 +190,7 @@ export async function analyzeStartupImports(options: {
   const resolvedBannedImports = new Set<string>();
   const edgeKey = (importer: string, kind: string, specifier: string) =>
     `${importer}\0${kind}\0${specifier}`;
-  const toProjectPath = (file: string) =>
-    path.relative(options.rootDir, file).split(path.sep).join("/");
+  const toProjectPath = (file: string) => path.relative(rootDir, file).split(path.sep).join("/");
 
   const result = await esbuild.build({
     absWorkingDir: options.rootDir,

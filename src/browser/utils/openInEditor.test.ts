@@ -4,6 +4,7 @@ import { openInEditor } from "./openInEditor";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "@/common/constants/remoteConnection";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 interface GlobalWithOptionalWindow {
   window?: unknown;
@@ -118,6 +119,34 @@ describe("openInEditor", () => {
     expect(url.endsWith(`${filePath}:1:1`)).toBe(true);
   });
 
+  // A deferred-access SSH runtime (Coder) persists the default srcBaseDir (~/mux) unresolved, so
+  // only the backend can resolve the checkout path once the host is reachable.
+  test("opens the path the backend resolved for an SSH checkout under ~", async () => {
+    const calls: OpenCall[] = [];
+    const recordEditorOpen = mock((_input: { workspaceId: string; remotePath?: string | null }) =>
+      Promise.resolve({
+        success: true as const,
+        data: { remotePath: "/home/dev/mux/project/feature" },
+      })
+    );
+    const api = createTestApiClient({ general: { recordEditorOpen } });
+
+    const result = await withWindow(createMockWindow(calls), () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: "~/mux/project/feature",
+        runtimeConfig: { type: "ssh", host: "dev-box", srcBaseDir: "~/mux" },
+      })
+    );
+
+    expect(result).toEqual({ success: true });
+    expect(recordEditorOpen.mock.calls[0]?.[0].remotePath).toBe("~/mux/project/feature");
+    expect(calls.map(([url]) => url)).toEqual([
+      "vscode://vscode-remote/ssh-remote+dev-box/home/dev/mux/project/feature",
+    ]);
+  });
+
   test("opens devcontainer deep links with mapped container path", async () => {
     const calls: OpenCall[] = [];
 
@@ -194,12 +223,15 @@ describe("openInEditor", () => {
     // a sticky durable marker permanently refusing snapshot archives of the workspace.
     const windowWithZed = {
       api: {},
-      localStorage: { getItem: () => JSON.stringify({ editor: "zed" }) },
+      localStorage: { getItem: () => null },
       open: (url: string, target?: string) => {
         calls.push([url, target]);
         return null;
       },
     };
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { appearance: { editorConfig: { editor: "zed" } } },
+    });
     const result = await withWindow(windowWithZed, () =>
       openInEditor({
         api,
@@ -208,7 +240,7 @@ describe("openInEditor", () => {
         runtimeConfig: { type: "docker", image: "node:20", containerName: "mux-ws" },
         isFile: true,
       })
-    );
+    ).finally(() => getAppConfigStore().updateOptimistically({ userPreferences: undefined }));
 
     expect(result.success).toBe(false);
     expect(recordEditorOpen).not.toHaveBeenCalled();

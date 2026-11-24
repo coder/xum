@@ -15,6 +15,7 @@ import {
   resolveXumEnvironmentValue,
   withLegacyMuxEnvironmentAliases,
 } from "./legacyMux";
+import { resolveXumEnvironmentEntry } from "./xumEnv";
 
 describe("legacy mux environment compatibility", () => {
   test("promotes legacy values to canonical XUM names", () => {
@@ -33,6 +34,20 @@ describe("legacy mux environment compatibility", () => {
     expect(env.XUM_ROOT).toBe("/canonical");
     expect(env.MUX_ROOT).toBe("/canonical");
     expect(resolveXumEnvironmentValue("ROOT", env)).toBe("/canonical");
+  });
+
+  test("names the variable that supplied the resolved value", () => {
+    expect(
+      resolveXumEnvironmentEntry("ROOT", { XUM_ROOT: "/canonical", MUX_ROOT: "/legacy" })
+    ).toEqual({
+      name: "XUM_ROOT",
+      value: "/canonical",
+    });
+    expect(resolveXumEnvironmentEntry("ROOT", { MUX_ROOT: "/legacy" })).toEqual({
+      name: "MUX_ROOT",
+      value: "/legacy",
+    });
+    expect(resolveXumEnvironmentEntry("ROOT", {})).toBeUndefined();
   });
 
   test("keeps the pre-mux multiple-instance spelling synchronized", () => {

@@ -12,7 +12,9 @@ import type {
   ResolvedAgentAiSettings,
 } from "@/common/types/agentAiSettings";
 import {
+  aiSettingsBaseOf,
   collectDeclaredAncestorLayers,
+  collectUnlistedAncestorHops,
   type AgentAncestorDescriptor,
 } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings as resolveAgentAiSettingsShared } from "@/common/utils/ai/resolveAgentAiSettings";
@@ -64,9 +66,20 @@ export async function resolveAcpAgentAiSettings(
   ]);
 
   const agentDef = agents.find((agent) => agent.id === trimmedAgentId);
-  const agentDefsById = new Map<string, AgentAncestorDescriptor>(
-    agents.map((agent) => [agent.id, { base: agent.base, definitionAiDefaults: agent.aiDefaults }])
-  );
+  // A listed agent's aiDefaults merge its bases' frontmatter, which a run ranks below those bases'
+  // Settings and drops when a settings base replaces them, so each layer takes only its own.
+  const ownAiDefaults = (agent: (typeof agents)[number]) =>
+    agent.aiLayers ? agent.aiLayers.targetDefinitionAiDefaults : agent.aiDefaults;
+  const agentDefsById = new Map<string, AgentAncestorDescriptor>([
+    ...collectUnlistedAncestorHops(agents),
+    ...agents.map(
+      (agent) =>
+        [
+          agent.id,
+          { base: aiSettingsBaseOf(agent), definitionAiDefaults: ownAiDefaults(agent) },
+        ] as const
+    ),
+  ]);
 
   return resolveAgentAiSettingsShared({
     targetAgentId: trimmedAgentId,
@@ -74,8 +87,12 @@ export async function resolveAcpAgentAiSettings(
     explicit: extras?.explicit,
     targetWorkspaceSettings: extras?.targetWorkspaceSettings,
     agentAiDefaults: config.agentAiDefaults,
-    targetDefinitionAiDefaults: agentDef?.aiDefaults,
-    ancestors: collectDeclaredAncestorLayers(trimmedAgentId, agentDefsById),
+    // agents.list resolves the agent's layers as a run does (its settings base included). Only an
+    // agent whose definition did not resolve walks the listed agents' declared bases.
+    ...(agentDef?.aiLayers ?? {
+      targetDefinitionAiDefaults: agentDef?.aiDefaults,
+      ancestors: collectDeclaredAncestorLayers(trimmedAgentId, agentDefsById),
+    }),
     parentRuntime: extras?.parentRuntime,
   });
 }

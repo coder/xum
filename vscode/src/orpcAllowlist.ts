@@ -35,6 +35,9 @@ const ALLOWED_PROCEDURES = {
     // sanitizeWebviewOrpcInput.
     "sendHeldInput",
     "discardHeldInput",
+    // The retry barrier's Retry and the interrupted divider's resume (#5092); limited to shown
+    // workspaces by sanitizeWebviewOrpcInput.
+    "resumeStream",
   ]),
   // redactWebviewOrpcResult strips URL and key-file fields from providers.getConfig (#4766).
   providers: new Set(["list", "getConfig", "onConfigChanged", "setModels"]),
@@ -46,11 +49,17 @@ const ALLOWED_PROCEDURES = {
   // the agent picker and agent-cycle shortcut (#4751). agents.get (full prompt bodies) stays
   // blocked, and sanitizeWebviewOrpcInput limits the input to workspaces the webview is shown.
   agents: new Set(["list"]),
-  // Read-only admin policy (provider/model allowlists, runtime and MCP flags) so the model list
-  // matches what the backend enforces (#4739); onChanged only emits empty change signals.
-  // redactWebviewOrpcResult strips provider forcedBaseUrl before policy.get reaches the webview.
-  policy: new Set(["get", "onChanged"]),
 } as const;
+
+// The only nested procedures the webview may call: the background processes strip lists
+// (subscribe) and terminates a workspace's background bashes (#5092), and the output dialog reads
+// a process's output (getOutput, #5196). sendToBackground stays blocked (bashForegroundControls is
+// unsupported). sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
+const ALLOWED_NESTED_PROCEDURES = new Set([
+  "workspace.backgroundBashes.subscribe",
+  "workspace.backgroundBashes.terminate",
+  "workspace.backgroundBashes.getOutput",
+]);
 
 export function isAllowedOrpcPath(path: string[]): boolean {
   assert(Array.isArray(path), "isAllowedOrpcPath requires path array");
@@ -59,8 +68,11 @@ export function isAllowedOrpcPath(path: string[]): boolean {
     return false;
   }
 
-  // We only support direct procedure access from the VS Code webview.
-  // Nested routers expand the surface area and aren't needed for the sidebar.
+  // We only support direct procedure access from the VS Code webview, plus the few nested
+  // procedures listed above. Other nested routers expand the surface area and aren't needed.
+  if (path.length === 3) {
+    return ALLOWED_NESTED_PROCEDURES.has(path.join("."));
+  }
   if (path.length !== 2) {
     return false;
   }
@@ -76,8 +88,6 @@ export function isAllowedOrpcPath(path: string[]): boolean {
       return ALLOWED_PROCEDURES.providers.has(procedure);
     case "agents":
       return ALLOWED_PROCEDURES.agents.has(procedure);
-    case "policy":
-      return ALLOWED_PROCEDURES.policy.has(procedure);
     case "config":
       return ALLOWED_PROCEDURES.config.has(procedure);
     default:
@@ -88,16 +98,14 @@ export function isAllowedOrpcPath(path: string[]): boolean {
 /**
  * Removes fields the webview does not need from results before they cross the bridge.
  *
- * policy.get: a provider's forcedBaseUrl is an internal gateway URL that could embed credentials,
- * and no webview code reads it; only the allowlists and flags are forwarded. The input is not
- * mutated. Every other result passes through unchanged.
- *
- * config.getConfig (#4766): the app config also holds prompts, the governor URL, preferences and
+ * config.getConfig (#4766): the app config also holds prompts, preferences and
  * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
- * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode) and
- * appearance.transcriptDensity (a valid density) are forwarded, and agentAiDefaults is forwarded
+ * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode),
+ * appearance.transcriptDensity (a valid density), appearance.vimEnabled (a boolean),
+ * ui.artifactsAllowCdnScripts (a boolean) and the numeric
+ * entries of ai.autoCompactionThresholdByModel are forwarded, and agentAiDefaults is forwarded
  * rebuilt by normalizeAgentAiDefaults (#4972, #4979, #4962).
  *
  * providers.getConfig (#4766): it carries no keys (only apiKeySet-style booleans), but base URLs and
@@ -112,33 +120,20 @@ export function redactWebviewOrpcResult(path: string[], value: unknown): unknown
   if (procedure === "providers.getConfig") {
     return redactProvidersConfig(value);
   }
-  if (procedure !== "policy.get") {
-    return value;
+  if (procedure === "workspace.backgroundBashes.subscribe") {
+    return redactBackgroundBashState(value);
   }
-  if (typeof value !== "object" || value === null) {
-    return value;
-  }
-  const response = value as { policy?: unknown };
-  const policy = response.policy as { providerAccess?: unknown } | null | undefined;
-  if (typeof policy !== "object" || policy === null || !Array.isArray(policy.providerAccess)) {
-    return value;
-  }
-  return {
-    ...response,
-    policy: {
-      ...policy,
-      providerAccess: policy.providerAccess.map((entry: unknown) => {
-        if (typeof entry !== "object" || entry === null) {
-          return entry;
-        }
-        const { forcedBaseUrl: _forcedBaseUrl, ...rest } = entry as Record<string, unknown>;
-        return rest;
-      }),
-    },
-  };
+  return value;
 }
 
-const WEBVIEW_APP_CONFIG_FIELDS = ["routePriority", "routeOverrides", "minThinkingLevelByModel"];
+const WEBVIEW_APP_CONFIG_FIELDS = [
+  "routePriority",
+  "routeOverrides",
+  "minThinkingLevelByModel",
+  "experiments",
+  "defaultModel",
+  "hiddenModels",
+];
 const REDACTED_PROVIDER_CONFIG_FIELDS = new Set([
   "baseUrl",
   "baseUrlResolved",
@@ -190,8 +185,41 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
   if (isTranscriptDensity(transcriptDensity)) {
     projectedAppearance.transcriptDensity = transcriptDensity;
   }
+  const vimEnabled = appearance?.vimEnabled;
+  if (typeof vimEnabled === "boolean") {
+    projectedAppearance.vimEnabled = vimEnabled;
+  }
+  const projectedPreferences: Record<string, unknown> = {};
   if (Object.keys(projectedAppearance).length > 0) {
-    projected.userPreferences = { appearance: projectedAppearance };
+    projectedPreferences.appearance = projectedAppearance;
+  }
+  // The composer's context meter shows the per-model compaction threshold; only the numbers cross.
+  const ai =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.ai as Record<string, unknown> | null | undefined)
+      : undefined;
+  const thresholds = ai?.autoCompactionThresholdByModel;
+  if (typeof thresholds === "object" && thresholds !== null) {
+    const projectedThresholds = Object.fromEntries(
+      Object.entries(thresholds).filter(
+        ([, percent]) => typeof percent === "number" && Number.isFinite(percent)
+      )
+    );
+    if (Object.keys(projectedThresholds).length > 0) {
+      projectedPreferences.ai = { autoCompactionThresholdByModel: projectedThresholds };
+    }
+  }
+  // MCP app frames grant CDN script sources only while the user allows them.
+  const ui =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.ui as Record<string, unknown> | null | undefined)
+      : undefined;
+  const allowCdnScripts = ui?.artifactsAllowCdnScripts;
+  if (typeof allowCdnScripts === "boolean") {
+    projectedPreferences.ui = { artifactsAllowCdnScripts: allowCdnScripts };
+  }
+  if (Object.keys(projectedPreferences).length > 0) {
+    projected.userPreferences = projectedPreferences;
   }
   // Agent switches and plan actions fall back to the per-agent defaults (Settings > Tasks) when the
   // workspace has no settings for the target agent (#4962). normalizeAgentAiDefaults rebuilds each
@@ -230,6 +258,14 @@ export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; err
  *
  * workspace.sendHeldInput / discardHeldInput (#4771): only for a workspace the extension sent, and
  * only {workspaceId, heldInputId} is forwarded.
+ *
+ * workspace.resumeStream (#5092): only for a workspace the extension sent, and only
+ * {workspaceId, options} is forwarded.
+ *
+ * workspace.backgroundBashes.subscribe / terminate (#5092) / getOutput (#5196): only for a
+ * workspace the extension sent. subscribe forwards {workspaceId}, terminate {workspaceId, processId},
+ * and getOutput {workspaceId, processId} plus numeric fromOffset/tailBytes (the backend schema
+ * bounds them). The backend refuses a processId of another workspace.
  */
 export function sanitizeWebviewOrpcInput(
   path: string[],
@@ -241,6 +277,12 @@ export function sanitizeWebviewOrpcInput(
   const procedure = path.join(".");
   if (procedure === "workspace.sendHeldInput" || procedure === "workspace.discardHeldInput") {
     return sanitizeHeldInputAction(procedure, input, knownWorkspaceIds);
+  }
+  if (procedure === "workspace.resumeStream") {
+    return sanitizeResumeStream(input, knownWorkspaceIds);
+  }
+  if (ALLOWED_NESTED_PROCEDURES.has(procedure)) {
+    return sanitizeBackgroundBashAction(procedure, input, knownWorkspaceIds);
   }
 
   if (procedure !== "agents.list") {
@@ -281,4 +323,82 @@ function sanitizeHeldInputAction(
     return { ok: false, error: `${procedure} requires a heldInputId` };
   }
   return { ok: true, input: { workspaceId, heldInputId: record.heldInputId } };
+}
+
+function sanitizeResumeStream(
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: "workspace.resumeStream requires an input object" };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: "workspace.resumeStream is limited to known workspaces" };
+  }
+  return { ok: true, input: { workspaceId, options: record.options } };
+}
+
+function sanitizeBackgroundBashAction(
+  procedure: string,
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: `${procedure} requires an input object` };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: `${procedure} is limited to known workspaces` };
+  }
+  if (procedure === "workspace.backgroundBashes.subscribe") {
+    return { ok: true, input: { workspaceId } };
+  }
+  if (typeof record.processId !== "string") {
+    return { ok: false, error: `${procedure} requires a processId` };
+  }
+  if (procedure === "workspace.backgroundBashes.getOutput") {
+    return {
+      ok: true,
+      input: {
+        workspaceId,
+        processId: record.processId,
+        ...(typeof record.fromOffset === "number" ? { fromOffset: record.fromOffset } : {}),
+        ...(typeof record.tailBytes === "number" ? { tailBytes: record.tailBytes } : {}),
+      },
+    };
+  }
+  assert(procedure === "workspace.backgroundBashes.terminate", `unexpected procedure ${procedure}`);
+  return { ok: true, input: { workspaceId, processId: record.processId } };
+}
+
+/**
+ * workspace.backgroundBashes.subscribe (#5092): a process's monitor carries up to 20 matched
+ * stdout/stderr lines (monitor.lastLines). Neither the strip nor the output dialog reads them (the
+ * dialog reads output through getOutput), so they are emptied before the state crosses the bridge.
+ * Everything else in each state passes through; the input is not mutated.
+ */
+function redactBackgroundBashState(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  const state = value as { processes?: unknown };
+  if (!Array.isArray(state.processes)) {
+    return value;
+  }
+  return {
+    ...state,
+    processes: state.processes.map((process: unknown) => {
+      if (typeof process !== "object" || process === null) {
+        return process;
+      }
+      const record = process as { monitor?: unknown };
+      if (typeof record.monitor !== "object" || record.monitor === null) {
+        return process;
+      }
+      return { ...record, monitor: { ...(record.monitor), lastLines: [] } };
+    }),
+  };
 }

@@ -91,6 +91,24 @@ describe("MessageQueue", () => {
       expect(queue.isEmpty()).toBe(true);
     });
 
+    // A turn-end required-report prompt queues behind the live turn: its task-turn provenance
+    // must reach exactly the dispatch it was queued for, never batch onto a neighbor.
+    it("keeps task turn provenance on its own dispatch", () => {
+      const automatic = { acceptanceOrigin: "automatic" as const, synthetic: true };
+      queue.add("plain automatic", undefined, automatic);
+      queue.add("report prompt", undefined, { ...automatic, taskTurnKind: "required_report" });
+      queue.add("later automatic", undefined, automatic);
+
+      expect(queue.dequeueNext()).toMatchObject({ message: "plain automatic" });
+      const prompt = queue.dequeueNext();
+      expect(prompt.message).toBe("report prompt");
+      expect(prompt.internal?.taskTurnKind).toBe("required_report");
+      const later = queue.dequeueNext();
+      expect(later.message).toBe("later automatic");
+      expect(later.internal?.taskTurnKind).toBeUndefined();
+      expect(queue.isEmpty()).toBe(true);
+    });
+
     it("removing a keyed manual add restores the remaining automatic origin", () => {
       const automatic = { acceptanceOrigin: "automatic" as const };
       queue.addOnce("automatic", undefined, "auto:1", automatic);
@@ -292,6 +310,26 @@ describe("MessageQueue", () => {
       expect(background.message).toBe("Background monitor wake");
       expect(background.internal).toMatchObject({ synthetic: true, agentInitiated: true });
       expect(queue.dequeueNext().message).toBe("User follow-up");
+    });
+
+    // #5170: an ACP prompt's turn binds only the dispatch that carries its correlation, so a
+    // correlated send must neither join an open entry nor absorb later messages.
+    it("dispatches an ACP-correlated send on its own, with its own correlation", () => {
+      queue.add("/compact", {
+        model: "gpt-4",
+        agentId: "exec",
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      });
+      queue.add("resent held input", { model: "gpt-4", agentId: "exec", acpPromptId: "acp-1" });
+      queue.add("desktop follow-up", { model: "gpt-4", agentId: "exec" });
+
+      expect(queue.dequeueNext().message).toBe("/compact");
+      const acpEntry = queue.dequeueNext();
+      expect(acpEntry.message).toBe("resent held input");
+      expect(acpEntry.options?.acpPromptId).toBe("acp-1");
+      const followUp = queue.dequeueNext();
+      expect(followUp.message).toBe("desktop follow-up");
+      expect(followUp.options?.acpPromptId).toBeUndefined();
     });
 
     it("keeps agent peer messages sealed so later messages never coalesce with them", () => {
@@ -744,6 +782,46 @@ describe("MessageQueue", () => {
       expect(queue.getVisibleQueueDispatchMode()).toBe("turn-end");
     });
 
+    it.each(["admission", "task", "compaction"] as const)(
+      "uses the first surviving entry's mode after %s admission goes stale",
+      (gate) => {
+        const stale = { admission: false, task: false, compaction: false };
+        queue.add(
+          "automatic guidance",
+          { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+          {
+            synthetic: true,
+            sealed: true,
+            admissionStale: () => stale.admission,
+            turnAdmission: {
+              admissionStale: () => stale.task,
+              onEnqueued: () => undefined,
+              onAdmitted: () => undefined,
+              onDisposed: () => undefined,
+            },
+            compactionAdmissionStale: () => stale.compaction,
+          }
+        );
+        expect(queue.hasDispatchableEntries()).toBe(true);
+        expect(queue.getNextDispatchableMode()).toBe("tool-end");
+
+        stale[gate] = true;
+        expect(queue.hasDispatchableEntries()).toBe(false);
+        expect(queue.getNextDispatchableMode()).toBeUndefined();
+        // Refusal/cancellation callbacks still belong to the normal FIFO drain.
+        expect(queue.isEmpty()).toBe(false);
+
+        queue.add("held user input", {
+          model: "gpt-4",
+          agentId: "exec",
+          queueDispatchMode: "turn-end",
+        });
+        expect(queue.hasDispatchableEntries()).toBe(true);
+        expect(queue.getNextDispatchableMode()).toBe("turn-end");
+        expect(queue.getNextQueueCutCandidate()?.dispatchMode).toBe("turn-end");
+      }
+    );
+
     it("should reset mode to tool-end when cleared", () => {
       queue.add("Follow up", {
         model: "gpt-4",
@@ -810,6 +888,15 @@ describe("MessageQueue", () => {
           () => queue.add("tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden),
           false,
         ],
+        [
+          // The tool-end entry cannot cut from behind the turn-end entry, so it is overtaken too.
+          "hidden tool-end entry behind a hidden turn-end entry",
+          () => {
+            queue.add("peer", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
+            queue.add("tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
+          },
+          true,
+        ],
       ];
       for (const [name, seed, expected] of scenarios) {
         queue = new MessageQueue();
@@ -820,6 +907,68 @@ describe("MessageQueue", () => {
         expect([name, queue.getMessages()[0] === "promoted"]).toEqual([name, expected]);
       }
     });
+
+    it.each(["cancel", "admission", "task", "compaction"] as const)(
+      "promotion, dispatch and correlation agree after hidden %s withdrawal",
+      (gate) => {
+        const turnMetadata: MuxMessageMetadata = {
+          type: "workspace-turn-task",
+          taskHandleId: "wst_parent",
+          ownerWorkspaceId: "grandparent",
+          turnId: "turn-1",
+        };
+        for (const mode of ["tool-end", "turn-end"] as const) {
+          queue = new MessageQueue();
+          const withdrawn = new AbortController();
+          let stale = false;
+          queue.add(
+            "withdrawn wake",
+            { ...validOptions, queueDispatchMode: mode },
+            {
+              ...hidden,
+              cancelSignal: withdrawn.signal,
+              admissionStale: () => gate === "admission" && stale,
+              turnAdmission: {
+                admissionStale: () => gate === "task" && stale,
+                onEnqueued: () => undefined,
+                onAdmitted: () => undefined,
+                onDisposed: () => undefined,
+              },
+              compactionAdmissionStale: () => gate === "compaction" && stale,
+            }
+          );
+          const peerCanceled = () => undefined;
+          queue.add(
+            "peer message",
+            { ...validOptions, queueDispatchMode: "turn-end", muxMetadata: turnMetadata },
+            { ...hidden, workspaceTurnContinuation: true, onCanceled: peerCanceled }
+          );
+          expect(queue.promotedToolEndWouldLead()).toBe(mode === "turn-end");
+          if (gate === "cancel") withdrawn.abort();
+          stale = true;
+          expect(queue.promotedToolEndWouldLead()).toBe(true);
+          expect(
+            queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1", {
+              promoteAheadOfHiddenTurnEnd: true,
+            })
+          ).toBe(true);
+          queue.add(
+            "progress report",
+            { ...validOptions, queueDispatchMode: "tool-end", muxMetadata: turnMetadata },
+            { ...hidden, workspaceTurnContinuation: true, promoteAheadOfHiddenTurnEnd: true }
+          );
+          expect(queue.getNextDispatchableMode()).toBe("tool-end");
+          expect(queue.dequeueNext().message).toBe("withdrawn wake");
+          const promoted = queue.dequeueNext();
+          expect(promoted.message).toBe("progress report");
+          expect(promoted.options?.muxMetadata).toEqual(turnMetadata);
+          const skipped = queue.dequeueNext();
+          expect(skipped.message).toBe("peer message");
+          expect(skipped.options?.muxMetadata).toEqual(turnMetadata);
+          expect(skipped.internal?.onCanceled).toBe(peerCanceled);
+        }
+      }
+    );
 
     it("never overtakes a user-authored turn-end entry", () => {
       queue.add("hidden turn-end", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
@@ -927,42 +1076,6 @@ describe("MessageQueue", () => {
       expect(skipped.internal?.onCanceled).toBe(peerCanceled);
     });
 
-    it("ignores a withdrawn predecessor when revalidating correlations after a promotion", () => {
-      const turnMetadata: MuxMessageMetadata = {
-        type: "workspace-turn-task",
-        taskHandleId: "wst_parent",
-        ownerWorkspaceId: "grandparent",
-        turnId: "turn-1",
-      };
-      const withdrawn = new AbortController();
-      queue.add(
-        "withdrawn wake",
-        { ...validOptions, queueDispatchMode: "tool-end" },
-        { ...hidden, cancelSignal: withdrawn.signal }
-      );
-      withdrawn.abort();
-      const peerCanceled = () => undefined;
-      queue.add(
-        "peer message",
-        { ...validOptions, queueDispatchMode: "turn-end", muxMetadata: turnMetadata },
-        { ...hidden, workspaceTurnContinuation: true, onCanceled: peerCanceled }
-      );
-      queue.add(
-        "progress report",
-        { ...validOptions, queueDispatchMode: "tool-end", muxMetadata: turnMetadata },
-        { ...hidden, workspaceTurnContinuation: true, promoteAheadOfHiddenTurnEnd: true }
-      );
-
-      expect(queue.dequeueNext().message).toBe("withdrawn wake");
-      const promoted = queue.dequeueNext();
-      expect(promoted.message).toBe("progress report");
-      expect(promoted.options?.muxMetadata).toEqual(turnMetadata);
-      const skipped = queue.dequeueNext();
-      expect(skipped.message).toBe("peer message");
-      expect(skipped.options?.muxMetadata).toEqual(turnMetadata);
-      expect(skipped.internal?.onCanceled).toBe(peerCanceled);
-    });
-
     it("ignores the hidden turn-end entries a promoted report overtakes when judging its correlation", () => {
       // A queued heartbeat (hidden, turn-end, uncorrelated) would make the plain check report a
       // superseding predecessor and strip the report's correlation before enqueue — yet the
@@ -974,11 +1087,9 @@ describe("MessageQueue", () => {
         turnId: "turn-1",
       };
       const ahead = (): boolean =>
-        queue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
-          "wst_parent",
-          "grandparent",
-          "turn-1"
-        );
+        queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1", {
+          promoteAheadOfHiddenTurnEnd: true,
+        });
 
       expect(ahead()).toBe(true);
       queue.add(
@@ -999,19 +1110,29 @@ describe("MessageQueue", () => {
       );
       expect(ahead()).toBe(true);
 
-      // An uncorrelated tool-end tail cannot be overtaken, so it (and everything before it) counts.
+      // An uncorrelated tool-end entry behind the heartbeat cuts nothing, so the report overtakes
+      // it too.
       queue.add("unrelated tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
-      expect(ahead()).toBe(false);
+      expect(ahead()).toBe(true);
+    });
+
+    it("counts an uncorrelated tool-end entry the promoted report stays behind", () => {
+      // The tool-end entry leads and cuts on its own, so the report dispatches after it.
+      queue.add("unrelated tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
+      queue.add("peer message", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1", {
+          promoteAheadOfHiddenTurnEnd: true,
+        })
+      ).toBe(false);
     });
 
     it("counts a user-authored turn-end tail as a predecessor for a promoted report", () => {
       queue.add("user wait for turn end", { ...validOptions, queueDispatchMode: "turn-end" });
       expect(
-        queue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
-          "wst_parent",
-          "grandparent",
-          "turn-1"
-        )
+        queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1", {
+          promoteAheadOfHiddenTurnEnd: true,
+        })
       ).toBe(false);
     });
   });
@@ -1563,6 +1684,94 @@ describe("MessageQueue", () => {
         "<review>note</review>\n\nFirst authored\n<review>only</review>\nPlain follow-up"
       );
       expect(dispatched.options != null && "authoredText" in dispatched.options).toBe(false);
+    });
+
+    it("restores the reviews of every batched add, behind a /compact too", () => {
+      // Codex PRRT_kwDOPxxmWM6rZqyS: the entry keeps only its first add's metadata, so a later
+      // review-only send lost its reviews when a hook blocked the batch and it was restored.
+      const first = { filePath: "src/a.ts", lineRange: "1", selectedCode: "a()", userNote: "1" };
+      const second = { filePath: "src/b.ts", lineRange: "2", selectedCode: "b()", userNote: "2" };
+      const options = { model: "claude-3-5-sonnet-20241022", agentId: "exec" };
+      queue.add("Summarize the conversation.", {
+        ...options,
+        agentId: "compact",
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      });
+      queue.add("<review>2</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [second] },
+        authoredText: "",
+      });
+      expect(queue.getInputForRestore()?.reviews).toEqual([second]);
+
+      queue.clear();
+      queue.add("<review>1</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [first] },
+        authoredText: "",
+      });
+      queue.add("<review>2</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [second] },
+        authoredText: "",
+      });
+      expect(queue.getInputForRestore()?.reviews).toEqual([first, second]);
+      expect(queue.getInputsForRestore()[0]?.reviews).toEqual([first, second]);
+      // A held re-send carries them in its metadata too (Codex PRRT_kwDOPxxmWM6s3RUw), also
+      // behind a first add whose metadata has no reviews.
+      expect(queue.getRestorableManualSends()[0]?.options.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [first, second],
+      });
+      // A dispatch carries them too (Codex PRRT_kwDOPxxmWM6s3-n2).
+      expect(queue.dequeueNext().options?.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [first, second],
+      });
+      queue.clear();
+      queue.add("plain", { ...options, muxMetadata: { type: "normal" } });
+      queue.add("<review>2</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [second] },
+        authoredText: "",
+      });
+      expect(queue.getRestorableManualSends()[0]?.options.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [second],
+      });
+    });
+
+    it("restores a /compact follow-up's attachments and review notes from its compaction metadata", () => {
+      // Codex P1 (PRRT_kwDOPxxmWM6r_ubq): prepareCompactionMessage keeps them only under
+      // parsed.followUpContent; a message.send block that restores the entry must give them back.
+      const review = { filePath: "src/a.ts", lineRange: "1", selectedCode: "a()", userNote: "n" };
+      const fileParts = [{ url: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" }];
+      queue.add("Summarize the conversation.", {
+        model: "claude-3-5-sonnet-20241022",
+        agentId: "compact",
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact\nfix the bug",
+          parsed: {
+            followUpContent: {
+              text: "fix the bug",
+              fileParts,
+              reviews: [review],
+              model: "claude-3-5-sonnet-20241022",
+              agentId: "exec",
+            },
+          },
+        },
+      });
+
+      expect(queue.getInputForRestore()).toEqual({
+        text: "/compact\nfix the bug",
+        fileParts,
+        reviews: [review],
+      });
+      const [perSend] = queue.getInputsForRestore();
+      expect(perSend?.fileParts).toEqual(fileParts);
+      expect(perSend?.reviews).toEqual([review]);
     });
 
     it("captures a refused task-attempt entry's full original send only for manual user input", () => {
@@ -2162,6 +2371,39 @@ describe("MessageQueue", () => {
 
       expect(queue.getRestorableManualSends().map((send) => send.displayText)).toEqual(["kept"]);
       expect(queue.getInputForRestore()?.text).toBe("kept");
+    });
+  });
+
+  describe("artifact sends (Artifacts M5b)", () => {
+    const interaction = {
+      id: "i-1",
+      artifactPath: "form.html",
+      title: "Form",
+      action: "send" as const,
+      text: "Ship it",
+    };
+    const queueArtifactSend = () =>
+      queue.add(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          muxMetadata: { type: "normal", artifactInteraction: interaction },
+        } as SendMessageOptions,
+        { onAccepted: () => undefined }
+      );
+
+    it("projects a lone artifact send with its metadata and confirmed text", () => {
+      queueArtifactSend();
+      expect(queue.getVisibleArtifactInteraction()).toEqual(interaction);
+      expect(queue.getVisibleDisplayText()).toBe("Ship it");
+    });
+
+    it("drops the metadata once a typed message queues behind it, but keeps the friendly text", () => {
+      queueArtifactSend();
+      queue.add("and also this");
+      expect(queue.getVisibleArtifactInteraction()).toBeUndefined();
+      expect(queue.getVisibleDisplayText()).toBe("Ship it\nand also this");
     });
   });
 });

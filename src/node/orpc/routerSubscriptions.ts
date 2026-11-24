@@ -1,10 +1,13 @@
 import type { ClaudeDesignExperimentSnapshot } from "@/common/orpc/schemas/claudeDesign";
+import type { FlightRecorderStatus } from "@/common/orpc/schemas/perfFlightRecorder";
+import type { ComputerUseStatus } from "@/common/orpc/schemas/computerUse";
 import type {
   FrontendWorkspaceMetadataSchemaType,
   OnChatMode,
   UpdateStatus,
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
+  OnChatEvent,
   WorkspaceStatsSnapshot,
 } from "@/common/orpc/types";
 import type {
@@ -16,14 +19,19 @@ import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
 import { ReviewStateService, type ReviewStateChange } from "@/node/services/reviewStateService";
+import type { DraftEvent } from "@/common/orpc/schemas/drafts";
+import { DRAFT_CHANGE_EVENT } from "@/node/services/draftService";
 import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { getErrorMessage } from "@/common/utils/errors";
 import { ORPCError, ValidationError } from "@orpc/server";
 import assert from "@/common/utils/assert";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
+import { getRpcPath } from "./inFlightProcedures";
 import { subscriptionIterable, type SubscriptionStreamOptions } from "./streamBridge";
 import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
+import { maybeRecordWorkspaceChat } from "@/node/services/sessionTapes/sessionTapeRecorder";
+import { getSessionTapeReplay } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
 import type { LogEntry } from "@/node/services/logBuffer";
 import { subscribeLogFeed } from "@/node/services/logBuffer";
@@ -43,14 +51,22 @@ interface MetadataEvent {
   metadata: FrontendWorkspaceMetadataSchemaType | null;
 }
 
+interface MetadataSnapshotEvent {
+  type: "snapshot";
+  workspaces: FrontendWorkspaceMetadataSchemaType[];
+}
+
 interface WorkspaceChatSubscriptionInput {
   workspaceId: string;
   mode?: OnChatMode;
   legacyAutoRetryEnabled?: boolean;
+  batchReplay?: boolean;
+  replayWindow?: boolean;
 }
 
 type WorkspaceActivityEvent =
   | { type: "activity"; workspaceId: string; activity: WorkspaceActivitySnapshot | null }
+  | { type: "usage-changed"; workspaceId: string }
   | { type: "heartbeat" };
 
 type TerminalAttachMessage =
@@ -78,7 +94,18 @@ const LOG_LEVEL_PRIORITY: Record<LogEntry["level"], number> = {
 };
 
 function runtimeSubscription<T>(context: ORPCContext, options: SubscriptionStreamOptions<T>) {
-  return subscriptionIterable({ ...options, context: context["effect/context"] });
+  // The path comes from inFlightProcedureMiddleware: direct callers have none and get no tap.
+  // Partial test contexts can lack the recorder, hence the widened type.
+  const path = getRpcPath(context);
+  const recorder: ORPCContext["perfFlightRecorder"] | undefined = context.perfFlightRecorder;
+  return subscriptionIterable({
+    ...options,
+    context: context["effect/context"],
+    openTap:
+      path !== undefined && recorder !== undefined
+        ? () => recorder.openRpcSubscription(path)
+        : undefined,
+  });
 }
 
 function shouldIncludeLogEntry(
@@ -91,6 +118,23 @@ function shouldIncludeLogEntry(
   );
 }
 
+/** Ticks when an MCP Apps server of the workspace sends tools/list_changed. */
+export function subscribeMcpAppEntrypointChanges(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<undefined> {
+  return runtimeSubscription<undefined>(context, {
+    signal,
+    // A tick only asks for a re-list: one pending tick covers any number of changes.
+    buffer: "latest",
+    subscribe: (emit) =>
+      context.mcpServerManager.onMcpAppCatalogChanged((changed) => {
+        if (changed === workspaceId) emit.push(undefined);
+      }),
+  });
+}
+
 export function subscribeConfigChanges(
   context: ORPCContext,
   signal?: AbortSignal
@@ -98,7 +142,15 @@ export function subscribeConfigChanges(
   return runtimeSubscription<undefined>(context, {
     signal,
     buffer: "latest",
-    subscribe: (emit) => context.config.onConfigChanged(() => emit.push(undefined)),
+    subscribe: (emit) => {
+      const push = () => emit.push(undefined);
+      const unsubscribeConfig = context.config.onConfigChanged(push);
+      const unsubscribeExperiments = context.experimentsService.onChange(push);
+      return () => {
+        unsubscribeConfig();
+        unsubscribeExperiments();
+      };
+    },
   });
 }
 
@@ -142,6 +194,24 @@ export function subscribeReviewState(
   });
 }
 
+export function subscribeDrafts(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<DraftEvent> {
+  const service = context.draftService;
+  return runtimeSubscription<DraftEvent>(context, {
+    signal,
+    // Keep every event: each one describes a different scope. Events fired while the snapshot
+    // is computed are delivered after it; clients skip those at or below the snapshot revision.
+    subscribe: (emit) => {
+      const listener = (event: DraftEvent) => emit.push(event);
+      service.on(DRAFT_CHANGE_EVENT, listener);
+      return () => service.off(DRAFT_CHANGE_EVENT, listener);
+    },
+    initial: () => service.getSnapshotEvent(),
+  });
+}
+
 export function subscribeProviderConfig(
   context: ORPCContext,
   signal?: AbortSignal
@@ -150,6 +220,26 @@ export function subscribeProviderConfig(
     signal,
     buffer: "latest",
     subscribe: (emit) => context.providerService.onConfigChanged(() => emit.push(undefined)),
+  });
+}
+
+/**
+ * The credential keys of recorded insufficient_scope prompts (#6739). Every key counts (a row
+ * refreshes only on its own), so nothing coalesces. The keys that have a prompt at attach time
+ * replay first: a prompt recorded between a row's status read and the attach is not lost.
+ */
+export function subscribeMcpInsufficientScope(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  const oauth = context.mcpOauthService;
+  return runtimeSubscription<string>(context, {
+    signal,
+    buffer: "all",
+    subscribe: (emit) => oauth.onInsufficientScope((key) => emit.push(key)),
+    initialize: (emit) => {
+      for (const key of oauth.insufficientScopeKeys()) emit.push(key);
+    },
   });
 }
 
@@ -169,14 +259,31 @@ export function subscribeDesignExperiment(
   });
 }
 
-export function subscribePolicyChanges(
+export function subscribePerfFlightRecorderStatus(
   context: ORPCContext,
   signal?: AbortSignal
-): AsyncGenerator<undefined> {
-  return runtimeSubscription<undefined>(context, {
+): AsyncGenerator<FlightRecorderStatus> {
+  const recorder = context.perfFlightRecorder;
+  return runtimeSubscription(context, {
     signal,
+    // Each event is the full status, so only the newest unconsumed one matters.
     buffer: "latest",
-    subscribe: (emit) => context.policyService.onPolicyChanged(() => emit.push(undefined)),
+    subscribe: (emit) => recorder.onStatusChange(emit.push),
+    initial: () => recorder.getStatus(),
+  });
+}
+
+export function subscribeComputerUseStatus(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<ComputerUseStatus> {
+  const service = context.computerUseService;
+  return runtimeSubscription(context, {
+    signal,
+    // Each event is the full status, so only the newest unconsumed one matters.
+    buffer: "latest",
+    subscribe: (emit) => service.subscribe(emit.push),
+    initial: () => service.getStatus(),
   });
 }
 
@@ -236,6 +343,9 @@ export function subscribeMemoryChanges(
           )
             return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
+          // Session stores are private to the acting workspace, and every
+          // workspace uses the same virtual session paths.
+          if (event.scope === "session" && event.workspaceId !== workspaceId) return;
           emit.push(event);
         };
         const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) =>
@@ -318,14 +428,16 @@ export function subscribeTimeline(
 }
 
 /**
- * The output validation oRPC's `eventIterator(WorkspaceChatMessageSchema)` applies to each yielded
+ * The output validation oRPC's `eventIterator(OnChatEventSchema)` applies to each yielded
  * onChat event, with the same transform (the schema's parse output is what goes on the wire) and
  * the same error, so disabling it on the procedure changes nothing observable (#4868).
  *
  * No onChat producer attaches oRPC event meta (`withEventMeta`). If one ever does, carry it over
  * with `getEventMeta` like oRPC's `wrapAsyncIteratorPreservingEventMeta`.
  */
-function validateChatEvent(event: WorkspaceChatMessage): WorkspaceChatMessage {
+function validateChatEvent(event: OnChatEvent): WorkspaceChatMessage {
+  // Batch-free schema on purpose (#5102): a `message-batch` only ever comes from the replay, as
+  // already-parsed rows in validatedReplayRows, so every event validated here is a single event.
   const result = WorkspaceChatMessageSchema["~standard"].validate(event);
   // The chat schema has no async refinements; a Promise here would silently skip validation.
   assert(!(result instanceof Promise), "WorkspaceChatMessageSchema validation must be synchronous");
@@ -353,7 +465,20 @@ export function subscribeWorkspaceChat(
    * did when oRPC validated at the procedure boundary.
    */
   options?: { validateOutput?: boolean }
-): AsyncGenerator<WorkspaceChatMessage> {
+): AsyncGenerator<OnChatEvent> {
+  // Perf harness (XUM_REPLAY_TAPES, desktop only): a mapped workspace is served from its tape
+  // before any session access, so no agent, tool or provider code runs. Not recorded again.
+  const tapeReplay = getSessionTapeReplay(input);
+  if (tapeReplay) {
+    return runtimeSubscription<OnChatEvent>(context, {
+      signal,
+      // Keeps the client's stall watchdog fed while a large tape loads and after playback.
+      heartbeat: { value: { type: "heartbeat" as const } },
+      progressiveInitialize: true,
+      subscribe: () => () => undefined,
+      initialize: (emit) => tapeReplay.play(emit.push, signal),
+    });
+  }
   const session = context.workspaceService.getOrCreateSession(input.workspaceId);
   if (typeof input.legacyAutoRetryEnabled === "boolean") {
     session.setLegacyAutoRetryEnabledHint(input.legacyAutoRetryEnabled);
@@ -362,9 +487,9 @@ export function subscribeWorkspaceChat(
   // Replay rows the session already parsed with the wire schema (#4868). A WeakSet rather than a
   // Set: `initialize` keeps replaying after a client disconnect, so entries must die with their
   // rows instead of accumulating until the replay finishes.
-  const validatedReplayRows = new WeakSet<WorkspaceChatMessage>();
+  const validatedReplayRows = new WeakSet<OnChatEvent>();
   // Subscribe before replay so the relay can buffer overlapping live deltas.
-  return runtimeSubscription<WorkspaceChatMessage>(context, {
+  const events = runtimeSubscription<OnChatEvent>(context, {
     signal,
     heartbeat: { value: { type: "heartbeat" as const } },
     // Replay rows are parsed once (#4868); every other event (live, stream replay, heartbeat,
@@ -390,24 +515,51 @@ export function subscribeWorkspaceChat(
           }
         },
         input.mode,
-        replayRelay.finishReplay
+        replayRelay.finishReplay,
+        // Batches (#4868) only travel the self-validating path: there the listener above adds a
+        // batch's `wireMessage` (parse output of every row) to validatedReplayRows, so mapValue
+        // does not validate it again. Direct callers (no validateOutput) always get single rows.
+        // The replay window (#4961) is gated the same way: only the renderer path opts in.
+        {
+          batchReplay: options?.validateOutput === true && input.batchReplay === true,
+          replayWindow: options?.validateOutput === true && input.replayWindow === true,
+        }
       );
       replayRelay.finishReplay();
       session.scheduleStartupRecovery();
     },
   });
+  // Experiment `sessionTapes`: wraps the post-mapValue stream so tapes hold the wire values.
+  // Returns `events` itself when the experiment is off or the subscription is not a full replay.
+  return maybeRecordWorkspaceChat(
+    context,
+    {
+      workspaceId: input.workspaceId,
+      mode: input.mode,
+      // The flags the replay above actually used (both are gated on validateOutput).
+      batchReplay: options?.validateOutput === true && input.batchReplay === true,
+      replayWindow: options?.validateOutput === true && input.replayWindow === true,
+      validateOutput: options?.validateOutput === true,
+    },
+    events
+  );
 }
 
 export function subscribeMetadata(
   context: ORPCContext,
+  archived: boolean,
   signal?: AbortSignal
-): AsyncGenerator<MetadataEvent> {
-  return runtimeSubscription(context, {
+): AsyncGenerator<MetadataEvent | MetadataSnapshotEvent> {
+  return runtimeSubscription<MetadataEvent | MetadataSnapshotEvent>(context, {
     signal,
     subscribe: (emit) => {
       context.workspaceService.on("metadata", emit.push);
       return () => context.workspaceService.off("metadata", emit.push);
     },
+    initial: async () => ({
+      type: "snapshot",
+      workspaces: await context.workspaceService.listByArchivedStatus(archived),
+    }),
   });
 }
 
@@ -423,8 +575,14 @@ export function subscribeWorkspaceActivity(
         workspaceId: string;
         activity: WorkspaceActivitySnapshot | null;
       }) => emit.push({ type: "activity", ...event });
+      const onUsageChanged = (event: { workspaceId: string }) =>
+        emit.push({ type: "usage-changed", ...event });
       context.workspaceService.on("activity", onActivity);
-      return () => context.workspaceService.off("activity", onActivity);
+      context.workspaceService.on("usage-changed", onUsageChanged);
+      return () => {
+        context.workspaceService.off("activity", onActivity);
+        context.workspaceService.off("usage-changed", onUsageChanged);
+      };
     },
   });
 }
@@ -569,13 +727,23 @@ export function subscribeTerminalOutput(
 export function attachTerminal(
   context: ORPCContext,
   sessionId: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  popout = false
 ): AsyncGenerator<TerminalAttachMessage> {
   // Output subscribes before screen capture so attach cannot lose bytes in the handshake.
   return runtimeSubscription<TerminalAttachMessage>(context, {
     signal,
-    subscribe: (emit) =>
-      context.terminalService.onOutput(sessionId, (data) => emit.push({ type: "output", data })),
+    subscribe: (emit) => {
+      const unsubscribe = context.terminalService.onOutput(sessionId, (data) =>
+        emit.push({ type: "output", data })
+      );
+      // The stream's end (window closed, crashed, reloaded or disconnected) releases the mark.
+      const releasePopout = popout ? context.terminalService.markPopoutAttached(sessionId) : null;
+      return () => {
+        releasePopout?.();
+        unsubscribe();
+      };
+    },
     initial: () => ({
       type: "screenState" as const,
       data: context.terminalService.getScreenState(sessionId),

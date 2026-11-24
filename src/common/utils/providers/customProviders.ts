@@ -68,10 +68,6 @@ export function validateCustomProviderId(id: string): CustomProviderIdValidation
   return { ok: true };
 }
 
-export function isValidCustomProviderId(id: string): boolean {
-  return validateCustomProviderId(id).ok;
-}
-
 /**
  * Every supported SDK adapter builds request URLs by appending the endpoint
  * path directly onto the configured base URL string (e.g.
@@ -166,6 +162,14 @@ export function getCustomProviderIds(providersConfig: ProvidersConfigWithProvide
   }
 
   return providerIds;
+}
+
+/** Built-in providers, then custom providers; a custom id shadowing a built-in is listed once. */
+export function getProviderIdsForUi(
+  providersConfig: ProvidersConfigWithProviderType | null | undefined
+): string[] {
+  const customProviders = providersConfig ? getCustomProviderIds(providersConfig) : [];
+  return Array.from(new Set([...SUPPORTED_PROVIDERS, ...customProviders]));
 }
 
 export function getShadowedCustomProviderIds(

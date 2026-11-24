@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { cleanup, render } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import type { ReactElement } from "react";
@@ -84,14 +85,14 @@ describe("summarizeOutcomeGroups", () => {
 
 describe("WorkspaceLifecycleToolCall", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
   });
 
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("expanded card surfaces per-row blocked details (paths + active turns)", () => {

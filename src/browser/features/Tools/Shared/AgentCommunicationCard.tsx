@@ -66,7 +66,7 @@ export function AgentCommunicationCard(props: AgentCommunicationCardProps) {
             role="status"
             className={cn(
               "inline-flex items-center gap-1",
-              props.status === "completed" && "text-success",
+              props.status === "completed" && "text-success-text",
               props.status === "failed" && "text-danger",
               props.status === "interrupted" && "text-interrupted",
               (props.status === "executing" || props.status === "backgrounded") &&

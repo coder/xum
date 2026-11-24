@@ -1,4 +1,10 @@
-import { getPlanFilePath, getLegacyPlanFilePath } from "./planStorage";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import {
+  getPlanFilePath,
+  getLegacyPlanFilePath,
+  sharesPlanDirectory,
+  sharesPlanStorage,
+} from "./planStorage";
 
 describe("planStorage", () => {
   // Plan paths use tilde prefix for portability across local/remote runtimes
@@ -56,6 +62,57 @@ describe("planStorage", () => {
       const result = getLegacyPlanFilePath("a1b2c3d4e5", "/var/mux");
       expect(result).toBe("/var/mux/plans/a1b2c3d4e5.md");
       expect(result).not.toContain("~/.xum");
+    });
+  });
+
+  describe("sharesPlanStorage", () => {
+    const ssh = (host: string, port?: number): RuntimeConfig => ({
+      type: "ssh",
+      host,
+      srcBaseDir: "~/xum",
+      ...(port !== undefined ? { port } : {}),
+    });
+
+    // #5180: compare the SSH endpoint, not its spelling. An unset user may be any user.
+    it.each([
+      { a: "box", b: "alice@box", shared: true },
+      // ssh routes these apart: Host patterns are case-sensitive, and `[::1]` keeps its brackets.
+      { a: "alice@box", b: "alice@BOX", shared: false },
+      { a: "alice@[::1]", b: "::1", shared: false },
+      { a: "alice@box", b: "bob@box", shared: false },
+      { a: "box", b: "other-box", shared: false },
+    ])("$a and $b share plan storage: $shared", ({ a, b, shared }) => {
+      expect(sharesPlanStorage(ssh(a), ssh(b))).toBe(shared);
+    });
+
+    it("keeps comparing ports: an explicit port differs, an unset one may match", () => {
+      expect(sharesPlanStorage(ssh("alice@box", 22), ssh("box", 2222))).toBe(false);
+      expect(sharesPlanStorage(ssh("alice@box", 22), ssh("box"))).toBe(true);
+    });
+  });
+
+  describe("sharesPlanDirectory", () => {
+    // Case-insensitive filesystems (macOS, Windows defaults) resolve both to one directory.
+    it("treats project names that differ only in case as one plan directory", () => {
+      const local = { type: "local" } as const;
+      expect(
+        sharesPlanDirectory(
+          { projectName: "App", projectPath: "/a/App", runtimeConfig: local },
+          { projectName: "app", projectPath: "/b/app", runtimeConfig: local }
+        )
+      ).toBe(true);
+    });
+
+    // SSH plans are keyed by the remote project id, a hash of the local project path (#5174).
+    it("splits same-basename SSH projects and joins one SSH project path", () => {
+      const ssh = { type: "ssh", host: "box", srcBaseDir: "~/xum" } as const;
+      const at = (projectPath: string) => ({
+        projectName: "project",
+        projectPath,
+        runtimeConfig: ssh,
+      });
+      expect(sharesPlanDirectory(at("/a/project"), at("/b/project"))).toBe(false);
+      expect(sharesPlanDirectory(at("/a/project"), at("/a/project/"))).toBe(true);
     });
   });
 });

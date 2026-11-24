@@ -13,8 +13,7 @@ jest.mock("lottie-react", () => ({
 }));
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getInputAttachmentsKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
@@ -37,9 +36,9 @@ const providerAttachment = (filename: string) => ({
 });
 
 const composerAttachmentNames = (app: AppHarness) =>
-  readPersistedState<{ filename?: string }[]>(getInputAttachmentsKey(app.workspaceId), []).map(
-    (attachment) => attachment.filename
-  );
+  getDraftStore()
+    .getAttachments({ kind: "workspace", workspaceId: app.workspaceId })
+    .map((attachment) => attachment.filename);
 /** The workspace's reviews in the backend review-state store. */
 const storeReviews = async (app: AppHarness) =>
   (await app.env.services.reviewStateService.getSnapshot(app.workspaceId)).sections.reviews ?? {};
@@ -78,8 +77,8 @@ async function attachStoreReview(app: AppHarness, id: string, data: ReviewNoteDa
 
 async function setComposerAttachments(app: AppHarness, filenames: string[]) {
   act(() => {
-    updatePersistedState(
-      getInputAttachmentsKey(app.workspaceId),
+    getDraftStore().setAttachments(
+      { kind: "workspace", workspaceId: app.workspaceId },
       filenames.map((filename) => providerAttachment(filename))
     );
   });
@@ -321,6 +320,63 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
       await app.chat.expectInputValue("queued follow-up", LOAD_TOLERANT_WAIT.timeout);
       expect(composerAttachmentNames(app)).toEqual(["queued.txt", "draft.txt"]);
       await waitFor(() => expect(composerText(app)).toContain("queued note"), LOAD_TOLERANT_WAIT);
+    } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+});
+
+describe("ArrowUp and a queued artifact send", () => {
+  beforeAll(async () => {
+    await preloadTestModules();
+  });
+
+  test("ArrowUp leaves a queued artifact send queued and the composer empty", async () => {
+    const app = await createAppHarness({ branchPrefix: "arrowup-artifact-send" });
+    try {
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      const holding = app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "[mock:wait-start] hold the workspace busy",
+        options: { model: "openai:gpt-5.2", agentId: "exec" },
+      });
+      await waitFor(() => expect(session.isBusy()).toBe(true), LOAD_TOLERANT_WAIT);
+      // What the artifact send path queues: the model-facing payload plus its metadata.
+      session.queueMessage(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: "openai:gpt-5.2",
+          agentId: "exec",
+          muxMetadata: {
+            type: "normal",
+            artifactInteraction: {
+              id: "i-1",
+              artifactPath: "form.html",
+              title: "Form",
+              action: "send",
+              text: "Ship it",
+            },
+          },
+        }
+      );
+      await waitFor(() => {
+        const card = app.view.container.querySelector('[data-component="QueuedMessageCard"]');
+        expect(card?.textContent).toContain("from artifact");
+      }, LOAD_TOLERANT_WAIT);
+
+      const composer = [
+        ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
+          'textarea[aria-label="Message"]'
+        ),
+      ].find((textarea) => textarea.value === "" && !textarea.disabled)!;
+      await act(async () => {
+        fireEvent.keyDown(composer, { key: "ArrowUp" });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      });
+      expect(session.hasQueuedMessages()).toBe(true);
+      await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
+
+      await stop(app, holding);
     } finally {
       await app.dispose();
     }

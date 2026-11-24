@@ -66,7 +66,7 @@ test.describe("chat typing performance profiling", () => {
       timeout: 20_000,
     });
 
-    const input = page.getByRole("textbox", { name: "Message Claude" });
+    const input = page.getByRole("textbox", { name: "Message", exact: true });
     await input.fill("");
 
     const { chromeProfile, reactProfile } = await profileChatInputTyping({
@@ -89,13 +89,14 @@ test.describe("chat typing performance profiling", () => {
     const projectName = path.basename(workspace.demoProject.projectPath);
     await page.getByRole("button", { name: `Create workspace in ${projectName}` }).click();
 
-    const input = page.getByRole("textbox", { name: "Message Claude" });
+    const input = page.getByRole("textbox", { name: "Message", exact: true });
     await expect(input).toBeVisible({ timeout: 20_000 });
 
     // Creation initializes branches, runtime availability, Coder status, and auto-naming
     // independently. Let those legitimate commits settle before resetting profiler samples.
-    await expect(page.getByRole("combobox", { name: "Workspace type" })).toBeEnabled();
-    await expect(page.getByRole("combobox", { name: "Select source branch" })).toBeEnabled();
+    const environment = page.getByTestId("creation-environment");
+    await expect(environment).toBeEnabled();
+    await expect(environment.locator('[data-branch-load="selected"]')).toBeVisible();
     const autoNamingButton = page.getByRole("button", { name: "Disable auto-naming" });
     await expect(autoNamingButton).toBeVisible();
     await autoNamingButton.click();

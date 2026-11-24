@@ -10,6 +10,7 @@ import {
   validateFileSize,
   validatePlanModeAccess,
 } from "./fileCommon";
+import { fileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
@@ -83,6 +84,7 @@ async function waitForFileEditOrAbort<TMetadata>(
       }
 
       abortSignal.removeEventListener("abort", onAbort);
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       resolve(getAbortedFileEditResult(abortSignal)!);
     };
 
@@ -117,7 +119,13 @@ export async function executeFileEditOperation<TMetadata>({
       correctedPath: validatedPath,
       warning: pathWarning,
       resolvedPath,
-    } = resolvePathWithinCwd(filePath, config.cwd, config.runtime);
+    } = await resolvePathWithinCwd(
+      filePath,
+      config.cwd,
+      config.runtime,
+      "write",
+      fileToolSandboxContext(config)
+    );
     filePath = validatedPath;
 
     // Validate plan mode access restrictions

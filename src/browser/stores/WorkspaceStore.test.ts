@@ -1,13 +1,24 @@
+import { dismissChatError, peekChatError } from "@/browser/utils/chatErrorToasts";
 import { EventEmitter } from "node:events";
+import { getSessionCacheHealth } from "@/common/utils/tokens/cacheHealth";
 // This integration regression drives the real server replay into the real renderer store.
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture, never bundled into the renderer
 import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture: real loadMore pages
+import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
 // eslint-disable-next-line local/no-cross-boundary-imports -- exercise the actual IPC replay boundary in this store fixture
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
+import { markSessionTapeReplayEgressBlocked } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import type { ORPCContext } from "@/node/orpc/context";
+import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
 import { Ok } from "@/common/types/result";
 import { GlobalWindow } from "happy-dom";
+import { createORPCClient } from "@orpc/client";
+import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
+import { eventIterator, os, type RouterClient } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/message-port";
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import {
   describe,
   expect,
@@ -30,18 +41,34 @@ import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMe
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
-import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  WorkspaceActivitySnapshot,
+  OnChatEvent,
+  WorkspaceChatMessage,
+  WorkspaceStatsSnapshot,
+} from "@/common/orpc/types";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
-import {
-  getAutoRetryKey,
-  getPinnedTodoExpandedKey,
-  getStatusStateKey,
-} from "@/common/constants/storage";
+import { getAutoRetryKey, getStatusStateKey } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
+import type { GoalSnapshot } from "@/common/types/goal";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import { revealTimelineTarget } from "@/browser/utils/timelineReveal";
+import type {
+  TimelineEvent,
+  TimelinePage,
+  TimelineSubscriptionEvent,
+} from "@/common/orpc/schemas/timeline";
+import type { APIClient } from "@/browser/contexts/API";
+import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import {
+  areActivityGoalsEqual,
+  findLastContextUsage,
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
+  resolveSidebarAgentStatus,
+  sumSessionCostUsage,
+  sumSessionTokens,
   WorkspaceStore,
   type TranscriptRefreshOutcome,
   type WorkspaceStoreOptions,
@@ -49,33 +76,57 @@ import {
 import {
   createControllableAsyncIterable,
   type ControllableAsyncIterable,
+  type TestApiOverrides,
 } from "@/browser/testUtils";
+import * as RealToolCardsStore from "@/browser/features/Tools/Shared/toolCardsStore";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 import {
   shouldNotifyOnResponseComplete,
   type ResponseCompleteEvent,
 } from "@/browser/utils/messages/responseCompletionMetadata";
 
+// Counts the store's tool-card requests (#6823) and records how many onChat calls preceded each.
+// The real request still runs, so every other test sees the real store.
+const realToolCardsStore = { ...RealToolCardsStore };
+const onChatCallsAtToolCardRequest: number[] = [];
+restoreModulesAfterSuite([["@/browser/features/Tools/Shared/toolCardsStore", realToolCardsStore]]);
+void mock.module("@/browser/features/Tools/Shared/toolCardsStore", () => ({
+  ...realToolCardsStore,
+  requestToolCards: () => {
+    onChatCallsAtToolCardRequest.push(mockOnChat.mock.calls.length);
+    realToolCardsStore.requestToolCards();
+  },
+}));
+
 interface LoadMoreResponse {
   messages: WorkspaceChatMessage[];
   nextCursor: { beforeHistorySequence: number; beforeMessageId?: string | null } | null;
   hasOlder: boolean;
+  notPageable?: boolean;
 }
 
 // Mock client
 // eslint-disable-next-line require-yield
-const mockOnChat = mock(async function* (
+async function* idleOnChat(
   _input?: { workspaceId: string; mode?: unknown },
   options?: { signal?: AbortSignal }
-): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+): AsyncGenerator<OnChatEvent, void, unknown> {
   // Keep the iterator open until the store aborts it (prevents retry-loop noise in tests).
   await waitForAbortSignal(options?.signal);
-});
+}
+const mockOnChat = mock(idleOnChat);
 
-const mockGetSessionUsage = mock((_input: { workspaceId: string }) =>
-  Promise.resolve<unknown>(undefined)
-);
+const noSessionUsage = (_input: { workspaceId: string }) => Promise.resolve<unknown>(undefined);
+const mockGetSessionUsage = mock(noSessionUsage);
+const noSubagentUsage = (_input: { workspaceId: string }, _options?: { signal?: AbortSignal }) =>
+  Promise.resolve<unknown>({ children: {} });
+const mockGetSubagentUsage = mock(noSubagentUsage);
 const mockHistoryLoadMore = mock(
-  (): Promise<LoadMoreResponse> =>
+  (_input?: {
+    workspaceId: string;
+    cursor?: { beforeHistorySequence: number; beforeMessageId?: string | null } | null;
+    windowed?: boolean;
+  }): Promise<LoadMoreResponse> =>
     Promise.resolve({
       messages: [],
       nextCursor: null,
@@ -91,6 +142,10 @@ type WorkspaceActivityEvent =
       type: "activity";
       workspaceId: string;
       activity: WorkspaceActivitySnapshot | null;
+    }
+  | {
+      type: "usage-changed";
+      workspaceId: string;
     }
   | {
       type: "heartbeat";
@@ -142,6 +197,7 @@ const mockClient = {
   workspace: {
     onChat: mockOnChat,
     getSessionUsage: mockGetSessionUsage,
+    getSubagentUsage: mockGetSubagentUsage,
     history: {
       loadMore: mockHistoryLoadMore,
     },
@@ -240,6 +296,7 @@ function makeWorkspaceMetadata(
     namedWorkspacePath: options.namedWorkspacePath ?? "/path/to/workspace",
     createdAt: options.createdAt ?? new Date().toISOString(),
     runtimeConfig: options.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
+    ...(options.parentWorkspaceId ? { parentWorkspaceId: options.parentWorkspaceId } : {}),
   };
 }
 
@@ -328,77 +385,6 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<bo
  */
 function tick(ms = 0): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Sentinel describing how to terminate a generated stream. */
-type StreamTerminator =
-  | { kind: "stream-end"; messageId: string; model: string }
-  | { kind: "stream-abort"; messageId: string };
-
-/**
- * Build the canonical 4-event "todo-write inside a stream" sequence used by
- * pinned-todo tests. Pass a terminator to choose between stream-end / stream-abort.
- */
-function pinnedTodoStreamEvents(
-  workspaceId: string,
-  todos: TodoItem[],
-  terminator: StreamTerminator
-): WorkspaceChatMessage[] {
-  const messageId = terminator.messageId;
-  const toolCallId = `${messageId}-todo-write`;
-  const events: WorkspaceChatMessage[] = [
-    {
-      type: "stream-start",
-      workspaceId,
-      messageId,
-      historySequence: 1,
-      model: "claude-sonnet-4",
-      startTime: 1_000,
-    },
-    {
-      type: "tool-call-start",
-      workspaceId,
-      messageId,
-      toolCallId,
-      toolName: "todo_write",
-      args: { todos },
-      tokens: 10,
-      timestamp: 1_001,
-    },
-    {
-      type: "tool-call-end",
-      workspaceId,
-      messageId,
-      toolCallId,
-      toolName: "todo_write",
-      result: { success: true },
-      timestamp: 1_002,
-    },
-  ];
-
-  if (terminator.kind === "stream-end") {
-    events.push({
-      type: "stream-end",
-      workspaceId,
-      messageId,
-      metadata: {
-        model: terminator.model,
-        historySequence: 1,
-        timestamp: 1_003,
-      },
-      parts: [],
-    });
-  } else {
-    events.push({
-      type: "stream-abort",
-      workspaceId,
-      messageId,
-      abortReason: "user",
-      metadata: {},
-    });
-  }
-
-  return events;
 }
 
 /**
@@ -536,6 +522,21 @@ const bashOutputEvent = (
   ...overrides,
 });
 
+const sandboxApprovalEvent = (
+  workspaceId: string,
+  toolCallId: string,
+  pending: boolean,
+  timestamp: number
+): WorkspaceChatMessage => ({
+  type: "bash-sandbox-approval",
+  workspaceId,
+  toolCallId,
+  script: `script of ${toolCallId}`,
+  reason: `reason for ${toolCallId}`,
+  pending,
+  timestamp,
+});
+
 const toolCallEndEvent = (
   workspaceId: string,
   toolCallId: string,
@@ -551,33 +552,6 @@ const toolCallEndEvent = (
   result,
   timestamp: 1,
   ...overrides,
-});
-
-const advisorPhaseEvent = (
-  workspaceId: string,
-  toolCallId: string,
-  phase: ChatEvent<"advisor-phase">["phase"],
-  timestamp: number
-): WorkspaceChatMessage => ({ type: "advisor-phase", workspaceId, toolCallId, phase, timestamp });
-
-const advisorOutputEvent = (
-  workspaceId: string,
-  toolCallId: string,
-  text: string,
-  timestamp: number
-): WorkspaceChatMessage => ({ type: "advisor-output", workspaceId, toolCallId, text, timestamp });
-
-const advisorReasoningOutputEvent = (
-  workspaceId: string,
-  toolCallId: string,
-  text: string,
-  timestamp: number
-): WorkspaceChatMessage => ({
-  type: "advisor-reasoning-output",
-  workspaceId,
-  toolCallId,
-  text,
-  timestamp,
 });
 
 function createWorkflowRunRecord(overrides: Partial<WorkflowRunRecord> = {}): WorkflowRunRecord {
@@ -789,11 +763,19 @@ describe("WorkspaceStore", () => {
   let mockOnModelUsed: Mock<(model: string) => void>;
 
   beforeEach(() => {
-    mockOnChat.mockClear();
-    mockGetSessionUsage.mockClear();
+    // Reset, not just clear: many tests install a lasting mockImplementation (openChat,
+    // mockBackgroundActivityTransition), and a leftover one feeds events into the next
+    // test, which then fails or passes depending on test order (`bun test --seed <n>`).
+    mockOnChat.mockReset();
+    mockOnChat.mockImplementation(idleOnChat);
+    mockGetSessionUsage.mockReset();
+    mockGetSessionUsage.mockImplementation(noSessionUsage);
+    mockGetSubagentUsage.mockReset();
+    mockGetSubagentUsage.mockImplementation(noSubagentUsage);
+    mockActivitySubscribe.mockReset();
+    mockActivitySubscribe.mockImplementation(idleActivitySubscription);
     mockHistoryLoadMore.mockClear();
     mockActivityList.mockClear();
-    mockActivitySubscribe.mockClear();
     mockTerminalActivitySubscribe.mockClear();
     mockGetProvidersConfig.mockClear();
     mockOnProvidersConfigChanged.mockClear();
@@ -865,6 +847,164 @@ describe("WorkspaceStore", () => {
   afterEach(() => {
     store.dispose();
   });
+
+  describe("toast-only events through the store", () => {
+    const notice = (workspaceId: string, message: string): WorkspaceChatMessage => ({
+      type: "plugin-hook-notice",
+      workspaceId,
+      plugin: "guard",
+      message,
+    });
+    const budget = (workspaceId: string, message: string): WorkspaceChatMessage => ({
+      type: "goal-budget-limited",
+      workspaceId,
+      goalId: "goal-1",
+      causedByChild: true,
+      childWorkspaceId: "child-1",
+      message,
+    });
+    const drainToasts = (workspaceId: string): string[] => {
+      const shown: string[] = [];
+      for (let message = peekChatError(workspaceId); message != null; ) {
+        shown.push(message);
+        dismissChatError(workspaceId, message);
+        message = peekChatError(workspaceId);
+      }
+      return shown;
+    };
+
+    it("a live plugin hook notice and goal-budget event queue their toasts", async () => {
+      const workspaceId = "live-toast-events";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+      await send(caughtUpEvent());
+
+      await send(notice(workspaceId, "Checked the command."), budget(workspaceId, "Over budget."));
+
+      expect(drainToasts(workspaceId)).toEqual([
+        "Plugin guard: Checked the command.",
+        "Over budget.",
+      ]);
+    });
+
+    it("live notices that arrive before a failed history replay still show their toasts", async () => {
+      const workspaceId = "failed-replay-toast-events";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+
+      await send(notice(workspaceId, "Checked the command."), budget(workspaceId, "Over budget."));
+      await send(caughtUpEvent({ replay: "full", historyReplayStatus: "failed" }));
+
+      expect(drainToasts(workspaceId)).toEqual([
+        "Plugin guard: Checked the command.",
+        "Over budget.",
+      ]);
+    });
+
+    it("live notices that arrive during a reconnect replay still show their toasts", async () => {
+      const workspaceId = "buffered-toast-events";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+
+      // The server never replays these: one before caught-up is live, buffered until history loads.
+      await send(notice(workspaceId, "Checked the command."), budget(workspaceId, "Over budget."));
+      await send(caughtUpEvent());
+
+      expect(drainToasts(workspaceId)).toEqual([
+        "Plugin guard: Checked the command.",
+        "Over budget.",
+      ]);
+    });
+  });
+
+  it("shows a refused session tape replay as an error and does not retry it", async () => {
+    // A mapped tape the backend refuses (here: missing) must end the skeleton with a visible
+    // reason, keep sends closed and not resubscribe: a retry can only be refused again. Served
+    // by the backend's real onChat entry point, with no services behind it.
+    const workspaceId = "tape-refused-workspace";
+    const savedEnv = {
+      XUM_REPLAY_TAPES: process.env.XUM_REPLAY_TAPES,
+      XUM_E2E: process.env.XUM_E2E,
+      XUM_REPLAY_HARNESS: process.env.XUM_REPLAY_HARNESS,
+    };
+    process.env.XUM_REPLAY_TAPES = JSON.stringify({ [workspaceId]: "/nonexistent/missing.jsonl" });
+    // The perf harness markers: outside them the backend refuses before reading the tape.
+    process.env.XUM_E2E = "1";
+    process.env.XUM_REPLAY_HARNESS = "1";
+    markSessionTapeReplayEgressBlocked();
+    const context = {} as unknown as ORPCContext;
+    mockOnChat.mockImplementation(async function* (input, options) {
+      yield* subscribeWorkspaceChat(context, { workspaceId: input!.workspaceId }, options?.signal, {
+        validateOutput: true,
+      });
+    });
+    try {
+      createAndAddWorkspace(store, workspaceId);
+      const showsRefusal = () =>
+        store
+          .getWorkspaceState(workspaceId)
+          .messages.some(
+            (message) => message.type === "stream-error" && message.error.includes("unreadable")
+          );
+      expect(await waitUntil(showsRefusal)).toBe(true);
+      // Past the first retry backoff (SUBSCRIPTION_RETRY_BASE_MS): a retry would subscribe again.
+      await tick(400);
+      expect(mockOnChat).toHaveBeenCalledTimes(1);
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.isHydratingTranscript).toBe(false);
+      expect(state.loading).toBe(false);
+      expect(state.isTranscriptCaughtUp).toBe(false);
+      // Not a model stream failure: no "Stream interrupted" barrier and no Retry/auto-retry.
+      expect(state.messages.at(-1)).toMatchObject({ errorType: "session_tape_replay" });
+      const interruption = getInterruptionContext(state.messages);
+      expect(interruption.hasInterruptedStream).toBe(false);
+      expect(interruption.isEligibleForAutoRetry).toBe(false);
+    } finally {
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it.each([false, true])(
+    "suppresses recorded side effects when the renderer replays a session tape (%p)",
+    async (replaying) => {
+      // A replayed tape's events never ran here: no git/review refresh.
+      const workspaceId = `tape-side-effects-${String(replaying)}`;
+      const api = global.window.api as { isSessionTapeReplay?: boolean };
+      api.isSessionTapeReplay = replaying;
+      try {
+        const send = openChat(workspaceId);
+        createAndAddWorkspace(store, workspaceId);
+        const messageId = "tape-stream";
+        await send(
+          caughtUpEvent(),
+          {
+            type: "stream-start",
+            workspaceId,
+            messageId,
+            historySequence: 1,
+            model: TEST_MODEL,
+            startTime: 1,
+          },
+          toolCallEndEvent(workspaceId, "tool-1", "bash", { output: "ok" }, { messageId }),
+          {
+            type: "stream-error",
+            messageId,
+            error: "Unauthorized",
+            errorType: "authentication",
+          }
+        );
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).messages.length > 0)
+        ).toBe(true);
+        expect(store.getFileModifyingToolMs(workspaceId) === undefined).toBe(replaying);
+      } finally {
+        delete api.isSessionTapeReplay;
+      }
+    }
+  );
 
   it.each([
     ["stream-abort", "full"],
@@ -963,7 +1103,7 @@ describe("WorkspaceStore", () => {
     const context = {
       workspaceService: { getOrCreateSession: () => h.session },
     } as unknown as ORPCContext;
-    const trace: WorkspaceChatMessage[] = [];
+    const trace: OnChatEvent[] = [];
     const consumed = Promise.withResolvers<void>();
     mockOnChat.mockImplementation(async function* (_input, options) {
       for await (const event of subscribeWorkspaceChat(
@@ -1098,283 +1238,6 @@ describe("WorkspaceStore", () => {
     });
   });
 
-  describe("pinned todo auto-collapse", () => {
-    const pinnedTodos: TodoItem[] = [{ content: "Add tests", status: "in_progress" }];
-
-    it("persists a collapsed panel when an active workspace stream ends with todos", async () => {
-      const workspaceId = "pinned-todo-stream-end";
-      const pinnedTodoKey = getPinnedTodoExpandedKey(workspaceId);
-
-      mockChatScript(
-        [
-          caughtUpEvent(),
-          Promise.resolve(),
-          ...pinnedTodoStreamEvents(workspaceId, pinnedTodos, {
-            kind: "stream-end",
-            messageId: "stream-end-msg",
-            model: TEST_MODEL,
-          }),
-        ],
-        { keepOpen: true }
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const collapsed = await waitUntil(
-        () => localStorageBacking.get(pinnedTodoKey) === JSON.stringify(false)
-      );
-      expect(collapsed).toBe(true);
-    });
-
-    it("persists a collapsed panel when an active workspace stream aborts with todos", async () => {
-      const workspaceId = "pinned-todo-stream-abort";
-      const pinnedTodoKey = getPinnedTodoExpandedKey(workspaceId);
-
-      mockChatScript(
-        [
-          caughtUpEvent(),
-          Promise.resolve(),
-          ...pinnedTodoStreamEvents(workspaceId, pinnedTodos, {
-            kind: "stream-abort",
-            messageId: "stream-abort-msg",
-          }),
-        ],
-        { keepOpen: true }
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const collapsed = await waitUntil(
-        () => localStorageBacking.get(pinnedTodoKey) === JSON.stringify(false)
-      );
-      expect(collapsed).toBe(true);
-    });
-
-    it("active workspace activity snapshot does not re-collapse after user re-expands", async () => {
-      const workspaceId = "active-workspace-pinned-todo-snapshot-race";
-      const pinnedTodoKey = getPinnedTodoExpandedKey(workspaceId);
-      const initialRecency = new Date("2099-01-10T00:00:00.000Z").getTime();
-
-      let releaseStopSnapshot!: () => void;
-      const stopSnapshotReady = new Promise<void>((resolve) => {
-        releaseStopSnapshot = resolve;
-      });
-
-      mockActivitySubscribe.mockImplementation(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-        await stopSnapshotReady;
-        if (options?.signal?.aborted) {
-          return;
-        }
-
-        yield {
-          type: "activity" as const,
-          workspaceId,
-          activity: {
-            recency: initialRecency,
-            streaming: true,
-            hasTodos: true,
-            lastModel: "claude-sonnet-4",
-            lastThinkingLevel: null,
-          },
-        };
-        yield {
-          type: "activity" as const,
-          workspaceId,
-          activity: {
-            recency: initialRecency + 1,
-            streaming: false,
-            hasTodos: true,
-            lastModel: "claude-sonnet-4",
-            lastThinkingLevel: null,
-          },
-        };
-
-        await waitForAbortSignal(options?.signal);
-      });
-      mockChatScript(
-        [
-          caughtUpEvent(),
-          Promise.resolve(),
-          ...pinnedTodoStreamEvents(workspaceId, pinnedTodos, {
-            kind: "stream-end",
-            messageId: "stream-end-msg",
-            model: TEST_MODEL,
-          }),
-        ],
-        { keepOpen: true }
-      );
-
-      recreateStore();
-      await tick(0);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const collapsed = await waitUntil(
-        () => localStorageBacking.get(pinnedTodoKey) === JSON.stringify(false)
-      );
-      expect(collapsed).toBe(true);
-
-      localStorageBacking.set(pinnedTodoKey, JSON.stringify(true));
-
-      releaseStopSnapshot();
-
-      const processedSnapshot = await waitUntil(
-        () => store.getWorkspaceState(workspaceId).recencyTimestamp === initialRecency + 1
-      );
-      expect(processedSnapshot).toBe(true);
-      expect(localStorageBacking.get(pinnedTodoKey)).toBe(JSON.stringify(true));
-    });
-
-    it("background stream-stop with hasTodos: true collapses panel even with empty aggregator", async () => {
-      const activeWorkspaceId = "active-workspace-pinned-todo";
-      const backgroundWorkspaceId = "background-workspace-pinned-todo";
-      const pinnedTodoKey = getPinnedTodoExpandedKey(backgroundWorkspaceId);
-      const initialRecency = new Date("2024-01-10T00:00:00.000Z").getTime();
-      const backgroundStreamingSnapshot: WorkspaceActivitySnapshot = {
-        recency: initialRecency,
-        streaming: true,
-        lastModel: "claude-sonnet-4",
-        lastThinkingLevel: null,
-      };
-
-      let releaseBackgroundCompletion!: () => void;
-      const backgroundCompletionReady = new Promise<void>((resolve) => {
-        releaseBackgroundCompletion = resolve;
-      });
-
-      mockActivityList.mockResolvedValue({
-        [backgroundWorkspaceId]: backgroundStreamingSnapshot,
-      });
-      mockActivitySubscribe.mockImplementation(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-        await backgroundCompletionReady;
-        if (options?.signal?.aborted) {
-          return;
-        }
-
-        yield {
-          type: "activity" as const,
-          workspaceId: backgroundWorkspaceId,
-          activity: {
-            ...backgroundStreamingSnapshot,
-            recency: initialRecency + 1,
-            streaming: false,
-            hasTodos: true,
-          },
-        };
-
-        await waitForAbortSignal(options?.signal);
-      });
-
-      recreateStore();
-      await tick(0);
-
-      createAndAddWorkspace(store, activeWorkspaceId);
-      createAndAddWorkspace(store, backgroundWorkspaceId, {}, false);
-
-      releaseBackgroundCompletion();
-
-      const collapsed = await waitUntil(
-        () => localStorageBacking.get(pinnedTodoKey) === JSON.stringify(false)
-      );
-      expect(collapsed).toBe(true);
-    });
-
-    it("background stream-stop with hasTodos: false does not collapse panel even with stale aggregator todos", async () => {
-      const activeWorkspaceId = "active-workspace-pinned-todo-stale";
-      const backgroundWorkspaceId = "background-workspace-pinned-todo-stale";
-      const pinnedTodoKey = getPinnedTodoExpandedKey(backgroundWorkspaceId);
-      const initialRecency = new Date("2024-01-10T00:00:00.000Z").getTime();
-      const backgroundStreamingSnapshot: WorkspaceActivitySnapshot = {
-        recency: initialRecency,
-        streaming: true,
-        lastModel: "claude-sonnet-4",
-        lastThinkingLevel: null,
-      };
-
-      let releaseBackgroundCompletion!: () => void;
-      const backgroundCompletionReady = new Promise<void>((resolve) => {
-        releaseBackgroundCompletion = resolve;
-      });
-
-      mockActivityList.mockResolvedValue({
-        [backgroundWorkspaceId]: backgroundStreamingSnapshot,
-      });
-      mockActivitySubscribe.mockImplementation(async function* (
-        _input?: void,
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
-        await backgroundCompletionReady;
-        if (options?.signal?.aborted) {
-          return;
-        }
-
-        yield {
-          type: "activity" as const,
-          workspaceId: backgroundWorkspaceId,
-          activity: {
-            ...backgroundStreamingSnapshot,
-            recency: initialRecency + 1,
-            streaming: false,
-            hasTodos: false,
-          },
-        };
-
-        await waitForAbortSignal(options?.signal);
-      });
-
-      recreateStore();
-      await tick(0);
-
-      createAndAddWorkspace(store, activeWorkspaceId);
-      createAndAddWorkspace(store, backgroundWorkspaceId, {}, false);
-      seedPinnedTodos(store, backgroundWorkspaceId, pinnedTodos);
-
-      const appliedInitialSnapshot = await waitUntil(
-        () => store.getWorkspaceState(backgroundWorkspaceId).canInterrupt
-      );
-      expect(appliedInitialSnapshot).toBe(true);
-
-      releaseBackgroundCompletion();
-
-      const processedSnapshot = await waitUntil(
-        () => !store.getWorkspaceState(backgroundWorkspaceId).canInterrupt
-      );
-      expect(processedSnapshot).toBe(true);
-      expect(localStorageBacking.has(pinnedTodoKey)).toBe(false);
-    });
-
-    it("does not persist a collapsed panel when a stream ends without todos", async () => {
-      const workspaceId = "pinned-todo-no-todos";
-      const pinnedTodoKey = getPinnedTodoExpandedKey(workspaceId);
-      let emittedStreamEnd = false;
-
-      mockChatScript(
-        [
-          caughtUpEvent(),
-          Promise.resolve(),
-          streamStartEvent(workspaceId, "stream-no-todos-msg", { startTime: 1_000 }),
-          streamEndEvent(workspaceId, "stream-no-todos-msg"),
-          () => {
-            emittedStreamEnd = true;
-          },
-        ],
-        { keepOpen: true }
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const processedStreamEnd = await waitUntil(() => emittedStreamEnd);
-      expect(processedStreamEnd).toBe(true);
-      expect(localStorageBacking.has(pinnedTodoKey)).toBe(false);
-    });
-  });
-
   describe("recency calculation for new workspaces", () => {
     it("should calculate recency from createdAt when workspace is added", () => {
       const workspaceId = "test-workspace";
@@ -1458,9 +1321,73 @@ describe("WorkspaceStore", () => {
 
       expect(listener).not.toHaveBeenCalled();
     });
+
+    it("applies a message-batch exactly like its rows (#4868)", async () => {
+      const replayed = [1, 2, 3].map((seq) => createHistoryMessageEvent(`history-${seq}`, seq));
+      const live = [4, 5].map((seq) => createHistoryMessageEvent(`live-${seq}`, seq));
+      const batch = (rows: WorkspaceChatMessage[]): OnChatEvent => ({
+        type: "message-batch",
+        messages: rows.flatMap((row) => (row.type === "message" ? [row] : [])),
+      });
+      // Before caught-up the rows go to the replay buffer; after it, down the live path.
+      const scripts: Record<string, OnChatEvent[]> = {
+        batched: [batch(replayed), fullCaughtUpEvent(3, "history-3"), batch(live)],
+        single: [...replayed, fullCaughtUpEvent(3, "history-3"), ...live],
+      };
+      mockOnChat.mockImplementation(async function* (input, options) {
+        yield* scripts[input?.workspaceId ?? ""] ?? [];
+        await waitForAbortSignal(options?.signal);
+      });
+
+      const transcript = async (workspaceId: string) => {
+        createAndAddWorkspace(store, workspaceId);
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).messages.length === 5)
+        ).toBe(true);
+        return JSON.stringify(store.getWorkspaceState(workspaceId).messages);
+      };
+      expect(await transcript("batched")).toBe(await transcript("single"));
+    });
   });
 
   describe("active workspace subscriptions", () => {
+    // #6823: on desktop the lazy cards' chunk evaluated after the first rows committed, so tool
+    // rows showed header-only cards for 1-2 frames. #7004: requesting it on every selection made
+    // chats without tool rows wait for it, so desktop requests it once, at idle after the first
+    // caught-up. The browser never requests it for a chat without tool calls (T3 #5971).
+    it.each([
+      ["desktop", true, 1],
+      ["browser", false, 0],
+    ] as const)(
+      "requests the tool cards once after the first caught-up in %s mode",
+      async (_mode, desktop, requests) => {
+        mockOnChat.mockImplementation(async function* (_input, options) {
+          yield caughtUpEvent();
+          await waitForAbortSignal(options?.signal);
+        });
+        const [first, second] = [`tool-cards-a-${_mode}`, `tool-cards-b-${_mode}`];
+        createAndAddWorkspace(store, first, {}, false);
+        createAndAddWorkspace(store, second, {}, false);
+        await tick(0);
+        onChatCallsAtToolCardRequest.length = 0;
+        const api = global.window.api as { getIsRosetta?: () => Promise<boolean> };
+        if (desktop) api.getIsRosetta = () => Promise.resolve(false);
+        try {
+          for (const [index, workspaceId] of [first, second, first].entries()) {
+            store.setActiveWorkspaceId(workspaceId);
+            // Selection itself never requests the cards.
+            expect(onChatCallsAtToolCardRequest).toHaveLength(index === 0 ? 0 : requests);
+            expect(await waitUntil(() => store.isWorkspaceTranscriptCaughtUp(workspaceId))).toBe(
+              true
+            );
+            await tick(0); // the idle fallback (no requestIdleCallback in bun)
+            expect(onChatCallsAtToolCardRequest).toHaveLength(requests);
+          }
+        } finally {
+          delete api.getIsRosetta;
+        }
+      }
+    );
     it("does not start onChat until workspace becomes active", async () => {
       const workspaceId = "inactive-workspace";
       createAndAddWorkspace(store, workspaceId, {}, false);
@@ -1510,6 +1437,61 @@ describe("WorkspaceStore", () => {
         mockChatScript([], { keepOpen: true });
       }
     );
+
+    it("drops the kept pre-replay usage when a full replay attempt ends before caught-up", async () => {
+      // A full replay keeps the last usage on screen until caught-up; if the attempt ends
+      // first, that snapshot must go so stale live usage is not shown while retries continue.
+      const workspaceId = "workspace-usage-snapshot-retry";
+      const attempts = Array.from({ length: 3 }, () =>
+        createControllableAsyncIterable<WorkspaceChatMessage>()
+      );
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (input, options) {
+        if (input?.workspaceId !== workspaceId) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        const events = attempts[subscriptions++];
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+      attempts[0].push(caughtUpEvent());
+      attempts[0].push({
+        type: "stream-start",
+        workspaceId,
+        messageId: "msg-live",
+        historySequence: 1,
+        model: "anthropic:claude-sonnet-4-20250514",
+        startTime: 1_000,
+      });
+      attempts[0].push({
+        type: "usage-delta",
+        workspaceId,
+        messageId: "msg-live",
+        usage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+        cumulativeUsage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+      });
+      expect(
+        await waitUntil(() => store.getWorkspaceUsage(workspaceId).liveUsage !== undefined)
+      ).toBe(true);
+
+      attempts[0].close();
+      expect(await waitUntil(() => subscriptions === 2)).toBe(true);
+      // The retry is a full replay that has not caught up: the snapshot stands in.
+      expect(store.getWorkspaceUsage(workspaceId).liveUsage).toBeDefined();
+
+      let usageNotified = false;
+      const unsubscribe = store.subscribeUsage(workspaceId, () => {
+        usageNotified = true;
+      });
+      attempts[1].close();
+      expect(await waitUntil(() => usageNotified)).toBe(true);
+      expect(store.getWorkspaceUsage(workspaceId).liveUsage).toBeUndefined();
+      unsubscribe();
+      mockChatScript([], { keepOpen: true });
+    });
 
     it("keeps transcript hydration active across full replay resets", async () => {
       const workspaceId = "workspace-full-replay-hydration";
@@ -1639,6 +1621,86 @@ describe("WorkspaceStore", () => {
       mockChatScript([], { keepOpen: true });
     });
 
+    it("logs a server event-validation failure as the client receives it, then retries", async () => {
+      // oRPC validates each yielded event against the chat schema and fails the stream; the
+      // server's own validation throws the identical error (#4868). It crosses a real oRPC
+      // message-port transport, like the desktop app's, which sends only the error's code and
+      // message: its `cause` (the schema issues) is never serialized (#5082).
+      const workspaceId = "workspace-event-validation-failed";
+      const serverRouter = {
+        // eslint-disable-next-line @typescript-eslint/require-await -- an event iterator source
+        onChat: os.output(eventIterator(WorkspaceChatMessageSchema)).handler(async function* () {
+          // A stream-delta without its required token count.
+          yield {
+            type: "stream-delta",
+            workspaceId,
+            messageId: "live",
+            delta: "text",
+            timestamp: 1,
+          } as unknown as WorkspaceChatMessage;
+        }),
+      };
+      const { port1, port2 } = new MessageChannel();
+      new RPCHandler(serverRouter).upgrade(port2);
+      port2.start();
+      const transport: RouterClient<typeof serverRouter> = createORPCClient(
+        new MessagePortLink({ port: port1 })
+      );
+      port1.start();
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (_input, options) {
+        // Only the first attempt reaches the server; the retry just stays open.
+        if (subscriptions++ > 0) return await waitForAbortSignal(options?.signal);
+        yield* await transport.onChat(undefined, { signal: options?.signal });
+      });
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => subscriptions === 2)).toBe(true);
+        expect(consoleError.mock.calls).toEqual([
+          [
+            `[WorkspaceStore] Event validation failed for ${workspaceId}: AsyncIteratorObject validation failed`,
+          ],
+        ]);
+      } finally {
+        consoleError.mockRestore();
+        port1.close();
+        port2.close();
+        mockChatScript([], { keepOpen: true });
+      }
+    });
+
+    it("warns and retries when a client change aborts the attempt mid-error", async () => {
+      const workspaceId = "workspace-error-after-client-change";
+      let subscriptions = 0;
+      // eslint-disable-next-line require-yield -- the attempt only waits, then fails
+      mockOnChat.mockImplementation(async function* (_input, options) {
+        subscriptions++;
+        if (subscriptions > 1) return await waitForAbortSignal(options?.signal);
+        await waitForAbortSignal(options?.signal);
+        // The transport fails with its own error, not an AbortError.
+        throw new Error("transport closed");
+      });
+      const consoleWarn = spyOn(console, "warn").mockImplementation(() => undefined);
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+        // A new client object, so the store treats it as a client change.
+        store.setClient({ ...mockClient } as unknown as Parameters<WorkspaceStore["setClient"]>[0]);
+
+        expect(await waitUntil(() => subscriptions === 2)).toBe(true);
+        expect(consoleWarn.mock.calls.map(([message]: unknown[]) => message)).toContain(
+          `[WorkspaceStore] onChat subscription aborted for ${workspaceId}; retrying...`
+        );
+        expect(consoleError).not.toHaveBeenCalled();
+      } finally {
+        consoleWarn.mockRestore();
+        consoleError.mockRestore();
+        mockChatScript([], { keepOpen: true });
+      }
+    });
+
     it("keeps the pending first-message row while hidden snapshot rows stream in", async () => {
       // Skill, MCP prompt, and @file first sends persist hidden synthetic user rows before the
       // durable message; each live event bumps state, so the row must survive that bump.
@@ -1695,7 +1757,7 @@ describe("WorkspaceStore", () => {
     });
 
     /**
-     * Leave live advisor output from a first (history-less) attempt, then end it so the
+     * Leave live bash output from a first (history-less) attempt, then end it so the
      * retry is a full replay. The output is cleared only by resetChatStateForReplay, so
      * its absence proves the reset ran.
      */
@@ -1706,20 +1768,20 @@ describe("WorkspaceStore", () => {
           ? [
               caughtUpEvent(),
               Promise.resolve(),
-              advisorOutputEvent(workspaceId, "call-replay-probe", "partial advice", 1),
+              bashOutputEvent(workspaceId, "call-replay-probe", "partial output"),
               endFirstAttempt.wait,
             ]
           : [() => waitForAbortSignal(signal)]
       );
       expect(
         await waitUntil(
-          () => store.getAdvisorToolLiveOutput(workspaceId, "call-replay-probe") !== null
+          () => store.getBashToolLiveOutput(workspaceId, "call-replay-probe") !== null
         )
       ).toBe(true);
       endFirstAttempt.release();
       expect(await waitUntil(() => subscriptions() === 2)).toBe(true);
       await tick(0);
-      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-replay-probe")).toBeNull();
+      expect(store.getBashToolLiveOutput(workspaceId, "call-replay-probe")).toBeNull();
       mockChatScript([], { keepOpen: true });
     };
 
@@ -1804,6 +1866,207 @@ describe("WorkspaceStore", () => {
     store.setActiveWorkspaceId(null);
     expect(store.isOnChatSubscriptionActive("workspace-1")).toBe(false);
     expect(store.isOnChatSubscriptionActive("workspace-2")).toBe(false);
+  });
+
+  // The /side chat tab renders a second live transcript next to the routed chat.
+  describe("pinned workspace subscription", () => {
+    const onChatSignals = (workspaceId: string) =>
+      mockOnChat.mock.calls
+        .filter(([input]) => input?.workspaceId === workspaceId)
+        .map(([, options]) => options?.signal);
+
+    beforeEach(() => {
+      mockChatScript([], { keepOpen: true });
+    });
+
+    it("keeps two side panes live alongside the routed chat and releases only the closed pane", async () => {
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side-a", {}, false);
+      createAndAddWorkspace(store, "side-b", {}, false);
+      const releaseA = store.acquirePinnedWorkspace("side-a");
+      const releaseB = store.acquirePinnedWorkspace("side-b");
+      await tick(0);
+      for (const id of ["main", "side-a", "side-b"]) {
+        expect(store.isOnChatSubscriptionActive(id)).toBe(true);
+        expect(onChatSignals(id)).toHaveLength(1);
+        expect(onChatSignals(id)[0]?.aborted).toBe(false);
+      }
+
+      // Switching the routed chat must not restart either side chat's replay.
+      createAndAddWorkspace(store, "other");
+      await tick(0);
+      expect(onChatSignals("main")[0]?.aborted).toBe(true);
+      for (const id of ["side-a", "side-b"]) {
+        expect(onChatSignals(id)).toHaveLength(1);
+        expect(onChatSignals(id)[0]?.aborted).toBe(false);
+      }
+
+      // Close the last-mounted pane first: the older pane must keep its subscription.
+      releaseB();
+      expect(onChatSignals("side-b")[0]?.aborted).toBe(true);
+      expect(store.isOnChatSubscriptionActive("side-b")).toBe(false);
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(true);
+      expect(onChatSignals("side-a")[0]?.aborted).toBe(false);
+      expect(store.isOnChatSubscriptionActive("other")).toBe(true);
+      expect(onChatSignals("other")[0]?.aborted).toBe(false);
+      releaseA();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(false);
+    });
+
+    it("subscribes once when the pinned workspace is also active", async () => {
+      createAndAddWorkspace(store, "main");
+      const release = store.acquirePinnedWorkspace("main");
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+
+      // Unpinning keeps the routed chat's loop; deactivating while pinned keeps it too.
+      release();
+      const releaseAgain = store.acquirePinnedWorkspace("main");
+      store.setActiveWorkspaceId(null);
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+      expect(onChatSignals("main")[0]?.aborted).toBe(false);
+      expect(store.isOnChatSubscriptionActive("main")).toBe(true);
+      releaseAgain();
+      expect(onChatSignals("main")[0]?.aborted).toBe(true);
+    });
+
+    it("releases duplicate owners independently and ignores repeated cleanup", async () => {
+      createAndAddWorkspace(store, "side", {}, false);
+      const releaseFirst = store.acquirePinnedWorkspace("side");
+      const releaseSecond = store.acquirePinnedWorkspace("side");
+      await tick(0);
+      expect(onChatSignals("side")).toHaveLength(1);
+      expect(mockGetSessionUsage).toHaveBeenCalledTimes(1);
+
+      releaseFirst();
+      releaseFirst();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(true);
+      expect(onChatSignals("side")[0]?.aborted).toBe(false);
+      releaseSecond();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(false);
+      expect(onChatSignals("side")[0]?.aborted).toBe(true);
+
+      const releaseNew = store.acquirePinnedWorkspace("side");
+      await tick(0);
+      releaseSecond();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(true);
+      expect(onChatSignals("side")[1]?.aborted).toBe(false);
+      releaseNew();
+      expect(onChatSignals("side")[1]?.aborted).toBe(true);
+    });
+
+    it("aborts all pins on disposal without letting old cleanup release later owners", async () => {
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side-a", {}, false);
+      createAndAddWorkspace(store, "side-b", {}, false);
+      const releaseA = store.acquirePinnedWorkspace("side-a");
+      const releaseB = store.acquirePinnedWorkspace("side-b");
+      await tick(0);
+      store.dispose();
+      for (const id of ["main", "side-a", "side-b"]) {
+        expect(onChatSignals(id)[0]?.aborted).toBe(true);
+        expect(store.isOnChatSubscriptionActive(id)).toBe(false);
+      }
+
+      createAndAddWorkspace(store, "side-a", {}, false);
+      const releaseNew = store.acquirePinnedWorkspace("side-a");
+      releaseA();
+      releaseB();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(true);
+      expect(store.isOnChatSubscriptionActive("side-b")).toBe(false);
+      releaseNew();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(false);
+    });
+
+    it("delivers independent live events to two pinned transcripts", async () => {
+      const streams = new Map([
+        ["side-a", createControllableAsyncIterable<WorkspaceChatMessage>()],
+        ["side-b", createControllableAsyncIterable<WorkspaceChatMessage>()],
+      ]);
+      mockOnChat.mockImplementation(async function* (input, options) {
+        const stream = streams.get(input?.workspaceId ?? "");
+        if (!stream) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        options?.signal?.addEventListener("abort", () => stream.close(), { once: true });
+        yield* stream.iterable;
+      });
+      createAndAddWorkspace(store, "main");
+      for (const [id, stream] of streams) {
+        createAndAddWorkspace(store, id, {}, false);
+        store.acquirePinnedWorkspace(id);
+        stream.push(caughtUpEvent());
+      }
+      expect(
+        await waitUntil(() =>
+          [...streams.keys()].every((id) => store.getWorkspaceState(id).isTranscriptCaughtUp)
+        )
+      ).toBe(true);
+
+      for (const [id, stream] of streams) {
+        stream.push(streamStartEvent(id, `response-${id}`));
+        expect(await waitUntil(() => store.getWorkspaceState(id).canInterrupt)).toBe(true);
+        if (id === "side-a") {
+          expect(store.getWorkspaceState("side-b").canInterrupt).toBe(false);
+        }
+      }
+      expect(store.getWorkspaceState("side-a").canInterrupt).toBe(true);
+      expect(store.getWorkspaceState("side-b").canInterrupt).toBe(true);
+    });
+
+    it("starts late-registered pins and invalidates their owners on removal", async () => {
+      const releaseOld = store.acquirePinnedWorkspace("late-side");
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(0);
+
+      createAndAddWorkspace(store, "late-side", {}, false);
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(1);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "late-side" });
+
+      store.removeWorkspace("late-side");
+      expect(onChatSignals("late-side")[0]?.aborted).toBe(true);
+      expect(store.isOnChatSubscriptionActive("late-side")).toBe(false);
+
+      // A re-registered workspace with the same id is not silently re-pinned.
+      createAndAddWorkspace(store, "late-side", {}, false);
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(1);
+
+      const releaseNew = store.acquirePinnedWorkspace("late-side");
+      await tick(0);
+      // Cleanup from the removed incarnation must not steal a new owner's subscription.
+      releaseOld();
+      expect(store.isOnChatSubscriptionActive("late-side")).toBe(true);
+      expect(onChatSignals("late-side")[1]?.aborted).toBe(false);
+      releaseNew();
+      expect(onChatSignals("late-side")[1]?.aborted).toBe(true);
+    });
+
+    it("trusts the caught-up aggregator over activity snapshots for the pinned workspace", async () => {
+      mockActivityList.mockResolvedValue({ side: createActivitySnapshot(10, { streaming: true }) });
+      mockActivitySubscribe.mockImplementation(idleActivitySubscription);
+      mockChatStreamFor("side", () => [
+        createHistoryMessageEvent("history-1", 1),
+        fullCaughtUpEvent(),
+      ]);
+      recreateStore();
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side", {}, false);
+
+      // Unsubscribed: the activity snapshot's streaming flag is the only signal.
+      expect(await waitUntil(() => store.getWorkspaceState("side").canInterrupt)).toBe(true);
+
+      store.acquirePinnedWorkspace("side");
+      expect(await waitUntil(() => store.getWorkspaceState("side").isTranscriptCaughtUp)).toBe(
+        true
+      );
+      const state = store.getWorkspaceState("side");
+      expect(state.messages).toHaveLength(1);
+      expect(state.canInterrupt).toBe(false);
+    });
   });
 
   describe("stale cached transcript", () => {
@@ -2857,10 +3120,12 @@ describe("WorkspaceStore", () => {
         expect(mockHistoryLoadMore).toHaveBeenNthCalledWith(1, {
           workspaceId,
           cursor: { beforeHistorySequence: 5, beforeMessageId: "h5" },
+          windowed: true,
         });
         expect(mockHistoryLoadMore).toHaveBeenNthCalledWith(2, {
           workspaceId,
           cursor: { beforeHistorySequence: 4, beforeMessageId: "h4" },
+          windowed: true,
         });
         expect(state().muxMessages.map((message) => message.id)).toEqual(["h3", "h4", "h5", "h6"]);
         // Regression: the cached target row was replaced by the fresh copy.
@@ -2895,6 +3160,37 @@ describe("WorkspaceStore", () => {
         finishSince(await chatAttempt(workspaceId, 2), [row("h6", 6)]);
         expect(await request).toEqual({ kind: "target-not-found" });
         expect(state().hasOlderHistory).toBe(false);
+      });
+
+      it("re-pages below a windowed replay through a not-pageable page, never reporting target-not-found", async () => {
+        // Window [h5, h6] of a longer epoch (#4961); the edited row h4 sits below the floor.
+        await hydrateRows([row("h5", 5), row("h6", 6)], true);
+        mockHistoryLoadMore
+          .mockResolvedValueOnce({
+            messages: [],
+            nextCursor: null,
+            hasOlder: false,
+            notPageable: true,
+          })
+          .mockResolvedValueOnce({
+            messages: [asEvent(row("h3", 3)), asEvent(row("h4", 4))],
+            nextCursor: null,
+            hasOlder: false,
+          });
+
+        const request = store.requestTranscriptRefresh(workspaceId, {
+          throughSequence: 4,
+          editMessageId: "h4",
+        });
+        finishSince(await chatAttempt(workspaceId, 2), [row("h6", 6)]);
+        expect((await request).kind).toBe("refreshed");
+        // The not-pageable windowed page is retried once, same cursor, as today's unbounded page.
+        const cursor = { beforeHistorySequence: 5, beforeMessageId: "h5" };
+        expect(mockHistoryLoadMore.mock.calls.map(([input]) => input)).toEqual([
+          { workspaceId, cursor, windowed: true },
+          { workspaceId, cursor },
+        ]);
+        expect(state().muxMessages.map((message) => message.id)).toEqual(["h3", "h4", "h5", "h6"]);
       });
 
       it("fails, rather than reporting the target gone, when an older-page read errors", async () => {
@@ -3018,6 +3314,71 @@ describe("WorkspaceStore", () => {
       const usage = store.getWorkspaceUsage(workspaceId);
       expect(usage.liveMetadataModel).toBe("anthropic:claude-sonnet-4-20250514");
       expect(usage.liveCostUsage?.input.cost_usd).toBeGreaterThan(0);
+    });
+
+    it("keeps tool-model usage on replayed rows and live stream-end for turn cache health", async () => {
+      const workspaceId = "live-tool-usage-cache-health";
+      const MODEL = "anthropic:claude-sonnet-5-5";
+      const coldToolUsage = {
+        toolName: "task",
+        model: MODEL,
+        usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10, totalTokens: 31_010 },
+        providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+      };
+      const warmUsage = {
+        inputTokens: 1_000,
+        cachedInputTokens: 900,
+        outputTokens: 10,
+        totalTokens: 1_010,
+      };
+      // Every event goes through the onChat output schema, which strips unknown fields.
+      const wire = (event: unknown) => WorkspaceChatMessageSchema.parse(event);
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+
+      await send(
+        wire({
+          type: "message",
+          id: "replayed-turn",
+          role: "assistant",
+          parts: [{ type: "text", text: "replayed" }],
+          metadata: {
+            historySequence: 1,
+            timestamp: 1,
+            model: MODEL,
+            usage: warmUsage,
+            toolModelUsages: [coldToolUsage],
+          },
+        }),
+        caughtUpEvent(),
+        wire({
+          type: "stream-start",
+          workspaceId,
+          messageId: "live-turn",
+          historySequence: 2,
+          model: MODEL,
+          startTime: 2,
+        }),
+        wire({
+          type: "stream-end",
+          workspaceId,
+          messageId: "live-turn",
+          metadata: {
+            model: MODEL,
+            historySequence: 2,
+            timestamp: 3,
+            usage: warmUsage,
+            toolModelUsages: [coldToolUsage],
+          },
+          parts: [],
+        })
+      );
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.cacheWriteTokens])).toEqual([
+        ["live-turn", 30_000],
+        ["replayed-turn", 30_000],
+      ]);
     });
   });
 
@@ -3165,6 +3526,685 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  describe("open sub-agent usage", () => {
+    const usageOf = (inputTokens: number, inputCost: number) => ({
+      input: { tokens: inputTokens, cost_usd: inputCost },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 0, cost_usd: 0 },
+      reasoning: { tokens: 0, cost_usd: 0 },
+    });
+    const ledger = (inputTokens: number, rolledUpFrom?: Record<string, true>) => ({
+      byModel: { "claude-opus": usageOf(inputTokens, inputTokens / 100) },
+      version: 1 as const,
+      ...(rolledUpFrom ? { rolledUpFrom } : {}),
+    });
+    const projection = (children: Record<string, [inputTokens: number, count: number]>) => ({
+      children: Object.fromEntries(
+        Object.entries(children).map(([id, [inputTokens, workspaceCount]]) => [
+          id,
+          { byModel: { "claude-opus": usageOf(inputTokens, inputTokens / 100) }, workspaceCount },
+        ])
+      ),
+    });
+    const shownInputTokens = (workspaceId: string) =>
+      sumSessionCostUsage(store.getWorkspaceUsage(workspaceId))?.input.tokens;
+    const rollUpDelta = (source: string, inputTokens: number): WorkspaceChatMessage => ({
+      type: "session-usage-delta",
+      workspaceId: "parent",
+      sourceWorkspaceId: source,
+      byModelDelta: { "claude-opus": usageOf(inputTokens, inputTokens / 100) },
+      timestamp: 1,
+    });
+
+    it("adds open sub-agents to the session cost of their parent only", async () => {
+      mockGetSessionUsage.mockImplementation(({ workspaceId }: { workspaceId: string }) =>
+        Promise.resolve(workspaceId === "parent" ? ledger(100) : undefined)
+      );
+      mockGetSubagentUsage.mockImplementation(({ workspaceId }: { workspaceId: string }) =>
+        Promise.resolve(projection(workspaceId === "parent" ? { child: [500, 3] } : {}))
+      );
+      // Real load order: the parent registers (and fetches usage) before its children exist
+      // in frontend metadata, so the store must not decide from metadata that it has none.
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+
+      expect(store.getWorkspaceUsage("child").subagentTotal).toBeUndefined();
+      const usage = store.getWorkspaceUsage("parent");
+      expect(usage.sessionTotal?.input.tokens).toBe(100);
+      expect(usage.subagentCount).toBe(3);
+      expect(shownInputTokens("parent")).toBe(600);
+      expect(sumSessionCostUsage(usage)?.input.cost_usd).toBe(6);
+    });
+
+    it("counts a child once when the ledger already rolled it up", async () => {
+      // The ledger read ran after the roll-up, the projection read before it.
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(600, { child: true })));
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve(projection({ child: [500, 1], other: [50, 2] }))
+      );
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+
+      expect(shownInputTokens("parent")).toBe(650);
+      expect(store.getWorkspaceUsage("parent").subagentCount).toBe(2);
+    });
+
+    it("counts a rolled-up child once and refetches the ledger", async () => {
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve(projection({ child: [500, 1] }))
+      );
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      expect(shownInputTokens("parent")).toBe(600);
+      mockGetSessionUsage.mockClear();
+      // Hold the refetch, so the delta handler alone decides what the tab shows.
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send(rollUpDelta("child", 500));
+      expect(shownInputTokens("parent")).toBe(600);
+      await send(rollUpDelta("child", 500));
+      expect(shownInputTokens("parent")).toBe(600);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+    });
+
+    it("a sub-agent's removal leaves the shown tokens and session cache health unchanged", async () => {
+      const cacheUsage = (read: number, write: number) => ({
+        ...usageOf(1_000, 0.01),
+        cached: { tokens: read, cost_usd: read / 1e6 },
+        cacheCreate: { tokens: write, cost_usd: write / 1e5 },
+      });
+      const child = cacheUsage(10_000, 20_000);
+      mockGetSessionUsage.mockImplementation(() =>
+        Promise.resolve({ byModel: { "claude-opus": cacheUsage(30_000, 5_000) }, version: 1 })
+      );
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve({
+          children: { child: { byModel: { "claude-opus": child }, workspaceCount: 1 } },
+        })
+      );
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      const shown = () => {
+        const usage = store.getWorkspaceUsage("parent");
+        return { tokens: sumSessionTokens(usage), cache: getSessionCacheHealth(usage) };
+      };
+      const before = shown();
+      expect(before.tokens).toBe(67_000);
+      expect(before.cache?.cacheWriteTokens).toBe(25_000);
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send({
+        type: "session-usage-delta",
+        workspaceId: "parent",
+        sourceWorkspaceId: "child",
+        byModelDelta: { "claude-opus": child },
+        timestamp: 1,
+      });
+
+      const after = shown();
+      expect(after.tokens).toBe(before.tokens);
+      expect(after.cache?.cacheWriteTokens).toBe(before.cache?.cacheWriteTokens);
+      expect(after.cache?.readRatio).toBeCloseTo(before.cache?.readRatio ?? NaN, 12);
+      expect(after.cache?.rewriteCostUsd).toBeCloseTo(before.cache?.rewriteCostUsd ?? NaN, 12);
+    });
+
+    it("runs one trailing projection fetch for refreshes asked while one is in flight", async () => {
+      const parentResponses: Array<(value: unknown) => void> = [];
+      mockGetSubagentUsage.mockImplementation(
+        ({ workspaceId }: { workspaceId: string }) =>
+          new Promise((resolve) => {
+            if (workspaceId === "parent") parentResponses.push(resolve);
+            else resolve(projection({}));
+          })
+      );
+      createAndAddWorkspace(store, "other");
+      createAndAddWorkspace(store, "parent");
+      store.setActiveWorkspaceId("other");
+      store.setActiveWorkspaceId("parent");
+      expect(parentResponses).toHaveLength(1);
+
+      parentResponses[0](projection({ child: [999, 1] }));
+      await tick(0);
+      expect(shownInputTokens("parent")).toBe(999);
+      expect(parentResponses).toHaveLength(2);
+      parentResponses[1](projection({ child: [7, 1] }));
+      await tick(0);
+
+      expect(shownInputTokens("parent")).toBe(7);
+      expect(parentResponses).toHaveLength(2);
+    });
+
+    it("leaves a self delta to the refetch for its usage change", async () => {
+      // Headless spend (status titles, bash AI proxy) reports the workspace itself as source and
+      // sends usage-changed, whose ledger refetch can land first: this ledger already holds it.
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(101)));
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      expect(shownInputTokens("parent")).toBe(101);
+      mockGetSessionUsage.mockClear();
+
+      await send(rollUpDelta("parent", 1));
+
+      expect(shownInputTokens("parent")).toBe(101);
+      expect(mockGetSessionUsage).not.toHaveBeenCalled();
+    });
+
+    it("sums model keys named after Object.prototype members", async () => {
+      const byModel = Object.fromEntries(
+        ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"].map((key) => [
+          key,
+          usageOf(10, 0.1),
+        ])
+      );
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve({
+          children: {
+            a: { byModel, workspaceCount: 1 },
+            b: { byModel, workspaceCount: 1 },
+          },
+        })
+      );
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send({
+        type: "session-usage-delta",
+        workspaceId: "parent",
+        sourceWorkspaceId: "removed-child",
+        byModelDelta: byModel,
+        timestamp: 1,
+      });
+
+      // Ledger 100, two sub-agent subtrees of 5 x 10, one roll-up delta of 5 x 10.
+      expect(shownInputTokens("parent")).toBe(100 + 100 + 50);
+    });
+
+    describe("usage changes", () => {
+      /** Feed the activity subscription; the store is recreated so it subscribes to it. */
+      const openActivity = async () => {
+        const subscriptions: Array<
+          ReturnType<typeof createControllableAsyncIterable<WorkspaceActivityEvent>>
+        > = [];
+        mockActivitySubscribe.mockImplementation(async function* (_input, options) {
+          const activity = createControllableAsyncIterable<WorkspaceActivityEvent>();
+          subscriptions.push(activity);
+          options?.signal?.addEventListener("abort", () => activity.close(), { once: true });
+          yield* activity.iterable;
+        });
+        recreateStore();
+        await tick(10);
+        const pushUsage = async (workspaceId: string) => {
+          subscriptions.at(-1)!.push({ type: "usage-changed", workspaceId });
+          await tick(0);
+        };
+        /** The subscription ends, and the store subscribes again and lists activity. */
+        const resubscribe = async () => {
+          const count = subscriptions.length;
+          subscriptions.at(-1)!.close();
+          expect(await waitUntil(() => subscriptions.length > count)).toBe(true);
+          await tick(10);
+        };
+        return { pushUsage, resubscribe };
+      };
+      const projectionFetches = () =>
+        mockGetSubagentUsage.mock.calls.map(([input]) => input.workspaceId);
+      const addParentWithChildren = async (childIds: string[]) => {
+        createAndAddWorkspace(store, "parent");
+        for (const childId of childIds) {
+          createAndAddWorkspace(store, childId, { parentWorkspaceId: "parent" }, false);
+        }
+        await tick(10);
+        mockGetSessionUsage.mockClear();
+        mockGetSubagentUsage.mockClear();
+      };
+
+      it("refreshes every shown ancestor's projection when a nested sub-agent's usage moves", async () => {
+        const { pushUsage } = await openActivity();
+        createAndAddWorkspace(store, "parent");
+        createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+        createAndAddWorkspace(store, "grandchild", { parentWorkspaceId: "child" }, false);
+        await tick(10);
+        mockGetSessionUsage.mockClear();
+        mockGetSubagentUsage.mockClear();
+
+        await pushUsage("grandchild");
+
+        expect(projectionFetches()).toEqual(["parent"]);
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+      });
+
+      it("refetches the shown usage when the activity subscription resubscribes", async () => {
+        // Usage changes while the subscription was down are not replayed.
+        const { resubscribe } = await openActivity();
+        await addParentWithChildren(["child"]);
+
+        await resubscribe();
+
+        expect(mockGetSessionUsage.mock.calls.map(([input]) => input.workspaceId)).toEqual([
+          "parent",
+        ]);
+        expect(projectionFetches()).toEqual(["parent"]);
+      });
+
+      it("refetches only the projection on resubscribe while the own stream is live here", async () => {
+        const { resubscribe } = await openActivity();
+        const send = openChat("parent");
+        await addParentWithChildren([]);
+        await send(caughtUpEvent(), streamStartEvent("parent", "stream-1"));
+        mockGetSessionUsage.mockClear();
+        mockGetSubagentUsage.mockClear();
+
+        await resubscribe();
+
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+        expect(projectionFetches()).toEqual(["parent"]);
+      });
+
+      it("refetches nothing more for the first activity list", async () => {
+        // Registration and activation fetch the usage: the first list is no resubscribe.
+        recreateStore();
+        createAndAddWorkspace(store, "parent");
+        const registrationFetches = mockGetSessionUsage.mock.calls.length;
+
+        await tick(10);
+
+        expect(mockGetSessionUsage).toHaveBeenCalledTimes(registrationFetches);
+      });
+
+      it("leaves the own ledger to the end of a stream that is live here", async () => {
+        // A usage-change refetch during the stream can already hold the settled stream, and
+        // stream-end adds that stream's usage too: the refetch at stream end replaces both.
+        const { pushUsage } = await openActivity();
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+        const send = openChat("parent");
+        await addParentWithChildren([]);
+        await send(caughtUpEvent(), streamStartEvent("parent", "stream-1"));
+        mockGetSessionUsage.mockClear();
+
+        await pushUsage("parent");
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(150)));
+        await send(streamEndEvent("parent", "stream-1"));
+        await tick(0);
+
+        expect(mockGetSessionUsage).toHaveBeenCalledTimes(1);
+        expect(shownInputTokens("parent")).toBe(150);
+      });
+
+      it("refetches the own ledger when a stream that is live here fails", async () => {
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+        const send = openChat("parent");
+        await addParentWithChildren([]);
+        await send(caughtUpEvent(), streamStartEvent("parent", "stream-1"));
+        mockGetSessionUsage.mockClear();
+
+        await send({
+          type: "stream-error",
+          messageId: "stream-1",
+          error: "provider failed",
+          errorType: "unknown",
+        });
+
+        expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+      });
+
+      it("shows a roll-up whose delta never reached the parent's chat", async () => {
+        const { pushUsage } = await openActivity();
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+        const send = openChat("parent");
+        await addParentWithChildren(["child"]);
+        await send(caughtUpEvent());
+        expect(shownInputTokens("parent")).toBe(100);
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(600, { child: true })));
+
+        // A hidden workspace's own usage change fetches no ledger.
+        await pushUsage("child");
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+        await pushUsage("parent");
+
+        expect(shownInputTokens("parent")).toBe(600);
+      });
+
+      it("coalesces a burst of 50 sub-agent usage changes into one fetch and one trailing fetch", async () => {
+        const { pushUsage } = await openActivity();
+        const children = Array.from({ length: 50 }, (_, index) => `child-${index}`);
+        await addParentWithChildren(children);
+        const held: Array<() => void> = [];
+        mockGetSubagentUsage.mockImplementation(
+          () => new Promise((resolve) => held.push(() => resolve(projection({}))))
+        );
+
+        for (const childId of children) {
+          await pushUsage(childId);
+        }
+        expect(mockGetSubagentUsage).toHaveBeenCalledTimes(1);
+        held[0]();
+        await tick(0);
+        expect(mockGetSubagentUsage).toHaveBeenCalledTimes(2);
+        held[1]();
+        await tick(0);
+
+        expect(mockGetSubagentUsage).toHaveBeenCalledTimes(2);
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+      });
+    });
+
+    it("does not let a fetch on a replaced client block the new client's projection fetches", async () => {
+      const responses: Array<(value: unknown) => void> = [];
+      mockGetSubagentUsage.mockImplementation(
+        () => new Promise((resolve) => responses.push(resolve))
+      );
+      createAndAddWorkspace(store, "parent");
+      expect(responses).toHaveLength(1);
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ ...mockClient } as any);
+      expect(responses).toHaveLength(2);
+      // The old client's fetch settles last: the new client's fetch still holds the slot.
+      responses[0](projection({}));
+      await tick(0);
+      store.setActiveWorkspaceId(null);
+      store.setActiveWorkspaceId("parent");
+
+      expect(responses).toHaveLength(2);
+    });
+
+    it("lets a refresh run after a hung projection fetch misses its deadline", async () => {
+      recreateStore(undefined, { subagentUsageFetchTimeoutMs: 20 });
+      mockGetSubagentUsage.mockImplementation(
+        (_input, options) =>
+          new Promise((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("timed out")), {
+              once: true,
+            });
+          })
+      );
+      createAndAddWorkspace(store, "parent");
+      store.setActiveWorkspaceId(null);
+      store.setActiveWorkspaceId("parent");
+      expect(mockGetSubagentUsage).toHaveBeenCalledTimes(1);
+
+      expect(await waitUntil(() => mockGetSubagentUsage.mock.calls.length === 2)).toBe(true);
+    });
+
+    it("drops the projection of a fetch that outlived its workspace's removal", async () => {
+      const responses: Array<(value: unknown) => void> = [];
+      mockGetSubagentUsage.mockImplementation(
+        () => new Promise((resolve) => responses.push(resolve))
+      );
+      createAndAddWorkspace(store, "parent");
+      store.removeWorkspace("parent");
+      createAndAddWorkspace(store, "parent");
+      expect(responses).toHaveLength(2);
+
+      responses[1](projection({ child: [7, 1] }));
+      await tick(0);
+      responses[0](projection({ child: [999, 1] }));
+      await tick(0);
+
+      expect(shownInputTokens("parent")).toBe(7);
+    });
+
+    it("refreshes the shown ancestors' projections when a sub-agent registers", async () => {
+      // Its usage can change before its parent link reaches this store.
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+      mockGetSubagentUsage.mockClear();
+
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+
+      expect(mockGetSubagentUsage.mock.calls.map(([input]) => input.workspaceId)).toEqual([
+        "parent",
+      ]);
+    });
+
+    it("starts a fresh projection fetch for a workspace re-added while its old fetch hangs", () => {
+      mockGetSubagentUsage.mockImplementation(() => new Promise(() => undefined));
+      createAndAddWorkspace(store, "parent");
+      store.removeWorkspace("parent");
+      createAndAddWorkspace(store, "parent");
+
+      expect(mockGetSubagentUsage).toHaveBeenCalledTimes(2);
+    });
+
+    it("refreshes the ancestors' projections when a nested sub-agent is removed", async () => {
+      // A grandchild rolls into the child's ledger: no delta reaches the parent.
+      createAndAddWorkspace(store, "parent");
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+      createAndAddWorkspace(store, "grandchild", { parentWorkspaceId: "child" }, false);
+      await tick(10);
+      mockGetSubagentUsage.mockClear();
+
+      store.removeWorkspace("grandchild");
+
+      expect(mockGetSubagentUsage.mock.calls.map(([input]) => input.workspaceId)).toContain(
+        "parent"
+      );
+    });
+  });
+
+  // Loaded session usage is repriced against the current provider config, except for
+  // costs-included rows, whose zero costs are real: repricing them would inflate totals.
+  describe("session usage repricing", () => {
+    // A flat-priced model: $5/M input and $25/M output tokens.
+    const BILLABLE_MODEL = "anthropic:claude-opus-4-5";
+    const OPUS_COST_OF_1000_IN_100_OUT = { input: 0.005, output: 0.0025 };
+    // No pricing metadata, unless a provider config maps it to a priced model.
+    const CUSTOM_MODEL = "ollama:custom";
+    const MAPPED_CUSTOM_CONFIG = {
+      ollama: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "custom", mappedToModel: BILLABLE_MODEL }],
+      },
+    };
+
+    const usageRow = (
+      costs: { input: number; output: number },
+      markers: { costsIncluded?: boolean; hasUnknownCosts?: boolean } = {}
+    ) => ({
+      input: { tokens: 1000, cost_usd: costs.input },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 100, cost_usd: costs.output },
+      reasoning: { tokens: 0, cost_usd: 0 },
+      ...markers,
+    });
+    type UsageRow = ReturnType<typeof usageRow>;
+
+    /** Load one row as both the model's session bucket and the last request. */
+    const loadUsage = async (workspaceId: string, model: string, row: UsageRow) => {
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? {
+                byModel: { [model]: structuredClone(row) },
+                lastRequest: { model, usage: structuredClone(row), timestamp: 1 },
+                version: 1 as const,
+              }
+            : undefined
+        )
+      );
+      // A caught-up chat: before catch-up, usage reads come from a pre-replay snapshot.
+      mockChatScript([caughtUpEvent()], { keepOpen: true });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.isSessionUsageKnown(workspaceId))).toBe(true);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+      // Repricing runs once the provider config has loaded too.
+      await tick(10);
+      const usage = store.getWorkspaceUsage(workspaceId);
+      return { bucket: usage.sessionByModel?.[model], lastRequest: usage.lastRequest?.usage };
+    };
+
+    const expectCosts = (row: unknown, costs: { input: number; output: number }) => {
+      expect(row).toMatchObject({ input: { tokens: 1000 }, output: { tokens: 100 } });
+      const priced = row as UsageRow;
+      expect(priced.input.cost_usd).toBeCloseTo(costs.input, 10);
+      expect(priced.output.cost_usd).toBeCloseTo(costs.output, 10);
+    };
+
+    it("reprices recorded costs with the current model pricing", async () => {
+      // One non-zero component is enough to rule out the legacy costs-included heuristic.
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-stale-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 1 })
+      );
+
+      expectCosts(bucket, OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    it("keeps the zero costs of rows marked as costs-included", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-costs-included",
+        BILLABLE_MODEL,
+        // The costsIncluded marker wins over a stale unknown-cost flag.
+        usageRow({ input: 0, output: 0 }, { costsIncluded: true, hasUnknownCosts: true })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+    });
+
+    it("keeps legacy all-zero costs of a billable model as costs-included", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-legacy-zero-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+      expect(bucket).not.toHaveProperty("hasUnknownCosts");
+    });
+
+    it("prices rows recorded without pricing metadata", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-unknown-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 0 }, { hasUnknownCosts: true })
+      );
+
+      expectCosts(bucket, OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    it("does not treat all-zero costs of an unpriced model as costs-included", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-unpriced-zero-costs",
+        CUSTOM_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      // Repricing an unpriced model strips the costs and flags them as unknown.
+      expect(bucket).toMatchObject({ hasUnknownCosts: true, input: { tokens: 1000 } });
+      expect(bucket?.input.cost_usd).toBeUndefined();
+      expect(lastRequest).toMatchObject({ hasUnknownCosts: true });
+    });
+
+    it("classifies a mapped custom model by the pricing of its mapped model", async () => {
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      recreateStore();
+
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-mapped-zero-costs",
+        CUSTOM_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+      expect(bucket).not.toHaveProperty("hasUnknownCosts");
+    });
+
+    it("prices unknown-cost rows once a provider config change maps their model", async () => {
+      const workspaceId = "reprice-after-mapping";
+      const before = await loadUsage(workspaceId, CUSTOM_MODEL, usageRow({ input: 0, output: 0 }));
+      expect(before.bucket).toMatchObject({ hasUnknownCosts: true });
+
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      providerConfigChanges.push(undefined);
+
+      expect(
+        await waitUntil(
+          () =>
+            store.getWorkspaceUsage(workspaceId).sessionByModel?.[CUSTOM_MODEL]?.input.cost_usd !==
+            undefined
+        )
+      ).toBe(true);
+      const usage = store.getWorkspaceUsage(workspaceId);
+      expectCosts(usage.sessionByModel?.[CUSTOM_MODEL], OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(usage.lastRequest?.usage, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    const projectUnpricedChild = () =>
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve({
+          children: {
+            child: {
+              byModel: {
+                [CUSTOM_MODEL]: usageRow({ input: 0, output: 0 }, { hasUnknownCosts: true }),
+              },
+              workspaceCount: 1,
+            },
+          },
+        })
+      );
+
+    it("prices open sub-agent usage with the loaded provider config", async () => {
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      recreateStore();
+      projectUnpricedChild();
+      await loadUsage("reprice-projection", BILLABLE_MODEL, usageRow({ input: 0, output: 1 }));
+
+      expectCosts(
+        store.getWorkspaceUsage("reprice-projection").subagentByModel?.[CUSTOM_MODEL],
+        OPUS_COST_OF_1000_IN_100_OUT
+      );
+    });
+
+    it("reprices open sub-agent usage when a provider config change maps its model", async () => {
+      projectUnpricedChild();
+      const workspaceId = "reprice-projection-after-mapping";
+      await loadUsage(workspaceId, BILLABLE_MODEL, usageRow({ input: 0, output: 1 }));
+      expect(store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL]).toMatchObject({
+        hasUnknownCosts: true,
+      });
+
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      providerConfigChanges.push(undefined);
+
+      expect(
+        await waitUntil(
+          () =>
+            store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL]?.input.cost_usd !==
+            undefined
+        )
+      ).toBe(true);
+      expectCosts(
+        store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL],
+        OPUS_COST_OF_1000_IN_100_OUT
+      );
+    });
+  });
+
   describe("syncWorkspaces", () => {
     it("should add new workspaces", async () => {
       const metadata1 = makeWorkspaceMetadata("workspace-1", {
@@ -3185,7 +4225,12 @@ describe("WorkspaceStore", () => {
         await tick(10);
       }
 
-      expect(mockOnChat).toHaveBeenCalledWith({ workspaceId: "workspace-1" }, expect.anything());
+      // batchReplay: the store unpacks replay batches (#4868); replayWindow: it pages older rows
+      // of the active epoch itself (#4961).
+      expect(mockOnChat).toHaveBeenCalledWith(
+        { workspaceId: "workspace-1", batchReplay: true, replayWindow: true },
+        expect.anything()
+      );
     });
 
     it("opens onChat without waiting on any other workspace RPC after activation", async () => {
@@ -3208,6 +4253,41 @@ describe("WorkspaceStore", () => {
       } finally {
         for (const undo of restore) undo();
       }
+    });
+
+    it("forwards a legacy auto-retry boolean once and drops it after the subscribe", async () => {
+      const workspaceId = "workspace-auto-retry-forward";
+      const autoRetryKey = getAutoRetryKey(workspaceId);
+      global.window.localStorage.setItem(autoRetryKey, JSON.stringify(false));
+      let storedAtSubscribe: string | null = "unread";
+      // A plain function runs when the store calls onChat; a generator body would run later.
+      mockOnChat.mockImplementation(((
+        input?: { workspaceId: string },
+        options?: { signal?: AbortSignal }
+      ) => {
+        if (input?.workspaceId === workspaceId) {
+          storedAtSubscribe = global.window.localStorage.getItem(autoRetryKey);
+        }
+        // eslint-disable-next-line require-yield -- an open stream that never yields
+        return (async function* () {
+          await waitForAbortSignal(options?.signal);
+        })();
+      }) as unknown as Parameters<typeof mockOnChat.mockImplementation>[0]);
+
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => mockOnChat.mock.calls.length > 0, 1_000)).toBe(true);
+
+      expect(mockOnChat.mock.calls[0]?.[0]).toMatchObject({
+        workspaceId,
+        legacyAutoRetryEnabled: false,
+        batchReplay: true,
+        replayWindow: true,
+      });
+      // Still stored while the subscribe runs, so a failed subscribe can forward it again.
+      expect(storedAtSubscribe).toBe("false");
+      expect(await waitUntil(() => global.window.localStorage.getItem(autoRetryKey) === null)).toBe(
+        true
+      );
     });
 
     it("sanitizes malformed legacy auto-retry values before subscribing", async () => {
@@ -4134,6 +5214,52 @@ describe("WorkspaceStore", () => {
       unsubscribe();
     });
 
+    it("invalidates streaming-stats cache on tool-call-start so the token count includes the tool's args", async () => {
+      // A tool-call-start adds its input tokens to the live count. Without a bump, a subscriber
+      // that read the stats before the event kept "~0 tokens" until the next delta, so a
+      // transcript's token readout depended on whether React rendered between the two events.
+      const workspaceId = "tool-call-start-invalidates-stats";
+      const streamModel = "anthropic:claude-opus-4-6";
+
+      const send = openChat(workspaceId);
+      recreateStore();
+      await tick(0);
+      createAndAddWorkspace(store, workspaceId);
+
+      const messageId = "tool-call-start-stats-message";
+      await send({
+        type: "stream-start",
+        workspaceId,
+        messageId,
+        model: streamModel,
+        historySequence: 1,
+        startTime: 1_000,
+      });
+      await send({ type: "caught-up", historyReplayStatus: "complete" });
+
+      let notifications = 0;
+      const unsubscribe = store.subscribeStreamingStats(workspaceId, () => {
+        notifications += 1;
+      });
+      expect(store.getWorkspaceStreamingStats(workspaceId)?.tokenCount).toBe(0);
+
+      await send({
+        type: "tool-call-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-call-start-stats-call",
+        toolName: "task_await",
+        args: { task_ids: ["task-a"], timeout_secs: 300 },
+        tokens: 5,
+        timestamp: 1_500,
+      });
+
+      expect(notifications).toBeGreaterThanOrEqual(1);
+      expect(store.getWorkspaceStreamingStats(workspaceId)?.tokenCount).toBe(5);
+
+      unsubscribe();
+    });
+
     it("invalidates streaming-stats cache on stream-start so the new turn never displays the prior turn's TPS", async () => {
       // Repro for "Streaming TPS starts with stale value": reconnect / hydration
       // paths drop aggregator.activeStreams via clearActiveStreams() WITHOUT
@@ -4805,12 +5931,57 @@ describe("WorkspaceStore", () => {
           beforeHistorySequence: 5,
           beforeMessageId: "msg-newer",
         },
+        windowed: true,
       });
 
       const state = store.getWorkspaceState(workspaceId);
       expect(state.hasOlderHistory).toBe(false);
       expect(state.loadingOlderHistory).toBe(false);
       expect(state.muxMessages.map((message) => message.id)).toEqual(["msg-older", "msg-newer"]);
+    });
+
+    it("shows older assistant turns in prompt-cache health after loading an older page", async () => {
+      const workspaceId = "history-pagination-cache-health";
+      const assistantTurn = (id: string, historySequence: number): WorkspaceChatMessage => ({
+        type: "message",
+        id,
+        role: "assistant",
+        parts: [{ type: "text", text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          model: "anthropic:claude-sonnet-5-5",
+          usage: { inputTokens: 2_000, outputTokens: 10, totalTokens: 2_010 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 1_500 } },
+        },
+      });
+
+      mockOnChat.mockImplementation(async function* (
+        _input?: { workspaceId: string; mode?: unknown },
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        yield assistantTurn("newer-turn", 5);
+        await Promise.resolve();
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: true };
+        await waitForAbortSignal(options?.signal);
+      });
+      mockHistoryLoadMore.mockResolvedValueOnce({
+        messages: [assistantTurn("older-turn", 3)],
+        nextCursor: null,
+        hasOlder: false,
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+      const turnIds = () =>
+        (store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? []).map(
+          (turn) => turn.messageId
+        );
+      expect(turnIds()).toEqual(["newer-turn"]);
+
+      await store.loadOlderHistory(workspaceId);
+
+      expect(turnIds()).toEqual(["newer-turn", "older-turn"]);
     });
 
     it("exposes loadingOlderHistory while requests are in flight and ignores concurrent loads", async () => {
@@ -4854,6 +6025,47 @@ describe("WorkspaceStore", () => {
       const state = store.getWorkspaceState(workspaceId);
       expect(state.loadingOlderHistory).toBe(false);
       expect(state.hasOlderHistory).toBe(false);
+    });
+
+    it("an onChat attempt that ends clears the older-history spinner and keeps the cursor", async () => {
+      const workspaceId = "history-pagination-attempt-end";
+      const attempts = Array.from({ length: 2 }, () =>
+        createControllableAsyncIterable<WorkspaceChatMessage>()
+      );
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (input, options) {
+        if (input?.workspaceId !== workspaceId) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        const events = attempts[subscriptions++];
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      // The load never answers: only the attempt's end can clear the spinner.
+      mockHistoryLoadMore.mockReturnValueOnce(new Promise<LoadMoreResponse>(() => undefined));
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+      attempts[0].push(createHistoryMessageEvent("msg-newer", 5));
+      attempts[0].push({
+        type: "caught-up",
+        historyReplayStatus: "complete",
+        hasOlderHistory: true,
+      });
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+      const pendingLoad = store.loadOlderHistory(workspaceId);
+      expect(pendingLoad).toBeInstanceOf(Promise);
+      expect(store.getWorkspaceState(workspaceId).loadingOlderHistory).toBe(true);
+
+      attempts[0].close();
+      expect(await waitUntil(() => !store.getWorkspaceState(workspaceId).loadingOlderHistory)).toBe(
+        true
+      );
+      // Reconnect retries keep pagination: a since caught-up omits hasOlderHistory.
+      expect(store.getWorkspaceState(workspaceId).hasOlderHistory).toBe(true);
+      mockChatScript([], { keepOpen: true });
     });
 
     it("ignores stale load-more responses after pagination state changes", async () => {
@@ -4914,7 +6126,378 @@ describe("WorkspaceStore", () => {
       expect(mockHistoryLoadMore).toHaveBeenLastCalledWith({
         workspaceId,
         cursor: { beforeHistorySequence: 6, beforeMessageId: "live-compaction-summary" },
+        windowed: true,
       });
+    });
+  });
+
+  // A whole message that arrives live, after catch-up, updates every view that reads whole
+  // messages: the draft's pending sends, the last prompt, usage and the recency order.
+  describe("live whole messages after catch-up", () => {
+    it("resolves the draft send and refreshes prompt, usage and recency", async () => {
+      const workspaceId = "live-user-message";
+      const send = openChat(workspaceId);
+      const onSendEvent = spyOn(getDraftStore(), "onSendEvent");
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        await send(createHistoryMessageEvent("msg-1", 1), caughtUpEvent());
+        const promptListener = mock(() => undefined);
+        const usageListener = mock(() => undefined);
+        const recencyListener = mock(() => undefined);
+        store.subscribeLastUserPrompt(workspaceId, promptListener);
+        store.subscribeUsage(workspaceId, usageListener);
+        store.subscribeDerived(recencyListener);
+
+        // Newer than the workspace's createdAt (now), so the recency order moves.
+        const timestamp = Date.now() + 60_000;
+        await send({
+          type: "message",
+          id: "msg-2",
+          role: "user",
+          parts: [{ type: "text", text: "live prompt" }],
+          metadata: { historySequence: 2, timestamp, sendIds: ["send-1"] },
+        });
+
+        expect(onSendEvent).toHaveBeenCalledWith(workspaceId, ["send-1"]);
+        expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe("live prompt");
+        expect(promptListener).toHaveBeenCalled();
+        expect(usageListener).toHaveBeenCalled();
+        expect(recencyListener).toHaveBeenCalled();
+        expect(store.getWorkspaceRecency()[workspaceId]).toBe(timestamp);
+      } finally {
+        onSendEvent.mockRestore();
+      }
+    });
+
+    it("resets pagination for a compaction summary without a boundary flag", async () => {
+      const workspaceId = "live-compaction-summary-metadata";
+      const send = openChat(workspaceId);
+      let resolveLoadMore: ((value: LoadMoreResponse) => void) | undefined;
+      mockHistoryLoadMore.mockReturnValueOnce(
+        new Promise<LoadMoreResponse>((resolve) => {
+          resolveLoadMore = resolve;
+        })
+      );
+      createAndAddWorkspace(store, workspaceId);
+      await send(createHistoryMessageEvent("msg-newer", 5), {
+        type: "caught-up",
+        historyReplayStatus: "complete",
+        hasOlderHistory: true,
+      });
+      const loadOlder = store.loadOlderHistory(workspaceId);
+
+      await send({
+        type: "message",
+        id: "live-summary",
+        role: "assistant",
+        parts: [{ type: "text", text: "Compacted summary" }],
+        metadata: {
+          historySequence: 6,
+          timestamp: 6,
+          muxMetadata: { type: "compaction-summary" },
+        },
+      });
+      resolveLoadMore?.({
+        messages: [createHistoryMessageEvent("msg-stale-older", 3)],
+        nextCursor: { beforeHistorySequence: 3, beforeMessageId: "msg-stale-older" },
+        hasOlder: true,
+      });
+      await loadOlder;
+
+      // The refreshed pagination makes the in-flight page stale, so it is not merged.
+      expect(
+        store.getWorkspaceState(workspaceId).muxMessages.map((message) => message.id)
+      ).not.toContain("msg-stale-older");
+    });
+  });
+
+  describe("windowed replay (#4961)", () => {
+    const workspaceId = "windowed-replay";
+    type ChatAttempt = ControllableAsyncIterable<WorkspaceChatMessage>;
+    let attempts: ChatAttempt[];
+    const seed = {
+      todos: [{ content: "written before the window", status: "in_progress" as const }],
+      assistedReview: [{ path: "src/pinned.ts" }],
+    };
+    const state = () => store.getWorkspaceState(workspaceId);
+    const ids = () => state().muxMessages.map((message) => message.id);
+    const aggregator = () => store.getAggregator(workspaceId)!;
+    const initRow = () => state().messages.find((message) => message.type === "workspace-init");
+
+    beforeEach(() => {
+      attempts = [];
+      mockOnChat.mockImplementation(async function* (_input, options) {
+        const events = createControllableAsyncIterable<WorkspaceChatMessage>();
+        attempts.push(events);
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+    });
+
+    /** Wait for the n-th (1-based) onChat attempt; the previous one is closed to reconnect. */
+    const attempt = async (ordinal: number): Promise<ChatAttempt> => {
+      if (ordinal === 1) createAndAddWorkspace(store, workspaceId);
+      else attempts[ordinal - 2].close();
+      expect(await waitUntil(() => attempts.length >= ordinal)).toBe(true);
+      return attempts[ordinal - 1];
+    };
+
+    /** Land a full caught-up for rows `sequences` (the window) on `events`. */
+    async function fullReplay(
+      events: ChatAttempt,
+      sequences: number[],
+      extra: Partial<ChatEvent<"caught-up">> = {}
+    ): Promise<void> {
+      for (const sequence of sequences) {
+        events.push(createHistoryMessageEvent(`h${sequence}`, sequence));
+      }
+      const newest = sequences[sequences.length - 1];
+      events.push(
+        caughtUpEvent({
+          replay: "full",
+          hasOlderHistory: sequences[0] > 0,
+          cursor: {
+            history: {
+              messageId: `h${newest}`,
+              historySequence: newest,
+              oldestHistorySequence: sequences[0],
+            },
+          },
+          ...extra,
+        })
+      );
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+    }
+
+    it("shows the seed's todos and pins, keeps them on since, and drops them on a full replay without one", async () => {
+      await fullReplay(await attempt(1), [100, 101], { windowSeed: seed });
+      expect(aggregator().getCurrentTodos()).toEqual(seed.todos);
+      expect(aggregator().getAssistedReviewHunks()).toEqual(seed.assistedReview);
+
+      const since = await attempt(2);
+      since.push(createHistoryMessageEvent("h101", 101));
+      since.push(sinceCaughtUpEvent(101, "h101"));
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      expect(aggregator().getCurrentTodos()).toEqual(seed.todos);
+      expect(aggregator().getAssistedReviewHunks()).toEqual(seed.assistedReview);
+
+      // A window that reached the epoch start carries no seed: nothing may survive from the old one.
+      await fullReplay(await attempt(3), [0, 1], { downgradeReason: "outside-window" });
+      expect(aggregator().getCurrentTodos()).toEqual([]);
+      expect(aggregator().getAssistedReviewHunks()).toEqual([]);
+    });
+
+    it.each(["fingerprint-mismatch", "outside-window"] as const)(
+      "a downgrade (%s) after paging holds exactly the new window",
+      async (downgradeReason) => {
+        await fullReplay(await attempt(1), [100, 101], { windowSeed: seed });
+        mockHistoryLoadMore.mockResolvedValueOnce({
+          messages: [createHistoryMessageEvent("h98", 98), createHistoryMessageEvent("h99", 99)],
+          nextCursor: { beforeHistorySequence: 98, beforeMessageId: "h98" },
+          hasOlder: true,
+        });
+        expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
+        expect(ids()).toEqual(["h98", "h99", "h100", "h101"]);
+
+        await fullReplay(await attempt(2), [102, 103], { windowSeed: seed, downgradeReason });
+        expect(ids()).toEqual(["h102", "h103"]);
+        expect(state().hasOlderHistory).toBe(true);
+        mockHistoryLoadMore.mockClear();
+        await store.loadOlderHistory(workspaceId);
+        expect(mockHistoryLoadMore.mock.calls[0]?.[0]).toMatchObject({
+          cursor: { beforeHistorySequence: 102, beforeMessageId: "h102" },
+        });
+      }
+    );
+
+    it.each([
+      {
+        name: "the start of history",
+        page: (): LoadMoreResponse => ({
+          messages: [createHistoryMessageEvent("h0", 0)],
+          nextCursor: null,
+          hasOlder: false,
+        }),
+      },
+      {
+        name: "the epoch's boundary row",
+        page: (): LoadMoreResponse => ({
+          messages: [
+            {
+              type: "message",
+              id: "boundary",
+              role: "assistant",
+              parts: [{ type: "text", text: "Compacted summary" }],
+              metadata: {
+                historySequence: 50,
+                timestamp: 500,
+                compacted: "idle",
+                compactionBoundary: true,
+                compactionEpoch: 1,
+              },
+            },
+            createHistoryMessageEvent("h51", 51),
+          ],
+          nextCursor: { beforeHistorySequence: 50, beforeMessageId: "boundary" },
+          hasOlder: true,
+        }),
+      },
+    ])("hides a finished init card until a page loads $name", async ({ page }) => {
+      const events = await attempt(1);
+      events.push({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1_000,
+        replay: true,
+        completed: { exitCode: 0, endTime: 2_000 },
+      });
+      events.push({ type: "init-end", exitCode: 0, timestamp: 2_000, replay: true });
+      await fullReplay(events, [100, 101], { windowSeed: seed });
+      // The window starts mid-epoch: the first loaded user row is not the transcript's first.
+      expect(initRow()).toBeUndefined();
+
+      mockHistoryLoadMore.mockResolvedValueOnce(page());
+      expect(await store.loadOlderHistory(workspaceId)).toBe("loaded");
+      expect(initRow()).toMatchObject({ status: "success" });
+
+      // A transcript refresh drops the paged rows below the floor: the card hides again.
+      const aggregator = store.getAggregator(workspaceId)!;
+      expect(aggregator.discardMessagesBelowSequence(100)).toBeGreaterThan(0);
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed.some((message) => message.type === "workspace-init")).toBe(false);
+    });
+
+    it("jumps to a timeline target within the page budget, and reports a farther one as not loaded without an unbounded page", async () => {
+      // 14,000 rows: the window (<=2,000) plus 10 windowed pages (<=1,000 each) cannot reach m2.
+      const rows = Array.from({ length: 14_000 }, (_, i) =>
+        createMuxMessage(`m${i}`, i % 2 === 0 ? "user" : "assistant", `text ${i}`, {
+          timestamp: i,
+        })
+      );
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: {
+          getStreamInfo: () => undefined,
+          replayStream: () => Promise.resolve(),
+        },
+        initStateManagerOverrides: { replayInit: () => Promise.resolve() },
+      });
+      try {
+        expect((await h.historyService.appendManyToHistory(workspaceId, rows)).success).toBe(true);
+        const workspaceService = createWorkspaceServiceForTest({
+          config: h.config,
+          historyService: h.historyService,
+        });
+        const context = {
+          workspaceService: { getOrCreateSession: () => h.session },
+        } as unknown as ORPCContext;
+        mockOnChat.mockImplementation(async function* (input, options) {
+          yield* subscribeWorkspaceChat(
+            context,
+            input as Parameters<typeof subscribeWorkspaceChat>[1],
+            options?.signal,
+            { validateOutput: true }
+          );
+        });
+        mockHistoryLoadMore.mockImplementation((input) =>
+          workspaceService.getHistoryLoadMore(input!.workspaceId, input!.cursor, {
+            windowed: input!.windowed === true,
+          })
+        );
+
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => state().isTranscriptCaughtUp, 10_000)).toBe(true);
+        const reveal = (messageId: string) =>
+          revealTimelineTarget({
+            workspaceId,
+            getTarget: () => ({ messageId }),
+            workspaceStore: store,
+            pinTarget: () => undefined,
+          });
+
+        expect(await reveal("m10500")).toBe("revealed");
+        expect(ids()).toContain("m10500");
+
+        mockHistoryLoadMore.mockClear();
+        expect(await reveal("m2")).toBe("not-loaded");
+        expect(ids()).not.toContain("m2");
+        // Bounded pages only: never one request for the rest of the epoch.
+        const calls = mockHistoryLoadMore.mock.calls;
+        expect(calls.length).toBeGreaterThan(0);
+        expect(calls.length).toBeLessThanOrEqual(10);
+        expect(calls.every(([input]) => input?.windowed === true)).toBe(true);
+      } finally {
+        store.dispose();
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    });
+
+    it("pages a windowed replay back to the start through the real backend, falling back once when not pageable", async () => {
+      // One turn longer than a windowed page sits right before the window's turns, so the page
+      // that reaches it is not pageable and must fall back to today's unbounded page.
+      const rows = Array.from({ length: 3_600 }, (_, i) =>
+        createMuxMessage(
+          `m${i}`,
+          i === 0 || (i > 1_500 && i % 2 === 0) ? "user" : "assistant",
+          `text ${i}`,
+          { timestamp: i }
+        )
+      );
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: {
+          getStreamInfo: () => undefined,
+          replayStream: () => Promise.resolve(),
+        },
+        initStateManagerOverrides: { replayInit: () => Promise.resolve() },
+      });
+      try {
+        expect((await h.historyService.appendManyToHistory(workspaceId, rows)).success).toBe(true);
+        const workspaceService = createWorkspaceServiceForTest({
+          config: h.config,
+          historyService: h.historyService,
+        });
+        const context = {
+          workspaceService: { getOrCreateSession: () => h.session },
+        } as unknown as ORPCContext;
+        mockOnChat.mockImplementation(async function* (input, options) {
+          // validateOutput: as the onChat procedure calls it (it gates replayWindow/batchReplay).
+          yield* subscribeWorkspaceChat(
+            context,
+            input as Parameters<typeof subscribeWorkspaceChat>[1],
+            options?.signal,
+            { validateOutput: true }
+          );
+        });
+        mockHistoryLoadMore.mockImplementation((input) =>
+          workspaceService.getHistoryLoadMore(input!.workspaceId, input!.cursor, {
+            windowed: input!.windowed === true,
+          })
+        );
+
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => state().isTranscriptCaughtUp, 10_000)).toBe(true);
+        expect(ids().length).toBeLessThan(rows.length);
+
+        let pages = 0;
+        while ((await store.loadOlderHistory(workspaceId)) === "loaded") pages++;
+        expect(pages).toBeGreaterThan(1);
+        expect(ids()).toEqual(rows.map((message) => message.id));
+        const unwindowed = mockHistoryLoadMore.mock.calls.filter(([input]) => !input?.windowed);
+        expect(unwindowed).toHaveLength(1);
+      } finally {
+        store.dispose();
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    });
+
+    it("keeps a running init card visible while the window misses the epoch start", async () => {
+      const events = await attempt(1);
+      events.push({ type: "init-start", hookPath: "/project", timestamp: 1_000 });
+      await fullReplay(events, [100, 101], { windowSeed: seed });
+      expect(initRow()).toMatchObject({ status: "running" });
     });
   });
 
@@ -5231,6 +6814,32 @@ describe("WorkspaceStore", () => {
       expect(state.agentStatus).toEqual({ emoji: "🔄", message: "Run typecheck" });
     });
 
+    it("between turns a finished plan keeps its TODO chip but not the sidebar status", () => {
+      const workspaceId = "active-finished-plan-status";
+      createAndAddWorkspace(store, workspaceId);
+      const todos: TodoItem[] = [
+        { content: "Run typecheck", status: "completed" },
+        { content: "Add regression test", status: "completed" },
+      ];
+      seedPinnedTodos(store, workspaceId, todos);
+      const aggregator = store.getAggregator(workspaceId);
+      if (!aggregator) throw new Error("expected aggregator");
+
+      aggregator.handleStreamEnd({
+        type: "stream-end",
+        workspaceId,
+        messageId: `${workspaceId}-stream`,
+        metadata: { historySequence: 1, timestamp: 1_003, model: "claude-sonnet-4" },
+        parts: [],
+      });
+
+      // The chip still reads 2/2, but the sidebar does not name the plan's last step: with the
+      // plan cleared at the turn's end it fell through to the agent's own status, here none.
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.todos).toEqual(todos);
+      expect(state.agentStatus).toBeUndefined();
+    });
+
     it("falls back to persisted AI status for active workspaces with no live todos", async () => {
       // Live aggregator todos are the freshest signal for "what is the
       // agent doing right now" because `todo_write` is processed
@@ -5404,6 +7013,29 @@ describe("WorkspaceStore", () => {
         isFinal: true,
         completedAt: initialRecency + 1,
       });
+    });
+
+    it("does not fire activity-driven completion for the pinned side chat", async () => {
+      const activeWorkspaceId = "active-workspace-pinned-stop";
+      const pinnedWorkspaceId = "pinned-workspace-stop";
+      const initialRecency = new Date("2024-01-05T00:00:00.000Z").getTime();
+      const initialSnapshot = createActivitySnapshot(initialRecency);
+      const releaseCompletion = mockBackgroundActivityTransition(
+        pinnedWorkspaceId,
+        initialSnapshot,
+        [{ ...initialSnapshot, recency: initialRecency + 1, streaming: false }]
+      );
+      const onResponseComplete = createResponseCompleteSpy();
+
+      recreateStore(onResponseComplete);
+      createAndAddWorkspace(store, activeWorkspaceId);
+      createAndAddWorkspace(store, pinnedWorkspaceId, {}, false);
+      store.acquirePinnedWorkspace(pinnedWorkspaceId);
+      releaseCompletion();
+      await tick(0);
+
+      // The side chat is on screen with a live onChat loop; its stream-end is authoritative.
+      expect(onResponseComplete).not.toHaveBeenCalled();
     });
 
     it("marks background compaction stops from activity snapshots as non-notifying completions", async () => {
@@ -5965,6 +7597,44 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  describe("activity goal updates", () => {
+    const goal: GoalSnapshot = {
+      goalId: "00000000-0000-4000-8000-000000000001",
+      status: "active",
+      objective: "Ship it",
+      budgetCents: 500,
+      costCents: 10,
+      turnsUsed: 1,
+      turnCap: 5,
+      startedAtMs: 1,
+    };
+
+    it("re-renders the workspace when a compared goal field changes", async () => {
+      const workspaceId = "activity-goal-cost";
+      const listener = mock(() => undefined);
+      const releaseActivity = mockBackgroundActivityTransition(
+        workspaceId,
+        createActivitySnapshot(1, { streaming: false, goal }),
+        [
+          // Only startedAtMs changes: no re-render.
+          createActivitySnapshot(1, { streaming: false, goal: { ...goal, startedAtMs: 2 } }),
+          createActivitySnapshot(1, { streaming: false, goal: { ...goal, costCents: 11 } }),
+        ]
+      );
+      recreateStore();
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).goal != null)).toBe(true);
+      store.subscribeKey(workspaceId, listener);
+
+      releaseActivity();
+
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).goal?.costCents === 11)
+      ).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("terminal activity", () => {
     it("propagates terminal activity to sidebar state", async () => {
       const workspaceId = "terminal-activity-workspace";
@@ -6145,6 +7815,269 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // The timeline panel reads one refcounted backend subscription per workspace: its snapshot is
+  // the newest page, live batches merge into it, and older pages load from the snapshot cursor.
+  describe("workspace timeline", () => {
+    const timelineEvent = (seq: number): TimelineEvent => ({
+      v: 1,
+      seq,
+      id: `event-${seq}`,
+      ts: seq,
+      kind: "turn.completed",
+      source: { system: "workspace" },
+    });
+
+    // Inputs come from the store's client contract, payloads from the shared timeline schema,
+    // so a change on either side of the IPC boundary breaks these tests at compile time.
+    type TimelineClient = NonNullable<
+      Parameters<WorkspaceStore["setClient"]>[0]
+    >["workspace"]["timeline"];
+    let feed: ControllableAsyncIterable<TimelineSubscriptionEvent>;
+    let subscribeSignals: AbortSignal[];
+    const mockTimelineSubscribe = mock(
+      (_input: Parameters<TimelineClient["subscribe"]>[0], options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscribeSignals.push(options.signal);
+        return Promise.resolve(feed.iterable);
+      }
+    );
+    const mockTimelineList = mock(
+      (_input: Parameters<TimelineClient["list"]>[0]): Promise<TimelinePage> =>
+        Promise.resolve({ events: [], nextCursor: null, hasOlder: false })
+    );
+
+    beforeEach(() => {
+      feed = createControllableAsyncIterable<TimelineSubscriptionEvent>();
+      subscribeSignals = [];
+      mockTimelineSubscribe.mockClear();
+      mockTimelineList.mockClear();
+      resetStore();
+      store.setClient({
+        ...mockClient,
+        workspace: {
+          ...mockClient.workspace,
+          timeline: { subscribe: mockTimelineSubscribe, list: mockTimelineList },
+        },
+      } as unknown as Parameters<WorkspaceStore["setClient"]>[0]);
+    });
+
+    const seqs = (workspaceId: string) =>
+      store.getWorkspaceTimeline(workspaceId).events.map((event) => event.seq);
+
+    /** Register and subscribe a workspace whose snapshot is events 3 and 2, with older events. */
+    const openTimeline = async (workspaceId: string) => {
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeTimeline(workspaceId, () => undefined);
+      feed.push({
+        type: "snapshot",
+        events: [timelineEvent(3), timelineEvent(2)],
+        nextCursor: 2,
+        hasOlder: true,
+      });
+      expect(await waitUntil(() => store.getWorkspaceTimeline(workspaceId).initialized)).toBe(true);
+      return unsubscribe;
+    };
+
+    it("shares one backend subscription between listeners and shows its snapshot", async () => {
+      const workspaceId = "timeline-shared";
+      const listener = mock(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, listener);
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockTimelineSubscribe.mock.calls[0][0]).toEqual({ workspaceId });
+
+      feed.push({ type: "snapshot", events: [timelineEvent(3)], nextCursor: 3, hasOlder: true });
+
+      expect(await waitUntil(() => listener.mock.calls.length > 0)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId)).toEqual({
+        events: [timelineEvent(3)],
+        nextCursor: 3,
+        hasOlder: true,
+        initialized: true,
+        loadingOlder: false,
+        loadError: null,
+        loadErrorKind: null,
+      });
+    });
+
+    it("marks an empty snapshot as initialized so the panel shows its empty state", async () => {
+      const workspaceId = "timeline-empty";
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, () => undefined);
+      feed.push({ type: "snapshot", events: [], nextCursor: null, hasOlder: false });
+
+      expect(await waitUntil(() => store.getWorkspaceTimeline(workspaceId).initialized)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).events).toEqual([]);
+    });
+
+    it("merges appended live events and skips empty batches", async () => {
+      const workspaceId = "timeline-appended";
+      const listener = mock(() => undefined);
+      await openTimeline(workspaceId);
+      store.subscribeTimeline(workspaceId, listener);
+
+      feed.push({ type: "appended", events: [] });
+      feed.push({ type: "appended", events: [timelineEvent(4)] });
+
+      expect(await waitUntil(() => seqs(workspaceId).length === 3)).toBe(true);
+      expect(seqs(workspaceId)).toEqual([4, 3, 2]);
+      // Only the non-empty batch notified listeners.
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: 2,
+        hasOlder: true,
+      });
+    });
+
+    it("closes the backend subscription and drops the timeline after the last listener", async () => {
+      const workspaceId = "timeline-refcount";
+      const unsubscribeFirst = await openTimeline(workspaceId);
+      const unsubscribeSecond = store.subscribeTimeline(workspaceId, () => undefined);
+
+      unsubscribeFirst();
+      expect(subscribeSignals[0].aborted).toBe(false);
+      expect(seqs(workspaceId)).toEqual([3, 2]);
+
+      unsubscribeSecond();
+      expect(subscribeSignals[0].aborted).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).initialized).toBe(false);
+      expect(seqs(workspaceId)).toEqual([]);
+
+      // A later listener opens a fresh subscription.
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("subscribes a listener that came before the workspace was registered", () => {
+      const workspaceId = "timeline-early-listener";
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).not.toHaveBeenCalled();
+
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it("closes a subscription that opens after its listener left", async () => {
+      const workspaceId = "timeline-late-open";
+      const onReturn = mock(() => undefined);
+      feed = createControllableAsyncIterable<TimelineSubscriptionEvent>({ onReturn });
+      let openSubscription!: () => void;
+      mockTimelineSubscribe.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            openSubscription = () => resolve(feed.iterable);
+          })
+      );
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeTimeline(workspaceId, () => undefined);
+
+      unsubscribe();
+      openSubscription();
+
+      expect(await waitUntil(() => onReturn.mock.calls.length > 0)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).initialized).toBe(false);
+    });
+
+    it("shows a failed subscription as an error until the user retries", async () => {
+      const workspaceId = "timeline-subscription-error";
+      mockTimelineSubscribe.mockImplementationOnce(() => Promise.reject(new Error("backend gone")));
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, () => undefined);
+
+      expect(
+        await waitUntil(() => store.getWorkspaceTimeline(workspaceId).loadError !== null)
+      ).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        initialized: true,
+        loadError: "backend gone",
+        loadErrorKind: "subscription",
+      });
+
+      store.retryTimeline(workspaceId);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(2);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        initialized: false,
+        loadError: null,
+      });
+      feed.push({
+        type: "snapshot",
+        events: [timelineEvent(1)],
+        nextCursor: null,
+        hasOlder: false,
+      });
+      expect(await waitUntil(() => seqs(workspaceId).length === 1)).toBe(true);
+    });
+
+    it("loads the next older page from the snapshot cursor", async () => {
+      const workspaceId = "timeline-older-page";
+      await openTimeline(workspaceId);
+      let resolvePage!: (page: TimelinePage) => void;
+      mockTimelineList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePage = resolve;
+          })
+      );
+
+      const loading = store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledWith({ workspaceId, cursor: 2 });
+      expect(store.getWorkspaceTimeline(workspaceId).loadingOlder).toBe(true);
+      // A second request while the page loads does not fetch it twice.
+      await store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledTimes(1);
+
+      resolvePage({ events: [timelineEvent(1)], nextCursor: null, hasOlder: false });
+      await loading;
+
+      expect(seqs(workspaceId)).toEqual([3, 2, 1]);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: null,
+        hasOlder: false,
+        loadingOlder: false,
+      });
+      // Without older events there is nothing left to load.
+      await store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the loaded events and shows a pagination error when a page fails", async () => {
+      const workspaceId = "timeline-older-page-error";
+      await openTimeline(workspaceId);
+      mockTimelineList.mockImplementationOnce(() => Promise.reject(new Error("page failed")));
+
+      await store.loadOlderTimeline(workspaceId);
+
+      expect(seqs(workspaceId)).toEqual([3, 2]);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: 2,
+        hasOlder: true,
+        loadingOlder: false,
+        loadError: "page failed",
+        loadErrorKind: "pagination",
+      });
+    });
+
+    it("drops an older page that resolves after the timeline was reset", async () => {
+      const workspaceId = "timeline-older-page-stale";
+      await openTimeline(workspaceId);
+      let resolvePage!: (page: TimelinePage) => void;
+      mockTimelineList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePage = resolve;
+          })
+      );
+
+      const loading = store.loadOlderTimeline(workspaceId);
+      store.retryTimeline(workspaceId);
+      resolvePage({ events: [timelineEvent(1)], nextCursor: null, hasOlder: false });
+      await loading;
+
+      expect(seqs(workspaceId)).toEqual([]);
+      expect(store.getWorkspaceTimeline(workspaceId).loadingOlder).toBe(false);
+    });
+  });
+
   describe("getWorkspaceRecency", () => {
     it("should return stable reference when values unchanged", () => {
       const recency1 = store.getWorkspaceRecency();
@@ -6152,6 +8085,172 @@ describe("WorkspaceStore", () => {
 
       // Should be same reference (cached)
       expect(recency1).toBe(recency2);
+    });
+  });
+
+  // Timing stats stream from one refcounted backend subscription per workspace, opened only
+  // while the UI shows them.
+  describe("workspace timing stats", () => {
+    const snapshot = (generatedAt: number): WorkspaceStatsSnapshot => ({
+      workspaceId: "stats",
+      generatedAt,
+    });
+
+    // One feed per backend subscription, so a test can tell a replacement stream from the old one.
+    let feeds: Array<ControllableAsyncIterable<WorkspaceStatsSnapshot>>;
+    let subscribeSignals: AbortSignal[];
+    const mockStatsSubscribe = mock(
+      (_input: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscribeSignals.push(options.signal);
+        const feed = createControllableAsyncIterable<WorkspaceStatsSnapshot>();
+        feeds.push(feed);
+        return Promise.resolve(feed.iterable);
+      }
+    );
+    // Typed against the real `workspace.stats.subscribe` procedure: a change to its input or
+    // snapshot schema fails the typecheck here.
+    const statsOverride: TestApiOverrides<APIClient> = {
+      workspace: { stats: { subscribe: mockStatsSubscribe } },
+    };
+    const statsClient = () =>
+      ({
+        ...mockClient,
+        workspace: { ...mockClient.workspace, ...statsOverride.workspace },
+      }) as unknown as Parameters<WorkspaceStore["setClient"]>[0];
+
+    beforeEach(() => {
+      feeds = [];
+      subscribeSignals = [];
+      mockStatsSubscribe.mockClear();
+      resetStore();
+      store.setClient(statsClient());
+    });
+
+    const generatedAt = (workspaceId: string) =>
+      store.getWorkspaceStatsSnapshot(workspaceId)?.generatedAt;
+
+    it("shares one backend subscription between listeners and shows its snapshots", async () => {
+      const workspaceId = "stats-shared";
+      const listener = mock(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      // Registration alone does not subscribe: no UI shows the stats yet.
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      store.subscribeStats(workspaceId, listener);
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockStatsSubscribe.mock.calls[0][0]).toEqual({ workspaceId });
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+
+      feeds[0].push(snapshot(1));
+      feeds[0].push(snapshot(2));
+
+      expect(await waitUntil(() => generatedAt(workspaceId) === 2)).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(2);
+    });
+
+    it("closes the backend subscription and drops the snapshot after the last listener", async () => {
+      const workspaceId = "stats-refcount";
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribeFirst = store.subscribeStats(workspaceId, () => undefined);
+      const unsubscribeSecond = store.subscribeStats(workspaceId, () => undefined);
+      feeds[0].push(snapshot(1));
+      expect(await waitUntil(() => generatedAt(workspaceId) === 1)).toBe(true);
+
+      unsubscribeFirst();
+      expect(subscribeSignals[0].aborted).toBe(false);
+      expect(generatedAt(workspaceId)).toBe(1);
+
+      unsubscribeSecond();
+      expect(subscribeSignals[0].aborted).toBe(true);
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+
+      // A later listener opens a fresh subscription, and its stream delivers.
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(2);
+      feeds[1].push(snapshot(2));
+      expect(await waitUntil(() => generatedAt(workspaceId) === 2)).toBe(true);
+    });
+
+    it("ignores an extra unsubscribe call once every listener is gone", () => {
+      const workspaceId = "stats-underflow";
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
+        unsubscribe();
+
+        unsubscribe();
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        // Restore even when an assertion fails, so later tests keep their warnings.
+        warn.mockRestore();
+      }
+
+      // The count did not go negative: the next listener subscribes again.
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("subscribes a listener that came before the workspace was registered", () => {
+      store.subscribeStats("stats-unregistered", () => undefined);
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      createAndAddWorkspace(store, "stats-unregistered", {}, false);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it("subscribes a listener that came before the client", () => {
+      store.setClient(null);
+      store.subscribeStats("stats-early", () => undefined);
+      createAndAddWorkspace(store, "stats-early", {}, false);
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      store.setClient(statsClient());
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockStatsSubscribe.mock.calls[0][0]).toEqual({ workspaceId: "stats-early" });
+    });
+
+    it("closes the subscription when the client changes or the workspace is removed", async () => {
+      createAndAddWorkspace(store, "stats-reconnect", {}, false);
+      createAndAddWorkspace(store, "stats-removed", {}, false);
+      store.subscribeStats("stats-reconnect", () => undefined);
+      store.subscribeStats("stats-removed", () => undefined);
+      expect(subscribeSignals).toHaveLength(2);
+
+      // A reconnect resubscribes the workspaces that still have listeners.
+      store.setClient(statsClient());
+      expect(subscribeSignals.map((signal) => signal.aborted)).toEqual([true, true, false, false]);
+      const reconnectFeed =
+        feeds[
+          mockStatsSubscribe.mock.calls.findLastIndex(
+            ([input]) => input.workspaceId === "stats-reconnect"
+          )
+        ];
+      reconnectFeed.push(snapshot(3));
+      expect(await waitUntil(() => generatedAt("stats-reconnect") === 3)).toBe(true);
+
+      store.removeWorkspace("stats-removed");
+      expect(subscribeSignals[3].aborted).toBe(true);
+      expect(subscribeSignals[2].aborted).toBe(false);
+    });
+
+    it("logs a failed subscription and keeps showing no snapshot", async () => {
+      const workspaceId = "stats-error";
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const failure = new Error("stats gone");
+        mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        store.subscribeStats(workspaceId, () => undefined);
+
+        expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
+        // The log carries the error itself, not just a message.
+        expect(warn.mock.calls[0]).toContain(failure);
+      } finally {
+        warn.mockRestore();
+      }
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
     });
   });
 
@@ -6440,7 +8539,7 @@ describe("WorkspaceStore", () => {
       expect(allStates.has("workspace-2")).toBe(true);
     });
 
-    it("handles workspace removal during state access", () => {
+    it("drops cached state on removal and creates a fresh snapshot after re-add", () => {
       createAndAddWorkspace(store, "test-workspace", TEST_WORKSPACE_OPTIONS, false);
 
       const state1 = store.getWorkspaceState("test-workspace");
@@ -6449,9 +8548,11 @@ describe("WorkspaceStore", () => {
       // Remove workspace
       store.removeWorkspace("test-workspace");
 
-      // Accessing state after removal should create new aggregator (lazy init)
+      // A removed workspace must be registered again, not served its old cached snapshot.
+      expect(() => store.getWorkspaceState("test-workspace")).toThrow();
+      createAndAddWorkspace(store, "test-workspace", TEST_WORKSPACE_OPTIONS, false);
       const state2 = store.getWorkspaceState("test-workspace");
-      expect(state2).toBeDefined();
+      expect(state2).not.toBe(state1);
       expect(state2.loading).toBe(true); // Fresh workspace, not caught up
     });
   });
@@ -6567,372 +8668,90 @@ describe("WorkspaceStore", () => {
       expect(live.stdout).toContain("buffered");
     });
   });
-  describe("advisor-phase events", () => {
-    it("tracks the latest live advisor phase while the advisor tool is running", async () => {
-      const workspaceId = "advisor-phase-workspace-1";
+  describe("bash-sandbox-approval events", () => {
+    it("keeps each waiting call until its wait ends, and names the newest one as latest", async () => {
+      const workspaceId = "sandbox-approval-workspace-1";
 
       mockChatScript([
         caughtUpEvent(),
         Promise.resolve(),
-        advisorPhaseEvent(workspaceId, "call-advisor-1", "preparing_context", 1),
-        advisorPhaseEvent(workspaceId, "call-advisor-1", "waiting_for_response", 2),
+        sandboxApprovalEvent(workspaceId, "call-old", true, 1),
+        sandboxApprovalEvent(workspaceId, "call-new", true, 2),
+        sandboxApprovalEvent(workspaceId, "call-done", true, 3),
+        sandboxApprovalEvent(workspaceId, "call-done", false, 4),
       ]);
 
       createAndAddWorkspace(store, workspaceId);
-
-      const hasLatestPhase = await waitUntil(
-        () =>
-          store.getAdvisorToolLivePhase(workspaceId, "call-advisor-1")?.phase ===
-          "waiting_for_response"
-      );
-      expect(hasLatestPhase).toBe(true);
-
-      const live = store.getAdvisorToolLivePhase(workspaceId, "call-advisor-1");
-      expect(live).toEqual({
-        phase: "waiting_for_response",
-        timestamp: 2,
-      });
-
-      const liveAgain = store.getAdvisorToolLivePhase(workspaceId, "call-advisor-1");
-      expect(liveAgain).toBe(live);
-    });
-
-    it("clears live advisor phase on advisor tool-call-end", async () => {
-      const workspaceId = "advisor-phase-workspace-2";
-      let releaseToolEnd: (() => void) | undefined;
-      const waitForToolEnd = new Promise<void>((resolve) => {
-        releaseToolEnd = resolve;
-      });
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorPhaseEvent(workspaceId, "call-advisor-2", "finalizing_result", 1),
-        waitForToolEnd,
-        toolCallEndEvent(
-          workspaceId,
-          "call-advisor-2",
-          "advisor",
-          { success: true },
-          {
-            messageId: "m-advisor-2",
-            timestamp: 2,
-          }
-        ),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLivePhase = await waitUntil(
-        () =>
-          store.getAdvisorToolLivePhase(workspaceId, "call-advisor-2")?.phase ===
-          "finalizing_result"
-      );
-      expect(hasLivePhase).toBe(true);
-
-      releaseToolEnd?.();
-
-      const clearedLivePhase = await waitUntil(
-        () => store.getAdvisorToolLivePhase(workspaceId, "call-advisor-2") === undefined
-      );
-      expect(clearedLivePhase).toBe(true);
-    });
-
-    it("ignores duplicate advisor phases for the same tool call", async () => {
-      const workspaceId = "advisor-phase-workspace-3";
-      let releaseDuplicate: (() => void) | undefined;
-      const waitForDuplicate = new Promise<void>((resolve) => {
-        releaseDuplicate = resolve;
-      });
-
-      mockChatScript(
-        [
-          caughtUpEvent(),
-          Promise.resolve(),
-          advisorPhaseEvent(workspaceId, "call-advisor-3", "waiting_for_response", 1),
-          waitForDuplicate,
-          advisorPhaseEvent(workspaceId, "call-advisor-3", "waiting_for_response", 2),
-        ],
-        { keepOpen: true }
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasInitialPhase = await waitUntil(
-        () => store.getAdvisorToolLivePhase(workspaceId, "call-advisor-3")?.timestamp === 1
-      );
-      expect(hasInitialPhase).toBe(true);
-
-      const live = store.getAdvisorToolLivePhase(workspaceId, "call-advisor-3");
-      expect(live).toEqual({
-        phase: "waiting_for_response",
-        timestamp: 1,
-      });
-      if (!live) throw new Error("Expected live advisor phase");
-
-      let notificationCount = 0;
-      const unsubscribe = store.subscribeKey(workspaceId, () => {
-        notificationCount += 1;
-      });
-
-      releaseDuplicate?.();
       await tick(10);
 
-      const liveAfterDuplicate = store.getAdvisorToolLivePhase(workspaceId, "call-advisor-3");
-      expect(liveAfterDuplicate).toBe(live);
-      expect(liveAfterDuplicate).toEqual({
-        phase: "waiting_for_response",
-        timestamp: 1,
-      });
-      expect(notificationCount).toBe(0);
-
-      unsubscribe();
-    });
-  });
-
-  describe("advisor-output events", () => {
-    it("accumulates live advisor output while the advisor tool is running", async () => {
-      const workspaceId = "advisor-output-workspace-1";
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorOutputEvent(workspaceId, "call-advisor-output-1", "first ", 1),
-        advisorOutputEvent(workspaceId, "call-advisor-output-1", "second", 2),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-1")?.text ===
-          "first second"
+      expect(store.getBashSandboxApproval(workspaceId, "call-old")?.reason).toBe(
+        "reason for call-old"
       );
-      expect(hasLiveOutput).toBe(true);
-
-      const live = store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-1");
-      expect(live).toEqual({ text: "first second", timestamp: 2 });
-      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-1")).toBe(live);
+      expect(store.getBashSandboxApproval(workspaceId, "call-done")).toBeNull();
+      expect(store.getLatestBashSandboxApprovalToolCallId(workspaceId)).toBe("call-new");
     });
 
-    it("clears live advisor output on advisor tool-call-end", async () => {
-      const workspaceId = "advisor-output-workspace-2";
-      let releaseToolEnd: (() => void) | undefined;
-      const waitForToolEnd = new Promise<void>((resolve) => {
-        releaseToolEnd = resolve;
-      });
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorOutputEvent(workspaceId, "call-advisor-output-2", "partial advice", 1),
-        waitForToolEnd,
-        toolCallEndEvent(
-          workspaceId,
-          "call-advisor-output-2",
-          "advisor",
-          { type: "advice", advice: "partial advice" },
-          { messageId: "m-advisor-output-2", timestamp: 2 }
-        ),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-2")?.text ===
-          "partial advice"
-      );
-      expect(hasLiveOutput).toBe(true);
-
-      releaseToolEnd?.();
-
-      const clearedLiveOutput = await waitUntil(
-        () => store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-2") === null
-      );
-      expect(clearedLiveOutput).toBe(true);
-    });
-
-    it("clears stale live advisor output after message deletion", async () => {
-      const workspaceId = "advisor-output-workspace-delete";
-      let releaseDelete: (() => void) | undefined;
-      const waitForDelete = new Promise<void>((resolve) => {
-        releaseDelete = resolve;
-      });
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorOutputEvent(workspaceId, "call-advisor-output-delete", "stale partial advice", 1),
-        waitForDelete,
-        { type: "delete", historySequences: [1] },
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-delete")?.text ===
-          "stale partial advice"
-      );
-      expect(hasLiveOutput).toBe(true);
-      const advisorListener = mock(() => undefined);
-      const unsubscribe = store.subscribeAdvisorLive(
-        workspaceId,
-        "call-advisor-output-delete",
-        advisorListener
-      );
-
-      releaseDelete?.();
-
-      const clearedLiveOutput = await waitUntil(
-        () => store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-delete") === null
-      );
-      expect(clearedLiveOutput).toBe(true);
-      // The delete-time sweep must release the keyed channel as well (which notifies its
-      // subscriber): with the transient entry gone, no later sweep can rediscover this key.
-      expect(advisorListener).toHaveBeenCalledTimes(1);
-      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
-      const { advisorLiveStore } = getInternal<{
-        advisorLiveStore: { has: (key: string) => boolean };
-      }>(store);
-      expect(advisorLiveStore.has(`${workspaceId}\u0000call-advisor-output-delete`)).toBe(false);
-      unsubscribe();
-    });
-
-    it("releases keyed advisor channels when a full replay resets transient state", async () => {
-      const workspaceId = "advisor-output-full-replay-reset";
-
-      const endFirstAttempt = createReleaseGate();
-      // The first attempt ends without history, so the retry is a full replay that
-      // resets transient state; the retry itself stays open and silent.
+    // Every replay re-sends the calls still waiting (pending:true) before caught-up, so a
+    // reconnect shows exactly those; a call answered while disconnected sends nothing.
+    const approvalAfterReconnect = async (
+      workspaceId: string,
+      replayed: WorkspaceChatMessage[]
+    ) => {
+      const firstSubscription = createReleaseGate();
       const subscriptions = mockChatReconnectScript((attempt, signal) =>
         attempt === 1
           ? [
-              caughtUpEvent(),
+              createHistoryMessageEvent("history-1", 1),
+              fullCaughtUpEvent(),
               Promise.resolve(),
-              advisorOutputEvent(workspaceId, "call-advisor-replay-reset", "partial advice", 1),
-              endFirstAttempt.wait,
+              streamStartEvent(workspaceId, "msg-sandbox", {
+                historySequence: 2,
+                startTime: 1_000,
+                model: "claude-3-5-sonnet-20241022",
+              }),
+              sandboxApprovalEvent(workspaceId, "call-wait", true, 1_001),
+              firstSubscription.wait,
             ]
-          : [() => waitForAbortSignal(signal)]
+          : [
+              createHistoryMessageEvent("history-1", 1),
+              ...replayed,
+              // The same stream still runs, so only the replayed approvals decide the card.
+              fullCaughtUpEvent(1, "history-1", { messageId: "msg-sandbox", lastTimestamp: 1_001 }),
+              Promise.resolve(),
+              () => waitForAbortSignal(signal),
+            ]
       );
-
       createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-replay-reset")?.text ===
-          "partial advice"
-      );
-      expect(hasLiveOutput).toBe(true);
-      const advisorListener = mock(() => undefined);
-      const unsubscribe = store.subscribeAdvisorLive(
-        workspaceId,
-        "call-advisor-replay-reset",
-        advisorListener
-      );
-
-      endFirstAttempt.release();
+      expect(
+        await waitUntil(() => store.getBashSandboxApproval(workspaceId, "call-wait") !== null)
+      ).toBe(true);
+      firstSubscription.release();
       expect(await waitUntil(() => subscriptions() === 2)).toBe(true);
-      await tick(0);
+      await tick(10);
+      return store.getBashSandboxApproval(workspaceId, "call-wait");
+    };
 
-      // The replaced transient maps were the only record of this tool-call ID,
-      // so the reset itself must release the keyed channel (notifying its subscriber).
-      expect(advisorListener).toHaveBeenCalledTimes(1);
-      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-replay-reset")).toBeNull();
-      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
-      const { advisorLiveStore } = getInternal<{
-        advisorLiveStore: { has: (key: string) => boolean };
-      }>(store);
-      expect(advisorLiveStore.has(`${workspaceId}\u0000call-advisor-replay-reset`)).toBe(false);
-      unsubscribe();
-      mockChatScript([], { keepOpen: true });
-    });
-
-    it("replays pre-caught-up advisor output after full replay catches up", async () => {
-      const workspaceId = "advisor-output-workspace-3";
-
-      mockChatScript([
-        advisorOutputEvent(workspaceId, "call-advisor-output-3", "buffered advice", 1),
-        Promise.resolve(),
-        caughtUpEvent({ replay: "full" }),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-3")?.text ===
-          "buffered advice"
-      );
-      expect(hasLiveOutput).toBe(true);
-    });
-  });
-
-  describe("advisor-reasoning-output events", () => {
-    it("accumulates live advisor reasoning while the advisor tool is running", async () => {
-      const workspaceId = "advisor-reasoning-workspace-1";
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorReasoningOutputEvent(workspaceId, "call-advisor-reasoning-1", "thinking ", 1),
-        advisorReasoningOutputEvent(workspaceId, "call-advisor-reasoning-1", "through risk", 2),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveReasoning = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-1")?.text ===
-          "thinking through risk"
-      );
-      expect(hasLiveReasoning).toBe(true);
-
-      const live = store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-1");
-      expect(live).toEqual({ text: "thinking through risk", timestamp: 2 });
-      expect(store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-1")).toBe(live);
-    });
-
-    it("clears live advisor reasoning on advisor tool-call-end", async () => {
-      const workspaceId = "advisor-reasoning-workspace-2";
-      let releaseToolEnd: (() => void) | undefined;
-      const waitForToolEnd = new Promise<void>((resolve) => {
-        releaseToolEnd = resolve;
-      });
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorReasoningOutputEvent(workspaceId, "call-advisor-reasoning-2", "partial thought", 1),
-        waitForToolEnd,
-        toolCallEndEvent(
+    it("shows a waiting call that a replay re-sends", async () => {
+      const workspaceId = "sandbox-approval-workspace-2";
+      const approval = await approvalAfterReconnect(workspaceId, [
+        {
+          type: "bash-sandbox-approval",
           workspaceId,
-          "call-advisor-reasoning-2",
-          "advisor",
-          { type: "advice", advice: "final advice" },
-          { messageId: "m-advisor-reasoning-2", timestamp: 2 }
-        ),
+          toolCallId: "call-wait",
+          script: "git push",
+          reason: "replayed reason",
+          pending: true,
+          timestamp: 1_001,
+        },
       ]);
+      expect(approval?.reason).toBe("replayed reason");
+    });
 
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveReasoning = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-2")?.text ===
-          "partial thought"
-      );
-      expect(hasLiveReasoning).toBe(true);
-
-      releaseToolEnd?.();
-
-      const clearedLiveReasoning = await waitUntil(
-        () => store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-2") === null
-      );
-      expect(clearedLiveReasoning).toBe(true);
+    it("drops a waiting call that a replay no longer re-sends", async () => {
+      const approval = await approvalAfterReconnect("sandbox-approval-workspace-3", []);
+      expect(approval).toBeNull();
     });
   });
-
   describe("workflow-run-attached events", () => {
     it("exposes the exact workflow run while the workflow tool is running", async () => {
       const workspaceId = "workflow-run-attached-workspace-1";
@@ -7043,6 +8862,76 @@ describe("WorkspaceStore", () => {
       await tick(10);
 
       expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-3")).toBeNull();
+    });
+  });
+
+  describe("live tool state after a delete", () => {
+    const runningToolPart = (toolCallId: string, toolName: string) => ({
+      type: "dynamic-tool" as const,
+      toolCallId,
+      toolName,
+      state: "input-available" as const,
+      input: {},
+    });
+
+    it("prunes live bash output and workflow runs of deleted tool calls and keeps the rest", async () => {
+      const workspaceId = "live-tool-state-delete";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+      const run = createWorkflowRunRecord({ id: "wfr_live_delete", workspaceId });
+
+      await send(
+        caughtUpEvent(),
+        {
+          type: "message",
+          id: "kept-turn",
+          role: "assistant",
+          parts: [
+            runningToolPart("call-bash-kept", "bash"),
+            {
+              ...runningToolPart("call-code", "code_execution"),
+              // Kernel-nested calls key their live state by their own ids.
+              nestedCalls: [
+                {
+                  toolCallId: "call-nested-workflow",
+                  toolName: "workflow_run",
+                  state: "input-available",
+                },
+                { toolCallId: "call-nested-bash", toolName: "bash", state: "input-available" },
+              ],
+            },
+          ],
+          metadata: { historySequence: 1, timestamp: 1 },
+        },
+        {
+          type: "message",
+          id: "deleted-turn",
+          role: "assistant",
+          parts: [
+            runningToolPart("call-bash-deleted", "bash"),
+            runningToolPart("call-workflow-deleted", "workflow_run"),
+          ],
+          metadata: { historySequence: 2, timestamp: 2 },
+        },
+        bashOutputEvent(workspaceId, "call-bash-kept", "kept output"),
+        bashOutputEvent(workspaceId, "call-nested-bash", "nested output"),
+        bashOutputEvent(workspaceId, "call-bash-deleted", "deleted output"),
+        workflowRunAttachedEvent(workspaceId, "call-nested-workflow", run.id, 3, run),
+        workflowRunAttachedEvent(workspaceId, "call-workflow-deleted", run.id, 4, run)
+      );
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-deleted")).not.toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-deleted")).not.toBeNull();
+
+      await send({ type: "delete", historySequences: [2] });
+
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-deleted")).toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-deleted")).toBeNull();
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-kept")).not.toBeNull();
+      expect(store.getBashToolLiveOutput(workspaceId, "call-nested-bash")).not.toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-nested-workflow")).toEqual({
+        runId: run.id,
+        run,
+      });
     });
   });
 
@@ -7296,6 +9185,338 @@ describe("WorkspaceStore", () => {
       expect(usage.lastContextUsage?.output.tokens).toBe(0);
       expect(usage.lastContextUsage?.model).toBe("claude-3-5-sonnet-20241022");
     });
+
+    it("derives per-turn prompt-cache health from completed assistant turns, newest first", async () => {
+      const workspaceId = "turn-cache-health-workspace";
+      const assistantTurn = (
+        id: string,
+        historySequence: number,
+        cache: { read: number; write: number }
+      ) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          model: "anthropic:claude-sonnet-5-5",
+          usage: {
+            inputTokens: 1_000 + cache.read + cache.write,
+            cachedInputTokens: cache.read,
+            outputTokens: 10,
+          },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: cache.write } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantTurn("cold-turn", 1, { read: 0, write: 30_000 }),
+        {
+          type: "message",
+          id: "user-turn",
+          role: "user",
+          parts: [{ type: "text", text: "next" }],
+          metadata: { historySequence: 2, timestamp: 2 },
+        },
+        assistantTurn("warm-turn", 3, { read: 29_000, write: 1_000 }),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.coldStart])).toEqual([
+        ["warm-turn", false],
+        ["cold-turn", true],
+      ]);
+      expect(turns[0].readRatio).toBeCloseTo(29_000 / 31_000, 12);
+      expect(turns[1].rewriteCostUsd).toBeGreaterThan(0);
+    });
+
+    it("does not price a legacy custom-model turn through the live provider mapping", async () => {
+      const workspaceId = "turn-cache-health-live-mapping";
+      // The live config maps the custom model to a priced one; the persisted row has no
+      // record-time metadataModel, so (as in the session-usage rebuild) it stays unpriced.
+      mockGetProvidersConfig.mockResolvedValueOnce({
+        ollama: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "custom", mappedToModel: "anthropic:claude-sonnet-5-5" }],
+        },
+      });
+      const assistantRow = (id: string, historySequence: number, metadataModel?: string) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          model: "ollama:custom",
+          ...(metadataModel !== undefined ? { metadataModel } : {}),
+          usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("legacy-turn", 1),
+        assistantRow("pinned-turn", 2, "anthropic:claude-sonnet-5-5"),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      providerConfigChanges.push(undefined);
+      await tick(10);
+      // The pushed change refetched the config, so the mapping is live in the store.
+      expect(mockGetProvidersConfig.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.rewriteCostUsd !== undefined])).toEqual([
+        ["pinned-turn", true],
+        ["legacy-turn", false],
+      ]);
+    });
+
+    it("leaves a fork's inherited turns out of its prompt-cache table", async () => {
+      const workspaceId = "turn-cache-health-fork";
+      const FORKED_AT = 5_000;
+      mockGetSessionUsage.mockImplementation((input) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? { byModel: {}, version: 1, forkedAt: FORKED_AT }
+            : undefined
+        )
+      );
+      const assistantRow = (id: string, historySequence: number, timestamp: number) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp,
+          model: "anthropic:claude-sonnet-5-5",
+          usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("inherited-turn", 1, FORKED_AT - 1),
+        assistantRow("inherited-last-turn", 2, FORKED_AT),
+        // An edit of an inherited message in the fork reuses a lower history sequence.
+        assistantRow("own-turn", 2, FORKED_AT + 1),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        await tick(10);
+        expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId });
+
+        const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+        expect(turns.map((turn) => turn.messageId)).toEqual(["own-turn"]);
+      } finally {
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(undefined));
+      }
+    });
+
+    it("leaves a legacy turn without a record-time model unpriced instead of using the current model", async () => {
+      const workspaceId = "turn-cache-health-legacy-model";
+      const assistantRow = (id: string, historySequence: number, model?: string) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          ...(model !== undefined ? { model } : {}),
+          usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("legacy-turn", 1),
+        // The newest row makes Sonnet 5.5 the workspace's current (priced) model.
+        assistantRow("priced-turn", 2, "anthropic:claude-sonnet-5-5"),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => turn.messageId)).toEqual(["priced-turn", "legacy-turn"]);
+      expect(turns[0].rewriteCostUsd).toBeGreaterThan(0);
+      expect(turns[1].cacheWriteTokens).toBe(30_000);
+      expect(turns[1].rewriteCostUsd).toBeUndefined();
+    });
+
+    it("counts tool-model usage in a turn's cache health and skips compaction summaries", async () => {
+      const workspaceId = "turn-cache-health-tools-workspace";
+      const MODEL = "anthropic:claude-sonnet-5-5";
+      const coldToolUsage = {
+        toolName: "task",
+        model: MODEL,
+        usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+        providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+      };
+      const assistantRow = (id: string, historySequence: number, metadata: object) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: { historySequence, timestamp: historySequence, model: MODEL, ...metadata },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("tool-only-turn", 1, { toolModelUsages: [coldToolUsage] }),
+        assistantRow("mixed-turn", 2, {
+          usage: { inputTokens: 31_000, cachedInputTokens: 29_000, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 1_000 } },
+          toolModelUsages: [coldToolUsage],
+        }),
+        // CompactionHandler keeps the summary's usage but strips its providerMetadata.
+        assistantRow("compaction-summary", 3, {
+          usage: { inputTokens: 40_000, cachedInputTokens: 0, outputTokens: 500 },
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        }),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.cacheWriteTokens, turn.coldStart])).toEqual([
+        ["mixed-turn", 31_000, false],
+        ["tool-only-turn", 30_000, true],
+      ]);
+    });
+  });
+
+  // The Costs tab's consumer breakdown comes from the token-stats cache persisted in
+  // session-usage.json when it still matches the history; otherwise the store recounts.
+  describe("consumer breakdown from the token-stats cache", () => {
+    const MODEL = "anthropic:claude-opus-4-5";
+    const CACHED_CONSUMERS = [{ name: "User", tokens: 42, percentage: 100 }];
+
+    const tokenStatsCache = (history: { messageCount: number; maxHistorySequence?: number }) => ({
+      version: 1 as const,
+      computedAt: 1,
+      // The beforeEach store loads an empty provider config.
+      providersConfigVersion: computeProvidersConfigFingerprint({}),
+      model: MODEL,
+      tokenizerName: "cached-tokenizer",
+      history,
+      consumers: CACHED_CONSUMERS,
+      totalTokens: 42,
+    });
+
+    /** Replay a two-message history (sequences 3 and 7) after the session usage loaded. */
+    const replayHistory = async (
+      workspaceId: string,
+      cache: ReturnType<typeof tokenStatsCache>
+    ) => {
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? { byModel: {}, tokenStatsCache: cache, version: 1 as const }
+            : undefined
+        )
+      );
+      mockChatScript(
+        [
+          // Hold the replay until the cache is in memory, so catch-up can use it.
+          waitUntil(() => store.isSessionUsageKnown(workspaceId)).then(() => tick(10)),
+          createHistoryMessageEvent("user-1", 3),
+          {
+            type: "message",
+            id: "assistant-1",
+            role: "assistant",
+            parts: [{ type: "text", text: "reply" }],
+            metadata: { historySequence: 7, timestamp: 7, model: MODEL },
+          },
+          caughtUpEvent(),
+        ],
+        { keepOpen: true }
+      );
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+    };
+
+    it("shows the cached breakdown when the history still matches it", async () => {
+      const workspaceId = "consumers-cache-hit";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId)).toEqual({
+        consumers: CACHED_CONSUMERS,
+        tokenizerName: "cached-tokenizer",
+        totalTokens: 42,
+        topFilePaths: undefined,
+        isCalculating: false,
+      });
+    });
+
+    it("recounts when the newest history sequence differs from the cached one", async () => {
+      // Same message count, but the history changed: the cache saw sequence 5 as newest.
+      const workspaceId = "consumers-cache-stale-sequence";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 5 }));
+
+      const state = store.getWorkspaceConsumers(workspaceId);
+      expect(state.isCalculating).toBe(true);
+      expect(state.consumers).toEqual([]);
+    });
+
+    it("recounts when the cache saw a different number of messages", async () => {
+      const workspaceId = "consumers-cache-stale-count";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 3, maxHistorySequence: 7 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(true);
+    });
+
+    it("trusts the message count when the cache has no history sequence", async () => {
+      const workspaceId = "consumers-cache-count-only";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId)).toMatchObject({
+        consumers: CACHED_CONSUMERS,
+        isCalculating: false,
+      });
+    });
+
+    it("recounts on the next read after a provider config change drops the cache", async () => {
+      const workspaceId = "consumers-cache-config-change";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }));
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(false);
+
+      // A new fingerprint invalidates the breakdown and the persisted cache.
+      mockGetProvidersConfig.mockResolvedValueOnce({
+        ollama: { apiKeySet: false, isEnabled: true, isConfigured: true },
+      });
+      providerConfigChanges.push(undefined);
+
+      // The reads themselves schedule the recount: nothing else re-triggers it.
+      expect(await waitUntil(() => store.getWorkspaceConsumers(workspaceId).isCalculating)).toBe(
+        true
+      );
+      expect(store.getWorkspaceConsumers(workspaceId).consumers).toEqual([]);
+    });
   });
 
   describe("mergeTimelineEvents", () => {
@@ -7490,6 +9711,48 @@ describe("WorkspaceStore", () => {
   });
 });
 
+describe("areActivityGoalsEqual", () => {
+  const goal: GoalSnapshot = {
+    goalId: "00000000-0000-4000-8000-000000000001",
+    status: "active",
+    objective: "Ship it",
+    budgetCents: 500,
+    costCents: 10,
+    turnsUsed: 1,
+    turnCap: 5,
+    startedAtMs: 1,
+  };
+
+  it("treats null and undefined as the same missing goal", () => {
+    expect(areActivityGoalsEqual(null, undefined)).toBe(true);
+    expect(areActivityGoalsEqual(undefined, undefined)).toBe(true);
+    expect(areActivityGoalsEqual(null, goal)).toBe(false);
+    expect(areActivityGoalsEqual(goal, undefined)).toBe(false);
+  });
+
+  it("detects a change in any compared goal field", () => {
+    const changes: Array<Partial<GoalSnapshot>> = [
+      { goalId: "00000000-0000-4000-8000-000000000002" },
+      { status: "paused" },
+      { objective: "Ship it later" },
+      { budgetCents: null },
+      { costCents: 11 },
+      { turnsUsed: 2 },
+      { turnCap: null },
+      { pendingPersistence: true },
+    ];
+    for (const change of changes) {
+      expect(areActivityGoalsEqual(goal, { ...goal, ...change })).toBe(false);
+    }
+  });
+
+  it("ignores the goal fields it does not compare", () => {
+    expect(
+      areActivityGoalsEqual(goal, { ...goal, startedAtMs: 2, completionSummary: "done" })
+    ).toBe(true);
+  });
+});
+
 describe("findRenderedRefineProposalHash", () => {
   const HASH = "a".repeat(64);
   const CREATED_AT = "2024-01-01T00:00:00.000Z";
@@ -7524,5 +9787,138 @@ describe("findRenderedRefineProposalHash", () => {
     // "Load all" disables the cap: the proposal is now actually rendered.
     aggregator.setShowAllMessages(true);
     expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
+  });
+});
+
+describe("resolveSidebarAgentStatus", () => {
+  const display = { emoji: "D", message: "compacting" };
+  const persisted = { emoji: "P", message: "summary" };
+  const agent = { emoji: "A", message: "status_set" };
+  const todos: TodoItem[] = [{ content: "write tests", status: "in_progress" }];
+  const liveTodo = { emoji: "🔄", message: "write tests" };
+  const activity = (overrides: Partial<WorkspaceActivitySnapshot>): WorkspaceActivitySnapshot => ({
+    recency: 1,
+    streaming: false,
+    lastModel: null,
+    lastThinkingLevel: null,
+    ...overrides,
+  });
+
+  describe("an inactive workspace (activity snapshot is the source)", () => {
+    const resolve = (snapshot: WorkspaceActivitySnapshot | undefined, todoItems = todos) =>
+      resolveSidebarAgentStatus({
+        useAggregatorState: false,
+        activity: snapshot,
+        todos: todoItems,
+        aggregatorAgentStatus: agent,
+      });
+
+    it("shows the system display status over everything else", () => {
+      expect(resolve(activity({ displayStatus: display, todoStatus: persisted }))).toEqual(display);
+    });
+
+    it("falls back to the persisted todo status, never to the aggregator's status", () => {
+      expect(resolve(activity({ displayStatus: null, todoStatus: persisted }))).toEqual(persisted);
+    });
+
+    it("derives a status from the cached todos when none was persisted", () => {
+      expect(resolve(activity({}))).toEqual(liveTodo);
+      expect(resolve(undefined)).toEqual(liveTodo);
+    });
+
+    it("shows nothing for a todo list the backend reports as cleared", () => {
+      expect(resolve(activity({ hasTodos: false }))).toBeUndefined();
+    });
+  });
+
+  describe("an active, caught-up workspace (the aggregator is the source)", () => {
+    const resolve = (
+      snapshot: WorkspaceActivitySnapshot | undefined,
+      todoItems: TodoItem[],
+      aggregatorAgentStatus: typeof agent | undefined
+    ) =>
+      resolveSidebarAgentStatus({
+        useAggregatorState: true,
+        activity: snapshot,
+        todos: todoItems,
+        aggregatorAgentStatus,
+      });
+
+    it("ignores the display status and prefers the live todo status", () => {
+      expect(
+        resolve(activity({ displayStatus: display, todoStatus: persisted }), todos, agent)
+      ).toEqual(liveTodo);
+    });
+
+    it("prefers the aggregator's status over the persisted todo status", () => {
+      expect(resolve(activity({ todoStatus: persisted }), [], agent)).toEqual(agent);
+    });
+
+    it("falls back to the persisted todo status", () => {
+      expect(resolve(activity({ todoStatus: persisted, hasTodos: false }), [], undefined)).toEqual(
+        persisted
+      );
+      expect(resolve(undefined, [], undefined)).toBeUndefined();
+    });
+  });
+});
+
+describe("findLastContextUsage", () => {
+  const usage = (inputTokens: number) => ({
+    inputTokens,
+    outputTokens: 0,
+    totalTokens: inputTokens,
+  });
+  const assistant = (id: string, metadata: NonNullable<MuxMessage["metadata"]>): MuxMessage =>
+    createMuxMessage(id, "assistant", "reply", metadata);
+  const boundary = (id: string, contextTokens?: number): MuxMessage =>
+    assistant(id, {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+      model: "anthropic:claude-opus-4-5",
+      ...(contextTokens === undefined ? {} : { contextUsage: usage(contextTokens) }),
+    });
+  const identity = (model: string) => model;
+  const inputTokens = (messages: MuxMessage[], currentModel?: string) =>
+    findLastContextUsage(messages, currentModel, identity)?.input.tokens;
+
+  it("reads the newest assistant message that has context usage", () => {
+    const messages = [
+      assistant("a1", { contextUsage: usage(10) }),
+      assistant("a2", { contextUsage: usage(20) }),
+      createMuxMessage("u1", "user", "next"),
+      assistant("a3", {}),
+    ];
+    expect(inputTokens(messages)).toBe(20);
+  });
+
+  it("skips compaction summaries", () => {
+    const messages = [
+      assistant("a1", { contextUsage: usage(10) }),
+      assistant("summary", { compacted: true, contextUsage: usage(99) }),
+    ];
+    expect(inputTokens(messages)).toBe(10);
+  });
+
+  it("does not read across a compaction boundary", () => {
+    const messages = [assistant("old", { contextUsage: usage(500) }), boundary("b1")];
+    expect(findLastContextUsage(messages, undefined, identity)).toBeUndefined();
+  });
+
+  it("uses the post-compaction estimate on the boundary itself", () => {
+    const messages = [assistant("old", { contextUsage: usage(500) }), boundary("b1", 7)];
+    expect(inputTokens(messages)).toBe(7);
+  });
+
+  it("prices with the resolved model and falls back to the current model", () => {
+    const resolve = mock((model: string) => `resolved:${model}`);
+    const result = findLastContextUsage(
+      [assistant("a1", { contextUsage: usage(10) })],
+      "openai:gpt-4o",
+      resolve
+    );
+    expect(resolve).toHaveBeenCalledWith("openai:gpt-4o");
+    expect(result?.model).toBe("openai:gpt-4o");
   });
 });

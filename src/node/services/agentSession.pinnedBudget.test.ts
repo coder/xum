@@ -6,9 +6,8 @@ import { ExperimentsService } from "./experimentsService";
 import { TelemetryService } from "./telemetryService";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
+import { MEMORY_CONTEXT_FILE_NAME } from "./memoryContextPersistence";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { FLUSH_MAX_OUTPUT_TOKENS } from "@/common/constants/contextBudget";
-import { ANTHROPIC_THINKING_BUDGETS } from "@/common/types/thinking";
 import * as fs from "node:fs/promises";
 import { attachLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -54,12 +53,13 @@ async function setup(
     telemetryService: new TelemetryService(config.rootDir),
     xumHome: config.rootDir,
   });
+  await experimentsService.setOverride(EXPERIMENT_IDS.TOKEN_BUDGET, true);
+  await experimentsService.setOverride(EXPERIMENT_IDS.MEMORY, true);
   const service = new AIService(
     config,
     historyService,
     init,
     new ProviderService(config),
-    undefined,
     undefined,
     undefined,
     undefined,
@@ -83,7 +83,6 @@ async function setup(
         canonicalProviderName: "openai",
         canonicalModelId: requestedModel.slice("openai:".length),
         wireProviderName: "openai",
-        routedThroughGateway: false,
       })
     );
   });
@@ -128,7 +127,7 @@ async function setup(
         session_history: smallTool,
         tool_catalog_search: smallTool,
         ...mcpTools,
-        ...(options.enableGoalTools?.completeGoal ? { complete_goal: smallTool } : {}),
+        ...(options.goalService ? { complete_goal: smallTool } : {}),
       })
   );
   const goalService = new WorkspaceGoalService(
@@ -172,7 +171,11 @@ async function setup(
   });
   const registration = eventSpine.useRequestContext(assembly, { workspaceId });
   const oldCache = Reflect.get(h.session, "memoryContextByModelString") as Map<string, unknown>;
-  oldCache.set("preserved-model", { context: { hotMemoriesBlock: "Preserved old notes" } });
+  oldCache.set("preserved-model", {
+    context: {
+      indexEntries: [{ path: "/memories/global/old.md", description: "Preserved old notes" }],
+    },
+  });
   expect(
     (
       await historyService.appendManyToHistory(workspaceId, [
@@ -249,10 +252,12 @@ describe("pinned full-payload rollover admission", () => {
       const { h, historyService, before, start, assembleTools, assembly, applyReset, oldCache } =
         fixture;
       try {
+        if (kind === "advertised-schema") {
+          await fixture.config.editConfig((cfg) => ({ ...cfg, toolSearchEnabled: false }));
+        }
         const result = await h.session.sendMessage("Small follow-up", {
           model,
           agentId: "exec",
-          experiments: { tokenBudget: true, toolSearch: kind === "deferred-schema" },
         });
         const fits = kind === "deferred-schema";
         expect(result.success).toBe(fits);
@@ -277,7 +282,11 @@ describe("pinned full-payload rollover admission", () => {
             ).toBe(false);
           expect(Reflect.get(h.session, "memoryContextByModelString")).toBe(oldCache);
           expect(oldCache.get("preserved-model")).toEqual({
-            context: { hotMemoriesBlock: "Preserved old notes" },
+            context: {
+              indexEntries: [
+                { path: "/memories/global/old.md", description: "Preserved old notes" },
+              ],
+            },
           });
         }
         if (fits) {
@@ -310,7 +319,7 @@ describe("pinned full-payload rollover admission", () => {
         });
       const sending = h.session.sendMessage(
         "Canceled candidate",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec" },
         {
           onAccepted:
             phase === "after-preparation"
@@ -349,7 +358,9 @@ describe("pinned full-payload rollover admission", () => {
   );
 
   test.each([false, true])(
-    "manual goal availability previews later pause (queued consent=%s)",
+    // #5247: the later manual pause must not change the pinned tool set; the
+    // goal tools gate on the live goal status when they execute.
+    "manual goal intervention keeps the goal tools pinned (queued consent=%s)",
     async (consent) => {
       const fixture = await setup("small");
       const { h, goalService, start, applyReset, assembly } = fixture;
@@ -364,7 +375,7 @@ describe("pinned full-payload rollover admission", () => {
           (
             await h.session.sendMessage(
               "Manual intervention",
-              { model, agentId: "exec", experiments: { tokenBudget: true } },
+              { model, agentId: "exec" },
               {
                 enqueuedAtMs: consent ? goal!.lastUserActivationAtMs! - 1000 : undefined,
               }
@@ -372,7 +383,7 @@ describe("pinned full-payload rollover admission", () => {
           ).success
         ).toBe(true);
         expect(start).toHaveBeenCalledTimes(1);
-        expect(start.mock.calls[0][0].tools?.complete_goal !== undefined).toBe(consent);
+        expect(start.mock.calls[0][0].tools?.complete_goal).toBeDefined();
         expect((await goalService.getGoal(workspaceId))?.status).toBe(
           consent ? "active" : "paused"
         );
@@ -399,7 +410,6 @@ describe("pinned full-payload rollover admission", () => {
       const result = await fixture.h.session.sendMessage("Manual intervention", {
         model,
         agentId: "exec",
-        experiments: { tokenBudget: true },
       });
       expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
       expect((await fixture.goalService.getGoal(workspaceId))?.status).toBe("paused");
@@ -422,59 +432,95 @@ describe("pinned full-payload rollover admission", () => {
         new MemoryMetaService(config.rootDir)
       );
       spyOn(fixture.experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.MEMORY_HOT_SET
+        (id) => id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.TOKEN_BUDGET
       );
-      // The real builder gates hot-memory injection on its experiment service, independently of the session cache.
-      const experiments = { memory: true, tokenBudget: true };
-      const previous = {
-        context: { indexEntries: [], hotMemoriesBlock: "Obsolete notes" },
-        includesHotMemories: true,
-        tokenBudgetActive: true,
-        memoryEnabled: true,
-        hotSetEnabled: true,
-      };
+      const notes = (description: string) => [{ path: "/memories/global/notes.md", description }];
+      const previous = { context: { indexEntries: notes("Obsolete notes") }, memoryEnabled: true };
       oldCache.set(model, previous);
       const fresh = overflow ? "漢".repeat(70000) : "Fresh retained notes";
-      const readMemory = spyOn(service, "buildMemorySessionContext").mockImplementation(
-        (_workspace, _model, options) =>
-          Promise.resolve({
-            indexEntries: [],
-            hotMemoriesBlock: options?.includeHotMemories === false ? null : fresh,
-          })
+      const readMemory = spyOn(service, "buildMemorySessionContext").mockResolvedValue({
+        indexEntries: notes(fresh),
+      });
+      // The index reaches the request through the memory tool description.
+      assembleTools.mockImplementation((_model, options) =>
+        Promise.resolve({
+          session_history: smallTool,
+          memory: tool({
+            description: (options.memoryIndexEntries ?? [])
+              .map((entry) => entry.description)
+              .join(),
+            inputSchema: jsonSchema({ type: "object", properties: {} }),
+          }),
+        })
       );
-      assembleTools.mockResolvedValue({ session_history: smallTool, memory: smallTool });
       try {
         expect(
           (
             await h.session.sendMessage("Use current notes", {
               model,
               agentId: "exec",
-              experiments,
             })
           ).success
         ).toBe(!overflow);
-        expect(readMemory).toHaveBeenCalledTimes(2);
+        expect(readMemory).toHaveBeenCalledTimes(1);
         expect(applyReset).toHaveBeenCalledTimes(overflow ? 0 : 1);
         if (overflow) {
           expect(Reflect.get(h.session, "memoryContextByModelString")).toBe(oldCache);
           expect(oldCache.get(model)).toBe(previous);
         } else {
-          expect(start.mock.calls[0][0].system).toContain(fresh);
-          expect(start.mock.calls[0][0].system).not.toContain("Obsolete notes");
+          const sentIndex = start.mock.calls[0][0].tools?.memory?.description;
+          expect(sentIndex).toContain(fresh);
+          expect(sentIndex).not.toContain("Obsolete notes");
           const cache = Reflect.get(h.session, "memoryContextByModelString") as Map<
             string,
             unknown
           >;
-          expect(cache.get(model)).toMatchObject({
-            context: { hotMemoriesBlock: fresh },
-            includesHotMemories: true,
+          expect(cache.get(model)).toEqual({
+            context: { indexEntries: notes(fresh) },
+            memoryEnabled: true,
           });
+          // The new window's context is saved before its first stream, so a server restart
+          // during that turn restores these bytes instead of rebuilding them.
+          const saved = await fs.readFile(
+            path.join(fixture.config.sessionsDir, workspaceId, MEMORY_CONTEXT_FILE_NAME),
+            "utf-8"
+          );
+          expect(saved).toContain(fresh);
+          expect(saved).not.toContain("Obsolete notes");
         }
       } finally {
         await fixture.cleanup();
       }
     }
   );
+  test("the first fresh-window request shows the IDs its rows were appended with", async () => {
+    const fixture = await setup("small");
+    const { h, historyService, start } = fixture;
+    try {
+      const result = await h.session.sendMessage("Small follow-up", {
+        model,
+        agentId: "exec",
+      });
+      expect(result.success).toBe(true);
+      const after = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!after.success) throw new Error(after.error);
+      const boundary = after.data[0];
+      const trigger = after.data.findLast((row) => row.role === "user");
+      expect(boundary.metadata?.muxMetadata?.type).toBe("context-window-rollover");
+      expect(start).toHaveBeenCalledTimes(1);
+      const request = start.mock.calls[0][0];
+      const system: unknown = request.system;
+      if (typeof system !== "string") throw new Error("Expected a string system prompt");
+      const windowSection = system.split("<context_window>")[1]?.split("</context_window>")[0];
+      expect(windowSection).toContain(`w:${String(boundary.metadata?.historySequence)}`);
+      expect(windowSection).toContain("w:0");
+      expect(JSON.stringify(request.messages)).toContain(
+        `[id: ${String(trigger?.metadata?.historySequence)}]`
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
   test.each(["dispose", "cancel", "admission-revoked"] as const)(
     "%s after preparation publishes no stream or accepted history",
     async (action) => {
@@ -508,7 +554,7 @@ describe("pinned full-payload rollover admission", () => {
       let revoked = false;
       const sending = h.session.sendMessage(
         "Revocable candidate",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec" },
         {
           cancelSignal: controller.signal,
           admissionStale: () => revoked,
@@ -571,7 +617,7 @@ describe("pinned full-payload rollover admission", () => {
       expect(
         await h.session.sendMessage(
           "Prepared but not committed",
-          { model, agentId: "exec", experiments: { tokenBudget: true } },
+          { model, agentId: "exec" },
           { onAccepted: accepted }
         )
       ).toMatchObject({ success: false, error: { type: "unknown" } });
@@ -589,6 +635,32 @@ describe("pinned full-payload rollover admission", () => {
             () => false
           )
         ).toBe(false);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("a Stop during an emergency rollover's runtime start arms no retry", async () => {
+    const fixture = await setup("deferred-schema", true);
+    const { h, service } = fixture;
+    // The rollover's request preparation reports a runtime failure without a pre-start error.
+    // A workspace-turn interrupt or a hard timeout lands while it waits for the runtime: it ends
+    // the retry loop, and the aborted runtime start fails as retryable runtime_start_failed.
+    spyOn(service, "prepareStreamMessage").mockImplementation(() => {
+      h.session.abandonAutoRetry("task_stopped");
+      return Promise.resolve(Err({ type: "runtime_start_failed", message: "Aborted" }));
+    });
+    const scheduled: string[] = [];
+    h.session.onChatEvent(({ message }) => {
+      if (message.type === "auto-retry-scheduled") scheduled.push(message.type);
+    });
+    try {
+      const result = await h.session.sendMessage("Small follow-up", { model, agentId: "exec" });
+      expect(result).toMatchObject({ success: false, error: { type: "runtime_start_failed" } });
+      expect({ pending: h.session.hasPendingAutoRetry(), scheduled }).toEqual({
+        pending: false,
+        scheduled: [],
+      });
     } finally {
       await fixture.cleanup();
     }
@@ -632,7 +704,6 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Start a fresh window", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true },
           })
         ).success
       ).toBe(true);
@@ -659,7 +730,7 @@ describe("pinned full-payload rollover admission", () => {
     }
   });
 
-  test("a final-flush turn never starts MCP servers", async () => {
+  test("a persisted legacy flush trigger resumes as an ordinary turn", async () => {
     const fixture = await setup("small");
     completeStartedTurnsOnStop(fixture);
     const { h, service, start } = fixture;
@@ -667,9 +738,15 @@ describe("pinned full-payload rollover admission", () => {
     const startServers = spyOn(mcpServerManager, "getToolsForWorkspace");
     // No on-send auto-compaction: the persisted trigger must be the request's last user row.
     await seedAutoCompactionThreshold(h.config, model, 100);
+    await fixture.experimentsService.setOverride(EXPERIMENT_IDS.TOKEN_BUDGET, false);
     try {
-      // A persisted flush trigger resumed after a restart keeps its flag for the request builder
-      // even with token-budget mode off (a fresh queued entry would be degraded instead).
+      // Builds from #4156 persisted this hidden trigger for a one-step, memory-only flush turn.
+      // Nothing executes that turn specially any more: it resumes with the normal toolset.
+      const legacyFlushMetadata = {
+        type: "normal",
+        contextBudgetContinuation: true,
+        contextBudgetFlush: true,
+      } as const;
       expect(
         (
           await fixture.historyService.appendToHistory(
@@ -677,11 +754,7 @@ describe("pinned full-payload rollover admission", () => {
             createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
               synthetic: true,
               uiVisible: false,
-              muxMetadata: {
-                type: "normal",
-                contextBudgetContinuation: true,
-                contextBudgetFlush: true,
-              },
+              muxMetadata: legacyFlushMetadata,
             })
           )
         ).success
@@ -691,108 +764,26 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.resumeStream({
             model,
             agentId: "exec",
-            experiments: { tokenBudget: false },
           })
         ).success
       ).toBe(true);
       expect(start).toHaveBeenCalledTimes(1);
-      // The memory-only ceiling proves the flag reached the builder: no catalog search and no
-      // read-only session_history (a history read would consume the single flush step).
-      const flushTools = Object.keys(start.mock.calls[0][0].tools ?? {});
-      expect(flushTools).not.toContain("tool_catalog_search");
-      expect(flushTools).not.toContain("session_history");
-      expect(startServers).not.toHaveBeenCalled();
-      await h.session.interruptStream();
-      await h.session.waitForIdle();
-      // Control: an ordinary turn on the same fixture does start them.
-      expect(
-        (
-          await h.session.sendMessage("Ordinary turn", {
-            model,
-            agentId: "exec",
-            experiments: { tokenBudget: false },
-          })
-        ).success
-      ).toBe(true);
+      const resumed = start.mock.calls[0][0];
       expect(startServers).toHaveBeenCalledTimes(1);
-    } finally {
-      await fixture.cleanup();
-    }
-  });
-
-  test("a final-flush fallback runs at its own inherent thinking minimum with a matching cap", async () => {
-    const fixture = await setup("small");
-    completeStartedTurnsOnStop(fixture);
-    const { h, config, start } = fixture;
-    // gpt-5.2 cannot go below medium thinking, and the user floor for it is higher still; the
-    // flush must ignore the floor (housekeeping) but size its cap for the model's own minimum.
-    const fallbackModel = "openai:gpt-5.2";
-    await config.editConfig((cfg) => ({
-      ...cfg,
-      modelFallbacks: { [model]: { models: [fallbackModel] } },
-      minThinkingLevelByModel: { [fallbackModel]: "high" },
-    }));
-    await seedAutoCompactionThreshold(h.config, model, 100);
-    try {
-      expect(
-        (
-          await fixture.historyService.appendToHistory(
-            workspaceId,
-            createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
-              synthetic: true,
-              uiVisible: false,
-              muxMetadata: {
-                type: "normal",
-                contextBudgetContinuation: true,
-                contextBudgetFlush: true,
-              },
-            })
-          )
-        ).success
-      ).toBe(true);
-      expect(
-        (
-          await h.session.resumeStream({
-            model,
-            agentId: "exec",
-            thinkingLevel: "high",
-            experiments: { tokenBudget: false },
-          })
-        ).success
-      ).toBe(true);
-      expect(start).toHaveBeenCalledTimes(1);
-      const primary = start.mock.calls[0][0];
-      // The primary's inherent minimum is off, so its cap carries no thinking budget.
-      expect(primary.maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
-      const fallback = await primary.modelFallback!.prepare(fallbackModel, {
-        thinkingLevelOverride: "high",
-      });
-      expect(fallback.success).toBe(true);
-      if (fallback.success) {
-        expect(fallback.data.thinkingLevel).toBe("medium");
-        expect(fallback.data.maxOutputTokens).toBe(
-          FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS.medium
-        );
-      }
+      expect(resumed.maxOutputTokens).toBeUndefined();
       await h.session.interruptStream();
       await h.session.waitForIdle();
-      // Control: an ordinary turn's fallback honors the user floor and keeps the caller's cap.
       expect(
         (
           await h.session.sendMessage("Ordinary turn", {
             model,
             agentId: "exec",
-            thinkingLevel: "off",
-            experiments: { tokenBudget: false },
           })
         ).success
       ).toBe(true);
-      const ordinary = await start.mock.calls[1][0].modelFallback!.prepare(fallbackModel);
-      expect(ordinary.success).toBe(true);
-      if (ordinary.success) {
-        expect(ordinary.data.thinkingLevel).toBe("high");
-        expect(ordinary.data.maxOutputTokens).toBeUndefined();
-      }
+      const ordinaryTools = Object.keys(start.mock.calls[1][0].tools ?? {}).sort();
+      expect(ordinaryTools).toContain("session_history");
+      expect(Object.keys(resumed.tools ?? {}).sort()).toEqual(ordinaryTools);
     } finally {
       await fixture.cleanup();
     }
@@ -819,7 +810,6 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Use a prepared primary", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true },
           })
         ).success
       ).toBe(true);
@@ -867,7 +857,7 @@ describe("pinned full-payload rollover admission", () => {
       }
       const sending = h.session.sendMessage(
         "Durable prepared monitor wake",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec" },
         {
           synthetic: true,
           agentInitiated: true,
@@ -925,7 +915,7 @@ describe("pinned full-payload rollover admission", () => {
       const controller = new AbortController();
       const sending = h.session.sendMessage(
         "Accepted prepared wake",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec" },
         {
           synthetic: true,
           agentInitiated: true,
@@ -984,7 +974,7 @@ describe("pinned full-payload rollover admission", () => {
       const cancelState = { canceledBeforeAcceptance: false };
       const sending = h.session.sendMessage(
         "Wake retained when rollback fails",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec" },
         {
           acceptanceOrigin: "automatic",
           synthetic: true,

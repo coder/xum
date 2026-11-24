@@ -1,5 +1,9 @@
+import { resolveCoderCanonicalRouteInstance } from "@/common/constants/coderOAuth";
+import { isValidProvider, PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import type { ProviderModelEntry } from "@/common/orpc/types";
+import type { GatewayModelIdResolver } from "@/common/routing/types";
 
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { normalizeCopilotModelId } from "@/common/utils/copilot/modelRouting";
 import { maybeGetProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 
@@ -34,7 +38,7 @@ export function isProviderModelAccessibleFromAuthoritativeCatalog(
     if (!Array.isArray(discoveredModels)) {
       return true;
     }
-    if (discoveredModels.includes(modelId)) {
+    if (coderCatalogListsModel(discoveredModels, modelId)) {
       return true;
     }
     // providers.jsonc is hand-editable JSON: a non-array `models` must not throw here.
@@ -85,5 +89,150 @@ export function isGatewayModelAccessibleFromAuthoritativeCatalog(
     models,
     discoveredModels,
     removedModels
+  );
+}
+
+interface GatewayRoutingProviderEntry {
+  models?: unknown;
+  discoveredModels?: unknown;
+  removedModels?: unknown;
+  canonicalRoutes?: unknown;
+  discoveredProviders?: unknown;
+  additionalProviders?: unknown;
+}
+
+type GatewayRoutingConfig = Readonly<
+  Record<string, GatewayRoutingProviderEntry | undefined>
+> | null;
+
+export interface GatewayRouting {
+  /** Authoritative-catalog gate for a gateway-scoped model ID. */
+  isGatewayModelAccessible: (gateway: string, gatewayModelId: string) => boolean;
+  /** Which gateway model ID serves a routed canonical model (see GatewayModelIdResolver). */
+  resolveGatewayModelId: GatewayModelIdResolver;
+}
+
+function toStringArray(value: unknown): string[] | undefined {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : undefined;
+}
+
+function resolveCoderGatewayModelId(
+  coderConfig: GatewayRoutingProviderEntry | undefined,
+  origin: string,
+  originModelId: string
+): string | null {
+  const instance = resolveCoderCanonicalRouteInstance(origin, coderConfig);
+  return instance == null ? null : `${instance}/${originModelId}`;
+}
+
+/**
+ * Config-derived gateway routing inputs for resolveRoute/isModelAvailable/
+ * availableRoutes, shared by the browser (ProvidersConfigMap) and the backend
+ * (raw providers.jsonc) so both make identical routing decisions. Bundled so a
+ * caller cannot apply the Coder catalog gate without the canonicalRoutes
+ * mapping (or vice versa).
+ */
+export function createGatewayRouting(providersConfig: GatewayRoutingConfig): GatewayRouting {
+  const coderConfig = providersConfig?.coder;
+  // Coder-only keys: validated once because hand-edited providers.jsonc can
+  // hold any shape.
+  const coderDiscoveredModels = toStringArray(coderConfig?.discoveredModels);
+  const coderRemovedModels = toStringArray(coderConfig?.removedModels);
+  return {
+    isGatewayModelAccessible: (gateway, gatewayModelId) => {
+      const models = providersConfig?.[gateway]?.models;
+      return isGatewayModelAccessibleFromAuthoritativeCatalog(
+        gateway,
+        gatewayModelId,
+        Array.isArray(models) ? models : undefined,
+        gateway === "coder" ? coderDiscoveredModels : undefined,
+        gateway === "coder" ? coderRemovedModels : undefined
+      );
+    },
+    resolveGatewayModelId: (gateway, origin, originModelId) => {
+      if (gateway === "coder") {
+        return resolveCoderGatewayModelId(coderConfig, origin, originModelId);
+      }
+      if (!isValidProvider(gateway)) {
+        return null;
+      }
+      const definition = PROVIDER_DEFINITIONS[gateway];
+      if (
+        definition.kind !== "gateway" ||
+        !(definition.routes as readonly string[]).includes(origin)
+      ) {
+        return null;
+      }
+      return definition.toGatewayModelId(origin, originModelId);
+    },
+  };
+}
+
+/**
+ * The Coder gateway model ID a selection reaches when its route is Coder: an
+ * explicit coder:<instance>/<model> stays literal, a canonical model goes to
+ * the instance canonicalRoutes selects. Null when Coder cannot serve it.
+ */
+export function resolveCoderRouteGatewayModelId(
+  modelString: string,
+  providersConfig: GatewayRoutingConfig
+): string | null {
+  if (modelString.startsWith("coder:")) {
+    return modelString.slice("coder:".length);
+  }
+  const canonical = normalizeToCanonical(modelString);
+  const colonIndex = canonical.indexOf(":");
+  if (colonIndex <= 0) {
+    return null;
+  }
+  return resolveCoderGatewayModelId(
+    providersConfig?.coder,
+    canonical.slice(0, colonIndex),
+    canonical.slice(colonIndex + 1)
+  );
+}
+
+/**
+ * Whether a loaded Coder catalog lists the model: its exact id, a dated snapshot of it, or the
+ * Google `models/` form. Removals are checked by the caller, exactly.
+ */
+function coderCatalogListsModel(discoveredModels: string[], modelId: string): boolean {
+  if (discoveredModels.includes(modelId)) {
+    return true;
+  }
+  if (claudeSnapshotListed(discoveredModels, modelId)) {
+    return true;
+  }
+  // Google catalogs list `models/<id>` while native selections and the
+  // gateway use the bare id; without this a loaded catalog would reject
+  // every mapped Gemini route.
+  const separatorIndex = modelId.indexOf("/");
+  if (
+    separatorIndex > 0 &&
+    discoveredModels.includes(
+      `${modelId.slice(0, separatorIndex)}/models/${modelId.slice(separatorIndex + 1)}`
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Anthropic-type gateways list only dated Claude snapshots (`claude-haiku-4-5-20251001`) while
+ * built-in models send the undated id (#5660), which Anthropic serves as an alias. So a dated
+ * Claude entry satisfies its undated id. Other model families get no such alias: an
+ * OpenAI-compatible upstream need not serve an undated id it never listed. Tombstones stay exact,
+ * as for the Gemini alias: only the undated id's own removal (checked by the caller) hides it.
+ */
+function claudeSnapshotListed(discoveredModels: string[], modelId: string): boolean {
+  if (!modelId.slice(modelId.indexOf("/") + 1).startsWith("claude-")) return false;
+  return discoveredModels.some(
+    (id) =>
+      id.length === modelId.length + 9 &&
+      id.startsWith(`${modelId}-`) &&
+      /^\d{8}$/.test(id.slice(modelId.length + 1))
   );
 }

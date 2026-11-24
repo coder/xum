@@ -1,4 +1,4 @@
-import { expect, userEvent, within } from "@storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
@@ -14,7 +14,7 @@ function setupTaskSettings() {
   return setupSettingsStory({
     // A global Pro default must not make the unknown calling chat look Pro.
     agentAiDefaults: {
-      exec: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
+      exec: { modelString: "openai:gpt-6.1-sol", thinkingLevel: "high", reasoningMode: "pro" },
     },
     providersConfig: {
       openai: { apiKeySet: true, isEnabled: true, isConfigured: true },

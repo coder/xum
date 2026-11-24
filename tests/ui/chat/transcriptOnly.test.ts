@@ -62,7 +62,7 @@ describe("Transcript-only workspace UI", () => {
       expect(notices[0].className).toContain("text-muted");
       expect(notices[0].getAttribute("role")).toBe("note");
 
-      expect(view.container.querySelector('textarea[aria-label="Message Claude"]')).toBeNull();
+      expect(view.container.querySelector('textarea[aria-label="Message"]')).toBeNull();
       expect(view.container.querySelector('[data-component="ChatInputControls"]')).toBeNull();
       expect(view.container.querySelector('[data-component="ChatModeToggles"]')).toBeNull();
       expect(view.container.querySelector('[data-component="ModelSelectorGroup"]')).toBeNull();

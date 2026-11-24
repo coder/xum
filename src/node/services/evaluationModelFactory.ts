@@ -1,4 +1,3 @@
-import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { createTypeSafeAi } from "@ai-sdk/typesafe-ai";
 import { Effect } from "effect";
 import { PROVIDER_REGISTRY } from "@/common/constants/providers";
@@ -15,7 +14,16 @@ import {
   type AutoModelRoutingEvaluationProvider,
 } from "@/constants/autoModelRouting";
 import type { ProvidersConfigStore } from "@/node/config/providersConfigStore";
-import type { PolicyService } from "@/node/services/policyService";
+import {
+  isSessionTapeReplayMode,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+} from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { isMockAiMode, MOCK_AI_MODEL_REFUSED_MESSAGE } from "@/node/services/mock/mockAiMode";
+import {
+  evaluationModelFromLanguageModel,
+  withTypeSafeScoreLevelLabels,
+  type EvaluationModelInstance,
+} from "@/node/services/evaluation/evaluationService";
 import {
   buildAIProviderRequestHeaders,
   normalizeAnthropicBaseURL,
@@ -29,25 +37,19 @@ import {
 } from "@/node/utils/providerRequirements";
 
 /**
- * Builds AI SDK evaluation models (`experimental_evaluate`) from the user's
+ * Builds AI SDK evaluation models (`experimental_decide`) from the user's
  * `provider:model` choice. Mirrors the chat-model factory's contract in
- * miniature: providers.jsonc is the only credential source, an enforced policy
- * gates provider, model, and base URL, and every failure is a typed reason the
- * Settings status line can show.
+ * miniature: providers.jsonc is the only credential source, and every failure is
+ * a typed reason the Settings status line can show.
  */
 
 export interface EvaluationModelFactoryDeps {
   providersConfigStore: Pick<ProvidersConfigStore, "loadProvidersConfig">;
-  policyService?: Pick<
-    PolicyService,
-    "isEnforced" | "isProviderAllowed" | "isModelAllowed" | "getForcedBaseUrl"
-  >;
   env?: Record<string, string | undefined>;
 }
 
 export type EvaluationModelFailure =
   | { code: "invalid_model"; message: string }
-  | { code: "policy_denied"; message: string }
   | { code: "provider_disabled"; message: string }
   | { code: "custom_provider"; message: string }
   | { code: "missing_api_key"; message: string };
@@ -61,7 +63,7 @@ interface EvaluationModelTarget {
 }
 
 /**
- * Everything except the SDK import: credentials, policy, and base URL. Synchronous so
+ * Everything except the SDK import: credentials and base URL. Synchronous so
  * the Settings status line can report availability without loading a provider SDK.
  */
 export function resolveEvaluationModelTarget(
@@ -76,16 +78,6 @@ export function resolveEvaluationModelTarget(
   }
   const { provider, modelId } = splitAutoModelRoutingEvaluationModel(modelString);
   const evaluationProvider = provider as AutoModelRoutingEvaluationProvider;
-  const policy = deps.policyService?.isEnforced() ? deps.policyService : undefined;
-  if (
-    policy &&
-    (!policy.isProviderAllowed(provider) || !policy.isModelAllowed(provider, modelId))
-  ) {
-    return Err({
-      code: "policy_denied",
-      message: `${modelString} is not allowed by provider policy`,
-    });
-  }
   const providersConfig = deps.providersConfigStore.loadProvidersConfig() ?? {};
   const entry: unknown = (providersConfig as Record<string, unknown>)[provider];
   // A custom chat provider under a built-in id (or the reserved typesafe id) points that
@@ -116,7 +108,7 @@ export function resolveEvaluationModelTarget(
       message: `No API key configured for ${provider} in providers.jsonc`,
     });
   }
-  const configuredBaseURL = policy?.getForcedBaseUrl(provider) ?? credentials.baseUrl;
+  const configuredBaseURL = credentials.baseUrl;
   // Same origin-only proxy handling as chat requests: the OpenAI and Anthropic SDKs need the
   // /v1 path that users routinely leave off, and a value the chat factory would fix up must
   // not send every classification to the wrong endpoint.
@@ -153,31 +145,47 @@ export function resolveEvaluationModelTarget(
 export function createEvaluationModel(
   modelString: string,
   deps: EvaluationModelFactoryDeps
-): Effect.Effect<Result<Experimental_EvaluationModelV4, EvaluationModelFailure>> {
+): Effect.Effect<Result<EvaluationModelInstance, EvaluationModelFailure>> {
   return Effect.gen(function* () {
+    // Perf harness replay mode (XUM_REPLAY_TAPES): no provider call, by construction.
+    if (isSessionTapeReplayMode()) {
+      return Err({ code: "provider_disabled", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+    }
+    // Mock AI mode (XUM_MOCK_AI, #5604): auto model routing makes no provider call either.
+    if (isMockAiMode()) {
+      return Err({ code: "provider_disabled", message: MOCK_AI_MODEL_REFUSED_MESSAGE });
+    }
     const target = resolveEvaluationModelTarget(modelString, deps);
     if (!target.success) return target;
     const { provider, modelId, settings, organization } = target.data;
     switch (provider) {
       case TYPESAFE_PROVIDER_KEY:
-        return Ok(createTypeSafeAi(settings).evaluationModel(modelId));
+        return Ok(withTypeSafeScoreLevelLabels(createTypeSafeAi(settings).decisionModel(modelId)));
       case "openai": {
         const { createOpenAI } = yield* Effect.promise(PROVIDER_REGISTRY.openai);
         return Ok(
-          createOpenAI({ ...settings, ...(organization ? { organization } : {}) }).evaluationModel(
-            modelId
+          evaluationModelFromLanguageModel(
+            createOpenAI({ ...settings, ...(organization ? { organization } : {}) }).responses(
+              modelId
+            ),
+            "openai"
           )
         );
       }
       case "anthropic": {
         const { createAnthropic } = yield* Effect.promise(PROVIDER_REGISTRY.anthropic);
         return Ok(
-          withAnthropicEvaluationEffort(createAnthropic(settings).evaluationModel(modelId), modelId)
+          withAnthropicEvaluationEffort(createAnthropic(settings).decisionModel(modelId), modelId)
         );
       }
       case "google": {
         const { createGoogleGenerativeAI } = yield* Effect.promise(PROVIDER_REGISTRY.google);
-        return Ok(createGoogleGenerativeAI(settings).evaluationModel(modelId));
+        return Ok(
+          evaluationModelFromLanguageModel(
+            createGoogleGenerativeAI(settings).chat(modelId),
+            "google"
+          )
+        );
       }
     }
   });

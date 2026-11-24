@@ -270,6 +270,8 @@ export function omitMCPProtocolMeta(result: unknown): unknown {
   return stripped;
 }
 
+const MCP_ERROR_CONTENT_MARKER = "[Tool reported an error]";
+
 /**
  * Transform MCP tool result to AI SDK format.
  * Converts MCP binary content (image, audio, embedded blob resources) to AI
@@ -399,10 +401,22 @@ export function transformMCPResult(result: unknown): unknown {
   // carrying binary payloads get an explicit text marker instead of bypassing
   // the media conversion (and its size guard).
   if (typed.isError) {
-    transformedContent.unshift({ type: "text", text: "[Tool reported an error]" });
+    transformedContent.unshift({ type: "text", text: MCP_ERROR_CONTENT_MARKER });
   }
 
   return { type: "content", value: transformedContent };
+}
+
+/**
+ * Whether a tool output is an MCP error result that transformMCPResult rewrote into the content
+ * shape (it carried binary parts), where the leading marker text is the only sign of the error.
+ */
+export function isMCPErrorContentOutput(output: unknown): boolean {
+  if (!isPlainObject(output) || output.type !== "content" || !Array.isArray(output.value)) {
+    return false;
+  }
+  const first: unknown = output.value[0];
+  return isPlainObject(first) && first.type === "text" && first.text === MCP_ERROR_CONTENT_MARKER;
 }
 
 /**

@@ -54,6 +54,8 @@ export function RuntimeConfigInput(props: {
         onChange={(e) => props.onChange(e.target.value)}
         placeholder={placeholder}
         disabled={props.disabled}
+        // The environment panel focuses the invalid field when it opens on a refused Send.
+        aria-invalid={props.hasError ? true : undefined}
         className={cn(
           "border-border-medium bg-background-secondary text-foreground placeholder:text-muted focus:border-accent h-7 rounded border px-2 text-xs focus:outline-none disabled:cursor-not-allowed disabled:opacity-50",
           props.inputClassName,

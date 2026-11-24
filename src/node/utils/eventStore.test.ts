@@ -4,6 +4,7 @@ import * as path from "path";
 import { EventStore } from "./eventStore";
 import { Config } from "@/node/config";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Test types
 interface TestState {
@@ -47,7 +48,14 @@ describe("EventStore", () => {
     tempDir = new DisposableTempDir("event-store-test");
     config = new Config(tempDir.path);
     emittedEvents = [];
-    store = new EventStore(config, testFilename, serializeState, emitEvent, "TestStore");
+    store = new EventStore(
+      config,
+      testFilename,
+      serializeState,
+      emitEvent,
+      nodeSessionLocks,
+      "TestStore"
+    );
   });
 
   afterEach(() => {

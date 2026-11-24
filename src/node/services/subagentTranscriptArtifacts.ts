@@ -1,12 +1,11 @@
-import * as fsPromises from "fs/promises";
 import * as path from "node:path";
-
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import type { ThinkingLevel } from "@/common/types/thinking";
 
 import { log } from "@/node/services/log";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 
 export interface SubagentTranscriptArtifactsFile {
   version: 1;
@@ -65,11 +64,13 @@ export function getSubagentTranscriptPartialPath(
 }
 
 export async function readSubagentTranscriptArtifactsFile(
-  workspaceSessionDir: string
+  workspaceSessionDir: string,
+  /** The session files of the workspace (phase 5). Absent: the Node layer. */
+  files: SessionFiles = nodeSessionFiles
 ): Promise<SubagentTranscriptArtifactsFile> {
   try {
     const filePath = getSubagentTranscriptArtifactsFilePath(workspaceSessionDir);
-    const raw = await fsPromises.readFile(filePath, "utf-8");
+    const raw = await files.promises.readFile(filePath, "utf-8");
     const parsed = JSON.parse(raw) as unknown;
 
     if (!parsed || typeof parsed !== "object") {
@@ -112,15 +113,22 @@ export async function updateSubagentTranscriptArtifactsFile(params: {
   workspaceId: string;
   workspaceSessionDir: string;
   update: (file: SubagentTranscriptArtifactsFile) => void;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
+  /** The session files of the workspace (phase 5). Absent: the Node layer. */
+  files?: SessionFiles;
 }): Promise<SubagentTranscriptArtifactsFile> {
-  return workspaceFileLocks.withLock(params.workspaceId, async () => {
-    const file = await readSubagentTranscriptArtifactsFile(params.workspaceSessionDir);
+  const fileLocks = params.locks.workspaceFiles;
+  return fileLocks.withLock(params.workspaceId, async () => {
+    // mutation-equivalent: files is a SessionFiles object or undefined, so ?? and || agree
+    const files = params.files ?? nodeSessionFiles;
+    const file = await readSubagentTranscriptArtifactsFile(params.workspaceSessionDir, files);
     params.update(file);
 
     try {
-      await fsPromises.mkdir(params.workspaceSessionDir, { recursive: true });
+      await files.promises.mkdir(params.workspaceSessionDir, { recursive: true });
       const filePath = getSubagentTranscriptArtifactsFilePath(params.workspaceSessionDir);
-      await writeFileAtomic(filePath, JSON.stringify(file, null, 2));
+      await files.writeFileAtomic(filePath, JSON.stringify(file, null, 2));
     } catch (error) {
       log.error("Failed to write subagent transcript artifacts file", { error });
     }
@@ -137,12 +145,18 @@ export async function upsertSubagentTranscriptArtifactIndexEntry(params: {
   updater: (
     existing: SubagentTranscriptArtifactIndexEntry | null
   ) => SubagentTranscriptArtifactIndexEntry;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
+  /** The session files of the workspace (phase 5). Absent: the Node layer. */
+  files?: SessionFiles;
 }): Promise<SubagentTranscriptArtifactIndexEntry> {
   let updated: SubagentTranscriptArtifactIndexEntry | null = null;
 
   await updateSubagentTranscriptArtifactsFile({
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.workspaceSessionDir,
+    locks: params.locks,
+    files: params.files,
     update: (file) => {
       const existing = file.artifactsByChildTaskId[params.childTaskId] ?? null;
       updated = params.updater(existing);

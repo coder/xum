@@ -1,12 +1,11 @@
 import { wrapAsyncIterator } from "@orpc/shared";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getRightSidebarLayoutKey,
@@ -17,14 +16,11 @@ import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
-import { waitForChatInputAutofocusDone } from "./storyPlayHelpers.js";
+import { waitForChatInputAutofocusDone, waitForModalLayer } from "./storyPlayHelpers.js";
 
 export default {
   ...appMeta,
   title: "App/Workflows",
-  beforeEach: () => () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS), undefined);
-  },
   parameters: {
     ...appMeta.parameters,
     viewport: {
@@ -148,9 +144,8 @@ function createWorkflowFixture(initialRun: WorkflowRunRecord, sidebarWidth = 480
           ),
         ],
       });
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS), true);
       updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(WORKSPACE_ID), false);
       updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "workflows");
       updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, sidebarWidth);
       updatePersistedState(
@@ -281,7 +276,9 @@ async function expectRawStages(canvasElement: HTMLElement, stages: unknown[]) {
   await expect(summary.parentElement).toHaveAttribute("open");
   await userEvent.click(canvas.getByRole("button", { name: "Open Argument: stages in full view" }));
   const page = within(canvasElement.ownerDocument.body);
-  const dialog = await page.findByRole("dialog", { name: "Argument: stages" });
+  const dialog = await waitForModalLayer(
+    await page.findByRole("dialog", { name: "Argument: stages" })
+  );
   const json = within(dialog).getByText((text) => text.startsWith("[")).textContent;
   await expect(JSON.parse(json ?? "null")).toEqual(stages);
   await userEvent.click(within(dialog).getByRole("button", { name: /^Close$/ }));
@@ -517,8 +514,12 @@ export const PlannedStagesPhone: AppStory = {
     await waitFor(() =>
       expect(canvas.getByRole("log", { name: "Conversation transcript" })).toBeVisible()
     );
-    const sidebar = canvasElement.querySelector('[aria-label="Workspace insights"]');
-    await expect(sidebar).toBeInTheDocument();
+    // The right sidebar is a lazy chunk (T3 #5971), so it can mount after the transcript.
+    const sidebar = await waitFor(() => {
+      const element = canvasElement.querySelector('[aria-label="Workspace insights"]');
+      if (element == null) throw new Error("right sidebar missing");
+      return element;
+    });
     // The real app hides this whole panel on phones. The test-runner does not
     // apply viewport globals, so only assert hidden at an actual phone width.
     if (window.innerWidth <= 390 || canvasElement.getBoundingClientRect().width <= 390) {
@@ -606,9 +607,11 @@ export const PlannedStagesMalformedFallback: AppStory = {
       canvas.queryByText("Original argument", { selector: "summary" })
     ).not.toBeInTheDocument();
     await userEvent.click(fullView);
-    const dialog = await within(canvasElement.ownerDocument.body).findByRole("dialog", {
-      name: "Argument: stages",
-    });
+    const dialog = await waitForModalLayer(
+      await within(canvasElement.ownerDocument.body).findByRole("dialog", {
+        name: "Argument: stages",
+      })
+    );
     const json = within(dialog).getByText((text) => text.startsWith("[")).textContent;
     await expect(JSON.parse(json ?? "null")).toEqual(MALFORMED_STAGES);
     await userEvent.click(within(dialog).getByRole("button", { name: /^Close$/ }));
@@ -641,7 +644,9 @@ export const PlannedStagesLiveUpdates: AppStory = {
     });
     await userEvent.click(fullView);
     const page = within(canvasElement.ownerDocument.body);
-    const dialog = await page.findByRole("dialog", { name: "Stage 1: foundation" });
+    const dialog = await waitForModalLayer(
+      await page.findByRole("dialog", { name: "Stage 1: foundation" })
+    );
     await expect(within(dialog).getByText(STAGES[0].brief, { exact: true })).toBeVisible();
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(page.queryByRole("dialog")).not.toBeInTheDocument());

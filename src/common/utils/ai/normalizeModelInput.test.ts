@@ -18,10 +18,6 @@ describe("normalizeModelInput", () => {
       model: "openrouter:openai/gpt-5",
       isAlias: false,
     });
-    expect(normalizeModelInput("mux-gateway:anthropic/claude-sonnet-4-6")).toEqual({
-      model: "mux-gateway:anthropic/claude-sonnet-4-6",
-      isAlias: false,
-    });
   });
 
   it("returns null for null and empty inputs", () => {

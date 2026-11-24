@@ -8,7 +8,13 @@ import { UserMessage, type UserMessageNavigation } from "./UserMessage";
 import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
 import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
-import { AlertTriangle, MessageSquare } from "lucide-react";
+import { AlertTriangle, LayoutDashboard, ListTodo, MessageSquare } from "lucide-react";
+import {
+  classifyStatusPageTurnEndNudgePrompt,
+  classifyLayoutTurnEndNudgePrompt,
+  classifyTodoTurnEndNudgePrompt,
+  type LayoutTurnEndNudgeParts,
+} from "@/common/utils/machineTurnPrompts";
 import {
   BackgroundWorkWakeMessage,
   getBackgroundWorkWakeSummary,
@@ -20,7 +26,7 @@ import { StreamErrorMessage } from "./StreamErrorMessage";
 import { CompactionBoundaryMessage } from "./CompactionBoundaryMessage";
 import { HistoryHiddenMessage } from "./HistoryHiddenMessage";
 import { InitMessage } from "./InitMessage";
-import { ProposePlanToolCall } from "../Tools/ProposePlanToolCall";
+import { LazyProposePlanToolCall } from "../Tools/Shared/ToolCardsLoad";
 import { removeEphemeralMessage, useStreamingMessageDelta } from "@/browser/stores/WorkspaceStore";
 import { TranscriptMessageBoundary, TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 
@@ -31,6 +37,8 @@ interface MessageRendererProps {
   onEditQueuedMessage?: () => void;
   workspaceId?: string;
   isCompacting?: boolean;
+  /** An edit send is unresolved: user messages cannot start another edit. */
+  editSendPending?: boolean;
   /** Handler for adding review notes from inline diffs */
   onReviewNote?: (data: ReviewNoteData) => void;
   /** Whether this message is the latest propose_plan tool call (for external edit detection) */
@@ -48,6 +56,20 @@ interface MessageRendererProps {
   onCloseEphemeral?: (historyId: string) => void;
   /** "Load all" handler for history-hidden rows; same reason as onCloseEphemeral. */
   onShowAllHistory?: () => void;
+}
+
+// The layout nudge's collapsed row names every nudge joined into its continuation: the hidden
+// prompt asks for each of them, so a layout-only summary would hide the TODO or status page ask.
+const LAYOUT_NUDGE_SUMMARIES: Record<`${boolean}-${boolean}`, string> = {
+  "false-false": "Asked the agent to re-publish HTML artifacts and fix layout issues",
+  "true-false": "Asked the agent to update its TODO list and fix HTML artifact layout issues",
+  "false-true": "Asked the agent to update its status page and fix HTML artifact layout issues",
+  "true-true":
+    "Asked the agent to update its TODO list and status page, and fix HTML artifact layout issues",
+};
+
+function layoutNudgeSummary(parts: LayoutTurnEndNudgeParts): string {
+  return LAYOUT_NUDGE_SUMMARIES[`${parts.todo}-${parts.statusPage}`];
 }
 
 function getMessageHistoryId(message: DisplayedMessage): string | undefined {
@@ -91,6 +113,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
     onEditUserMessage,
     workspaceId,
     isCompacting,
+    editSendPending,
     onReviewNote,
     isLatestProposePlan,
     bashOutputGroup,
@@ -107,13 +130,21 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
       case "user": {
         const backgroundWorkWakeSummary =
           message.isSynthetic === true ? getBackgroundWorkWakeSummary(message.content) : null;
+        const todoNudgeKind =
+          message.isSynthetic === true ? classifyTodoTurnEndNudgePrompt(message.content) : null;
+        const statusPageNudgeKind =
+          message.isSynthetic === true
+            ? classifyStatusPageTurnEndNudgePrompt(message.content)
+            : null;
+        const layoutNudgeParts =
+          message.isSynthetic === true ? classifyLayoutTurnEndNudgePrompt(message.content) : null;
         renderedMessage =
           message.contextBudgetWarning != null ? (
             <CollapsibleMachineMessage
               content={message.content}
               summary={
                 message.contextBudgetWarning.final
-                  ? "Context window ending: notes flush"
+                  ? "Context window ending: final handoff"
                   : message.contextBudgetWarning.handoff
                     ? "Context handoff requested"
                     : "Context budget warning"
@@ -135,6 +166,46 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               marker="agent-peer-message-trigger"
               className={className}
             />
+          ) : todoNudgeKind != null ? (
+            // Xum's turn-end TODO nudge is constant control text, not user input. Exact match
+            // only: a nudge joined to a plugin's turn.stop prompt keeps the full bubble so the
+            // plugin's text stays visible. The current nudge keeps the turn's tools and can do real
+            // work, so its summary says so; rows from #6720 were todo_write-only list updates.
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary={
+                todoNudgeKind === "current"
+                  ? "Asked the agent to update its TODO list and finish open items"
+                  : "Asked the agent to update its TODO list"
+              }
+              icon={<ListTodo aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="todo-turn-end-nudge"
+              className={className}
+            />
+          ) : statusPageNudgeKind != null ? (
+            // The Agent interface view's turn-end status page nudge, alone or after the TODO nudge
+            // in one continuation: constant control text, so the same compact row.
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary={
+                statusPageNudgeKind === "todo-and-status-page"
+                  ? "Asked the agent to update its TODO list and status page"
+                  : "Asked the agent to update its status page"
+              }
+              icon={<LayoutDashboard aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="status-page-turn-end-nudge"
+              className={className}
+            />
+          ) : layoutNudgeParts != null ? (
+            // The turn-end layout nudge, alone or after the TODO and status page nudges in one
+            // continuation: constant control text, so the same compact row.
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary={layoutNudgeSummary(layoutNudgeParts)}
+              icon={<LayoutDashboard aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="layout-turn-end-nudge"
+              className={className}
+            />
           ) : backgroundWorkWakeSummary != null ? (
             <BackgroundWorkWakeMessage
               message={message}
@@ -147,6 +218,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               className={className}
               onEdit={onEditUserMessage}
               isCompacting={isCompacting}
+              editSendPending={editSendPending}
               navigation={userMessageNavigation}
             />
           );
@@ -206,7 +278,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         break;
       case "plan-display":
         renderedMessage = (
-          <ProposePlanToolCall
+          <LazyProposePlanToolCall
             args={{}}
             isEphemeralPreview={true}
             content={message.content}

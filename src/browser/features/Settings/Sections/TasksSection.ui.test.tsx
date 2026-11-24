@@ -1,12 +1,21 @@
 // Real Radix exports must initialize after the DOM, even when this suite runs first.
 import { installDom } from "../../../../../tests/ui/dom";
+import assert from "@/common/utils/assert";
 import type React from "react";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
+import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestApiOverrides,
+  type TestClientConfig,
+} from "@/browser/testUtils";
 import * as WorkspaceModule from "@/browser/contexts/WorkspaceContext";
+import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ModelsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
@@ -14,14 +23,16 @@ import * as SelectPrimitiveModule from "@/browser/components/SelectPrimitive/Sel
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getModelKey } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { FALLBACK_AGENTS } from "./TasksSection.agents";
 
-let advisorExperimentEnabled = false;
+let experimentsEnabledByDefault = false;
 let experimentValues: Record<string, boolean> = {};
 
 let apiMock: {
@@ -35,10 +46,12 @@ let apiMock: {
 } | null = null;
 
 let selectedWorkspaceMock: { projectPath: string; workspaceId: string } | null = null;
+let pendingProjectMock: string | null = null;
 
 // Snapshot real exports before Bun replaces their live bindings for this suite.
 restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...WorkspaceModule }],
+  ["@/browser/contexts/ProjectContext", { ...ProjectContextModule }],
   ["@/browser/hooks/useExperiments", { ...ExperimentsModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...ModelsModule }],
   ["@/browser/components/Tooltip/Tooltip", { ...tooltipModule }],
@@ -47,11 +60,20 @@ restoreModulesAfterSuite([
 ]);
 
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
-  useWorkspaceContext: () => ({ selectedWorkspace: selectedWorkspaceMock }),
+  useWorkspaceContext: () => ({
+    selectedWorkspace: selectedWorkspaceMock,
+    pendingNewWorkspaceProject: pendingProjectMock,
+  }),
+}));
+
+// The resource limits section lists projects; these tests have none.
+void mock.module("@/browser/contexts/ProjectContext", () => ({
+  ...ProjectContextModule,
+  useProjectContext: () => ({ userProjects: new Map() }),
 }));
 
 void mock.module("@/browser/hooks/useExperiments", () => ({
-  useExperimentValue: (id: string) => experimentValues[id] ?? advisorExperimentEnabled,
+  useExperimentValue: (id: string) => experimentValues[id] ?? experimentsEnabledByDefault,
 }));
 
 void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
@@ -60,8 +82,8 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
     models: [
       "anthropic:foo",
       "anthropic:ui-exec",
-      "openai:gpt-5-pro",
-      "openai:gpt-5.6-sol",
+      "xai:grok-4-1-fast",
+      "openai:gpt-6-luna",
       "openai:subagent-model",
       "xai:grok-code-fast-1",
     ],
@@ -108,25 +130,35 @@ void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
   ),
 }));
 
+// The native select takes the trigger's accessible name, as the Radix trigger carries it.
+function MockSelectTrigger(_props: { "aria-label"?: string }) {
+  return null;
+}
 void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => ({
   Select: (props: {
     value: string;
     onValueChange: (value: string) => void;
     children: React.ReactNode;
-  }) => (
-    <select
-      aria-label="Select"
-      value={props.value}
-      onChange={(event) => props.onValueChange(event.currentTarget.value)}
-    >
-      {props.children}
-    </select>
-  ),
+  }) => {
+    const trigger = (Array.isArray(props.children) ? props.children : [props.children]).find(
+      (child): child is React.ReactElement<{ "aria-label"?: string }> =>
+        (child as React.ReactElement | null)?.type === MockSelectTrigger
+    );
+    return (
+      <select
+        aria-label={trigger?.props["aria-label"] ?? "Select"}
+        value={props.value}
+        onChange={(event) => props.onValueChange(event.currentTarget.value)}
+      >
+        {props.children}
+      </select>
+    );
+  },
   SelectContent: (props: { children: React.ReactNode }) => <>{props.children}</>,
   SelectItem: (props: { value: string; children: React.ReactNode }) => (
     <option value={props.value}>{props.children}</option>
   ),
-  SelectTrigger: () => null,
+  SelectTrigger: MockSelectTrigger,
   SelectValue: () => null,
 }));
 
@@ -137,6 +169,11 @@ interface RenderTasksSectionOptions {
   /** When set, serves this discovered-agent list instead of FALLBACK_AGENTS. */
   agents?: AgentDefinitionDescriptor[];
   workspaceModel?: string;
+  minThinkingLevelByModel?: TestClientConfig["minThinkingLevelByModel"];
+  /** Settings over the project page: the agents come from the project, with no workspace. */
+  projectPageOnly?: boolean;
+  /** Which of the two sections built on TasksSection to render (default: Agents). */
+  part?: "behavior" | "agents";
 }
 
 function renderTasksSection(options: RenderTasksSectionOptions = {}) {
@@ -145,6 +182,7 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
     Promise.resolve(
       createTestConfig({
         agentAiDefaults: options.agentAiDefaults ?? {},
+        minThinkingLevelByModel: options.minThinkingLevelByModel,
       })
     )
   );
@@ -160,18 +198,20 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   } satisfies TestApiOverrides<APIClient>;
   // Discovery only runs for a selected workspace's project.
   selectedWorkspaceMock =
-    options.agents || options.workspaceModel ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
+    (options.agents || options.workspaceModel) && !options.projectPageOnly
+      ? { projectPath: "/proj", workspaceId: "ws-1" }
+      : null;
+  pendingProjectMock = options.projectPageOnly ? "/proj" : null;
+  resetAiSelectionIntentForTests();
   if (options.workspaceModel) {
-    updatePersistedState(getModelKey("ws-1"), options.workspaceModel);
+    markAiSelectionIntent("ws-1", "model", options.workspaceModel);
   }
 
   // Inject the per-test client through the real provider; mocking the API module leaks into
   // later files.
   const view = render(
     <APIProvider client={createTestApiClient(apiMock)}>
-      <PolicyProvider>
-        <TasksSection />
-      </PolicyProvider>
+      <TasksSection part={options.part ?? "agents"} />
     </APIProvider>
   );
   return { ...view, getConfig, saveConfig };
@@ -191,6 +231,20 @@ function getAgentCardByName(
     throw new Error(`Could not find ${name} agent card`);
   }
   return card;
+}
+
+const CYBER_CAPABLE_MODEL = "openai:gpt-6.1-sol";
+const REASONING_MODE_TOGGLES: Array<{ mode: "pro" | "cyber"; component: string }> = [
+  { mode: "pro", component: "ProModeToggle" },
+  { mode: "cyber", component: "CyberModeToggle" },
+];
+
+let providersConfigSpy: { mockRestore: () => void } | null = null;
+
+function enableCyberModel() {
+  providersConfigSpy = spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue({
+    openai: { apiKeySet: true, isEnabled: true, isConfigured: true, cyberModelEnabled: true },
+  });
 }
 
 function getLatestSavePayload(saveConfig: ReturnType<typeof mock>) {
@@ -215,7 +269,7 @@ describe("TasksSection Exec subagent defaults", () => {
   beforeEach(() => {
     restoreDom = installDom();
     getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: {} });
-    advisorExperimentEnabled = false;
+    experimentsEnabledByDefault = false;
     experimentValues = {};
     apiMock = null;
     selectedWorkspaceMock = null;
@@ -223,187 +277,12 @@ describe("TasksSection Exec subagent defaults", () => {
 
   afterEach(() => {
     cleanup();
+    providersConfigSpy?.mockRestore();
+    providersConfigSpy = null;
     getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: {} });
     apiMock = null;
     restoreDom?.();
     restoreDom = null;
-  });
-
-  test.each([
-    [false, false],
-    [false, true],
-    [true, false],
-    [true, true],
-  ])("gates the Intuition card on parent=%s and intuition=%s", async (memory, intuition) => {
-    advisorExperimentEnabled = true;
-    experimentValues = {
-      [EXPERIMENT_IDS.MEMORY]: memory,
-      [EXPERIMENT_IDS.MEMORY_INTUITION]: intuition,
-    };
-    const view = renderTasksSection({
-      agentAiDefaults: {
-        intuition: {
-          modelString: "openai:gpt-5.6-sol",
-          advisorEnabled: true,
-          thinkingLevel: "high",
-        },
-      },
-    });
-    await view.findByText("Name Workspace");
-    if (!memory || !intuition) {
-      expect(view.queryByText("Intuition")).toBeNull();
-      return;
-    }
-    const card = getAgentCardByName(view, "Intuition");
-    expect(within(card).getByRole<HTMLSelectElement>("combobox", { name: "Model" }).value).toBe(
-      "openai:gpt-5.6-sol"
-    );
-    expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
-    expect(within(card).getAllByRole("switch")).toHaveLength(1);
-    expect(within(card).getAllByRole("combobox")).toHaveLength(1);
-    expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
-    expect(
-      within(getAgentCardByName(view, "Name Workspace")).getByLabelText(
-        "Toggle name_workspace advisor"
-      )
-    ).toBeTruthy();
-    selectReasoningOption(card, "Medium");
-    await waitFor(() => {
-      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toMatchObject({
-        modelString: "openai:gpt-5.6-sol",
-        thinkingLevel: "medium",
-      });
-    });
-    expect(within(card).queryByRole("button", { name: /Pro mode/ })).toBeNull();
-    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
-    fireEvent.click(within(listbox).getByRole("option", { name: "Inherit" }));
-    await waitFor(() => {
-      const settings = getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition;
-      expect(settings?.thinkingLevel).toBeUndefined();
-      expect(settings?.modelString).toBe("openai:gpt-5.6-sol");
-    });
-    expect(
-      within(getAgentCardByName(view, "Name Workspace")).getByRole("button", { name: "Reasoning" })
-    ).toBeTruthy();
-  });
-
-  test("Intuition can display and save Off and Low below the chat minimum", async () => {
-    advisorExperimentEnabled = true;
-    getAppConfigStore().updateOptimistically({
-      minThinkingLevelByModel: { "openai:gpt-5.6-sol": "high" },
-    });
-    const view = renderTasksSection({
-      agentAiDefaults: {
-        intuition: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "low" },
-        explore: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "low" },
-      },
-    });
-    await view.findByText("Intuition");
-    const card = getAgentCardByName(view, "Intuition");
-    const reasoning = within(card).getByRole("button", { name: "Reasoning" });
-    expect(reasoning.textContent).toContain("Low");
-    fireEvent.click(reasoning);
-    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
-    for (const [label, level] of [
-      ["Off", "off"],
-      ["Low", "low"],
-    ] as const) {
-      fireEvent.click(within(listbox).getByRole("option", { name: label }));
-      await waitFor(() => {
-        expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
-          level
-        );
-      });
-      expect(reasoning.textContent).toContain(label);
-    }
-
-    // Ordinary task agents still use the chat floor for the same model.
-    const explore = getAgentCardByName(view, "Explore");
-    const exploreReasoning = within(explore).getByRole("button", { name: "Reasoning" });
-    expect(exploreReasoning.textContent).toContain("High");
-    fireEvent.click(exploreReasoning);
-    expect(within(explore).queryByRole("option", { name: "Off" })).toBeNull();
-    expect(within(explore).queryByRole("option", { name: "Low" })).toBeNull();
-  });
-
-  test.each([undefined, "openai:gpt-5.6-sol"])(
-    "Intuition inherits workspace/default capabilities instead of global Exec (workspace=%s)",
-    async (workspaceModel) => {
-      advisorExperimentEnabled = true;
-      const view = renderTasksSection({
-        workspaceModel,
-        agentAiDefaults: { exec: { modelString: "openai:gpt-5-pro" } },
-      });
-      await view.findByText("Intuition");
-      const card = getAgentCardByName(view, "Intuition");
-      selectReasoningOption(card, "Low");
-      const max = within(card).queryByRole("option", { name: "Max" });
-      if (workspaceModel) expect(max).toBeTruthy();
-      else expect(max).toBeNull();
-      await waitFor(() => {
-        expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toEqual({
-          thinkingLevel: "low",
-        });
-      });
-    }
-  );
-
-  test.each([undefined, "openai:gpt-5-pro"])(
-    "Intuition prefers its own model override to its definition, then the parent (override=%s)",
-    async (modelString) => {
-      advisorExperimentEnabled = true;
-      const view = renderTasksSection({
-        agents: FALLBACK_AGENTS.map((agent) =>
-          agent.id === "intuition"
-            ? { ...agent, aiDefaults: { model: "openai:gpt-5.6-sol" } }
-            : agent
-        ),
-        agentAiDefaults: {
-          exec: { modelString: "anthropic:ui-exec" },
-          intuition: { modelString },
-        },
-      });
-      await view.findByText("Intuition");
-      const card = getAgentCardByName(view, "Intuition");
-      fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
-      const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
-      expect(within(listbox).getByRole("option", { name: "High" })).toBeTruthy();
-      if (modelString) {
-        expect(within(listbox).queryByRole("option", { name: "Low" })).toBeNull();
-        expect(within(listbox).queryByRole("option", { name: "Max" })).toBeNull();
-      } else {
-        expect(within(listbox).getByRole("option", { name: "Low" })).toBeTruthy();
-        expect(within(listbox).getByRole("option", { name: "Max" })).toBeTruthy();
-      }
-    }
-  );
-
-  test("Intuition exposes only Off and High for the binary Grok Fast model", async () => {
-    advisorExperimentEnabled = true;
-    const view = renderTasksSection({
-      agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel: "low" } },
-    });
-    await view.findByText("Intuition");
-    const card = getAgentCardByName(view, "Intuition");
-    expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
-    selectReasoningOption(card, "Off");
-    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
-    expect(
-      within(listbox)
-        .getAllByRole("option")
-        .map((option) => option.getAttribute("aria-label"))
-    ).toEqual(["Inherit", "Off", "High"]);
-    await waitFor(() => {
-      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
-        "off"
-      );
-    });
-    fireEvent.click(within(listbox).getByRole("option", { name: "High" }));
-    await waitFor(() => {
-      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
-        "high"
-      );
-    });
   });
 
   test("renders a distinct Exec subagent row", async () => {
@@ -413,17 +292,6 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(within(getExecSubagentRow(view)).getByText("Exec")).toBeTruthy();
     expect(view.getByText("UI agents")).toBeTruthy();
     expect(view.getByText("Sub-agents")).toBeTruthy();
-  });
-
-  test("defaults advisor on for Exec and Plan when the experiment is enabled", async () => {
-    advisorExperimentEnabled = true;
-    const view = renderTasksSection();
-
-    const planAdvisorSwitch = await view.findByRole("switch", { name: "Toggle plan advisor" });
-    const execAdvisorSwitch = view.getByRole("switch", { name: "Toggle exec advisor" });
-
-    expect(execAdvisorSwitch.getAttribute("aria-checked")).toBe("true");
-    expect(planAdvisorSwitch.getAttribute("aria-checked")).toBe("true");
   });
 
   test("preserves unchanged nested subagent defaults when saving an agent-only change", async () => {
@@ -451,6 +319,86 @@ describe("TasksSection Exec subagent defaults", () => {
     expect("subagentAiDefaults" in payload).toBe(false);
   });
 
+  // Behavior and Agents each load their own copy of both fields: sending the other section's
+  // copy would revert that section's newer edit.
+  test("Agents saves only agent defaults, not its loaded copy of task settings", async () => {
+    const view = renderTasksSection();
+    await view.findByText("Explore");
+    fireEvent.click(
+      within(getAgentCardByName(view, "Explore")).getByRole("switch", {
+        name: "Toggle explore enabled",
+      })
+    );
+    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
+    expect(Object.keys(getLatestSavePayload(view.saveConfig))).toEqual(["agentAiDefaults"]);
+  });
+
+  test("pagehide saves a change made inside the autosave delay, once (#7157)", async () => {
+    // Record which pagehide listeners come and go; the real methods still run. Wrapped by hand
+    // and restored from their descriptors: bun's spyOn on the happy-dom window broke later
+    // test files.
+    const addDescriptor = Object.getOwnPropertyDescriptor(window, "addEventListener");
+    const removeDescriptor = Object.getOwnPropertyDescriptor(window, "removeEventListener");
+    assert(addDescriptor && removeDescriptor, "happy-dom defines the listener methods on window");
+    const added: unknown[] = [];
+    const removed: unknown[] = [];
+    const realAdd = window.addEventListener.bind(window);
+    const realRemove = window.removeEventListener.bind(window);
+    window.addEventListener = ((type: string, listener: EventListener, options?: boolean) => {
+      if (type === "pagehide") added.push(listener);
+      realAdd(type, listener, options);
+    }) as typeof window.addEventListener;
+    window.removeEventListener = ((type: string, listener: EventListener, options?: boolean) => {
+      if (type === "pagehide") removed.push(listener);
+      realRemove(type, listener, options);
+    }) as typeof window.removeEventListener;
+    try {
+      const view = renderTasksSection();
+      await view.findByText("Explore");
+      fireEvent.click(
+        within(getAgentCardByName(view, "Explore")).getByRole("switch", {
+          name: "Toggle explore enabled",
+        })
+      );
+
+      // A reload right after the change: pagehide fires before the debounced save.
+      fireEvent(window, new window.Event("pagehide"));
+      expect(view.saveConfig).toHaveBeenCalledTimes(1);
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.explore).toEqual({
+        enabled: false,
+      });
+
+      // The unmount after pagehide does not save the same change again.
+      view.unmount();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(view.saveConfig).toHaveBeenCalledTimes(1);
+      expect(added.length).toBeGreaterThan(0);
+      expect(removed).toEqual(added);
+    } finally {
+      Object.defineProperty(window, "addEventListener", addDescriptor);
+      Object.defineProperty(window, "removeEventListener", removeDescriptor);
+    }
+  });
+
+  test("pagehide during an in-flight autosave still sends the newer change", async () => {
+    const view = renderTasksSection();
+    // The first autosave never settles, as over a slow channel.
+    view.saveConfig.mockImplementationOnce(() => new Promise<undefined>(() => undefined));
+    await view.findByText("Explore");
+    const toggle = (agentId: string) =>
+      fireEvent.click(view.getByRole("switch", { name: `Toggle ${agentId} enabled` }));
+
+    toggle("explore");
+    await waitFor(() => expect(view.saveConfig).toHaveBeenCalledTimes(1));
+    toggle("name_workspace");
+    fireEvent(window, new window.Event("pagehide"));
+
+    expect(view.saveConfig).toHaveBeenCalledTimes(2);
+    expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.name_workspace).toEqual({
+      enabled: false,
+    });
+  });
+
   test("includes nested subagent defaults when saving a delegated default change", async () => {
     const view = renderTasksSection();
     const row = await view.findByRole("group", { name: "Exec defaults" });
@@ -468,7 +416,7 @@ describe("TasksSection Exec subagent defaults", () => {
     });
   });
 
-  test.each(["openai:gpt-5.6-sol", "xai:grok-code-fast-1"])(
+  test.each(["openai:gpt-6-luna", "xai:grok-code-fast-1"])(
     "does not resolve or persist inherited preferences from global Exec model %s",
     async (modelString) => {
       const view = renderTasksSection({
@@ -527,7 +475,7 @@ describe("TasksSection Exec subagent defaults", () => {
       agentAiDefaults: {
         exec: {
           reasoningMode: "pro",
-          subagent: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "high" },
+          subagent: { modelString: "openai:gpt-6-luna", thinkingLevel: "high" },
         },
       },
     });
@@ -628,30 +576,34 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(payload.agentAiDefaults.exec).toBeUndefined();
   });
 
-  test("toggling Pro mode persists the agent default", async () => {
-    const view = renderTasksSection({
-      agentAiDefaults: {
-        explore: { modelString: "openai:gpt-5.6-sol" },
-      },
-    });
+  test.each(REASONING_MODE_TOGGLES)(
+    "toggling $mode mode persists the agent default",
+    async ({ mode, component }) => {
+      enableCyberModel();
+      const view = renderTasksSection({
+        agentAiDefaults: {
+          explore: { modelString: CYBER_CAPABLE_MODEL },
+        },
+      });
 
-    await view.findByText("Explore");
-    const card = getAgentCardByName(view, "Explore");
-    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
-    const proToggle = card.querySelector('[data-component="ProModeToggle"]');
-    if (!(proToggle instanceof HTMLElement)) throw new Error("Pro mode toggle not rendered");
-    fireEvent.click(proToggle);
+      await view.findByText("Explore");
+      const card = getAgentCardByName(view, "Explore");
+      fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+      const modeToggle = card.querySelector(`[data-component="${component}"]`);
+      if (!(modeToggle instanceof HTMLElement)) throw new Error(`${component} not rendered`);
+      fireEvent.click(modeToggle);
 
-    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
-    const payload = getLatestSavePayload(view.saveConfig);
+      await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
+      const payload = getLatestSavePayload(view.saveConfig);
 
-    expect(payload.agentAiDefaults.explore?.reasoningMode).toBe("pro");
-  });
+      expect(payload.agentAiDefaults.explore?.reasoningMode).toBe(mode);
+    }
+  );
 
   test("toggling Pro mode off removes the persisted reasoning mode", async () => {
     const view = renderTasksSection({
       agentAiDefaults: {
-        explore: { modelString: "openai:gpt-5.6-sol", reasoningMode: "pro" },
+        explore: { modelString: "openai:gpt-6-luna", reasoningMode: "pro" },
       },
     });
 
@@ -667,14 +619,14 @@ describe("TasksSection Exec subagent defaults", () => {
     const payload = getLatestSavePayload(view.saveConfig);
 
     expect(payload.agentAiDefaults.explore?.reasoningMode).toBeUndefined();
-    expect(payload.agentAiDefaults.explore?.modelString).toBe("openai:gpt-5.6-sol");
+    expect(payload.agentAiDefaults.explore?.modelString).toBe("openai:gpt-6-luna");
   });
 
   test.each(["standard", "pro"] as const)(
     "cycles inherited mode through explicit Pro and Standard regardless of global %s",
     async (reasoningMode) => {
       const view = renderTasksSection({
-        agentAiDefaults: { exec: { modelString: "openai:gpt-5.6-sol", reasoningMode } },
+        agentAiDefaults: { exec: { modelString: "openai:gpt-6-luna", reasoningMode } },
       });
       const row = await view.findByRole("group", { name: "Exec defaults" });
       const trigger = within(row).getByRole("button", { name: "Reasoning" });
@@ -703,29 +655,33 @@ describe("TasksSection Exec subagent defaults", () => {
     }
   );
 
-  test("disabling Pro mode inherited from a base agent persists an explicit standard override", async () => {
-    // Explore's base is exec (FALLBACK_AGENTS), so ACP resolution inherits
-    // exec's pro; deleting explore's override would silently fall back to pro.
-    const view = renderTasksSection({
-      agentAiDefaults: {
-        exec: { reasoningMode: "pro" },
-        explore: { modelString: "openai:gpt-5.6-sol", reasoningMode: "pro" },
-      },
-    });
+  test.each(REASONING_MODE_TOGGLES)(
+    "disabling $mode mode inherited from a base agent persists an explicit standard override",
+    async ({ mode, component }) => {
+      enableCyberModel();
+      // Explore's base is exec (FALLBACK_AGENTS), so ACP resolution inherits
+      // exec's mode; deleting explore's override would silently fall back to it.
+      const view = renderTasksSection({
+        agentAiDefaults: {
+          exec: { reasoningMode: mode },
+          explore: { modelString: CYBER_CAPABLE_MODEL, reasoningMode: mode },
+        },
+      });
 
-    await view.findByText("Explore");
-    const card = getAgentCardByName(view, "Explore");
-    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
-    const proToggle = card.querySelector('[data-component="ProModeToggle"]');
-    if (!(proToggle instanceof HTMLElement)) throw new Error("Pro mode toggle not rendered");
-    fireEvent.click(proToggle);
+      await view.findByText("Explore");
+      const card = getAgentCardByName(view, "Explore");
+      fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+      const modeToggle = card.querySelector(`[data-component="${component}"]`);
+      if (!(modeToggle instanceof HTMLElement)) throw new Error(`${component} not rendered`);
+      fireEvent.click(modeToggle);
 
-    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
-    const payload = getLatestSavePayload(view.saveConfig);
+      await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
+      const payload = getLatestSavePayload(view.saveConfig);
 
-    expect(payload.agentAiDefaults.explore?.reasoningMode).toBe("standard");
-    expect(payload.agentAiDefaults.exec?.reasoningMode).toBe("pro");
-  });
+      expect(payload.agentAiDefaults.explore?.reasoningMode).toBe("standard");
+      expect(payload.agentAiDefaults.exec?.reasoningMode).toBe(mode);
+    }
+  );
 
   test("selecting Inherit clears the reasoning override along with the thinking level", async () => {
     const view = renderTasksSection({
@@ -753,7 +709,7 @@ describe("TasksSection Exec subagent defaults", () => {
     const view = renderTasksSection({
       agentAiDefaults: {
         exec: { reasoningMode: "pro" },
-        explore: { modelString: "openai:gpt-5.6-sol" },
+        explore: { modelString: "openai:gpt-6-luna" },
       },
     });
 
@@ -778,7 +734,7 @@ describe("TasksSection Exec subagent defaults", () => {
     // without first overriding the model.
     const view = renderTasksSection({
       agentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.6-sol", reasoningMode: "pro" },
+        exec: { modelString: "openai:gpt-6-luna", reasoningMode: "pro" },
       },
     });
 
@@ -803,7 +759,7 @@ describe("TasksSection Exec subagent defaults", () => {
           name: "Researcher",
           uiSelectable: false,
           subagentRunnable: true,
-          aiDefaults: { model: "openai:gpt-5.6-sol" },
+          aiDefaults: { model: "openai:gpt-6-luna" },
         },
       ],
     });
@@ -814,12 +770,45 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(card.querySelector('[data-component="ProModeToggle"]')).not.toBeNull();
   });
 
+  test("gates Pro on the settings base's model, not a base pin the settings base replaced", async () => {
+    // A Cursor `model: fast` agent on Exec, where a project exec.md pins a pro-capable model. A
+    // run resolves [ci-watcher, explore, exec], so Explore's Settings model outranks that pin,
+    // while the base-merged aiDefaults still carry it.
+    const view = renderTasksSection({
+      agents: [
+        {
+          id: "ci-watcher",
+          scope: "global",
+          name: "CI Watcher",
+          uiSelectable: false,
+          subagentRunnable: true,
+          base: "exec",
+          aiSettingsBase: "explore",
+          aiDefaults: { model: "openai:gpt-6-luna", settingsBase: "explore" },
+          aiLayers: {
+            ancestors: [
+              { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" } },
+              { agentId: "exec", definitionAiDefaults: { model: "openai:gpt-6-luna" } },
+            ],
+          },
+        },
+      ],
+      agentAiDefaults: { explore: { modelString: "anthropic:foo" } },
+    });
+
+    await view.findByText("CI Watcher");
+    const card = getAgentCardByName(view, "CI Watcher");
+    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+    expect(within(card).getByRole("listbox", { name: "Reasoning effort" })).toBeTruthy();
+    expect(card.querySelector('[data-component="ProModeToggle"]')).toBeNull();
+  });
+
   test("hides the Pro mode toggle on the Name Workspace card even for pro-capable models", async () => {
     // Name generation runs raw streamText (workspaceTitleGenerator) and never
     // applies reasoningMode, same headless class as Dream.
     const view = renderTasksSection({
       agentAiDefaults: {
-        name_workspace: { modelString: "openai:gpt-5.6-sol" },
+        name_workspace: { modelString: "openai:gpt-6-luna" },
       },
     });
 
@@ -834,10 +823,10 @@ describe("TasksSection Exec subagent defaults", () => {
   test("hides the Pro mode toggle on the Dream card even for pro-capable models", async () => {
     // Dream's headless requests (raw streamText) never apply reasoningMode,
     // so the card must not offer a toggle that cannot affect them.
-    advisorExperimentEnabled = true; // shared experiment mock also enables memory consolidation
+    experimentsEnabledByDefault = true; // enables memory consolidation
     const view = renderTasksSection({
       agentAiDefaults: {
-        dream: { modelString: "openai:gpt-5.6-sol" },
+        dream: { modelString: "openai:gpt-6-luna" },
       },
     });
 
@@ -870,7 +859,7 @@ describe("TasksSection Auto routing defaults", () => {
 
   beforeEach(() => {
     restoreDom = installDom();
-    advisorExperimentEnabled = false;
+    experimentsEnabledByDefault = false;
     experimentValues = { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true };
     apiMock = null;
     selectedWorkspaceMock = null;
@@ -967,13 +956,492 @@ describe("TasksSection Auto routing defaults", () => {
     fireEvent.click(within(plan).getByRole("button", { name: "Reset" }));
 
     fireEvent.change(within(getAgentCardByName(view, "mystery")).getByLabelText("Model"), {
-      target: { value: "openai:gpt-5.6-sol" },
+      target: { value: "openai:gpt-6-luna" },
     });
 
     await waitFor(() => {
       const payload = getLatestSavePayload(view.saveConfig);
       expect(payload.agentAiDefaults.plan).toBeUndefined();
-      expect(payload.agentAiDefaults.mystery).toEqual({ modelString: "openai:gpt-5.6-sol" });
+      expect(payload.agentAiDefaults.mystery).toEqual({ modelString: "openai:gpt-6-luna" });
     });
+  });
+});
+
+// A reconnect reloads the config and the agents through the new client. The agent list stays on
+// screen ("Loading agents…" is for another project only), and a value the user changed but the
+// debounced autosave has not sent yet is kept and saved, not replaced by the reload.
+describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => {
+  let restoreDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreDom = installDom();
+    experimentsEnabledByDefault = false;
+    experimentValues = {};
+    selectedWorkspaceMock = { projectPath: "/proj", workspaceId: "ws-1" };
+  });
+
+  afterEach(() => {
+    cleanup();
+    apiMock = null;
+    selectedWorkspaceMock = null;
+    restoreDom?.();
+    restoreDom = null;
+  });
+
+  function connect(maxParallelAgentTasks: number, agents: Promise<AgentDefinitionDescriptor[]>) {
+    const saveConfig = mock((_payload: { taskSettings: { maxParallelAgentTasks: number } }) =>
+      Promise.resolve(undefined)
+    );
+    apiMock = {
+      config: {
+        getConfig: mock(() =>
+          Promise.resolve(
+            createTestConfig({
+              taskSettings: { ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks },
+            })
+          )
+        ),
+        saveConfig,
+      },
+      agents: { list: mock(() => agents) },
+    };
+    return saveConfig;
+  }
+
+  function maxParallelInput(view: ReturnType<typeof render>): HTMLInputElement {
+    const row = view.getByText("Max Parallel Agent Tasks").closest(".justify-between");
+    const input = row?.querySelector("input");
+    if (!(input instanceof window.HTMLInputElement)) throw new Error("No max-parallel input");
+    return input;
+  }
+
+  test("keeps the agent list while the reload is pending", async () => {
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const harness = createConnectionHarness(mode, () => apiMock ?? {});
+    const view = render(
+      <harness.Wrapper>
+        <TasksSection part="agents" />
+      </harness.Wrapper>
+    );
+    await waitFor(() => expect(view.queryByText("Loading agents…") === null).toBe(true));
+
+    connect(3, new Promise(() => undefined));
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(view.queryByText("Loading agents…")).toBeNull();
+  });
+
+  test("keeps and saves a change the reload would overwrite", async () => {
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const harness = createConnectionHarness(mode, () => apiMock ?? {});
+    const view = render(
+      <harness.Wrapper>
+        <TasksSection part="behavior" />
+      </harness.Wrapper>
+    );
+    await waitFor(() => expect(maxParallelInput(view).value).toBe("3"));
+
+    // The change, then the reconnect, before the debounced autosave fires.
+    const input = maxParallelInput(view);
+    const reactPropsKey = Object.keys(input).find((key) => key.startsWith("__reactProps"));
+    const onChange = (
+      reactPropsKey ? (input as unknown as Record<string, unknown>)[reactPropsKey] : null
+    ) as { onChange?: (event: { target: { value: string } }) => void } | null;
+    if (!onChange?.onChange) throw new Error("Expected the input to expose its onChange handler");
+    const change = onChange.onChange;
+    act(() => change({ target: { value: "7" } }));
+    const saveConfig = connect(5, Promise.resolve(FALLBACK_AGENTS));
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+
+    expect(maxParallelInput(view).value).toBe("7");
+    await waitFor(() => expect(saveConfig).toHaveBeenCalled(), { timeout: 2_000 });
+    expect(saveConfig.mock.calls.at(-1)?.[0].taskSettings.maxParallelAgentTasks).toBe(7);
+  });
+
+  // Offline an edit would live only in this section's state, and leaving the section before the
+  // reconnect would lose it: the controls must be disabled until a live client is back.
+  test("disables the controls while offline", async () => {
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const harness = createConnectionHarness(mode, () => apiMock ?? {});
+    const view = render(
+      <harness.Wrapper>
+        <TasksSection part="behavior" />
+      </harness.Wrapper>
+    );
+    await waitFor(() => expect(maxParallelInput(view).value).toBe("3"));
+    // happy-dom does not apply a disabled <fieldset> to `:disabled`: read the fieldset (browsers
+    // disable every control inside it).
+    const isDisabled = (input: HTMLInputElement) =>
+      input.disabled || input.closest("fieldset")?.disabled === true;
+    expect(isDisabled(maxParallelInput(view))).toBe(false);
+
+    await harness.drop();
+    await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(true));
+    // The kept value stays on screen.
+    expect(maxParallelInput(view).value).toBe("3");
+
+    // Until the reload answers the controls stay disabled: an edit then would be replaced by it.
+    let answer: (() => void) | null = null;
+    const answered = new Promise<void>((resolve) => (answer = resolve));
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const config = apiMock?.config.getConfig;
+    if (!apiMock || !config) throw new Error("connect() sets the client");
+    apiMock.config.getConfig = mock(() => answered.then(() => config() as unknown));
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(isDisabled(maxParallelInput(view))).toBe(true);
+    act(() => answer?.());
+    await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(false));
+  });
+});
+
+// #6384: the limit inputs used to clamp and autosave on every keystroke, so clearing a field saved
+// 1. The field must keep the typed text, save only a valid value, and settle the text on blur.
+describe("TasksSection limit inputs", () => {
+  let restoreDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreDom = installDom();
+    experimentsEnabledByDefault = false;
+    experimentValues = {};
+    apiMock = null;
+    selectedWorkspaceMock = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    apiMock = null;
+    restoreDom?.();
+    restoreDom = null;
+  });
+
+  function limitInput(view: ReturnType<typeof render>, label: string): HTMLInputElement {
+    const row = view.getByText(label).closest(".justify-between");
+    const input = row?.querySelector("input");
+    if (!(input instanceof window.HTMLInputElement)) throw new Error(`No input for ${label}`);
+    return input;
+  }
+
+  // fireEvent does not reach this Input's React handlers in happy-dom (see the reconnect suite
+  // above), so call them through React's props, as a browser event would.
+  function reactHandlers(input: HTMLInputElement) {
+    const key = Object.keys(input).find((name) => name.startsWith("__reactProps"));
+    return (key ? (input as unknown as Record<string, unknown>)[key] : null) as {
+      onChange?: (event: { target: { value: string } }) => void;
+      onBlur?: (event: { target: { value: string } }) => void;
+      onKeyDown?: (event: { key: string }) => void;
+    } | null;
+  }
+
+  function type(view: ReturnType<typeof render>, label: string, value: string) {
+    const onChange = reactHandlers(limitInput(view, label))?.onChange;
+    if (!onChange) throw new Error("Expected an onChange handler");
+    act(() => onChange({ target: { value } }));
+  }
+
+  // Without an onBlur handler, a blur changes nothing.
+  function blur(view: ReturnType<typeof render>, label: string) {
+    const input = limitInput(view, label);
+    const onBlur = reactHandlers(input)?.onBlur;
+    if (onBlur) act(() => onBlur({ target: { value: input.value } }));
+  }
+
+  const savedValues = (saveConfig: ReturnType<typeof mock>, key: string): unknown[] =>
+    saveConfig.mock.calls.map(
+      (call) => (call[0] as { taskSettings: Record<string, unknown> }).taskSettings[key]
+    );
+
+  // Longer than the autosave debounce, so a save of the cleared field would have happened.
+  const waitPastAutosave = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    });
+
+  test("Max Parallel Agent Tasks keeps the typed text and never saves a cleared field as 1", async () => {
+    const view = renderTasksSection({ part: "behavior" });
+    const label = "Max Parallel Agent Tasks";
+    await waitFor(() => expect(limitInput(view, label).value).toBe("32"));
+
+    type(view, label, "");
+    expect(limitInput(view, label).value).toBe("");
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).not.toContain(1);
+
+    // A valid value saves while the user types.
+    type(view, label, "12");
+    expect(limitInput(view, label).value).toBe("12");
+    await waitFor(() =>
+      expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).toContain(12)
+    );
+
+    // An out-of-range value stays as typed, then clamps on blur.
+    type(view, label, "999");
+    expect(limitInput(view, label).value).toBe("999");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("256");
+    await waitFor(() =>
+      expect(savedValues(view.saveConfig, "maxParallelAgentTasks").at(-1)).toBe(256)
+    );
+
+    // A field left empty goes back to the saved value.
+    type(view, label, "");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("256");
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).not.toContain(1);
+  });
+
+  test("Max Task Nesting Depth keeps the typed text and reverts an empty field on blur", async () => {
+    const view = renderTasksSection({ part: "behavior" });
+    const label = "Max Task Nesting Depth";
+    await waitFor(() => expect(limitInput(view, label).value).toBe("5"));
+
+    type(view, label, "");
+    expect(limitInput(view, label).value).toBe("");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("5");
+
+    // Enter settles the text like blur: an out-of-range value clamps to the maximum.
+    type(view, label, "9");
+    const onKeyDown = reactHandlers(limitInput(view, label))?.onKeyDown;
+    if (!onKeyDown) throw new Error("Expected an onKeyDown handler");
+    act(() => onKeyDown({ key: "Enter" }));
+    expect(limitInput(view, label).value).toBe("5");
+
+    type(view, label, "2");
+    await waitFor(() => expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).toContain(2));
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).not.toContain(1);
+  });
+
+  test("Behavior saves only task settings, not its loaded copy of agent defaults", async () => {
+    const view = renderTasksSection({ part: "behavior" });
+    const label = "Max Parallel Agent Tasks";
+    await waitFor(() => expect(limitInput(view, label).value).toBe("32"));
+    type(view, label, "12");
+    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
+    expect(Object.keys(getLatestSavePayload(view.saveConfig))).toEqual(["taskSettings"]);
+  });
+});
+
+describe("TasksSection prompt cache TTL", () => {
+  let restoreDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreDom = installDom();
+    experimentsEnabledByDefault = false;
+    experimentValues = {};
+    apiMock = null;
+    selectedWorkspaceMock = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    providersConfigSpy?.mockRestore();
+    providersConfigSpy = null;
+    apiMock = null;
+    restoreDom?.();
+    restoreDom = null;
+  });
+
+  const cacheSelect = (view: ReturnType<typeof renderTasksSection>, agentId: string) =>
+    view.queryByRole("combobox", { name: `${agentId} prompt cache duration` });
+  const selectedOptionText = (select: HTMLElement | null) => {
+    const value = (select as { value?: string } | null)?.value;
+    return [...(select?.querySelectorAll("option") ?? [])].find((option) => option.value === value)
+      ?.textContent;
+  };
+  const setGlobalCacheTtl = (cacheTtl: "5m" | "1h") => {
+    providersConfigSpy = spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue({
+      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true, cacheTtl },
+    });
+  };
+
+  test("choosing 1 hour saves it, and Inherit removes it", async () => {
+    const view = renderTasksSection();
+    await view.findByText("Explore");
+
+    fireEvent.change(cacheSelect(view, "explore")!, { target: { value: "1h" } });
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.explore).toEqual({
+        cacheTtl: "1h",
+      })
+    );
+
+    fireEvent.change(cacheSelect(view, "explore")!, { target: { value: "__inherit__" } });
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.explore).toBeUndefined()
+    );
+  });
+
+  test("an unknown agent's stale value shows and resets to Inherit", async () => {
+    const view = renderTasksSection({ agentAiDefaults: { mystery: { cacheTtl: "1h" } } });
+    await view.findAllByText("Plan");
+
+    expect(selectedOptionText(cacheSelect(view, "mystery"))).toBe("1 hour");
+    fireEvent.change(cacheSelect(view, "mystery")!, { target: { value: "__inherit__" } });
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.mystery).toBeUndefined()
+    );
+  });
+
+  test("Inherit names the value the agent inherits without its own Settings value", async () => {
+    setGlobalCacheTtl("1h");
+    const view = renderTasksSection({
+      agentAiDefaults: { exec: { cacheTtl: "5m" }, researcher: { cacheTtl: "1h" } },
+      agents: [
+        ...FALLBACK_AGENTS.filter((agent) => agent.id !== "explore"),
+        {
+          ...FALLBACK_AGENTS.find((agent) => agent.id === "explore")!,
+          aiDefaults: { cacheTtl: "5m" },
+        },
+        {
+          id: "researcher",
+          scope: "project",
+          name: "Researcher",
+          base: "exec",
+          uiSelectable: false,
+          subagentRunnable: true,
+        },
+      ],
+    });
+    await view.findByText("Researcher");
+
+    // Its own Settings value is shown as the choice, and Inherit names its base's value.
+    expect(selectedOptionText(cacheSelect(view, "researcher"))).toBe("1 hour");
+    expect(
+      within(cacheSelect(view, "researcher")!).getByRole("option", { name: "Inherit (5 minutes)" })
+    ).toBeTruthy();
+    // Explore's frontmatter outranks its base's Settings value and the global 1h.
+    expect(selectedOptionText(cacheSelect(view, "explore"))).toBe("Inherit (5 minutes)");
+    // Plan has no base and no value: the global TTL.
+    expect(selectedOptionText(cacheSelect(view, "plan"))).toBe("Inherit (1 hour)");
+  });
+
+  test("without discovered agents, Inherit reads the fallback agents' own frontmatter", async () => {
+    setGlobalCacheTtl("1h");
+    const view = renderTasksSection();
+    await view.findByText("Explore");
+
+    // Built-in explore's frontmatter 5m outranks the global 1h, as in a run of explore.
+    expect(selectedOptionText(cacheSelect(view, "explore"))).toBe("Inherit (5 minutes)");
+    expect(selectedOptionText(cacheSelect(view, "plan"))).toBe("Inherit (1 hour)");
+  });
+
+  test("Inherit ranks a base's Settings value above frontmatter merged from that base", async () => {
+    const explore = FALLBACK_AGENTS.find((agent) => agent.id === "explore")!;
+    const subagent = { scope: "project" as const, uiSelectable: false, subagentRunnable: true };
+    const view = renderTasksSection({
+      agentAiDefaults: { explore: { cacheTtl: "1h" } },
+      agents: [
+        ...FALLBACK_AGENTS,
+        {
+          ...subagent,
+          id: "scout",
+          name: "Scout",
+          base: "explore",
+          // agents.list merges explore's frontmatter 5m into Scout's aiDefaults.
+          aiDefaults: explore.aiDefaults,
+          aiLayers: {
+            ancestors: [
+              { agentId: "explore", definitionAiDefaults: explore.aiDefaults },
+              { agentId: "exec" },
+            ],
+          },
+        },
+        // Did not resolve, so Inherit walks its declared base Scout, by Scout's own layer.
+        { ...subagent, id: "draft", name: "Draft", base: "scout" },
+      ],
+    });
+    await view.findByText("Scout");
+
+    expect(selectedOptionText(cacheSelect(view, "scout"))).toBe("Inherit (1 hour)");
+    expect(selectedOptionText(cacheSelect(view, "draft"))).toBe("Inherit (1 hour)");
+  });
+
+  test("Inherit follows the base layers agents.list resolves over the listed bases", async () => {
+    const exec = FALLBACK_AGENTS.find((agent) => agent.id === "exec")!;
+    const listed = (
+      id: string,
+      scope: "project" | "global",
+      base: string,
+      ancestorIds: string[]
+    ) => ({
+      id,
+      scope,
+      name: id,
+      base,
+      uiSelectable: false,
+      subagentRunnable: true,
+      aiLayers: { ancestors: ancestorIds.map((agentId) => ({ agentId })) },
+    });
+    const view = renderTasksSection({
+      agentAiDefaults: { helper: { cacheTtl: "1h" } },
+      agents: [
+        ...FALLBACK_AGENTS.filter((agent) => agent.id !== "exec"),
+        // A project exec.md, which a global agent's base resolves past.
+        {
+          ...exec,
+          scope: "project",
+          base: "exec",
+          aiLayers: { targetDefinitionAiDefaults: { cacheTtl: "1h" }, ancestors: [] },
+        },
+        listed("helper", "global", "exec", ["exec"]),
+        // Refines a global agent whose base (helper) the listed descriptor no longer shows.
+        listed("refined", "project", "refined", ["helper", "exec"]),
+      ],
+    });
+    await view.findByText("refined");
+
+    expect(selectedOptionText(cacheSelect(view, "refined"))).toBe("Inherit (1 hour)");
+    expect(
+      within(cacheSelect(view, "helper")!).getByRole("option", { name: "Inherit (5 minutes)" })
+    ).toBeTruthy();
+  });
+
+  test("Settings over a project page labels Inherit from that project's agents", async () => {
+    const explore = FALLBACK_AGENTS.find((agent) => agent.id === "explore")!;
+    const projectExplore = { ...explore, scope: "project" as const, base: "explore" };
+    const view = renderTasksSection({
+      projectPageOnly: true,
+      agents: [
+        ...FALLBACK_AGENTS.filter((agent) => agent.id !== "explore"),
+        {
+          ...projectExplore,
+          aiDefaults: { cacheTtl: "1h" },
+          aiLayers: {
+            targetDefinitionAiDefaults: { cacheTtl: "1h" },
+            ancestors: [{ agentId: "exec" }],
+          },
+        },
+      ],
+    });
+
+    await waitFor(() =>
+      expect(selectedOptionText(cacheSelect(view, "explore"))).toBe("Inherit (1 hour)")
+    );
+  });
+
+  test("is absent on the delegated Exec card and on headless agents", async () => {
+    experimentsEnabledByDefault = true; // shows the Dream and Status Page cards
+    const view = renderTasksSection();
+    await view.findByText("Dream");
+
+    expect(cacheSelect(view, "exec")).toBeTruthy();
+    expect(
+      within(getExecSubagentRow(view)).queryByRole("combobox", { name: /prompt cache/ })
+    ).toBeNull();
+    for (const agentId of ["dream", "name_workspace", "status_page"]) {
+      expect(cacheSelect(view, agentId)).toBeNull();
+    }
   });
 });

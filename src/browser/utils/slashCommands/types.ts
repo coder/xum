@@ -10,7 +10,7 @@
  */
 
 import type { ExperimentId } from "@/common/constants/experiments";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
 import type { ParsedThinkingInput } from "@/common/types/thinking";
@@ -31,8 +31,10 @@ export type ParsedCommand =
   | { type: "dream" }
   | { type: "refine"; apply?: boolean }
   | { type: "fork"; startMessage?: string }
+  | { type: "side" }
   | { type: "new"; startMessage?: string }
   | { type: "vim-toggle" }
+  | { type: "speed-mode-toggle"; mode: "fast" | "ultrafast" }
   | { type: "plan-show" }
   | { type: "plan-open" }
   | { type: "workflow-run"; scriptPath: string; argsText?: string }
@@ -65,10 +67,7 @@ export type SuggestionsHandler = (args: SuggestionsHandlerArgs) => SlashSuggesti
 export interface SlashCommandVisibilityContext {
   /** Variant determines which commands are available */
   variant?: "workspace" | "creation";
-  /**
-   * Optional resolver for experiment state. Tests and React callers can inject
-   * hook-derived values instead of reading from localStorage directly.
-   */
+  /** Experiment state; experiment-gated commands stay hidden without it. */
   isExperimentEnabled?: (experimentId: ExperimentId) => boolean | undefined;
 }
 
@@ -103,7 +102,7 @@ export interface SlashSuggestion {
 }
 
 export interface SlashSuggestionContext extends SlashCommandVisibilityContext {
-  agentSkills?: AgentSkillDescriptor[];
+  agentSkills?: InvocableSkill[];
   mcpPrompts?: MCPPromptDescriptor[];
   /** Agent Plugins: manifest-contributed commands (name -> expansion). */
   pluginCommands?: PluginSlashCommandDescriptor[];

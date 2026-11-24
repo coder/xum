@@ -89,6 +89,7 @@ export function commandBypassesTranscriptBarrier(parsed: ParsedCommand): boolean
     case "model-set":
     case "model-help":
     case "vim-toggle":
+    case "speed-mode-toggle":
     case "plan-show":
     case "plan-open":
     case "heartbeat-set":

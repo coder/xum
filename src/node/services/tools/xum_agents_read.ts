@@ -1,6 +1,7 @@
-import * as fsPromises from "fs/promises";
 import { tool } from "ai";
 
+import { assertProjectFileReachable } from "@/node/services/agentSandbox/fileToolSandbox";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import type { XumAgentsReadToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -28,6 +29,7 @@ export const createXumAgentsReadTool: ToolFactory = (config: ToolConfiguration) 
             return { success: true, content: "" };
           }
 
+          await assertProjectFileReachable(config, resolved.realPath, "read");
           const content = await readFileString(config.runtime, resolved.realPath);
           return { success: true, content };
         }
@@ -42,7 +44,8 @@ export const createXumAgentsReadTool: ToolFactory = (config: ToolConfiguration) 
           return { success: true, content: "" };
         }
 
-        const content = await fsPromises.readFile(resolved.realPath, "utf-8");
+        await assertProjectFileReachable(config, resolved.realPath, "read");
+        const content = await nodeHostFiles.promises.readFile(resolved.realPath, "utf-8");
         return { success: true, content };
       } catch (error) {
         const message = getErrorMessage(error);

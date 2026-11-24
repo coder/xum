@@ -18,6 +18,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import { fileURLToPath } from "url";
 import chalk from "chalk";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { parseBoolEnv } from "@/common/utils/env";
@@ -149,22 +150,28 @@ function setDegradedState(error: unknown): void {
   };
 }
 
+/**
+ * Ends the stream and resolves once its file descriptor is closed. stream.end() only starts the
+ * close: its callback fires on 'finish', which precedes 'close', while the descriptor is still
+ * open. A rotation renames the log files and a clear truncates the file after this resolves, and
+ * Windows cannot rename or delete a file that a stream holds open.
+ */
 function waitForStreamClose(stream: fs.WriteStream): Promise<void> {
   return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) {
-        return;
-      }
-      done = true;
+    // A stream that is already closed never emits 'close' again.
+    if (stream.closed) {
       resolve();
-    };
+      return;
+    }
 
-    stream.once("close", finish);
-    stream.once("error", finish);
-    // .end() callback fires on 'finish', which precedes 'close'—
-    // but the callback guarantees flush completed.
-    stream.end(() => finish());
+    stream.once("close", () => resolve());
+    // A failed stream is destroyed, and 'close' follows its 'error' once the descriptor (if the open
+    // succeeded) is closed, so this waits for it too. Destroy a stream that nothing destroyed, so a
+    // stream that fails without a destroy cannot stall the transition.
+    stream.once("error", () => {
+      if (!stream.destroyed) stream.destroy();
+    });
+    stream.end();
   });
 }
 
@@ -369,6 +376,19 @@ export function __resetFileSinkForTests(): void {
   sinkLifecycleEpoch = 0;
 }
 
+/**
+ * @internal Test seam: close the file sink and wait until every sink transition is done. Each one
+ * waits for its stream to close, including a rotation or clear that is in flight (it has already
+ * taken its stream out of the open state). The sink stays closed, so a log line (or a transition
+ * that resumes) while the caller deletes the folder that holds the log file cannot reopen it
+ * (Windows cannot delete a file that a stream holds open). Call __resetFileSinkForTests afterwards
+ * to log to a file again.
+ */
+export async function __closeFileSinkForTests(): Promise<void> {
+  closeSink();
+  await sinkTransition;
+}
+
 let currentLogLevel: LogLevel = getDefaultLogLevel();
 
 /**
@@ -435,38 +455,6 @@ function getTimestamp(): string {
   return `${hours}:${mm}.${ms}${ampm}`;
 }
 
-interface ParsedStackFrame {
-  filePath: string;
-  lineNum: string;
-}
-
-function parseStackFrame(stackLine: string): ParsedStackFrame | null {
-  const match = /\((.+):(\d+):\d+\)$/.exec(stackLine) ?? /at (.+):(\d+):\d+$/.exec(stackLine);
-  if (!match) {
-    return null;
-  }
-
-  const [, filePath, lineNum] = match;
-  return { filePath, lineNum };
-}
-
-function isLoggerStackFrame(stackLine: string, filePath: string): boolean {
-  const normalizedPath = filePath.replace(/\\/g, "/");
-
-  if (
-    normalizedPath.endsWith("/src/node/services/log.ts") ||
-    normalizedPath.endsWith("/src/node/services/log.js")
-  ) {
-    return true;
-  }
-
-  return (
-    stackLine.includes("getCallerLocation") ||
-    stackLine.includes("safePipeLog") ||
-    stackLine.includes("formatLogLine")
-  );
-}
-
 function formatCallerLocation(filePath: string, lineNum: string): string {
   const normalizedPath = filePath.replace(/\\/g, "/");
   const normalizedCwd = process.cwd().replace(/\\/g, "/");
@@ -483,31 +471,54 @@ function formatCallerLocation(filePath: string, lineNum: string): string {
   return `${path.basename(normalizedPath)}:${lineNum}`;
 }
 
+/** A public log function: the caller's frame is the one directly below it. */
+type LogEntryFunction = (...args: never[]) => void;
+
 /**
- * Get the first non-logger caller frame from the stack trace.
- *
- * We intentionally scan frames instead of using a fixed stack index because
- * wrapper levels can shift over time and otherwise collapse locations to the
- * logger wrapper (e.g. log.ts:488) instead of the real call site.
+ * The current stack as raw V8 call sites. `new Error().stack` would run the global
+ * Error.prepareStackTrace, which source-map-support replaces (desktop/main.ts, cli/server.ts):
+ * it maps every frame, and the first frame from a file parses that file's whole source map on
+ * this thread (#6556: about 50 ms for workspaceService.js on each desktop start, hundreds of ms
+ * over a server start). So the hook is swapped out for this one capture. The cost: in dist
+ * builds (also `make dev`) the location is the compiled .js line, not the .ts line. Logged
+ * Error objects and uncaught exceptions keep their source-mapped stacks.
  */
-function getCallerLocation(): string {
-  const stackLines = new Error().stack?.split("\n").slice(1) ?? [];
+function rawCallSites(stackTop: LogEntryFunction): NodeJS.CallSite[] {
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- only stored and restored, never called
+  const previous = Error.prepareStackTrace;
+  try {
+    Error.prepareStackTrace = (_error, callSites) => callSites;
+    const holder: { stack?: unknown } = {};
+    Error.captureStackTrace(holder, stackTop);
+    // Read inside the override: V8 formats the stack on first access.
+    const stack = holder.stack;
+    return Array.isArray(stack) ? (stack as NodeJS.CallSite[]) : [];
+  } finally {
+    Error.prepareStackTrace = previous;
+  }
+}
 
-  for (const stackLine of stackLines) {
-    const parsedFrame = parseStackFrame(stackLine);
-    if (!parsedFrame) {
+/**
+ * The first frame below `stackTop`, the public log function the caller called.
+ *
+ * V8 drops `stackTop` and every frame above it, so the logger's own frames never appear. This
+ * holds in every build: a match on the logger's file path or function names fails in the
+ * minified Docker server bundle, where all code shares one file and names are mangled (#7146).
+ */
+function getCallerLocation(stackTop: LogEntryFunction): string {
+  for (const callSite of rawCallSites(stackTop)) {
+    const fileName = callSite.getFileName();
+    const lineNumber = callSite.getLineNumber();
+    if (!fileName || lineNumber === null) {
       continue;
     }
 
-    if (parsedFrame.filePath.startsWith("node:")) {
+    if (fileName.startsWith("node:")) {
       continue;
     }
 
-    if (isLoggerStackFrame(stackLine, parsedFrame.filePath)) {
-      continue;
-    }
-
-    return formatCallerLocation(parsedFrame.filePath, parsedFrame.lineNum);
+    const filePath = fileName.startsWith("file:") ? fileURLToPath(fileName) : fileName;
+    return formatCallerLocation(filePath, String(lineNumber));
   }
 
   return "unknown:0";
@@ -519,14 +530,17 @@ function getCallerLocation(): string {
  * @param level - Log level
  * @param args - Arguments to log
  */
-function formatLogLine(level: LogLevel): {
+function formatLogLine(
+  level: LogLevel,
+  stackTop: LogEntryFunction
+): {
   timestamp: string;
   location: string;
   useColor: boolean;
   prefix: string;
 } {
   const timestamp = getTimestamp();
-  const location = getCallerLocation();
+  const location = getCallerLocation(stackTop);
   const useColor = supportsColor();
 
   // Apply colors based on level (if terminal supports it)
@@ -553,7 +567,7 @@ function formatLogLine(level: LogLevel): {
   return { timestamp, location, useColor, prefix };
 }
 
-function safePipeLog(level: LogLevel, ...args: unknown[]): void {
+function safePipeLog(level: LogLevel, stackTop: LogEntryFunction, ...args: unknown[]): void {
   const shouldConsoleLog = shouldLog(level);
 
   // Fast path: skip formatting entirely for debug entries that won't be
@@ -563,7 +577,7 @@ function safePipeLog(level: LogLevel, ...args: unknown[]): void {
     return;
   }
 
-  const { timestamp, location, useColor, prefix } = formatLogLine(level);
+  const { timestamp, location, useColor, prefix } = formatLogLine(level, stackTop);
 
   try {
     if (shouldConsoleLog) {
@@ -676,10 +690,10 @@ function debugObject(filename: string, obj: unknown): void {
     // Write the object as pretty-printed JSON
     fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf-8");
 
-    safePipeLog("debug", `Dumped object to ${filePath}`);
+    safePipeLog("debug", debugObject, `Dumped object to ${filePath}`);
   } catch (error) {
     // Don't crash if we can't write debug files
-    safePipeLog("error", `Failed to dump debug object to ${filename}:`, error);
+    safePipeLog("error", debugObject, `Failed to dump debug object to ${filename}:`, error);
   }
 }
 
@@ -729,11 +743,12 @@ function appendFieldsToArgs(args: unknown[], fields?: LogFields): unknown[] {
 
 function createLogger(boundFields?: LogFields): Logger {
   const normalizedFields = normalizeFields(boundFields);
-  const logAtLevel =
-    (level: LogLevel) =>
-    (...args: unknown[]): void => {
-      safePipeLog(level, ...appendFieldsToArgs(args, normalizedFields));
+  const logAtLevel = (level: LogLevel) => {
+    const entry = (...args: unknown[]): void => {
+      safePipeLog(level, entry, ...appendFieldsToArgs(args, normalizedFields));
     };
+    return entry;
+  };
 
   return {
     ...baseLogger,

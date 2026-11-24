@@ -9,7 +9,12 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { normalizeProjectMetadataIdentityPath } from "@/common/compat/legacyMux";
-import type { MCPServerInfo, MCPStdioServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
+import type {
+  MCPServerInfo,
+  MCPServerOAuthConfig,
+  MCPStdioServerInfo,
+  WorkspaceMCPOverrides,
+} from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -24,7 +29,25 @@ import {
   MAX_PLUGIN_MANIFEST_BYTES,
   readPluginFileWithinRootCapped,
 } from "./discovery";
+import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
+import {
+  CURSOR_IGNORED_FIELDS,
+  cursorValuePlaceholder,
+  folderAliases,
+  ignoredFieldReason,
+  needsValuesReason,
+  xumStdioEntry,
+  type McpDialect,
+} from "./mcpDialects";
+import {
+  envNameKey,
+  isReservedPluginEnvName,
+  PLUGIN_MCP_CONFIG_PARSE_ERROR,
+  readOpenAIMcpAuth,
+  toServerOAuthConfig,
+  translateCodexMcpEntry,
+} from "./openaiMcpAuth";
 
 /**
  * Agent Plugins MCP documents become default-disabled, read-only Xum servers.
@@ -161,8 +184,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 // Closed variants (§7.2.1): an unknown field makes the entry invalid.
-const STDIO_ENTRY_KEYS = new Set(["type", "command", "args", "env", "cwd"]);
-const REMOTE_ENTRY_KEYS = new Set(["type", "url", "headers"]);
+// `extensions` is not in the Agent Plugins 1.0.0 mcp schema; it is where
+// OpenAI documents per-server settings (`extensions["com.openai"].auth`).
+// Other namespaces stay opaque.
+const STDIO_ENTRY_KEYS = new Set(["type", "command", "args", "env", "cwd", "extensions"]);
+const REMOTE_ENTRY_KEYS = new Set(["type", "url", "headers", "extensions"]);
 
 // Canonical mcp.schema.json cwd pattern: `./…`, `${PLUGIN_ROOT}[/…]`, `${PLUGIN_DATA}[/…]`.
 const CWD_FORM_PATTERN = /^(?:\.\/|\$\{PLUGIN_ROOT\}(?:\/|$)|\$\{PLUGIN_DATA\}(?:\/|$))/;
@@ -276,6 +302,61 @@ interface NormalizeContext {
   vars: PluginPlaceholderValues;
 }
 
+/**
+ * The variables Xum supplies to a plugin server's environment: the placeholder names of its
+ * dialect (PLUGIN_ROOT and PLUGIN_DATA, plus the dialect's folder aliases, because Claude Code
+ * and Cursor export them and their servers read them).
+ */
+function suppliedPluginEnv(vars: PluginPlaceholderValues): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(vars).filter((entry): entry is [string, string] => entry[1] !== undefined)
+  );
+}
+
+/** The first problem of a stdio entry's `env` object, or undefined when it is valid. */
+function stdioEnvError(
+  env: Record<string, unknown>,
+  supplied: Record<string, string>
+): string | undefined {
+  for (const [key, value] of Object.entries(env)) {
+    if (isReservedPluginEnvName(key) || Object.hasOwn(supplied, envNameKey(key))) {
+      // §9.2: reserved names in `env` make the entry invalid; the client
+      // supplies these variables itself.
+      return `'env' must not contain reserved variable '${key}'`;
+    }
+    if (typeof value !== "string") {
+      return `'env.${key}' must be a string`;
+    }
+    if (key.includes("\0") || value.includes("\0")) {
+      // Same spawn constraint as args: env entries must be NUL-free.
+      return `'env' entry ${JSON.stringify(key)} must not contain NUL bytes`;
+    }
+    if (key.length === 0 || key.includes("=")) {
+      // As env_vars names (codexEnvVarName): a key `PLUGIN_DATA=/x` would set PLUGIN_DATA in
+      // the joined env block, and Windows sorts that block, so order cannot protect it (#6713).
+      // An empty key would be an unnamed `=value` entry.
+      return `'env' key ${JSON.stringify(key)} must be a non-empty name without '='`;
+    }
+  }
+  return undefined;
+}
+
+function pluginPlaceholderValues(
+  plugin: AgentPluginInfo,
+  dataPath: string
+): PluginPlaceholderValues {
+  const folders = { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath };
+  return {
+    ...folders,
+    ...Object.fromEntries(
+      Object.entries(folderAliases(plugin.mcpConfigDialect)).map(([alias, folder]) => [
+        alias,
+        folders[folder],
+      ])
+    ),
+  };
+}
+
 /** Validate + normalize one stdio entry; returns null (with error) when invalid. */
 async function normalizeStdioEntry(
   entry: Record<string, unknown>,
@@ -313,20 +394,9 @@ async function normalizeStdioEntry(
     return { error: "'env' must be an object of strings" };
   }
   const env = entry.env ?? {};
-  for (const [key, value] of Object.entries(env)) {
-    if (key === "PLUGIN_ROOT" || key === "PLUGIN_DATA") {
-      // §9.2: reserved names in `env` make the entry invalid; the client
-      // supplies these variables itself.
-      return { error: `'env' must not contain reserved variable '${key}'` };
-    }
-    if (typeof value !== "string") {
-      return { error: `'env.${key}' must be a string` };
-    }
-    if (key.includes("\0") || value.includes("\0")) {
-      // Same spawn constraint as args: env entries must be NUL-free.
-      return { error: `'env' entry ${JSON.stringify(key)} must not contain NUL bytes` };
-    }
-  }
+  const supplied = suppliedPluginEnv(ctx.vars);
+  const envError = stdioEnvError(env, supplied);
+  if (envError !== undefined) return { error: envError };
 
   if (entry.cwd !== undefined && typeof entry.cwd !== "string") {
     return { error: "'cwd' must be a string" };
@@ -443,11 +513,7 @@ async function normalizeStdioEntry(
       args: expandedArgs,
       // §9.1 overlay order: configured env first, reserved variables last so
       // they can never be shadowed.
-      env: {
-        ...expandedEnv,
-        PLUGIN_ROOT: rootPath,
-        PLUGIN_DATA: ctx.dataPath,
-      },
+      env: { ...expandedEnv, ...supplied },
       cwd: resolvedCwd,
       disabled: true,
       plugin: {
@@ -525,6 +591,94 @@ function normalizeRemoteEntry(
 }
 
 /**
+ * A remote server's OAuth settings: applies the usable ones to `info` and returns the warnings
+ * for the rest. Discovery + DCR cover what the config omits.
+ */
+function remoteOAuthMessages(
+  info: Exclude<MCPServerInfo, MCPStdioServerInfo>,
+  entry: Record<string, unknown>,
+  codex: { ignored: string[]; warnings: string[]; hasClientSecret?: boolean },
+  /** Where the OAuth service rereads a Codex client secret (see readPluginClientSecret). */
+  secretSource: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+): string[] {
+  const auth = readOpenAIMcpAuth(entry.extensions);
+  const { config: oauth, ignored: unusable } = toServerOAuthConfig(auth.auth, {
+    serverUrl: info.url,
+    ...(codex.hasClientSecret === true ? { clientSecretSource: secretSource } : {}),
+  });
+  if (oauth !== undefined) info.oauth = oauth;
+  const ignored = [...codex.ignored, ...auth.ignored, ...unusable];
+  if (codex.hasClientSecret === true && oauth?.clientSecretSource === undefined)
+    ignored.push("oauth.client_secret (needs client_id)");
+  const messages = [...codex.warnings, ...auth.warnings];
+  if (ignored.length > 0) messages.push(`Xum's MCP OAuth ignores: ${ignored.join(", ")}`);
+  return messages;
+}
+
+/** Normalize one (translated) entry by its transport; a translation error skips it. */
+async function normalizeServerEntry(
+  translated: ReturnType<typeof translateCodexMcpEntry>,
+  ctx: NormalizeContext
+): Promise<{ info: MCPServerInfo } | { error: string } | { skip: string }> {
+  if (translated.error !== undefined) return { error: translated.error };
+  const entry = translated.entry;
+  if (entry.type === "streamable-http" || entry.type === "sse")
+    return normalizeRemoteEntry(entry, ctx);
+  if (entry.type !== "stdio")
+    return { error: `unknown server 'type' ${JSON.stringify(entry.type)}` };
+  const result = await normalizeStdioEntry(
+    xumStdioEntry(entry, folderAliases(ctx.plugin.mcpConfigDialect)),
+    ctx
+  );
+  if ("info" in result && translated.forwardEnv !== undefined)
+    result.info.forwardEnv = translated.forwardEnv;
+  return result;
+}
+
+function dialectEntrySkip(
+  rawEntry: Record<string, unknown>,
+  dialect: McpDialect | undefined
+): string | undefined {
+  // Claude Code skips a remote entry without `type` as a configuration error, so Xum does not
+  // infer a transport for it as the Codex dialect does.
+  if (dialect === "claude" && rawEntry.type === undefined && rawEntry.url !== undefined)
+    return "a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json";
+  if (dialect !== "cursor") return undefined;
+  const placeholder = cursorValuePlaceholder(rawEntry);
+  return placeholder === undefined ? undefined : needsValuesReason(placeholder);
+}
+
+function translateDialectEntry(
+  rawEntry: Record<string, unknown>,
+  dialect: McpDialect | undefined
+): ReturnType<typeof translateCodexMcpEntry> {
+  if (dialect === undefined)
+    return { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
+  if (dialect !== "cursor") return translateCodexMcpEntry(rawEntry);
+  const dropped = CURSOR_IGNORED_FIELDS.filter((field) => rawEntry[field] !== undefined);
+  const droppedKeys = new Set<string>(dropped);
+  const entry = Object.fromEntries(
+    Object.entries(rawEntry).filter(([key]) => !droppedKeys.has(key))
+  );
+  const translated = translateCodexMcpEntry(entry, Object.keys(folderAliases("cursor")));
+  translated.warnings.push(...dropped.map(ignoredFieldReason));
+  return translated;
+}
+
+/**
+ * Why a server entry cannot load at all, before dialect handling. `__proto__` is refused because
+ * the registry's consent record (a `z.record`) drops that key on parse (#6534): the server could
+ * never keep its review, so it is skipped with a diagnostic instead of staying unreviewable.
+ */
+function checkServerEntryShape(
+  serverName: string,
+  rawEntry: unknown
+): { rawEntry: Record<string, unknown> } | { error: string } {
+  if (serverName === "__proto__") return { error: "the server name '__proto__' is reserved" };
+  return isPlainObject(rawEntry) ? { rawEntry } : { error: "server entry must be an object" };
+}
+
+/**
  * Load and normalize a plugin's `mcp.json` into default-disabled Xum server
  * records keyed by `plugin:<instanceId>:<serverName>`. The instance ID
  * defaults to hashing the canonical plugin root; callers pass an explicit
@@ -541,10 +695,14 @@ export async function loadPluginMcpServers(
 
   const diagnostics: AgentPluginDiagnostic[] = [];
   const servers: Record<string, MCPServerInfo> = {};
+  // Name the real file (mcp.json, the Codex .mcp.json fallback, or a
+  // contributes.mcp path) in every message.
+  const fileLabel = path.basename(plugin.mcpConfigPath);
 
   const disableMcp = (message: string): LoadPluginMcpServersResult => {
     log.warn(`Agent plugin ${plugin.rootPath}: ${message}`);
     diagnostics.push({
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       path: plugin.mcpConfigPath!,
       scope: plugin.scope,
       severity: "error",
@@ -570,7 +728,7 @@ export async function loadPluginMcpServers(
         filePath: plugin.mcpConfigPath,
         pluginRoot: plugin.rootPath,
         maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
-        label: "mcp.json",
+        label: fileLabel,
       })
     ).content;
   } catch (error) {
@@ -579,31 +737,49 @@ export async function loadPluginMcpServers(
   let raw: unknown;
   try {
     raw = JSON.parse(text) as unknown;
-  } catch (error) {
-    // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only.
-    return disableMcp(`mcp.json is not valid JSON: ${getErrorMessage(error)}`);
+  } catch {
+    // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only. The parser message is
+    // not reported: it quotes source text, and a Codex `.mcp.json` holds `client_secret` (#6297).
+    return disableMcp(`${fileLabel}: ${PLUGIN_MCP_CONFIG_PARSE_ERROR}`);
   }
 
   if (!isPlainObject(raw)) {
-    return disableMcp("mcp.json must be a JSON object");
+    return disableMcp(`${fileLabel} must be a JSON object`);
   }
 
+  // Codex packages ship `.mcp.json` in their own dialect (no `$schema`,
+  // `type: "http"`, `oauth`/`scopes`/`oauth_resource`). Discovery marks it
+  // from the lexical selection (a contained symlink keeps the dialect); a
+  // root mcp.json stays strict.
+  const codexShape = plugin.mcpConfigDialect !== undefined;
+  // Codex also accepts a flat `{ "<server>": {...} }` map without `mcpServers`.
+  const doc: Record<string, unknown> =
+    codexShape && !("mcpServers" in raw)
+      ? (({ $schema, ...servers }) => ({
+          ...($schema !== undefined ? { $schema } : {}),
+          mcpServers: servers,
+        }))(raw)
+      : raw;
+
   // Closed top-level: exactly { $schema, mcpServers }, both required (§7.2.1).
-  for (const key of Object.keys(raw)) {
+  for (const key of Object.keys(doc)) {
     if (key !== "$schema" && key !== "mcpServers") {
-      return disableMcp(`mcp.json has unknown top-level field '${key}'`);
+      return disableMcp(`${fileLabel} has unknown top-level field '${key}'`);
     }
   }
-  if (raw.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0) {
+  if (
+    doc.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 &&
+    !(codexShape && doc.$schema === undefined)
+  ) {
     // Discovery only admits 1.0.0 manifests, so any other value is either an
     // unsupported version or a version mismatch with plugin.json — both
     // disable MCP for this plugin (§7.2.2 rule 2).
     return disableMcp(
-      `mcp.json '$schema' must be '${AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0}' (matching plugin.json's Agent Plugins version)`
+      `${fileLabel} '$schema' must be '${AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0}' (matching plugin.json's Agent Plugins version)`
     );
   }
-  if (!isPlainObject(raw.mcpServers)) {
-    return disableMcp("mcp.json 'mcpServers' is required and must be an object");
+  if (!isPlainObject(doc.mcpServers)) {
+    return disableMcp(`${fileLabel} 'mcpServers' is required and must be an object`);
   }
 
   const instanceId = ctx.instanceId ?? computePluginInstanceId(plugin.rootPath);
@@ -611,10 +787,10 @@ export async function loadPluginMcpServers(
   const normalizeCtx: NormalizeContext = {
     plugin,
     dataPath,
-    vars: { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath },
+    vars: pluginPlaceholderValues(plugin, dataPath),
   };
 
-  for (const [serverName, entry] of Object.entries(raw.mcpServers)) {
+  for (const [serverName, rawEntryValue] of Object.entries(doc.mcpServers)) {
     // Filter before registration: saved workspace overrides cannot resurrect an unimported server.
     if (
       plugin.importedComponents != null &&
@@ -622,9 +798,10 @@ export async function loadPluginMcpServers(
     )
       continue;
     const reportEntry = (severity: "warning" | "error", message: string): void => {
-      const fullMessage = `mcp.json server '${serverName}': ${message}; skipping this server`;
+      const fullMessage = `${fileLabel} server '${serverName}': ${message}; skipping this server`;
       log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
       diagnostics.push({
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         path: plugin.mcpConfigPath!,
         scope: plugin.scope,
         severity,
@@ -632,23 +809,23 @@ export async function loadPluginMcpServers(
       });
     };
 
-    if (!isPlainObject(entry)) {
-      reportEntry("error", "server entry must be an object");
+    const shape = checkServerEntryShape(serverName, rawEntryValue);
+    if ("error" in shape) {
+      reportEntry("error", shape.error);
       continue;
     }
+    const { rawEntry } = shape;
+    const dialectSkip = dialectEntrySkip(rawEntry, plugin.mcpConfigDialect);
+    if (dialectSkip !== undefined) {
+      reportEntry("warning", dialectSkip);
+      continue;
+    }
+    const codex = translateDialectEntry(rawEntry, plugin.mcpConfigDialect);
+    const entry = codex.entry;
 
     // §7.2.2 rules 3-4: invalid entries and unknown transports are skipped
     // individually; sibling servers keep loading.
-    let result: { info: MCPServerInfo } | { error: string } | { skip: string };
-    if (entry.type === "stdio") {
-      result = await normalizeStdioEntry(entry, normalizeCtx);
-    } else if (entry.type === "streamable-http" || entry.type === "sse") {
-      result = normalizeRemoteEntry(entry, normalizeCtx);
-    } else {
-      reportEntry("error", `unknown server 'type' ${JSON.stringify(entry.type)}`);
-      continue;
-    }
-
+    const result = await normalizeServerEntry(codex, normalizeCtx);
     if ("error" in result) {
       reportEntry("error", result.error);
       continue;
@@ -659,12 +836,38 @@ export async function loadPluginMcpServers(
     }
 
     const info = result.info;
+    // Unusable settings only warn: the server still loads. Messages name fields, never values
+    // (see openaiMcpAuth's SECURITY AUDIT).
+    const messages =
+      info.transport === "stdio"
+        ? codex.warnings
+        : remoteOAuthMessages(info, entry, codex, {
+            pluginRoot: plugin.rootPath,
+            mcpConfigPath: plugin.mcpConfigPath,
+            serverName,
+          });
+    for (const message of messages) {
+      const fullMessage = `${fileLabel} server '${serverName}': ${message}`;
+      log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
+      diagnostics.push({
+        path: plugin.mcpConfigPath,
+        scope: plugin.scope,
+        severity: "warning",
+        message: fullMessage,
+      });
+    }
     assert(
       info.plugin !== undefined,
       "loadPluginMcpServers: normalized info must carry provenance"
     );
     info.plugin.serverName = serverName;
     if (plugin.componentPolicy !== undefined) info.plugin.componentPolicy = plugin.componentPolicy;
+    // The fingerprint of what will launch (#6498). The lexical install path is a root spelling
+    // too: the install review normalized it, and a manifest can name it literally.
+    info.plugin.consentFingerprint = serverConsentFingerprint(info, {
+      rootPaths: [plugin.rootPath, path.join(plugin.containerPath, plugin.dirName)],
+      dataPaths: [dataPath],
+    });
     servers[buildPluginServerKey(instanceId, serverName)] = info;
   }
 
@@ -729,7 +932,7 @@ export type AgentPluginsMcpProvider = (
 function computeProjectPluginInstanceId(args: {
   projectKey: string;
   projectRoot: string;
-  plugin: AgentPluginInfo;
+  plugin: Pick<AgentPluginInfo, "containerPath" | "dirName">;
 }): string {
   const relativeLocation = normalizeProjectMetadataIdentityPath(
     path.join(path.relative(args.projectRoot, args.plugin.containerPath), args.plugin.dirName)
@@ -738,25 +941,43 @@ function computeProjectPluginInstanceId(args: {
 }
 
 /**
- * Build the MCP server provider for Agent Plugins containers. Returns an empty
- * map when the agent-plugins experiment is off. Project-scope containers are
- * consulted only for trusted projects (mirroring repo `.xum/mcp.jsonc`).
- * Failures in one plugin never affect others (§11.3).
+ * The one instance ID of a discovered plugin. Plugin MCP server keys,
+ * `PLUGIN_DATA` and plugin hook settings all use it, so every consumer must
+ * call this instead of hashing a path itself: a second hashing rule would
+ * make hooks read a different server than the plugin's own.
+ * (Salvaged from the closed PR #6040.)
  */
-export function createAgentPluginsMcpProvider(ctx: {
-  xumHome: string;
-  isEnabled: () => boolean;
-}): AgentPluginsMcpProvider {
+export function resolvePluginInstanceId(
+  plugin: Pick<AgentPluginInfo, "scope" | "containerPath" | "dirName">,
+  ctx: AgentPluginsMcpContext
+): string {
+  if (plugin.scope === "project" && ctx.projectRoot !== undefined) {
+    return computeProjectPluginInstanceId({
+      projectKey: ctx.projectKey ?? ctx.projectRoot,
+      projectRoot: ctx.projectRoot,
+      plugin,
+    });
+  }
+  // Global scope: hash the LEXICAL installation location, not the canonical
+  // root. A symlinked plugin dir (e.g. a version-managed install) realpaths to
+  // a version-specific target, so hashing rootPath would rotate the server key
+  // and PLUGIN_DATA on every update, silently disabling workspace-enabled
+  // servers and orphaning their persistent data.
+  return computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
+}
+
+/**
+ * Build the MCP server provider for Agent Plugins containers. Project-scope
+ * containers are consulted only for trusted projects (mirroring repo
+ * `.xum/mcp.jsonc`). Failures in one plugin never affect others (§11.3).
+ */
+export function createAgentPluginsMcpProvider(ctx: { xumHome: string }): AgentPluginsMcpProvider {
   assert(
     path.isAbsolute(ctx.xumHome),
     "createAgentPluginsMcpProvider: xumHome must be an absolute path"
   );
 
   return async (args) => {
-    if (!ctx.isEnabled()) {
-      return {};
-    }
-
     const projectRoot = args.projectRoot;
     const containers: AgentPluginContainer[] = computeAgentPluginContainers({
       xumHome: ctx.xumHome,
@@ -771,7 +992,6 @@ export function createAgentPluginsMcpProvider(ctx: {
         if (plugin.mcpConfigPath === undefined) {
           continue;
         }
-        let instanceId: string;
         if (plugin.scope === "project" && projectRoot !== undefined) {
           // Project plugin roots keep the repo-symlink posture of repo config:
           // the plugin root itself must stay inside the scanned checkout.
@@ -783,20 +1003,11 @@ export function createAgentPluginsMcpProvider(ctx: {
             );
             continue;
           }
-          instanceId = computeProjectPluginInstanceId({
-            projectKey: args.projectKey ?? projectRoot,
-            projectRoot,
-            plugin,
-          });
-        } else {
-          // Global scope: hash the LEXICAL installation location, not the
-          // canonical root. A symlinked plugin dir (e.g. a version-managed
-          // install) realpaths to a version-specific target, so hashing
-          // rootPath would rotate the server key and PLUGIN_DATA on every
-          // update, silently disabling workspace-enabled servers and
-          // orphaning their persistent data.
-          instanceId = computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
         }
+        const instanceId = resolvePluginInstanceId(plugin, {
+          projectRoot,
+          projectKey: args.projectKey,
+        });
         try {
           const { servers } = await loadPluginMcpServers(plugin, {
             xumHome: ctx.xumHome,

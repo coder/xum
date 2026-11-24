@@ -21,6 +21,17 @@ interface CachedPostCompactionData {
  */
 const postCompactionStateCache = new Map<string, CachedPostCompactionData>();
 
+/** Mounted hooks per workspace, so an action elsewhere can make them fetch again. */
+const refetchListeners = new Map<string, Set<() => void>>();
+
+/**
+ * Make every mounted usePostCompactionState for `workspaceId` fetch again: for actions outside
+ * the hook that change its state without a backend event (a legacy plan import, #5174).
+ */
+export function refetchPostCompactionState(workspaceId: string): void {
+  for (const listener of refetchListeners.get(workspaceId) ?? []) listener();
+}
+
 function loadFromCache(wsId: string) {
   const cached = postCompactionStateCache.get(wsId);
   return {
@@ -40,6 +51,20 @@ function loadFromCache(wsId: string) {
 export function usePostCompactionState(workspaceId: string): PostCompactionState {
   const { api } = useAPI();
   const [state, setState] = useState(() => loadFromCache(workspaceId));
+  // Bumped by refetchPostCompactionState to fetch again.
+  const [fetchCount, setFetchCount] = useState(0);
+
+  // Subscribing to the external refetch signal for this workspace.
+  useEffect(() => {
+    const listener = () => setFetchCount((count) => count + 1);
+    const listeners = refetchListeners.get(workspaceId) ?? new Set<() => void>();
+    listeners.add(listener);
+    refetchListeners.set(workspaceId, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) refetchListeners.delete(workspaceId);
+    };
+  }, [workspaceId]);
 
   // Track which workspaceId the current state belongs to.
   // Reset synchronously during render when workspaceId changes (React-recommended pattern).
@@ -82,7 +107,7 @@ export function usePostCompactionState(workspaceId: string): PostCompactionState
     return () => {
       cancelled = true;
     };
-  }, [api, workspaceId]);
+  }, [api, workspaceId, fetchCount]);
 
   const toggleExclusion = useCallback(
     async (itemId: string) => {

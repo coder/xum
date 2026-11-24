@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { ArchiveRestore, CloudUpload, RefreshCw, TriangleAlert } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
-import { seedConfigMirrors } from "@/browser/utils/configMirrors";
+import { useSettings } from "@/browser/contexts/SettingsContext";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   formatKeybind,
   isDialogOpen,
@@ -15,7 +17,11 @@ import {
   type Keybind,
 } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import {
+  EMPTY_BACKUP_PLUGIN_REPORT,
+  type BackupPluginReport,
+  type SettingsBackupInput,
+} from "@/common/orpc/schemas/backup";
 import {
   BACKUP_CONTENT_DEFAULTS,
   BACKUP_CONTENT_FLAGS,
@@ -23,7 +29,15 @@ import {
   type BackupContentFlag,
   type BackupContents,
 } from "@/common/config/schemas/settingsBackup";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
+import {
+  BackupPluginsCard,
+  PluginRemovalCard,
+  reviewBackedUpPlugins,
+  savedPluginReport,
+  usePluginRemovalPrompt,
+} from "./BackupPluginsCard";
 
 type BackupRoute = keyof APIClient["backup"];
 type BackupRouteOutput<Route extends BackupRoute> = Awaited<ReturnType<APIClient["backup"][Route]>>;
@@ -52,6 +66,8 @@ const BACKUP_SHORTCUTS = [
   ["restore", KEYBINDS.SETTINGS_BACKUP_RESTORE],
   ["toggleOverride", KEYBINDS.SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN],
   ["toggleApproveCommands", KEYBINDS.SETTINGS_BACKUP_APPROVE_COMMANDS],
+  ["reviewPlugins", KEYBINDS.SETTINGS_BACKUP_REVIEW_PLUGINS],
+  ["confirmPluginRemoval", KEYBINDS.SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL],
 ] as const;
 
 type BackupShortcutAction = (typeof BACKUP_SHORTCUTS)[number][0];
@@ -92,8 +108,15 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
     flag: "includePreferences",
     label: "Portable preferences",
     description:
-      "Appearance and workflow preferences, plus model and agent settings such as default models, thinking levels, advisor and task settings, and layout presets.",
+      "Appearance and workflow preferences, plus model and agent settings such as default models, hidden models, thinking levels, model fallbacks, task settings, and runtime defaults.",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
+  },
+  {
+    flag: "includePlugins",
+    label: "Agent plugins",
+    description:
+      "The list of installed plugins: each one's repository, tracked branch or tag, and pinned commit. A restore never installs them; it offers each one for review on this machine.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PLUGINS,
   },
   {
     flag: "includeMcp",
@@ -125,7 +148,26 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
       "Adds your project list and per-project memories to the backup, and lets a restore reimport them on another machine.",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS,
   },
+  {
+    // Project shelves travel with the project bundle above; this covers only the global shelf.
+    flag: "includeGlobalArtifacts",
+    label: "Pinned global artifacts",
+    description:
+      "Artifacts are not settings. Include pinned global artifacts in the backup? Project shelves travel with the project bundle. Files over 8 MiB are skipped and listed.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS,
+  },
 ];
+
+/**
+ * The projects row's copy while the Artifacts experiment is on: project shelves travel with the
+ * project bundle (adapters.ts), so the row says so and turning it on is informed consent to
+ * back up pinned project artifacts too.
+ */
+const PROJECTS_WITH_ARTIFACTS_COPY = {
+  label: "Project list, project memories & pinned project artifacts",
+  description:
+    "Adds your project list, per-project memories and each project's pinned artifacts to the backup, and lets a restore reimport them on another machine.",
+} as const;
 
 type BackupDraft = SettingsBackupInput & BackupContents;
 
@@ -154,6 +196,14 @@ function draftsEqual(left: BackupDraft, right: BackupDraft): boolean {
   );
 }
 
+/** The save error for the first required field the draft leaves blank, or null. */
+function getMissingFieldError(draft: BackupDraft): string | null {
+  if (draft.repoUrl.trim() === "") return "Repository URL is required.";
+  if (draft.branch.trim() === "") return "Branch is required.";
+  if (draft.path.trim() === "") return "Subdirectory is required.";
+  return null;
+}
+
 function getOperationErrorMessage(error: BackupOperationError): string {
   if (!error.files?.length) return error.message;
   return `${error.message}: ${error.files.join(", ")}`;
@@ -175,7 +225,7 @@ function importResultLabel(result: BackupProjectImportResult): string {
 
 function importResultTone(result: BackupProjectImportResult): string {
   if (result.status === "failed") return "text-error";
-  return result.skippedFiles.length > 0 ? "text-warning" : "text-success";
+  return result.skippedFiles.length > 0 ? "text-warning" : "text-success-text";
 }
 
 /**
@@ -211,15 +261,6 @@ function describeRestoredFiles(count: number): string {
   return `${count} file${count === 1 ? "" : "s"}`;
 }
 
-/** A restore rewrites config behind the renderer's localStorage mirrors. */
-async function reseedConfigMirrors(api: APIClient): Promise<void> {
-  try {
-    seedConfigMirrors(await api.config.getConfig());
-  } catch {
-    // Best-effort: the mirrors re-seed on the next startup.
-  }
-}
-
 function ChangeList(props: {
   title: string;
   emptyLabel: string;
@@ -238,12 +279,28 @@ function ChangeList(props: {
         <ul className="mt-2 space-y-1.5">
           {props.changes.map((change) => (
             <li key={`${change.status}:${change.path}`} className="flex min-w-0 gap-2 text-xs">
-              <span className="text-accent w-5 shrink-0 font-mono">{change.status}</span>
+              <span className="text-accent-text w-5 shrink-0 font-mono">{change.status}</span>
               <span className="text-muted min-w-0 break-all">{change.path}</span>
             </li>
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+function SkippedNotice(props: { intro: string; items: readonly string[] | undefined }) {
+  if (props.items === undefined || props.items.length === 0) return null;
+  return (
+    <div className="border-border-light text-muted rounded-md border p-3 text-xs">
+      {props.intro}
+      <ul className="mt-1 list-disc pl-4">
+        {props.items.map((item) => (
+          <li key={item} className="break-words">
+            {item}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -264,6 +321,17 @@ function ownsBackupShortcuts(root: HTMLElement | null, target: EventTarget | nul
 
 export function BackupSection() {
   const { api } = useAPI();
+  const { setActiveSection } = useSettings();
+  // The global artifact shelf only exists with the Artifacts experiment: without it the row is
+  // hidden and its shortcut does nothing.
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const contentOptions = artifactsEnabled
+    ? BACKUP_CONTENT_OPTIONS.map((option) =>
+        option.flag === "includeProjects" ? { ...option, ...PROJECTS_WITH_ARTIFACTS_COPY } : option
+      )
+    : BACKUP_CONTENT_OPTIONS.filter((option) => option.flag !== "includeGlobalArtifacts");
+  const contentOptionsRef = useRef(contentOptions);
+  contentOptionsRef.current = contentOptions;
   const [draft, setDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
   const [savedDraft, setSavedDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
   const [loading, setLoading] = useState(true);
@@ -288,18 +356,41 @@ export function BackupSection() {
   const [projectImportResults, setProjectImportResults] = useState<BackupProjectImportResult[]>([]);
   const [projectBundleSkipped, setProjectBundleSkipped] = useState(false);
   const [unsupportedSettings, setUnsupportedSettings] = useState<string[]>([]);
+  // Pinned artifacts the last preview, push, or restore left out, each with its reason.
+  const [shelfSkipped, setShelfSkipped] = useState<string[]>([]);
+  const [symlinkSkipped, setSymlinkSkipped] = useState<string[]>();
+  // The plugin list of the last preview or restore, kept until the settings or the repository
+  // change: it describes that backup's plugins against this machine, nothing more.
+  const [pluginBackup, setPluginBackup] = useState<BackupPluginReport>(EMPTY_BACKUP_PLUGIN_REPORT);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
   const savedDraftRef = useRef(savedDraft);
+  const settingsLoadedRef = useRef(false);
   const refreshRef = useRef<((options?: { markFresh?: boolean }) => Promise<void>) | null>(null);
   draftRef.current = draft;
   savedDraftRef.current = savedDraft;
 
   const isDirty = !draftsEqual(draft, savedDraft);
+  const shownPluginBackup = savedPluginReport(pluginBackup, isDirty);
+  // What the repository operations act on. With the Artifacts experiment off the global shelf
+  // is left out even when the saved setting includes it: the row is hidden, so the user could
+  // not see or change it. The saved setting itself is kept for when the experiment returns.
+  const requestDraft: BackupDraft = artifactsEnabled
+    ? savedDraft
+    : { ...savedDraft, includeGlobalArtifacts: false };
   const configured = settingsFresh && savedDraft.repoUrl.trim() !== "";
   const saving = activeAction === "save";
   const busy = activeAction !== null;
+  const pluginRemoval = usePluginRemovalPrompt({ busy, push: handlePush });
+  // The settings reload effect must rerun for a new API client only, so it reads the current
+  // `clear` through this ref instead of listing it as a dependency.
+  const clearPluginRemovalRef = useRef(pluginRemoval.clear);
+  clearPluginRemovalRef.current = pluginRemoval.clear;
+  // A settings read is pending (a reconnect keeps the form on screen while it reloads). Save
+  // waits for it: the draft's untouched fields would overwrite changes made on the server.
+  const [reading, setReading] = useState(false);
+  const saveBlocked = busy || reading;
 
   useEffect(() => {
     if (!api) {
@@ -315,13 +406,16 @@ export function BackupSection() {
     // Liveness belongs to this API subscription. An older effect can finish after its
     // replacement starts, so sharing this flag across generations creates stale writes.
     let streamLive = false;
-    setLoading(true);
+    // Only the first load hides the form: a new client (reconnect) reloads behind the shown
+    // settings. Destructive actions still wait until the reload is fresh.
+    if (!settingsLoadedRef.current) setLoading(true);
     setSettingsFresh(false);
     setSaveError(null);
 
     const refresh = async (options?: { markFresh?: boolean }) => {
       const version = (refreshGenerationRef.current += 1);
       setSettingsFresh(false);
+      setReading(true);
 
       try {
         const settings = await api.backup.getSettings();
@@ -334,6 +428,7 @@ export function BackupSection() {
           setDraft(nextDraft);
         }
         savedDraftRef.current = nextDraft;
+        settingsLoadedRef.current = true;
         setSavedDraft(nextDraft);
         if (options?.markFresh !== false && streamLive) setSettingsFresh(true);
         setSaveError(null);
@@ -350,6 +445,10 @@ export function BackupSection() {
           setProjectImportSelections({});
           setProjectBundleSkipped(false);
           setUnsupportedSettings([]);
+          setShelfSkipped([]);
+          setSymlinkSkipped(undefined);
+          setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
+          clearPluginRemovalRef.current();
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -361,6 +460,7 @@ export function BackupSection() {
       } finally {
         if (!signal.aborted && version === refreshGenerationRef.current) {
           setLoading(false);
+          setReading(false);
         }
       }
     };
@@ -418,17 +518,10 @@ export function BackupSection() {
   }, [api]);
 
   async function handleSave() {
-    if (!api || activeAction !== null) return;
-    if (draft.repoUrl.trim() === "") {
-      setSaveError("Repository URL is required.");
-      return;
-    }
-    if (draft.branch.trim() === "") {
-      setSaveError("Branch is required.");
-      return;
-    }
-    if (draft.path.trim() === "") {
-      setSaveError("Subdirectory is required.");
+    if (!api || saveBlocked) return;
+    const missingField = getMissingFieldError(draft);
+    if (missingField != null) {
+      setSaveError(missingField);
       return;
     }
 
@@ -467,6 +560,10 @@ export function BackupSection() {
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
       setUnsupportedSettings([]);
+      setShelfSkipped([]);
+      setSymlinkSkipped(undefined);
+      setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
+      pluginRemoval.clear();
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -504,7 +601,7 @@ export function BackupSection() {
     setValidation(null);
 
     try {
-      const result = await api.backup.validate(savedDraft);
+      const result = await api.backup.validate(requestDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
         return;
@@ -535,9 +632,12 @@ export function BackupSection() {
     setProjectImports([]);
     setProjectBundleSkipped(false);
     setUnsupportedSettings([]);
+    setShelfSkipped([]);
+    setSymlinkSkipped(undefined);
+    setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
 
     try {
-      const result = await api.backup.preview(savedDraft);
+      const result = await api.backup.preview(requestDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
         return;
@@ -568,6 +668,9 @@ export function BackupSection() {
       });
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setUnsupportedSettings(result.data.unsupportedSettings);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
+      setSymlinkSkipped(result.data.symlinkSkipped);
+      setPluginBackup(result.data.plugins);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -584,14 +687,16 @@ export function BackupSection() {
 
     try {
       const result = await api.backup.push({
-        ...savedDraft,
+        ...requestDraft,
         // The digest from the block the user is looking at, so approval cannot carry over to
         // a payload another window changed in between. Sent only while the control is visible.
         approvedSecretDigest:
           overrideSecretScan && secretScanBlocked ? (secretScanApproval ?? undefined) : undefined,
+        approvedPluginRemovalDigest: pluginRemoval.approvedDigest(),
       });
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
+        pluginRemoval.record(result.error);
         const blocked = result.error.code === "SECRET_DETECTED";
         setSecretScanBlocked(blocked);
         // A new digest means new bytes, so a previous approval no longer describes them.
@@ -605,12 +710,16 @@ export function BackupSection() {
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setSecretScanApproval(null);
+      pluginRemoval.clear();
       // The push replaced the remote bundle the candidates and the skipped flag described;
       // their tokens no longer match anything, so a restore would only be refused.
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
       setUnsupportedSettings([]);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
+      setSymlinkSkipped(undefined);
+      setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
@@ -629,7 +738,7 @@ export function BackupSection() {
 
     try {
       const result = await api.backup.restore({
-        ...savedDraft,
+        ...requestDraft,
         approvedCommandTokens: approveCommands ? commandApprovals.map((item) => item.token) : [],
         // Only candidates the user explicitly checked; the backend re-verifies each token
         // against the checked-out payload and validates the target path.
@@ -642,9 +751,7 @@ export function BackupSection() {
       });
       if (!result.success) {
         // A failure after the snapshot completed may have overwritten files already; the
-        // snapshot is the only recovery path, so its location belongs in the error. Config may
-        // have been rewritten as well, so the mirrors are re-seeded as after a success.
-        if (result.error.snapshotPath != null) await reseedConfigMirrors(api);
+        // snapshot is the only recovery path, so its location belongs in the error.
         setActionError(
           result.error.snapshotPath != null
             ? `${getOperationErrorMessage(result.error)} Your settings from before the restore are saved at: ${result.error.snapshotPath}`
@@ -690,7 +797,9 @@ export function BackupSection() {
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setUnsupportedSettings(result.data.unsupportedSettings);
-      await reseedConfigMirrors(api);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
+      setSymlinkSkipped(result.data.symlinkSkipped);
+      setPluginBackup(result.data.plugins);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0
@@ -712,6 +821,15 @@ export function BackupSection() {
     setRestoreConfirmationOpen(true);
   }
 
+  // Hands the missing plugins to Settings → Plugins, where each one gets its install review.
+  function reviewPlugins() {
+    reviewBackedUpPlugins({
+      report: shownPluginBackup,
+      enabled: !busy,
+      openPlugins: () => setActiveSection("plugins"),
+    });
+  }
+
   const actionsRef = useRef<BackupShortcutHandlers | null>(null);
   actionsRef.current = {
     save: handleSave,
@@ -719,6 +837,8 @@ export function BackupSection() {
     preview: handlePreview,
     push: handlePush,
     restore: openRestoreConfirmation,
+    reviewPlugins,
+    confirmPluginRemoval: pluginRemoval.confirm,
     toggleOverride: () => {
       // Mirrors the checkbox's own render condition so the shortcut is never advertised
       // while the control is hidden, and never inert while it is visible.
@@ -750,7 +870,7 @@ export function BackupSection() {
 
       const shortcut = BACKUP_SHORTCUTS.find(([, keybind]) => matchesKeybind(event, keybind));
       const action = shortcut && actionsRef.current?.[shortcut[0]];
-      const option = BACKUP_CONTENT_OPTIONS.find((candidate) =>
+      const option = contentOptionsRef.current.find((candidate) =>
         matchesKeybind(event, candidate.shortcut)
       );
       if (!action && !option) return;
@@ -788,6 +908,7 @@ export function BackupSection() {
       </div>
 
       <section className="border-border-light space-y-4 rounded-md border p-4">
+        <SettingsMark id="backup-repository" />
         <div className="grid min-w-0 gap-4 sm:grid-cols-2">
           <label className="min-w-0 space-y-1.5 sm:col-span-2">
             <span className="text-foreground text-xs font-medium">Repository URL</span>
@@ -828,7 +949,8 @@ export function BackupSection() {
           <legend className="text-foreground text-xs font-medium">
             What to back up and restore
           </legend>
-          {BACKUP_CONTENT_OPTIONS.map((option) => {
+          <SettingsMark id="backup-contents" />
+          {contentOptions.map((option) => {
             const parentOff = option.parent !== undefined && !draft[option.parent];
             return (
               <label
@@ -870,7 +992,7 @@ export function BackupSection() {
           <Button
             size="sm"
             onClick={() => void handleSave()}
-            disabled={busy || !isDirty}
+            disabled={saveBlocked || !isDirty}
             tooltip={`Save settings (${formatKeybind(KEYBINDS.SETTINGS_BACKUP_SAVE)})`}
             className="w-full sm:w-auto"
           >
@@ -882,6 +1004,7 @@ export function BackupSection() {
       </section>
 
       <section className="border-border-light space-y-3 rounded-md border p-4">
+        <SettingsMark id="backup-access" />
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <h3 className="text-foreground text-sm font-medium">Repository access</h3>
@@ -916,6 +1039,7 @@ export function BackupSection() {
       </section>
 
       <section className="space-y-3">
+        <SettingsMark id="backup-preview" />
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h3 className="text-foreground text-sm font-medium">Preview</h3>
@@ -1020,7 +1144,13 @@ export function BackupSection() {
       ) : null}
 
       {actionError ? <div className="text-error text-xs">{actionError}</div> : null}
-      {statusMessage ? <div className="text-success text-xs">{statusMessage}</div> : null}
+      {statusMessage ? <div className="text-success-text text-xs">{statusMessage}</div> : null}
+
+      <PluginRemovalCard
+        removal={pluginRemoval.removal}
+        busy={busy}
+        onConfirm={() => void pluginRemoval.confirm()}
+      />
 
       <section className="border-border-light flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center">
         <Button
@@ -1088,6 +1218,14 @@ export function BackupSection() {
           They were likely saved by a newer Xum; update and restore again to apply them.
         </div>
       ) : null}
+
+      <SkippedNotice intro="Some pinned artifacts were left out:" items={shelfSkipped} />
+      <SkippedNotice
+        intro="These backed-up files are skipped because their local path is a symlink:"
+        items={symlinkSkipped}
+      />
+
+      <BackupPluginsCard report={shownPluginBackup} busy={busy} onReview={reviewPlugins} />
 
       {projectImports.length > 0 ? (
         <div className="border-border-light space-y-3 rounded-md border p-3">

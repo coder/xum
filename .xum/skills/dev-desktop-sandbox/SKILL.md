@@ -65,7 +65,7 @@ bash({
 });
 ```
 
-After a readiness wake, use the sandbox output/ports shown in the matched logs to connect with the Electron or agent-browser workflow. Use `task_await` only when the wake line is not enough context.
+After a readiness wake, read the sandbox output with `task_await` to find the ports, then connect with the Electron or agent-browser workflow.
 
 ## Options
 

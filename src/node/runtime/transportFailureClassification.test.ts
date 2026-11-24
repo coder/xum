@@ -67,6 +67,7 @@ class StubbedSSHRuntime extends SSHRuntime {
       getConfig: () => config,
       spawnRemoteProcess: () => Promise.reject(new Error("exec is stubbed")),
       createPtySession: () => Promise.reject(new Error("no PTY here")),
+      openReverseForward: () => Promise.reject(new Error("no reverse forward here")),
     };
     super(config, transport, workspace);
   }
@@ -119,11 +120,26 @@ describe("read failure vs positive absence", () => {
     ]);
   });
 
+  // uutils coreutils (the default coreutils since Ubuntu 25.10) appends the errno.
+  it("treats uutils diagnostics with an os error suffix as absence", async () => {
+    expect(
+      await classify(
+        "stat: cannot stat '/remote/AGENTS.md': No such file or directory (os error 2)"
+      )
+    ).toEqual([absent, absent]);
+    expect(
+      await classify("stat: cannot stat '/remote/AGENTS.md/x': Not a directory (os error 20)")
+    ).toEqual([absent, absent]);
+  });
+
   it("treats permission and other errors as read failures", async () => {
     expect(await classify("cat: /remote/AGENTS.md: Permission denied")).toEqual([
       unreadable,
       unreadable,
     ]);
+    expect(
+      await classify("stat: cannot stat '/remote/AGENTS.md': Permission denied (os error 13)")
+    ).toEqual([unreadable, unreadable]);
     // OpenSSH can warn about a missing identity file on a working connection:
     // that line must not turn the permission error into "missing".
     expect(
@@ -176,6 +192,15 @@ describe("container exec failures", () => {
     "Shell server terminated (code: 1, signal: null)\n\n" + unavailable[0],
     "[2026-09-28T07:09:47.831Z] Error: Dev container not found.\n    at Ng (devContainersSpecCLI.js:473:1096)\n",
   ];
+  // #5018: the OS refused the dial (a Windows named-pipe ACL, or EPERM). Only a
+  // permission change fixes it. Windows wordings: older clients (docker/for-win
+  // issues) and newer clients (moby client/request.go); not measured here.
+  const ACCESS_DENIAL = /Access is denied\.|operation not permitted/;
+  const accessDenied = [
+    'error during connect: This error may indicate that the docker daemon is not running.: Get "http://%2F%2F.%2Fpipe%2Fdocker_engine/v1.24/containers/json": open //./pipe/docker_engine: Access is denied.\n',
+    "failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine; check if the path is correct and if the daemon is running: open //./pipe/dockerDesktopLinuxEngine: Access is denied.\n",
+    'error during connect: Get "http://10.0.0.5:2375/v1.47/containers/ws/json": dial tcp 10.0.0.5:2375: connect: operation not permitted\n',
+  ];
   const transport = async (runtime: Probed) =>
     (await failures(runtime, false)).map((error) => isRuntimeTransportError(error));
 
@@ -213,11 +238,26 @@ describe("container exec failures", () => {
       "Error response from daemon: client version 1.52 is too new. Maximum supported API version is 1.47\n",
       "Error response from daemon: authorization denied by plugin opa-docker-authz: request rejected by administrative policy\n",
       "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: permission denied\n",
+      ...accessDenied,
     ]) {
       const refused = await failures(new StubbedDockerRuntime([refusal, 1]), false);
       expect(refused.map((error) => isRuntimeTransportError(error))).toEqual([false, false]);
       expect(refused.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
     }
+    // Near miss: the same connection lines with a dial error that is not a denial
+    // (the pipe/socket is simply absent) stay transport.
+    for (const denied of accessDenied) {
+      const absent = denied.replace(ACCESS_DENIAL, "The system cannot find the file specified.");
+      expect(absent).not.toBe(denied);
+      expect(await transport(new StubbedDockerRuntime([absent, 1]))).toEqual([true, true]);
+    }
+    // #5021: a probe SIGKILLed with empty output (exit 137) stays a read failure.
+    // Measured on docker 27.5.1, a container killed mid-exec and a probe OOM-killed
+    // inside a still-running container both give exactly this shape, so it does
+    // not prove the container is gone.
+    const killed = await failures(new StubbedDockerRuntime(["", 137]), false);
+    expect(killed.map((error) => isRuntimeTransportError(error))).toEqual([false, false]);
+    expect(killed.map((error) => isRuntimeReadFailure(error))).toEqual([true, true]);
     // #4985: a daemon line does not make an uninvokable command (exit 126/127) transport.
     const daemonNoBash = `Error response from daemon: ${noBash}`;
     for (const exitCode of [126, 127]) {

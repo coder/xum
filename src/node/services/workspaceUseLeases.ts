@@ -1,9 +1,11 @@
+import { WorkspaceMutationInProgressError } from "@/node/utils/concurrency/lockErrors";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { getErrorMessage } from "@/common/utils/errors";
+import type { WorkspaceBackgroundProcessBlocker } from "@/common/types/workspace";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -33,6 +35,10 @@ import {
  * record schema. The path is unique to this instance, so acquiring it never contends.
  */
 // "unarchive" is held by a keep-mode unarchive from before its commit until it finishes (#4871).
+// "launch" is held by a sub-agent task's launch from before its row becomes `starting` until the
+// launch settles: no structural mutator ignores it, so a removal never
+// deletes a checkout a launch is preparing, and another backend's startup recovery leaves the
+// preparing task alone.
 export type WorkspaceUseKind =
   | "turn"
   | "terminal"
@@ -40,13 +46,21 @@ export type WorkspaceUseKind =
   | "mcp"
   | "exec"
   | "editor"
-  | "unarchive";
+  | "unarchive"
+  | "launch";
 
 /** Thrown by hold() while a structural mutation of the workspace is in progress. */
-export class WorkspaceMutationInProgressError extends Error {}
+export { WorkspaceMutationInProgressError };
 
 /** Thrown by withMutationGate() when the workspace is in use or already being mutated. */
-export class WorkspaceBusyError extends Error {}
+export class WorkspaceBusyError extends Error {
+  constructor(
+    message: string,
+    readonly backgroundProcesses?: WorkspaceBackgroundProcessBlocker[]
+  ) {
+    super(message);
+  }
+}
 
 export interface WorkspaceMutationGateOptions {
   /**
@@ -61,6 +75,10 @@ export interface WorkspaceMutationGateOptions {
    * instead of leasing: true when any runs in the workspace, in this or any other process.
    */
   hasRunningBackgroundProcesses: (workspaceId: string) => Promise<boolean>;
+  /** Removal reports exact records so the user can acknowledge only unknown activity. */
+  getBackgroundProcessBlockers?: (
+    workspaceId: string
+  ) => Promise<WorkspaceBackgroundProcessBlocker[]>;
 }
 
 export interface WorkspaceUseLease {
@@ -84,6 +102,16 @@ export function workspaceUseLockDir(rootDir: string, workspaceId: string): strin
   return path.join(rootDir, "locks", "workspace-use", safeName(workspaceId));
 }
 
+/**
+ * Directory holding every backend's init-record locks for one workspace (#4918; see
+ * InitStateManager). Apart from the use leases on purpose: they say a backend may still write
+ * the workspace's init record, which only init replay weighs, never a mutation gate.
+ */
+export function initRecordLockDir(rootDir: string, workspaceId: string): string {
+  assert(workspaceId.length > 0, "initRecordLockDir requires a workspace id");
+  return path.join(rootDir, "locks", "init-record", safeName(workspaceId));
+}
+
 /** The per-workspace mutation gate a structural mutator holds while it runs. */
 export function workspaceMutationLockPath(rootDir: string, workspaceId: string): string {
   assert(workspaceId.length > 0, "workspaceMutationLockPath requires a workspace id");
@@ -93,6 +121,20 @@ export function workspaceMutationLockPath(rootDir: string, workspaceId: string):
 interface HeldFile {
   count: number;
   release: () => Promise<void>;
+}
+
+/**
+ * The text of a WorkspaceMutationInProgressError. Exported so the SessionLocks
+ * test layers refuse with today's text, byte for byte.
+ */
+export function workspaceMutationInProgressMessage(
+  workspaceId: string,
+  gate: { holder: string; why: string }
+): string {
+  return (
+    `Workspace ${workspaceId} is being renamed, removed or archived by ${gate.holder}; ` +
+    `try again when it finishes (${gate.why}).`
+  );
 }
 
 /** One instance per backend (ServiceContainer). */
@@ -186,8 +228,21 @@ export class WorkspaceUseLeases {
       // files are judged by their counts, read under the transition lock: a hold that published
       // its file and probed the gate before it existed has not counted itself yet, and would
       // otherwise be missed. Once the lock is free, every later transition sees the gate.
+      const backgroundProcesses: WorkspaceBackgroundProcessBlocker[] = [];
       for (const id of ids) {
-        await this.transitions.withLock(id, () => this.assertUnused(id, options));
+        backgroundProcesses.push(
+          ...(await this.transitions.withLock(id, () => this.assertUnused(id, options)))
+        );
+      }
+      // Scan every target before offering recovery. An unknown record must not hide a live process.
+      if (backgroundProcesses.length > 0) {
+        const running = backgroundProcesses.some((record) => record.state === "running");
+        throw new WorkspaceBusyError(
+          running
+            ? "A workspace has a running background process; stop it and try again."
+            : "Xum cannot verify background activity from old process records; review the records before removal.",
+          backgroundProcesses
+        );
       }
     } catch (error) {
       await releaseAll();
@@ -200,7 +255,7 @@ export class WorkspaceUseLeases {
   private async assertUnused(
     workspaceId: string,
     options: WorkspaceMutationGateOptions
-  ): Promise<void> {
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
     // The held entries themselves, so no kind can be left out of the check.
     for (const [kind, file] of this.held.get(workspaceId) ?? []) {
       if (options.ignoreOwnKinds?.get(workspaceId)?.has(kind) === true) continue;
@@ -238,12 +293,23 @@ export class WorkspaceUseLeases {
           `${probe.holder}; try again when it finishes (${probe.why}).`
       );
     }
+    return await this.checkBackgroundProcesses(workspaceId, options);
+  }
+
+  private async checkBackgroundProcesses(
+    workspaceId: string,
+    options: WorkspaceMutationGateOptions
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
+    if (options.getBackgroundProcessBlockers != null) {
+      return await options.getBackgroundProcessBlockers(workspaceId);
+    }
     if (await options.hasRunningBackgroundProcesses(workspaceId)) {
       throw new WorkspaceBusyError(
         `Workspace ${workspaceId} has a running background process (in this, another or a ` +
           "crashed Xum process); stop it and try again."
       );
     }
+    return [];
   }
 
   /**
@@ -321,8 +387,7 @@ export class WorkspaceUseLeases {
       if (gate.state === "held") {
         await release?.();
         throw new WorkspaceMutationInProgressError(
-          `Workspace ${workspaceId} is being renamed, removed or archived by ${gate.holder}; ` +
-            `try again when it finishes (${gate.why}).`
+          workspaceMutationInProgressMessage(workspaceId, gate)
         );
       }
       if (existing != null) {

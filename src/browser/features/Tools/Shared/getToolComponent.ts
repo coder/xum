@@ -15,22 +15,22 @@ import {
 
 import { AnalyticsQueryToolCall } from "../analyticsQuery/AnalyticsQueryToolCall";
 import { AttachFileToolCall } from "../AttachFileToolCall";
-import { AdvisorToolCall } from "../AdvisorToolCall";
+import { ArtifactToolCall } from "../ArtifactToolCall";
 import { GenericToolCall } from "../GenericToolCall";
 import { BashToolCall } from "../BashToolCall";
 import { DesktopActionToolCall } from "../DesktopActionToolCall";
 import { DesktopScreenshotToolCall } from "../DesktopScreenshotToolCall";
+import { ComputerToolCall } from "../ComputerToolCall";
 import { FileEditToolCall } from "../FileEditToolCall";
 import { AgentSkillReadToolCall } from "../AgentSkillReadToolCall";
 import { AgentSkillReadFileToolCall } from "../AgentSkillReadFileToolCall";
 import { AgentSkillListToolCall } from "../AgentSkillListToolCall";
 import { FileReadToolCall } from "../FileReadToolCall";
 import { MemoryToolCall } from "../MemoryToolCall";
-import { IntuitionToolCall } from "../IntuitionToolCall";
 import { WebFetchToolCall } from "../WebFetchToolCall";
 import { WebSearchToolCall } from "../WebSearchToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
-import { AskUserQuestionToolCall } from "../AskUserQuestionToolCall";
+import { PlacedAskUserQuestionToolCall } from "../AskUserQuestionToolCall";
 import { ProposePlanToolCall } from "../ProposePlanToolCall";
 import { TodoToolCall } from "../TodoToolCall";
 import { StatusSetToolCall } from "../StatusSetToolCall";
@@ -78,8 +78,8 @@ const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
   bash: BashToolCall,
   file_read: FileReadToolCall,
   memory: MemoryToolCall,
-  intuition: IntuitionToolCall,
   attach_file: AttachFileToolCall,
+  artifact: ArtifactToolCall,
   desktop_screenshot: DesktopScreenshotToolCall,
   desktop_move_mouse: DesktopActionToolCall,
   desktop_click: DesktopActionToolCall,
@@ -88,13 +88,14 @@ const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
   desktop_scroll: DesktopActionToolCall,
   desktop_type: DesktopActionToolCall,
   desktop_key_press: DesktopActionToolCall,
+  computer: ComputerToolCall,
   agent_skill_read: AgentSkillReadToolCall,
   agent_skill_read_file: AgentSkillReadFileToolCall,
   agent_skill_list: AgentSkillListToolCall,
   file_edit_replace_string: FileEditToolCall,
   file_edit_replace_lines: FileEditToolCall,
   file_edit_insert: FileEditToolCall,
-  ask_user_question: AskUserQuestionToolCall,
+  ask_user_question: PlacedAskUserQuestionToolCall,
   propose_plan: ProposePlanToolCall,
   todo_write: TodoToolCall,
   status_set: StatusSetToolCall,
@@ -102,7 +103,6 @@ const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
   tool_catalog_search: ToolSearchToolCall,
   tool_search: ToolSearchToolCall,
   analytics_query: AnalyticsQueryToolCall,
-  advisor: AdvisorToolCall,
   web_fetch: WebFetchToolCall,
   bash_background_list: BashBackgroundListToolCall,
   bash_background_terminate: BashBackgroundTerminateToolCall,
@@ -174,6 +174,7 @@ const TOOL_SCHEMA_OVERRIDES: Record<string, ZodSchema> = {
 /**
  * Returns the appropriate tool component for a given tool name, args and result.
  * Validates args against Zod schemas; returns GenericToolCall if validation fails or tool unknown.
+ * Removed tools still use this fallback so saved transcripts remain readable without their renderer.
  * `result` is required so every caller decides on it: a persisted payload that exceeded the
  * depth bound is replaced by TOOL_PAYLOAD_DEPTH_REJECTION (a string) when history is read, and
  * tool-specific renderers assume object results (`"key" in result` throws on a string), which

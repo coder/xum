@@ -129,6 +129,9 @@ describe("AgentPeerMessageBroker", () => {
     { relation: "target_ancestor", relationship: "descendant" },
     { relation: "peer", relationship: "sibling" },
     { relation: "target_unrelated", relationship: "unrelated" },
+    { relation: "target_main_chat", relationship: "side_chat" },
+    { relation: "target_side_chat", relationship: "main_chat" },
+    { relation: "target_tagged", relationship: "tagged" },
   ] as const)(
     "maps routing relation $relation to envelope relationship $relationship",
     ({ relation, relationship }) => {

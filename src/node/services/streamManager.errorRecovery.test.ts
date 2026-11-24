@@ -1,5 +1,5 @@
-import { describe, test, expect } from "bun:test";
-import type { TurnEngineEvent } from "./streamManager";
+import { describe, test, expect, spyOn } from "bun:test";
+import type { TurnEngineEvent, TurnExecutionOptions } from "./streamManager";
 import * as aiSdk from "ai";
 import {
   APICallError,
@@ -8,8 +8,13 @@ import {
   type LanguageModel,
   type ModelMessage,
 } from "ai";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { OPENAI_RESPONSES_BASE_URL_HINT } from "./utils/openAIResponsesBaseUrlHint";
+import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
+import { assemblePromptPayload } from "./turnContextAssembler";
+import { log } from "./log";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -19,7 +24,11 @@ import {
   appendPartialAssistantForTests,
   createStreamResultForTests,
   prepareStepForTests,
+  REFUSAL_FINISH,
 } from "./streamManager.suite.testHarness";
+import { Ok } from "@/common/types/result";
+import { clampErrorMessage } from "@/common/utils/errors";
+import { ERROR_MESSAGE_CLAMP_MAX_CHARS } from "@/constants/errors";
 
 installStreamManagerTestHistory();
 
@@ -30,13 +39,14 @@ function createApiCallErrorForTests(overrides: {
   isRetryable: boolean;
   data?: unknown;
   url?: string;
+  responseHeaders?: Record<string, string>;
 }): APICallError {
   return new APICallError({
     message: overrides.message,
     url: overrides.url ?? "https://api.openai.com/v1/responses",
     requestBodyValues: {},
     statusCode: overrides.statusCode,
-    responseHeaders: {},
+    responseHeaders: overrides.responseHeaders ?? {},
     responseBody: overrides.responseBody,
     isRetryable: overrides.isRetryable,
     ...(overrides.data !== undefined ? { data: overrides.data } : {}),
@@ -90,6 +100,7 @@ function createRecoveryHarness() {
   let attempts: Attempt[] = [];
   let calls: StreamTextOptions[] = [];
   let streamUsage: unknown = TEST_USAGE;
+  let streamSteps: unknown[] = [];
   let workspaceId = "";
   let stops: Array<Promise<unknown>> = [];
   const context: AttemptContext = {
@@ -114,6 +125,7 @@ function createRecoveryHarness() {
         ...createStreamResultForTests(attempt(options, context)),
         usage: Promise.resolve(streamUsage),
         totalUsage: Promise.resolve(streamUsage),
+        steps: Promise.resolve(streamSteps),
       };
     }),
   });
@@ -126,8 +138,12 @@ function createRecoveryHarness() {
     modelString?: string;
     messages?: ModelMessage[];
     providerOptions?: Record<string, unknown>;
+    initialMetadata?: Partial<MuxMetadata>;
     /** SDK-reported total usage for every attempt of this turn. */
     streamUsage?: unknown;
+    /** SDK-reported steps for every attempt of this turn; omitted means none. */
+    streamSteps?: unknown[];
+    requestOptions?: Partial<TurnExecutionOptions>;
   }) {
     const historySequence = input.historySequence ?? 1;
     const messageId = `${input.workspaceId}-${historySequence}`;
@@ -136,6 +152,7 @@ function createRecoveryHarness() {
     calls = [];
     stops = [];
     streamUsage = "streamUsage" in input ? input.streamUsage : TEST_USAGE;
+    streamSteps = input.streamSteps ?? [];
     await appendPartialAssistantForTests(input.workspaceId, messageId, historySequence);
     const result = await streamManager.startStream(
       testStartOptions({
@@ -146,7 +163,9 @@ function createRecoveryHarness() {
         ...(input.modelString != null ? { modelString: input.modelString } : {}),
         ...(input.messages != null ? { messages: input.messages } : {}),
         providerOptions: input.providerOptions,
+        ...(input.initialMetadata != null ? { initialMetadata: input.initialMetadata } : {}),
         providedRuntimeTempDir: "",
+        ...input.requestOptions,
       })
     );
     if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result)}`);
@@ -254,13 +273,18 @@ describe("StreamManager - previousResponseId recovery", () => {
     const { calls, messageId } = await harness.run({
       workspaceId,
       providerOptions: { openai: { previousResponseId: "resp_abc123" } },
-      // The SDK total covers only the restarted stream, not the completed first step.
+      // The SDK total and steps cover only the restarted stream, not the completed first step.
       streamUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      streamSteps: [{ usage: { inputTokens: 4, outputTokens: 5, totalTokens: 9 } }],
       attempts: [
         async function* (options) {
           yield { type: "start-step" };
           yield { type: "text-delta", text: "step one" };
-          yield { type: "finish-step", usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } };
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+            providerMetadata: { anthropic: { cacheCreationInputTokens: 30 } },
+          };
           await prepareStepForTests(options, stepMessages, 1);
           yield {
             type: "error",
@@ -285,11 +309,15 @@ describe("StreamManager - previousResponseId recovery", () => {
     expect(harness.errors()).toEqual([]);
     const [streamEnd] = harness.streamEnds();
     expect(partTexts(streamEnd)).toEqual(["step one", "step two"]);
-    // Step-boundary retries report the per-step accumulation, not the restarted SDK total.
+    // Step-boundary retries report the per-step accumulation, not the restarted SDK total,
+    // and keep the first step's cache writes in the provider metadata priced with it.
     expect(streamEnd?.metadata.usage).toMatchObject({
       inputTokens: 5,
       outputTokens: 7,
       totalTokens: 12,
+    });
+    expect(streamEnd?.metadata.providerMetadata).toMatchObject({
+      anthropic: { cacheCreationInputTokens: 30 },
     });
     // The retried step reuses its start index instead of recording a duplicate.
     expect(await committedStepStarts(workspaceId, messageId)).toEqual([0, 1]);
@@ -869,29 +897,48 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
       expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
     });
   }
+});
 
-  for (const [modelId, repaired] of [
-    ["openai/gpt-5.2-codex", true],
-    ["anthropic/claude-opus-4-5", false],
-  ] as const) {
-    test(`Xum gateway ${modelId} ${repaired ? "is" : "is not"} eligible for the repair`, async () => {
-      const harness = createRecoveryHarness();
-
-      const { calls } = await runReplayTurn(harness, {
-        workspaceId: "replay-gateway",
-        model: createTestLanguageModel(modelId, "gateway"),
-        modelString: `mux-gateway:${modelId}`,
-        attempts: repaired
-          ? [failingAttempt(openAIReasoningReplayRejections[0].error), successfulAttempt]
-          : [failingAttempt(openAIReasoningReplayRejections[0].error)],
-      });
-
-      expect(calls).toHaveLength(repaired ? 2 : 1);
-      expect(harness.streamEnds()).toHaveLength(repaired ? 1 : 0);
-      expect(harness.errors()).toHaveLength(repaired ? 0 : 1);
-      expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
+describe("StreamManager - error partial ordering", () => {
+  test("a stop during the error partial write cannot replace it with a pre-error snapshot", async () => {
+    // #5344: the error partial is the stream's terminal snapshot. A stop that lands while it is
+    // being written runs its own pre-abort flush; that flush must not land after the error
+    // partial and drop the error from partial.json.
+    const harness = createRecoveryHarness();
+    const workspaceId = "error-partial-vs-stop";
+    const writePartial = historyService.writePartial.bind(historyService);
+    let stop: Promise<unknown> | undefined;
+    const writeSpy = spyOn(historyService, "writePartial").mockImplementation((id, message) => {
+      if (message.metadata?.error === undefined || stop !== undefined) {
+        return writePartial(id, message);
+      }
+      const write = writePartial(id, message);
+      stop = harness.streamManager.stopStream(workspaceId, { abortReason: "user" });
+      return write;
     });
-  }
+    try {
+      const { messageId } = await harness.run({
+        workspaceId,
+        attempts: [
+          async function* () {
+            await Promise.resolve();
+            yield { type: "start-step" };
+            yield { type: "text-delta", text: "before the failure" };
+            yield { type: "error", error: new Error("provider exploded") };
+          },
+        ],
+      });
+      expect(stop).toBeDefined();
+      await stop;
+
+      expect(harness.errors()).toHaveLength(1);
+      const partial = await historyService.readPartial(workspaceId);
+      expect(partial?.id).toBe(messageId);
+      expect(partial?.metadata?.error ?? "no error metadata").toContain("provider exploded");
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
 });
 
 describe("StreamManager - stream error classification", () => {
@@ -910,6 +957,20 @@ describe("StreamManager - stream error classification", () => {
     expect(partial?.metadata?.errorType).toBe(harness.errors()[0]?.errorType);
     return harness.errors()[0]?.errorType;
   }
+
+  test("clamps a huge provider error message before it is persisted and emitted", async () => {
+    const harness = createRecoveryHarness();
+    const huge = `head ${"x".repeat(ERROR_MESSAGE_CLAMP_MAX_CHARS * 2)} tail`;
+    await harness.run({
+      workspaceId: "clamp-error",
+      attempts: [failingAttempt(new Error(huge))],
+    });
+    const emitted = harness.errors()[0]?.error ?? "";
+    expect(emitted).toBe(clampErrorMessage(huge));
+    expect(emitted.length).toBeLessThan(huge.length);
+    const partial = await historyService.readPartial("clamp-error");
+    expect(partial?.metadata?.error).toBe(emitted);
+  });
 
   test("unwraps RetryError.lastError to classify model_not_found", async () => {
     const apiError = createApiCallErrorForTests({
@@ -942,6 +1003,94 @@ describe("StreamManager - stream error classification", () => {
     expect(await errorTypeForStreamFailure(apiError)).toBe("model_not_found");
   });
 
+  // Google Vertex AI ADC: google-auth-library reads the GOOGLE_APPLICATION_CREDENTIALS
+  // file locally, so a retry fails the same way and auto-retry must stop.
+  test.each([
+    "The incoming JSON object does not contain a client_email field",
+    // On its own, "refresh_token" would read as a context window error.
+    "The incoming JSON object does not contain a refresh_token field",
+  ])(
+    "classifies an unusable GOOGLE_APPLICATION_CREDENTIALS file as authentication: %s",
+    async (reason) => {
+      const error = new Error(
+        "Unable to read the credential file specified by the GOOGLE_APPLICATION_CREDENTIALS " +
+          `environment variable: ${reason}`
+      );
+
+      expect(await errorTypeForStreamFailure(error)).toBe("authentication");
+    }
+  );
+
+  // Google Vertex AI ADC: google-auth-library could not reach Google's OAuth token endpoint
+  // (offline, a proxy, a firewall). A retry can succeed; compacting the chat cannot help.
+  test("classifies a failed connection to Google's token endpoint as a network error", async () => {
+    const error = new Error(
+      "request to https://oauth2.googleapis.com/token failed, reason: connect ECONNREFUSED 142.250.0.1:443"
+    );
+
+    expect(await errorTypeForStreamFailure(error)).toBe("network");
+  });
+
+  describe("OpenAI Daybreak access program rejections", () => {
+    // Built-in OpenAI provider with a custom base URL, the route that gets the
+    // Responses base-URL hint on generic 400s.
+    const accessProgramError = (code: string, statusCode: number, message: string) =>
+      createApiCallErrorForTests({
+        message: "Bad Request",
+        url: "https://proxy.example.com/v1/responses",
+        statusCode,
+        responseBody: JSON.stringify({ error: { code, message } }),
+        isRetryable: false,
+        data: { error: { code, message } },
+      });
+
+    let runs = 0;
+    async function surfacedError(error: unknown): Promise<{ type: unknown; message: unknown }> {
+      const harness = createRecoveryHarness();
+      await harness.run({
+        workspaceId: `access-program-${++runs}`,
+        attempts: [failingAttempt(error)],
+        initialMetadata: { routeProvider: "openai" },
+      });
+      const [event] = harness.errors();
+      return { type: event?.errorType, message: event?.error };
+    }
+
+    for (const [code, statusCode] of [
+      ["invalid_access_program", 400],
+      ["unsupported_access_program", 400],
+      ["access_program_not_enabled", 403],
+    ] as const) {
+      test(`stops auto-retry and keeps OpenAI's explanation for ${code}`, async () => {
+        const openaiMessage = `Program rejected (${code}).`;
+        const apiError = accessProgramError(code, statusCode, openaiMessage);
+        const retryError = new RetryError({
+          message: "AI SDK retry exhausted",
+          reason: "maxRetriesExceeded",
+          errors: [apiError],
+        });
+        for (const error of [apiError, retryError]) {
+          const surfaced = await surfacedError(error);
+          expect(surfaced.type).toBe("authentication");
+          expect(surfaced.message).toEndWith(` OpenAI: ${openaiMessage}`);
+          expect(surfaced.message).not.toBe(` OpenAI: ${openaiMessage}`);
+        }
+      });
+    }
+
+    test("leaves other 400 and 403 rejections unchanged", async () => {
+      for (const [code, statusCode] of [
+        ["invalid_value", 400],
+        ["unsupported_country_region_territory", 403],
+      ] as const) {
+        const surfaced = await surfacedError(accessProgramError(code, statusCode, "Nope."));
+        expect(surfaced.type).not.toBe("authentication");
+        expect(surfaced.message).not.toContain("OpenAI: ");
+        if (statusCode === 400) expect(surfaced.message).toContain(OPENAI_RESPONSES_BASE_URL_HINT);
+      }
+    });
+  });
+
   const categorizeCases: Array<{ name: string; error: unknown; expected: string }> = [
     {
       name: "classifies Anthropic missing message_stop as stream_truncated",
@@ -961,13 +1110,12 @@ describe("StreamManager - stream error classification", () => {
     {
       name: "classifies 402 payment required as quota (avoid auto-retry)",
       error: createApiCallErrorForTests({
-        message: "Insufficient balance. Please add credits to continue.",
-        url: "https://gateway.mux.coder.com/api/v1/ai-gateway/v1/ai/language-model",
+        message: "Payment required",
+        url: "https://openrouter.ai/api/v1/chat/completions",
         statusCode: 402,
-        responseBody:
-          '{"error":{"message":"Insufficient balance. Please add credits to continue.","type":"invalid_request_error"}}',
+        responseBody: '{"error":{"message":"Payment required","code":402}}',
         isRetryable: false,
-        data: { error: { message: "Insufficient balance. Please add credits to continue." } },
+        data: { error: { message: "Payment required", code: 402 } },
       }),
       expected: "quota",
     },
@@ -1005,6 +1153,17 @@ describe("StreamManager - stream error classification", () => {
       }),
       expected: "rate_limit",
     },
+    {
+      // 500 is the lowest status that counts as a provider outage.
+      name: "classifies HTTP 500 as server_error",
+      error: createApiCallErrorForTests({
+        message: "Internal server error",
+        statusCode: 500,
+        responseBody: '{"error":{"message":"Internal server error"}}',
+        isRetryable: true,
+      }),
+      expected: "server_error",
+    },
   ];
 
   for (const categorizeCase of categorizeCases) {
@@ -1012,4 +1171,706 @@ describe("StreamManager - stream error classification", () => {
       expect(await errorTypeForStreamFailure(categorizeCase.error)).toBe(categorizeCase.expected);
     });
   }
+
+  let retryAfterRun = 0;
+  async function retryAfterForStreamFailure(error: unknown): Promise<number | undefined> {
+    const { completion } = await createRecoveryHarness().run({
+      workspaceId: `retry-after-${++retryAfterRun}`,
+      attempts: [failingAttempt(error)],
+    });
+    expect(completion.status).toBe("failed");
+    return completion.status === "failed" ? completion.streamError.retryAfterMs : undefined;
+  }
+
+  const rateLimited = (responseHeaders: Record<string, string>, statusCode = 429) =>
+    createApiCallErrorForTests({
+      message: "Too many requests",
+      statusCode,
+      responseBody: '{"error":{"message":"Too many requests"}}',
+      isRetryable: true,
+      responseHeaders,
+    });
+
+  test("carries the provider's Retry-After into a rate_limit error", async () => {
+    expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "30" }))).toBe(30_000);
+    // retry-after-ms is more precise and wins, as in the AI SDK's own retry loop.
+    expect(
+      await retryAfterForStreamFailure(
+        rateLimited({ "retry-after-ms": "1500", "retry-after": "30" })
+      )
+    ).toBe(1500);
+    const date = new Date(Date.now() + 45_000).toUTCString();
+    const fromDate = await retryAfterForStreamFailure(rateLimited({ "retry-after": date }));
+    expect(fromDate).toBeGreaterThan(40_000);
+    expect(fromDate).toBeLessThanOrEqual(45_000);
+  });
+
+  test("reads Retry-After from the last attempt after the AI SDK exhausts its retries", async () => {
+    const retryError = new RetryError({
+      message: "AI SDK retry exhausted",
+      reason: "maxRetriesExceeded",
+      errors: [rateLimited({ "retry-after": "1" }), rateLimited({ "retry-after": "90" })],
+    });
+    expect(await retryAfterForStreamFailure(retryError)).toBe(90_000);
+  });
+
+  test("ignores Retry-After on errors that are not rate limits, and malformed values", async () => {
+    expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "30" }, 503))).toBe(
+      undefined
+    );
+    expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "soon" }))).toBe(
+      undefined
+    );
+    expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "-5" }))).toBe(undefined);
+  });
+});
+
+describe("StreamManager - Anthropic mid-stream overload", () => {
+  /** A real Anthropic model whose stream starts, then sends one SSE `error` event. */
+  function anthropicStreamFailingWith(error: Record<string, unknown>) {
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5-5",
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 10, output_tokens: 0 },
+        },
+      },
+      { type: "error", error },
+    ];
+    return createAnthropic({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        () =>
+          Promise.resolve(
+            new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+              headers: { "content-type": "text/event-stream" },
+            })
+          ),
+        { preconnect: fetch.preconnect.bind(fetch) }
+      ),
+    })("claude-opus-5-5");
+  }
+  /** Forwards the request to the real SDK, so the stream error is built as in production. */
+  const realSdkAttempt: Attempt = async function* (options) {
+    const result = aiSdk.streamText({ model: options.model, prompt: "continue", maxRetries: 0 });
+    yield* result.fullStream;
+  };
+
+  // Seen live: a proxy in front of Anthropic wraps the provider's overloaded_error event in
+  // the message of a generic `error`, so the SDK's StreamProviderError has no 529 status, is
+  // not retryable, and showed the raw "unknown stream error" text.
+  const wrappedOverload = {
+    type: "error",
+    message:
+      'unknown stream error: received error while streaming: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_1"}\n',
+  };
+  // The SDK's own form of the same event: type overloaded_error, status 529.
+  const nativeOverload = { type: "overloaded_error", message: "Overloaded" };
+
+  test.each([
+    ["a proxy-wrapped", wrappedOverload],
+    ["a native", nativeOverload],
+  ])("%s overloaded_error event is reported like an HTTP 529", async (_name, error) => {
+    const harness = createRecoveryHarness();
+    await harness.run({
+      workspaceId: "anthropic-overload",
+      model: anthropicStreamFailingWith(error),
+      modelString: "anthropic:claude-opus-5-5",
+      attempts: [realSdkAttempt],
+    });
+
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.errors()[0]).toMatchObject({
+      error: "Anthropic is temporarily overloaded (HTTP 529). Please try again later.",
+      errorType: "server_error",
+    });
+  });
+
+  // Validation messages can echo request text (a tool description), which can hold an
+  // overload body. Only the generic wrapper's embedded body counts.
+  test.each([
+    ["mentions", "tool description: retry on overloaded_error"],
+    ["embeds", 'tool description: {"error":{"type":"overloaded_error"}}'],
+  ])(
+    "an invalid_request_error whose text %s overloaded_error keeps its own message",
+    async (_name, message) => {
+      const harness = createRecoveryHarness();
+      await harness.run({
+        workspaceId: "anthropic-not-overload",
+        model: anthropicStreamFailingWith({ type: "invalid_request_error", message }),
+        modelString: "anthropic:claude-opus-5-5",
+        attempts: [realSdkAttempt],
+      });
+
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.errors()[0]?.error).toBe(message);
+    }
+  );
+});
+
+describe("StreamManager - Anthropic thinking signature recovery", () => {
+  // Verbatim shape from an Opus 5.5 route without the drop_block control, after
+  // a memory write changed the system prompt and tool list between turns.
+  const bindingRejectionBody = JSON.stringify({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      message:
+        'messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block". That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header. The `system` prompt and the `tools` list both differ from when this block was created.',
+    },
+  });
+  const successEvents = [
+    {
+      type: "message_start",
+      message: {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: "claude-opus-5-5",
+        content: [],
+        stop_reason: null,
+        usage: { input_tokens: 10, output_tokens: 0 },
+      },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "repaired" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+    { type: "message_stop" },
+  ];
+
+  /** A real Anthropic Messages model whose HTTP responses are scripted; request bodies are captured. */
+  function scriptedAnthropicModel(responses: Array<() => Response | Promise<Response>>) {
+    const requestBlockTypes: string[][] = [];
+    const model = createAnthropic({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        (_url: unknown, init?: { body?: unknown }) => {
+          const body = JSON.parse(String(init?.body)) as {
+            messages: Array<{ content: Array<{ type: string }> }>;
+          };
+          requestBlockTypes.push(
+            body.messages.flatMap((message) => message.content.map((block) => block.type))
+          );
+          const next = responses.shift();
+          if (!next) throw new Error(`Unexpected Anthropic request ${requestBlockTypes.length}`);
+          return Promise.resolve(next());
+        },
+        { preconnect: fetch.preconnect.bind(fetch) }
+      ),
+    })("claude-opus-5-5");
+    return { model, requestBlockTypes };
+  }
+  const rejection = () =>
+    new Response(bindingRejectionBody, {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  const success = () =>
+    new Response(successEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  /** Forwards the request StreamManager built to the real SDK, so the wire shape is real. */
+  const realSdkAttempt: Attempt = async function* (options) {
+    const result = aiSdk.streamText({
+      model: options.model,
+      ...(options.messages != null ? { messages: options.messages } : { prompt: "continue" }),
+      maxRetries: 0,
+    });
+    yield* result.fullStream;
+  };
+
+  const staleThinking = {
+    type: "reasoning" as const,
+    text: "earlier thinking",
+    providerOptions: { anthropic: { signature: "sig-bound-to-old-prefix" } },
+  };
+  const toolCall = {
+    type: "tool-call" as const,
+    toolCallId: "toolu_1",
+    toolName: "bash",
+    input: { script: "pwd" },
+  };
+  const messages = (): ModelMessage[] => [
+    { role: "user", content: "earlier" },
+    { role: "assistant", content: [staleThinking, toolCall] },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "toolu_1",
+          toolName: "bash",
+          output: { type: "text", value: "/tmp" },
+        },
+      ],
+    },
+    { role: "user", content: "now" },
+  ];
+  test("strips replayed thinking once and keeps the tool loop", async () => {
+    const harness = createRecoveryHarness();
+    const { model, requestBlockTypes } = scriptedAnthropicModel([rejection, success]);
+
+    const { calls, messageId } = await harness.run({
+      workspaceId: "anthropic-binding-repair",
+      model,
+      modelString: "coder:claude-aws-us-east-2/claude-opus-5-5",
+      messages: messages(),
+      attempts: [realSdkAttempt, realSdkAttempt],
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(requestBlockTypes[0]).toContain("thinking");
+    expect(requestBlockTypes[1]).not.toContain("thinking");
+    expect(requestBlockTypes[1]).toContain("tool_use");
+    expect(requestBlockTypes[1]).toContain("tool_result");
+    expect(harness.errors()).toEqual([]);
+    expect(harness.streamEnds()).toHaveLength(1);
+    // The committed row carries the receipt, so later turns keep thinking out.
+    const history = await historyService.getHistoryFromLatestBoundary("anthropic-binding-repair");
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.find((message) => message.id === messageId)?.metadata?.anthropicThinkingReplay
+    ).toBe("off");
+  });
+
+  test("persists the receipt before the retry request goes out", async () => {
+    const workspaceId = "anthropic-binding-receipt-first";
+    const harness = createRecoveryHarness();
+    const receiptsAtRetry: Array<MuxMetadata["anthropicThinkingReplay"]> = [];
+    const { model } = scriptedAnthropicModel([
+      rejection,
+      async () => {
+        const partial = await historyService.readPartial(workspaceId);
+        receiptsAtRetry.push(partial?.metadata?.anthropicThinkingReplay);
+        return success();
+      },
+    ]);
+
+    await harness.run({
+      workspaceId,
+      model,
+      messages: messages(),
+      attempts: [realSdkAttempt, realSdkAttempt],
+    });
+
+    expect(harness.streamEnds()).toHaveLength(1);
+    expect(receiptsAtRetry).toEqual(["off"]);
+  });
+
+  test("an OpenAI replay repair writes no Anthropic receipt", async () => {
+    const workspaceId = "openai-replay-no-receipt";
+    const harness = createRecoveryHarness();
+    const { messageId } = await harness.run({
+      workspaceId,
+      model: createTestLanguageModel("gpt-5.2-codex", "openai.responses"),
+      modelString: "openai:gpt-5.2-codex",
+      messages: [
+        { role: "user", content: "earlier" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "stale",
+              providerOptions: { openai: { reasoningEncryptedContent: "gAAA-stale" } },
+            },
+            { type: "text", text: "earlier answer" },
+          ],
+        },
+        { role: "user", content: "now" },
+      ],
+      attempts: [
+        failingAttempt(
+          createApiCallErrorForTests({
+            message: "Item with id 'rs_1' not found.",
+            statusCode: 400,
+            responseBody: "Item with id 'rs_1' not found.",
+            isRetryable: false,
+          })
+        ),
+        textAttempt("repaired answer"),
+      ],
+    });
+
+    expect(harness.streamEnds()).toHaveLength(1);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.find((message) => message.id === messageId);
+    expect(row).toBeDefined();
+    expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
+  });
+
+  test("a repeated rejection is terminal instead of retrying forever", async () => {
+    const workspaceId = "anthropic-binding-repeat";
+    const harness = createRecoveryHarness();
+    const { model } = scriptedAnthropicModel([rejection, rejection]);
+
+    const { calls, messageId } = await harness.run({
+      workspaceId,
+      model,
+      messages: messages(),
+      attempts: [realSdkAttempt, realSdkAttempt],
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.errors()[0]).toMatchObject({ messageId, errorType: "reasoning_rejected" });
+    const errorPartial = await historyService.readPartial(workspaceId);
+    expect(errorPartial?.metadata?.errorType).toBe("reasoning_rejected");
+    // The failed retry already ran without thinking: the stored row keeps the receipt.
+    expect(errorPartial?.metadata?.anthropicThinkingReplay).toBe("off");
+  });
+
+  // #5886: the receipt must survive a turn that produced no output, or the next turn
+  // puts the removed thinking back and pays one more 400.
+  describe("receipt on a turn without output", () => {
+    const signedEarlierTurn = (): MuxMessage =>
+      createMuxMessage("earlier-assistant", "assistant", "", { historySequence: 1 }, [
+        {
+          type: "reasoning",
+          text: "earlier thinking",
+          providerOptions: { anthropic: { signature: "sig-bound-to-old-prefix" } },
+        },
+        { type: "text", text: "earlier answer" },
+      ]);
+    async function seedEarlierTurn(workspaceId: string) {
+      for (const message of [
+        createMuxMessage("earlier-user", "user", "earlier", { historySequence: 0 }),
+        signedEarlierTurn(),
+        createMuxMessage("now-user", "user", "now", { historySequence: 2 }),
+      ]) {
+        const appended = await historyService.appendToHistory(workspaceId, message);
+        if (!appended.success) throw new Error(appended.error);
+      }
+    }
+    /** Thinking parts the next Anthropic turn would replay from the committed history. */
+    async function nextTurnThinking(workspaceId: string) {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const payload = await assemblePromptPayload({
+        history: [
+          ...history.data,
+          createMuxMessage("next-user", "user", "next", { historySequence: 4 }),
+        ],
+        systemMessage: "system",
+        modelString: "anthropic:claude-opus-5-5",
+        providerForMessages: "anthropic",
+        effectiveThinkingLevel: "medium",
+        effectiveAgentId: "exec",
+        toolNamesForSentinel: [],
+        workspaceId,
+      });
+      const serialized = JSON.stringify(payload.messages);
+      // The earlier answer itself must stay: only its thinking goes.
+      expect(serialized).toContain("earlier answer");
+      return payload.messages.flatMap((message) =>
+        message.role === "assistant" && Array.isArray(message.content)
+          ? message.content.filter((part) => part.type === "reasoning")
+          : []
+      );
+    }
+
+    test("a failed step-0 retry keeps the receipt through commitPartial", async () => {
+      const workspaceId = "anthropic-receipt-failed-retry";
+      await seedEarlierTurn(workspaceId);
+      const harness = createRecoveryHarness();
+      const { model } = scriptedAnthropicModel([rejection, rejection]);
+
+      await harness.run({
+        workspaceId,
+        historySequence: 3,
+        model,
+        messages: messages(),
+        attempts: [realSdkAttempt, realSdkAttempt],
+      });
+      expect(harness.errors()).toHaveLength(1);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      expect(await nextTurnThinking(workspaceId)).toEqual([]);
+    });
+
+    test("a partial left by a crash after the repair keeps the receipt", async () => {
+      const workspaceId = "anthropic-receipt-crash";
+      await seedEarlierTurn(workspaceId);
+      await appendPartialAssistantForTests(workspaceId, "crashed-turn", 3);
+      // What flushPartialWrite left on disk before the retry request: no parts, no error.
+      const written = await historyService.writePartial(workspaceId, {
+        id: "crashed-turn",
+        role: "assistant",
+        metadata: { historySequence: 3, partial: true, anthropicThinkingReplay: "off" },
+        parts: [],
+      });
+      if (!written.success) throw new Error(written.error);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      expect(await nextTurnThinking(workspaceId)).toEqual([]);
+    });
+
+    test("a crash after the receipt reached the row keeps it on the next commit", async () => {
+      const workspaceId = "anthropic-receipt-crash-after-row";
+      await seedEarlierTurn(workspaceId);
+      // commitPartial already wrote the receipt to the row, then crashed before
+      // deleting the errored partial.
+      const placeholder = await historyService.appendToHistory(workspaceId, {
+        id: "repaired-turn",
+        role: "assistant",
+        metadata: { historySequence: 3, partial: true, anthropicThinkingReplay: "off" },
+        parts: [],
+      });
+      if (!placeholder.success) throw new Error(placeholder.error);
+      const written = await historyService.writePartial(workspaceId, {
+        id: "repaired-turn",
+        role: "assistant",
+        metadata: {
+          historySequence: 3,
+          partial: true,
+          anthropicThinkingReplay: "off",
+          error: "rejected again",
+          errorType: "reasoning_rejected",
+        },
+        parts: [],
+      });
+      if (!written.success) throw new Error(written.error);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      expect(await nextTurnThinking(workspaceId)).toEqual([]);
+    });
+
+    test("without a receipt, an empty failed turn still leaves no row", async () => {
+      const workspaceId = "anthropic-no-receipt-failed-turn";
+      await seedEarlierTurn(workspaceId);
+      await appendPartialAssistantForTests(workspaceId, "failed-turn", 3);
+      const written = await historyService.writePartial(workspaceId, {
+        id: "failed-turn",
+        role: "assistant",
+        metadata: { historySequence: 3, partial: true, error: "boom", errorType: "unknown" },
+        parts: [],
+      });
+      if (!written.success) throw new Error(written.error);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.map((message) => message.id)).not.toContain("failed-turn");
+      expect(await nextTurnThinking(workspaceId)).toHaveLength(1);
+    });
+  });
+
+  test("a step-0 thinking rebuild after the repair sends no thinking", async () => {
+    // #5886: the rebuild reads history, which does not hold this turn's receipt yet.
+    const rebuiltTail = { text: "\n\n[Warning: B]", placement: "row" as const };
+    const rebuiltInstructions = { text: "\n<custom-instructions>\nB\n</custom-instructions>" };
+    const thinkingOverrideState: NonNullable<TurnExecutionOptions["thinkingOverrideState"]> = {
+      applied: "medium",
+    };
+    const harness = createRecoveryHarness();
+    const { model, requestBlockTypes } = scriptedAnthropicModel([
+      () => {
+        // The user changes the thinking level while the rejected request is in flight.
+        thinkingOverrideState.pending = "high";
+        return rejection();
+      },
+      success,
+    ]);
+    const preparedSdkAttempt: Attempt = async function* (options) {
+      const prepared = await prepareStepForTests(options, options.messages ?? [], 0);
+      yield* aiSdk.streamText({
+        model: options.model,
+        messages: prepared?.messages ?? options.messages ?? [],
+        maxRetries: 0,
+      }).fullStream;
+    };
+
+    await harness.run({
+      workspaceId: "anthropic-receipt-rebuild",
+      model,
+      messages: messages(),
+      attempts: [preparedSdkAttempt, preparedSdkAttempt],
+      providerOptions: {},
+      requestOptions: {
+        thinkingOverrideState,
+        rebuildProviderOptionsForThinkingLevel: (level) => ({
+          effectiveLevel: level,
+          providerOptions: {},
+        }),
+        // History-based rebuild: still holds the earlier signed thinking. Its volatile-tail
+        // record (mechanism 10) and system token count replace the ones the turn started with.
+        rebuildFirstStepForThinkingLevel: () =>
+          Promise.resolve({
+            messages: messages(),
+            systemRecords: {
+              volatileSystemTail: rebuiltTail,
+              customInstructions: { ...rebuiltInstructions, placement: "row" },
+            },
+            systemMessageTokens: 4321,
+          }),
+      },
+    });
+
+    expect(harness.streamEnds()).toHaveLength(1);
+    const history = await historyService.getHistoryFromLatestBoundary("anthropic-receipt-rebuild");
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.at(-1)?.metadata?.volatileSystemTail).toEqual(rebuiltTail);
+    expect(history.data.at(-1)?.metadata?.customInstructions).toEqual({
+      ...rebuiltInstructions,
+      placement: "row",
+    });
+    expect(history.data.at(-1)?.metadata?.systemMessageTokens).toBe(4321);
+    expect(thinkingOverrideState.applied).toBe("high");
+    expect(requestBlockTypes).toHaveLength(2);
+    expect(requestBlockTypes[1]).not.toContain("thinking");
+    expect(requestBlockTypes[1]).toContain("tool_use");
+  });
+
+  test("a model fallback after the repair sends no thinking", async () => {
+    // #5886: prepare() rebuilds the fallback request from history, which does not hold
+    // this turn's receipt yet.
+    const harness = createRecoveryHarness();
+    const { model } = scriptedAnthropicModel([rejection]);
+    const refusedRetry: Attempt = async function* () {
+      await Promise.resolve();
+      yield { type: "start-step" };
+      yield { type: "finish-step", usage: TEST_USAGE, finishReason: "content-filter" };
+      yield REFUSAL_FINISH;
+    };
+    const fallbackModel = createTestLanguageModel("claude-sonnet-5", "anthropic.messages");
+
+    const { calls } = await harness.run({
+      workspaceId: "anthropic-receipt-fallback",
+      model,
+      modelString: "anthropic:claude-opus-5-5",
+      messages: messages(),
+      attempts: [realSdkAttempt, refusedRetry, textAttempt("fallback answer")],
+      requestOptions: {
+        modelFallback: {
+          chain: ["anthropic:claude-sonnet-5"],
+          prepare: (modelString) =>
+            Promise.resolve(
+              Ok({
+                model: fallbackModel,
+                modelString,
+                // History-based rebuild: still holds the earlier signed thinking.
+                messages: messages(),
+                system: "system",
+                tools: undefined,
+                thinkingLevel: "medium" as const,
+              })
+            ),
+        },
+      },
+    });
+
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.model).toBe(fallbackModel);
+    const fallbackParts = (calls[2]?.messages ?? []).flatMap((message) =>
+      message.role === "assistant" && Array.isArray(message.content) ? message.content : []
+    );
+    expect(fallbackParts.map((part) => part.type)).toEqual(["tool-call"]);
+  });
+
+  test("logs prefix-binding thinking drops for the step at info, without paths", async () => {
+    const harness = createRecoveryHarness();
+    const [messageStart, ...rest] = successEvents;
+    const droppedEvents = [
+      {
+        ...messageStart,
+        message: {
+          ...messageStart.message,
+          input_transformations: [
+            {
+              type: "thinking_dropped",
+              path: "messages.1.content.0",
+              reason: "prefix_binding_mismatch",
+            },
+            {
+              type: "thinking_dropped",
+              path: "messages.3.content.0",
+              reason: "model_binding_mismatch",
+            },
+          ],
+        },
+      },
+      ...rest,
+    ];
+    const { model } = scriptedAnthropicModel([
+      () =>
+        new Response(droppedEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    ]);
+    const infoLines: unknown[][] = [];
+    const realWithFields = log.withFields;
+    const withFields = spyOn(log, "withFields").mockImplementation((fields) => {
+      const child = realWithFields(fields);
+      return {
+        ...child,
+        info: (...args: unknown[]) => {
+          infoLines.push(args);
+          child.info(...args);
+        },
+      };
+    });
+    try {
+      await harness.run({
+        workspaceId: "anthropic-input-transformations",
+        model,
+        messages: messages(),
+        attempts: [realSdkAttempt],
+      });
+    } finally {
+      withFields.mockRestore();
+    }
+
+    expect(harness.streamEnds()).toHaveLength(1);
+    const dropLines = infoLines.filter(([message]) =>
+      String(message).includes("replayed thinking blocks")
+    );
+    expect(dropLines).toHaveLength(1);
+    expect(dropLines[0]?.[1]).toMatchObject({
+      dropped: {
+        prefix_binding_mismatch: 1,
+        model_binding_mismatch: 1,
+        organization_binding_mismatch: 0,
+      },
+      mismatchAllowed: 0,
+    });
+    expect(JSON.stringify(dropLines)).not.toContain("messages.1.content.0");
+  });
+
+  test("leaves an unrelated Anthropic 400 to ordinary error handling", async () => {
+    const harness = createRecoveryHarness();
+    const { model } = scriptedAnthropicModel([
+      () =>
+        new Response(
+          JSON.stringify({
+            type: "error",
+            error: { type: "invalid_request_error", message: "tool_use ids must be unique" },
+          }),
+          { status: 400, headers: { "content-type": "application/json" } }
+        ),
+    ]);
+
+    const { calls } = await harness.run({
+      workspaceId: "anthropic-binding-unrelated",
+      model,
+      messages: messages(),
+      attempts: [realSdkAttempt],
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
+  });
 });

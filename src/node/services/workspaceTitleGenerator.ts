@@ -142,8 +142,6 @@ export function mapModelCreationError(
       return { type: "configuration", raw: "Provider not supported" };
     case "model_not_available":
       return { type: "configuration", raw: `Model ${error.modelId} not available` };
-    case "policy_denied":
-      return { type: "policy", provider, raw: error.message };
     case "unknown":
       return { type: "unknown", raw: error.raw ?? "Unknown error" };
     default: {
@@ -206,7 +204,12 @@ export async function generateWorkspaceIdentity(
   /** Optional conversation turns context used for regenerate-title prompts. */
   conversationContext?: string,
   /** Optional most recent user message; included as additional context only — not given precedence over older turns. */
-  latestUserMessage?: string
+  latestUserMessage?: string,
+  /**
+   * Stops the request in flight (a deadline, or the workspace went away). Later candidates then
+   * fail at once without a request, since their fetch starts with the signal already aborted.
+   */
+  abortSignal?: AbortSignal
 ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
   if (candidates.length === 0) {
     return Err({ type: "unknown", raw: "No model candidates provided for name generation" });
@@ -216,8 +219,14 @@ export async function generateWorkspaceIdentity(
   // chat model so honoring naming settings does not displace the last fallback.
   const maxAttempts = Math.min(candidates.length, 4);
 
-  // Track the last classified error to return if all candidates fail
+  // The last classified error, returned if all candidates fail. A failed request explains the
+  // outcome better than a later candidate skipped before any request (often a provider the user
+  // never set up), so a skip is reported only when no request failed.
   let lastError: NameGenerationError | null = null;
+  let lastSkipError: NameGenerationError = {
+    type: "configuration",
+    raw: "No working model candidates were available for name generation.",
+  };
 
   for (let i = 0; i < maxAttempts; i++) {
     const candidate = candidates[i];
@@ -241,7 +250,7 @@ export async function generateWorkspaceIdentity(
       agentInitiated: true,
     });
     if (!modelResult.success) {
-      lastError = mapModelCreationError(modelResult.error, modelString);
+      lastSkipError = mapModelCreationError(modelResult.error, modelString);
       log.debug(`Name generation: skipping ${modelString} (${modelResult.error.type})`);
       continue;
     }
@@ -295,21 +304,21 @@ export async function generateWorkspaceIdentity(
       // streamText (not generateText): the Codex OAuth endpoint requires
       // stream:true in the request body; streamText sets it automatically.
       //
-      // No toolChoice — forced tool choice (toolChoice: "required" / "any" /
-      // { type: "tool" }) is incompatible with extended thinking models.
-      // Instead, the prompt instructs the model to call the tool, and the
-      // name_workspace builtin agent declares tools.require: [propose_name]
-      // which the StreamManager enforces via stopWhen for full agent sessions.
-      // For this direct streamText path, the candidate retry loop handles the
-      // (rare) case where the model ignores the instruction.
+      // Force propose_name only when the serialized request leaves thinking off:
+      // Anthropic rejects forced tool use with thinking enabled. With thinking on,
+      // the prompt asks for the call and the candidate loop covers a skipped call.
       const currentStream = streamText({
         model: pinned.model,
         prompt: buildWorkspaceIdentityPrompt(message, conversationContext, latestUserMessage),
+        abortSignal,
         // Same route/wire receipt as model creation; also pins thinking off
         // explicitly for fallbacks (some providers default to medium otherwise).
         providerOptions: providerOptions as Parameters<typeof streamText>[0]["providerOptions"],
         ...(anthropicBudget !== undefined && {
           maxOutputTokens: anthropicBudget + NAME_GEN_MAX_OUTPUT_TOKENS,
+        }),
+        ...(serializesThinkingOff(providerOptions) && {
+          toolChoice: { type: "tool", toolName: "propose_name" } as const,
         }),
         tools: {
           // Defined inline so TypeScript preserves full schema inference on
@@ -361,12 +370,7 @@ export async function generateWorkspaceIdentity(
     }
   }
 
-  return Err(
-    lastError ?? {
-      type: "configuration",
-      raw: "No working model candidates were available for name generation.",
-    }
-  );
+  return Err(lastError ?? lastSkipError);
 }
 
 /**
@@ -399,6 +403,39 @@ function anthropicThinkingBudget(
   }
   const thinking = providerOptions.anthropic.thinking;
   return thinking?.type === "enabled" ? thinking.budgetTokens : undefined;
+}
+
+/**
+ * Whether the serialized request leaves thinking off. An omitted Anthropic
+ * `thinking` is off because the policy keeps "off" away from models whose API
+ * defaults to adaptive; an omitted OpenAI effort runs the model's default reasoning.
+ * Bedrock and OpenRouter count only their explicit "off" (#5954): an empty namespace
+ * there runs the model's default, which can reason.
+ */
+function serializesThinkingOff(providerOptions: ReturnType<typeof buildProviderOptions>): boolean {
+  if ("anthropic" in providerOptions) {
+    const thinking = providerOptions.anthropic.thinking;
+    return thinking === undefined || thinking.type === "disabled";
+  }
+  if ("openai" in providerOptions) {
+    return providerOptions.openai.reasoningEffort === "none";
+  }
+  if ("bedrock" in providerOptions) {
+    return bedrockThinkingDisabled(providerOptions.bedrock.additionalModelRequestFields?.thinking);
+  }
+  if ("openrouter" in providerOptions) {
+    return providerOptions.openrouter.reasoning?.effort === "none";
+  }
+  return false;
+}
+
+/** Whether Bedrock's verbatim `thinking` request field turns thinking off. */
+function bedrockThinkingDisabled(thinking: unknown): boolean {
+  return (
+    typeof thinking === "object" &&
+    thinking !== null &&
+    (thinking as { type?: unknown }).type === "disabled"
+  );
 }
 
 /**

@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
 import { Ok, Err } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
@@ -23,12 +24,19 @@ import type { WindowService } from "./windowService";
 import type { WorkspaceService } from "./workspaceService";
 import type { TokenizerService } from "./tokenizerService";
 import { AgentStatusService } from "./agentStatusService";
+import { SessionUsageService } from "./sessionUsageService";
 import * as workspaceStatusGenerator from "./workspaceStatusGenerator";
 import { createTestHistoryService } from "./testHistoryService";
+import {
+  PAYLOAD_ROW_SHAPES,
+  payloadPartial,
+  payloadRow,
+} from "./historyScanner.generator.testHarness";
 import { createContextResetBoundaryMessageId } from "./utils/messageIds";
 
 interface AgentStatusServiceInternals {
   runTick(): Promise<void>;
+  buildTrailingTranscript(workspaceId: string): Promise<string>;
   runForWorkspace(
     workspaceId: string,
     observedRecency?: number | null,
@@ -77,6 +85,7 @@ describe("AgentStatusService", () => {
   let emitWorkspaceActivityMock: ReturnType<
     typeof mock<(workspaceId: string, snapshot: unknown) => void>
   >;
+  let emitChatEventMock: ReturnType<typeof mock<(workspaceId: string, message: unknown) => void>>;
   let getCandidatesMock: ReturnType<typeof mock<(workspaceId: string) => Promise<string[]>>>;
   let generateSpy: ReturnType<
     typeof spyOn<typeof workspaceStatusGenerator, "generateWorkspaceStatus">
@@ -100,7 +109,10 @@ describe("AgentStatusService", () => {
   }
 
   // Bypass the scheduler timers so each test step is deterministic.
-  function createService(options?: { clock?: () => number }): AgentStatusService {
+  function createService(options?: {
+    clock?: () => number;
+    sessionUsageService?: SessionUsageService;
+  }): AgentStatusService {
     return new AgentStatusService(
       mockConfig,
       historyHandle.historyService,
@@ -112,6 +124,7 @@ describe("AgentStatusService", () => {
       {
         clock: options?.clock,
         tickIntervalMs: 60 * 60 * 1000,
+        sessionUsageService: options?.sessionUsageService,
       }
     );
   }
@@ -130,10 +143,12 @@ describe("AgentStatusService", () => {
     } as unknown as Config;
 
     emitWorkspaceActivityMock = mock(() => undefined);
+    emitChatEventMock = mock(() => undefined);
     getCandidatesMock = mock((_id: string) => Promise.resolve(["anthropic:claude-haiku-4-5"]));
     mockWorkspaceService = {
       getWorkspaceTitleModelCandidates: getCandidatesMock,
       emitWorkspaceActivity: emitWorkspaceActivityMock,
+      emitChatEvent: emitChatEventMock,
     } as unknown as WorkspaceService;
 
     // Stateful fake for the shared status slot: mirrors the real service,
@@ -213,6 +228,65 @@ describe("AgentStatusService", () => {
     const [persistedWorkspaceId, persistedStatus] = setSidebarStatusMock.mock.calls[0];
     expect(persistedWorkspaceId).toBe(workspaceId);
     expect(persistedStatus).toEqual({ emoji: "🛠️", message: "Editing source" });
+  });
+
+  // #6118: status generation spends tokens outside the stream, so without a delta the footer's
+  // session total missed that spend until a reload re-read session-usage.json.
+  test("publishes one session-usage delta per recorded status usage, none when recording fails", async () => {
+    const sessionUsageService = new SessionUsageService(
+      historyHandle.config,
+      historyHandle.historyService
+    );
+    const recordSpy = spyOn(sessionUsageService, "recordHeadlessUsage");
+    const model = "anthropic:claude-haiku-4-5";
+    type RecordUsage = NonNullable<
+      NonNullable<
+        Parameters<typeof workspaceStatusGenerator.generateWorkspaceStatus>[3]
+      >["recordUsage"]
+    >;
+    generateSpy.mockImplementation(async (_transcript, _candidates, _ai, options) => {
+      const usage = { inputTokens: 1000, outputTokens: 50, totalTokens: 1050 };
+      await options?.recordUsage?.(model, usage as Parameters<RecordUsage>[1], {
+        metadataModel: model,
+      });
+      return Ok({ status: { emoji: "🛠️", message: "Editing source" }, modelUsed: model });
+    });
+    const service = createService({ sessionUsageService });
+    const usageDeltas = () =>
+      emitChatEventMock.mock.calls.filter(
+        ([, message]) => (message as { type?: string }).type === "session-usage-delta"
+      );
+
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(recordSpy).toHaveBeenCalledTimes(1);
+    const recorded = (await recordSpy.mock.results[0].value) as Awaited<
+      ReturnType<SessionUsageService["recordHeadlessUsage"]>
+    >;
+    if (!recorded) throw new Error("the status usage was recorded");
+    expect(usageDeltas()).toHaveLength(1);
+    expect(usageDeltas()[0]).toMatchObject([
+      workspaceId,
+      {
+        type: "session-usage-delta",
+        workspaceId,
+        sourceWorkspaceId: workspaceId,
+        byModelDelta: { [recorded.model]: recorded.usage },
+      },
+    ]);
+
+    // A failed record (the recorder returns undefined) publishes nothing.
+    recordSpy.mockResolvedValueOnce(undefined);
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u2", "user", "Now fix the failures")
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(recordSpy).toHaveBeenCalledTimes(2);
+    expect(usageDeltas()).toHaveLength(1);
   });
 
   test("skips regeneration when the trailing transcript is unchanged (dedup)", async () => {
@@ -486,6 +560,59 @@ describe("AgentStatusService", () => {
     expect(transcript).toContain("Summary: the parser refactor is underway");
     expect(transcript).toContain("User: Now write the tests");
     expect(transcript).not.toContain("PRE-COMPACTION-DETAIL");
+  });
+
+  test("payload size never changes the status transcript (#4790)", async () => {
+    // Rows over 1 MiB come back status-grade (null tool payloads, empty file URLs). The
+    // formatter must never read those fields: the same conversation with giant payloads (tool
+    // output and input, file URL, nested call output) and with tiny ones gives one transcript.
+    projectsConfig = makeProjectsConfig([
+      makeWorkspaceEntry({ id: "ws-giant", name: "ws-giant" }),
+      makeWorkspaceEntry({ id: "ws-tiny", name: "ws-tiny" }),
+    ]);
+    const service = createService();
+    const transcripts: string[] = [];
+    for (const [id, payload] of [
+      ["ws-giant", "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 1)],
+      ["ws-tiny", "x"],
+    ] as const) {
+      await historyHandle.historyService.appendToHistory(
+        id,
+        createMuxMessage("u1", "user", "Please look at the logs")
+      );
+      for (let shape = 0; shape < PAYLOAD_ROW_SHAPES; shape++)
+        await historyHandle.historyService.appendToHistory(
+          id,
+          payloadRow(`p${shape}`, shape, payload)
+        );
+      await getInternals(service).runForWorkspace(id);
+      expect(generateSpy).toHaveBeenCalledTimes(transcripts.length + 1);
+      transcripts.push(generateSpy.mock.calls[transcripts.length][0]);
+    }
+    expect(transcripts[0]).toContain("payload row p3");
+    expect(transcripts[0]).toEqual(transcripts[1]);
+  });
+
+  test("a giant in-flight partial is read status-grade without changing the transcript (#5213)", async () => {
+    const { historyService } = historyHandle;
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please look at the logs")
+    );
+    await historyService.writePartial(
+      workspaceId,
+      payloadPartial("a-partial", "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 1))
+    );
+    const statusRead = spyOn(historyService, "readStatusPartial");
+    const internals = getInternals(createService());
+
+    const transcript = await internals.buildTrailingTranscript(workspaceId);
+    expect(statusRead).toHaveBeenCalledWith(workspaceId);
+    expect(transcript).toContain("Assistant (in progress): payload partial a-partial");
+    expect(transcript).toContain("[tool bash done]");
+
+    statusRead.mockImplementation((id) => historyService.readPartial(id));
+    expect(await internals.buildTrailingTranscript(workspaceId)).toEqual(transcript);
   });
 
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {
@@ -1656,6 +1783,24 @@ describe("AgentStatusService", () => {
 
     expect(generateSpy).toHaveBeenCalledTimes(2);
     expect(generateSpy.mock.calls[1][0]).toContain("User: Pivot after config failure");
+  });
+
+  test("side chats never generate an invisible sidebar status", async () => {
+    const workspace = makeWorkspaceEntry({ sideChatParentWorkspaceId: "parent" });
+    projectsConfig = makeProjectsConfig([workspace]);
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("side-context", "user", "Inherited context")
+    );
+
+    const service = createService();
+    await getInternals(service).runTick();
+    expect(generateSpy).not.toHaveBeenCalled();
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    delete workspace.sideChatParentWorkspaceId;
+    await getInternals(service).runTick();
+    expect(generateSpy).toHaveBeenCalledTimes(1);
   });
 
   test("archived workspaces are not regenerated", async () => {

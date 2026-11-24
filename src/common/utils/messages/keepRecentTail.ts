@@ -15,6 +15,7 @@ import assert from "@/common/utils/assert";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { safeStringifyForCounting } from "@/common/utils/tokens/safeStringifyForCounting";
 import { hasProviderEligibleMessages } from "@/common/utils/messages/compactionBoundary";
+import { renderPluginHookContextBlocks } from "@/common/utils/messages/pluginHookContext";
 import { RLM_COMPACTION_CHARS_PER_TOKEN } from "@/constants/rlmCompaction";
 
 /**
@@ -23,7 +24,12 @@ import { RLM_COMPACTION_CHARS_PER_TOKEN } from "@/constants/rlmCompaction";
  */
 export function estimateMuxMessageTokens(message: MuxMessage): number {
   assert(message != null, "estimateMuxMessageTokens requires a message");
-  return Math.ceil(safeStringifyForCounting(message.parts).length / RLM_COMPACTION_CHARS_PER_TOKEN);
+  // Hook context is metadata in history but text in the request: count it like the provider does.
+  const hookContextChars = renderPluginHookContextBlocks(message)?.length ?? 0;
+  return Math.ceil(
+    (safeStringifyForCounting(message.parts).length + hookContextChars) /
+      RLM_COMPACTION_CHARS_PER_TOKEN
+  );
 }
 
 /**

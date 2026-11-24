@@ -9,11 +9,15 @@ import {
   isDesktopViewportFocused,
   isTerminalFocused,
   isDialogOpen,
+  isCommandPaletteTarget,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { isCompactingStream, cancelCompaction } from "@/browser/utils/compaction/handler";
 import { stopStream } from "@/browser/utils/stopStream";
 import { useAPI } from "@/browser/contexts/API";
+import { isEscapeDismissOverlayOpen } from "@/browser/hooks/useEscapeToDismiss";
 import type { EditingMessageState } from "@/browser/utils/chatEditing";
 
 interface UseAIViewKeybindsParams {
@@ -23,6 +27,8 @@ interface UseAIViewKeybindsParams {
   chatInputAPI: React.RefObject<ChatInputAPI | null>;
   jumpToBottom: () => void;
   loadOlderHistory: (() => void) | null;
+  /** Mounts the rows below a detached transcript slice; null while the slice is attached. */
+  showNewerMessages?: (() => void) | null;
   handleOpenTerminal: () => void;
   handleOpenInEditor: () => void;
   aggregator: StreamingMessageAggregator | undefined; // For compaction detection
@@ -42,6 +48,7 @@ interface UseAIViewKeybindsParams {
  * - Ctrl+I: Focus chat input
  * - Shift+H: Load older transcript messages (when available)
  * - Shift+G: Jump to bottom
+ * - SHOW_NEWER_MESSAGES: Show newer transcript messages (below a detached slice)
  * - Ctrl+T: Open terminal
  * - Ctrl+Shift+E: Open in editor
  * - Ctrl+C (during compaction in vim mode): Cancel compaction, restore command
@@ -55,6 +62,7 @@ export function useAIViewKeybinds({
   chatInputAPI,
   jumpToBottom,
   loadOlderHistory,
+  showNewerMessages = null,
   handleOpenTerminal,
   handleOpenInEditor,
   aggregator,
@@ -64,9 +72,13 @@ export function useAIViewKeybinds({
   resumeInterruptedStream,
 }: UseAIViewKeybindsParams): void {
   const { api } = useAPI();
+  // The main chat and the /side chat tab both mount these window listeners; only the pane that
+  // owns the event's target acts, so Esc/Ctrl+I/Shift+G never hit both chats at once.
+  const paneScope = useChatPaneScope();
 
   useEffect(() => {
     const handleInterruptKeyDown = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       // Check vim-aware interrupt keybind
       const interruptKeybind = vimEnabled
         ? KEYBINDS.INTERRUPT_STREAM_VIM
@@ -88,6 +100,11 @@ export function useAIViewKeybinds({
       ) {
         // If something else already claimed this key event, skip.
         if (e.defaultPrevented) {
+          return;
+        }
+
+        // An open overlay (the narrow-screen drawer) takes this Escape to close itself.
+        if (interruptKeybind === KEYBINDS.INTERRUPT_STREAM_NORMAL && isEscapeDismissOverlayOpen()) {
           return;
         }
 
@@ -130,6 +147,7 @@ export function useAIViewKeybinds({
     };
 
     const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       // Remote desktops own their keyboard, including chat/editor shortcuts.
       if (isDesktopViewportFocused(e.target)) return;
       const dialogOpen = isDialogOpen();
@@ -137,7 +155,8 @@ export function useAIViewKeybinds({
       // Focus chat input works anywhere (even in input fields)
       if (matchesKeybind(e, KEYBINDS.FOCUS_CHAT)) {
         e.preventDefault();
-        if (!dialogOpen) chatInputAPI.current?.focus();
+        // Same rule as the creation screen: focus must not move behind the command palette (#5752).
+        if (!dialogOpen && !isCommandPaletteTarget(e.target)) chatInputAPI.current?.focus();
         return;
       }
 
@@ -171,15 +190,14 @@ export function useAIViewKeybinds({
         return;
       }
 
-      if (matchesKeybind(e, KEYBINDS.LOAD_OLDER_MESSAGES) && loadOlderHistory) {
+      const transcriptAction = [
+        { keybind: KEYBINDS.LOAD_OLDER_MESSAGES, run: loadOlderHistory },
+        { keybind: KEYBINDS.SHOW_NEWER_MESSAGES, run: showNewerMessages },
+        { keybind: KEYBINDS.JUMP_TO_BOTTOM, run: jumpToBottom },
+      ].find((action) => matchesKeybind(e, action.keybind))?.run;
+      if (transcriptAction) {
         e.preventDefault();
-        loadOlderHistory();
-        return;
-      }
-
-      if (matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)) {
-        e.preventDefault();
-        jumpToBottom();
+        transcriptAction();
       }
     };
 
@@ -197,6 +215,7 @@ export function useAIViewKeybinds({
   }, [
     jumpToBottom,
     loadOlderHistory,
+    showNewerMessages,
     handleOpenTerminal,
     handleOpenInEditor,
     workspaceId,
@@ -209,5 +228,6 @@ export function useAIViewKeybinds({
     canResumeInterruptedStream,
     resumeInterruptedStream,
     api,
+    paneScope,
   ]);
 }

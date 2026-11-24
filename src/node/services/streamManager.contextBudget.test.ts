@@ -1,26 +1,31 @@
 import { tmpdir } from "node:os";
-import { prepareToolSearch, type ToolSearchRuntime } from "@/common/utils/tools/toolCatalog";
+import {
+  NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS,
+  prepareToolSearch,
+  type ToolSearchRuntime,
+} from "@/common/utils/tools/toolCatalog";
 import { createToolSearchTool } from "./tools/toolSearch";
 import { createTestToolConfig } from "./tools/testHelpers";
 import { describe, expect, spyOn, test } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
-import { tool } from "ai";
+import { tool, type ModelMessage } from "ai";
 import { z } from "zod";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
-import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
-import { MuxMessageSchema } from "@/common/orpc/schemas/message";
-import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas/stream";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { evaluateStepBudget } from "@/common/utils/compaction/contextBudget";
+import { createMuxMessage } from "@/common/types/message";
+import {
+  evaluateStepBudget,
+  getContextBudgetHardCeiling,
+} from "@/common/utils/compaction/contextBudget";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { StreamManager, type SettledStepBudget, type TurnEngineEvent } from "./streamManager";
-import { onTurnEngineEvent } from "./streamManager.testHarness";
+import { StreamManager, type SettledStepBudget } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
 import * as budgetCounting from "./contextBudgetCounting";
-import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
+import {
+  estimateAnchoredRequestTokensForModel,
+  estimateAssembledRequestTokensForModel,
+} from "./contextBudgetCounting";
 
 describe("settled context hard ceiling", () => {
   test.each(["inactive", "activation-fits", "activation-overflow", "search-off"] as const)(
@@ -147,6 +152,325 @@ describe("settled context hard ceiling", () => {
     }
   );
 
+  test.each([false, true])(
+    "budgets only tools that are sent (XUM_DISABLE_AGENT_TOOLS=%p)",
+    async (toolsDisabled) => {
+      const h = await createTestHistoryService();
+      const workspaceId = "disabled-tools-budget";
+      const messageId = "disabled-tools-assistant";
+      const sentToolCounts: number[] = [];
+      const model = new MockLanguageModelV3({
+        doStream: (request) => {
+          sentToolCounts.push(request.tools?.length ?? 0);
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "stream-start", warnings: [] },
+                { type: "text-start", id: "answer" },
+                { type: "text-delta", id: "answer", delta: "Done" },
+                { type: "text-end", id: "answer" },
+                {
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 10, text: 10, reasoning: 0 },
+                  },
+                },
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          });
+        },
+      });
+      // One schema alone exceeds the 10k-token budget.
+      const tools = {
+        huge: tool({
+          description: "Huge schema",
+          inputSchema: z.object({ argument: z.string().describe("漢".repeat(10000)) }),
+        }),
+      };
+      if (toolsDisabled) process.env.XUM_DISABLE_AGENT_TOOLS = "1";
+      const manager = new StreamManager(h.historyService);
+      const runtimeDir = await fs.mkdtemp(path.join(tmpdir(), "disabled-tools-budget-"));
+      try {
+        expect(
+          (
+            await h.historyService.appendManyToHistory(workspaceId, [
+              createMuxMessage("user", "user", "Hello"),
+              createMuxMessage(messageId, "assistant", ""),
+            ])
+          ).success
+        ).toBe(true);
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          system: "Answer briefly",
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          tools,
+          contextBudgetLimit: 10000,
+        });
+        if (!started.success) throw new Error("Expected stream construction");
+        const completion = await started.data.completion;
+        expect(completion.status).toBe(toolsDisabled ? "completed" : "failed");
+        expect(sentToolCounts).toEqual(toolsDisabled ? [0] : []);
+      } finally {
+        delete process.env.XUM_DISABLE_AGENT_TOOLS;
+        await manager.stopStream(workspaceId);
+        await fs.rm(runtimeDir, { recursive: true, force: true });
+        await h.cleanup();
+      }
+    }
+  );
+
+  // #7662: step zero has no settled step, so it counts against the turn anchor, as the
+  // turn-start check did; a full estimate here could refuse what turn start accepted. A
+  // thinking change that races stream setup rebuilds step zero at a level the anchor's
+  // provider count does not hold, so that step uses the full estimate.
+  test.each(["none", "anchored", "rethought"] as const)(
+    "step zero counts against the turn anchor (%s)",
+    async (mode) => {
+      const anchored = mode === "anchored";
+      const h = await createTestHistoryService();
+      const workspaceId = "turn-anchor-budget";
+      const messageId = "turn-anchor-assistant";
+      let providerCalls = 0;
+      const model = new MockLanguageModelV3({
+        doStream: () => {
+          providerCalls++;
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "stream-start", warnings: [] },
+                { type: "text-start", id: "answer" },
+                { type: "text-delta", id: "answer", delta: "Done" },
+                { type: "text-end", id: "answer" },
+                {
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 10, text: 10, reasoning: 0 },
+                  },
+                },
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          });
+        },
+      });
+      const manager = new StreamManager(h.historyService);
+      const runtimeDir = await fs.mkdtemp(path.join(tmpdir(), "turn-anchor-budget-"));
+      try {
+        expect(
+          (
+            await h.historyService.appendManyToHistory(workspaceId, [
+              createMuxMessage("user", "user", "Hello"),
+              createMuxMessage(messageId, "assistant", ""),
+            ])
+          ).success
+        ).toBe(true);
+        const messages: ModelMessage[] = [
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Hi" },
+          { role: "user", content: "Again" },
+        ];
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages,
+          system: "Answer briefly",
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          contextBudgetLimit: 10000,
+          // The previous reply's provider count alone is at the ceiling.
+          ...(mode === "none"
+            ? {}
+            : {
+                contextBudgetTurnAnchor: {
+                  model: "openai:gpt-4o",
+                  metadataModel: "openai:gpt-4o",
+                  providerTokens: getContextBudgetHardCeiling(10000),
+                },
+              }),
+          ...(mode === "rethought"
+            ? {
+                thinkingOverrideState: { pending: "off" as const },
+                rebuildProviderOptionsForThinkingLevel: () => ({
+                  providerOptions: {},
+                  effectiveLevel: "off" as const,
+                }),
+                rebuildFirstStepForThinkingLevel: () => Promise.resolve({ messages }),
+              }
+            : {}),
+        });
+        if (!started.success) throw new Error("Expected stream construction");
+        const completion = await started.data.completion;
+        expect(completion.status).toBe(anchored ? "failed" : "completed");
+        expect(providerCalls).toBe(anchored ? 0 : 1);
+      } finally {
+        await manager.stopStream(workspaceId);
+        await fs.rm(runtimeDir, { recursive: true, force: true });
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each(["fits", "overflow", "stale-activation"] as const)(
+    "native tool search sends every tool each step and budgets only loaded schemas (%s)",
+    async (mode) => {
+      const h = await createTestHistoryService();
+      const workspaceId = "native-catalog-budget";
+      const messageId = "native-catalog-assistant";
+      const settledEstimates: Array<number | undefined> = [];
+      const requests: Array<{ tools: string; prompt: unknown[] }> = [];
+      const searchRuntime: ToolSearchRuntime = {};
+      const search = prepareToolSearch({
+        tools: {
+          tool_catalog_search: createToolSearchTool({
+            ...createTestToolConfig(h.tempDir),
+            toolSearchRuntime: searchRuntime,
+          }),
+          mcp_large: tool({
+            description: "Large catalog schema",
+            inputSchema: z.object({
+              argument: z.string().describe("漢".repeat(mode === "fits" ? 100 : 10000)),
+            }),
+          }),
+          // Never loaded: lifts the deferred catalog over the native size
+          // threshold (#5405) without touching the budgeted schemas.
+          padding_tool: tool({
+            description: "Lorem ipsum dolor sit amet. ".repeat(
+              Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
+            ),
+            inputSchema: z.object({}),
+          }),
+        },
+        mcpToolNames: ["mcp_large", "padding_tool"],
+        promptCacheActive: true,
+      });
+      searchRuntime.state = search.state;
+      // An activation whose tool_reference a compacted prefix no longer carries.
+      if (mode === "stale-activation") search.state?.activatedToolNames.add("mcp_large");
+      const model = new MockLanguageModelV3({
+        doStream: (request) => {
+          requests.push({ tools: JSON.stringify(request.tools), prompt: request.prompt });
+          const activate = requests.length === 1;
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "stream-start", warnings: [] },
+                ...(activate
+                  ? [
+                      {
+                        type: "tool-call" as const,
+                        toolCallId: "activation",
+                        toolName: "tool_catalog_search",
+                        input:
+                          mode === "stale-activation"
+                            ? '{"query":"unmatched"}'
+                            : '{"query":"mcp_large"}',
+                      },
+                    ]
+                  : [
+                      { type: "text-start" as const, id: "answer" },
+                      { type: "text-delta" as const, id: "answer", delta: "Done" },
+                      { type: "text-end" as const, id: "answer" },
+                    ]),
+                {
+                  type: "finish",
+                  finishReason: {
+                    unified: activate ? "tool-calls" : "stop",
+                    raw: activate ? "tool_calls" : "stop",
+                  },
+                  usage: {
+                    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 10, text: 10, reasoning: 0 },
+                  },
+                },
+              ],
+            }),
+          });
+        },
+      });
+      const manager = new StreamManager(h.historyService);
+      const runtimeDir = await fs.mkdtemp(path.join(tmpdir(), "context-budget-stream-"));
+      try {
+        expect(
+          (
+            await h.historyService.appendManyToHistory(workspaceId, [
+              createMuxMessage("user", "user", "Use the catalog"),
+              createMuxMessage(messageId, "assistant", ""),
+            ])
+          ).success
+        ).toBe(true);
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages: [{ role: "user", content: "Use the catalog" }],
+          system: "Use tools",
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          tools: search.tools,
+          toolSearchState: search.state,
+          contextBudgetLimit: 10000,
+          onStepSettled: (step) => {
+            settledEstimates.push(step.nextRequestTokens);
+            return Promise.resolve({ decision: "continue" as const });
+          },
+        });
+        expect(started.success).toBe(true);
+        if (!started.success) throw new Error("Expected stream construction");
+        const completion = await started.data.completion;
+        if (mode === "stale-activation") {
+          expect(settledEstimates).toHaveLength(1);
+          // The unreferenced schema alone measures several thousand tokens.
+          expect(settledEstimates[0]).toBeLessThan(2000);
+        }
+        // The deferred schema is sent but not loaded, so the first step fits
+        // even when loading it would not; the activation then counts it.
+        expect(completion.status).toBe(mode === "overflow" ? "failed" : "completed");
+        expect(requests).toHaveLength(mode === "overflow" ? 1 : 2);
+        expect(requests[0].tools).toContain('"deferLoading":true');
+        if (mode === "fits") {
+          expect(requests[1].tools).toBe(requests[0].tools);
+          expect(requests[1].prompt.at(-1)).toMatchObject({
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                output: {
+                  type: "content",
+                  value: [
+                    {
+                      type: "custom",
+                      providerOptions: {
+                        anthropic: { type: "tool-reference", toolName: "mcp_large" },
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          });
+        }
+      } finally {
+        await manager.stopStream(workspaceId);
+        await fs.rm(runtimeDir, { recursive: true, force: true });
+        await h.cleanup();
+      }
+    }
+  );
+
   test.each(["thinking", "fallback"] as const)(
     "late %s rebuild uses its actual messages and model limit before provider dispatch",
     async (mode) => {
@@ -212,7 +536,7 @@ describe("settled context hard ceiling", () => {
                   effectiveLevel: "high" as const,
                 }),
                 rebuildFirstStepForThinkingLevel: () =>
-                  Promise.resolve([{ role: "user" as const, content: large }]),
+                  Promise.resolve({ messages: [{ role: "user" as const, content: large }] }),
               }
             : {
                 modelFallback: {
@@ -350,11 +674,14 @@ describe("settled context hard ceiling", () => {
             toolResultTokens: step.toolResultTokens,
             modelContextLimit: 128000,
             threshold: 1,
-            warningEmitted: false,
             handoffRequested: false,
+            finalHandoffAvailable: false,
           });
-          // The session maps the internal handoff decision onto the callback's "warn" stop.
-          return Promise.resolve({ decision: decision === "handoff" ? "warn" : decision });
+          // The session maps the internal handoff and final decisions onto callback stops.
+          return Promise.resolve({
+            decision:
+              decision === "handoff" ? "warn" : decision === "final" ? "rollover" : decision,
+          });
         },
       });
       expect(started.success).toBe(true);
@@ -404,9 +731,14 @@ describe("settled context hard ceiling", () => {
   // step's preflight enforces. The settled step must see that same estimate so the forced
   // rollover wins; before the fix the preflight hard-stopped the turn every time. With a roomy
   // limit, the settled measure must equal what the next step's preflight actually checks.
-  test.each([10_000, 100_000])(
-    "a settled step measures the next preflight request (limit %d)",
-    async (limit) => {
+  // #4858: with provider usage both measures anchor on it; without it both use the full estimate.
+  test.each([
+    { limit: 10_000, reported: false },
+    { limit: 10_000, reported: true },
+    { limit: 100_000, reported: true },
+  ])(
+    "a settled step measures the next preflight request (limit $limit, usage $reported)",
+    async ({ limit, reported }) => {
       const preflights = spyOn(budgetCounting, "checkAssembledRequestBudgetForModel");
       const h = await createTestHistoryService();
       const workspaceId = "next-request-rollover";
@@ -414,7 +746,9 @@ describe("settled context hard ceiling", () => {
       let providerCalls = 0;
       const settled: SettledStepBudget[] = [];
       const usage = {
-        inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+        inputTokens: reported
+          ? { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 }
+          : { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
         outputTokens: { total: 10, text: 10, reasoning: 0 },
       };
       const model = new MockLanguageModelV3({
@@ -486,10 +820,13 @@ describe("settled context hard ceiling", () => {
               nextRequestTokens: step.nextRequestTokens,
               modelContextLimit: limit,
               threshold: 0.9,
-              warningEmitted: true,
               handoffRequested: true,
+              finalHandoffAvailable: false,
             });
-            return Promise.resolve({ decision: decision === "handoff" ? "warn" : decision });
+            return Promise.resolve({
+              decision:
+                decision === "handoff" ? "warn" : decision === "final" ? "rollover" : decision,
+            });
           },
         });
         if (!started.success) throw new Error("Expected stream startup");
@@ -498,7 +835,7 @@ describe("settled context hard ceiling", () => {
         expect(
           completion.status === "failed" ? completion.streamError.errorType : completion.status
         ).toBe("completed");
-        if (limit === 10_000) {
+        if (!reported) {
           expect(providerCalls).toBe(1);
           expect(settled).toHaveLength(1);
           // Provider usage plus the settled tool output alone stays below the ceiling...
@@ -506,10 +843,14 @@ describe("settled context hard ceiling", () => {
           // ...but the next assembled request does not, so the step stops as a rollover.
           expect(settled[0].nextRequestTokens).toBeGreaterThan(7_500);
         } else {
+          // The anchored request fits even the small window, so the turn takes its second step.
           expect(providerCalls).toBe(2);
           // The last preflight checked step two's request: re-measure its exact payload.
-          const [payload, budget] = preflights.mock.calls.at(-1)!;
-          expect(settled[0].nextRequestTokens).toBe(
+          const [payload, budget, anchor] = preflights.mock.calls.at(-1)!;
+          expect(anchor?.providerTokens).toBe(100);
+          const anchored = await estimateAnchoredRequestTokensForModel(payload, budget, anchor);
+          expect(settled[0].nextRequestTokens).toBe(anchored!.estimate);
+          expect(anchored!.estimate).toBeLessThan(
             (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate
           );
         }
@@ -620,192 +961,4 @@ describe("settled context hard ceiling", () => {
       await h.cleanup();
     }
   }, 20000);
-});
-
-describe("final flush turn transcript visibility", () => {
-  const CREATED_AT = "2026-01-01T00:00:00.000Z";
-  const FLUSH_TEXT_DELTAS = ["Saved the ", "notes; window ", "can close."];
-  const USAGE = {
-    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
-    outputTokens: { total: 10, text: 10, reasoning: 0 },
-  };
-
-  const displayedRowsFor = (aggregator: StreamingMessageAggregator, messageId: string) =>
-    aggregator
-      .getDisplayedMessages()
-      .filter((row) => "historyId" in row && row.historyId === messageId);
-
-  const loadIntoFreshAggregator = (rows: MuxMessage[]) => {
-    const aggregator = new StreamingMessageAggregator(CREATED_AT);
-    aggregator.loadHistoricalMessages(
-      rows.map((row) => MuxMessageSchema.parse(row)),
-      false
-    );
-    return aggregator;
-  };
-
-  // The renderer only ever sees engine events after the IPC schema parsed them, so a flag
-  // the emitter or schema drops never reaches the aggregator no matter what the engine knew.
-  const applyThroughIpcSchema = (aggregator: StreamingMessageAggregator, event: TurnEngineEvent) =>
-    applyWorkspaceChatEventToAggregator(aggregator, WorkspaceChatMessageSchema.parse(event), {
-      allowSideEffects: false,
-    });
-
-  test.each([
-    { flush: true, ending: "completed" },
-    { flush: true, ending: "stopped" },
-    { flush: false, ending: "completed" },
-  ] as const)(
-    "flush output never surfaces while an ordinary turn does (flush=$flush, $ending)",
-    async ({ flush, ending }) => {
-      const h = await createTestHistoryService();
-      const manager = new StreamManager(h.historyService);
-      const workspaceId = `flush-visibility-${ending}`;
-      const messageId = "flush-assistant";
-      const runtimeDir = await fs.mkdtemp(path.join(tmpdir(), "context-budget-stream-"));
-      // The provider stream is hand-driven so the test can observe the renderer between
-      // deltas and stop the turn mid-text; the engine reads it lazily after startStream.
-      const controllerReady =
-        Promise.withResolvers<ReadableStreamDefaultController<LanguageModelV3StreamPart>>();
-      const model = new MockLanguageModelV3({
-        doStream: ({ abortSignal }) =>
-          Promise.resolve({
-            stream: new ReadableStream<LanguageModelV3StreamPart>({
-              start: (streamController) => {
-                streamController.enqueue({ type: "stream-start", warnings: [] });
-                streamController.enqueue({ type: "text-start", id: "answer" });
-                // Like a real transport, a stop must surface to the consumer as an abort.
-                abortSignal?.addEventListener("abort", () => {
-                  try {
-                    streamController.error(new DOMException("Stopped", "AbortError"));
-                  } catch {
-                    // Already closed.
-                  }
-                });
-                controllerReady.resolve(streamController);
-              },
-            }),
-          }),
-      });
-      const events: TurnEngineEvent[] = [];
-      let firstDelta!: () => void;
-      const firstDeltaSeen = new Promise<void>((resolve) => {
-        firstDelta = resolve;
-      });
-      for (const type of ["stream-start", "stream-delta", "stream-end", "stream-abort"] as const) {
-        onTurnEngineEvent(manager, type, (event) => {
-          events.push(event);
-          if (event.type === "stream-delta") firstDelta();
-        });
-      }
-      try {
-        // Rows as the request builder persists them: the hidden synthetic trigger and the
-        // empty assistant placeholder that the stream fills in.
-        const trigger = createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
-          synthetic: true,
-          uiVisible: false,
-          muxMetadata: {
-            type: "normal",
-            contextBudgetContinuation: true,
-            ...(flush ? { contextBudgetFlush: true } : {}),
-          },
-        });
-        const placeholder = createMuxMessage(messageId, "assistant", "");
-        expect(
-          (await h.historyService.appendManyToHistory(workspaceId, [trigger, placeholder])).success
-        ).toBe(true);
-        const before = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
-        if (!before.success) throw new Error(before.error);
-        const live = loadIntoFreshAggregator(before.data);
-
-        const started = await manager.startStream({
-          workspaceId,
-          messageId,
-          historySequence: placeholder.metadata?.historySequence ?? 1,
-          model,
-          modelString: "openai:gpt-4o",
-          messages: [{ role: "user", content: "Flush context notes now." }],
-          system: "Write notes",
-          runtime: new LocalRuntime(h.tempDir),
-          providedRuntimeTempDir: runtimeDir,
-          initialMetadata: {
-            muxMetadata: {
-              type: "normal",
-              contextBudgetContinuation: true,
-              ...(flush ? { contextBudgetFlush: true } : {}),
-            },
-          },
-        });
-        expect(started.success).toBe(true);
-        if (!started.success) throw new Error("Expected stream construction");
-        const controller = await controllerReady.promise;
-        controller.enqueue({ type: "text-delta", id: "answer", delta: FLUSH_TEXT_DELTAS[0] });
-        await firstDeltaSeen;
-        if (ending === "stopped") {
-          await manager.stopStream(workspaceId);
-        } else {
-          for (const delta of FLUSH_TEXT_DELTAS.slice(1)) {
-            controller.enqueue({ type: "text-delta", id: "answer", delta });
-          }
-          controller.enqueue({ type: "text-end", id: "answer" });
-          controller.enqueue({
-            type: "finish",
-            finishReason: { unified: "stop", raw: "stop" },
-            usage: USAGE,
-          });
-          controller.close();
-        }
-        const completion = await started.data.completion;
-        expect(completion.status).toBe(ending === "stopped" ? "aborted" : "completed");
-
-        // Live path: replay the real engine emissions into the renderer aggregator and check
-        // after every event, so a partially streamed flush cannot flash into the transcript.
-        const expectedEventTypes: Array<TurnEngineEvent["type"]> =
-          ending === "stopped"
-            ? ["stream-start", "stream-delta", "stream-abort"]
-            : [
-                "stream-start",
-                ...FLUSH_TEXT_DELTAS.map(() => "stream-delta" as const),
-                "stream-end",
-              ];
-        expect(events.map((event) => event.type)).toEqual(expectedEventTypes);
-        const seenLive: string[][] = [];
-        for (const event of events) {
-          applyThroughIpcSchema(live, event);
-          seenLive.push(displayedRowsFor(live, messageId).map((row) => row.type));
-        }
-        if (flush) {
-          expect(seenLive.flat()).toEqual([]);
-        } else {
-          expect(seenLive.at(-1)).toEqual(["assistant"]);
-          expect(displayedRowsFor(live, messageId)[0]).toMatchObject({
-            content: FLUSH_TEXT_DELTAS.join(""),
-          });
-        }
-        // The hidden trigger row is unaffected either way.
-        expect(displayedRowsFor(live, trigger.id)).toEqual([]);
-
-        // Durable path: the same rows a reload or crash recovery replays from disk.
-        if (ending === "stopped") {
-          // Stopping commits the partial into history with its streamed text.
-          expect(await h.historyService.readPartial(workspaceId)).toBeNull();
-        }
-        const persisted = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
-        if (!persisted.success) throw new Error(persisted.error);
-        const assistantRow = persisted.data.find((row) => row.id === messageId);
-        expect(
-          assistantRow?.parts.map((part) => (part.type === "text" ? part.text : part.type)).join("")
-        ).toBe(ending === "stopped" ? FLUSH_TEXT_DELTAS[0] : FLUSH_TEXT_DELTAS.join(""));
-        const reloaded = loadIntoFreshAggregator(persisted.data);
-        expect(displayedRowsFor(reloaded, messageId).map((row) => row.type)).toEqual(
-          flush ? [] : ["assistant"]
-        );
-      } finally {
-        await manager.stopStream(workspaceId);
-        await fs.rm(runtimeDir, { recursive: true, force: true });
-        await h.cleanup();
-      }
-    },
-    20000
-  );
 });

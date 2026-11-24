@@ -12,6 +12,8 @@ import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/messag
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import { BackgroundProcessManager } from "./backgroundProcessManager";
+import { TestTempDir } from "./tools/testHelpers";
 import type { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
 import type { TurnCompletion } from "./streamManager";
@@ -521,6 +523,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
             fileParts: [...fileParts, ...laterFileParts],
             reviews,
             heldInputIds: h.session.getHeldInputs().map((held) => held.id),
+            // Per send (idempotent sends): these sends were queued without send ids.
+            inputs: [
+              {
+                text: restoreAt === "raw command" ? "/init" : "first\nsecond",
+                fileParts,
+                reviews,
+                sendIds: [],
+              },
+              { text: "later input", fileParts: laterFileParts, sendIds: [] },
+            ],
           },
         ]);
         // The dequeued send and the later entry are each held with their own send (#4448).
@@ -586,6 +598,173 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       expect(h.session.discardHeldInput(held[0].id)).toBe("discarded");
       expect(h.session.hasPendingUserInput()).toBe(false);
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // #5171: an ACP prompt that waits in the queue settles only on events carrying its correlation
+  // id. A dequeue refusal starts no stream, so the held list must name the refused prompt.
+  test("a queued send refused at dequeue is held with its ACP prompt correlation id", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-refused-acp-held",
+      captureEvents: true,
+    });
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      h.session.queueMessage(
+        "acp prompt",
+        { model: TEST_MODEL, agentId: "exec", acpPromptId: "acp-prompt-1" },
+        {
+          acceptanceOrigin: "manual",
+          // A task attempt closed while the prompt waited: the dequeue gate refuses it.
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      h.session.sendQueuedMessages();
+      await h.session.waitForIdle();
+
+      expect(stream).not.toHaveBeenCalled();
+      expect(h.events.findLast((event) => event.type === "held-inputs-changed")).toMatchObject({
+        heldInputs: [{ displayText: "acp prompt", acpPromptId: "acp-prompt-1" }],
+      });
+    } finally {
+      stream.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // #5198: a queued ACP prompt gets no correlated event while it waits, so the queue event must
+  // name it for the ACP agent to hold its correlation timeout until the entry leaves the queue.
+  test("queue events list the ACP prompts still queued", async () => {
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)))
+    );
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-acp-prompt-ids",
+      captureEvents: true,
+      aiServiceOverrides: { streamMessage },
+    });
+    const lastQueueEvent = () =>
+      h.events.findLast((event) => event.type === "queued-message-changed");
+    try {
+      h.session.queueMessage("acp prompt", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        acpPromptId: "acp-prompt-1",
+      });
+      h.session.queueMessage("plain follow-up", { model: TEST_MODEL, agentId: "exec" });
+      expect(lastQueueEvent()).toMatchObject({ acpPromptIds: ["acp-prompt-1"] });
+
+      h.session.sendQueuedMessages();
+      expect(await waitForCondition(() => streamMessage.mock.calls.length > 0)).toBe(true);
+      expect(lastQueueEvent()).toMatchObject({
+        queuedMessages: ["plain follow-up"],
+        acpPromptIds: [],
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // Artifacts M5b: a queued artifact send carries its metadata to the renderer, which shows it
+  // like the sent message instead of the model-facing <artifact_interaction> payload.
+  test("queue events carry a queued artifact send's metadata and confirmed text", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-artifact-interaction",
+      captureEvents: true,
+    });
+    const interaction = {
+      id: "i-1",
+      artifactPath: "form.html",
+      title: "Form",
+      action: "send" as const,
+      text: "Ship it",
+    };
+    try {
+      h.session.queueMessage(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "normal", artifactInteraction: interaction },
+        }
+      );
+      expect(h.events.findLast((event) => event.type === "queued-message-changed")).toMatchObject({
+        displayText: "Ship it",
+        artifactInteraction: interaction,
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // #5170: an ACP /send-held re-sends the held send as a NEW prompt, so the send must carry that
+  // prompt's correlation, not the one it was queued with, and the held copy must stay unchanged.
+  test("claiming a held send for an ACP prompt re-addresses it without touching the held copy", async () => {
+    const h = await createAgentSessionHarness({ workspaceId: "held-acp-correlation" });
+    try {
+      h.session.queueMessage(
+        "acp prompt",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          acpPromptId: "old-prompt",
+          delegatedToolNames: ["file_read"],
+          muxMetadata: { acpPromptId: "old-prompt", acpDelegatedTools: ["file_read"], keep: 1 },
+        },
+        {
+          acceptanceOrigin: "manual",
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      h.session.sendQueuedMessages();
+      await h.session.waitForIdle();
+      const [held] = h.session.getHeldInputs();
+      const claimOptions = (correlation?: {
+        acpPromptId: string;
+        delegatedToolNames?: string[];
+      }) => {
+        const claim = h.session.claimHeldInputSend(held.id, correlation);
+        h.session.releaseHeldInputSend(held.id);
+        return claim.kind === "claimed" ? claim.send.options : undefined;
+      };
+
+      expect(claimOptions({ acpPromptId: "new-prompt" })).toMatchObject({
+        acpPromptId: "new-prompt",
+        delegatedToolNames: undefined,
+        muxMetadata: { acpPromptId: "new-prompt", keep: 1 },
+      });
+      expect(claimOptions({ acpPromptId: "new-prompt" })?.muxMetadata).not.toHaveProperty(
+        "acpDelegatedTools"
+      );
+      expect(
+        claimOptions({ acpPromptId: "new-prompt", delegatedToolNames: ["bash"] })
+      ).toMatchObject({
+        delegatedToolNames: ["bash"],
+        muxMetadata: { acpPromptId: "new-prompt", acpDelegatedTools: ["bash"] },
+      });
+      // Without a correlation (desktop Send) the send is exactly what was queued.
+      expect(claimOptions()).toMatchObject({ acpPromptId: "old-prompt" });
+      // The held copy itself is never rewritten: a failed re-send keeps the original.
+      expect(h.session.getHeldInputs()[0].send.options).toMatchObject({
+        acpPromptId: "old-prompt",
+        muxMetadata: { acpPromptId: "old-prompt", acpDelegatedTools: ["file_read"] },
+      });
     } finally {
       await h.session.dispose();
       await h.cleanup();
@@ -1083,14 +1262,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("withdrawn tool-end entry neither soft-stops nor hides a later entry's mode", async () => {
     const workspaceId = "queue-dispatch-withdrawn-head";
-    const queuedSignals: boolean[] = [];
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
-      backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
-          queuedSignals.push(queued);
-        }),
-      },
     });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
 
@@ -1127,7 +1300,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       });
       expect(session.hasQueuedMessages("tool-end")).toBe(false);
       expect(session.hasQueuedMessages("turn-end")).toBe(true);
-      expect(queuedSignals).toEqual([true, false]);
     } finally {
       stopStream.mockRestore();
       await session.dispose();
@@ -1156,16 +1328,94 @@ describe("AgentSession queued message tool-call dispatch", () => {
     ],
   });
 
+  test.each([
+    ["user", "tool-end"],
+    ["user", "turn-end"],
+    ["agent", "tool-end"],
+    ["agent", "turn-end"],
+  ] as const)("%s %s input backgrounds Bash only when dispatchable", async (sender, mode) => {
+    using tempDir = new TestTempDir("queued-bash");
+    const manager = new BackgroundProcessManager(tempDir.path);
+    const workspaceId = "queue-dispatch-bash";
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManager: manager,
+    });
+    const background = mock(() => undefined);
+    const otherBackground = mock(() => undefined);
+    const foreground = manager.registerForegroundProcess(
+      workspaceId,
+      "bash-1",
+      "test",
+      "test",
+      background
+    );
+    const other = manager.registerForegroundProcess(
+      "other-workspace",
+      "bash-other",
+      "test",
+      "test",
+      otherBackground
+    );
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      session.queueMessage(
+        "follow up",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: mode },
+        sender === "agent" ? peerTriggerInternal("agent-msg:sender:bash") : undefined
+      );
+      expect(background).toHaveBeenCalledTimes(mode === "tool-end" ? 1 : 0);
+      expect(otherBackground).not.toHaveBeenCalled();
+    } finally {
+      foreground.unregister();
+      other.unregister();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("held user input blocks agent Bash backgrounding until Send now", async () => {
+    using tempDir = new TestTempDir("held-queued-bash");
+    const manager = new BackgroundProcessManager(tempDir.path);
+    const workspaceId = "queue-dispatch-held-bash";
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManager: manager,
+    });
+    const background = mock(() => undefined);
+    const foreground = manager.registerForegroundProcess(
+      workspaceId,
+      "bash-1",
+      "test",
+      "test",
+      background
+    );
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      session.queueMessage("hold", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      session.queueMessage(
+        "agent follow up",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        peerTriggerInternal("agent-msg:sender:held-bash")
+      );
+      expect(background).not.toHaveBeenCalled();
+      session.setQueuedMessageDispatchMode("tool-end");
+      expect(background).toHaveBeenCalledTimes(1);
+    } finally {
+      foreground.unregister();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
   test("a synthetic turn-end entry never cuts a tool boundary and drains at stream-end", async () => {
     const workspaceId = "queue-dispatch-synthetic-turn-end";
-    const queuedSignals: boolean[] = [];
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
-      backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
-          queuedSignals.push(queued);
-        }),
-      },
     });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
     const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
@@ -1186,7 +1436,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.getQueuedInputStopCause()).toBeUndefined();
       expect(session.hasQueuedMessages("tool-end")).toBe(false);
       // bash_output early-return signal stays off for turn-end entries.
-      expect(queuedSignals).toEqual([false]);
 
       // Provider-executed and local tool results both pass without a soft stop.
       aiEmitter.emit("tool-call-end", {
@@ -1228,14 +1477,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("a synthetic tool-end entry cuts the next tool boundary and dispatches after the abort", async () => {
     const workspaceId = "queue-dispatch-synthetic-tool-end";
-    const queuedSignals: boolean[] = [];
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
-      backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
-          queuedSignals.push(queued);
-        }),
-      },
     });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
     const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
@@ -1253,7 +1496,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.hasQueuedMessages("tool-end")).toBe(true);
       // Local tool boundaries stop through the queued-input cause (StreamManager stopWhen).
       expect(session.getQueuedInputStopCause()).toMatchObject({ kind: "queued-input" });
-      expect(queuedSignals).toEqual([true]);
 
       // Provider-executed boundaries soft-stop the stream and dispatch once it aborts.
       aiEmitter.emit("tool-call-end", {
@@ -1488,11 +1730,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("updates visible queued dispatch mode without dequeuing content", async () => {
     const workspaceId = "queue-dispatch-mode-update";
-    const setMessageQueued = mock((_workspaceId: string, _queued: boolean) => undefined);
     const { session, cleanup, events } = await createAgentSessionHarness({
       workspaceId,
       captureEvents: true,
-      backgroundProcessManagerOverrides: { setMessageQueued },
     });
 
     try {
@@ -1513,7 +1753,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         queuedMessages: ["my queued follow-up"],
         queueDispatchMode: "tool-end",
       });
-      expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, true);
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
       expect(session.hasQueuedMessages()).toBe(true);
 
       expect(session.setQueuedMessageDispatchMode("turn-end")).toBe(true);
@@ -1522,7 +1762,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         queuedMessages: ["my queued follow-up"],
         queueDispatchMode: "turn-end",
       });
-      expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, false);
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
       expect(session.hasQueuedMessages()).toBe(true);
     } finally {
       await session.dispose();

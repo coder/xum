@@ -49,3 +49,19 @@ export function installQuotaLimitedStorage(capacityChars: number): QuotaLimitedS
   Object.defineProperty(window, "localStorage", { configurable: true, value: storage });
   return storage;
 }
+
+/**
+ * Simulate an app restart: install a new localStorage holding only what the old one stored, so
+ * values kept in memory for the session (over their budget) are gone.
+ */
+export function restartLocalStorage(): QuotaLimitedStorage {
+  const previous = window.localStorage;
+  const storage = new QuotaLimitedStorage(Number.POSITIVE_INFINITY);
+  for (let index = 0; index < previous.length; index++) {
+    const key = previous.key(index);
+    const value = key === null ? null : previous.getItem(key);
+    if (key !== null && value !== null) storage.seed(key, value);
+  }
+  Object.defineProperty(window, "localStorage", { configurable: true, value: storage });
+  return storage;
+}

@@ -19,6 +19,8 @@ import { shellQuote } from "@/common/utils/shell";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { log } from "@/node/services/log";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { ensureGitInfoExclude } from "@/node/utils/git/ensureGitInfoExclude";
 
@@ -508,14 +510,19 @@ const HISTORY_SCAN_CHUNK_BYTES = 1024 * 1024;
  * append-only history never has to be held in memory whole. Paths cannot span lines: they come
  * from JSON strings, which escape newlines.
  */
-export async function extractStagedAttachmentPathsFromFile(filePath: string): Promise<string[]> {
+export async function extractStagedAttachmentPathsFromFile(
+  filePath: string,
+  // Session history files go through the HistoryService's SessionFiles. Other callers read
+  // host files.
+  files: SessionFiles = nodeSessionFiles
+): Promise<string[]> {
   const paths = new Set<string>();
   const scan = (text: string) => {
     for (const stagedPath of extractStagedAttachmentPathsFromText(text)) {
       paths.add(stagedPath);
     }
   };
-  const handle = await fsPromises.open(filePath, "r");
+  const handle = await files.promises.open(filePath, "r");
   try {
     const decoder = new StringDecoder("utf8");
     const chunk = Buffer.alloc(HISTORY_SCAN_CHUNK_BYTES);

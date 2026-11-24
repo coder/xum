@@ -1,6 +1,21 @@
 import { z } from "zod";
 import type { Review, ReviewNoteData, ReviewStatus } from "@/common/types/review";
 
+const ArtifactAnnotationAnchorSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("text"), quote: z.string(), prefix: z.string(), suffix: z.string() }),
+  z.object({
+    kind: z.literal("point"),
+    x: z.number(),
+    y: z.number(),
+    selector: z.string().optional(),
+  }),
+]);
+
+// Not strict: notes saved before versions were removed also carry `version`; it is dropped on load.
+const ArtifactAnnotationRefSchema = z.object({
+  anchor: ArtifactAnnotationAnchorSchema,
+});
+
 // Review data schema for queued message display and persisted review notes.
 export const ReviewNoteDataSchema = z.object({
   filePath: z.string(),
@@ -10,6 +25,7 @@ export const ReviewNoteDataSchema = z.object({
   oldStart: z.number().optional(),
   newStart: z.number().optional(),
   userNote: z.string(),
+  artifact: ArtifactAnnotationRefSchema.optional(),
 });
 
 export const ReviewStatusSchema = z.enum(["pending", "attached", "checked"]);

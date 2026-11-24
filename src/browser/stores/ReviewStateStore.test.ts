@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getReviewStateKey, getReviewsKey } from "@/common/constants/storage";
 import type {
   ReviewStateDelta,
@@ -10,9 +10,19 @@ import type {
 } from "@/common/orpc/schemas/reviewState";
 import { REVIEW_STATE_SECTIONS } from "@/common/orpc/schemas/reviewState";
 import type { Review } from "@/common/types/review";
-import { applyReviewStateDelta, withReviewStateSection } from "@/common/utils/reviewState";
+import {
+  applyReviewStateDelta,
+  assignSection,
+  capReviewStateSections,
+} from "@/common/utils/reviewState";
 import { installDom } from "../../../tests/ui/dom";
 import { ReviewStateStore } from "./ReviewStateStore";
+
+// Older builds wrote these legacy keys; the key registry refuses them now, so seed them the way
+// an older build left them on disk.
+function seedLegacyKey(key: string, value: unknown): void {
+  window.localStorage.setItem(key, JSON.stringify(value));
+}
 
 const WS = "ws-review-store";
 
@@ -133,7 +143,10 @@ function createBackend(initial: ReviewStateSections = {}) {
         if (sections[section] !== undefined) {
           results[section] = "present";
         } else {
-          sections = withReviewStateSection(sections, section, incoming);
+          sections = { ...sections };
+          assignSection(sections, section, incoming);
+          // ReviewStateService.importLegacy caps what it imports; keep the double in step.
+          sections = capReviewStateSections(sections);
           results[section] = "applied";
         }
       }
@@ -341,6 +354,150 @@ describe("ReviewStateStore", () => {
     expect(backend.sections.hunkExpand).toEqual({ h0: true, h1: true });
   });
 
+  test("a send after a failed first subscription retries at once and reads the attached notes (#5011)", async () => {
+    const { backend, client } = createBackend({
+      reviews: { r1: makeReview("r1", "attached"), r2: makeReview("r2", "pending") },
+    });
+    backend.failNextSubscribe = true;
+    const store = connect(client);
+    await store.whenReady(WS);
+    expect(store.getAttachedReviews(WS)).toEqual([]);
+
+    // Well under the first resubscribe backoff would matter only if the read waited it out;
+    // the read retries the subscription itself instead.
+    const attached = await store.readAttachedReviewsForSend(WS, 2_000);
+    expect(attached?.map((review) => review.id)).toEqual(["r1"]);
+  });
+
+  test("a send reports missing notes (null) when hydration keeps failing (#5011)", async () => {
+    const { backend, client } = createBackend({ reviews: { r1: makeReview("r1", "attached") } });
+    const gate = deferred();
+    backend.failNextSubscribe = true;
+    const store = connect(client);
+    await store.whenReady(WS);
+
+    // The immediate retry fails as well.
+    backend.failNextSubscribe = true;
+    expect(await store.readAttachedReviewsForSend(WS, 2_000)).toBeNull();
+
+    // A retry that never answers is bounded by the timeout.
+    backend.hydrationGate = gate.promise;
+    expect(await store.readAttachedReviewsForSend(WS, 50)).toBeNull();
+    gate.resolve();
+  });
+
+  test("a send bounds a stalled first snapshot after a revisit (#5011)", async () => {
+    const { backend, client } = createBackend({ reviews: { r1: makeReview("r1", "attached") } });
+    const store = connect(client);
+    await store.whenReady(WS);
+    unsubscribe?.();
+    unsubscribe = undefined;
+
+    // Revisit while the backend's first snapshot never arrives.
+    backend.hydrationGate = new Promise<void>(() => undefined);
+    unsubscribe = store.subscribe(WS, () => undefined);
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("send read never settled")), 1_000)
+    );
+    expect(await Promise.race([store.readAttachedReviewsForSend(WS, 50), timeout])).toBeNull();
+  });
+
+  test("a mutate after the last subscriber left runs against fresh server data (#5011)", async () => {
+    const { backend, client } = createBackend({ readMore: {} });
+    const store = connect(client);
+    await store.whenReady(WS);
+    unsubscribe?.();
+    unsubscribe = undefined;
+    await waitUntil(() => backend.openStreams === 0);
+
+    // Another renderer changes the section while no selector is mounted here.
+    backend.externalWrite({ readMore: { set: { h1: { up: 1, down: 0 } } } });
+
+    // The updater depends on the current value; the cached copy would not have h1.
+    store.mutate(WS, "readMore", (prev) => ({
+      set: { h1: { up: (prev.h1?.up ?? 0) + 1, down: 0 } },
+    }));
+    await waitUntil(() => backend.sections.readMore?.h1?.up === 2);
+    await waitUntil(() => backend.openStreams === 0);
+  });
+
+  test("a flush after the last subscriber left waits for the new snapshot (#5011)", async () => {
+    const { backend, client } = createBackend();
+    const store = connect(client);
+    await store.whenReady(WS);
+    unsubscribe?.();
+    unsubscribe = undefined;
+
+    const gate = deferred();
+    backend.hydrationGate = gate.promise;
+    store.mutate(WS, "hunkExpand", () => ({ set: { h1: true } }));
+    const flushed = store.flush(WS);
+    gate.resolve();
+    await flushed;
+    expect(backend.sections.hunkExpand).toEqual({ h1: true });
+  });
+
+  test("a write that fails after release keeps retrying through a failed rehydration", async () => {
+    const { backend, client } = createBackend();
+    const store = connect(client);
+    await store.whenReady(WS);
+
+    backend.failNextUpdate = true;
+    store.mutate(WS, "hunkExpand", () => ({ set: { h1: true } }));
+    unsubscribe?.();
+    unsubscribe = undefined;
+    // The retry has to rehydrate first, and that first rehydration fails too.
+    backend.failNextSubscribe = true;
+
+    await waitUntil(() => backend.sections.hunkExpand?.h1 === true);
+    await waitUntil(() => backend.openStreams === 0);
+  });
+
+  test("a flush after release without an API client rejects instead of hanging", async () => {
+    const { client } = createBackend();
+    const store = connect(client);
+    await store.whenReady(WS);
+    unsubscribe?.();
+    unsubscribe = undefined;
+    store.setClient(null);
+
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("flush never settled")), 1_000)
+    );
+    let flushError: unknown = null;
+    await Promise.race([
+      store.flush(WS).catch((error: unknown) => {
+        flushError = error;
+      }),
+      timeout,
+    ]);
+    expect(flushError).toBeInstanceOf(Error);
+    expect((flushError as Error).message).not.toBe("flush never settled");
+  });
+
+  test("removing a workspace settles a pending whenReady and flush (#5011)", async () => {
+    const { backend, client } = createBackend();
+    backend.hydrationGate = new Promise<void>(() => undefined);
+    const store = connect(client);
+
+    const ready = store.whenReady(WS);
+    const flushed = store.flush(WS);
+    store.removeWorkspace(WS);
+
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("waiter never settled")), 1_000)
+    );
+    await Promise.race([ready, timeout]);
+    let flushError: unknown = null;
+    await Promise.race([
+      flushed.catch((error: unknown) => {
+        flushError = error;
+      }),
+      timeout,
+    ]);
+    expect(flushError).not.toBeNull();
+  });
+
   test("reports restored notes durable only once the backend acknowledged them (#4448)", async () => {
     const { backend, client } = createBackend();
     const store = connect(client);
@@ -362,7 +519,7 @@ describe("ReviewStateStore legacy localStorage migration", () => {
   test("sends a legacy section the backend already has (another origin's data), then removes the key", async () => {
     const { backend, client } = createBackend({ reviews: {} });
     const legacyReviews = { other: makeReview("other", "attached") };
-    updatePersistedState(getReviewsKey(WS), {
+    seedLegacyKey(getReviewsKey(WS), {
       workspaceId: WS,
       reviews: legacyReviews,
       lastUpdated: 1,
@@ -379,7 +536,7 @@ describe("ReviewStateStore legacy localStorage migration", () => {
   test("imports a legacy section the backend never wrote, then removes the key", async () => {
     const { backend, client } = createBackend();
     const readState = { h1: { hunkId: "h1", isRead: true, timestamp: 5 } };
-    updatePersistedState(getReviewStateKey(WS), { workspaceId: WS, readState, lastUpdated: 1 });
+    seedLegacyKey(getReviewStateKey(WS), { workspaceId: WS, readState, lastUpdated: 1 });
 
     const store = connect(client);
     await store.whenReady(WS);
@@ -408,7 +565,7 @@ describe("ReviewStateStore legacy localStorage migration", () => {
       readState: { h1: { hunkId: "h1", isRead: true, timestamp: 5 } },
       lastUpdated: 1,
     };
-    updatePersistedState(getReviewStateKey(WS), legacy);
+    seedLegacyKey(getReviewStateKey(WS), legacy);
 
     const store = connect(client);
     await store.whenReady(WS);

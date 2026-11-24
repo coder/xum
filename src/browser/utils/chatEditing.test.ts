@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
-import type {
-  CompactionFollowUpRequest,
-  DisplayedUserMessage,
-  QueuedMessage,
+import {
+  createMuxMessage,
+  type CompactionFollowUpRequest,
+  type DisplayedUserMessage,
+  type QueuedMessage,
 } from "@/common/types/message";
+import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import {
   buildEditingStateFromCompaction,
   buildEditingStateFromDisplayed,
@@ -46,6 +48,48 @@ describe("canEditDisplayedUserMessage", () => {
 
   test("excludes the not-yet-persisted first message of a new workspace", () => {
     expect(canEditDisplayedUserMessage(userMessage({ isPendingSend: true }))).toBe(false);
+  });
+
+  test.each([
+    ["after the user row", ["user", "warning"]],
+    ["raised mid-stream", ["user", "assistant", "warning", "continue"]],
+  ])("ArrowUp skips a Token Budget warning %s", (_label, order) => {
+    const rows = {
+      user: createMuxMessage("user", "user", "Investigate the failing test"),
+      assistant: createMuxMessage("assistant", "assistant", "Looking into it"),
+      warning: createMuxMessage("warning", "user", "Write the next steps to workspace notes.", {
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: {
+          type: "context-budget-warning",
+          contextTokens: 800,
+          maxTokens: 1000,
+          budgetTokens: 991,
+          handoff: true,
+        },
+      }),
+      // Hidden Continue the mid-stream stage queues after the warning; not displayed.
+      continue: createMuxMessage("continue", "user", "Continue", {
+        synthetic: true,
+        muxMetadata: { type: "normal", contextBudgetContinuation: true },
+      }),
+    };
+    const aggregator = new StreamingMessageAggregator("2026-01-01T00:00:00.000Z");
+    aggregator.loadHistoricalMessages(
+      order.map((key, index) => ({
+        ...rows[key as keyof typeof rows],
+        metadata: { ...rows[key as keyof typeof rows].metadata, historySequence: index + 1 },
+      })),
+      false
+    );
+    // Same selection as ChatPane's ArrowUp handler: the newest editable displayed user row.
+    const target = aggregator
+      .getDisplayedMessages()
+      .findLast(
+        (message): message is DisplayedUserMessage =>
+          message.type === "user" && canEditDisplayedUserMessage(message)
+      );
+    expect(target?.historyId).toBe("user");
   });
 
   test("excludes local command output messages", () => {

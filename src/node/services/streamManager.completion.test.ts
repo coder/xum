@@ -1,10 +1,18 @@
-import { describe, test, expect, mock } from "bun:test";
+import { describe, test, expect, mock, spyOn } from "bun:test";
+import nodeFs from "node:fs";
+import * as path from "node:path";
+import * as aiSdk from "ai";
 import { tool } from "ai";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
 import { Ok, Err } from "@/common/types/result";
-import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
+import type { ModelFallbackPrepareOptions } from "./streamManager";
+import type { MuxMessage } from "@/common/types/message";
+import { HistoryService } from "./historyService";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "./workspaceRemoval";
 import type { SessionUsageService } from "./sessionUsageService";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -18,11 +26,14 @@ import {
 import {
   installStreamManagerTestHistory,
   historyService,
+  historyConfig,
   createTestLanguageModel,
   appendPartialAssistantForTests,
   createStreamResultForTests,
   createStreamInfoForTests,
   runTurnForTests,
+  scriptedStreamText,
+  STOP_FINISH,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -83,25 +94,228 @@ describe("StreamManager - exact step indices", () => {
     expect(committed?.metadata?.stepStartPartIndices).toEqual([0, 1]);
   });
 
-  // The preserve-parts reset is proven publicly by errorRecovery's step-boundary
-  // previousResponseId retry, which commits stepStartPartIndices [0, 1].
-  test("retry reset discards step indices together with discarded parts", async () => {
-    const streamManager = new StreamManager(historyService);
-    const streamInfo = createStreamInfoForTests({
-      parts: [{ type: "text", text: "discarded", timestamp: 1 }],
-      stepStartIndices: [0, 1, 3],
+  test("persists Gemini tool-call thought signatures to chat.jsonl", async () => {
+    // A retry rebuilds the current turn from history, and Gemini rejects its
+    // function calls without their signatures.
+    const call = (toolCallId: string, providerMetadata?: unknown) => ({
+      type: "tool-call",
+      toolCallId,
+      toolName: "bash",
+      input: { script: "pwd" },
+      ...(providerMetadata != null ? { providerMetadata } : {}),
     });
-    const reset = engineInternals(streamManager).resetStreamStateForRetry;
-    await reset.call(streamManager, "step-reset-workspace", streamInfo, { preserveParts: false });
-    expect(streamInfo.stepStartIndices).toEqual([0]);
-    expect(streamInfo.currentStepStartIndex).toBe(0);
-    const buildPartial = engineInternals(streamManager).buildPartialAssistantMessage;
-    const partial = buildPartial.call(streamManager, streamInfo);
-    expect(partial.metadata?.stepStartPartIndices).toEqual([]);
-    await historyService.writePartial("step-reset-workspace", partial);
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: turnStreamTextForTests(() =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield call("coder", {
+              coderGoogle: { thoughtSignature: "sig-coder", extra: "dropped" },
+              openai: { itemId: "dropped" },
+            });
+            yield call("vertex", { vertex: { thoughtSignature: "sig-vertex" } });
+            yield call("plain");
+            for (const toolCallId of ["coder", "vertex", "plain"]) {
+              yield { type: "tool-result", toolCallId, toolName: "bash", output: "/tmp" };
+            }
+            yield { type: "finish", finishReason: "tool-calls" };
+          })()
+        )
+      ),
+    });
+    const workspaceId = "tool-call-signature-workspace";
+    const messageId = "tool-call-signature-message";
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence: 1 });
+
+    const restarted = new HistoryService(historyConfig);
+    const history = await restarted.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const committed = history.data.find((row) => row.id === messageId);
     expect(
-      (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
-    ).toEqual([]);
+      committed?.parts.map((part) =>
+        part.type === "dynamic-tool" ? [part.toolCallId, part.providerOptions] : part.type
+      )
+    ).toEqual([
+      ["coder", { coderGoogle: { thoughtSignature: "sig-coder" } }],
+      ["vertex", { googleVertex: { thoughtSignature: "sig-vertex" } }],
+      ["plain", undefined],
+    ]);
+  });
+});
+
+// #7499: StreamRetries.test.ts owns the retry reset; this checks the conditional delete it uses.
+describe("StreamManager - the retry's partial delete holds the history write lock (#7499)", () => {
+  const workspaceId = "retry-partial-workspace";
+  const partialOf = (id: string): MuxMessage => ({
+    id,
+    role: "assistant",
+    parts: [{ type: "text", text: `partial of ${id}` }],
+    metadata: { historySequence: 1 },
+  });
+
+  test("a foreign backend's replacement between the check and the unlink survives", async () => {
+    await historyService.writePartial(workspaceId, partialOf("this-message"));
+    // This test plays the foreign backend: it holds the cross-process history write lock that
+    // partial writes take, and replaces partial.json while the delete (deleteForRetry's
+    // conditional delete) waits.
+    const lockPath = historyWriteLockPath(historyConfig.rootDir, workspaceId);
+    const foreignLock = await acquireProcessFileLock({
+      lockPath,
+      timeoutMs: 5_000,
+      label: "foreign history write lock",
+    });
+    const locks = historyService.locks;
+    const acquire = locks.acquireProcessFileLock.bind(locks);
+    let markWaiting = () => undefined as void;
+    const waiting = new Promise<void>((resolve) => (markWaiting = resolve));
+    const lockSpy = spyOn(locks, "acquireProcessFileLock").mockImplementation((options) => {
+      if (options.lockPath === lockPath) markWaiting();
+      return acquire(options);
+    });
+    try {
+      const deleted = historyService.deletePartialIfMessageIdMatches(workspaceId, "this-message");
+      // Without the lock the delete never waits: it finishes first and deletes this partial,
+      // before the replacement below.
+      await Promise.race([waiting, deleted]);
+      nodeFs.writeFileSync(
+        path.join(historyConfig.sessionsDir, workspaceId, "partial.json"),
+        JSON.stringify(partialOf("other-message"))
+      );
+      await foreignLock[Symbol.asyncDispose]();
+      expect(await deleted).toEqual(Ok(false));
+    } finally {
+      lockSpy.mockRestore();
+    }
+    expect((await historyService.readPartial(workspaceId))?.id).toBe("other-message");
+  });
+});
+
+describe("StreamManager - completion persistence is crash-consistent", () => {
+  // A restarted backend (fresh HistoryService, empty memory) can recover the reply
+  // when either partial.json still holds it or the chat.jsonl row already does.
+  async function recoverableAfterRestart(workspaceId: string, messageId: string, text: string) {
+    const restarted = new HistoryService(historyConfig);
+    const partial = await restarted.readPartial(workspaceId);
+    const history = await restarted.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.find((message) => message.id === messageId);
+    const hasText = (parts: MuxMessage["parts"] | undefined) =>
+      (parts ?? []).some((part) => part.type === "text" && part.text === text);
+    return (partial?.id === messageId && hasText(partial.parts)) || hasText(row?.parts);
+  }
+
+  function textTurnStream(text: string, beforeFinish?: () => void) {
+    return turnStreamTextForTests(() =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text };
+          beforeFinish?.();
+          yield { type: "finish", finishReason: "stop" };
+        })()
+      )
+    );
+  }
+
+  test("a crash at any completion persistence step leaves the reply recoverable", async () => {
+    const workspaceId = "completion-crash-window-workspace";
+    const messageId = "completion-crash-window-message";
+    const text = "final answer";
+    // Snapshot the on-disk state a crash right before each completion write would leave.
+    const snapshots: Array<{ step: string; recoverable: boolean }> = [];
+    const originalUpdate = historyService.updateHistory.bind(historyService);
+    const originalDelete = historyService.deletePartialIfMessageIdMatches.bind(historyService);
+    const updateSpy = spyOn(historyService, "updateHistory").mockImplementation(
+      async (ws, message) => {
+        if (ws === workspaceId) {
+          snapshots.push({
+            step: "updateHistory",
+            recoverable: await recoverableAfterRestart(workspaceId, messageId, text),
+          });
+        }
+        return originalUpdate(ws, message);
+      }
+    );
+    const deleteSpy = spyOn(historyService, "deletePartialIfMessageIdMatches").mockImplementation(
+      async (ws, id) => {
+        if (ws === workspaceId) {
+          snapshots.push({
+            step: "deletePartial",
+            recoverable: await recoverableAfterRestart(workspaceId, messageId, text),
+          });
+        }
+        return originalDelete(ws, id);
+      }
+    );
+    try {
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: textTurnStream(text),
+      });
+      const { completion } = await runTurnForTests(streamManager, { workspaceId, messageId });
+      expect(completion.status).toBe("completed");
+    } finally {
+      updateSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+
+    expect(snapshots.map((snapshot) => snapshot.step).sort()).toEqual([
+      "deletePartial",
+      "updateHistory",
+    ]);
+    expect(snapshots.every((snapshot) => snapshot.recoverable)).toBe(true);
+    expect(await recoverableAfterRestart(workspaceId, messageId, text)).toBe(true);
+    // Success still retires partial.json.
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+  });
+
+  test("a failed final history write keeps partial.json so recovery restores the reply", async () => {
+    const workspaceId = "completion-update-failure-workspace";
+    const messageId = "completion-update-failure-message";
+    const text = "final answer";
+    const chatPath = path.join(historyConfig.sessionsDir, workspaceId, "chat.jsonl");
+    const originalRename = nodeFs.rename;
+    let restoreRename: (() => void) | undefined;
+    let injectedFailures = 0;
+    try {
+      const streamManager = createStreamManagerForTests(historyService, {
+        // Inject the I/O failure only once the turn is streaming, so the placeholder
+        // append succeeds and only the final chat.jsonl publish fails.
+        streamText: textTurnStream(text, () => {
+          const renameSpy = spyOn(nodeFs, "rename").mockImplementation(((
+            from: nodeFs.PathLike,
+            to: nodeFs.PathLike,
+            callback: nodeFs.NoParamCallback
+          ) => {
+            if (String(to) === chatPath) {
+              injectedFailures++;
+              callback(Object.assign(new Error("EIO: injected"), { code: "EIO" }));
+              return;
+            }
+            originalRename(from, to, callback);
+          }) as typeof nodeFs.rename);
+          restoreRename = () => renameSpy.mockRestore();
+        }),
+      });
+      const { completion } = await runTurnForTests(streamManager, { workspaceId, messageId });
+      expect(completion.status).toBe("completed");
+      expect(injectedFailures).toBeGreaterThan(0);
+    } finally {
+      restoreRename?.();
+    }
+
+    const restarted = new HistoryService(historyConfig);
+    const kept = await restarted.readPartial(workspaceId);
+    expect(kept?.id).toBe(messageId);
+    // The provider finished this turn, so the kept partial says so: startup must not treat it as
+    // interrupted and auto-retry an extra continuation (#5322).
+    expect(kept?.metadata?.streamFinalized).toBe(true);
+    expect(await restarted.commitPartial(workspaceId)).toEqual({ success: true, data: undefined });
+    const history = await restarted.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.find((message) => message.id === messageId);
+    expect(row?.parts).toMatchObject([{ type: "text", text }]);
+    expect(row?.metadata?.partial).toBeUndefined();
+    expect(row?.metadata).not.toHaveProperty("streamFinalized");
   });
 });
 
@@ -200,6 +414,26 @@ describe("StreamManager - empty stream completions", () => {
     expect(partial?.metadata?.providerMetadata).toEqual({ openai: { cached_tokens: 2 } });
   });
 
+  test("an empty-output retry forgets the empty attempt's finish", async () => {
+    // The empty attempt ended with a finish event. The retried attempt closes
+    // without one, so it must still fail as truncated, not complete.
+    const usage = { inputTokens: 3, outputTokens: 0, totalTokens: 3 };
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        { chunks: [STOP_FINISH], usage },
+        { chunks: [{ type: "text-delta", text: "partial answer" }], usage },
+      ]),
+    });
+    const workspaceId = "empty-retry-truncated-workspace";
+
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+
+    expect(completion.status).toBe("failed");
+    const partial = await historyService.readPartial(workspaceId);
+    expect(partial?.metadata?.errorType).toBe("stream_truncated");
+    expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
+  });
+
   test("persists retryable partial error when a non-empty stream closes before finish", async () => {
     const turnStream = () =>
       createStreamResultForTests(
@@ -247,54 +481,105 @@ describe("StreamManager - empty stream completions", () => {
     expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
   });
 
-  test("treats streamText's synthesized (other, undefined) finish part as a truncated stream", async () => {
-    // streamText's runStep initializes stepFinishReason="other" /
-    // stepRawFinishReason=undefined and unconditionally emits those from its
-    // flush() at end-of-stream. The OpenAI Responses, Chat Completions, and
-    // Anthropic Messages adapters all surface this shape when the upstream
-    // SSE stream closed before any terminal event arrived. StreamManager
-    // must treat that synthesized default as a missing terminal event so the
-    // existing truncation guard fires a retryable `stream_truncated` error
-    // rather than committing the partial output as a clean assistant
-    // message.
-    const turnStream = () =>
-      createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "text-delta", text: "partial answer" };
-          // The provider adapter never emitted its own finish (e.g. clean
-          // SSE EOF before response.completed / message_stop). The ai
-          // package's flush() synthesizes this one:
-          yield { type: "finish", finishReason: "other", rawFinishReason: undefined };
-        })(),
-        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
-      );
+  // streamText's runStep initializes stepFinishReason="other" /
+  // stepRawFinishReason=undefined and emits those from its flush() when no
+  // model finish arrived. Since AI SDK 7.0.1xx the OpenAI, Anthropic and Google
+  // adapters emit their own `interrupted` finish when the upstream SSE stream
+  // closed before any terminal event. StreamManager must treat both as a
+  // missing terminal event so the truncation guard fires a retryable
+  // `stream_truncated` error rather than committing the partial output as a
+  // clean assistant message.
+  test.each(["other", "interrupted"])(
+    "treats a cut-off (%s, undefined) finish part as a truncated stream",
+    async (finishReason) => {
+      const turnStream = () =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "text-delta", text: "partial answer" };
+            // The stream closed before response.completed / message_stop /
+            // finishReason arrived.
+            yield { type: "finish", finishReason, rawFinishReason: undefined };
+          })(),
+          { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+        );
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: turnStreamTextForTests(turnStream),
+      });
+      const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
+      const streamEndEvents: unknown[] = [];
+
+      onTurnEngineEvent(streamManager, "error", (data) => {
+        errorEvents.push(data as { messageId: string; error: string; errorType?: string });
+      });
+      onTurnEngineEvent(streamManager, "stream-end", (data) => {
+        streamEndEvents.push(data);
+      });
+
+      const workspaceId = "synthesized-finish-workspace";
+      const messageId = "synthesized-finish-message";
+      const historySequence = 1;
+
+      await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
+
+      expect(streamEndEvents).toHaveLength(0);
+      expect(errorEvents).toHaveLength(1);
+      expect(errorEvents[0]).toMatchObject({
+        messageId,
+        errorType: "stream_truncated",
+      });
+
+      const partial = await historyService.readPartial(workspaceId);
+      expect(partial?.metadata?.errorType).toBe("stream_truncated");
+      expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
+    }
+  );
+
+  test("a real Anthropic stream cut before message_stop fails as stream_truncated", async () => {
+    // @ai-sdk/anthropic 4.0.104 finishes this stream as `interrupted` itself.
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-5-5",
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 3, output_tokens: 0 },
+        },
+      },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "partial answer" },
+      },
+    ];
+    const anthropic = createAnthropic({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        () =>
+          Promise.resolve(
+            new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+              headers: { "content-type": "text/event-stream" },
+            })
+          ),
+        { preconnect: fetch.preconnect.bind(fetch) }
+      ),
+    });
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: turnStreamTextForTests(turnStream),
+      streamText: fakeStreamText((options) => aiSdk.streamText(options)),
     });
-    const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
-    const streamEndEvents: unknown[] = [];
+    const workspaceId = "anthropic-cut-off-workspace";
 
-    onTurnEngineEvent(streamManager, "error", (data) => {
-      errorEvents.push(data as { messageId: string; error: string; errorType?: string });
-    });
-    onTurnEngineEvent(streamManager, "stream-end", (data) => {
-      streamEndEvents.push(data);
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      model: anthropic("claude-sonnet-5-5"),
     });
 
-    const workspaceId = "synthesized-finish-workspace";
-    const messageId = "synthesized-finish-message";
-    const historySequence = 1;
-
-    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
-
-    expect(streamEndEvents).toHaveLength(0);
-    expect(errorEvents).toHaveLength(1);
-    expect(errorEvents[0]).toMatchObject({
-      messageId,
-      errorType: "stream_truncated",
-    });
-
+    expect(completion.status).toBe("failed");
     const partial = await historyService.readPartial(workspaceId);
     expect(partial?.metadata?.errorType).toBe("stream_truncated");
     expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
@@ -844,6 +1129,7 @@ describe("StreamManager - empty stream completions", () => {
       runtime,
       stepTracker: {
         latestMessages: [{ role: "user", content: "stale source-step transcript" }],
+        recordSystemSections: () => undefined,
       },
       modelFallback: {
         options: { chain: [fallbackModel], prepare },
@@ -1509,5 +1795,67 @@ describe("StreamManager - empty stream completions", () => {
 
     const partial = await historyService.readPartial(workspaceId);
     expect(partial?.metadata?.errorType).toBe("model_refusal");
+  });
+});
+
+describe("StreamManager - stream start", () => {
+  const answered = {
+    chunks: [{ type: "text-delta", text: "answer" }, STOP_FINISH],
+    usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+  };
+
+  test("stream-start carries the turn's history sequence", async () => {
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([answered]),
+    });
+    const starts: Array<{ historySequence?: number }> = [];
+    onTurnEngineEvent(streamManager, "stream-start", (data) => starts.push(data));
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "stream-start-history-sequence",
+      historySequence: 7,
+    });
+    expect(completion.status).toBe("completed");
+    expect(starts.map((start) => start.historySequence)).toEqual([7]);
+  });
+
+  test("the live token tracker counts the turn's model from stream start", async () => {
+    const setModel = mock((_model: string, _metadataModel?: string) => Promise.resolve());
+    const streamManager = createStreamManagerForTests(historyService, {
+      tokenTracker: { setModel, countTokens: () => Promise.resolve(0) },
+      streamText: scriptedStreamText([answered]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "stream-start-token-tracker",
+      modelString: KNOWN_MODELS.SONNET.id,
+    });
+    expect(completion.status).toBe("completed");
+    expect(setModel.mock.calls[0]?.[0]).toBe(KNOWN_MODELS.SONNET.id);
+  });
+
+  test("a running turn reports streaming, and a failed one reports error while it settles", async () => {
+    // isStreaming() reads this state: queued sends wait while a turn streams, and
+    // a failing turn must stop counting as streaming before its error event.
+    const workspaceId = "stream-state-lifecycle";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        {
+          chunks: [
+            { type: "text-delta", text: "partial" },
+            () => Promise.reject(new Error("provider exploded")),
+          ],
+        },
+      ]),
+    });
+    const states: string[] = [];
+    onTurnEngineEvent(streamManager, "stream-start", () =>
+      states.push(`start:${streamManager.getStreamState(workspaceId)}`)
+    );
+    onTurnEngineEvent(streamManager, "error", () =>
+      states.push(`error:${streamManager.getStreamState(workspaceId)}`)
+    );
+
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+    expect(completion.status).toBe("failed");
+    expect(states).toEqual(["start:streaming", "error:error"]);
   });
 });

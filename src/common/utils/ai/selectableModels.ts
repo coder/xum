@@ -1,25 +1,22 @@
-import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
+import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
-import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { isModelAvailable, resolveRoute } from "@/common/routing";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import assert from "@/common/utils/assert";
 import {
-  isGatewayModelAccessibleForUi,
-  isModelAllowedByPolicy,
-} from "@/common/utils/policy/modelPolicy";
-import { isProviderModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
+  createGatewayRouting,
+  isProviderModelAccessibleFromAuthoritativeCatalog,
+  type GatewayRouting,
+} from "@/common/utils/providers/gatewayModelCatalog";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
 
 /**
  * Selectable-models pipeline shared by the composer model picker
- * (useModelsFromSettings) and the backend `models_list` tool. One implementation
- * keeps routing, credential, authoritative-catalog, policy and hidden-model
- * filtering identical on both sides. The predicates below were moved verbatim
- * from the hook and take `providersConfig`/`effectivePolicy` as plain arguments
- * instead of closing over React state.
+ * (useModelsFromSettings) and the backend `models_list` tool. Routing, credential
+ * and authoritative-catalog filtering are shared; hidden-model filtering is picker-only.
  */
 
 export const BUILT_IN_MODELS: string[] = Object.values(KNOWN_MODELS).map((m) => m.id);
@@ -28,14 +25,12 @@ export interface SelectableModelsInput {
   /** null = provider config still loading (UI only): availability filters are skipped. */
   providersConfig: ProvidersConfigMap | null;
   hiddenModels: string[];
-  /** null = policy not enforced. */
-  effectivePolicy: EffectivePolicy | null;
   /** Mutable arrays match the resolveRoute/isModelAvailable signatures. */
   routePriority: string[];
   routeOverrides: Record<string, string>;
 }
 
-/** One `models_list` entry: a picker selection in the form the `task` tool accepts. */
+/** One `models_list` suggestion in the form the `task` tool accepts. */
 export interface AvailableModel {
   /** Normalized selection ID accepted by task.model (explicit gateway prefixes preserved). */
   model: string;
@@ -51,8 +46,6 @@ export function getCustomModels(config: ProvidersConfigMap | null): string[] {
   if (!config) return [];
   const models: string[] = [];
   for (const [provider, info] of Object.entries(config)) {
-    // Skip mux-gateway - those models are accessed via the cloud toggle, not listed separately
-    if (provider === "mux-gateway") continue;
     // Keep github-copilot's persisted catalog for authoritative model gating, not direct selector entries.
     if (provider === "github-copilot") continue;
     // Only surface custom models from enabled providers
@@ -103,7 +96,7 @@ export function isProviderConfigured(
 }
 
 /**
- * Direct-provider counterpart of isGatewayModelAccessibleForUi: coder and
+ * Direct-provider counterpart of GatewayRouting.isGatewayModelAccessible: coder and
  * github-copilot carry authoritative catalogs that gate their own model IDs.
  */
 export function isAuthoritativeProviderModelAccessible(
@@ -128,7 +121,7 @@ export function isAuthoritativeProviderModelAccessible(
 
 /**
  * The OpenAI auth gates in this pipeline apply to the direct route only. A gateway
- * route (mux-gateway, openrouter, ...) supplies its own credentials, so the
+ * route (openrouter, coder, ...) supplies its own credentials, so the
  * user's OpenAI auth state must not hide, or warn about, models the gateway
  * serves. For a model with no active route, resolveRoute falls back to direct,
  * which keeps the gate in place.
@@ -138,50 +131,30 @@ export function resolvesToDirectOpenAI(
   routePriority: string[],
   routeOverrides: Record<string, string>,
   isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible: (gateway: string, modelId: string) => boolean
+  gatewayRouting: GatewayRouting
 ): boolean {
   return (
-    resolveRoute(modelId, routePriority, routeOverrides, isConfigured, isGatewayModelAccessible)
-      .routeProvider === "openai"
+    resolveRoute(
+      modelId,
+      routePriority,
+      routeOverrides,
+      isConfigured,
+      gatewayRouting.isGatewayModelAccessible,
+      gatewayRouting.resolveGatewayModelId
+    ).routeProvider === "openai"
   );
-}
-
-/**
- * Policy check on the identity the backend enforces. createModel resolves the
- * route first and then checks `isModelAllowed(routeProvider, routeModelId)`,
- * so a policy that lists only a gateway permits a canonical model whose active
- * route is that gateway. A model with no active route resolves to direct and is
- * checked under its canonical identity.
- */
-export function isModelAllowedByPolicyOnActiveRoute(
-  policy: EffectivePolicy | null,
-  modelId: string,
-  routePriority: string[],
-  routeOverrides: Record<string, string>,
-  isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible: (gateway: string, modelId: string) => boolean
-): boolean {
-  const route = resolveRoute(
-    modelId,
-    routePriority,
-    routeOverrides,
-    isConfigured,
-    isGatewayModelAccessible
-  );
-  return isModelAllowedByPolicy(policy, `${route.routeProvider}:${route.routeModelId}`);
 }
 
 /**
  * The raw entries the composer picker offers, in picker order: custom models of
  * enabled providers, then built-ins, minus hidden models, filtered by
- * authoritative catalogs, route availability, direct-route OpenAI auth gating
- * and the policy on the active route.
+ * authoritative catalogs, route availability and direct-route OpenAI auth
+ * gating.
  */
 export function computeSelectableModels(input: SelectableModelsInput): string[] {
-  const { providersConfig, hiddenModels, effectivePolicy, routePriority, routeOverrides } = input;
+  const { providersConfig, hiddenModels, routePriority, routeOverrides } = input;
   const isConfigured = (provider: string) => isProviderConfigured(providersConfig, provider);
-  const isGatewayModelAccessible = (gateway: string, modelId: string) =>
-    isGatewayModelAccessibleForUi(effectivePolicy, providersConfig, gateway, modelId);
+  const gatewayRouting = createGatewayRouting(providersConfig);
 
   const suggested = filterHiddenModels(getSuggestedModels(providersConfig), hiddenModels);
 
@@ -198,50 +171,29 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
               routePriority,
               routeOverrides,
               isConfigured,
-              isGatewayModelAccessible
+              gatewayRouting.isGatewayModelAccessible,
+              gatewayRouting.resolveGatewayModelId
             )
         );
 
-  const allowedByPolicy = (modelId: string) =>
-    isModelAllowedByPolicyOnActiveRoute(
-      effectivePolicy,
-      modelId,
-      routePriority,
-      routeOverrides,
-      isConfigured,
-      isGatewayModelAccessible
-    );
   if (providersConfig == null) {
-    return effectivePolicy ? providerFiltered.filter(allowedByPolicy) : providerFiltered;
+    return providerFiltered;
   }
   const hasOpenaiApiKey = providersConfig.openai?.apiKeySet === true;
   const hasCodexOauth = providersConfig.openai?.codexOauthSet === true;
 
   // OpenAI model gating (direct route only; see resolvesToDirectOpenAI):
-  // - API key + OAuth: allow everything.
-  // - API key only: hide models that require OAuth.
-  // - OAuth only: show only models routable via OAuth.
-  // - Neither: hide models that require OAuth (status quo).
+  // with OAuth but no API key, show only models routable via OAuth.
   // providerFiltered already guarantees an active route, so the resolved
   // route is the real one rather than the direct fallback.
-  const next = providerFiltered.filter((modelId) => {
+  return providerFiltered.filter((modelId) => {
     if (!modelId.startsWith("openai:")) {
       return true;
     }
 
     if (
-      !resolvesToDirectOpenAI(
-        modelId,
-        routePriority,
-        routeOverrides,
-        isConfigured,
-        isGatewayModelAccessible
-      )
+      !resolvesToDirectOpenAI(modelId, routePriority, routeOverrides, isConfigured, gatewayRouting)
     ) {
-      return true;
-    }
-
-    if (hasOpenaiApiKey && hasCodexOauth) {
       return true;
     }
 
@@ -249,14 +201,12 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
       return isCodexOauthAllowedModel(modelId, providersConfig);
     }
 
-    return !isCodexOauthRequiredModel(modelId, providersConfig);
+    return true;
   });
-
-  return effectivePolicy ? next.filter(allowedByPolicy) : next;
 }
 
 /**
- * The picker entries in the form `task.model` accepts: each raw entry is run
+ * Model suggestions in the form `task.model` accepts: each raw entry is run
  * through `normalizeModelInput` (what `parseTaskAiOverrides` does), so the
  * emitted IDs are exactly the strings the task tool will accept unchanged.
  *
@@ -266,15 +216,16 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
  *   data, not a programmer invariant, hence no assert).
  * - `unchecked_identity`: normalization changed the identity (e.g. a
  *   whitespace-padded custom entry) and the normalized ID is not itself a
- *   picker entry — advertising it would bypass the routing/credential/catalog/
- *   policy/hidden checks the picker applied to the raw string.
+ *   catalog entry — advertising it would bypass the routing/credential/catalog
+ *   checks applied to the raw string.
  * Two raw entries normalizing to the same ID collapse into one.
  */
 export function listAvailableModels(
-  input: SelectableModelsInput & { providersConfig: ProvidersConfigMap },
+  input: Omit<SelectableModelsInput, "hiddenModels"> & { providersConfig: ProvidersConfigMap },
   onSkipped?: (raw: string, reason: SkippedModelReason) => void
 ): AvailableModel[] {
-  const rawEntries = computeSelectableModels(input);
+  // Hiding picker suggestions does not prevent tasks from using those models.
+  const rawEntries = computeSelectableModels({ ...input, hiddenModels: [] });
   const selectable = new Set(rawEntries);
 
   const aliasesByModel = new Map<string, string[]>();

@@ -1,5 +1,8 @@
 import assert from "@/common/utils/assert";
 
+/** Largest delay setTimeout honours; larger ones (and non-finite ones) fire after 1 ms. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
 /**
  * In-process FIFO lock per key (a lock path). A key is present in `queues` exactly while it is
  * held; its array lists the waiters in arrival order, and release hands the key straight to the
@@ -31,21 +34,29 @@ export class KeyedFifoLock {
     const waiters = this.queues.get(key);
     assert(waiters != null, "KeyedFifoLock: a held key has a waiter list");
     return await new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const grant = () => {
         clearTimeout(timer);
         resolve(this.releaser(key));
       };
-      const timer = setTimeout(
-        () => {
-          const index = waiters.indexOf(grant);
-          if (index !== -1) {
-            waiters.splice(index, 1);
-            resolve(null);
-          }
-        },
-        Math.max(0, deadline - Date.now())
-      );
-      timer.unref?.();
+      const giveUp = () => {
+        const index = waiters.indexOf(grant);
+        if (index !== -1) {
+          waiters.splice(index, 1);
+          resolve(null);
+        }
+      };
+      // Timers clamp delays above MAX_TIMER_DELAY_MS to 1 ms, which made a far deadline give up
+      // at once (#5332). Arm at most one chunk and re-arm until the deadline is in range.
+      const arm = () => {
+        const remaining = Math.max(0, deadline - Date.now());
+        timer =
+          remaining > MAX_TIMER_DELAY_MS
+            ? setTimeout(arm, MAX_TIMER_DELAY_MS)
+            : setTimeout(giveUp, remaining);
+        timer.unref?.();
+      };
+      arm();
       waiters.push(grant);
     });
   }

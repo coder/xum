@@ -8,7 +8,6 @@ import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
 import { createAppHarness, type AppHarness } from "./harness";
 import { openSettingsDialog } from "./helpers";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/mcpConfig";
 import type { MCPTestResult } from "@/common/types/mcp";
@@ -81,10 +80,6 @@ describeIntegration("MCP settings plugin tool inspection", () => {
       aiMode: "none",
       branchPrefix: "mcp-plugin-tools",
       beforeRenderEnvironment: async (env) => {
-        await env.orpc.experiments.setOverride({
-          experimentId: EXPERIMENT_IDS.AGENT_PLUGINS,
-          enabled: true,
-        });
         const pluginDir = path.join(env.config.rootDir, "plugins", PLUGIN);
         await fs.mkdir(pluginDir, { recursive: true });
         await fs.writeFile(

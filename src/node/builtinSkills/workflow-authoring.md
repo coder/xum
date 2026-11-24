@@ -377,7 +377,7 @@ const screening = evaluate(
   {
     id: "screen-issue", // stable step id (replay key)
     title: "Screen issue text", // optional UI label
-    model: "openai:gpt-5.6-luna", // optional; otherwise --evaluation-model / the persisted default
+    model: "openai:gpt-6-luna", // optional; otherwise --evaluation-model / the persisted default
     questions: {
       injection: {
         type: "choice",
@@ -428,7 +428,7 @@ gh label list -R "$REPO" --search needs-human-review --json name --jq '.[].name'
 gh issue view "$N" -R "$REPO" --json title,body \
   | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
   | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
-      --evaluation-model openai:gpt-5.6-luna --model openai:gpt-5.6-luna
+      --evaluation-model openai:gpt-6-luna --model openai:gpt-6-luna
 ```
 
 ## Structured output schemas

@@ -6,16 +6,18 @@ import { EnvHttpProxyAgent } from "undici/index.js";
 import { Config } from "@/node/config";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
-import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
 
-let root: string, config: Config, service: ProviderService, policy: PolicyService;
+// undici lists destroy()'s promise overload last, so `.call` on the bare method picks it. The
+// promise form re-enters the mocked destroy, so these mocks call the callback overload.
+type DestroyWithCallback = (
+  this: EnvHttpProxyAgent,
+  err: Error | null,
+  callback: () => void
+) => void;
+
+let root: string, config: Config, service: ProviderService;
 let cleanups: Array<() => void>;
-function policySpy<K extends keyof PolicyService>(key: K) {
-  const spy = spyOn(policy, key);
-  cleanups.push(() => spy.mockRestore());
-  return spy;
-}
 let server: ReturnType<typeof Bun.serve>;
 let respond: (request: Request) => Response | Promise<Response>;
 let requests: Request[];
@@ -32,12 +34,13 @@ const envKeys = [
   "GOOGLE_BASE_URL",
   "XAI_API_KEY",
   "XAI_BASE_URL",
+  "META_MODEL_API_KEY",
+  "MODEL_API_KEY",
   "OPENROUTER_API_KEY",
   "DEEPSEEK_API_KEY",
   "MOONSHOT_API_KEY",
   "ZAI_API_KEY",
   "GITHUB_COPILOT_TOKEN",
-  "AI_GATEWAY_API_KEY",
 ];
 let savedEnv: Array<string | undefined>;
 function save(provider: string, extra: BaseProviderConfig = {}) {
@@ -56,8 +59,7 @@ beforeEach(() => {
   envKeys.forEach((key) => delete process.env[key]);
   root = mkdtempSync(join(tmpdir(), "discovery-"));
   config = new Config(root);
-  policy = new PolicyService(config);
-  service = new ProviderService(config, policy);
+  service = new ProviderService(config);
   requests = [];
   respond = () => Response.json({ data: [], has_more: false });
   server = Bun.serve({
@@ -73,7 +75,6 @@ afterEach(async () => {
   await server.stop(true);
   cleanups.forEach((cleanup) => cleanup());
   service.dispose();
-  policy.dispose();
   rmSync(root, { recursive: true, force: true });
   envKeys.forEach((key, i) => {
     if (savedEnv[i] === undefined) delete process.env[key];
@@ -214,7 +215,7 @@ it.each(["config", "file", "env"])(
   }
 );
 
-it.each(["unknown", "coder", "github-copilot", "disabled", "denied", "custom", "oauth", "azure"])(
+it.each(["unknown", "coder", "github-copilot", "disabled", "custom", "oauth", "azure"])(
   "does not request unavailable %s catalogs",
   async (kind) => {
     save("openai", {
@@ -223,8 +224,6 @@ it.each(["unknown", "coder", "github-copilot", "disabled", "denied", "custom", "
       ...(kind === "oauth" && { apiKey: undefined, codexOauth: { access: "private-oauth" } }),
       ...(kind === "azure" && { baseUrl: `${server.url}openai/deployments/name` }),
     });
-    policySpy("isProviderAllowed").mockReturnValue(kind !== "denied");
-    policySpy("isEnforced").mockReturnValue(kind === "denied");
     const provider = ["unknown", "coder", "github-copilot"].includes(kind) ? kind : "openai";
     expect(["unsupported", "not-configured"]).toContain(
       (await service.discoverModels(provider)).status
@@ -233,7 +232,7 @@ it.each(["unknown", "coder", "github-copilot", "disabled", "denied", "custom", "
   }
 );
 
-it.each(["key", "keyfile", "base", "headers", "organization", "policy", "disabled"])(
+it.each(["key", "keyfile", "base", "headers", "organization", "disabled"])(
   "rejects a delayed response after %s changes",
   async (change) => {
     const keyFile = join(root, "key");
@@ -245,7 +244,6 @@ it.each(["key", "keyfile", "base", "headers", "organization", "policy", "disable
       started.resolve();
       return release.promise;
     };
-    const enforced = policySpy("isEnforced").mockReturnValue(false);
     const pending = service.discoverModels("openai");
     await started.promise;
     if (change === "keyfile") writeFileSync(keyFile, "rotated");
@@ -256,28 +254,10 @@ it.each(["key", "keyfile", "base", "headers", "organization", "policy", "disable
     if (change === "organization")
       save("openai", { apiKey: undefined, apiKeyFile: keyFile, organization: "new" });
     if (change === "disabled") save("openai", { enabled: false });
-    if (change === "policy") enforced.mockReturnValue(true);
     release.resolve(Response.json({ data: [{ id: "old-model" }] }));
     expect(await pending).toEqual({ status: "error", reason: "stale-config" });
   }
 );
-
-it("uses the forced endpoint and current model allowlist", async () => {
-  save("openai", { baseUrl: "http://must-not-request.invalid" });
-  policySpy("isEnforced").mockReturnValue(true);
-  policySpy("isProviderAllowed").mockReturnValue(true);
-  policySpy("getEffectivePolicy").mockReturnValue({
-    policyFormatVersion: "0.1",
-    providerAccess: [
-      { id: "openai", forcedBaseUrl: `${server.url}forced`, allowedModels: ["allowed"] },
-    ],
-    mcp: { allowUserDefined: { remote: true, stdio: true } },
-    runtimes: null,
-  });
-  respond = () => Response.json({ data: [{ id: "denied" }, { id: "allowed" }] });
-  expect(await service.discoverModels("openai")).toEqual({ status: "ok", modelIds: ["allowed"] });
-  expect(requests[0].url).toBe(`${server.url}forced/models`);
-});
 
 it.each(["abort", "pre-aborted", "timeout"])(
   "bounds a stalled response with %s",
@@ -317,7 +297,7 @@ it.each(["unchanged", "key", "abort"])(
     const release = Promise.withResolvers<void>();
     // Capture before spying; the callback overload is invoked below with its original receiver.
     // eslint-disable-next-line @typescript-eslint/unbound-method
-    const destroy = EnvHttpProxyAgent.prototype.destroy;
+    const destroy = EnvHttpProxyAgent.prototype.destroy as DestroyWithCallback;
     const spy = spyOn(EnvHttpProxyAgent.prototype, "destroy").mockImplementation(async function (
       this: EnvHttpProxyAgent
     ) {
@@ -346,9 +326,22 @@ it.each(["unchanged", "key", "abort"])(
   }
 );
 
+it("matches Meta inference's /v1 normalization for a bare proxy origin", async () => {
+  save("meta", { baseUrl: new URL(server.url).origin });
+  respond = (request) =>
+    new URL(request.url).pathname === "/v1/models"
+      ? Response.json({ data: [{ id: "muse-wonder-1.0" }] })
+      : new Response("not found", { status: 404 });
+  expect(await service.discoverModels("meta")).toEqual({
+    status: "ok",
+    modelIds: ["muse-wonder-1.0"],
+  });
+});
+
 const httpAdapters = [
   "google",
   "xai",
+  "meta",
   "deepseek",
   "moonshotai",
   "openrouter",
@@ -577,18 +570,11 @@ it.each([...CUSTOM_PROVIDER_TYPES])(
   }
 );
 
-it.each(httpAdapters)(
-  "does not request disabled or policy-denied %s catalogs",
-  async (provider) => {
-    const id = saveAdapter(provider, { enabled: false });
-    expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
-    saveAdapter(provider);
-    policySpy("isEnforced").mockReturnValue(true);
-    policySpy("isProviderAllowed").mockReturnValue(false);
-    expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
-    expect(requests).toHaveLength(0);
-  }
-);
+it.each(httpAdapters)("does not request disabled %s catalogs", async (provider) => {
+  const id = saveAdapter(provider, { enabled: false });
+  expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
+  expect(requests).toHaveLength(0);
+});
 
 it("does not implicitly contact an unconfigured Ollama service", async () => {
   expect(await service.discoverModels("ollama")).toEqual({ status: "not-configured" });
@@ -681,19 +667,18 @@ it("fences custom wire-type changes while a catalog is in flight", async () => {
   }
 });
 
-const specializedProviders = ["github-copilot", "mux-gateway"];
+const specializedProviders = ["github-copilot"];
 function specializedCatalog(
-  provider: string,
   models: unknown[] = [
     { id: "vendor/model.v1" },
     { id: "vendor/model.v1" },
     { id: "embedding", modelType: "embedding" },
   ]
 ) {
-  return provider === "mux-gateway" ? { models } : { data: models };
+  return { data: models };
 }
 function saveSpecialized(provider: string, overrides: BaseProviderConfig = {}) {
-  save(provider, { ...(provider === "mux-gateway" && { couponCode: "coupon-key" }), ...overrides });
+  save(provider, overrides);
 }
 
 it.each(specializedProviders)(
@@ -711,27 +696,18 @@ it.each(specializedProviders)(
     }));
     const files = [service.providersConfigStore.providersFile, join(root, "config.json")];
     const before = files.map((file) => readFileSync(file, "utf8"));
-    respond = () => Response.json(specializedCatalog(provider));
+    respond = () => Response.json(specializedCatalog());
     expect(await service.discoverModels(provider)).toEqual({
       status: "ok",
       modelIds: ["vendor/model.v1", "embedding"],
     });
     expect(requests[0].method).toBe("GET");
-    expect(requests[0].url).toBe(
-      `${server.url}proxy/${provider === "mux-gateway" ? "config" : "models"}?tenant=one`
-    );
-    expect(requests[0].headers.get("authorization")).toBe(
-      `Bearer ${provider === "mux-gateway" ? "coupon-key" : "private-key"}`
-    );
+    expect(requests[0].url).toBe(`${server.url}proxy/models?tenant=one`);
+    expect(requests[0].headers.get("authorization")).toBe("Bearer private-key");
     expect(requests[0].headers.get("x-custom")).toBe("private-header");
-    if (provider === "mux-gateway") {
-      expect(requests[0].headers.get("ai-gateway-protocol-version")).toBe("0.0.1");
-      expect(requests[0].headers.get("ai-gateway-auth-method")).toBe("api-key");
-    } else {
-      expect(requests[0].headers.get("openai-intent")).toBe("conversation-edits");
-      expect(requests[0].headers.get("accept")).toBe("application/json");
-    }
-    respond = () => Response.json(specializedCatalog(provider, []));
+    expect(requests[0].headers.get("openai-intent")).toBe("conversation-edits");
+    expect(requests[0].headers.get("accept")).toBe("application/json");
+    respond = () => Response.json(specializedCatalog([]));
     expect(await service.discoverModels(provider)).toEqual({ status: "ok", modelIds: [] });
     expect(requests).toHaveLength(2);
     expect(files.map((file) => readFileSync(file, "utf8"))).toEqual(before);
@@ -746,122 +722,47 @@ it.each(specializedProviders)(
         Authorization: "Bearer custom-auth",
         "OPENAI-INTENT": "custom-intent",
         "X-API-KEY": "extra-key",
-        "AI-GATEWAY-PROTOCOL-VERSION": "custom-protocol",
-        "AI-GATEWAY-AUTH-METHOD": "custom-method",
       },
     });
-    respond = () => Response.json(specializedCatalog(provider));
+    respond = () => Response.json(specializedCatalog());
     expect((await service.discoverModels(provider)).status).toBe("ok");
     const headers = requests[0].headers;
-    expect(headers.get("authorization")).toBe(
-      provider === "github-copilot" ? "Bearer private-key" : "Bearer custom-auth"
-    );
-    expect(headers.get("openai-intent")).toBe(
-      provider === "github-copilot" ? "conversation-edits" : "custom-intent"
-    );
-    expect(headers.get("x-api-key")).toBe(provider === "github-copilot" ? null : "extra-key");
-    expect(headers.get("ai-gateway-protocol-version")).toBe("custom-protocol");
-    expect(headers.get("ai-gateway-auth-method")).toBe("custom-method");
+    expect(headers.get("authorization")).toBe("Bearer private-key");
+    expect(headers.get("openai-intent")).toBe("conversation-edits");
+    expect(headers.get("x-api-key")).toBeNull();
   }
 );
 
-it("honors the Gateway's global enabled state before and during discovery", async () => {
-  saveSpecialized("mux-gateway");
-  // Like getConfig's tests: the flag is read from the loaded main config.
-  const loadMainConfig = config.loadConfigOrDefault.bind(config);
-  let gatewayEnabled = false;
-  const mainConfigSpy = spyOn(config, "loadConfigOrDefault").mockImplementation(() => ({
-    ...loadMainConfig(),
-    muxGatewayEnabled: gatewayEnabled,
-  }));
-  try {
-    expect(await service.discoverModels("mux-gateway")).toEqual({ status: "not-configured" });
-    expect(requests).toHaveLength(0);
-
-    gatewayEnabled = true;
-    const started = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<Response>();
-    respond = () => {
-      started.resolve();
-      return release.promise;
-    };
-    const pending = service.discoverModels("mux-gateway");
-    await started.promise;
-    gatewayEnabled = false;
-    release.resolve(Response.json({ models: [{ id: "old-model" }] }));
-    expect(await pending).toEqual({ status: "error", reason: "stale-config" });
-  } finally {
-    mainConfigSpy.mockRestore();
-  }
-});
-
-it.each(["copilot-config", "copilot-file", "copilot-env", "gateway-coupon", "gateway-voucher"])(
+it.each(["copilot-config", "copilot-file", "copilot-env"])(
   "specialized %s uses only the existing credential resolver",
   async (source) => {
     process.env.GITHUB_COPILOT_TOKEN = "env-key";
-    process.env.AI_GATEWAY_API_KEY = "must-not-use-sdk-environment";
     const file = join(root, "key");
     writeFileSync(file, "file-key");
-    const copilot = source.startsWith("copilot");
-    const provider = copilot ? "github-copilot" : "mux-gateway";
-    save(
-      provider,
-      copilot
-        ? {
-            apiKey: source === "copilot-config" ? "config-key" : undefined,
-            apiKeyFile: source === "copilot-env" ? undefined : file,
-          }
-        : {
-            couponCode: source === "gateway-coupon" ? "coupon-key" : undefined,
-            voucher: "voucher-key",
-          }
-    );
-    respond = () => Response.json(specializedCatalog(provider));
+    const provider = "github-copilot";
+    save(provider, {
+      apiKey: source === "copilot-config" ? "config-key" : undefined,
+      apiKeyFile: source === "copilot-env" ? undefined : file,
+    });
+    respond = () => Response.json(specializedCatalog());
     expect((await service.discoverModels(provider)).status).toBe("ok");
     expect(requests[0].headers.get("authorization")).toBe(`Bearer ${source.split("-")[1]}-key`);
   }
 );
 
 it.each(specializedProviders)(
-  "specialized %s applies forced endpoints, model policy, disabled and shadow rules",
+  "specialized %s applies disabled and shadow rules",
   async (provider) => {
-    saveSpecialized(provider, { baseUrl: "http://must-not-contact.invalid" });
-    policySpy("isEnforced").mockReturnValue(true);
-    const allowed = policySpy("isProviderAllowed").mockReturnValue(true);
-    policySpy("getEffectivePolicy").mockReturnValue({
-      policyFormatVersion: "0.1",
-      providerAccess: [
-        { id: provider, forcedBaseUrl: `${server.url}forced`, allowedModels: ["embedding"] },
-      ],
-      mcp: { allowUserDefined: { remote: true, stdio: true } },
-      runtimes: null,
-    });
-    respond = () => Response.json(specializedCatalog(provider));
-    expect(await service.discoverModels(provider)).toEqual({
-      status: "ok",
-      modelIds: ["embedding"],
-    });
-    expect(new URL(requests[0].url).pathname).toBe(
-      `/forced/${provider === "mux-gateway" ? "config" : "models"}`
-    );
-    allowed.mockReturnValue(false);
-    expect(await service.discoverModels(provider)).toEqual({ status: "not-configured" });
-    allowed.mockReturnValue(true);
     saveSpecialized(provider, { enabled: false });
     expect(await service.discoverModels(provider)).toEqual({ status: "not-configured" });
     saveSpecialized(provider, { providerType: "openai-compatible" });
     expect(await service.discoverModels(provider)).toEqual({ status: "unsupported" });
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(0);
   }
 );
 
-it("specialized unconfigured providers never borrow generic Gateway credentials", async () => {
-  process.env.AI_GATEWAY_API_KEY = "must-not-use-sdk-environment";
+it("specialized unconfigured providers are not discovered", async () => {
   expect(await service.discoverModels("github-copilot")).toEqual({ status: "not-configured" });
-  save("mux-gateway");
-  expect(await service.discoverModels("mux-gateway")).toEqual({ status: "not-configured" });
-  save("mux-gateway", { couponCode: "", voucher: "not-a-fallback-for-blank-coupon" });
-  expect(await service.discoverModels("mux-gateway")).toEqual({ status: "not-configured" });
   expect(requests).toHaveLength(0);
 });
 
@@ -872,11 +773,10 @@ it.each(specializedProviders)(
     const before = readFileSync(service.providersConfigStore.providersFile, "utf8");
     for (const status of [404, 405, 401, 403, 429, 500]) {
       respond = () => new Response("private-upstream-error", { status });
-      expect(await service.discoverModels(provider)).toEqual(
-        provider === "mux-gateway" && [404, 405].includes(status)
-          ? { status: "unsupported" }
-          : { status: "error", reason: "request-failed" }
-      );
+      expect(await service.discoverModels(provider)).toEqual({
+        status: "error",
+        reason: "request-failed",
+      });
       expect(readFileSync(service.providersConfigStore.providersFile, "utf8")).toBe(before);
     }
     expect(requests).toHaveLength(6);
@@ -891,18 +791,12 @@ it.each(specializedProviders)(
       requests = [];
       respond = () => {
         if (kind === "json") return new Response("private-body");
-        if (kind === "shape")
-          return Response.json(provider === "mux-gateway" ? { data: [] } : { models: [] });
-        if (kind === "id")
-          return Response.json(specializedCatalog(provider, [{ id: "valid" }, { id: " " }]));
-        if (kind === "partial")
-          return Response.json({ ...specializedCatalog(provider), has_more: true });
+        if (kind === "shape") return Response.json({ models: [] });
+        if (kind === "id") return Response.json(specializedCatalog([{ id: "valid" }, { id: " " }]));
+        if (kind === "partial") return Response.json({ ...specializedCatalog(), has_more: true });
         if (kind === "items")
           return Response.json(
-            specializedCatalog(
-              provider,
-              Array.from({ length: 10001 }, () => ({ id: "duplicate" }))
-            )
+            specializedCatalog(Array.from({ length: 10001 }, () => ({ id: "duplicate" })))
           );
         if (kind === "bytes") return new Response("x".repeat(2 * 1024 * 1024 + 1));
         return new Response(null, {
@@ -924,28 +818,18 @@ it.each(specializedProviders)(
   }
 );
 
-const specializedRaceCases = [
-  "copilot-key",
-  "copilot-file",
-  "gateway-coupon",
-  "gateway-voucher",
-].flatMap((source) =>
+const specializedRaceCases = ["copilot-key", "copilot-file"].flatMap((source) =>
   ["request", "teardown"].flatMap((cut) =>
-    ["credential", "abort", "headers", "policy", "base"].map((change) => [source, cut, change])
+    ["credential", "abort", "headers", "base"].map((change) => [source, cut, change])
   )
 );
 it.each(specializedRaceCases)(
   "specialized %s rejects %s-time %s changes",
   async (source, cut, change) => {
-    const provider = source.startsWith("copilot") ? "github-copilot" : "mux-gateway";
+    const provider = "github-copilot";
     const file = join(root, "key");
     writeFileSync(file, "initial");
-    const field =
-      provider === "github-copilot"
-        ? "apiKey"
-        : source === "gateway-voucher"
-          ? "voucher"
-          : "couponCode";
+    const field = "apiKey";
     const auth =
       source === "copilot-file" ? { apiKey: undefined, apiKeyFile: file } : { [field]: "initial" };
     save(provider, auth);
@@ -956,11 +840,11 @@ it.each(specializedRaceCases)(
         barrier.resolve();
         await release.promise;
       }
-      return Response.json(specializedCatalog(provider));
+      return Response.json(specializedCatalog());
     };
     if (cut === "teardown") {
       // eslint-disable-next-line @typescript-eslint/unbound-method
-      const destroy = EnvHttpProxyAgent.prototype.destroy;
+      const destroy = EnvHttpProxyAgent.prototype.destroy as DestroyWithCallback;
       const spy = spyOn(EnvHttpProxyAgent.prototype, "destroy").mockImplementation(async function (
         this: EnvHttpProxyAgent
       ) {
@@ -986,10 +870,6 @@ it.each(specializedRaceCases)(
       if (change === "abort") abort.abort(new Error("private-abort-reason"));
       if (change === "headers") save(provider, { ...auth, headers: { "x-identity": "changed" } });
       if (change === "base") save(provider, { ...auth, baseUrl: `${server.url}changed` });
-      if (change === "policy") {
-        policySpy("isEnforced").mockReturnValue(true);
-        policySpy("isProviderAllowed").mockReturnValue(false);
-      }
       release.resolve();
       expect(await pending).toEqual({
         status: "error",

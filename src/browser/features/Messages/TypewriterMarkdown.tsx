@@ -1,7 +1,9 @@
-import React, { useContext } from "react";
+import React, { useContext, useState } from "react";
 import { useSmoothStreamingText } from "@/browser/hooks/useSmoothStreamingText";
 import { useWorkspaceStreamingStats } from "@/browser/stores/WorkspaceStore";
 import { cn } from "@/common/lib/utils";
+import { STATIC_STREAMING_MOUNT_MAX_CHARS } from "@/constants/streaming";
+import { ChunkedStreamingMarkdown, hasDocumentScopedMarkdown } from "./ChunkedStreamingMarkdown";
 import { MarkdownCore } from "./MarkdownCore";
 import { StreamingContext } from "./StreamingContext";
 import { TranscriptBackfillContext } from "./TranscriptBackfillContext";
@@ -79,17 +81,40 @@ export const TypewriterMarkdown: React.FC<TypewriterMarkdownProps> = ({
   // Completed rows render statically either way; gating on isStreaming keeps the flag flip from
   // changing their props, which would re-render every mounted markdown row.
   const isTranscriptBackfilling = useContext(TranscriptBackfillContext);
-  const renderSynchronously = isStreaming && isTranscriptBackfilling;
+  // Streamdown's streaming mode starts with no blocks and fills them in a transition, so a row
+  // that mounts mid-stream (chat switch-back, bundle toggle) painted nothing for 100-250 ms
+  // (#5555). Such a row renders statically until its text next changes; the static render keeps
+  // the block state current, so streaming mode then resumes without blanking (as above). Rows
+  // above the cap skip this: their synchronous mount would block the chat switch too long.
+  const [mountedContent] = useState(content);
+  const renderSynchronously =
+    isStreaming &&
+    (isTranscriptBackfilling ||
+      (content === mountedContent && content.length <= STATIC_STREAMING_MOUNT_MAX_CHARS));
+  // Above the cap such a row renders in chunks for the rest of its life instead (#5647).
+  const [renderChunked] = useState(
+    () => isStreaming && content.length > STATIC_STREAMING_MOUNT_MAX_CHARS
+  );
 
   return (
     <StreamingContext.Provider value={streamingContextValue}>
       <div className={cn("markdown-content", className)}>
-        <MarkdownCore
-          content={visibleText}
-          parseIncompleteMarkdown={isStreaming}
-          renderSynchronously={renderSynchronously}
-          preserveLineBreaks={preserveLineBreaks}
-        />
+        {/* After completion, references and footnotes need the whole document in one render
+            (the same render main does at completion). */}
+        {renderChunked && (isStreaming || !hasDocumentScopedMarkdown(visibleText)) ? (
+          <ChunkedStreamingMarkdown
+            content={visibleText}
+            isStreaming={isStreaming}
+            preserveLineBreaks={preserveLineBreaks}
+          />
+        ) : (
+          <MarkdownCore
+            content={visibleText}
+            parseIncompleteMarkdown={isStreaming}
+            renderSynchronously={renderSynchronously}
+            preserveLineBreaks={preserveLineBreaks}
+          />
+        )}
       </div>
     </StreamingContext.Provider>
   );

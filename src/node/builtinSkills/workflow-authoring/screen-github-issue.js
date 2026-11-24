@@ -16,7 +16,7 @@
 //   gh issue view "$N" -R "$REPO" --json title,body \
 //     | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
 //     | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
-//         --evaluation-model openai:gpt-5.6-luna --model openai:gpt-5.6-luna
+//         --evaluation-model openai:gpt-6-luna --model openai:gpt-6-luna
 //
 // A passing screen means "screened", not "trusted": classification can be
 // steered by adversarial text and probabilities are uncalibrated across models.

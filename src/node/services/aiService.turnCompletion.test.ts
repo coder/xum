@@ -3,6 +3,7 @@ import { AIService } from "./aiService";
 import { InitStateManager } from "./initStateManager";
 import { ProviderService } from "./providerService";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import { createMuxMessage } from "@/common/types/message";
 import type { StreamAbortEvent } from "@/common/types/stream";
 
@@ -12,7 +13,9 @@ describe("AIService startup completion", () => {
   test.each(["user", "system"] as const)(
     "preserves %s cancellation reason without inventing a delivered abort",
     async (abortReason) => {
-      const { config, historyService, cleanup } = await createTestHistoryService();
+      const { config, historyService, cleanup } = await createTestHistoryService({
+        files: SessionFilesMemory,
+      });
       const init = new InitStateManager(config);
       const service = new AIService(config, historyService, init, new ProviderService(config));
       service.enableMockMode();

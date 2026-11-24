@@ -3,7 +3,11 @@ import type { WorkspaceService } from "./workspaceService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import path from "path";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import {
+  ASK_USER_QUESTION_ASYNC_SUMMARY,
+  ASK_USER_QUESTION_NOT_WAITING_MESSAGE,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import { createTestHistoryService } from "./testHistoryService";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { AIService } from "./aiService";
@@ -87,6 +91,66 @@ describe("WorkspaceService rename lock", () => {
     if (!result.success) {
       expect(result.error).toContain("stream is active");
     }
+  });
+
+  describe("answering a question that is not waiting", () => {
+    const workspaceId = "ask-not-waiting";
+    const questions = [
+      {
+        header: "Choice",
+        question: "Which option?",
+        options: [
+          { label: "First", description: "Use first" },
+          { label: "Second", description: "Use second" },
+        ],
+        multiSelect: false,
+      },
+    ];
+    const answers = { "Which option?": "First" };
+
+    test("refuses while the stream runs instead of finalizing its partial", async () => {
+      // An Exec question seen before its immediate result: the live stream rewrites the partial
+      // from memory, so finalizing it here would drop the answer.
+      spyOn(harness.aiService, "isStreaming").mockReturnValue(true);
+      const question = createMuxMessage("question", "assistant", "", {}, [
+        {
+          type: "dynamic-tool",
+          state: "input-available",
+          toolCallId: "ask-live",
+          toolName: "ask_user_question",
+          input: { questions },
+        },
+      ]);
+      await harness.historyService.writePartial(workspaceId, question);
+
+      expect(
+        await workspaceService.answerAskUserQuestion(workspaceId, "ask-live", answers)
+      ).toEqual(Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE));
+      expect((await harness.historyService.readPartial(workspaceId))?.parts[0]).toMatchObject({
+        state: "input-available",
+      });
+    });
+
+    test("does not report a non-blocking question as answered", async () => {
+      const question = createMuxMessage("question", "assistant", "", {}, [
+        {
+          type: "dynamic-tool",
+          state: "output-available",
+          toolCallId: "ask-async",
+          toolName: "ask_user_question",
+          input: { questions },
+          output: {
+            summary: ASK_USER_QUESTION_ASYNC_SUMMARY,
+            ui_only: { ask_user_question: { questions, answers: {}, answerDelivery: "message" } },
+          },
+        },
+      ]);
+      await harness.historyService.appendToHistory(workspaceId, question);
+
+      expect(
+        await workspaceService.answerAskUserQuestion(workspaceId, "ask-async", answers)
+      ).toEqual(Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE));
+    });
   });
 
   test("an SSH rename is serialized through the workspace's MCP-overrides lock", async () => {
@@ -317,6 +381,89 @@ test("a committed question stays answerable after a hidden plan-review record is
       });
     }
   } finally {
+    await session.dispose();
+    await cleanup();
+  }
+});
+
+test("the restart fallback answers a just-committed question without overwriting a newer partial", async () => {
+  // #5344: between the fallback's partial read and its write, the question's partial can be
+  // committed and a new stream can start writing its own partial. The fallback must leave that
+  // newer partial alone and answer the committed question in history instead.
+  const { config, historyService, cleanup } = await createTestHistoryService();
+  const workspaceId = "question-committed-mid-answer";
+  const projectPath = path.join(config.rootDir, "repo");
+  await saveWorkspaces(config, projectPath, [projectWorkspace(projectPath, "child", workspaceId)]);
+  const { session, aiEmitter } = await createAgentSessionHarness({
+    workspaceId,
+    config,
+    historyService,
+  });
+  const workspaceService = createWorkspaceServiceForTest({
+    config,
+    historyService,
+    aiService: createMockAIService({
+      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
+      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
+    }),
+  });
+  (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+    workspaceId,
+    session
+  );
+  const question = createMuxMessage("question", "assistant", "", {}, [
+    {
+      type: "dynamic-tool",
+      state: "input-available",
+      toolCallId: "ask-mid-commit",
+      toolName: "ask_user_question",
+      input: {
+        questions: [
+          {
+            header: "Choice",
+            question: "Which option?",
+            options: [
+              { label: "First", description: "Use first" },
+              { label: "Second", description: "Use second" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+    },
+  ]);
+  const nextStream = createMuxMessage("next-stream", "assistant", "newer stream output");
+  const readPartial = historyService.readPartial.bind(historyService);
+  const readSpy = spyOn(historyService, "readPartial");
+  try {
+    await historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "Work"));
+    expect((await historyService.appendToHistory(workspaceId, question)).success).toBe(true);
+    // appendToHistory stamped the question's historySequence, so this partial owns its row.
+    expect((await historyService.writePartial(workspaceId, question)).success).toBe(true);
+    readSpy.mockImplementationOnce(async (id, options) => {
+      const read = await readPartial(id, options);
+      expect((await historyService.commitPartial(workspaceId)).success).toBe(true);
+      expect((await historyService.writePartial(workspaceId, nextStream)).success).toBe(true);
+      return read;
+    });
+
+    expect(
+      await workspaceService.answerAskUserQuestion(workspaceId, "ask-mid-commit", {
+        "Which option?": "First",
+      })
+    ).toEqual(Ok(undefined));
+
+    const partial = await readPartial(workspaceId);
+    expect(partial?.id).toBe("next-stream");
+    expect(partial?.parts).toEqual(nextStream.parts);
+    const history = await historyService.getLastMessages(workspaceId, 1);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      expect(history.data[0]?.id).toBe("question");
+      expect(history.data[0]?.parts[0]).toMatchObject({ state: "output-available" });
+    }
+  } finally {
+    readSpy.mockRestore();
     await session.dispose();
     await cleanup();
   }

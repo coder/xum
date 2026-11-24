@@ -9,21 +9,19 @@
 
 import React from "react";
 import {
-  BugPlay,
   ExternalLink,
-  Monitor,
-  Globe,
   Sparkles,
-  Target,
-  ListTree,
+  MessagesSquare,
+  Plus,
   Terminal as TerminalIcon,
-  Workflow,
   X,
 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { getTerminalTabFallbackName } from "@/browser/types/rightSidebar";
 import { type ReviewStats } from "./registry";
+import { TAB_ICONS } from "./tabIcons";
 import { useAPI } from "@/browser/contexts/API";
+import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAdditionalSystemContextSnapshot } from "@/browser/utils/additionalSystemContextStore";
 import {
@@ -32,11 +30,12 @@ import {
 } from "@/browser/utils/workspaceInstructionsStore";
 import { cn } from "@/common/lib/utils";
 import {
+  sumSessionCostUsage,
   useOptionalWorkspaceSidebarState,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
 import { goalActiveMode, isGoalPendingPersistence } from "@/common/types/goal";
-import { sumUsageHistory, type ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
+import { SIDE_CHAT_INITIAL_TITLE } from "@/constants/workspaceDefaults";
 
 interface StatsTabLabelProps {
   workspaceId: string;
@@ -53,12 +52,7 @@ export const StatsTabLabel: React.FC<StatsTabLabelProps> = ({ workspaceId }) => 
   const usage = useWorkspaceUsage(workspaceId);
 
   const sessionCost = React.useMemo(() => {
-    const parts: ChatUsageDisplay[] = [];
-    if (usage.sessionTotal) parts.push(usage.sessionTotal);
-    if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
-    if (parts.length === 0) return null;
-
-    const aggregated = sumUsageHistory(parts);
+    const aggregated = sumSessionCostUsage(usage);
     if (!aggregated) return null;
 
     const total =
@@ -68,17 +62,20 @@ export const StatsTabLabel: React.FC<StatsTabLabelProps> = ({ workspaceId }) => 
       (aggregated.output.cost_usd ?? 0) +
       (aggregated.reasoning.cost_usd ?? 0);
     return total > 0 ? total : null;
-  }, [usage.sessionTotal, usage.liveCostUsage]);
+  }, [usage]);
 
   return (
-    <>
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.costs className="h-3 w-3 shrink-0" />
       Stats
       {sessionCost !== null && (
-        <span className="text-muted text-[10px] tabular-nums">
+        // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
+        // selected tab's bg-hover in every theme (#5965).
+        <span className="text-[10px] tabular-nums">
           ${sessionCost < 0.01 ? "<0.01" : sessionCost.toFixed(2)}
         </span>
       )}
-    </>
+    </span>
   );
 };
 
@@ -121,6 +118,7 @@ export const ReviewTabLabel: React.FC<ReviewTabLabelProps> = ({ reviewStats }) =
             aria-label={`Review — ${unreadAssisted} unread agent-flagged hunk${unreadAssisted === 1 ? "" : "s"}`}
             data-testid="review-tab-assisted-pizzazz"
           >
+            <TAB_ICONS.review className="h-3 w-3 shrink-0" aria-hidden="true" />
             Review
             <Sparkles className="h-3 w-3 shrink-0" aria-hidden="true" />
             <span className="counter-nums">{unreadAssisted}</span>
@@ -134,21 +132,24 @@ export const ReviewTabLabel: React.FC<ReviewTabLabelProps> = ({ reviewStats }) =
   }
 
   return (
-    <>
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.review className="h-3 w-3 shrink-0" />
       Review
       {reviewStats !== null && reviewStats.total > 0 && (
-        <span className="text-muted text-[10px]">
+        // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
+        // selected tab's bg-hover in every theme (#5965).
+        <span className="text-[10px]">
           {reviewStats.read}/{reviewStats.total}
         </span>
       )}
-    </>
+    </span>
   );
 };
 
 /** Desktop tab label with monitor icon */
 export const DesktopTabLabel: React.FC = () => (
   <span className="inline-flex items-center gap-1">
-    <Monitor className="h-3 w-3 shrink-0" />
+    <TAB_ICONS.desktop className="h-3 w-3 shrink-0" />
     Desktop
   </span>
 );
@@ -156,7 +157,7 @@ export const DesktopTabLabel: React.FC = () => (
 /** Browser tab label with globe icon */
 export const BrowserTabLabel: React.FC = () => (
   <span className="inline-flex items-center gap-1">
-    <Globe className="h-3 w-3 shrink-0" />
+    <TAB_ICONS.browser className="h-3 w-3 shrink-0" />
     Browser
   </span>
 );
@@ -164,7 +165,7 @@ export const BrowserTabLabel: React.FC = () => (
 /** Debug tab label with bug icon */
 export const DebugTabLabel: React.FC = () => (
   <span className="inline-flex items-center gap-1">
-    <BugPlay className="h-3 w-3 shrink-0" />
+    <TAB_ICONS.debug className="h-3 w-3 shrink-0" />
     Debug
   </span>
 );
@@ -177,10 +178,10 @@ interface GoalTabLabelProps {
  * Goal tab label.
  *
  * Subscribes directly to the workspace's sidebar state so the label can apply
- * a semantic accent (`text-success` or `text-warning`) when the workspace
+ * a semantic accent (`text-success-text` or `text-warning`) when the workspace
  * has a *live* goal in chat:
  *
- *   • `text-success` — the goal is running (`status === "active"` &&
+ *   • `text-success-text` — the goal is running (`status === "active"` &&
  *     non-pending). Mirrors the `useActiveGoalCount` /
  *     `ActiveGoalsWarningToast` predicate so a workspace that contributes
  *     to the global "active goals" toast is also the one that lights up
@@ -213,12 +214,12 @@ export const GoalTabLabel: React.FC<GoalTabLabelProps> = ({ workspaceId }) => {
     <span
       className={cn(
         "inline-flex items-center gap-1",
-        isRunning && "text-success",
+        isRunning && "text-success-text",
         isStalled && "text-warning"
       )}
       aria-label={ariaLabel}
     >
-      <Target className="h-3 w-3 shrink-0" />
+      <TAB_ICONS.goal className="h-3 w-3 shrink-0" />
       Goal
     </span>
   );
@@ -238,11 +239,11 @@ export const WorkflowsTabLabel: React.FC<WorkflowsTabLabelProps> = ({ workspaceI
   const activeCount = sidebarState?.activeWorkflowRunCount ?? 0;
   return (
     <span className="inline-flex items-center gap-1">
-      <Workflow className="h-3 w-3 shrink-0" />
+      <TAB_ICONS.workflows className="h-3 w-3 shrink-0" />
       Workflows
       {activeCount > 0 && (
         <span
-          className="text-accent inline-flex items-center gap-1 text-[10px] tabular-nums"
+          className="text-accent-text inline-flex items-center gap-1 text-[10px] tabular-nums"
           aria-label={`${activeCount} running workflow${activeCount === 1 ? "" : "s"}`}
         >
           <span className="bg-accent inline-block h-[6px] w-[6px] animate-pulse rounded-full motion-reduce:animate-none" />
@@ -254,20 +255,39 @@ export const WorkflowsTabLabel: React.FC<WorkflowsTabLabelProps> = ({ workspaceI
 };
 
 export function OutputTabLabel() {
-  return <>Output</>;
+  return (
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.output className="h-3 w-3 shrink-0" />
+      Output
+    </span>
+  );
 }
 
 export function TimelineTabLabel() {
   return (
     <span className="inline-flex items-center gap-1">
-      <ListTree className="h-3 w-3 shrink-0" />
+      <TAB_ICONS.timeline className="h-3 w-3 shrink-0" />
       Timeline
     </span>
   );
 }
 
+export function ArtifactsTabLabel() {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.artifacts className="h-3 w-3 shrink-0" />
+      Artifacts
+    </span>
+  );
+}
+
 export function MemoryTabLabel() {
-  return <>Memory</>;
+  return (
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.memory className="h-3 w-3 shrink-0" />
+      Memory
+    </span>
+  );
 }
 
 interface InstructionsTabLabelProps {
@@ -305,11 +325,14 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
   const showBadge = chatInstructionsActive || (fileCount != null && fileCount > 0);
 
   return (
-    <>
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.instructions className="h-3 w-3 shrink-0" />
       Instructions
       {showBadge && (
+        // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
+        // selected tab's bg-hover in every theme (#5965).
         <span
-          className="text-muted text-[10px] tabular-nums"
+          className="text-[10px] tabular-nums"
           aria-label={
             chatInstructionsActive
               ? `${baseCount} instruction files plus active Chat Instructions`
@@ -326,7 +349,62 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
           )}
         </span>
       )}
-    </>
+    </span>
+  );
+};
+
+/** Label of the New tab (the tool launcher). */
+export function NewTabLabel() {
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1">
+      <Plus className="h-3 w-3 shrink-0" />
+      <span className="truncate">New tab</span>
+    </span>
+  );
+}
+
+/** Shared by the label and its outer tooltip; title updates stay at the leaves of the strip. */
+export function SideChatTabTitle(props: { workspaceId: string }) {
+  const metadata = useOptionalWorkspaceMetadata();
+  const title = metadata?.workspaceMetadata.get(props.workspaceId)?.title?.trim();
+  return <>{title != null && title.length > 0 ? title : SIDE_CHAT_INITIAL_TITLE}</>;
+}
+
+/**
+ * /side chats use their live chat title, just like regular chats; closing discards the chat.
+ * Without onClose (the All tabs menu row) it renders no close button.
+ */
+export const SideChatTabLabel: React.FC<{ workspaceId: string; onClose?: () => void }> = (
+  props
+) => {
+  const onClose = props.onClose;
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1">
+      <MessagesSquare className="h-3 w-3 shrink-0" />
+      <span className="min-w-0 truncate">
+        <SideChatTabTitle workspaceId={props.workspaceId} />
+      </span>
+      {onClose && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className="text-muted hover:text-destructive -my-0.5 shrink-0 rounded p-0.5 transition-colors"
+              onClick={(e) => {
+                e.stopPropagation();
+                onClose();
+              }}
+              aria-label="Close side chat"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            Close and discard side chat ({formatKeybind(KEYBINDS.CLOSE_TAB)})
+          </TooltipContent>
+        </Tooltip>
+      )}
+    </span>
   );
 };
 
@@ -336,12 +414,15 @@ interface TerminalTabLabelProps {
   /** Terminal index (0-based) within the current tabset */
   terminalIndex: number;
   /** Callback when pop-out button is clicked */
-  onPopOut: () => void;
+  onPopOut?: () => void;
   /** Callback when close button is clicked */
-  onClose: () => void;
+  onClose?: () => void;
 }
 
-/** Terminal tab label with icon, dynamic title, and action buttons */
+/**
+ * Terminal tab label with icon, dynamic title, and action buttons. Without the callbacks (the
+ * All tabs menu row) it renders no buttons.
+ */
 export const TerminalTabLabel: React.FC<TerminalTabLabelProps> = ({
   dynamicTitle,
   terminalIndex,
@@ -351,43 +432,47 @@ export const TerminalTabLabel: React.FC<TerminalTabLabelProps> = ({
   const displayName = dynamicTitle ?? getTerminalTabFallbackName(terminalIndex);
 
   return (
-    <span className="inline-flex items-center gap-1">
+    <span className="inline-flex min-w-0 items-center gap-1">
       <TerminalIcon className="h-3 w-3 shrink-0" />
       <span className="max-w-[20ch] min-w-0 truncate">{displayName}</span>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            className="text-muted hover:text-foreground -my-0.5 rounded p-0.5 transition-colors"
-            onClick={(e) => {
-              e.stopPropagation();
-              onPopOut();
-            }}
-            aria-label="Open terminal in new window"
-          >
-            <ExternalLink className="h-3 w-3" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">Open in new window</TooltipContent>
-      </Tooltip>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            type="button"
-            className="text-muted hover:text-destructive -my-0.5 rounded p-0.5 transition-colors"
-            onClick={(e) => {
-              e.stopPropagation();
-              onClose();
-            }}
-            aria-label="Close terminal"
-          >
-            <X className="h-3 w-3" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">
-          Close terminal ({formatKeybind(KEYBINDS.CLOSE_TAB)})
-        </TooltipContent>
-      </Tooltip>
+      {onPopOut && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className="text-muted hover:text-foreground -my-0.5 shrink-0 rounded p-0.5 transition-colors"
+              onClick={(e) => {
+                e.stopPropagation();
+                onPopOut();
+              }}
+              aria-label="Open terminal in new window"
+            >
+              <ExternalLink className="h-3 w-3" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Open in new window</TooltipContent>
+        </Tooltip>
+      )}
+      {onClose && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className="text-muted hover:text-destructive -my-0.5 shrink-0 rounded p-0.5 transition-colors"
+              onClick={(e) => {
+                e.stopPropagation();
+                onClose();
+              }}
+              aria-label="Close terminal"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            Close terminal ({formatKeybind(KEYBINDS.CLOSE_TAB)})
+          </TooltipContent>
+        </Tooltip>
+      )}
     </span>
   );
 };

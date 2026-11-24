@@ -46,6 +46,66 @@ export async function listLocalBranches(
     .sort((a, b) => a.localeCompare(b));
 }
 
+/** How many branches a branch list names as recent. */
+export const RECENT_BRANCH_COUNT = 5;
+
+/**
+ * The local branches committed to most recently, newest first. A repository can hold hundreds of
+ * branches (one per agent workspace); the few a person touched last are the likely base branches.
+ */
+export async function listRecentLocalBranches(
+  projectPath: string,
+  count: number = RECENT_BRANCH_COUNT,
+  options?: ExecFileAsyncOptions
+): Promise<string[]> {
+  using proc = execFileAsync(
+    "git",
+    [
+      "-C",
+      projectPath,
+      "for-each-ref",
+      "--sort=-committerdate",
+      `--count=${count}`,
+      "--format=%(refname:short)",
+      "refs/heads",
+    ],
+    options
+  );
+  const { stdout } = await proc.result;
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * The repository's default branch, for tagging it in a branch list: the branch the `origin`
+ * remote's HEAD points at when a local branch has that name, else the first conventional trunk
+ * name present. Null when neither is known. Unlike {@link detectDefaultTrunkBranch} it never
+ * answers with the checked-out branch, which is only where the user happens to be.
+ */
+export async function detectRepositoryDefaultBranch(
+  projectPath: string,
+  branches: readonly string[]
+): Promise<string | null> {
+  const local = new Set(branches);
+  try {
+    using proc = execFileAsync("git", [
+      "-C",
+      projectPath,
+      "symbolic-ref",
+      "--short",
+      "refs/remotes/origin/HEAD",
+    ]);
+    const { stdout } = await proc.result;
+    const remoteDefault = stdout.trim().replace(/^origin\//, "");
+    if (local.has(remoteDefault)) return remoteDefault;
+  } catch {
+    // No origin remote, or its HEAD was never recorded: fall through to the conventions.
+  }
+  return FALLBACK_TRUNK_CANDIDATES.find((candidate) => local.has(candidate)) ?? null;
+}
+
 export async function getCurrentBranch(
   projectPath: string,
   options?: ExecFileAsyncOptions

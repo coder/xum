@@ -1,48 +1,33 @@
 import { useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { DEFAULT_RUNTIME_KEY, RUNTIME_ENABLEMENT_KEY } from "@/common/constants/storage";
+import { saveConfigOptimistically, useAppConfig } from "@/browser/stores/AppConfigStore";
 import {
-  DEFAULT_RUNTIME_ENABLEMENT,
-  RUNTIME_ENABLEMENT_IDS,
   normalizeRuntimeEnablement,
   type RuntimeEnablement,
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
+import { normalizeIsolationChoice, type IsolationChoice } from "@/common/types/isolation";
+
+interface RuntimeEnablementPatch {
+  runtimeEnablement?: RuntimeEnablement;
+  defaultIsolation?: IsolationChoice | null;
+}
 
 interface RuntimeEnablementState {
   enablement: RuntimeEnablement;
   setRuntimeEnabled: (
     id: RuntimeEnablementId,
     enabled: boolean,
-    nextDefaultRuntime?: RuntimeEnablementId | null
+    nextDefaultIsolation?: IsolationChoice | null
   ) => void;
-  defaultRuntime: RuntimeEnablementId | null;
-  setDefaultRuntime: (id: RuntimeEnablementId | null) => void;
-}
-
-function normalizeDefaultRuntime(value: unknown): RuntimeEnablementId | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  return RUNTIME_ENABLEMENT_IDS.includes(value as RuntimeEnablementId)
-    ? (value as RuntimeEnablementId)
-    : null;
+  defaultIsolation: IsolationChoice | null;
+  setDefaultIsolation: (choice: IsolationChoice | null) => void;
 }
 
 export function useRuntimeEnablement(): RuntimeEnablementState {
   const { api } = useAPI();
-  const [rawEnablement, setRawEnablement] = usePersistedState<unknown>(
-    RUNTIME_ENABLEMENT_KEY,
-    DEFAULT_RUNTIME_ENABLEMENT,
-    { listener: true }
-  );
-  const [rawDefaultRuntime, setRawDefaultRuntime] = usePersistedState<unknown>(
-    DEFAULT_RUNTIME_KEY,
-    null,
-    { listener: true }
-  );
+  const rawEnablement = useAppConfig((config) => config.runtimeEnablement);
+  const rawDefaultIsolation = useAppConfig((config) => config.defaultIsolation);
 
   // Normalize persisted values so corrupted/legacy payloads don't break toggles.
   // Stabilize the reference: normalizeRuntimeEnablement returns a fresh object every call,
@@ -57,47 +42,36 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
     prevSerializedRef.current = currentSerialized;
   }
   const enablement = enablementRef.current;
-  const defaultRuntime = normalizeDefaultRuntime(rawDefaultRuntime);
+  const defaultIsolation = normalizeIsolationChoice(rawDefaultIsolation) ?? null;
+
+  const persist = (payload: RuntimeEnablementPatch) => {
+    saveConfigOptimistically(api, payload, (client) =>
+      client.config.updateRuntimeEnablement(payload)
+    );
+  };
 
   const setRuntimeEnabled = (
     id: RuntimeEnablementId,
     enabled: boolean,
-    nextDefaultRuntime?: RuntimeEnablementId | null
+    nextDefaultIsolation?: IsolationChoice | null
   ) => {
     const nextMap: RuntimeEnablement = {
       ...enablement,
       [id]: enabled,
     };
 
-    // Persist locally first so Settings reflects changes immediately and stays in sync.
-    setRawEnablement(nextMap);
-    if (nextDefaultRuntime !== undefined) {
-      setRawDefaultRuntime(nextDefaultRuntime);
+    const payload: RuntimeEnablementPatch = { runtimeEnablement: nextMap };
+
+    if (nextDefaultIsolation !== undefined) {
+      payload.defaultIsolation = nextDefaultIsolation;
     }
 
-    // Best-effort backend write keeps ~/.xum/config.json aligned across devices.
-    const payload: {
-      runtimeEnablement: RuntimeEnablement;
-      defaultRuntime?: RuntimeEnablementId | null;
-    } = { runtimeEnablement: nextMap };
-
-    if (nextDefaultRuntime !== undefined) {
-      payload.defaultRuntime = nextDefaultRuntime;
-    }
-
-    api?.config?.updateRuntimeEnablement(payload).catch(() => {
-      // Best-effort only.
-    });
+    persist(payload);
   };
 
-  const setDefaultRuntime = (id: RuntimeEnablementId | null) => {
-    // Keep the local cache and config.json aligned for the global default runtime.
-    setRawDefaultRuntime(id);
-
-    api?.config?.updateRuntimeEnablement({ defaultRuntime: id }).catch(() => {
-      // Best-effort only.
-    });
+  const setDefaultIsolation = (choice: IsolationChoice | null) => {
+    persist({ defaultIsolation: choice });
   };
 
-  return { enablement, setRuntimeEnabled, defaultRuntime, setDefaultRuntime };
+  return { enablement, setRuntimeEnabled, defaultIsolation, setDefaultIsolation };
 }

@@ -1,15 +1,23 @@
 import { SecretsStore, type Config, type ProjectConfig, type ProjectsConfig } from "@/node/config";
+import { clearRemoteProjectPluginSnapshots } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
 import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
   validateProjectPath,
+  resolvesToFilesystemRoot,
+  PROJECT_AT_FILESYSTEM_ROOT_ERROR,
   isGitRepository,
   isInsideGitRepository,
   stripTrailingSlashes,
 } from "@/node/utils/pathUtils";
-import { listLocalBranches, detectDefaultTrunkBranch } from "@/node/git";
+import {
+  listLocalBranches,
+  listRecentLocalBranches,
+  detectDefaultTrunkBranch,
+  detectRepositoryDefaultBranch,
+} from "@/node/git";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { Secret } from "@/common/types/secrets";
@@ -35,6 +43,7 @@ import {
 } from "./sshCloneFailure";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
+import type { RemovedCreationDraft } from "@/common/orpc/schemas/drafts";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import * as path from "path";
 import { getXumProjectsDir } from "@/common/constants/paths";
@@ -59,7 +68,13 @@ import {
   withProjectRegistrationFileLock,
   withProjectRegistrationLock,
 } from "@/node/config/projectRegistrationLock";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
+import { isProjectTrusted, isProjectTrustedIn, trustOwnerPathIn } from "@/node/utils/projectTrust";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import {
+  applySshDirectoryTrust,
+  parseSshDirectoryTrustTarget,
+  TRUST_PROJECT_FIRST_ERROR,
+} from "@/common/utils/sshDirectoryTrust";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -404,6 +419,10 @@ export class ProjectService {
   private workspaceService?: WorkspaceRemover;
   private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
   private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
+  private draftCleaner?: { deleteProjectDrafts(projectPath: string): Promise<string[]> };
+  private unsubscribeProjectTrust?: () => void;
+  /** The effectively trusted project paths at the last config change (watchProjectTrust). */
+  private trustedProjectsKey?: string;
 
   constructor(
     private readonly config: Config,
@@ -425,6 +444,13 @@ export class ProjectService {
     mcpServerManager: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">
   ): void {
     this.mcpServerManager = mcpServerManager;
+  }
+
+  /** Deletes a removed project's creation drafts (DraftService); wired by the service container. */
+  setDraftCleaner(draftCleaner: {
+    deleteProjectDrafts(projectPath: string): Promise<string[]>;
+  }): void {
+    this.draftCleaner = draftCleaner;
   }
 
   setDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>) {
@@ -511,6 +537,11 @@ export class ProjectService {
         normalizedPath = path.resolve(expandTilde(projectPath));
       } else {
         normalizedPath = path.resolve(projectPath);
+      }
+      // File completions, git status and review scans would walk the whole disk (#5917). A
+      // symlink to the root counts as the root.
+      if (await resolvesToFilesystemRoot(normalizedPath)) {
+        return Err(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
       }
 
       let existingStat: Stats | null = null;
@@ -944,6 +975,48 @@ export class ProjectService {
   /** A mutation admitted during teardown would be killed half-done by the exit that follows. */
   beginShutdown(): void {
     this.shuttingDown = true;
+    this.unsubscribeProjectTrust?.();
+    this.unsubscribeProjectTrust = undefined;
+  }
+
+  /**
+   * #7621: `xum trust` and other writers of config.json change trust without setTrust, so they
+   * reach this backend only as a config change. Drop the remote plugin snapshots when the set of
+   * effectively trusted projects changes, as setTrust does. Reads only the config snapshot that
+   * every config-change listener shares. The subscription keeps Config's config.json watch open
+   * until beginShutdown. Never throws: a startup step must not fail, and a throw in an own save's
+   * notification would reach that save's caller.
+   */
+  watchProjectTrust(): void {
+    if (this.unsubscribeProjectTrust) return;
+    try {
+      this.trustedProjectsKey = this.readTrustedProjectsKey();
+      this.unsubscribeProjectTrust = this.config.onConfigChanged(() => {
+        try {
+          const key = this.readTrustedProjectsKey();
+          if (key === this.trustedProjectsKey) return;
+          this.trustedProjectsKey = key;
+          clearRemoteProjectPluginSnapshots();
+        } catch (error) {
+          log.warn(`Project trust watch: config change not applied: ${getErrorMessage(error)}`);
+        }
+      });
+    } catch (error) {
+      log.warn(`Project trust watch: not started: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private readTrustedProjectsKey(): string {
+    const projects = this.config.loadConfigOrDefault().projects;
+    const trusted = [...projects.keys()].filter((projectPath) =>
+      isProjectTrustedIn(projects, projectPath)
+    );
+    // Trusted SSH+None directories gate project plugins too, so a change to them counts.
+    return JSON.stringify(
+      trusted
+        .sort()
+        .map((projectPath) => [projectPath, projects.get(projectPath)?.trustedSshDirectories ?? []])
+    );
   }
 
   async *cloneWithProgress(
@@ -1211,7 +1284,16 @@ export class ProjectService {
         : undefined;
 
     try {
-      const child = spawn("git", ["clone", "--progress", "--", cloneUrl, cloneWorkPath], {
+      // --no-local: for a source on this machine, git's local-clone shortcut hard-links or copies
+      // the source's `objects/` files one by one. A background repack of that repository (git
+      // starts one after a commit or fetch) removes loose objects mid-copy, so the clone fails
+      // ("failed to copy file to ...", "hardlink different from source", or a checkout that
+      // cannot read an object). The transport reads the source through `git upload-pack`, which
+      // git keeps safe against a concurrent repack. It costs a full pack write instead of hard
+      // links, and leaves a clone that does not depend on the source's object store. Git ignores
+      // the flag for a remote URL.
+      const cloneArgs = ["clone", "--progress", "--no-local", "--", cloneUrl, cloneWorkPath];
+      const child = spawn("git", cloneArgs, {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(askpass?.env ?? {}) },
         // Detached children become process-group leaders on Unix so we can
@@ -1312,6 +1394,7 @@ export class ProjectService {
       try {
         while (!processEnded) {
           if (stderrChunks.length > 0) {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             yield { type: "progress", line: stderrChunks.shift()! };
             continue;
           }
@@ -1328,6 +1411,7 @@ export class ProjectService {
       }
 
       while (stderrChunks.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield { type: "progress", line: stderrChunks.shift()! };
       }
 
@@ -1384,7 +1468,10 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
-  async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
+  async remove(
+    projectPath: string,
+    force = false
+  ): Promise<Result<{ removedCreationDrafts: RemovedCreationDraft[] }, ProjectRemoveError>> {
     if (this.shuttingDown) throw new Error("Server is shutting down");
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
@@ -1421,8 +1508,9 @@ export class ProjectService {
         } catch (error) {
           log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
         }
+        const removedCreationDrafts = await this.deleteCreationDrafts([normalizedPath]);
         this.mcpServerManager?.forgetProjectTrust(normalizedPath);
-        return Ok(undefined);
+        return Ok({ removedCreationDrafts });
       }
 
       // Self-healing: purge workspace entries whose backing directories no longer exist.
@@ -1576,6 +1664,11 @@ export class ProjectService {
         return freshConfig;
       });
 
+      const removedCreationDrafts = await this.deleteCreationDrafts([
+        normalizedPath,
+        ...removedSubProjectPaths,
+      ]);
+
       for (const subProjectPath of removedSubProjectPaths) {
         try {
           await this.secretsStore.updateProjectSecrets(subProjectPath, []);
@@ -1593,11 +1686,29 @@ export class ProjectService {
       for (const removedPath of [normalizedPath, ...removedSubProjectPaths]) {
         this.mcpServerManager?.forgetProjectTrust(removedPath);
       }
-      return Ok(undefined);
+      return Ok({ removedCreationDrafts });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err({ type: "unknown" as const, message: `Failed to remove project: ${message}` });
     }
+  }
+
+  /**
+   * Delete the creation drafts whose project field is a removed project, server-side, so a
+   * removal from any client (or none mounted) leaves none behind. Best-effort like the secrets
+   * cleanup: a record this misses stays as an orphan file. Returns the deleted drafts.
+   */
+  private async deleteCreationDrafts(projectPaths: string[]): Promise<RemovedCreationDraft[]> {
+    const removed: RemovedCreationDraft[] = [];
+    for (const projectPath of projectPaths) {
+      try {
+        const draftIds = (await this.draftCleaner?.deleteProjectDrafts(projectPath)) ?? [];
+        for (const draftId of draftIds) removed.push({ projectPath, draftId });
+      } catch (error) {
+        log.error(`Failed to clean up drafts for project ${projectPath}:`, error);
+      }
+    }
+    return removed;
   }
 
   /**
@@ -1692,6 +1803,7 @@ export class ProjectService {
       if (!validation.valid) {
         throw new Error(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
 
       // Non-git repos return empty branches - they're restricted to local runtime only.
@@ -1712,7 +1824,11 @@ export class ProjectService {
       }
 
       const recommendedTrunk = await detectDefaultTrunkBranch(normalizedPath, branches);
-      return { branches, recommendedTrunk };
+      // Recency only orders the picker, so a failure here must not fail the list (the list is
+      // the creation page's send barrier).
+      const recentBranches = await listRecentLocalBranches(normalizedPath).catch(() => []);
+      const defaultBranch = await detectRepositoryDefaultBranch(normalizedPath, branches);
+      return { branches, recommendedTrunk, defaultBranch, recentBranches };
     } catch (error) {
       log.error("Failed to list branches:", error);
       throw error instanceof Error ? error : new Error(String(error));
@@ -1755,6 +1871,11 @@ export class ProjectService {
           "user.name=mux",
           "-c",
           "user.email=mux@localhost",
+          // No `git maintenance run --auto --detach` after the commit: a repository with one
+          // empty commit needs none, and a failed create deletes this directory right after
+          // the commit, while that detached git would still be using it.
+          "-c",
+          "maintenance.auto=false",
           "commit",
           "--allow-empty",
           "-m",
@@ -1799,6 +1920,7 @@ export class ProjectService {
       if (!validation.valid) {
         return Err(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
       // Same exclusive claim as create(): concurrent initializations of one directory
       // could double-commit or let one call's failure rollback delete the other's .git.
@@ -1839,6 +1961,7 @@ export class ProjectService {
       return { paths: [] };
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const normalizedPath = validation.expandedPath!;
 
     let cacheEntry = this.fileCompletionsCache.get(normalizedPath);
@@ -1990,9 +2113,14 @@ export class ProjectService {
 
   async setTrust(projectPath: string, trusted: boolean): Promise<void> {
     const normalizedPath = stripTrailingSlashes(projectPath);
+    // Checked on the unstripped path: a Windows drive root strips to a drive-relative spelling.
+    const isRootPath = await resolvesToFilesystemRoot(projectPath);
     await this.config.editConfig((config) => {
       let project = config.projects.get(normalizedPath);
       if (!project) {
+        // Trust can create a project entry, but never a new one at the root (#5917). An existing
+        // root project (from an older config) can still change its trust.
+        if (isRootPath) throw new Error(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
         project = { workspaces: [] };
         config.projects.set(normalizedPath, project);
       }
@@ -2000,21 +2128,108 @@ export class ProjectService {
       return config;
     });
 
-    const affectedPaths = [normalizedPath];
-    for (const [candidatePath, project] of this.config.loadConfigOrDefault().projects) {
+    this.publishProjectTrust(normalizedPath);
+  }
+
+  /**
+   * Publish the trust of `projectPath` and its sub-projects to the MCP manager. Each update
+   * carries the owner's trusted SSH directories so the manager computes per-workspace trust (an
+   * SSH+None workspace also needs its directory trusted) instead of applying the project-wide bit.
+   */
+  private publishProjectTrust(projectPath: string): void {
+    const projects = this.config.loadConfigOrDefault().projects;
+    // Directory trust lives on the trust owner (a sub-project's parent).
+    const trustedSshDirectories = projects.get(
+      trustOwnerPathIn(projects, projectPath)
+    )?.trustedSshDirectories;
+    const affectedPaths = [projectPath];
+    for (const [candidatePath, project] of projects) {
       if (
         project.parentProjectPath !== undefined &&
-        stripTrailingSlashes(project.parentProjectPath) === normalizedPath
+        stripTrailingSlashes(project.parentProjectPath) === projectPath
       ) {
         affectedPaths.push(candidatePath);
       }
     }
-    this.mcpServerManager?.applyProjectTrust(
-      affectedPaths.map((candidatePath) => ({
-        projectPath: candidatePath,
-        trusted: isProjectTrusted(this.config, candidatePath),
-      }))
+    try {
+      this.mcpServerManager?.applyProjectTrust(
+        affectedPaths.map((candidatePath) => ({
+          projectPath: candidatePath,
+          trusted: isProjectTrustedIn(projects, candidatePath),
+          trustedSshDirectories,
+        }))
+      );
+    } finally {
+      // #6426: snapshots of remote project plugins exist only for trusted projects. After the
+      // trust change is published, even when the MCP update throws; synchronous, never throws.
+      clearRemoteProjectPluginSnapshots();
+    }
+  }
+
+  /**
+   * Trust or untrust one SSH+None directory for a project. The directory is not the local
+   * project, so project trust alone does not cover it (isWorkspaceDirTrusted); this grant does,
+   * and only while the project itself stays trusted. Granting requires a trusted project.
+   *
+   * projectDir is stored as SSH+None workspaces persist it: absolute, resolved on the host the
+   * way workspace creation resolves it (~ and relative paths need the host). Returns the stored
+   * projectDir.
+   */
+  async setSshDirectoryTrust(input: {
+    projectPath: string;
+    host: string;
+    port?: number | null;
+    projectDir: string;
+    trusted: boolean;
+  }): Promise<Result<{ projectDir: string }, string>> {
+    const target = parseSshDirectoryTrustTarget(input);
+    if (!target.success) {
+      return Err(target.error);
+    }
+    const rawDirectory = target.data;
+    const trustOwnerPath = trustOwnerPathIn(
+      this.config.loadConfigOrDefault().projects,
+      input.projectPath
     );
+    if (input.trusted && !isProjectTrusted(this.config, trustOwnerPath)) {
+      return Err(TRUST_PROJECT_FIRST_ERROR);
+    }
+
+    let projectDir = rawDirectory.projectDir;
+    if (!projectDir.startsWith("/")) {
+      try {
+        projectDir = await createRuntime({
+          type: "ssh",
+          ...rawDirectory,
+          // Unused by resolvePath; any valid value.
+          srcBaseDir: "~/mux",
+          workspaceIsolation: "none",
+        }).resolvePath(rawDirectory.projectDir);
+      } catch (error) {
+        return Err(
+          `Failed to resolve ${rawDirectory.projectDir} on ${rawDirectory.host}: ${getErrorMessage(error)}`
+        );
+      }
+    }
+    const directory = { ...rawDirectory, projectDir };
+
+    try {
+      await this.config.editConfig((config) => {
+        // Re-checks project trust under the config lock: it may have been revoked meanwhile.
+        applySshDirectoryTrust(
+          config.projects.get(trustOwnerPath),
+          trustOwnerPath,
+          directory,
+          input.trusted
+        );
+        return config;
+      });
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+
+    this.publishProjectTrust(trustOwnerPath);
+    return Ok({ projectDir });
   }
 
   async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {
@@ -2037,6 +2252,18 @@ export class ProjectService {
         throw new Error(`Project not found: ${normalizedPath}`);
       }
       project.color = color ?? undefined;
+      return config;
+    });
+  }
+
+  async setIcon(projectPath: string, icon: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.icon = icon ?? undefined;
       return config;
     });
   }

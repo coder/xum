@@ -1,11 +1,11 @@
 /**
  * Codex (ChatGPT) OAuth service.
  *
- * Internals are Effect-native (see muxGatewayOauthService.ts for the shape):
- * fallible pipelines are `Effect.gen` programs whose error channel carries a
- * single reason-carrying tagged error, and the public Promise methods are
- * thin `Effect.runPromise` facades folding back into the wire
- * `Result<_, string>` shape, so pre-Effect callers keep working unchanged.
+ * Internals are Effect-native: fallible pipelines are `Effect.gen` programs
+ * whose error channel carries a single reason-carrying tagged error, and the
+ * public Promise methods are thin `Effect.runPromise` facades folding back
+ * into the wire `Result<_, string>` shape, so pre-Effect callers keep working
+ * unchanged.
  * Device-flow cancellation stays on the AbortController seam (the polling
  * loop is a forked fiber, but its lifecycle is controlled through
  * `finishDeviceFlow`'s abort, not fiber interruption).
@@ -165,12 +165,11 @@ export class CodexOauthService {
   }
 
   /**
-   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
-   * (mirrors startDesktopFlowEffect in muxGatewayOauthService.ts): a client
-   * abort between the loopback-server acquisition and `desktopFlows.register`
-   * would leak the server with nothing left to close it. Flow startup is quick
-   * and local, so running it to completion on abort is cheap; an abandoned
-   * flow still self-cleans via the registered timeout.
+   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible:
+   * a client abort between the loopback-server acquisition and
+   * `desktopFlows.register` would leak the server with nothing left to close
+   * it. Flow startup is quick and local, so running it to completion on abort
+   * is cheap; an abandoned flow still self-cleans via the registered timeout.
    */
   startDesktopFlowEffect(): Effect.Effect<
     Result<{ flowId: string; authorizeUrl: string }, string>

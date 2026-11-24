@@ -15,7 +15,7 @@ function rolloverConfig(threshold: number): AutoCompactionConfig {
 }
 
 function displayedThreshold(config: AutoCompactionConfig): number {
-  const percentage = /(\d+)%/.exec(getAutoCompactionLabel(config))?.[1];
+  const percentage = /(\d+(?:\.\d+)?)%/.exec(getAutoCompactionLabel(config))?.[1];
   expect(percentage).toBeDefined();
   return Number(percentage);
 }
@@ -31,10 +31,11 @@ function evaluateAt(
     toolResultChars: 0,
     imageParts: 0,
     modelContextLimit: options.modelContextLimit ?? 1_000_000,
-    // Both backend callers clamp the stored slider value the same way before syncing it.
-    threshold: getEffectiveThreshold(config) / 100,
-    warningEmitted: true,
+    // The backend resolves the stored slider value with the same minimum clamp and applies the
+    // final-zone clamp itself, so it never sees the display's limit-aware value.
+    threshold: getEffectiveThreshold({ ...config, modelContextLimit: null }) / 100,
     handoffRequested: options.handoffRequested ?? false,
+    finalHandoffAvailable: false,
   });
 }
 
@@ -68,6 +69,25 @@ describe("automatic context threshold labels", () => {
     // Values at or above the minimum are displayed unchanged.
     expect(displayedThreshold(rolloverConfig(10))).toBe(10);
     expect(displayedThreshold(rolloverConfig(15))).toBe(15);
+  });
+
+  test("a high slider is shown at the final-zone clamp the evaluator applies", () => {
+    const modelContextLimit = 128_000;
+    const config = { ...rolloverConfig(90), modelContextLimit };
+    const shown = displayedThreshold(config);
+    expect(shown).toBeLessThan(90);
+    const shownTokens = (shown / 100) * modelContextLimit;
+    expect(evaluateAt(Math.floor(shownTokens) - 1, config, { modelContextLimit }).decision).toBe(
+      "continue"
+    );
+    // The label rounds down to a tenth of a percent, so the handoff fires within that step.
+    expect(
+      evaluateAt(Math.ceil(shownTokens + modelContextLimit / 1000), config, { modelContextLimit })
+        .decision
+    ).toBe("handoff");
+    // The same slider sits below the zone on a large window, and an unknown limit keeps it.
+    expect(displayedThreshold({ ...rolloverConfig(90), modelContextLimit: 1_000_000 })).toBe(90);
+    expect(displayedThreshold(rolloverConfig(90))).toBe(90);
   });
 
   test("a smaller model's hard ceiling can precede the advertised target", () => {

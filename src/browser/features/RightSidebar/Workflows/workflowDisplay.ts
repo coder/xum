@@ -36,6 +36,12 @@ export const WORKFLOW_TONE_VAR: Record<WorkflowTone, string> = {
   destructive: "var(--color-danger)",
 };
 
+/** Tone → CSS color for text. Light-theme success green is below WCAG AA as text (#6882). */
+export const WORKFLOW_TONE_TEXT_VAR: Record<WorkflowTone, string> = {
+  ...WORKFLOW_TONE_VAR,
+  success: "var(--color-success-text)",
+};
+
 export function getWorkflowStepTone(status: WorkflowStepDisplayStatus): WorkflowTone {
   switch (status) {
     case "running":
@@ -99,6 +105,7 @@ export interface WorkflowTextPreview {
 export function countCodePoints(text: string): number {
   let count = 0;
   for (let i = 0; i < text.length; count += 1) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const code = text.codePointAt(i)!;
     i += code > 0xffff ? 2 : 1;
   }
@@ -124,6 +131,7 @@ export function getWorkflowTextPreview(
       truncated = true;
       break;
     }
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const code = text.codePointAt(i)!;
     i += code > 0xffff ? 2 : 1;
   }

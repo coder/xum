@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { WorkBundleMessage } from "@/browser/features/Messages/WorkBundleMessage";
 import { OperationalBundleMessage } from "@/browser/features/Messages/OperationalBundleMessage";
 import {
@@ -25,6 +25,14 @@ function findTailProposePlanToolId(messages: readonly DisplayedMessage[]): strin
   return null;
 }
 
+const EMPTY_OVERRIDES: ReadonlyMap<string, boolean> = new Map();
+
+interface BundleExpansionOverrides {
+  workspaceId: string;
+  work: ReadonlyMap<string, boolean>;
+  operational: ReadonlyMap<string, boolean>;
+}
+
 export interface TranscriptBundles {
   /** Indexed like the full message array; undefined outside hyper density. */
   workBundleInfos: Array<WorkBundleInfo | undefined> | undefined;
@@ -46,19 +54,25 @@ export function useTranscriptBundles(params: {
 }): TranscriptBundles {
   const { workspaceId, messages, transcriptDensity, isTurnActive } = params;
 
-  const [workBundleExpansionOverrides, setWorkBundleExpansionOverrides] = useState<
-    Map<string, boolean>
-  >(new Map());
-
-  const [operationalBundleExpansionOverrides, setOperationalBundleExpansionOverrides] = useState<
-    Map<string, boolean>
-  >(new Map());
-
-  // Expansion choices belong to one workspace's transcript.
-  useEffect(() => {
-    setWorkBundleExpansionOverrides(new Map());
-    setOperationalBundleExpansionOverrides(new Map());
-  }, [workspaceId]);
+  // Expansion choices belong to one workspace's transcript: the overrides are stored with their
+  // workspace and read as empty for any other, so a switch never renders the previous
+  // workspace's choices (forked transcripts share bundle keys), not even for the frame an
+  // effect-based reset would leave.
+  const [bundleExpansion, setBundleExpansion] = useState<BundleExpansionOverrides>(() => ({
+    workspaceId,
+    work: EMPTY_OVERRIDES,
+    operational: EMPTY_OVERRIDES,
+  }));
+  const isCurrentWorkspace = bundleExpansion.workspaceId === workspaceId;
+  if (!isCurrentWorkspace) {
+    // Choices are per visit: drop the stored overrides on switch (render-phase update, React
+    // re-renders before committing), else returning to the earlier workspace would restore them.
+    setBundleExpansion({ workspaceId, work: EMPTY_OVERRIDES, operational: EMPTY_OVERRIDES });
+  }
+  const workBundleExpansionOverrides = isCurrentWorkspace ? bundleExpansion.work : EMPTY_OVERRIDES;
+  const operationalBundleExpansionOverrides = isCurrentWorkspace
+    ? bundleExpansion.operational
+    : EMPTY_OVERRIDES;
 
   const workBundleInfos = useMemo(
     () => (transcriptDensity === "hyper" ? computeWorkBundleInfos(messages) : undefined),
@@ -89,12 +103,23 @@ export function useTranscriptBundles(params: {
       ? null
       : (operationalBundleInfos?.[tailProposePlanIndex]?.key ?? null);
 
+  const updateBundleExpansion = (kind: "work" | "operational", key: string, expanded: boolean) => {
+    setBundleExpansion((current) => {
+      const base: BundleExpansionOverrides =
+        current.workspaceId === workspaceId
+          ? current
+          : { workspaceId, work: EMPTY_OVERRIDES, operational: EMPTY_OVERRIDES };
+      const overrides = new Map(base[kind]).set(key, expanded);
+      return kind === "work" ? { ...base, work: overrides } : { ...base, operational: overrides };
+    });
+  };
+
   const setWorkBundleExpanded = (key: string, expanded: boolean) => {
-    setWorkBundleExpansionOverrides((prev) => new Map(prev).set(key, expanded));
+    updateBundleExpansion("work", key, expanded);
   };
 
   const setOperationalBundleExpanded = (key: string, expanded: boolean) => {
-    setOperationalBundleExpansionOverrides((prev) => new Map(prev).set(key, expanded));
+    updateBundleExpansion("operational", key, expanded);
   };
 
   return {

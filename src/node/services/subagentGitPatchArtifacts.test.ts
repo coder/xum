@@ -10,6 +10,7 @@ import {
   readSubagentGitPatchArtifactsFile,
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("subagentGitPatchArtifacts", () => {
   let testDir: string;
@@ -34,6 +35,7 @@ describe("subagentGitPatchArtifacts", () => {
     const createdAtMs = Date.now();
 
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -89,6 +91,7 @@ describe("subagentGitPatchArtifacts", () => {
     const createdAtMs = Date.now();
 
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -125,6 +128,7 @@ describe("subagentGitPatchArtifacts", () => {
 
     const appliedAtMs = createdAtMs + 1234;
     const updated = await markSubagentGitPatchArtifactApplied({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -171,6 +175,7 @@ describe("subagentGitPatchArtifacts", () => {
 
     const appliedAtMs = 456;
     const updated = await markSubagentGitPatchArtifactApplied({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -222,6 +227,54 @@ describe("subagentGitPatchArtifacts", () => {
     const file = await readSubagentGitPatchArtifactsFile(testDir);
     expect(file.artifactsByChildTaskId[childTaskId]?.status).toBe("ready");
     expect(file.artifactsByChildTaskId.broken).toBeUndefined();
+  });
+
+  test("skips an entry whose map key escapes the patch folder, and later writes still work", async () => {
+    const artifactsPath = getSubagentGitPatchArtifactsFilePath(testDir);
+    const validArtifact = (childTaskId: string) => ({
+      childTaskId,
+      parentWorkspaceId: "parent-1",
+      createdAtMs: 123,
+      status: "ready",
+      projectArtifacts: [
+        {
+          projectPath: "/tmp/project-a",
+          projectName: "project-a",
+          storageKey: "project-a",
+          status: "ready",
+          commitCount: 1,
+        },
+      ],
+      readyProjectCount: 1,
+      failedProjectCount: 0,
+      skippedProjectCount: 0,
+      totalCommitCount: 1,
+    });
+    // The entry's own childTaskId is safe; only its key is not.
+    await fsPromises.writeFile(
+      artifactsPath,
+      JSON.stringify({
+        version: 2,
+        artifactsByChildTaskId: {
+          "../../escape": validArtifact("child-safe"),
+          "child-kept": validArtifact("child-kept"),
+        },
+      }),
+      "utf-8"
+    );
+
+    const file = await readSubagentGitPatchArtifactsFile(testDir);
+    expect(Object.keys(file.artifactsByChildTaskId)).toEqual(["child-kept"]);
+
+    const updated = await markSubagentGitPatchArtifactApplied({
+      locks: nodeSessionLocks,
+      workspaceId: "parent-1",
+      workspaceSessionDir: testDir,
+      childTaskId: "child-kept",
+      projectPath: "/tmp/project-a",
+      appliedAtMs: 456,
+    });
+    expect(updated?.projectArtifacts[0]?.appliedAtMs).toBe(456);
   });
 
   test("normalizes version 1 artifacts into one-project patch sets", async () => {

@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import { KNOWN_MODELS, type KnownModelKey } from "@/common/constants/knownModels";
 import type {
-  EffectivePolicy,
   ProviderConfigInfo,
   ProviderModelEntry,
   ProvidersConfigMap,
@@ -21,40 +20,24 @@ import {
   type SkippedModelReason,
 } from "./selectableModels";
 
-// Explicit per-provider built-in lists in KNOWN_MODELS (= picker) order. The
-// sanity test below fails loudly when the catalog changes so every expected
-// list in this file stays explicit instead of being derived from the pipeline.
+// Per-provider built-in lists, derived from KNOWN_MODELS in its (= picker) order, so a model
+// added to or renamed in the catalog needs no change here. The provider order below is
+// what the sanity test pins against BUILT_IN_MODELS.
 const ids = (...keys: KnownModelKey[]): string[] => keys.map((key) => KNOWN_MODELS[key].id);
-const ANTHROPIC = ids("FABLE", "MYTHOS", "OPUS", "SONNET", "HAIKU");
-const OPENAI = ids(
-  "GPT",
-  "GPT_56_TERRA",
-  "GPT_6_LUNA",
-  "GPT_6_ASTRA",
-  "GPT_PRO",
-  "GPT_54_MINI",
-  "GPT_54_NANO",
-  "GPT_53_CODEX",
-  "GPT_53_CODEX_SPARK",
-  "GPT_MINI",
-  "GPT_CODEX_MAX",
-  "DAYBREAK_BLUE",
-  "DAYBREAK_RED"
-);
-const GOOGLE = ids("GEMINI_31_PRO", "GEMINI_FLASH");
-const XAI = ids("GROK_47");
-const DEEPSEEK = ids("DEEPSEEK_V4_PRO", "DEEPSEEK_V4_FLASH");
-const MOONSHOT = ids("KIMI_K3");
-const ZAI = ids("GLM_53_FLASH");
-const ALL_BUILT_INS = [
-  ...ANTHROPIC,
-  ...OPENAI,
-  ...GOOGLE,
-  ...XAI,
-  ...DEEPSEEK,
-  ...MOONSHOT,
-  ...ZAI,
-];
+const builtIns = (provider: (typeof KNOWN_MODELS)[KnownModelKey]["provider"]): string[] =>
+  Object.values(KNOWN_MODELS)
+    .filter((model) => model.provider === provider)
+    .map((model) => model.id);
+const ANTHROPIC = builtIns("anthropic");
+const OPENAI = builtIns("openai");
+const GOOGLE = builtIns("google");
+const XAI = builtIns("xai");
+const DEEPSEEK = builtIns("deepseek");
+const MOONSHOT = builtIns("moonshotai");
+const META = builtIns("meta");
+const ZAI = builtIns("zai");
+const PROVIDER_LISTS = [ANTHROPIC, OPENAI, GOOGLE, XAI, DEEPSEEK, MOONSHOT, META, ZAI];
+const ALL_BUILT_INS = PROVIDER_LISTS.flat();
 const OPENROUTER_ROUTABLE_BUILT_INS = [
   ...ANTHROPIC,
   ...OPENAI,
@@ -65,7 +48,6 @@ const OPENROUTER_ROUTABLE_BUILT_INS = [
 ];
 
 const SONNET = KNOWN_MODELS.SONNET.id;
-const SPARK = KNOWN_MODELS.GPT_53_CODEX_SPARK.id;
 const without = (models: string[], ...excluded: string[]): string[] =>
   models.filter((model) => !excluded.includes(model));
 
@@ -80,22 +62,10 @@ function customProvider(
   return provider({ isCustom: true, providerType: "openai-compatible", models, ...overrides });
 }
 
-function enforcedPolicy(
-  providerAccess: NonNullable<EffectivePolicy["providerAccess"]>
-): EffectivePolicy {
-  return {
-    policyFormatVersion: "0.1",
-    providerAccess,
-    mcp: { allowUserDefined: { stdio: true, remote: true } },
-    runtimes: null,
-  };
-}
-
 function select(overrides: Partial<SelectableModelsInput>): string[] {
   return computeSelectableModels({
     providersConfig: null,
     hiddenModels: [],
-    effectivePolicy: null,
     routePriority: ["direct"],
     routeOverrides: {},
     ...overrides,
@@ -103,18 +73,26 @@ function select(overrides: Partial<SelectableModelsInput>): string[] {
 }
 
 describe("computeSelectableModels", () => {
+  test("makes Muse Wonder selectable only when Meta is configured and enabled", () => {
+    expect(select({ providersConfig: { meta: provider() } })).toEqual(META);
+    expect(select({ providersConfig: { meta: provider({ isConfigured: false }) } })).toEqual([]);
+    expect(select({ providersConfig: { meta: provider({ isEnabled: false }) } })).toEqual([]);
+  });
+
   test("fixture lists cover the built-in catalog in picker order", () => {
+    // Fails when the catalog gains a provider or stops grouping models by provider.
     expect(ALL_BUILT_INS).toEqual(BUILT_IN_MODELS);
+    // An empty list would let that provider's expectations below pass vacuously.
+    for (const list of PROVIDER_LISTS) expect(list.length).toBeGreaterThan(0);
   });
 
   describe("custom models", () => {
-    test("surfaces custom models of enabled providers before built-ins; skips disabled, mux-gateway and github-copilot entries", () => {
+    test("surfaces custom models of enabled providers before built-ins; skips disabled and github-copilot entries", () => {
       const providersConfig: ProvidersConfigMap = {
         anthropic: provider(),
         fixture: customProvider(["fixture-a", { id: "fixture-mapped", mappedToModel: SONNET }]),
         "fixture-off": customProvider(["never"], { isEnabled: false }),
-        "mux-gateway": provider({ models: ["anthropic/claude-sonnet-5"] }),
-        "github-copilot": provider({ models: ["gpt-5.6-sol"] }),
+        "github-copilot": provider({ models: ["gpt-6.1-sol"] }),
       };
 
       expect(select({ providersConfig })).toEqual([
@@ -186,21 +164,23 @@ describe("computeSelectableModels", () => {
     test("explicit gateway-prefixed custom entries survive unchanged", () => {
       const providersConfig: ProvidersConfigMap = {
         openrouter: provider({ models: ["anthropic/claude-sonnet-5"] }),
-        coder: provider({ models: ["openai/gpt-5.6-sol"] }),
+        coder: provider({ models: ["openai/gpt-6.1-sol"] }),
       };
 
       expect(select({ providersConfig })).toEqual([
         "openrouter:anthropic/claude-sonnet-5",
-        "coder:openai/gpt-5.6-sol",
+        "coder:openai/gpt-6.1-sol",
       ]);
     });
   });
 
   describe("authoritative catalogs", () => {
     test("coder gates gateway routing on discoveredModels and honors removedModels", () => {
-      // Follow the moving `gpt` alias so the catalog keeps listing the routed built-in.
+      // Follow the moving `gpt` and `astra` aliases so the catalog keeps listing the
+      // routed built-ins.
       const gptSlug = `openai/${KNOWN_MODELS.GPT.providerModelId}`;
-      const catalog = [gptSlug, "openai/gpt-6-astra"];
+      const astraSlug = `openai/${KNOWN_MODELS.GPT_6_ASTRA.providerModelId}`;
+      const catalog = [gptSlug, astraSlug];
       const base = { apiKeySet: false, isEnabled: true, isConfigured: true };
 
       // Unknown catalog (discovery pending): permissive, every routable openai built-in shows.
@@ -209,7 +189,7 @@ describe("computeSelectableModels", () => {
           providersConfig: { coder: { ...base, models: catalog } },
           routePriority: ["coder"],
         })
-      ).toEqual([`coder:${gptSlug}`, "coder:openai/gpt-6-astra", ...ANTHROPIC, ...OPENAI]);
+      ).toEqual([`coder:${gptSlug}`, `coder:${astraSlug}`, ...ANTHROPIC, ...OPENAI]);
 
       // Known catalog: only listed models route through coder.
       expect(
@@ -219,7 +199,7 @@ describe("computeSelectableModels", () => {
         })
       ).toEqual([
         `coder:${gptSlug}`,
-        "coder:openai/gpt-6-astra",
+        `coder:${astraSlug}`,
         KNOWN_MODELS.GPT.id,
         KNOWN_MODELS.GPT_6_ASTRA.id,
       ]);
@@ -232,12 +212,32 @@ describe("computeSelectableModels", () => {
               ...base,
               models: catalog,
               discoveredModels: catalog,
-              removedModels: ["openai/gpt-6-astra"],
+              removedModels: [astraSlug],
             },
           },
           routePriority: ["coder"],
         })
       ).toEqual([`coder:${gptSlug}`, KNOWN_MODELS.GPT.id]);
+    });
+
+    test("coder lists Google built-ins only when canonicalRoutes maps google to a google instance", () => {
+      const base = { apiKeySet: false, isEnabled: true, isConfigured: true };
+      const discoveredProviders = [{ name: "agents-google", type: "google" }];
+
+      expect(
+        select({
+          providersConfig: { coder: { ...base, discoveredProviders } },
+          routePriority: ["coder"],
+        })
+      ).toEqual([...ANTHROPIC, ...OPENAI]);
+      expect(
+        select({
+          providersConfig: {
+            coder: { ...base, discoveredProviders, canonicalRoutes: { google: "agents-google" } },
+          },
+          routePriority: ["coder"],
+        })
+      ).toEqual([...ANTHROPIC, ...OPENAI, ...GOOGLE]);
     });
 
     test("github-copilot's persisted catalog gates the built-ins it can route", () => {
@@ -256,17 +256,7 @@ describe("computeSelectableModels", () => {
     const openai = (auth: { apiKeySet: boolean; codexOauthSet: boolean }): ProvidersConfigMap => ({
       openai: provider({ isConfigured: true, ...auth }),
     });
-    const CODEX_ALLOWED_BUILT_INS = ids(
-      "GPT",
-      "GPT_56_TERRA",
-      "GPT_6_LUNA",
-      "GPT_6_ASTRA",
-      "GPT_54_MINI",
-      "GPT_53_CODEX",
-      "GPT_53_CODEX_SPARK",
-      "GPT_MINI",
-      "GPT_CODEX_MAX"
-    );
+    const CODEX_ALLOWED_BUILT_INS = ids("GPT", "GPT_6_LUNA", "GPT_6_ASTRA");
 
     test("API key + OAuth: every OpenAI built-in", () => {
       expect(select({ providersConfig: openai({ apiKeySet: true, codexOauthSet: true }) })).toEqual(
@@ -274,22 +264,10 @@ describe("computeSelectableModels", () => {
       );
     });
 
-    test("API key only: hides OAuth-required models", () => {
-      expect(
-        select({ providersConfig: openai({ apiKeySet: true, codexOauthSet: false }) })
-      ).toEqual(without(OPENAI, SPARK));
-    });
-
     test("OAuth only: shows only OAuth-routable models", () => {
       expect(
         select({ providersConfig: openai({ apiKeySet: false, codexOauthSet: true }) })
       ).toEqual(CODEX_ALLOWED_BUILT_INS);
-    });
-
-    test("neither: hides OAuth-required models", () => {
-      expect(
-        select({ providersConfig: openai({ apiKeySet: false, codexOauthSet: false }) })
-      ).toEqual(without(OPENAI, SPARK));
     });
 
     test("a gateway-routed OpenAI model is not gated by OpenAI auth state", () => {
@@ -305,52 +283,11 @@ describe("computeSelectableModels", () => {
     });
   });
 
-  describe("policy", () => {
-    test("a model denied under its canonical identity stays when its active gateway route is allowed", () => {
-      expect(
-        select({
-          providersConfig: { openrouter: provider() },
-          routePriority: ["openrouter"],
-          effectivePolicy: enforcedPolicy([{ id: "openrouter", allowedModels: null }]),
-        })
-      ).toEqual(OPENROUTER_ROUTABLE_BUILT_INS);
-    });
-
-    test("a model denied on its active route is excluded", () => {
-      expect(
-        select({
-          providersConfig: { anthropic: provider(), xai: provider() },
-          effectivePolicy: enforcedPolicy([
-            { id: "anthropic", allowedModels: [KNOWN_MODELS.SONNET.providerModelId] },
-          ]),
-        })
-      ).toEqual([SONNET]);
-    });
-
-    test("effectivePolicy: null skips policy filtering", () => {
-      expect(
-        select({
-          providersConfig: { anthropic: provider(), xai: provider() },
-          effectivePolicy: null,
-        })
-      ).toEqual([...ANTHROPIC, ...XAI]);
-    });
-  });
-
   describe("providersConfig: null (still loading)", () => {
     test("returns the hidden-filtered suggested list without availability filtering", () => {
       expect(select({ providersConfig: null, hiddenModels: [SONNET] })).toEqual(
         without(ALL_BUILT_INS, SONNET)
       );
-    });
-
-    test("still applies the policy under canonical identity", () => {
-      expect(
-        select({
-          providersConfig: null,
-          effectivePolicy: enforcedPolicy([{ id: "anthropic", allowedModels: null }]),
-        })
-      ).toEqual(ANTHROPIC);
     });
   });
 });
@@ -388,8 +325,6 @@ describe("listAvailableModels", () => {
     const models = listAvailableModels(
       {
         providersConfig,
-        hiddenModels: [KNOWN_MODELS.HAIKU.id],
-        effectivePolicy: null,
         routePriority: ["direct"],
         routeOverrides: {},
       },
@@ -423,6 +358,7 @@ describe("listAvailableModels", () => {
         aliases: ["sonnet"],
         thinkingLevels: [...getThinkingPolicyForModel(KNOWN_MODELS.SONNET.id)],
       },
+      { model: KNOWN_MODELS.HAIKU.id, aliases: ["haiku"], thinkingLevels: FULL_POLICY },
     ]);
   });
 
@@ -442,8 +378,6 @@ describe("listAvailableModels", () => {
     expect(
       listAvailableModels({
         providersConfig: {},
-        hiddenModels: [],
-        effectivePolicy: null,
         routePriority: ["direct"],
         routeOverrides: {},
       })

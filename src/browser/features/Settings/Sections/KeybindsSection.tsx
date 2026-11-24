@@ -1,26 +1,37 @@
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { KEYBINDS, formatKeybind, isKeybindDeprecated } from "@/browser/utils/ui/keybinds";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { SettingsAnchor, SettingsGroup } from "../Components/SettingsLayout";
+import { keybindAnchorId } from "../settingsRegistry";
 
 /**
  * Human-readable labels for keybind IDs.
  * Derived from the comments in keybinds.ts.
  */
-const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
+export const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   TOGGLE_AGENT: "Open agent picker",
   CYCLE_AGENT: "Cycle agent",
   SEND_MESSAGE: "Send message",
   SEND_QUEUED_MESSAGE_NOW: "Send queued message now",
   SEND_HELD_INPUT: "Send oldest unsent message",
   DISCARD_HELD_INPUT: "Discard oldest unsent message",
+  SET_DEFAULT_ISOLATION: "Make the new workspace's isolation the project default",
+  OPEN_CREATION_ENVIRONMENT: "Open the new workspace's environment panel",
+  FOCUS_BACKGROUND_PROCESSES: "Focus background processes",
+  OPEN_TODO_PANEL: "Open TODO list",
+  OPEN_SUB_AGENTS_PANEL: "Open sub-agents",
+  OPEN_REVIEWS_PANEL: "Open reviews",
+  BACKGROUND_PROCESS_NEXT: "Next background process",
+  BACKGROUND_PROCESS_PREV: "Previous background process",
+  BACKGROUND_PROCESS_VIEW_OUTPUT: "View background process output",
+  BACKGROUND_PROCESS_TERMINATE: "Terminate background process",
   SEND_MESSAGE_AFTER_TURN: "Send after turn",
   NEW_LINE: "Insert newline",
   CANCEL: "Cancel / Close modal",
   CANCEL_EDIT: "Cancel editing message",
   SAVE_EDIT: "Save edit",
+  TOGGLE_MARKDOWN_PREVIEW: "Toggle Markdown preview",
   INTERRUPT_STREAM_VIM: "Interrupt stream (Vim mode)",
   INTERRUPT_STREAM_NORMAL: "Interrupt stream",
-  RESUME_STREAM: "Continue interrupted stream",
+  RESUME_STREAM: "Retry or continue interrupted stream",
   FOCUS_INPUT_I: "Focus input (i)",
   FOCUS_INPUT_A: "Focus input (a)",
   NEW_WORKSPACE: "New workspace",
@@ -28,14 +39,20 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   EDIT_WORKSPACE_TITLE: "Edit workspace title",
   GENERATE_WORKSPACE_TITLE: "Generate new title",
   ARCHIVE_WORKSPACE: "Archive workspace",
-  PIN_WORKSPACE: "Pin/unpin chat",
-  MOVE_PINNED_UP: "Move pinned chat up",
-  MOVE_PINNED_DOWN: "Move pinned chat down",
+  PIN_WORKSPACE: "Pin/unpin workspace",
+  MOVE_PINNED_UP: "Move pinned workspace up",
+  MOVE_PINNED_DOWN: "Move pinned workspace down",
+  FORK_WORKSPACE: "Fork workspace",
+  STOP_WORKSPACE_RUNTIME: "Stop container",
+  MARK_WORKSPACE_UNREAD: "Mark unread (in the workspace actions menu)",
+  TOGGLE_COMPLETED_SUB_AGENTS: "Show/hide sub-agents (in the workspace actions menu)",
   JUMP_TO_BOTTOM: "Jump to bottom",
   LOAD_OLDER_MESSAGES: "Load older messages",
+  SHOW_NEWER_MESSAGES: "Show newer messages",
   NEXT_WORKSPACE: "Next workspace",
   PREV_WORKSPACE: "Previous workspace",
-  TOGGLE_SIDEBAR: "Toggle sidebar",
+  TOGGLE_SIDEBAR: "Toggle left sidebar",
+  TOGGLE_RIGHT_SIDEBAR: "Toggle right sidebar",
   CYCLE_MODEL: "Cycle model",
   OPEN_TERMINAL: "New terminal",
   OPEN_IN_EDITOR: "Open in editor",
@@ -43,15 +60,40 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   CONFIGURE_HEARTBEAT: "Configure heartbeat",
   CONFIGURE_UNRELATED_MESSAGING: "Configure messages from other workspaces",
   OPEN_COMMAND_PALETTE: "Command palette",
+  FOCUS_SETTINGS_SEARCH: "Search settings",
   OPEN_COMMAND_PALETTE_ACTIONS: "Command palette (alternate)",
   TOGGLE_THINKING: "Toggle thinking",
   INCREASE_THINKING: "Increase thinking level",
   DECREASE_THINKING: "Decrease thinking level",
   TOGGLE_FAST_MODE: "Toggle fast mode",
+  TOGGLE_ULTRAFAST_MODE: "Toggle ultrafast mode",
+  TOGGLE_COMPUTER_USE: "Toggle computer use",
+  STOP_COMPUTER_USE: "Stop computer use (works in any app)",
   FOCUS_CHAT: "Focus chat input",
+  NEW_SIDEBAR_TAB: "New sidebar tab",
   CLOSE_TAB: "Close tab",
   REVEAL_TIMELINE_EVENT: "Reveal selected timeline event in transcript",
-  OPEN_TIMELINE_DIALOG: "Open timeline dialog (small viewports)",
+  OPEN_TIMELINE_DIALOG: "Open Timeline tab (small viewports)",
+  OPEN_STATS_DIALOG: "Open Stats tab (small viewports)",
+  OPEN_ARTIFACTS_TAB: "Focus Artifacts tab, or hide the sidebar when focused",
+  TOGGLE_AGENT_INTERFACE_VIEW: "Switch between status page and chat (Agent interface view)",
+  TOGGLE_STATUS_TRANSCRIPT_PEEK: "Show or hide the transcript on the status page",
+  STATUS_START_HERE: "Start here from the agent's last reply (status page)",
+  TOGGLE_ARTIFACT_FULLSCREEN: "Toggle artifact fullscreen (Artifacts tab)",
+  NEXT_ARTIFACT: "Next artifact (Artifacts tab)",
+  PREV_ARTIFACT: "Previous artifact (Artifacts tab)",
+  RELOAD_ARTIFACT: "Reload artifact (Artifacts tab)",
+  UNPIN_ARTIFACT_FILE: "Unpin the selected pinned file (Artifacts tab)",
+  ZOOM_IN_ARTIFACT_IMAGE: "Zoom in on image artifact",
+  ZOOM_OUT_ARTIFACT_IMAGE: "Zoom out of image artifact",
+  FIT_ARTIFACT_IMAGE: "Fit image artifact to panel",
+  ACTUAL_SIZE_ARTIFACT_IMAGE: "Image artifact at actual size",
+  PIN_ARTIFACT_TO_PROJECT_SHELF: "Pin artifact to project shelf (Artifacts tab)",
+  PIN_ARTIFACT_TO_GLOBAL_SHELF: "Pin artifact to global shelf (Artifacts tab)",
+  UNPIN_SHELF_ENTRY: "Unpin shelf entry (Artifacts tab)",
+  TOGGLE_ARTIFACT_ANNOTATE: "Toggle artifact annotate mode (Artifacts tab)",
+  SEND_ARTIFACT_MESSAGE: "Send the message an artifact asks to send (Artifacts tab)",
+  DISMISS_ARTIFACT_MESSAGE: "Dismiss the message an artifact asks to send (Artifacts tab)",
   REVEAL_LAST_PROMPT: "Reveal last prompt in transcript",
   SIDEBAR_TAB_1: "Tab 1",
   SIDEBAR_TAB_2: "Tab 2",
@@ -73,7 +115,10 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   TOGGLE_ASSISTED_REVIEW: "Toggle Assisted filter",
   OPEN_SETTINGS: "Open settings",
   OPEN_ANALYTICS: "Open analytics",
+  SAVE_SESSION_TAPES: "Save open session tapes (experimental)",
+  REVEAL_SESSION_TAPES: "Reveal session tapes folder (experimental)",
   OPEN_SERVER_WINDOW: "Open server window (desktop)",
+  REPORT_SLOWNESS: "Report slowness (flight recorder experiment)",
   TOGGLE_VOICE_INPUT: "Toggle voice input",
   NAVIGATE_BACK: "Navigate back",
   NAVIGATE_FORWARD: "Navigate forward",
@@ -97,6 +142,10 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SETTINGS_BACKUP_TOGGLE_MCP_HEADERS: "Toggle MCP header values in backup",
   SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: "Toggle MCP stdio commands in backup",
   SETTINGS_BACKUP_TOGGLE_PROJECTS: "Toggle project backup",
+  SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: "Toggle global artifact backup",
+  SETTINGS_BACKUP_TOGGLE_PLUGINS: "Toggle plugin list backup",
+  SETTINGS_BACKUP_REVIEW_PLUGINS: "Review and install backed-up plugins",
+  SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL: "Back up and remove plugins from the backup",
   // Modal-only keybinds; intentionally omitted from KEYBIND_GROUPS.
   CONFIRM_DIALOG_YES: "Confirm dialog action",
   CONFIRM_DIALOG_NO: "Cancel dialog action",
@@ -116,6 +165,8 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   REVIEW_COPY_FILE: "Copy file contents (immersive)",
   TOGGLE_PLAN_ANNOTATE: "Toggle plan annotate mode",
   RUN_LATEST_PLAN_ACTION: "Implement latest plan",
+  RUN_OUTSIDE_SANDBOX: "Run latest sandbox approval outside once",
+  DENY_OUTSIDE_SANDBOX: "Deny latest sandbox approval",
   // Transcript-menu-only actions show their shortcuts in that menu.
   COPY_MARKDOWN: "Copy Markdown (transcript context menu)",
   // Image-viewer-scoped keybinds (lightbox / image context menu); intentionally
@@ -128,7 +179,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
 };
 
 /** Groups for organizing keybinds in the UI */
-const KEYBIND_GROUPS: Array<{
+export const KEYBIND_GROUPS: Array<{
   label: string;
   keys: Array<keyof typeof KEYBINDS>;
 }> = [
@@ -139,13 +190,21 @@ const KEYBIND_GROUPS: Array<{
       "CYCLE_AGENT",
       "OPEN_COMMAND_PALETTE",
       "OPEN_SETTINGS",
+      "FOCUS_SETTINGS_SEARCH",
       "OPEN_ANALYTICS",
       "OPEN_SERVER_WINDOW",
+      "REPORT_SLOWNESS",
+      "SAVE_SESSION_TAPES",
+      "REVEAL_SESSION_TAPES",
       "TOGGLE_SIDEBAR",
+      "TOGGLE_RIGHT_SIDEBAR",
       "CYCLE_MODEL",
       "DECREASE_THINKING",
       "INCREASE_THINKING",
       "TOGGLE_FAST_MODE",
+      "TOGGLE_ULTRAFAST_MODE",
+      "TOGGLE_COMPUTER_USE",
+      "STOP_COMPUTER_USE",
       "TOGGLE_NOTIFICATIONS",
       "TOGGLE_DRIFT_MODE",
       "SHOW_WORKSPACE_DETAILS",
@@ -165,6 +224,8 @@ const KEYBIND_GROUPS: Array<{
       "FOCUS_INPUT_A",
       "TOGGLE_PLAN_ANNOTATE",
       "RUN_LATEST_PLAN_ACTION",
+      "RUN_OUTSIDE_SANDBOX",
+      "DENY_OUTSIDE_SANDBOX",
       "CANCEL",
       "INTERRUPT_STREAM_NORMAL",
       "INTERRUPT_STREAM_VIM",
@@ -172,11 +233,15 @@ const KEYBIND_GROUPS: Array<{
       "TOGGLE_VOICE_INPUT",
       "SHOW_LAST_PROMPT",
       "REVEAL_LAST_PROMPT",
+      "FOCUS_BACKGROUND_PROCESSES",
+      "OPEN_TODO_PANEL",
+      "OPEN_SUB_AGENTS_PANEL",
+      "OPEN_REVIEWS_PANEL",
     ],
   },
   {
     label: "Editing",
-    keys: ["SAVE_EDIT", "CANCEL_EDIT"],
+    keys: ["SAVE_EDIT", "CANCEL_EDIT", "TOGGLE_MARKDOWN_PREVIEW"],
   },
   {
     label: "Navigation",
@@ -186,12 +251,17 @@ const KEYBIND_GROUPS: Array<{
       "EDIT_WORKSPACE_TITLE",
       "GENERATE_WORKSPACE_TITLE",
       "ARCHIVE_WORKSPACE",
+      "FORK_WORKSPACE",
+      "STOP_WORKSPACE_RUNTIME",
+      "MARK_WORKSPACE_UNREAD",
+      "TOGGLE_COMPLETED_SUB_AGENTS",
       "NEXT_WORKSPACE",
       "PREV_WORKSPACE",
       "NAVIGATE_BACK",
       "NAVIGATE_FORWARD",
       "JUMP_TO_BOTTOM",
       "LOAD_OLDER_MESSAGES",
+      "SHOW_NEWER_MESSAGES",
     ],
   },
   {
@@ -206,9 +276,35 @@ const KEYBIND_GROUPS: Array<{
       "SIDEBAR_TAB_7",
       "SIDEBAR_TAB_8",
       "SIDEBAR_TAB_9",
+      "NEW_SIDEBAR_TAB",
       "CLOSE_TAB",
       "REVEAL_TIMELINE_EVENT",
       "OPEN_TIMELINE_DIALOG",
+      "OPEN_STATS_DIALOG",
+    ],
+  },
+  {
+    label: "Artifacts",
+    keys: [
+      "OPEN_ARTIFACTS_TAB",
+      "TOGGLE_AGENT_INTERFACE_VIEW",
+      "TOGGLE_STATUS_TRANSCRIPT_PEEK",
+      "STATUS_START_HERE",
+      "TOGGLE_ARTIFACT_FULLSCREEN",
+      "NEXT_ARTIFACT",
+      "PREV_ARTIFACT",
+      "RELOAD_ARTIFACT",
+      "UNPIN_ARTIFACT_FILE",
+      "ZOOM_IN_ARTIFACT_IMAGE",
+      "ZOOM_OUT_ARTIFACT_IMAGE",
+      "FIT_ARTIFACT_IMAGE",
+      "ACTUAL_SIZE_ARTIFACT_IMAGE",
+      "PIN_ARTIFACT_TO_PROJECT_SHELF",
+      "PIN_ARTIFACT_TO_GLOBAL_SHELF",
+      "UNPIN_SHELF_ENTRY",
+      "TOGGLE_ARTIFACT_ANNOTATE",
+      "SEND_ARTIFACT_MESSAGE",
+      "DISMISS_ARTIFACT_MESSAGE",
     ],
   },
   {
@@ -259,6 +355,10 @@ const KEYBIND_GROUPS: Array<{
       "SETTINGS_BACKUP_TOGGLE_MCP_HEADERS",
       "SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS",
       "SETTINGS_BACKUP_TOGGLE_PROJECTS",
+      "SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS",
+      "SETTINGS_BACKUP_TOGGLE_PLUGINS",
+      "SETTINGS_BACKUP_REVIEW_PLUGINS",
+      "SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL",
     ],
   },
   {
@@ -275,37 +375,30 @@ const KEYBIND_DISPLAY_ALTERNATES: Partial<
 };
 
 export function KeybindsSection() {
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const visibleKeybindGroups = KEYBIND_GROUPS.map((group) => ({
     ...group,
-    keys: group.keys.filter(
-      (key) =>
-        !isKeybindDeprecated(KEYBINDS[key]) &&
-        (key !== "CONFIGURE_HEARTBEAT" || workspaceHeartbeatsEnabled)
-    ),
+    keys: group.keys.filter((key) => !isKeybindDeprecated(KEYBINDS[key])),
   })).filter((group) => group.keys.length > 0);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       {visibleKeybindGroups.map((group) => (
-        <div key={group.label}>
-          <h3 className="text-foreground mb-3 text-sm font-medium">{group.label}</h3>
-          <div className="space-y-1">
-            {group.keys.map((key) => (
-              <div
-                key={key}
-                className="flex items-center justify-between rounded px-2 py-1.5 text-sm"
-              >
-                <span className="text-muted">{KEYBIND_LABELS[key]}</span>
-                <kbd className="bg-background-secondary text-foreground border-border-medium rounded border px-2 py-0.5 font-mono text-xs">
-                  {[key, ...(KEYBIND_DISPLAY_ALTERNATES[key] ?? [])]
-                    .map((keybindId) => formatKeybind(KEYBINDS[keybindId]))
-                    .join(" / ")}
-                </kbd>
-              </div>
-            ))}
-          </div>
-        </div>
+        <SettingsGroup key={group.label} title={group.label}>
+          {group.keys.map((key) => (
+            <SettingsAnchor
+              key={key}
+              id={keybindAnchorId(key)}
+              className="flex items-center justify-between gap-4 px-4 py-2 text-sm"
+            >
+              <span className="text-content-primary">{KEYBIND_LABELS[key]}</span>
+              <kbd className="bg-surface-primary text-content-primary border-border-medium shrink-0 rounded border px-2 py-0.5 font-mono text-xs">
+                {[key, ...(KEYBIND_DISPLAY_ALTERNATES[key] ?? [])]
+                  .map((keybindId) => formatKeybind(KEYBINDS[keybindId]))
+                  .join(" / ")}
+              </kbd>
+            </SettingsAnchor>
+          ))}
+        </SettingsGroup>
       ))}
     </div>
   );

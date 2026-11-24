@@ -12,6 +12,7 @@
  * No service dependencies: TaskService and WorkspaceTurnManager both import it.
  */
 
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   taskAiPinsToLayer,
@@ -41,6 +42,14 @@ import {
 } from "@/node/services/taskWorkspaceSeam";
 
 type LoadedConfig = ReturnType<Config["loadConfigOrDefault"]>;
+type AgentSettingsBucket = NonNullable<WorkspaceConfigEntry["aiSettingsByAgent"]>[string];
+
+/** Planning never reads the composer's Auto flags, so a flag-only change must not refuse a commit. */
+function withoutAutoRoutingFlags(bucket: AgentSettingsBucket | undefined) {
+  if (bucket == null) return null;
+  const { autoModelRouting, autoThinkingLevel, ...settings } = bucket;
+  return settings;
+}
 
 /** AI settings one reawakened execution runs with; mirrors creation's conventions. */
 export interface AgentTaskTurnAiSnapshot {
@@ -53,6 +62,7 @@ export interface AgentTaskTurnAiSnapshot {
   thinkingLevel: ThinkingLevel;
   /** Selected reasoning mode; "standard" when nothing configures one. */
   reasoningMode: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }
 
 /** Transient commit payload handed from TaskService to createWorkspaceTurn. */
@@ -93,18 +103,17 @@ function stableStringify(value: unknown): string {
   });
 }
 
-/** Identity of the checkout (and discovery flags) the definition layers were read from. */
-export function buildReawakenContextKey(
-  entry: { projectPath: string; workspace: WorkspaceConfigEntry },
-  includeAgentPlugins: boolean
-): string {
+/** Identity of the checkout the definition layers were read from. */
+export function buildReawakenContextKey(entry: {
+  projectPath: string;
+  workspace: WorkspaceConfigEntry;
+}): string {
   return stableStringify({
     runtimeConfig: entry.workspace.runtimeConfig ?? null,
     projectPath: entry.projectPath,
     name: entry.workspace.name ?? null,
     path: entry.workspace.path ?? null,
     subProjectPath: entry.workspace.subProjectPath ?? null,
-    includeAgentPlugins,
   });
 }
 
@@ -132,7 +141,7 @@ export function computeReawakenInputsKey(
       agentId,
       parentWorkspaceId: child.parentWorkspaceId ?? null,
       taskAiPins: child.taskAiPins ?? null,
-      bucket: child.aiSettingsByAgent?.[agentId] ?? null,
+      bucket: withoutAutoRoutingFlags(child.aiSettingsByAgent?.[agentId]),
       aiSettings: child.aiSettings ?? null,
       taskModelString: child.taskModelString ?? null,
       taskThinkingLevel: child.taskThinkingLevel ?? null,
@@ -142,7 +151,15 @@ export function computeReawakenInputsKey(
         ? {
             agentId: parent.agentId ?? null,
             agentType: parent.agentType ?? null,
-            aiSettingsByAgent: parent.aiSettingsByAgent ?? null,
+            aiSettingsByAgent:
+              parent.aiSettingsByAgent != null
+                ? Object.fromEntries(
+                    Object.entries(parent.aiSettingsByAgent).map(([id, bucket]) => [
+                      id,
+                      withoutAutoRoutingFlags(bucket),
+                    ])
+                  )
+                : null,
             aiSettings: parent.aiSettings ?? null,
           }
         : null,
@@ -197,6 +214,7 @@ export function buildParentAiSettingsFallbacks(
       model: settings.model,
       thinkingLevel: coerceThinkingLevel(settings.thinkingLevel),
       reasoningMode: coerceOpenAIReasoningMode(settings.reasoningMode),
+      serviceTier: ServiceTierSchema.safeParse(settings.serviceTier).data,
     });
   };
   const normalizedTarget = normalizeAgentId(targetAgentId, "");
@@ -255,6 +273,8 @@ export function planReawakenAi(params: {
       bucket != null
         ? (coerceOpenAIReasoningMode(bucket.reasoningMode) ?? "standard")
         : coerceOpenAIReasoningMode(child.aiSettings?.reasoningMode),
+    serviceTier: ServiceTierSchema.safeParse(bucket?.serviceTier ?? child.aiSettings?.serviceTier)
+      .data,
   };
   const pinsLayer = taskAiPinsToLayer(child.taskAiPins);
   const layers = prepared?.layers ?? null;
@@ -289,6 +309,9 @@ export function planReawakenAi(params: {
     canonicalModel: resolved.effective.model,
     thinkingLevel: resolved.effective.thinkingLevel,
     reasoningMode: resolved.selected.reasoningMode ?? "standard",
+    ...(resolved.selected.serviceTier != null
+      ? { serviceTier: resolved.selected.serviceTier }
+      : {}),
   };
   assert(snapshot.taskModelString.length > 0, "planReawakenAi: resolved model must be non-empty");
   return { kind: "resolved", snapshot, inputsKey, usedDefinitionLayers: layers != null };
@@ -310,13 +333,19 @@ export function applyAgentTaskTurnAiSnapshot(
     model: snapshot.canonicalModel,
     thinkingLevel: snapshot.thinkingLevel,
     reasoningMode: snapshot.reasoningMode,
+    ...(snapshot.serviceTier != null ? { serviceTier: snapshot.serviceTier } : {}),
   };
+  const previous = workspace.aiSettingsByAgent?.[snapshot.agentId];
   workspace.aiSettingsByAgent = {
     ...(workspace.aiSettingsByAgent ?? {}),
     [snapshot.agentId]: {
       model: bucketModel,
       thinkingLevel: snapshot.thinkingLevel,
       reasoningMode: snapshot.reasoningMode,
+      ...(snapshot.serviceTier != null ? { serviceTier: snapshot.serviceTier } : {}),
+      // The snapshot has no Auto choices; the child's composer keeps them for its next sends.
+      ...(previous?.autoModelRouting === true ? { autoModelRouting: true } : {}),
+      ...(previous?.autoThinkingLevel === true ? { autoThinkingLevel: true } : {}),
     },
   };
   workspace.taskModelString = snapshot.taskModelString;

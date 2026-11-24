@@ -24,6 +24,7 @@ import {
   CompactionCancellationReadRefusedError,
 } from "./compactionCancellation";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 
 const workspaceId = "cancellation-runtime";
 const options = { model: "openai:gpt-4o", agentId: "exec" };
@@ -88,11 +89,11 @@ describe("compaction cancellation runtime", () => {
       const budget = Reflect.get(h.state.contextController, "tokenBudget") as {
         clearContextBudgetState(): void;
         contextBudgetGeneration: number;
-        contextBudgetWarningClaimed: boolean;
-        contextBudgetFlushClaimed: boolean;
+        contextBudgetHandoffClaimed: boolean;
+        contextBudgetFinalClaimed: boolean;
       };
-      budget.contextBudgetWarningClaimed = true;
-      budget.contextBudgetFlushClaimed = true;
+      budget.contextBudgetHandoffClaimed = true;
+      budget.contextBudgetFinalClaimed = true;
       const generation = budget.contextBudgetGeneration;
       const token = pending ? h.state.coordinator.beginCompactionObservation("continuous") : null;
       if (pending) {
@@ -121,8 +122,8 @@ describe("compaction cancellation runtime", () => {
       try {
         // No await: admission and stale-work invalidation must precede the physical stop.
         expect(budget.contextBudgetGeneration).toBe(generation + 1);
-        expect(budget.contextBudgetWarningClaimed).toBe(false);
-        expect(budget.contextBudgetFlushClaimed).toBe(false);
+        expect(budget.contextBudgetHandoffClaimed).toBe(false);
+        expect(budget.contextBudgetFinalClaimed).toBe(false);
         // Ordinary Stop cancels compaction before budget cleanup. The later abandon branch
         // remains separate: moving either reset would change its synchronous admission fence.
         expect(order).toEqual([
@@ -568,8 +569,8 @@ describe("compaction cancellation runtime", () => {
     const stopped = await h.storage.read();
     expect(stopped?.version).toBe(2);
     let failed = false;
-    const readFile = fs.promises.readFile;
-    const read = spyOn(fs.promises, "readFile").mockImplementation(
+    const readFile = fileIO.readFile;
+    const read = spyOn(fileIO, "readFile").mockImplementation(
       new Proxy(readFile, {
         apply(target, receiver, args) {
           if (!failed && args[0] === generationPath) {
@@ -592,6 +593,7 @@ describe("compaction cancellation runtime", () => {
       expect(await h.storage.read()).toEqual(stopped);
       expect(await Promise.all(durablePaths.map((file) => fileIO.readFile(file)))).toEqual(before);
       expect(h.stream).not.toHaveBeenCalled();
+      expect(read).toHaveBeenCalled();
     } finally {
       read.mockRestore();
     }
@@ -1928,8 +1930,13 @@ describe("compaction cancellation runtime", () => {
         spyOn(fresh.historyService, "cleanupCompactionFollowUp").mockImplementationOnce(
           async (...args) => {
             const result = await cleanup(...args);
+            const foreignHistory = new HistoryService(h.config);
             const foreign = new CompactionCancellation(
-              new FileCompactionCancellationStorage(new HistoryService(h.config), workspaceId)
+              new FileCompactionCancellationStorage(
+                foreignHistory,
+                workspaceId,
+                foreignHistory.files
+              )
             );
             await foreign.cancel();
             successorNonce = (await foreign.read())?.nonce;
@@ -2279,7 +2286,7 @@ describe("compaction cancellation runtime", () => {
     }
   );
 
-  test.each(["user", "assistant", "partial"] as const)(
+  test.each(["user", "assistant", "partial", "user-then-budget-warning"] as const)(
     "explicit resume stamps the actual %s tail before notices",
     async (kind) => {
       const h = await fixture();
@@ -2287,16 +2294,37 @@ describe("compaction cancellation runtime", () => {
         workspaceId,
         createMuxMessage("user", "user", "prior")
       );
+      // #5286 appends the Token Budget warning after the turn's user row. The warning is a
+      // notice, so the resume target stays the user row it follows.
+      const warning = createContextBudgetWarning({
+        contextTokens: 90_000,
+        maxTokens: 128_000,
+        budgetTokens: 119_808,
+        sessionHistoryAvailable: true,
+        handoff: true,
+        handoffTokens: 89_600,
+        newContextAvailable: true,
+      });
+      if (kind === "user-then-budget-warning")
+        await h.historyService.appendToHistory(workspaceId, warning);
+      const targetId = kind === "user-then-budget-warning" ? "user" : kind;
+      const tailId = kind === "user-then-budget-warning" ? warning.id : kind;
       if (kind === "assistant")
         await h.historyService.appendToHistory(
           workspaceId,
           createMuxMessage("assistant", "assistant", "answer")
         );
-      if (kind === "partial")
+      if (kind === "partial") {
+        // The interrupted stream's empty placeholder row precedes its partial.
+        await h.historyService.appendToHistory(workspaceId, {
+          ...createMuxMessage("partial", "assistant", "", { historySequence: 1 }),
+          parts: [],
+        });
         await h.historyService.writePartial(
           workspaceId,
           createMuxMessage("partial", "assistant", "interrupted answer", { historySequence: 1 })
         );
+      }
       await h.session.cancelCompaction(true);
       const stop = await h.storage.read();
       const detect = h.state.fileChangeTracker.getChangedAttachments.bind(
@@ -2304,10 +2332,14 @@ describe("compaction cancellation runtime", () => {
       );
       const notice = spyOn(h.state.fileChangeTracker, "getChangedAttachments").mockImplementation(
         async () => {
-          expect((await h.rows()).at(-1)).toMatchObject({
-            id: kind,
-            metadata: { compactionReplacementNonce: stop?.nonce },
-          });
+          const rows = await h.rows();
+          // No notice row lands before the stamp: the tail is still the resumed history.
+          expect(rows.at(-1)?.id).toBe(tailId);
+          const stamped = rows.filter(
+            (row) => row.metadata?.compactionReplacementNonce === stop?.nonce
+          );
+          expect(stop?.nonce).toBeDefined();
+          expect(stamped.map((row) => row.id)).toEqual([targetId]);
           expect(await h.storage.read()).toBeNull();
           return detect();
         }

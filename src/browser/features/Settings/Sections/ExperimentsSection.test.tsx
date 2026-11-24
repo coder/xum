@@ -3,21 +3,17 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { GlobalWindow } from "happy-dom";
 import type { ReactNode } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
+import * as ActualExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
-import {
-  createTestApiClient,
-  createTestConfig,
-  type TestApiOverrides,
-  type TestClientConfig,
-} from "@/browser/testUtils";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 
 // Snapshot values, not Bun's live module namespaces, before installing overrides.
 const actualExperiments = { ...ActualExperimentsModule };
 const actualTelemetry = { ...ActualTelemetryModule };
 
 afterAll(() => {
-  void mock.module("@/browser/contexts/ExperimentsContext", () => actualExperiments);
+  void mock.module("@/browser/hooks/useExperiments", () => actualExperiments);
   void mock.module("@/browser/hooks/useTelemetry", () => actualTelemetry);
 });
 
@@ -36,6 +32,7 @@ function createDeferred<T>() {
 let mockApi: TestApiOverrides<APIClient>;
 let experimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
+let writeExperiment: () => Promise<void> = () => Promise.resolve();
 
 // Inject the current client through the real provider; mocking the API module leaks across
 // files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
@@ -43,12 +40,13 @@ function ApiWrapper(props: { children: ReactNode }) {
   return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
-void mock.module("@/browser/contexts/ExperimentsContext", () => ({
+void mock.module("@/browser/hooks/useExperiments", () => ({
   ...actualExperiments,
   useExperiment: (experimentId: string) => [
     experimentValues[experimentId] ?? experimentEnabled,
     (enabled: boolean) => {
       experimentValues[experimentId] = enabled;
+      return writeExperiment();
     },
   ],
   useExperimentValue: (experimentId: string) => experimentValues[experimentId] ?? experimentEnabled,
@@ -63,6 +61,8 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { ExperimentsSection, PortableDesktopExperimentWarning } from "./ExperimentsSection";
+import { MemoryConsolidationGroup } from "./MemorySection";
+import { SettingsOpenSettingContext } from "../Components/SettingsLayout";
 
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
@@ -111,6 +111,7 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.window.api = { platform: "linux", versions: {} };
     experimentEnabled = true;
     experimentValues = {};
+    writeExperiment = () => Promise.resolve();
     const stoppedServerStatus = {
       running: false,
       baseUrl: null,
@@ -133,8 +134,6 @@ describe("PortableDesktopExperimentWarning", () => {
       config: {
         getConfig: mock(() => Promise.resolve(createTestConfig())),
         updateGoalDefaults: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultPrompt: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultIntervalMs: mock(() => Promise.resolve()),
       },
       server: {
         setApiServerSettings: mock(() => Promise.resolve(stoppedServerStatus)),
@@ -173,7 +172,6 @@ describe("PortableDesktopExperimentWarning", () => {
         "Programmatic Tool Calling",
         "Agent Memory",
         "Multi-project workspaces",
-        "Workspace Heartbeats",
       ]) {
         expect(view.getByRole("switch", { name: `Toggle ${name}` })).toBeTruthy();
       }
@@ -184,52 +182,93 @@ describe("PortableDesktopExperimentWarning", () => {
     }
   );
 
-  test("shows heartbeat defaults inline only when its experiment is enabled", async () => {
-    // Goal defaults moved out of ExperimentsSection into the Goal tab
-    // (`GoalDefaultsSection`); goals graduated to GA so it is no longer
-    // shown here at all. Heartbeat defaults remain inline here for now.
-    experimentEnabled = false;
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: false,
-    };
+  test.each([true, false])(
+    "turning LAN exposure off resets the bind settings only once the write is saved (saved=%p)",
+    async (saved) => {
+      experimentEnabled = false;
+      experimentValues = { [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: true };
+      let settle!: () => void;
+      writeExperiment = () =>
+        new Promise<void>((resolve, reject) => {
+          settle = () => (saved ? resolve() : reject(new Error("offline")));
+        });
+      const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+      fireEvent.click(view.getByRole("switch", { name: "Toggle Expose API server on LAN/VPN" }));
+      await act(() => Promise.resolve());
+      expect(mockApi.server?.setApiServerSettings).not.toHaveBeenCalled();
+      settle();
+      await act(() => Promise.resolve());
+      expect(mockApi.server?.setApiServerSettings).toHaveBeenCalledTimes(saved ? 1 : 0);
+    }
+  );
 
-    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
-
-    expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
-    expect(view.queryByLabelText("Default heartbeat threshold in minutes")).toBeNull();
-
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
-    };
-    view.rerender(<ExperimentsSection />);
-
-    await waitFor(() => {
-      expect(view.getByLabelText("Default heartbeat threshold in minutes")).toBeTruthy();
-    });
-    // Goal defaults are no longer rendered in the Experiments panel —
-    // they live in the Goal tab now.
-    expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
-  });
-
-  test("hides Memory Intuition when Agent Memory is off without clearing its toggle", () => {
+  test("hides Memory Consolidation when Agent Memory is off without clearing its toggle", () => {
     experimentEnabled = false;
     experimentValues = {
       [EXPERIMENT_IDS.MEMORY]: false,
-      [EXPERIMENT_IDS.MEMORY_INTUITION]: true,
+      [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
     };
     const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
-    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+    expect(view.queryByLabelText("Toggle Memory Consolidation")).toBeNull();
 
     fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
     view.rerender(<ExperimentsSection />);
-    expect(view.getByLabelText("Toggle Memory Intuition").getAttribute("aria-checked")).toBe(
+    expect(view.getByLabelText("Toggle Memory Consolidation").getAttribute("aria-checked")).toBe(
       "true"
     );
 
     fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
     view.rerender(<ExperimentsSection />);
-    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
-    expect(experimentValues[EXPERIMENT_IDS.MEMORY_INTUITION]).toBe(true);
+    expect(view.queryByLabelText("Toggle Memory Consolidation")).toBeNull();
+    expect(experimentValues[EXPERIMENT_IDS.MEMORY_CONSOLIDATION]).toBe(true);
+  });
+
+  // The dream limits moved from under Memory Consolidation in Experiments to Settings → Memory.
+  test.each(["Dream cost ceiling", "Dream edit limit", "Dream run timeout"])(
+    "shows the %s field in Memory only while Memory Consolidation is on",
+    (label) => {
+      experimentEnabled = false;
+      experimentValues = {
+        [EXPERIMENT_IDS.MEMORY]: true,
+        [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: false,
+      };
+      const view = render(<MemoryConsolidationGroup />, { wrapper: ApiWrapper });
+      expect(view.queryByLabelText(label)).toBeNull();
+
+      experimentValues = {
+        [EXPERIMENT_IDS.MEMORY]: true,
+        [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
+      };
+      view.rerender(<MemoryConsolidationGroup />);
+      expect(view.getByLabelText(label)).toBeTruthy();
+    }
+  );
+
+  test("Experiments keeps only the switches of experiments whose options moved", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.MEMORY]: true,
+      [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
+      [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: true,
+    };
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+    expect(view.getByLabelText("Toggle Memory Consolidation")).toBeTruthy();
+    expect(view.queryByLabelText("Dream cost ceiling")).toBeNull();
+    expect(view.queryByText("Bind host")).toBeNull();
+  });
+
+  test("Configure links open the moved configuration's first row, not just its section", () => {
+    experimentEnabled = false;
+    experimentValues = { [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: true };
+    const openSetting = mock((_id: string) => undefined);
+    const view = render(
+      <SettingsOpenSettingContext.Provider value={openSetting}>
+        <ExperimentsSection />
+      </SettingsOpenSettingContext.Provider>,
+      { wrapper: ApiWrapper }
+    );
+    fireEvent.click(view.getByRole("button", { name: "Configure in Server access" }));
+    expect(openSetting).toHaveBeenCalledWith("lan-bind");
   });
 
   test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {
@@ -251,77 +290,74 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(view.getByLabelText("Toggle RLM Mode")).toBeTruthy();
   });
 
-  test("reloads experiment settings when inline controls remount", async () => {
-    // Only the heartbeat panel still triggers an inline `getConfig`.
+  test("shows Agent interface view nested under Artifacts only when Artifacts is enabled", () => {
     experimentEnabled = false;
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
-    };
-
+    experimentValues = { [EXPERIMENT_IDS.ARTIFACTS]: false };
     const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+    expect(view.queryByLabelText("Toggle Agent interface view")).toBeNull();
 
-    await waitFor(() => {
-      expect(view.getByLabelText("Default heartbeat threshold in minutes")).toBeTruthy();
-    });
-    expect(mockApi.config?.getConfig).toHaveBeenCalledTimes(1);
-
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: false,
-    };
+    experimentValues = { [EXPERIMENT_IDS.ARTIFACTS]: true };
     view.rerender(<ExperimentsSection />);
-
-    expect(view.queryByLabelText("Default heartbeat threshold in minutes")).toBeNull();
-
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
-    };
-    view.rerender(<ExperimentsSection />);
-
-    await waitFor(() => {
-      expect(mockApi.config?.getConfig).toHaveBeenCalledTimes(2);
-    });
+    expect(view.getByLabelText("Toggle Agent interface view")).toBeTruthy();
   });
 
-  test("starts a fresh settings load when the API client changes", async () => {
-    experimentEnabled = false;
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
-    };
+  // A reconnect checks the prerequisite again through the new client. The warning stays on
+  // screen while offline and until that check answers.
+  describe.each([...GAP_MODES])("across a reconnect (%s)", (mode) => {
+    test("keeps the missing-binary warning until the new check answers", async () => {
+      let nextStatus: Promise<{ available: false; reason: "binary_not_found" }> = Promise.resolve({
+        available: false,
+        reason: "binary_not_found",
+      });
+      const harness = createConnectionHarness(mode, (): TestApiOverrides<APIClient> => {
+        const status = nextStatus;
+        return { desktop: { getPrereqStatus: () => status } };
+      });
+      const view = render(
+        <harness.Wrapper>
+          <PortableDesktopExperimentWarning />
+        </harness.Wrapper>
+      );
+      await waitFor(() =>
+        expect(view.container.textContent).toContain("Portable Desktop is currently disabled")
+      );
 
-    const staleConfig = createDeferred<TestClientConfig>();
-    const staleGetConfig = mock(() => staleConfig.promise);
-    mockApi = {
-      ...mockApi,
-      config: {
-        getConfig: staleGetConfig,
-        updateGoalDefaults: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultPrompt: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultIntervalMs: mock(() => Promise.resolve()),
-      },
-    };
-
-    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
-
-    await waitFor(() => {
-      expect(staleGetConfig).toHaveBeenCalledTimes(1);
+      nextStatus = new Promise(() => undefined);
+      await harness.drop();
+      expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+      expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
     });
 
-    const freshConfig = createDeferred<TestClientConfig>();
-    const freshGetConfig = mock(() => freshConfig.promise);
-    mockApi = {
-      ...mockApi,
-      config: {
-        getConfig: freshGetConfig,
-        updateGoalDefaults: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultPrompt: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultIntervalMs: mock(() => Promise.resolve()),
-      },
-    };
+    // Offline the kept warning's buttons could not reach the server: they must be disabled.
+    test("disables the warning's buttons while offline", async () => {
+      const harness = createConnectionHarness(
+        mode,
+        (): TestApiOverrides<APIClient> => ({
+          desktop: {
+            getPrereqStatus: () =>
+              Promise.resolve({ available: false as const, reason: "binary_not_found" as const }),
+          },
+        })
+      );
+      const view = render(
+        <harness.Wrapper>
+          <PortableDesktopExperimentWarning />
+        </harness.Wrapper>
+      );
+      const restart = (await view.findByRole("button", {
+        name: "Restart Xum",
+      })) as HTMLButtonElement;
+      const checkAgain = view.getByRole("button", { name: "Check again" }) as HTMLButtonElement;
+      await waitFor(() => expect(restart.disabled).toBe(false));
 
-    view.rerender(<ExperimentsSection />);
-
-    await waitFor(() => {
-      expect(freshGetConfig).toHaveBeenCalledTimes(1);
+      await harness.drop();
+      expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
+      expect(restart.disabled).toBe(true);
+      expect(checkAgain.disabled).toBe(true);
     });
   });
 

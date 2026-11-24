@@ -147,4 +147,22 @@ describe("replay fixture session", () => {
     // input(1400) - cacheCreate(1300) = 100 fresh + 1300 cache-write.
     expect(audit[2].approxBustedTokens).toBe(1400);
   });
+
+  test("the step prefix rule finds the fixture's one prefix break and names its first block", async () => {
+    const { stepPrefix } = await replayVerifySession({
+      sessionDir: REPLAY_FIXTURE_DIR,
+      workspaceId: REPLAY_FIXTURE_WORKSPACE_ID,
+      historyMessages: await readFixtureHistory(),
+    });
+    expect(stepPrefix.comparedPairs).toBe(2);
+    // Turn 1 extends turn 0. Turn 2 added the bash tool, which sorts before
+    // the system prompt edit, so the first differing block is that tool.
+    expect(stepPrefix.breaks).toMatchObject([
+      {
+        runId: "run-3",
+        boundary: "turn",
+        comparison: { section: "tools", blockIndex: 1, next: { toolName: "bash" } },
+      },
+    ]);
+  });
 });

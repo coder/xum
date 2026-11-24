@@ -2,6 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { hasUrlCredentials } from "@/common/config/schemas/settingsBackup";
+import { normalizeAgentPluginSubpath } from "@/common/utils/agentPluginSource";
 import { GITHUB_SHORTHAND_PATTERN, normalizeRepoUrlForClone } from "@/node/utils/gitUrls";
 
 /**
@@ -10,8 +11,10 @@ import { GITHUB_SHORTHAND_PATTERN, normalizeRepoUrlForClone } from "@/node/utils
  * Accepted inputs (one text field):
  * - `owner/repo` — GitHub shorthand
  * - `owner/repo@ref` — shorthand with a branch, tag, or full 40-hex commit SHA
- * - `owner/repo/sub/path[@ref]` — shorthand with a monorepo subpath (parsed
- *   and persisted from day one; the v1 installer rejects subpath installs)
+ * - `owner/repo/sub/path[@ref]` — shorthand with a monorepo subpath: only
+ *   that folder is fetched (sparse checkout) and installed as the plugin root.
+ *   The ref splits at the FIRST `@`, so a subpath containing `@` cannot be
+ *   written as shorthand; pass it through the API `subpath` argument instead.
  * - any git remote URL (`https://…`, `ssh://…`, `git@host:path`, `file://…`,
  *   absolute local paths) — passed to git unchanged; refs for URL inputs come
  *   from the separate ref field because `@` is ambiguous inside URLs
@@ -22,7 +25,7 @@ export interface ParsedAgentPluginSourceInput {
   url: string;
   /** Branch/tag name or full commit SHA parsed from `@ref` shorthand. */
   ref?: string;
-  /** Repo-relative plugin directory parsed from shorthand (monorepo installs; v2). */
+  /** Repo-relative plugin directory parsed from shorthand (normalized; see normalizeAgentPluginSubpath). */
   subpath?: string;
 }
 
@@ -123,7 +126,9 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
     throw new Error("Ref after '@' must not be empty (use owner/repo@branch, @tag, or @sha).");
   }
 
-  const segments = pathPart.split("/");
+  // One trailing slash is harmless (`owner/repo/`, `owner/repo/sub/`); any
+  // other empty segment (`owner/repo//sub`) is a typo, not an absolute path.
+  const segments = pathPart.replace(/\/$/, "").split("/");
   if (segments.length < 2 || segments.some((segment) => segment.length === 0)) {
     throw new Error(
       `'${input}' is not a git URL or owner/repo shorthand. Examples: coder/mux, coder/mux@main, https://github.com/coder/mux.git`
@@ -135,10 +140,30 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
     throw new Error(`'${ownerRepo}' is not a valid owner/repo shorthand.`);
   }
 
-  const subpath = segments.slice(2).join("/");
+  // Everything after owner/repo is the plugin folder; normalizing here
+  // rejects escapes like `owner/repo/../x` before anything is fetched.
   return {
     url: normalizeRepoUrlForClone(ownerRepo).cloneUrl,
     ...(refPart !== undefined ? { ref: refPart } : {}),
-    ...(subpath.length > 0 ? { subpath } : {}),
+    ...(segments.length > 2
+      ? { subpath: normalizeAgentPluginSubpath(segments.slice(2).join("/")) }
+      : {}),
   };
+}
+
+/**
+ * True when the installer reads `url` as a repository URL and hands git exactly it: it parses
+ * (no remote-helper transport, no credential, no shorthand to expand) and nothing is stripped or
+ * expanded. A stored source passes this by construction, so a settings backup lists only rows
+ * that its preview takes as written. The grammar lives here, in node (the parser expands `~`
+ * and reads the environment for shorthand), so the backup applies it where it reads and writes
+ * the list, not in the common schema.
+ */
+export function isInstallerSourceUrl(url: string): boolean {
+  try {
+    const parsed = parseAgentPluginSourceInput(url);
+    return parsed.url === url && parsed.ref === undefined && parsed.subpath === undefined;
+  } catch {
+    return false;
+  }
 }

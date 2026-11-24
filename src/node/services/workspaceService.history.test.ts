@@ -41,6 +41,64 @@ describe("WorkspaceService.getHistoryLoadMore", () => {
   });
 });
 
+describe("WorkspaceService.getHistoryLoadMore windowed pages (#4961)", () => {
+  test("pages from the replay window back to the epoch start and falls back when not pageable", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "load-more-windowed";
+    try {
+      // More rows than a replay window plus one page, alternating turns.
+      const rows = Array.from({ length: 3_300 }, (_, i) =>
+        createMuxMessage(`m${i}`, i % 2 === 0 ? "user" : "assistant", `text ${i}`, { timestamp: i })
+      );
+      expect((await historyService.appendManyToHistory(workspaceId, rows)).success).toBe(true);
+      const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+      const full = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      const window = await historyService.getHistoryWindowFromLatestBoundary(workspaceId, {
+        maxRows: 2_000,
+        maxBytes: 8 * 1024 * 1024,
+      });
+      if (!full.success || !window.success || window.data.kind !== "window")
+        throw new Error("read");
+      const windowStart = window.data.messages[0].metadata?.historySequence;
+      if (typeof windowStart !== "number") throw new Error("window start must be sequenced");
+
+      // A client that does not opt in keeps today's page: every older row of the epoch.
+      const plain = await workspaceService.getHistoryLoadMore(workspaceId, {
+        beforeHistorySequence: windowStart,
+      });
+      expect(plain.messages.length).toBe(windowStart);
+      expect(plain.notPageable).toBeUndefined();
+
+      let loaded = window.data.messages.map((m) => m.id);
+      let cursor: { beforeHistorySequence: number } | null = { beforeHistorySequence: windowStart };
+      let pages = 0;
+      while (cursor) {
+        const page = await workspaceService.getHistoryLoadMore(workspaceId, cursor, {
+          windowed: true,
+        });
+        expect(page.notPageable).toBeUndefined();
+        expect(page.messages.length).toBeLessThanOrEqual(1_000);
+        loaded = [...page.messages.map((m) => ("id" in m ? m.id : "")), ...loaded];
+        pages++;
+        cursor = page.hasOlder ? page.nextCursor : null;
+      }
+      expect(pages).toBeGreaterThan(1);
+      expect(loaded).toEqual(full.data.map((m) => m.id));
+
+      // A cursor row that is gone cannot be paged: the client must do a full replay.
+      expect(
+        await workspaceService.getHistoryLoadMore(
+          workspaceId,
+          { beforeHistorySequence: 99_999 },
+          { windowed: true }
+        )
+      ).toEqual({ messages: [], nextCursor: null, hasOlder: false, notPageable: true });
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 describe("WorkspaceService.stageAttachment", () => {
   test("waits for workspace init before writing into the workspace", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();

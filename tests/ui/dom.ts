@@ -1,5 +1,7 @@
 import { GlobalWindow } from "happy-dom";
 import * as React from "react";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX, SHORT_VIEWPORT_MAX_HEIGHT_PX } from "@/constants/layout";
+import { captureDomGlobals } from "./domGlobals";
 
 /**
  * Rebind Radix's layout-effect hook to the genuine React hook once a document exists.
@@ -29,27 +31,6 @@ function rebindRadixLayoutEffect(): void {
   }));
 }
 
-interface DomGlobalsSnapshot {
-  window: typeof globalThis.window;
-  document: typeof globalThis.document;
-  navigator: typeof globalThis.navigator;
-  localStorage: typeof globalThis.localStorage;
-  CustomEvent: typeof globalThis.CustomEvent;
-  DocumentFragment: unknown;
-  Element: unknown;
-  HTMLInputElement: unknown;
-  HTMLElement: unknown;
-  NodeFilter: unknown;
-  Node: unknown;
-  Image: unknown;
-  requestAnimationFrame: typeof globalThis.requestAnimationFrame;
-  cancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
-  getComputedStyle: typeof globalThis.getComputedStyle;
-  ResizeObserver: unknown;
-  IntersectionObserver: unknown;
-  MutationObserver: unknown;
-}
-
 // NOTE: installDom intentionally mutates globalThis.* (window/document/etc) to give UI
 // tests a DOM environment.
 //
@@ -57,27 +38,7 @@ interface DomGlobalsSnapshot {
 // on `globalThis.document`. See the bootstrap at the bottom of this module.
 
 export function installDom(): () => void {
-  const previous: DomGlobalsSnapshot = {
-    window: globalThis.window,
-    document: globalThis.document,
-    Element: (globalThis as unknown as { Element?: unknown }).Element,
-    DocumentFragment: (globalThis as unknown as { DocumentFragment?: unknown }).DocumentFragment,
-    navigator: globalThis.navigator,
-    HTMLInputElement: (globalThis as unknown as { HTMLInputElement?: unknown }).HTMLInputElement,
-    localStorage: globalThis.localStorage,
-    CustomEvent: globalThis.CustomEvent,
-    NodeFilter: (globalThis as unknown as { NodeFilter?: unknown }).NodeFilter,
-    HTMLElement: (globalThis as unknown as { HTMLElement?: unknown }).HTMLElement,
-    Node: (globalThis as unknown as { Node?: unknown }).Node,
-    Image: (globalThis as unknown as { Image?: unknown }).Image,
-    requestAnimationFrame: globalThis.requestAnimationFrame,
-    getComputedStyle: globalThis.getComputedStyle,
-    cancelAnimationFrame: globalThis.cancelAnimationFrame,
-    ResizeObserver: (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver,
-    MutationObserver: (globalThis as unknown as { MutationObserver?: unknown }).MutationObserver,
-    IntersectionObserver: (globalThis as unknown as { IntersectionObserver?: unknown })
-      .IntersectionObserver,
-  };
+  const restorePrevious = captureDomGlobals();
 
   const domWindow = new GlobalWindow({ url: "http://localhost" }) as unknown as Window &
     typeof globalThis;
@@ -90,6 +51,9 @@ export function installDom(): () => void {
   globalThis.getComputedStyle = domWindow.getComputedStyle.bind(domWindow);
   globalThis.localStorage = domWindow.localStorage;
   globalThis.CustomEvent = domWindow.CustomEvent;
+  // Not `Event`: Node code under test dispatches on native EventTargets (wsFlowControl), which
+  // reject happy-dom events. happy-dom 21 dispatches only its own events, so DOM tests build
+  // them with `new window.Event(...)`.
   (globalThis as unknown as { Element: unknown }).Element = domWindow.Element;
   (globalThis as unknown as { DocumentFragment: unknown }).DocumentFragment =
     domWindow.DocumentFragment;
@@ -233,29 +197,7 @@ export function installDom(): () => void {
   return () => {
     domWindow.close();
 
-    (globalThis as unknown as { Element?: unknown }).Element = previous.Element;
-    globalThis.window = previous.window;
-    (globalThis as unknown as { DocumentFragment?: unknown }).DocumentFragment =
-      previous.DocumentFragment;
-    globalThis.document = previous.document;
-    globalThis.navigator = previous.navigator;
-    (globalThis as unknown as { HTMLInputElement?: unknown }).HTMLInputElement =
-      previous.HTMLInputElement;
-    globalThis.localStorage = previous.localStorage;
-    globalThis.CustomEvent = previous.CustomEvent;
-    (globalThis as unknown as { HTMLElement?: unknown }).HTMLElement = previous.HTMLElement;
-    (globalThis as unknown as { NodeFilter?: unknown }).NodeFilter = previous.NodeFilter;
-    (globalThis as unknown as { MutationObserver?: unknown }).MutationObserver =
-      previous.MutationObserver;
-    (globalThis as unknown as { Node?: unknown }).Node = previous.Node;
-    (globalThis as unknown as { Image?: unknown }).Image = previous.Image;
-    globalThis.requestAnimationFrame = previous.requestAnimationFrame;
-    globalThis.getComputedStyle = previous.getComputedStyle;
-    globalThis.cancelAnimationFrame = previous.cancelAnimationFrame;
-    (globalThis as unknown as { IntersectionObserver?: unknown }).IntersectionObserver =
-      previous.IntersectionObserver;
-    (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver =
-      previous.ResizeObserver;
+    restorePrevious();
 
     // Self-heal: snapshots taken after a `document = undefined` teardown would
     // restore that poisoned state here, breaking modules that detect DOM
@@ -291,3 +233,40 @@ if (typeof globalThis.document === "undefined") {
 // module evaluation.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 require("react-dnd");
+
+// The app loads the tool cards lazily (toolCardsStore). Load them up front, after the DOM
+// bootstrap like react-dnd, so a UI suite renders a tool row's real card in its first commit.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+require("@/browser/features/Tools/Shared/toolCardsLoader");
+
+/**
+ * Makes useNarrowViewport() read `narrow` in the DOM installDom() made: only the narrow-viewport
+ * query changes its answer, so other media queries (the color scheme) keep theirs. The next
+ * installDom() starts wide again.
+ */
+export function stubNarrowViewport(narrow: boolean): void {
+  stubMediaQuery(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`, narrow);
+}
+
+/** Makes useShortViewport() read `short`, the way stubNarrowViewport() stubs the width. */
+export function stubShortViewport(short: boolean): void {
+  stubMediaQuery(`(max-height: ${SHORT_VIEWPORT_MAX_HEIGHT_PX}px)`, short);
+}
+
+function stubMediaQuery(stubbedQuery: string, matches: boolean): void {
+  const original = window.matchMedia.bind(window);
+  window.matchMedia = ((query: string) => {
+    if (query !== stubbedQuery) return original(query);
+    // A plain list: the viewport never changes during the test.
+    return {
+      matches,
+      media: query,
+      onchange: null,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      dispatchEvent: () => false,
+    } as unknown as MediaQueryList;
+  }) as typeof window.matchMedia;
+}

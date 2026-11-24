@@ -164,6 +164,35 @@ export function makeNullable(schema: unknown): unknown {
   return widened ? schema : { anyOf: [schema, { type: "null" }] };
 }
 
+// Recurse only into subschemas: const, enum, default and examples hold data. Draft-07
+// `dependencies` is a map whose values are schemas or property-name lists; a list holds only
+// strings, which a rewrite leaves alone.
+const TOOL_SUBSCHEMA_KEY =
+  /^(items|prefixItems|additionalItems|contains|additionalProperties|propertyNames|not|if|then|else|anyOf|allOf|oneOf|unevaluatedItems|unevaluatedProperties)$/;
+const TOOL_SCHEMA_MAP_KEY =
+  /^(properties|patternProperties|\$defs|definitions|dependentSchemas|dependencies)$/;
+
+/** Rewrite every subschema of a JSON Schema bottom-up: children first, then the schema itself. */
+export function mapToolSubschemas(
+  node: unknown,
+  rewrite: (schema: Record<string, unknown>) => Record<string, unknown>
+): unknown {
+  if (Array.isArray(node)) return node.map((item) => mapToolSubschemas(item, rewrite));
+  if (!isPlainObject(node)) return node;
+  const out = Object.fromEntries(
+    Object.entries(node).map(([key, value]): [string, unknown] => {
+      if (TOOL_SUBSCHEMA_KEY.test(key)) return [key, mapToolSubschemas(value, rewrite)];
+      if (!TOOL_SCHEMA_MAP_KEY.test(key) || !isPlainObject(value)) return [key, value];
+      const schemas = Object.entries(value).map(([name, schema]): [string, unknown] => [
+        name,
+        mapToolSubschemas(schema, rewrite),
+      ]);
+      return [key, Object.fromEntries(schemas)];
+    })
+  );
+  return rewrite(out);
+}
+
 /** Property names an object schema requires, including those declared in `allOf` branches. */
 export function requiredPropertyNames(schema: unknown): Set<string> {
   const required = new Set<string>();
@@ -440,6 +469,19 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
 }
 
 /**
+ * The tool a sanitized copy came from. Hook rewrites are checked against its full schema: the
+ * sanitized one drops constraints (minLength, pattern, bounds) the MCP server still enforces.
+ * Enumerable, so descriptor clones and object spreads keep it.
+ */
+export const UNSANITIZED_TOOL = Symbol.for("xum.unsanitizedTool");
+
+/** The tool before sanitizeToolSchemaForOpenAI, or the tool itself. */
+export function unsanitizedTool(tool: unknown): unknown {
+  if (tool === null || typeof tool !== "object" || !(UNSANITIZED_TOOL in tool)) return tool;
+  return (tool as Record<symbol, unknown>)[UNSANITIZED_TOOL];
+}
+
+/**
  * Sanitize all MCP tools for OpenAI compatibility.
  *
  * @param mcpTools - Record of MCP tools to sanitize
@@ -448,7 +490,14 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
 export function sanitizeMCPToolsForOpenAI(mcpTools: Record<string, Tool>): Record<string, Tool> {
   const sanitized: Record<string, Tool> = {};
   for (const [name, tool] of Object.entries(mcpTools)) {
-    sanitized[name] = sanitizeToolSchemaForOpenAI(tool);
+    const copy = sanitizeToolSchemaForOpenAI(tool);
+    if (copy !== tool) {
+      Object.defineProperty(copy, UNSANITIZED_TOOL, {
+        value: unsanitizedTool(tool),
+        enumerable: true,
+      });
+    }
+    sanitized[name] = copy;
   }
   return sanitized;
 }

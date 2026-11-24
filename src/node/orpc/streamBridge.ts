@@ -55,6 +55,14 @@ export interface SubscriptionEmit<T> {
   end: () => void;
 }
 
+/** Observes one subscription's delivered values (perf flight recorder, F3). */
+export interface SubscriptionTap {
+  /** One value is about to be yielded to the consumer. */
+  event(): void;
+  /** The subscription ended (any exit path); called exactly once. */
+  close(): void;
+}
+
 export interface SubscriptionStreamOptions<T> {
   /** Runtime references (notably Clock); omitted for the original global-runtime path. */
   context?: Context.Context<never>;
@@ -113,6 +121,12 @@ export interface SubscriptionStreamOptions<T> {
    * of CPU on a 1.24M-row onChat replay (#4868).
    */
   mapValue?: (value: T) => T;
+  /**
+   * Called once when the generator starts (after the pre-aborted check). The tap counts every
+   * yielded value at the single yield point and is closed in the same `finally` as teardown,
+   * so observing costs no extra generator layer.
+   */
+  openTap?: () => SubscriptionTap | null;
 }
 
 /**
@@ -226,13 +240,16 @@ export function subscriptionIterable<T>(options: SubscriptionStreamOptions<T>): 
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
 
+    const tap = options.openTap?.() ?? null;
     try {
       while (true) {
         const result = await iterator.next();
         if (result.done) return;
+        tap?.event();
         yield options.mapValue ? options.mapValue(result.value) : result.value;
       }
     } finally {
+      tap?.close();
       options.signal?.removeEventListener("abort", onAbort);
       await iterator.return?.();
     }

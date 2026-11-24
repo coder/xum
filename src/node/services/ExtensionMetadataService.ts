@@ -76,31 +76,32 @@ export interface ExtensionMetadataStreamingUpdate {
   generation?: number;
 }
 
+/**
+ * Name infix for per-consume claim files
+ * (`<main><infix><ino>-<mtimeNs>-<size>-<pid>-<uuid>`). Unique names keep
+ * concurrent recoveries from replacing or clearing each other's live
+ * claims, and the embedded identity token makes every crash point
+ * replay-safe: the consumer only calls consume AFTER merging the
+ * generation identified by the token, so a stranded claim whose file
+ * identity MATCHES its embedded token is proven represented at the main
+ * path (rename preserves ino/mtime/size) and is deleted by discovery —
+ * replaying it would re-fill fields another backend explicitly cleared
+ * to null (the null-fill merge is not idempotent across clears). A
+ * mismatched or unparseable claim holds a foreign generation nobody
+ * merged and is replayed.
+ */
+const CLAIM_INFIX = ".corrupt-claim-";
+
+/**
+ * Prefix (after the main file name) for uniquely named in-flight
+ * moved-aside mains AND the scan claims that consume them when stranded.
+ * The trailing dash keeps the bounded fixed-name `.recreated` leftover
+ * (finalized, proven-superseded bytes) out of the stranded-file scan.
+ */
+const RECREATED_INFIX = ".recreated-";
+
 export class ExtensionMetadataService {
   private readonly filePath: string;
-
-  /**
-   * Name infix for per-consume claim files
-   * (`<main><infix><ino>-<mtimeNs>-<size>-<pid>-<uuid>`). Unique names keep
-   * concurrent recoveries from replacing or clearing each other's live
-   * claims, and the embedded identity token makes every crash point
-   * replay-safe: the consumer only calls consume AFTER merging the
-   * generation identified by the token, so a stranded claim whose file
-   * identity MATCHES its embedded token is proven represented at the main
-   * path (rename preserves ino/mtime/size) and is deleted by discovery —
-   * replaying it would re-fill fields another backend explicitly cleared
-   * to null (the null-fill merge is not idempotent across clears). A
-   * mismatched or unparseable claim holds a foreign generation nobody
-   * merged and is replayed.
-   */
-  private static readonly CLAIM_INFIX = ".corrupt-claim-";
-  /**
-   * Prefix (after the main file name) for uniquely named in-flight
-   * moved-aside mains AND the scan claims that consume them when stranded.
-   * The trailing dash keeps the bounded fixed-name `.recreated` leftover
-   * (finalized, proven-superseded bytes) out of the stranded-file scan.
-   */
-  private static readonly RECREATED_INFIX = ".recreated-";
 
   /** Parse the identity token embedded in a claim file name; null when the
    * name does not carry one (fail toward replay — the pre-token behavior). */
@@ -467,7 +468,7 @@ export class ExtensionMetadataService {
     // merged (see CLAIM_INFIX): a crash at ANY later point leaves a claim
     // discovery can classify by identity — matching bytes were merged
     // (delete), anything else is a foreign generation (replay).
-    const claimPath = `${this.filePath}${ExtensionMetadataService.CLAIM_INFIX}${token.ino}-${token.mtimeNs}-${token.size}-${process.pid}-${randomUUID()}`;
+    const claimPath = `${this.filePath}${CLAIM_INFIX}${token.ino}-${token.mtimeNs}-${token.size}-${process.pid}-${randomUUID()}`;
     try {
       await rename(quarantinePath, claimPath);
     } catch (renameError) {
@@ -560,7 +561,7 @@ export class ExtensionMetadataService {
     // recovery indefinitely (recency/goal/status hidden in the claim).
     const dirNames = await readdir(dirname(this.filePath));
     const claimNames = dirNames.filter((name) =>
-      name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.CLAIM_INFIX}`)
+      name.startsWith(`${basename(this.filePath)}${CLAIM_INFIX}`)
     );
     // Crash-stranded in-flight moved-aside mains (see
     // moveMainAsideAsRecreatedLeftover): their unique names make them
@@ -571,7 +572,7 @@ export class ExtensionMetadataService {
     // slot below runs its claim rename (ENOENT — see
     // recoverStrandedRecreatedLeftover for the steal semantics).
     const strandedRecreatedNames = dirNames.filter((name) =>
-      name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.RECREATED_INFIX}`)
+      name.startsWith(`${basename(this.filePath)}${RECREATED_INFIX}`)
     );
     if (claimNames.length === 0 && strandedRecreatedNames.length === 0) {
       return reconciledSidecar;
@@ -1452,7 +1453,7 @@ export class ExtensionMetadataService {
    * unverified bytes another recovery could destroy.
    */
   private async moveMainAsideAsRecreatedLeftover(): Promise<string> {
-    const inflightPath = `${this.filePath}${ExtensionMetadataService.RECREATED_INFIX}${process.pid}-${randomUUID()}`;
+    const inflightPath = `${this.filePath}${RECREATED_INFIX}${process.pid}-${randomUUID()}`;
     await rename(this.filePath, inflightPath);
     return inflightPath;
   }
@@ -1507,7 +1508,7 @@ export class ExtensionMetadataService {
     // superseded, and valid bytes merge idempotently under the
     // strictly-newer recency gate below, so replaying a claim after a crash
     // between merge and unlink is a no-op rather than a resurrection.
-    const claimPath = `${this.filePath}${ExtensionMetadataService.RECREATED_INFIX}claim-${process.pid}-${randomUUID()}`;
+    const claimPath = `${this.filePath}${RECREATED_INFIX}claim-${process.pid}-${randomUUID()}`;
     try {
       await rename(strandedPath, claimPath);
     } catch (renameError) {

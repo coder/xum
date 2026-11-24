@@ -859,6 +859,57 @@ describe("refinementRollback", () => {
     expect(refused.error).toContain("global skills root");
   });
 
+  it("refuses global memory and global skill rollbacks when global writes are refused", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/g.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/g.md", "v1", "v2", "agent");
+    const globalMemoryRow = await lastRow(fixture.sessionDir);
+    const globalMemoryFile = path.join(fixture.muxHome, "memory", "global", "g.md");
+
+    const skillFile = path.join(fixture.muxHome, "skills", "my-skill", "SKILL.md");
+    await fsPromises.mkdir(path.dirname(skillFile), { recursive: true });
+    await fsPromises.writeFile(skillFile, "body\n", "utf-8");
+    await appendRefinementEvent({
+      sessionDir: fixture.sessionDir,
+      workspaceId: WORKSPACE_ID,
+      kind: "skill",
+      action: { op: "write", skillName: "my-skill", filePath: "SKILL.md" },
+      inverse: { op: "delete-files", paths: [skillFile] },
+      evidence: { toolName: "agent_skill_write" },
+    });
+    const globalSkillRow = await lastRow(fixture.sessionDir);
+
+    for (const row of [globalMemoryRow, globalSkillRow]) {
+      const refused = await rollbackRefinement({
+        sessionDir: fixture.sessionDir,
+        id: row.id,
+        force: true,
+        refuseGlobalWrites: true,
+        evidence: EVIDENCE,
+      });
+      expect(refused.success).toBe(false);
+      if (refused.success) throw new Error("unreachable");
+      expect(refused.error).toContain("agent sandbox blocks");
+    }
+    expect(await fsPromises.readFile(globalMemoryFile, "utf-8")).toBe("v2\n");
+    expect(await fsPromises.readFile(skillFile, "utf-8")).toBe("body\n");
+
+    // Workspace memory is not global: its rollback still runs.
+    await fixture.service.create(fixture.ctx, "/memories/workspace/w.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/workspace/w.md", "v1", "v2", "agent");
+    const workspaceRow = await lastRow(fixture.sessionDir);
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: workspaceRow.id,
+      refuseGlobalWrites: true,
+      evidence: EVIDENCE,
+    });
+    expect(result.success).toBe(true);
+    expect(
+      await fsPromises.readFile(path.join(fixture.sessionDir, "memory", "w.md"), "utf-8")
+    ).toBe("v1\n");
+  });
+
   it("undoes a memory rename via the mirrored rename inverse", async () => {
     using fixture = await createFixture();
     await fixture.service.create(fixture.ctx, "/memories/global/old.md", "v1\n", "agent");

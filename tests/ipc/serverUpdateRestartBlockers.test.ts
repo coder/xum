@@ -21,12 +21,13 @@ import {
   createWorkspace,
   waitForInitComplete,
 } from "./helpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function monitorInternals(service: WorkspaceService) {
   return service as unknown as {
     bashMonitorRegistryStore: BashMonitorRegistryStore;
     bashMonitorRecoveryPromise: Promise<void>;
-    drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+    bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
     scheduleBashMonitorWakeReconcile(workspaceId: string): void;
   };
 }
@@ -120,6 +121,7 @@ describeIntegration("Server update restart blockers", () => {
 
   async function spawnQuietMonitor() {
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime: new LocalRuntime(workspacePath),
       secrets: {},
@@ -143,7 +145,9 @@ describeIntegration("Server update restart blockers", () => {
     }
     const live = await runningMonitor(result.backgroundProcessId);
     processes.push({ id: live.id, pid: live.pid });
-    await monitorInternals(env.services.workspaceService).drainBashMonitorPersistence(workspaceId);
+    await monitorInternals(
+      env.services.workspaceService
+    ).bashMonitorPersistence.drainBashMonitorPersistence(workspaceId);
     return live.id;
   }
 

@@ -1,19 +1,22 @@
 import { z } from "zod";
 
 import { AgentIdSchema, RuntimeEnablementIdSchema } from "../../schemas/ids";
+import { IsolationChoiceSchema } from "../../schemas/isolation";
 import { ProjectConfigSchema } from "../../schemas/project";
 import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
+import { CacheTtlSchema } from "./providersConfig";
 import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
+import { AgentResourceLimitsSchema } from "./agentResourceLimits";
+import { AgentSandboxConfigSchema, salvageAgentSandbox } from "./agentSandbox";
 import { SettingsBackupSchema } from "./settingsBackup";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
 export { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
-export type { RuntimeEnablementOverrides } from "../../schemas/runtimeEnablement";
 export { UserPreferencesSchema } from "./userPreferences";
 export type { UserPreferences } from "./userPreferences";
 export { TaskSettingsSchema } from "./taskSettings";
@@ -25,11 +28,7 @@ export {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallSourceSchema,
 } from "./agentPluginInstalls";
-export type {
-  AgentPluginGitSource,
-  AgentPluginInstallEntry,
-  AgentPluginInstallSource,
-} from "./agentPluginInstalls";
+export type { AgentPluginGitSource, AgentPluginInstallEntry } from "./agentPluginInstalls";
 
 /**
  * Sparse delegated-run (sub-agent) override profile nested under an agent's
@@ -52,7 +51,9 @@ export const AgentAiDefaultsEntrySchema = z.object({
   autoModelRouting: z.boolean().optional(),
   autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
-  advisorEnabled: z.boolean().optional(),
+  // Anthropic prompt-cache TTL for this agent's runs (interactive and delegated alike);
+  // absent inherits the base chain, then the global providers.jsonc anthropic.cacheTtl.
+  cacheTtl: CacheTtlSchema.optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
@@ -132,11 +133,9 @@ export const AppConfigMigrationsSchema = z
      * not re-run their exec split migration.
      */
     execSubagentDefaultsSplit: z.boolean().optional(),
-    userPreferencesInitialized: z.boolean().optional(),
-    daybreakModelsHidden: z.boolean().optional(),
     // Default seeding must not claim legacy local-only hidden preferences.
     hiddenModelsInitialized: z.boolean().optional(),
-    /** One-time seed of DEFAULT_MODEL_FALLBACKS; not re-applied while true. */
+    /** One-time seed of SEEDED_MODEL_FALLBACKS; not re-applied while true. */
     defaultModelFallbacksSeeded: z.boolean().optional(),
     /**
      * One-time re-run of the fallback seed after the fable alias moved to
@@ -144,8 +143,14 @@ export const AppConfigMigrationsSchema = z
      * source key.
      */
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
+    /** Same one-time re-seed for the fable alias move to Fable 5.2. */
+    defaultModelFallbacksSeededFable52: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
+    /** One-time move of task limits still at PREVIOUS_TASK_SETTINGS_DEFAULTS to the new defaults. */
+    taskSettingsDefaultsRaised: z.boolean().optional(),
+    /** One-time carry-over of the former workspace-heartbeats experiment into agentHeartbeatsEnabled. */
+    agentHeartbeatsSeeded: z.boolean().optional(),
   })
   // Preserve flags introduced by newer app versions: without the catchall a
   // downgrade to this version would strip unknown flags on save, re-running
@@ -166,14 +171,33 @@ export const AppConfigOnDiskSchema = z
     serverAuthGithubOwner: z.string().optional(),
     defaultProjectDir: z.string().optional(),
     viewedSplashScreens: z.array(z.string()).optional(),
-    layoutPresets: z.unknown().optional(),
     userPreferences: UserPreferencesSchema.optional(),
     taskSettings: TaskSettingsSchema.optional(),
+    /**
+     * CPU and memory that all local agent processes share (Linux cgroup v2). Absent = no limit.
+     * `.catch`: a hand-edited value out of range degrades to no limit instead of failing the
+     * whole document.
+     */
+    agentResourceLimits: AgentResourceLimitsSchema.optional().catch(undefined),
+    /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
+    agentResourceLimitsEnabled: z.boolean().optional(),
+    /**
+     * macOS sandbox for local agent commands. Absent = off. `.catch` fails closed: a malformed
+     * value keeps its valid fields, and `enabled: true`, instead of turning the sandbox off.
+     */
+    agentSandbox: AgentSandboxConfigSchema.optional().catch((ctx) =>
+      salvageAgentSandbox(ctx.input)
+    ),
     chatTranscriptFullWidth: z.boolean().optional(),
-    muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */
     keepScreenAwake: z.boolean().optional(),
+    /** Defer MCP tool definitions behind tool_catalog_search. Absent = on. */
+    toolSearchEnabled: z.boolean().optional(),
+    /** Route AI calls from bash tool commands through Xum's cost-tracking proxy. Absent = off. */
+    bashAiProxyEnabled: z.boolean().optional(),
+    /** Expose the `heartbeat` tool so agents can schedule their own recurring turns. Absent = off. */
+    agentHeartbeatsEnabled: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()
@@ -183,7 +207,6 @@ export const AppConfigOnDiskSchema = z
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
     evaluationDefaults: EvaluationDefaultsSchema.optional(),
-    muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
     /**
@@ -213,11 +236,6 @@ export const AppConfigOnDiskSchema = z
       .optional()
       .catch(undefined),
     defaultModel: z.string().optional(),
-    advisorModelString: z.string().optional(),
-    advisorThinkingLevel: ThinkingLevelSchema.optional(),
-    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
-    advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
-    advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),
     preferredCompactionModel: z.string().optional(),
     agentAiDefaults: AgentAiDefaultsSchema.optional(),
@@ -230,8 +248,6 @@ export const AppConfigOnDiskSchema = z
     subagentAiDefaults: SubagentAiDefaultsSchema.optional(),
     migrations: AppConfigMigrationsSchema.optional(),
     useSSH2Transport: z.boolean().optional(),
-    muxGovernorUrl: z.string().optional(),
-    muxGovernorToken: z.string().optional(),
     coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS).optional(),
     worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS).optional(),
     deleteWorktreeOnArchive: z.boolean().optional(),
@@ -239,6 +255,9 @@ export const AppConfigOnDiskSchema = z
     terminalDefaultShell: z.string().optional(),
     updateChannel: UpdateChannelSchema.optional(),
     runtimeEnablement: RuntimeEnablementOverridesSchema.optional(),
+    defaultIsolation: IsolationChoiceSchema.optional(),
+    // Legacy mirror of defaultIsolation: older builds read only this flat runtime id, so every
+    // save writes the nearest supported runtime here to keep downgrades working.
     defaultRuntime: RuntimeEnablementIdSchema.optional(),
     // `.catch`: an unusable stored value must not fail the whole config parse. Degrading to
     // "not configured" keeps every other setting loadable and lets the user re-enter this one.

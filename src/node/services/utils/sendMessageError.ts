@@ -5,7 +5,11 @@ import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { StreamErrorMessage } from "@/common/orpc/types";
 import { PROVIDER_DISPLAY_NAMES, type ProviderName } from "@/common/constants/providers";
 import { createAssistantMessageId } from "./messageIds";
-import { formatSendMessageError as formatSendMessageErrorForDisplay } from "@/common/utils/errors/formatSendError";
+import {
+  formatPluginBlockedMessage,
+  formatSendMessageError as formatSendMessageErrorForDisplay,
+  getCredentialSetupCopy,
+} from "@/common/utils/errors/formatSendError";
 
 const getProviderDisplayName = (provider: string): string =>
   PROVIDER_DISPLAY_NAMES[provider as ProviderName] ?? provider;
@@ -50,6 +54,13 @@ export const formatSendMessageError = (
 ): { message: string; errorType: StreamErrorType } => {
   switch (error.type) {
     case "api_key_not_found": {
+      const setupCopy = getCredentialSetupCopy(error.provider);
+      if (setupCopy) {
+        return {
+          message: `${setupCopy.message} ${setupCopy.resolutionHint}`,
+          errorType: "authentication",
+        };
+      }
       const displayName = getProviderDisplayName(error.provider);
       return {
         message: `API key not configured for ${displayName}. Please add your API key in settings.`,
@@ -77,8 +88,9 @@ export const formatSendMessageError = (
     case "provider_not_supported": {
       const displayName = getProviderDisplayName(error.provider);
       return {
-        message: `Provider "${displayName}" is not supported.`,
-        errorType: "unknown",
+        message: `Provider "${displayName}" is not supported. Select a different model.`,
+        // A non-retryable type: an unknown provider fails the same way on every retry.
+        errorType: "model_not_found",
       };
     }
     case "model_not_available": {
@@ -125,11 +137,6 @@ export const formatSendMessageError = (
         message: error.raw,
         errorType: "unknown",
       };
-    case "policy_denied":
-      return {
-        message: error.message,
-        errorType: "unknown",
-      };
     case "task_checkout_unsanitized":
       // Permanent until the task is removed (#4674): a non-retryable stream type, so a turn
       // refused after its init wait schedules no auto-resume.
@@ -138,6 +145,13 @@ export const formatSendMessageError = (
       return { message: EDIT_HISTORY_CHANGED_MESSAGE, errorType: "unknown" };
     case "plan_review_feedback_edit_blocked":
       return { message: error.message, errorType: "unknown" };
+    case "session_tape_replay":
+      return { message: error.message, errorType: "session_tape_replay" };
+    case "plugin_blocked":
+      return {
+        message: formatPluginBlockedMessage(error.plugin, error.reason),
+        errorType: "plugin_blocked",
+      };
   }
 };
 
@@ -151,6 +165,16 @@ export interface StreamErrorPayload {
   error: string;
   errorType?: StreamErrorType;
   acpPromptId?: string;
+  /**
+   * Internal: the provider's Retry-After for a `rate_limit` error, in ms. Feeds auto-retry
+   * scheduling only; not persisted and not part of the renderer wire payload.
+   */
+  retryAfterMs?: number;
+  /**
+   * Internal: the model the failed request ran on, which is a refusal fallback after a swap.
+   * The compaction context_exceeded retry plans from it. Not part of the renderer wire payload.
+   */
+  model?: string;
 }
 
 export const createErrorEvent = (workspaceId: string, payload: StreamErrorPayload): ErrorEvent => ({

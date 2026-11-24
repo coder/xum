@@ -8,8 +8,54 @@ import type { ExecOptions, ExecStream, FileStat, Runtime } from "@/node/runtime/
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
-import { copyPlanFileAcrossRuntimes, movePlanFile, readPlanFile } from "./helpers";
+import { copyPlanFileAcrossRuntimes, execBuffered, movePlanFile, readPlanFile } from "./helpers";
+import type { PlanFileLocation } from "./planLocation";
 import { drainFifoReaders } from "../../../../tests/ipc/fifoRelease";
+
+// The pre-#5174 call shapes these tests were written against: a workspace whose plan location
+// has no shared legacy fallback (every local runtime, and every new row).
+function legacyFreeLocation(
+  runtime: Runtime,
+  workspaceName: string,
+  projectName: string,
+  workspaceId: string
+): PlanFileLocation {
+  return {
+    planPath: getPlanFilePath(workspaceName, projectName, runtime.getXumHome()),
+    legacyIdPath: getLegacyPlanFilePath(workspaceId, runtime.getXumHome()),
+  };
+}
+const readPlanAt = (
+  runtime: Runtime,
+  workspaceName: string,
+  projectName: string,
+  workspaceId: string
+) => readPlanFile(runtime, legacyFreeLocation(runtime, workspaceName, projectName, workspaceId));
+const movePlanAt = (
+  runtime: Runtime,
+  oldWorkspaceName: string,
+  newWorkspaceName: string,
+  projectName: string
+) =>
+  movePlanFile(
+    runtime,
+    getPlanFilePath(oldWorkspaceName, projectName, runtime.getXumHome()),
+    getPlanFilePath(newWorkspaceName, projectName, runtime.getXumHome())
+  );
+const copyPlanAt = (
+  sourceRuntime: Runtime,
+  targetRuntime: Runtime,
+  sourceWorkspaceName: string,
+  sourceWorkspaceId: string,
+  targetWorkspaceName: string,
+  projectName: string
+) =>
+  copyPlanFileAcrossRuntimes(
+    sourceRuntime,
+    targetRuntime,
+    legacyFreeLocation(sourceRuntime, sourceWorkspaceName, projectName, sourceWorkspaceId),
+    getPlanFilePath(targetWorkspaceName, projectName, targetRuntime.getXumHome())
+  );
 
 interface MockRuntimeState {
   xumHome: string;
@@ -128,6 +174,46 @@ function createMockRuntime(state: MockRuntimeState): Runtime {
   } as unknown as Runtime;
 }
 
+describe("execBuffered when the command stops reading its stdin", () => {
+  // A command that exits early closes its end of the pipe: the write of its input then fails.
+  function runtimeWhoseStdinFails(code: string): Runtime {
+    const stream: ExecStream = {
+      ...createExecStream("partial output", "", 7),
+      stdin: new WritableStream<Uint8Array>({
+        write: () => Promise.reject(Object.assign(new Error(`${code}: write failed`), { code })),
+      }),
+    };
+    return { exec: () => Promise.resolve(stream) } as unknown as Runtime;
+  }
+
+  it("fails by default, so a command that needs all of its input cannot pass on a part of it", async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      execBuffered(runtimeWhoseStdinFails("EPIPE"), "cat > file", { cwd: "/", stdin: "input" })
+    ).rejects.toThrow("EPIPE");
+  });
+
+  it("returns the exit code and the output when the caller allows unread stdin", async () => {
+    const result = await execBuffered(runtimeWhoseStdinFails("EPIPE"), "exit 7", {
+      cwd: "/",
+      stdin: "input",
+      stdinMayGoUnread: true,
+    });
+    expect(result).toMatchObject({ exitCode: 7, stdout: "partial output" });
+  });
+
+  it("still fails on a write error that is not a closed pipe", async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      execBuffered(runtimeWhoseStdinFails("EIO"), "exit 7", {
+        cwd: "/",
+        stdin: "input",
+        stdinMayGoUnread: true,
+      })
+    ).rejects.toThrow("EIO");
+  });
+});
+
 describe("copyPlanFileAcrossRuntimes", () => {
   const sourceWorkspaceName = "source-workspace";
   const sourceWorkspaceId = "source-workspace-id";
@@ -149,7 +235,7 @@ describe("copyPlanFileAcrossRuntimes", () => {
     });
     const targetState = createRuntimeState(targetXumHome);
 
-    await copyPlanFileAcrossRuntimes(
+    await copyPlanAt(
       createMockRuntime(sourceState),
       createMockRuntime(targetState),
       sourceWorkspaceName,
@@ -176,7 +262,7 @@ describe("copyPlanFileAcrossRuntimes", () => {
     });
     const targetState = createRuntimeState(targetXumHome);
 
-    await copyPlanFileAcrossRuntimes(
+    await copyPlanAt(
       createMockRuntime(sourceState),
       createMockRuntime(targetState),
       sourceWorkspaceName,
@@ -198,7 +284,7 @@ describe("copyPlanFileAcrossRuntimes", () => {
     const sourceState = createRuntimeState(sourceMuxHome);
     const targetState = createRuntimeState(targetXumHome);
 
-    await copyPlanFileAcrossRuntimes(
+    await copyPlanAt(
       createMockRuntime(sourceState),
       createMockRuntime(targetState),
       sourceWorkspaceName,
@@ -281,7 +367,7 @@ async function settleWithin<T>(p: Promise<T>, ms: number, label: string): Promis
     }
 
     function copy(): Promise<string | undefined> {
-      const attempt = copyPlanFileAcrossRuntimes(
+      const attempt = copyPlanAt(
         new HomeRuntime(path.join(dir, "source")),
         new HomeRuntime(path.join(dir, "target")),
         sourceWorkspaceName,
@@ -359,7 +445,7 @@ describe("readPlanFile", () => {
 
     state.resolvedPaths.set(planPath, resolvedPlanPath);
 
-    const result = await readPlanFile(
+    const result = await readPlanAt(
       createMockRuntime(state),
       workspaceName,
       projectName,
@@ -382,6 +468,7 @@ describe("readPlanFile", () => {
           XUM_LEGACY_PLAN: legacyPath,
           XUM_PLAN: planPath,
         },
+        sandbox: "internal",
         timeout: 5,
       },
     });
@@ -409,7 +496,7 @@ describe("readPlanFile", () => {
       state.resolvedPaths.set(planPath, planPath);
       state.resolvedPaths.set(runtimeLegacyPath, runtimeLegacyPath);
 
-      const result = await readPlanFile(
+      const result = await readPlanAt(
         createMockRuntime(state),
         workspaceName,
         projectName,
@@ -439,7 +526,7 @@ describe("movePlanFile", () => {
       [oldPath]: "# old plan\n",
     });
 
-    await movePlanFile(createMockRuntime(state), oldWorkspaceName, newWorkspaceName, projectName);
+    await movePlanAt(createMockRuntime(state), oldWorkspaceName, newWorkspaceName, projectName);
 
     expect(state.execCalls).toHaveLength(1);
     expect(state.execCalls[0]).toEqual({
@@ -450,6 +537,7 @@ describe("movePlanFile", () => {
           XUM_OLD_PLAN: oldPath,
           XUM_NEW_PLAN: newPath,
         },
+        sandbox: "internal",
         timeout: 5,
       },
     });
@@ -471,7 +559,7 @@ describe("plan-file helpers on transport failures", () => {
     const state = createRuntimeState(xumHome, { [legacyPath]: "# stale legacy plan\n" });
     state.transportFailPaths.add(planPath);
 
-    const attempt = readPlanFile(createMockRuntime(state), workspaceName, projectName, workspaceId);
+    const attempt = readPlanAt(createMockRuntime(state), workspaceName, projectName, workspaceId);
 
     // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(attempt).rejects.toThrow("ssh: connect to host failed");
@@ -486,14 +574,14 @@ describe("plan-file helpers on transport failures", () => {
 
     // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(
-      readPlanFile(createMockRuntime(state), workspaceName, projectName, workspaceId)
+      readPlanAt(createMockRuntime(state), workspaceName, projectName, workspaceId)
     ).rejects.toThrow("ssh: connect to host failed");
   });
 
   it("readPlanFile still reports a truly missing plan as absent", async () => {
     const state = createRuntimeState(xumHome);
 
-    const result = await readPlanFile(
+    const result = await readPlanAt(
       createMockRuntime(state),
       workspaceName,
       projectName,
@@ -512,7 +600,7 @@ describe("plan-file helpers on transport failures", () => {
 
       // eslint-disable-next-line @typescript-eslint/await-thenable
       await expect(
-        movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName)
+        movePlanAt(createMockRuntime(state), workspaceName, "renamed-workspace", projectName)
       ).rejects.toThrow("ssh: connect to host failed");
       expect(state.execCalls).toHaveLength(0);
     });
@@ -523,14 +611,14 @@ describe("plan-file helpers on transport failures", () => {
 
       // eslint-disable-next-line @typescript-eslint/await-thenable
       await expect(
-        movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName)
+        movePlanAt(createMockRuntime(state), workspaceName, "renamed-workspace", projectName)
       ).rejects.toThrow("Failed to move plan file");
     });
 
     it("still succeeds as a no-op when there is no plan", async () => {
       const state = createRuntimeState(xumHome);
 
-      await movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName);
+      await movePlanAt(createMockRuntime(state), workspaceName, "renamed-workspace", projectName);
 
       expect(state.execCalls).toHaveLength(0);
       expect(state.files.has(newPlanPath)).toBe(false);
@@ -548,7 +636,7 @@ describe("plan-file helpers on transport failures", () => {
 
       // eslint-disable-next-line @typescript-eslint/await-thenable
       await expect(
-        copyPlanFileAcrossRuntimes(
+        copyPlanAt(
           createMockRuntime(sourceState),
           createMockRuntime(targetState),
           workspaceName,
@@ -566,7 +654,7 @@ describe("plan-file helpers on transport failures", () => {
       const sourceState = createRuntimeState(xumHome);
       const targetState = createRuntimeState(targetXumHome);
 
-      await copyPlanFileAcrossRuntimes(
+      await copyPlanAt(
         createMockRuntime(sourceState),
         createMockRuntime(targetState),
         workspaceName,

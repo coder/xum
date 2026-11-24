@@ -7,6 +7,9 @@ import { isReadableHistoryMessage } from "./historyScanner";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import { scanHistoryRows } from "./historyRowScanner.testHarness";
 import { createHistoryMessageEvidence } from "./historyMessageEvidence";
+import { WorkflowScriptDescriptorSchema } from "@/common/orpc/schemas/workflow";
+
+const DESCRIPTION_MAX = WorkflowScriptDescriptorSchema.shape.description.maxLength!;
 
 const date = "2026-09-11T12:00:00Z";
 const run = () => ({
@@ -261,12 +264,44 @@ describe("streamed history message evidence", () => {
     expect(result.id?.matchesExpected).toBe(true);
     expect(result.matchesNonce).toBe(true);
     expect(result.id?.length).toBe(huge.length);
-    expect(result.id!.prefix.length).toBeLessThan(2048);
+    // The prefix stays bounded: one code point past the largest bound, in UTF-16 units.
+    expect(result.id!.prefix.length).toBeLessThanOrEqual(2 * (DESCRIPTION_MAX + 1));
     await differential([
       JSON.stringify(
         message([tool({ ...run(), workflow: { ...run().workflow, description: huge } })])
       ),
     ]);
+  });
+
+  // zod >= 4.5 counts string bounds in code points, so an astral character counts once even
+  // though it takes two UTF-16 units. The streamed evidence must agree with the real parse at
+  // the bound for every mix of one-unit and two-unit characters.
+  it("matches the real parse at the description bound in code points", async () => {
+    const emoji = "\u{1F600}";
+    const withDescription = (description: string) =>
+      JSON.stringify(message([tool({ ...run(), workflow: { ...run().workflow, description } })]));
+    const descriptions = [
+      "x".repeat(DESCRIPTION_MAX),
+      "x".repeat(DESCRIPTION_MAX + 1),
+      emoji.repeat(DESCRIPTION_MAX),
+      emoji.repeat(DESCRIPTION_MAX + 1),
+      "x" + emoji.repeat(DESCRIPTION_MAX - 1),
+      "x" + emoji.repeat(DESCRIPTION_MAX),
+      emoji.repeat(DESCRIPTION_MAX - 2) + "xy",
+      emoji.repeat(DESCRIPTION_MAX - 1) + "xy",
+    ];
+    const results = await inspect(descriptions.map(withDescription));
+    expect(results.map((result) => result.readable)).toEqual([
+      true,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      false,
+    ]);
+    await differential(descriptions.map(withDescription));
   });
 
   it("matches schema field mutations without retaining whole workflow records", async () => {

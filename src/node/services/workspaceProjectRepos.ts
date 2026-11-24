@@ -9,7 +9,7 @@ import {
   buildRemoteProjectLayout,
   getRemoteWorkspacePath,
 } from "@/node/runtime/remoteProjectLayout";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 
 export interface WorkspaceProjectRepo {
   projectPath: string;
@@ -173,7 +173,10 @@ export function getWorkspacePathHintForProject(
 }
 
 export function getWorkspaceProjectRepos(
-  params: WorkspaceProjectRepoParams
+  params: WorkspaceProjectRepoParams & {
+    /** Builds a multi-project checkout's runtime to find its path. Outside the loop: nodeRuntimeFactory. */
+    runtimeFactory: RuntimeFactory;
+  }
 ): WorkspaceProjectRepo[] {
   assert(
     params.workspaceId.trim().length > 0,
@@ -207,10 +210,12 @@ export function getWorkspaceProjectRepos(
     const repoCwd = !isMultiProject
       ? params.workspacePath
       : (sshWorkspacePathHint ??
-        createRuntime(params.runtimeConfig, {
-          projectPath: project.projectPath,
-          workspaceName: params.workspaceName,
-        }).getWorkspacePath(project.projectPath, params.workspaceName));
+        params.runtimeFactory
+          .createRuntime(params.runtimeConfig, {
+            projectPath: project.projectPath,
+            workspaceName: params.workspaceName,
+          })
+          .getWorkspacePath(project.projectPath, params.workspaceName));
 
     assert(
       repoCwd.trim().length > 0,

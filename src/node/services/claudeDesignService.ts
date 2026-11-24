@@ -10,7 +10,6 @@ import {
   CLAUDE_DESIGN_MAX_CREDENTIAL_BYTES,
   CLAUDE_DESIGN_MAX_ERROR_BYTES,
   CLAUDE_DESIGN_SCOPES,
-  CLAUDE_DESIGN_SERVER_NAME,
   CLAUDE_DESIGN_URL,
   CLAUDE_DESIGN_READ_TIMEOUT_MS,
   CLAUDE_DESIGN_TEST_TIMEOUT_MS,
@@ -437,5 +436,3 @@ async function needsConsent(response: Response): Promise<boolean> {
     reader.cancel().catch(() => undefined);
   }
 }
-
-export { CLAUDE_DESIGN_SERVER_NAME };

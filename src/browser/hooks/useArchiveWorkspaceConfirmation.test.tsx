@@ -14,6 +14,8 @@ type ArchiveResult = Awaited<
   ReturnType<UseArchiveWorkspaceConfirmationOptions["archiveWorkspace"]>
 >;
 
+type ArchiveOptions = Parameters<UseArchiveWorkspaceConfirmationOptions["archiveWorkspace"]>[1];
+
 const WORKSPACE_ID = "ws-1";
 const READY: PreflightResult = { success: true, data: { kind: "ready" } };
 const ARCHIVED: ArchiveResult = { success: true, data: { kind: "archived" } };
@@ -26,9 +28,8 @@ function setup(overrides: Partial<UseArchiveWorkspaceConfirmationOptions> = {}) 
   const preflightArchiveWorkspace = mock(
     (_workspaceId: string): Promise<PreflightResult> => Promise.resolve(READY)
   );
-  const archiveWorkspace = mock(
-    (_workspaceId: string, _options?: { acknowledgedUntrackedPaths?: string[] }) =>
-      Promise.resolve(ARCHIVED)
+  const archiveWorkspace = mock((_workspaceId: string, _options?: ArchiveOptions) =>
+    Promise.resolve(ARCHIVED)
   );
   const showError = mock(
     (_workspaceId: string, _error: string, _anchorEl?: HTMLElement) => undefined
@@ -122,6 +123,63 @@ describe("useArchiveWorkspaceConfirmation", () => {
     expect(view.result.current.modalProps.isOpen).toBe(false);
   });
 
+  test("confirms a sub-agent's untracked-file loss and acknowledges it per sub-agent", async () => {
+    const subagents = [{ workspaceId: "sub-1", title: "Verifier", paths: ["notes.txt"] }];
+    const { view, request, confirm, archiveWorkspace } = setup({
+      preflightArchiveWorkspace: mock(() =>
+        Promise.resolve({
+          success: true,
+          data: { kind: "confirm-lossy-untracked-files" as const, paths: [], subagents },
+        })
+      ),
+    });
+
+    await request();
+
+    const modal = view.result.current.modalProps;
+    expect(modal.isOpen).toBe(true);
+    expect(modal.warning).toContain("Verifier: notes.txt");
+
+    await confirm();
+
+    expect(archiveWorkspace.mock.calls).toEqual([
+      [
+        WORKSPACE_ID,
+        {
+          acknowledgedUntrackedPaths: [],
+          acknowledgedSubagentUntrackedPaths: { "sub-1": ["notes.txt"] },
+        },
+      ],
+    ]);
+  });
+
+  test("reopens when a sub-agent gains an untracked file after the confirmation", async () => {
+    let preflightCalls = 0;
+    const preflightArchiveWorkspace = mock(() => {
+      preflightCalls += 1;
+      const paths = preflightCalls === 1 ? ["a.txt"] : ["a.txt", "b.txt"];
+      return Promise.resolve({
+        success: true,
+        data: {
+          kind: "confirm-lossy-untracked-files" as const,
+          paths: [],
+          subagents: [{ workspaceId: "sub-1", title: "Verifier", paths }],
+        },
+      });
+    });
+    const { view, request, confirm, showError } = setup({
+      preflightArchiveWorkspace,
+      archiveWorkspace: mock(() => Promise.resolve({ success: false, error: "not confirmed" })),
+    });
+
+    await request();
+    await confirm();
+
+    expect(view.result.current.modalProps.isOpen).toBe(true);
+    expect(view.result.current.modalProps.warning).toContain("Verifier: b.txt");
+    expect(showError).not.toHaveBeenCalled();
+  });
+
   test("confirms interrupting an active stream, then archives without acknowledged paths", async () => {
     const { view, request, confirm, archiveWorkspace } = setup({ isStreaming: () => true });
 
@@ -207,6 +265,32 @@ describe("useArchiveWorkspaceConfirmation", () => {
     expect(preflightArchiveWorkspace).toHaveBeenCalledTimes(2);
     expect(view.result.current.modalProps.isOpen).toBe(true);
     expect(view.result.current.modalProps.warning).toContain("b.txt");
+    expect(showError).not.toHaveBeenCalled();
+  });
+
+  test("opens the confirmation when a first archive meets a sub-agent file created after the preflight", async () => {
+    let preflightCalls = 0;
+    const preflightArchiveWorkspace = mock(() => {
+      preflightCalls += 1;
+      if (preflightCalls === 1) return Promise.resolve(READY);
+      return Promise.resolve({
+        success: true,
+        data: {
+          kind: "confirm-lossy-untracked-files" as const,
+          paths: [],
+          subagents: [{ workspaceId: "sub-1", title: "Verifier", paths: ["late.txt"] }],
+        },
+      });
+    });
+    const { view, request, showError } = setup({
+      preflightArchiveWorkspace,
+      archiveWorkspace: mock(() => Promise.resolve({ success: false, error: "not confirmed" })),
+    });
+
+    await request();
+
+    expect(view.result.current.modalProps.isOpen).toBe(true);
+    expect(view.result.current.modalProps.warning).toContain("Verifier: late.txt");
     expect(showError).not.toHaveBeenCalled();
   });
 

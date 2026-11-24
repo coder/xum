@@ -26,7 +26,6 @@ function randomProviderToken(rng: Rng): string {
         "direct",
         "anthropic",
         "openai",
-        "mux-gateway",
         "openrouter",
         "coder",
         "bedrock",

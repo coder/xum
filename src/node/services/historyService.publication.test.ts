@@ -14,7 +14,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import { historyWriteLockPath } from "./workspaceRemoval";
 
 type PublicationObserver = NonNullable<
-  Parameters<HistoryService["appendManyToHistoryUnderWriteLock"]>[2]
+  Parameters<HistoryService["appendManyToHistoryUnderWriteLock"]>[3]
 >;
 // Compile-time assertion only; behavioral tests below check receipt timing at publication.
 expectTypeOf<() => Promise<undefined>>().not.toMatchTypeOf<PublicationObserver["onCommitted"]>();
@@ -54,11 +54,13 @@ describe("HistoryService private publication seam", () => {
       updateHistoryUnderWriteLock(
         workspaceId: string,
         message: MuxMessage,
+        assertStillOwned: () => Promise<void>,
         observer: PublicationObserver
       ): Promise<Result<void>>;
       appendManyToHistoryUnderWriteLock(
         workspaceId: string,
         messages: MuxMessage[],
+        assertStillOwned: () => Promise<void>,
         observer: PublicationObserver
       ): Promise<Result<void>>;
     };
@@ -71,12 +73,18 @@ describe("HistoryService private publication seam", () => {
           return service.updateHistoryUnderWriteLock(
             workspaceId,
             createMuxMessage("assistant", "assistant", "updated", { historySequence: 1 }),
+            observer.assertStillOwned,
             observer
           );
         }
         const rows = [createMuxMessage("replacement", "user", "next question")];
         if (kind === "batch") rows.unshift(createMuxMessage("payload", "assistant", "payload"));
-        return service.appendManyToHistoryUnderWriteLock(workspaceId, rows, observer);
+        return service.appendManyToHistoryUnderWriteLock(
+          workspaceId,
+          rows,
+          observer.assertStillOwned,
+          observer
+        );
       }
     );
   }

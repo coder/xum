@@ -218,6 +218,8 @@ export class AgentStatusService {
         const id = ws.id ?? ws.name;
         if (typeof id !== "string" || id.length === 0) continue;
         if (isWorkspaceArchived(ws.archivedAt, ws.unarchivedAt)) continue;
+        // Side chats have no sidebar status UI; inherited context must not trigger paid background work.
+        if (ws.sideChatParentWorkspaceId != null) continue;
         const state = this.tracked.get(id);
         if (state?.inFlight) continue;
         const snapshot = snapshots.get(id);
@@ -422,6 +424,15 @@ export class AgentStatusService {
           );
           if (recorded) {
             this.requestAnalyticsIngest?.(workspaceId);
+            // #6118: this spend bypasses the stream, so tell the open chat about it, as the
+            // bash AI proxy does; otherwise the footer total misses it until a reload.
+            this.workspaceService.emitChatEvent(workspaceId, {
+              type: "session-usage-delta",
+              workspaceId,
+              sourceWorkspaceId: workspaceId,
+              byModelDelta: { [recorded.model]: recorded.usage },
+              timestamp: Date.now(),
+            });
           }
         },
       });
@@ -550,7 +561,7 @@ export class AgentStatusService {
   /**
    * Build the trailing chat transcript, capped by message count and
    * AGENT_STATUS_MAX_TRANSCRIPT_TOKENS. Includes the in-flight partial
-   * assistant message (HistoryService.readPartial) so the hash refreshes
+   * assistant message (HistoryService.readStatusPartial) so the hash refreshes
    * mid-stream — exactly when "what is the agent doing now" matters most.
    */
   private async buildTrailingTranscript(workspaceId: string): Promise<string> {
@@ -560,23 +571,31 @@ export class AgentStatusService {
     // reset floors, so a malformed reset row still discards everything before it (#4555).
     // Only the trailing window is read: the suffix holds at least the last
     // AGENT_STATUS_MAX_TRAILING_MESSAGES status rows of that read, so the filtered window below
-    // is unchanged without parsing the whole epoch under the history lock (#4720).
+    // is unchanged without parsing the whole epoch under the history lock (#4720). Rows over
+    // 1 MiB come back status-grade (null tool payloads, empty file URLs), which the formatter
+    // never reads (#4790); so does a partial over 1 MiB (#5213).
     //
     // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
     // must not leak into the request, and a readable reset marker is structure, not
     // conversation. The window is counted in VISIBLE rows: counting before filtering would let
     // a burst of hidden records (resolving many threads) evict the recent conversation, and
     // each hidden append would change the hash by evicting a visible row.
-    const history = await this.historyService.getHistorySuffixFromLatestBoundary(
+    const history = await this.historyService.getStatusHistorySuffix(
       workspaceId,
       AGENT_STATUS_MAX_TRAILING_MESSAGES,
       isStatusTranscriptRow
     );
-    if (!history.success) return "";
+    if (!history.success) {
+      log.debug("Agent status: history read failed; skipping this run", {
+        workspaceId,
+        error: history.error,
+      });
+      return "";
+    }
     const committedMessages = history.data
       .filter(isStatusTranscriptRow)
       .slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES);
-    const partial = await this.historyService.readPartial(workspaceId);
+    const partial = await this.historyService.readStatusPartial(workspaceId);
 
     // Partial messages get an "(in progress)" role suffix so the model sees
     // they aren't finalized; committed messages render with their normal

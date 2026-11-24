@@ -7,7 +7,9 @@ import {
 } from "@/node/runtime/Runtime";
 import { streamToString, streamToStringCapped } from "@/node/runtime/streamUtils";
 import { PlatformPaths } from "@/node/utils/paths.main";
-import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
+import { isIgnorableStreamError } from "@/node/utils/streamErrors";
+// Type-only: planLocation imports remoteProjectLayout, which imports getProjectName from here.
+import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 
 /**
  * Convenience helpers for working with streaming Runtime APIs.
@@ -45,6 +47,13 @@ export async function execBuffered(
   options: ExecOptions & {
     stdin?: string;
     /**
+     * A script can exit before it has read all of `stdin` (an early `exit`). The write then fails
+     * with EPIPE, at a moment that depends on the input's size and the Bun version. When set, that
+     * is not an error: the exit code says what happened. Never set it for a command whose result
+     * depends on all of its input, such as a file write.
+     */
+    stdinMayGoUnread?: boolean;
+    /**
      * When set, stdout and stderr are each capped at this many raw bytes while
      * reading (excess is drained and discarded), bounding memory on commands
      * with unbounded output. Pair with `timeout` to also bound duration.
@@ -62,7 +71,7 @@ export async function execBuffered(
       await writer.close();
     } catch (err) {
       writer.releaseLock();
-      throw err;
+      if (!(options.stdinMayGoUnread && isIgnorableStreamError(err))) throw err;
     }
   } else {
     // Close stdin immediately if no input
@@ -72,7 +81,8 @@ export async function execBuffered(
   // Read stdout and stderr concurrently
   const readStream =
     options.maxOutputBytes !== undefined
-      ? (s: ReadableStream<Uint8Array>) => streamToStringCapped(s, options.maxOutputBytes!)
+      ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+        (s: ReadableStream<Uint8Array>) => streamToStringCapped(s, options.maxOutputBytes!)
       : streamToString;
   const [stdout, stderr, exitCode, duration] = await Promise.all([
     readStream(stream.stdout),
@@ -133,6 +143,16 @@ export async function writeFileString(
 }
 
 /**
+ * Every path that holds a workspace's plan (see PlanFileLocation), in read order. An SSH row's
+ * location has its plan path only: its one-shot migration already ran (planLocation.ts).
+ */
+export function planReadPaths(location: PlanFileLocation): string[] {
+  return location.legacyIdPath === undefined
+    ? [location.planPath]
+    : [location.planPath, location.legacyIdPath];
+}
+
+/**
  * Result from reading a plan file with legacy migration support
  */
 export interface ReadPlanResult {
@@ -145,19 +165,14 @@ export interface ReadPlanResult {
 }
 
 /**
- * Read plan file content, checking new path first then legacy, migrating if needed.
- * This handles the transparent migration from {runtimeHome}/plans/{id}.md to
- * {runtimeHome}/plans/{projectName}/{workspaceName}.md
+ * Read a workspace's plan from its location (planLocation.ts): planPath, else (local and container
+ * rows) the legacy-by-id path, moved to planPath since it is provably this workspace's.
  */
 export async function readPlanFile(
   runtime: Runtime,
-  workspaceName: string,
-  projectName: string,
-  workspaceId: string
+  location: PlanFileLocation
 ): Promise<ReadPlanResult> {
-  const xumHome = runtime.getXumHome();
-  const planPath = getPlanFilePath(workspaceName, projectName, xumHome);
-  const legacyPath = getLegacyPlanFilePath(workspaceId, xumHome);
+  const { planPath, legacyIdPath: legacyPath } = location;
 
   // Resolve tilde to absolute path for client use (editor deep links, etc.)
   // For local runtimes this expands ~ to /home/user; for SSH it resolves remotely
@@ -176,6 +191,8 @@ export async function readPlanFile(
     // An unreachable runtime is not a missing plan (#4826): callers must fail
     // visibly, not act as if no plan exists or fall back to a stale legacy one.
     if (isRuntimeTransportError(error)) throw error;
+    // SSH rows have no legacy-by-id fallback once migrated (planLocation.ts).
+    if (legacyPath === undefined) return { content: "", exists: false, path: resolvedPath };
     // Fall back to legacy path
     try {
       const content = await readFileString(runtime, legacyPath, undefined, planReadOptions);
@@ -193,6 +210,8 @@ export async function readPlanFile(
               XUM_PLAN: planPath,
             },
             timeout: 5,
+            // Xum code, not agent code: moves a plan file under <xumHome>/plans.
+            sandbox: "internal",
           }
         );
       } catch {
@@ -212,17 +231,14 @@ export async function readPlanFile(
  * Silently succeeds if source file doesn't exist. Throws when the source could
  * not be probed in transport or the move itself failed, so a caller never
  * reports a moved plan that stayed behind (#4826).
+ *
+ * Both paths are plan paths (planLocation.ts, one directory): this moves only that file.
  */
 export async function movePlanFile(
   runtime: Runtime,
-  oldWorkspaceName: string,
-  newWorkspaceName: string,
-  projectName: string
+  oldPath: string,
+  newPath: string
 ): Promise<void> {
-  const xumHome = runtime.getXumHome();
-  const oldPath = getPlanFilePath(oldWorkspaceName, projectName, xumHome);
-  const newPath = getPlanFilePath(newWorkspaceName, projectName, xumHome);
-
   try {
     await runtime.stat(oldPath);
   } catch (error) {
@@ -237,6 +253,8 @@ export async function movePlanFile(
       XUM_NEW_PLAN: newPath,
     },
     timeout: 5,
+    // Xum code, not agent code: moves a plan file under <xumHome>/plans.
+    sandbox: "internal",
   });
   throwIfTransportFailure(runtime, result, "Failed to move plan file");
   if (result.exitCode !== 0) {
@@ -259,18 +277,11 @@ export async function movePlanFile(
 export async function copyPlanFileAcrossRuntimes(
   sourceRuntime: Runtime,
   targetRuntime: Runtime,
-  sourceWorkspaceName: string,
-  sourceWorkspaceId: string,
-  targetWorkspaceName: string,
-  projectName: string
+  sourceLocation: PlanFileLocation,
+  targetPath: string
 ): Promise<string | undefined> {
-  const sourceMuxHome = sourceRuntime.getXumHome();
-  const targetXumHome = targetRuntime.getXumHome();
-  const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, sourceMuxHome);
-  const legacySourcePath = getLegacyPlanFilePath(sourceWorkspaceId, sourceMuxHome);
-  const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetXumHome);
-
-  for (const candidatePath of [sourcePath, legacySourcePath]) {
+  // Every path that holds the source's plan.
+  for (const candidatePath of planReadPaths(sourceLocation)) {
     let content: string;
     try {
       // Same guard as readPlanFile: every fork reads this user/agent-writable path, so a FIFO
@@ -283,11 +294,12 @@ export async function copyPlanFileAcrossRuntimes(
       if (isRuntimeTransportError(error)) throw error;
       continue; // Missing (or not a regular file): try the next candidate.
     }
-    // A plan already at the target is not this copy's: fork() refuses names of live workspaces in
-    // its project (#5009), so it is an orphan of a removed workspace. Removal deletes plans since
-    // #5019, but orphans remain from older builds, failed or skipped deletions (unreachable host,
-    // Docker/devcontainer, a same-basename project), so the copy overwrites instead of failing
-    // closed. A probe that fails in transport counts as existing.
+    // A plan already at the target is not this copy's. fork() copies only after its registration
+    // write holds the name in its plan directory (#5175), so no live workspace this installation's
+    // config knows owns the target: the overwrite can replace only an orphan of a removed workspace
+    // (older builds, failed or skipped deletions) or the plan of a row this installation cannot see
+    // (another installation on the same SSH host, #5174). A filesystem-level no-clobber copy is
+    // #5487. A probe that fails in transport counts as existing.
     const targetExisted = await targetRuntime.stat(targetPath).then(
       () => true,
       (error: unknown) => isRuntimeTransportError(error)

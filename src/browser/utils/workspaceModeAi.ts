@@ -1,6 +1,6 @@
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isValidModelFormat } from "@/common/utils/ai/models";
-import type { AiSettingSource } from "@/common/types/agentAiSettings";
+import type { AiSettingSource, ResolveAgentAiSettingsInput } from "@/common/types/agentAiSettings";
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
@@ -10,7 +10,6 @@ import {
 import { normalizeAgentId as normalizeWorkspaceAgentId } from "@/common/utils/agentIds";
 import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
-import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
 
 export type WorkspaceAISettingsCache = Partial<
   Record<
@@ -21,6 +20,30 @@ export type WorkspaceAISettingsCache = Partial<
 
 function normalizeAgentId(agentId: string): string {
   return normalizeWorkspaceAgentId(agentId, "exec");
+}
+
+/**
+ * The model an agent's Settings card inherits, its own Settings model left out: the shared
+ * resolver over the layers a run resolves (agents.list `aiLayers`), so each layer's Settings and
+ * frontmatter rank as in the backend, and a settings base has replaced the bases that the merged
+ * `aiDefaults` still hold. Undefined when no Settings entry or definition sets one.
+ */
+export function resolveInheritedLayerModel(
+  agentId: string,
+  layers: Pick<ResolveAgentAiSettingsInput, "targetDefinitionAiDefaults" | "ancestors">,
+  agentAiDefaults: AgentAiDefaults
+): string | undefined {
+  const resolved = resolveAgentAiSettings({
+    targetAgentId: agentId,
+    profile: "interactive",
+    agentAiDefaults: {
+      ...agentAiDefaults,
+      [agentId]: { ...agentAiDefaults[agentId], modelString: undefined },
+    },
+    ...layers,
+  });
+  const tier = resolved.sources.model?.tier;
+  return tier === "config" || tier === "definition" ? resolved.selected.model : undefined;
 }
 
 /**
@@ -82,68 +105,6 @@ export function resolveConfiguredAiDefaults(
       : undefined,
     autoModelRouting: resolveConfiguredAuto("autoModelRouting", resolved.sources.model),
     autoThinkingLevel: resolveConfiguredAuto("autoThinkingLevel", resolved.sources.thinkingLevel),
-  };
-}
-
-/** Explicit composer picks per agent: true = Auto, false = a concrete value. */
-export type AutoRoutingChoiceByAgent = Partial<
-  Record<string, Partial<Record<AutoRoutingDimension, boolean>>>
->;
-
-/** undefined leaves the scope's Auto flag unchanged. */
-export type AutoRoutingOutcome = Record<AutoRoutingDimension, boolean | undefined>;
-
-/**
- * Explicit switches prefer workspace picks over configured defaults. Background sync only
- * enables configured Auto when no pick or per-agent bucket exists, and never disables existing Auto.
- */
-export function resolveAutoRoutingForAgent(args: {
-  agentId: string;
-  agentAiDefaults: AgentAiDefaults;
-  agentBaseById?: ReadonlyMap<string, string | undefined>;
-  explicitSwitch: boolean;
-  experimentEnabled: boolean;
-  routingChoices?: AutoRoutingChoiceByAgent;
-  workspaceByAgent?: WorkspaceAISettingsCache;
-}): AutoRoutingOutcome {
-  if (!args.experimentEnabled) {
-    // Keep per-agent choices stored but inactive while the experiment is off.
-    const outcome = args.explicitSwitch ? false : undefined;
-    return { model: outcome, thinkingLevel: outcome };
-  }
-
-  const normalizedAgentId = normalizeAgentId(args.agentId);
-  const configured = resolveConfiguredAiDefaults(
-    normalizedAgentId,
-    args.agentAiDefaults,
-    args.agentBaseById
-  );
-  const choices = args.routingChoices?.[normalizedAgentId];
-  const bucket = args.workspaceByAgent?.[normalizedAgentId];
-  const bucketModel = typeof bucket?.model === "string" ? bucket.model.trim() : "";
-
-  const resolveDimension = (
-    choice: boolean | undefined,
-    configuredAuto: boolean,
-    hasBucketValue: boolean
-  ): boolean | undefined => {
-    if (args.explicitSwitch) {
-      return choice ?? configuredAuto;
-    }
-    return configuredAuto && choice === undefined && !hasBucketValue ? true : undefined;
-  };
-
-  return {
-    model: resolveDimension(
-      choices?.model,
-      configured.autoModelRouting === true,
-      isValidModelFormat(bucketModel)
-    ),
-    thinkingLevel: resolveDimension(
-      choices?.thinkingLevel,
-      configured.autoThinkingLevel === true,
-      coerceThinkingLevel(bucket?.thinkingLevel) != null
-    ),
   };
 }
 

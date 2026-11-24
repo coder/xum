@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import { AgentReportToolCall } from "../AgentReportToolCall";
 import { GenericToolCall } from "../GenericToolCall";
-import { IntuitionToolCall } from "../IntuitionToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
 import { ToolSearchToolCall } from "../ToolSearchToolCall";
 import { WorkspaceLifecycleToolCall } from "../WorkspaceLifecycleToolCall";
@@ -19,9 +18,27 @@ describe("getToolComponent", () => {
     expect(getToolComponent("bash", args, { success: true, output: "ok" })).toBe(BashToolCall);
   });
 
+  test("routes bash args that omit timeout_secs to the real card", () => {
+    // timeout_secs is optional and the handler applies the default, so stored args
+    // without it validate and the row keeps its dedicated card. They used to fail the
+    // required field and lose the card, which only showed up in the ui lane.
+    expect(getToolComponent("bash", { script: "ls" }, { success: true, output: "" })).toBe(
+      BashToolCall
+    );
+  });
+
   test("falls back to generic rendering for removed or unknown tools", () => {
     expect(getToolComponent("workflow_list", {}, undefined)).toBe(GenericToolCall);
     expect(getToolComponent("unknown_tool", {}, undefined)).toBe(GenericToolCall);
+  });
+
+  test("renders saved advisor calls through the generic fallback", () => {
+    // Removing a tool must not make existing transcripts depend on its deleted renderer/schema.
+    for (const args of [{ question: "Review this approach" }, null, "legacy input"]) {
+      expect(getToolComponent("advisor", args, { advice: "Keep the change small" })).toBe(
+        GenericToolCall
+      );
+    }
   });
 
   test("renders legacy file-backed agent_report transcripts", () => {
@@ -86,16 +103,6 @@ describe("getToolComponent", () => {
     expect(
       getToolComponent("server:GOOGLE_SEARCH_WEB", { queries: "not-an-array" }, undefined)
     ).toBe(GenericToolCall);
-  });
-
-  test("uses the intuition card only for valid cue arguments", () => {
-    expect(getToolComponent("intuition", { cue: "Recall deployment constraints" }, undefined)).toBe(
-      IntuitionToolCall
-    );
-    expect(getToolComponent("intuition", { cue: "" }, undefined)).toBe(GenericToolCall);
-    expect(getToolComponent("intuition", { cue: { nested: true } }, undefined)).toBe(
-      GenericToolCall
-    );
   });
 
   test("renders legacy tool_search transcript calls", () => {

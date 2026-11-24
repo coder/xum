@@ -1,5 +1,6 @@
 import type { TurnCoordinator } from "./turnCoordinator";
 import { createMuxMessage } from "@/common/types/message";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { Exit, Scope } from "effect";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
@@ -85,9 +86,9 @@ describe("AgentSession turn completion", () => {
         },
       })
     );
-    const open = fileIO.open;
+    const open = fs.open;
     let failed = false;
-    const reading = spyOn(fileIO, "open").mockImplementation(
+    const reading = spyOn(fs, "open").mockImplementation(
       async (...args: Parameters<typeof open>) => {
         if (args[0] === storage.path && !failed) {
           failed = true;
@@ -138,23 +139,21 @@ describe("AgentSession turn completion", () => {
       const stream = spyOn(h.aiService, "streamMessage");
       const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
       const failure = Object.assign(new Error(`${code}: cancellation read unavailable`), { code });
-      const open = fileIO.open;
-      let reading: ReturnType<typeof spyOn<typeof fileIO, "open">> | undefined;
+      const open = fs.open;
+      let reading: ReturnType<typeof spyOn<typeof fs, "open">> | undefined;
       const warning = spyOn(log, "warn");
       try {
         expect(await h.session.sendMessage("original", sendOptions)).toEqual(Ok(undefined));
         expect(await h.session.cancelCompaction(true)).toEqual(Ok(undefined));
         const cancellationBytes = await fileIO.readFile(storage.path);
-        reading = spyOn(fileIO, "open").mockImplementation(
-          async (...args: Parameters<typeof open>) => {
-            if (args[0] === storage.path) {
-              entered.resolve();
-              await release.promise;
-              throw failure;
-            }
-            return open(...args);
+        reading = spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+          if (args[0] === storage.path) {
+            entered.resolve();
+            await release.promise;
+            throw failure;
           }
-        );
+          return open(...args);
+        });
         const streamError = {
           messageId: "assistant-1",
           error: "provider failed",
@@ -225,7 +224,7 @@ describe("AgentSession turn completion", () => {
       "observeContinuousCompactionAtStreamEnd"
     );
     const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
-    let reading: ReturnType<typeof spyOn<typeof fileIO, "readFile">> | undefined;
+    let reading: ReturnType<typeof spyOn<typeof fs, "readFile">> | undefined;
     let failed = false;
     try {
       // Keep admission's real frontier stable: only the ordinary completion read fails.
@@ -245,8 +244,8 @@ describe("AgentSession turn completion", () => {
         readCompactionAdmission: () => Promise.resolve(admission),
       });
       // Install the transient fault only after the queue's recorded acquisition completes.
-      const read = fileIO.readFile;
-      reading = spyOn(fileIO, "readFile").mockImplementation((async (
+      const read = fs.readFile;
+      reading = spyOn(fs, "readFile").mockImplementation((async (
         ...args: Parameters<typeof read>
       ) => {
         if (args[0] === generationPath && !failed) {
@@ -277,6 +276,44 @@ describe("AgentSession turn completion", () => {
       observation.mockRestore();
       accounting.mockRestore();
       consumer.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test("a completed stream whose goal accounting throws releases its receipt unaccounted", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          return Promise.resolve(Ok({ messageId: "assistant-1", completion: completion.promise }));
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const settle = mock(() => undefined);
+    const release = mock(() => undefined);
+    try {
+      await h.session.sendMessage("hello", sendOptions);
+      Reflect.set(h.session, "workspaceGoalService", {
+        settleStreamAccountingReceipt: settle,
+        releaseUnaccountedStreamAccountingReceipt: release,
+        applyPendingAfterStreamEnd: mock(() => Promise.resolve(null)),
+      } satisfies Partial<WorkspaceGoalService>);
+      spyOn(internal(h.session), "recordGoalAccountingFromUsage").mockRejectedValue(
+        new Error("goal accounting failed")
+      );
+      completion.resolve({ status: "completed", streamEnd: end() });
+      await policyPromise(consumer);
+      // TaskService must not treat the goal state as including this stream's accounting.
+      expect(settle).not.toHaveBeenCalled();
+      expect(release).toHaveBeenCalledWith(workspaceId, "assistant-1");
+    } finally {
       await h.session.dispose();
       await h.cleanup();
     }
@@ -360,6 +397,7 @@ describe("AgentSession turn completion", () => {
       await h.session.sendMessage("original", sendOptions);
       Reflect.set(h.session, "workspaceGoalService", {
         recordUserStoppedStream: mock(() => Promise.reject(new Error("accounting failed"))),
+        settleStreamAccountingReceipt: () => undefined,
       } satisfies Partial<WorkspaceGoalService>);
       completion.resolve({ status: "aborted", abortReason: "user", streamAbort: abort() });
       await policyPromise(consumer);
@@ -417,6 +455,7 @@ describe("AgentSession turn completion", () => {
       Reflect.set(h.session, "workspaceGoalService", {
         recordUserStoppedStream,
         assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
+        settleStreamAccountingReceipt: () => undefined,
       } satisfies Partial<WorkspaceGoalService>);
       emitter.emit("stream-abort", abort());
       completion.resolve({ status: "aborted", abortReason: "user", streamAbort: abort() });
@@ -595,6 +634,8 @@ describe("AgentSession turn completion", () => {
         Reflect.set(h.session, "workspaceGoalService", {
           recordUserStoppedStream,
           recordStreamAccounting: mock(() => Promise.resolve(null)),
+          settleStreamAccountingReceipt: () => undefined,
+          wakeContinuationBlockedByUserInput: () => undefined,
         } satisfies Partial<WorkspaceGoalService>);
         emitter.emit("stream-abort", abort());
         expect(recordUserStoppedStream).not.toHaveBeenCalled();
@@ -887,8 +928,9 @@ describe("AgentSession turn completion", () => {
         workspaceId,
         createMuxMessage("prior", "assistant", "Earlier completed work")
       );
-      const options = { ...sendOptions, experiments: { tokenBudget: true } };
-      expect((await h.session.sendMessage("original request", options)).success).toBe(true);
+      const enabled = new Set<string>([EXPERIMENT_IDS.TOKEN_BUDGET, EXPERIMENT_IDS.MEMORY]);
+      spyOn(h.aiService, "isExperimentEnabled").mockImplementation((id) => enabled.has(id));
+      expect((await h.session.sendMessage("original request", sendOptions)).success).toBe(true);
       oldPolicy = policyPromise(consumer);
       const read = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
       spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(async (id) => {
@@ -908,7 +950,7 @@ describe("AgentSession turn completion", () => {
       const coordinator = internal(h.session).coordinator;
       const originalOperation = coordinator.operationId;
       coordinator.finishTurn(coordinator.turnId);
-      expect((await h.session.sendMessage("replacement request", options)).success).toBe(true);
+      expect((await h.session.sendMessage("replacement request", sendOptions)).success).toBe(true);
       const replacementOperation = coordinator.operationId;
       expect(replacementOperation).toBeDefined();
       expect(replacementOperation).not.toBe(originalOperation);
@@ -1049,6 +1091,49 @@ describe("AgentSession turn completion", () => {
       await policyPromise(consumer);
       expect(accounting).not.toHaveBeenCalled();
       expect(h.session.isBusy()).toBe(false);
+    } finally {
+      release.resolve();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+  test("reading another stream's compaction decision while a compaction prepares, or after a request is left behind, never creates a wait nothing resolves (#5326)", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: mock(async () => {
+          entered.resolve();
+          await release.promise;
+          return Err({ type: "unknown" as const, raw: "provider unavailable" });
+        }),
+      },
+    });
+    const settled = (decision: Promise<boolean>) =>
+      Promise.race([
+        decision,
+        new Promise<"unresolved">((resolve) => setTimeout(() => resolve("unresolved"), 500)),
+      ]);
+    try {
+      // The compaction's operation is configured, but has no stream identity yet.
+      const compacting = h.session.sendMessage("Please compact", {
+        model,
+        agentId: "compact",
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      });
+      await entered.promise;
+      expect(internal(h.session).activeCompactionRequest).toBeDefined();
+      expect(await settled(h.session.waitForPendingCompactionCompletionDecision("resume-1"))).toBe(
+        false
+      );
+      release.resolve();
+      await compacting;
+      // A request that outlived its turn authorizes no wait either.
+      internal(h.session).activeCompactionRequest = { id: "left-behind", modelString: model };
+      expect(await settled(h.session.waitForPendingCompactionCompletionDecision("resume-1"))).toBe(
+        false
+      );
     } finally {
       release.resolve();
       await h.session.dispose();

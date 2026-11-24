@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { within, waitFor } from "@storybook/test";
+import { within, waitFor } from "storybook/test";
 import { useRef, useState, type ComponentType, type FC, type ReactNode } from "react";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
@@ -87,6 +87,7 @@ function createStubWorkspaceContextValue(): WorkspaceContextValue {
         workspaceId: "created-workspace",
       }),
     removeWorkspace: () => Promise.resolve({ success: true }),
+    removeSubagent: () => Promise.resolve({ success: true }),
     updateWorkspaceTitle: () => Promise.resolve({ success: true }),
     setWorkspacePinned: () => Promise.resolve({ success: true }),
     reorderPinnedWorkspaces: () => Promise.resolve({ success: true }),

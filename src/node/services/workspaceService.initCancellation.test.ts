@@ -1,4 +1,5 @@
 import { describe, expect, test, mock, spyOn } from "bun:test";
+import * as humanIdModule from "human-id";
 import type { AgentSession } from "./agentSession";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
@@ -10,7 +11,7 @@ import { Config, type SecretsStore } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
-import type { WorkspaceServiceArgs, WorkspaceServiceHarness } from "./workspaceService.testHarness";
+import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
 import {
   createCompactionAdmissionMocks,
   createWorkspaceServiceHarness,
@@ -149,24 +150,6 @@ describe("WorkspaceService init cancellation", () => {
     expect(await fsPromises.stat(victimPath).then(() => true)).toBe(true);
   });
 
-  test("createScratch rejects when policy disallows the local runtime", async () => {
-    const policyService = {
-      isEnforced: mock(() => true),
-      isRuntimeAllowed: mock(() => false),
-    } as unknown as WorkspaceServiceArgs[8];
-    await using harness = await createWorkspaceServiceHarness({ policyService });
-    const { config, service: workspaceService } = harness;
-
-    const result = await workspaceService.createScratch("Blocked scratch");
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("not allowed by policy");
-    }
-    // No config entry or workdir may be left behind by the rejected create.
-    expect((await config.getAllWorkspaceMetadata()).length).toBe(0);
-  });
-
   test("create() rejects untrusted projects", async () => {
     await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
@@ -183,9 +166,34 @@ describe("WorkspaceService init cancellation", () => {
 
     expect(result).toEqual(
       Err(
-        "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
+        "This project must be trusted before creating workspaces. Trust the project in Settings → Project trust, or create a workspace from the project page."
       )
     );
+    expect(generateStableId).not.toHaveBeenCalled();
+    expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toEqual([]);
+  });
+
+  test("create() rejects SSH workspaces without isolation that name no project directory", async () => {
+    await using harness = await createWorkspaceServiceHarness();
+    const { config, service: workspaceService } = harness;
+    const projectPath = path.join(harness.rootDir, "proj");
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, { workspaces: [], trusted: true });
+      return cfg;
+    });
+    const generateStableId = spyOn(config, "generateStableId");
+
+    const result = await workspaceService.create(projectPath, "ws-branch", undefined, "title", {
+      type: "ssh",
+      host: "devbox",
+      srcBaseDir: "~/xum",
+      workspaceIsolation: "none",
+      projectDir: " ",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.success ? "" : result.error).toContain("project directory on the SSH host");
+    // Refused before any per-workspace state (id, runtime, SSH connection) exists.
     expect(generateStableId).not.toHaveBeenCalled();
     expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toEqual([]);
   });
@@ -357,20 +365,23 @@ describe("WorkspaceService init cancellation", () => {
 
   async function setUpAutoNamedCreate() {
     // /new mirrors /fork's seamless flow: callers no longer have to invent a
-    // workspace name. The backend should derive the next "workspace-N" slot
+    // workspace name. The backend should pick a free random name
     // and persist `pendingAutoTitle` so the first message can title the workspace.
     const workspaceId = "ws-auto-named";
     const harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
     const projectPath = path.join(harness.rootDir, "proj-auto");
-    // Two pre-existing workspaces — auto-naming should skip past them.
+    // The first random draw is taken by an existing workspace, so auto-naming must skip it.
     await saveWorkspaces(config, projectPath, [
-      projectWorkspace(projectPath, "workspace-1", "x"),
+      projectWorkspace(projectPath, "brave-cows-jump", "x"),
       projectWorkspace(projectPath, "workspace-2", "y"),
     ]);
+    const humanIdSpy = spyOn(humanIdModule, "humanId")
+      .mockReturnValueOnce("brave-cows-jump")
+      .mockReturnValue("calm-otters-sing");
     spyOn(config, "generateStableId").mockReturnValue(workspaceId);
     const { createWorkspace, createRuntimeSpy } = mockCreateWorkspace(
-      path.join(projectPath, "workspace-3")
+      path.join(projectPath, "calm-otters-sing")
     );
     const readEntry = (id: string) =>
       config
@@ -403,6 +414,7 @@ describe("WorkspaceService init cancellation", () => {
       projectPath,
       createWorkspace,
       createRuntimeSpy,
+      humanIdSpy,
       readEntry,
       consentDuringSanitize,
     };
@@ -416,7 +428,7 @@ describe("WorkspaceService init cancellation", () => {
     try {
       const result = await harness.service.create(
         projectPath,
-        // No branchName — backend should auto-generate workspace-3.
+        // No branchName: the backend auto-generates one.
         undefined,
         undefined,
         undefined,
@@ -431,17 +443,17 @@ describe("WorkspaceService init cancellation", () => {
         return;
       }
 
-      // Backend picked the next "workspace-N" slot and threaded it through to
+      // Backend picked the free random name and threaded it through to
       // both the runtime call and the persisted config entry.
       expect(createWorkspace).toHaveBeenCalledWith(
         expect.objectContaining({
-          branchName: "workspace-3",
-          directoryName: "workspace-3",
+          branchName: "calm-otters-sing",
+          directoryName: "calm-otters-sing",
         })
       );
 
       const newEntry = readEntry(workspaceId);
-      expect(newEntry?.name).toBe("workspace-3");
+      expect(newEntry?.name).toBe("calm-otters-sing");
       expect(newEntry?.pendingAutoTitle).toBe(true);
       // New root workspaces are opted in to unrelated messaging at creation, but only after
       // registration-time sanitization; the announced metadata carries the same generation.
@@ -455,6 +467,7 @@ describe("WorkspaceService init cancellation", () => {
       );
     } finally {
       setup.createRuntimeSpy.mockRestore();
+      setup.humanIdSpy.mockRestore();
     }
   });
 
@@ -467,7 +480,7 @@ describe("WorkspaceService init cancellation", () => {
     try {
       const result = await workspaceService.create(
         projectPath,
-        // No branchName — backend should auto-generate workspace-3.
+        // No branchName: the backend auto-generates one.
         undefined,
         undefined,
         undefined,
@@ -484,17 +497,17 @@ describe("WorkspaceService init cancellation", () => {
         return;
       }
 
-      // Backend picked the next "workspace-N" slot and threaded it through to
+      // Backend picked the free random name and threaded it through to
       // both the runtime call and the persisted config entry.
       expect(createWorkspace).toHaveBeenCalledWith(
         expect.objectContaining({
-          branchName: "workspace-3",
-          directoryName: "workspace-3",
+          branchName: "calm-otters-sing",
+          directoryName: "calm-otters-sing",
         })
       );
 
       const newEntry = readEntry(workspaceId);
-      expect(newEntry?.name).toBe("workspace-3");
+      expect(newEntry?.name).toBe("calm-otters-sing");
       expect(newEntry?.pendingAutoTitle).toBe(true);
       // Nothing granted or announced; the success hands the surviving mark to the caller (#4453).
       expect(newEntry?.unrelatedWorkspaceConsent).toBeUndefined();
@@ -502,6 +515,7 @@ describe("WorkspaceService init cancellation", () => {
       expect(newEntry?.unrelatedWorkspaceConsentPending).toBe(true);
     } finally {
       setup.createRuntimeSpy.mockRestore();
+      setup.humanIdSpy.mockRestore();
     }
   });
 

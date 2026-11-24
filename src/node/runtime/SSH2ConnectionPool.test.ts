@@ -1,5 +1,19 @@
-import { describe, expect, it } from "bun:test";
-import { getProxyShellArgs, spawnProxyCommand } from "./SSH2ConnectionPool";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as net from "node:net";
+import type { AddressInfo } from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
+import { Client, Server, utils, type ConnectConfig } from "ssh2";
+import { isRuntimeRetryableTransportError } from "./Runtime";
+import {
+  SSH2ConnectionPool,
+  getProxyShellArgs,
+  spawnProxyCommand,
+  ssh2ConnectionPool,
+} from "./SSH2ConnectionPool";
+import type { SSHConnectionConfig } from "./sshConnectionPool";
+import { SSH2Transport } from "./transports/SSH2Transport";
 
 const PROXY_TOKENS = { host: "example.test", port: 2222, user: "alice" };
 
@@ -73,3 +87,309 @@ describe("spawnProxyCommand", () => {
     expect(description).toContain("oops");
   });
 });
+
+// #5063: the pool's wait loop must not re-authenticate through its backoff after a permanent
+// failure (a rejected key). Every retry repeats a login that cannot succeed, and servers count
+// failed logins. Transient failures (nothing listening) keep waiting.
+// Skipped on Windows: the pool always adds Pageant there, and a runner without it fails with
+// "Failed to retrieve identities from agent" before the server's rejection is seen.
+describe.skipIf(process.platform === "win32")(
+  "SSH2ConnectionPool wait loop: permanent failures and deadlines",
+  () => {
+    // Key-file authentication only: an ambient agent (working or broken) must not change the result.
+    const originalAuthSock = process.env.SSH_AUTH_SOCK;
+    beforeEach(() => {
+      delete process.env.SSH_AUTH_SOCK;
+    });
+    let cleanup: (() => Promise<void>) | undefined;
+    afterEach(async () => {
+      if (originalAuthSock === undefined) delete process.env.SSH_AUTH_SOCK;
+      else process.env.SSH_AUTH_SOCK = originalAuthSock;
+      await cleanup?.();
+      cleanup = undefined;
+    });
+
+    // ECDSA keys: ssh2's ed25519 generator emits an unparseable key ~0.4% of the time under Bun.
+    const newPrivateKey = () => utils.generateKeyPairSync("ecdsa", { bits: 256 }).private;
+
+    async function startServer(onConnection: ConstructorParameters<typeof Server>[1]) {
+      const server = new Server({ hostKeys: [newPrivateKey()] }, onConnection);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-pool-"));
+      const identityFile = path.join(dir, "id_ecdsa");
+      await fs.writeFile(identityFile, newPrivateKey(), { mode: 0o600 });
+      const config: SSHConnectionConfig = {
+        host: "127.0.0.1",
+        port: (server.address() as AddressInfo).port,
+        identityFile,
+      };
+      const close = () => new Promise<void>((resolve) => server.close(() => resolve()));
+      cleanup = async () => {
+        await close().catch(() => undefined);
+        await fs.rm(dir, { recursive: true, force: true });
+      };
+      return { config, close };
+    }
+
+    function acquire(pool: SSH2ConnectionPool, config: SSHConnectionConfig, maxWaitMs: number) {
+      const waits: number[] = [];
+      const result = pool
+        .acquireConnection(config, { maxWaitMs, onWait: (ms) => waits.push(ms) })
+        .then(
+          () => new Error("acquisition unexpectedly succeeded"),
+          (error: unknown) => error
+        );
+      return { waits, result };
+    }
+
+    it("a rejected key fails at once instead of re-authenticating through the backoff", async () => {
+      let connections = 0;
+      const { config } = await startServer((conn) => {
+        connections++;
+        conn.on("authentication", (ctx) => ctx.reject());
+        conn.on("error", () => undefined);
+      });
+      const pool = new SSH2ConnectionPool();
+
+      const first = acquire(pool, config, 5_000);
+      expect(String(await first.result)).toContain("All configured authentication methods failed");
+      expect(first.waits).toEqual([]);
+      expect(connections).toBe(1);
+
+      // The pool still recorded the failure: the next caller waits out that backoff, then
+      // makes one login of its own and stops on its failure. (The recorded last error alone
+      // is not trusted: other writers report failures into it too.)
+      const next = acquire(pool, config, 5_000);
+      expect(String(await next.result)).toContain("All configured authentication methods failed");
+      expect(next.waits.length).toBeGreaterThanOrEqual(1); // a sleep can wake just before the deadline
+      expect(connections).toBe(2);
+    });
+
+    it("a refused connection still waits through the backoff", async () => {
+      const { config, close } = await startServer((conn) => conn.on("error", () => undefined));
+      await close(); // Nothing listens on the port any more: ECONNREFUSED.
+      const pool = new SSH2ConnectionPool();
+
+      const { waits, result } = acquire(pool, config, 2_500);
+      expect(String(await result)).toContain("ECONNREFUSED");
+      expect(waits.length).toBeGreaterThan(0);
+    });
+
+    it("a retired client's late error does not put the host into backoff", async () => {
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      });
+      const pool = new SSH2ConnectionPool();
+      pool.setIdleTimeoutMsForTests(100);
+
+      // Connection 1 is idle-closed, but its end() is held back, as on a dead TCP path.
+      const first = await pool.acquireConnection(config);
+      let idleClosed!: () => void;
+      const idleClose = new Promise<void>((resolve) => (idleClosed = resolve));
+      const endSpy = spyOn(first.client, "end").mockImplementation(() => {
+        idleClosed();
+        return first.client;
+      });
+      await idleClose;
+      endSpy.mockRestore();
+      const second = await pool.acquireConnection(config);
+      expect(second === first).toBe(false);
+
+      // Connection 1's late error is about a client the pool already dropped.
+      first.client.emit("error", new Error("write after end"));
+      first.client.end();
+
+      // Connection 2 closes cleanly; the next caller must connect at once, not wait out a backoff.
+      const secondClosed = new Promise<void>((resolve) =>
+        second.client.once("close", () => resolve())
+      );
+      second.client.end();
+      await secondClosed;
+      const third = await pool.acquireConnection(config, { maxWaitMs: 0 });
+      expect(third === second).toBe(false);
+      third.client.end();
+    });
+
+    // #5507: the client "error" handler backs off only while its entry is still the pool's. That
+    // relies on ssh2 emitting a keepalive timeout's "error" before "end"/"close": if an ssh2
+    // upgrade reversed that order, onClose would drop the entry first and a dead host would never
+    // back off. Real ssh2 on both ends; only the keepalive interval is shortened.
+    it("a keepalive timeout on a live connection puts the host into backoff", async () => {
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      });
+      // A TCP relay in front of the server that can stop forwarding the server's replies, so the
+      // client's keepalive pings go unanswered (a dead network path).
+      let frozen = false;
+      const sockets = new Set<net.Socket>();
+      const relay = net.createServer((downstream) => {
+        const upstream = net.connect(config.port ?? 22, "127.0.0.1");
+        for (const socket of [downstream, upstream]) {
+          sockets.add(socket);
+          socket.on("error", () => undefined);
+          socket.on("close", () => sockets.delete(socket));
+        }
+        downstream.on("data", (data) => upstream.write(data));
+        upstream.on("data", (data) => {
+          if (!frozen) downstream.write(data);
+        });
+        downstream.on("close", () => upstream.destroy());
+        upstream.on("close", () => downstream.destroy());
+      });
+      await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+      const realConnect = Client.prototype.connect; // eslint-disable-line @typescript-eslint/unbound-method -- called with the original receiver
+      const connectSpy = spyOn(Client.prototype, "connect").mockImplementation(function (
+        this: Client,
+        options: ConnectConfig
+      ) {
+        return realConnect.call(this, { ...options, keepaliveInterval: 50, keepaliveCountMax: 1 });
+      });
+      const pool = new SSH2ConnectionPool();
+      try {
+        const relayed = { ...config, port: (relay.address() as AddressInfo).port };
+        const entry = await pool.acquireConnection(relayed);
+        const reportFailure = spyOn(pool, "reportFailure");
+        // Registered after the pool's own handlers, so these run after them.
+        const events: string[] = [];
+        const closed = new Promise<void>((resolve) => entry.client.once("close", () => resolve()));
+        entry.client.on("error", () => events.push("error"));
+        entry.client.on("end", () => events.push("end"));
+        entry.client.on("close", () => events.push("close"));
+        frozen = true;
+        await closed;
+        expect(events[0]).toBe("error");
+        // Target assertion: the timeout reached the pool while the entry was still its own.
+        expect(reportFailure).toHaveBeenCalledTimes(1);
+        expect(String(reportFailure.mock.calls[0]?.[1])).toContain("Keepalive timeout");
+      } finally {
+        connectSpy.mockRestore();
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => relay.close(() => resolve()));
+      }
+    }, 15_000);
+
+    // #5033: an exec joining (or starting) a connect that is still pending must fail at its own
+    // deadline, while the connect keeps going for waiters with a longer budget. The server holds
+    // authentication until the test releases it, so the connect stays pending for as long as needed.
+    const deadlineCases = [
+      { waiting: "joining", startsConnect: false, deadlineInMs: 2_000 },
+      { waiting: "starting", startsConnect: true, deadlineInMs: 2_000 },
+      // A deadline that has already passed must not fall back to an unbounded wait.
+      {
+        waiting: "joining, with its deadline already passed,",
+        startsConnect: false,
+        deadlineInMs: -1,
+      },
+    ];
+    for (const { waiting, startsConnect, deadlineInMs } of deadlineCases) {
+      it(`an exec stops at its deadline while ${waiting} a pending connect`, async () => {
+        let releaseAuth!: () => void;
+        const authGate = new Promise<void>((resolve) => (releaseAuth = resolve));
+        let connections = 0;
+        const { config } = await startServer((conn) => {
+          connections++;
+          conn.on("authentication", (ctx) => void authGate.then(() => ctx.accept()));
+          conn.on("error", () => undefined);
+        });
+        // SSH2Transport execs use the shared pool.
+        const longWaiter = () =>
+          ssh2ConnectionPool.acquireConnection(config, { timeoutMs: 15_000, maxWaitMs: 30_000 });
+        const shortExec = () =>
+          new SSH2Transport(config)
+            .spawnRemoteProcess("true", { timeout: 30, deadlineMs: Date.now() + deadlineInMs })
+            .then(
+              () => new Error("exec unexpectedly succeeded"),
+              (error: unknown) => error
+            );
+
+        const started = Date.now();
+        // The first call starts the connect; the second joins it.
+        const short = startsConnect ? shortExec() : undefined;
+        const longResult = longWaiter().then(
+          (entry) => entry,
+          (error: unknown) => (error instanceof Error ? error : new Error(String(error)))
+        );
+        const failurePromise = short ?? shortExec();
+        try {
+          const failure = await failurePromise;
+          const elapsedMs = Date.now() - started;
+          expect(isRuntimeRetryableTransportError(failure)).toBe(true);
+          // Bounds, not exact timings: timers can fire a little early or late under load.
+          expect(elapsedMs).toBeGreaterThanOrEqual(Math.max(0, deadlineInMs - 500));
+          expect(elapsedMs).toBeLessThan(Math.max(0, deadlineInMs) + 3_000); // connect timeout: 15 s
+
+          releaseAuth();
+          const entry = await longResult;
+          expect(entry).not.toBeInstanceOf(Error);
+          expect(connections).toBe(1); // both callers shared one connect
+        } finally {
+          releaseAuth();
+          const entry = await longResult;
+          if (!(entry instanceof Error)) entry.client.end();
+          ssh2ConnectionPool.clearAllHealthForTests();
+        }
+      }, 30_000);
+    }
+
+    // #5101: the caller that starts a shared connect must not take it down for everyone when it
+    // aborts. maxWaitMs 0 makes a joiner fail on the first error; 30 s lets it retry, which on
+    // the old code started a second connect (and a second login) instead of joining the first.
+    for (const joinerMaxWaitMs of [0, 30_000]) {
+      it(`a joiner (maxWaitMs ${joinerMaxWaitMs}) keeps the connect when its starter aborts`, async () => {
+        let releaseAuth!: () => void;
+        const authGate = new Promise<void>((resolve) => (releaseAuth = resolve));
+        let authRequested!: () => void;
+        const authSeen = new Promise<void>((resolve) => (authRequested = resolve));
+        let connections = 0;
+        const { config } = await startServer((conn) => {
+          connections++;
+          conn.on("authentication", (ctx) => {
+            authRequested();
+            void authGate.then(() => ctx.accept());
+          });
+          conn.on("error", () => undefined);
+        });
+        const pool = new SSH2ConnectionPool();
+        const starterAbort = new AbortController();
+        const settle = <T>(promise: Promise<T>): Promise<T | Error> =>
+          promise.then(
+            (entry) => entry,
+            (error: unknown) => (error instanceof Error ? error : new Error(String(error)))
+          );
+
+        const starter = settle(
+          pool.acquireConnection(config, {
+            timeoutMs: 15_000,
+            maxWaitMs: 30_000,
+            abortSignal: starterAbort.signal,
+          })
+        );
+        const joiner = settle(
+          pool.acquireConnection(config, { timeoutMs: 15_000, maxWaitMs: joinerMaxWaitMs })
+        );
+        try {
+          await authSeen; // the connect is in flight on the server
+          const abortedAt = Date.now();
+          starterAbort.abort();
+          const starterResult = await starter;
+          // The starter's own wait still ends at its abort, well before the connect timeout.
+          expect(starterResult).toBeInstanceOf(Error);
+          expect((starterResult as Error).message).toContain("aborted");
+          expect(Date.now() - abortedAt).toBeLessThan(3_000);
+
+          releaseAuth();
+          const entry = await joiner;
+          expect(entry).not.toBeInstanceOf(Error);
+          expect(connections).toBe(1); // the joiner got the original connect, not a new one
+        } finally {
+          releaseAuth();
+          for (const result of [await starter, await joiner]) {
+            if (!(result instanceof Error)) result.client.end();
+          }
+        }
+      }, 30_000);
+    }
+  }
+);

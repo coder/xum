@@ -23,21 +23,39 @@ import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRuntimeEnablement } from "@/browser/hooks/useRuntimeEnablement";
 import {
   readSshOptionDefaults,
   type RuntimeOptionDefaults,
+  updateRuntimeOptionDefaults,
+  useRuntimeOptionDefaults,
   writeSshCoderDefaultsPreservingMode,
 } from "@/browser/utils/runtimeOptionDefaults";
 import {
+  PROJECT_ISOLATION_UI,
   RUNTIME_CHOICE_UI,
+  WORKSPACE_ISOLATION_UI,
   getRuntimeOptionField,
+  type IsolationOptionUi,
   type RuntimeUiSpec,
 } from "@/browser/utils/runtimeUi";
+import {
+  DEFAULT_ISOLATION,
+  PROJECT_ISOLATIONS,
+  WORKSPACE_ISOLATIONS,
+  WORKSPACE_ISOLATION_ENABLEMENT_ID,
+  getUnsupportedIsolationReason,
+  isolationEquals,
+  isProjectIsolationEnabled,
+  isWorkspaceIsolationEnabled,
+  nearestSupportedIsolation,
+  resolveEnabledIsolation,
+  type IsolationChoice,
+  type ProjectIsolation,
+  type WorkspaceIsolation,
+} from "@/common/types/isolation";
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
 import { cn } from "@/common/lib/utils";
-import { getLastRuntimeConfigKey } from "@/common/constants/storage";
 import type { ProjectConfig } from "@/common/types/project";
 import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
 import type {
@@ -47,9 +65,22 @@ import type {
   RuntimeMode,
 } from "@/common/types/runtime";
 
+import { ArchiveBehaviorSettings } from "./ArchiveBehaviorSettings";
+import { DefaultProjectDirSetting } from "./DefaultProjectDirSetting";
+import {
+  SETTINGS_CARD_CLASS,
+  SETTINGS_GROUP_CARD_CLASS,
+  SETTINGS_GROUP_HEADING_CLASS,
+  SettingsMark,
+} from "../Components/SettingsLayout";
+
 type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 
-type RuntimeRow = { id: RuntimeEnablementId } & RuntimeUiSpec;
+/**
+ * One toggle row. `id` is the legacy enablement key the option is stored under (see
+ * WORKSPACE_ISOLATION_ENABLEMENT_ID): keeping the on-disk keys makes upgrade<->downgrade lossless.
+ */
+type RuntimeRow = { id: RuntimeEnablementId; options?: string } & IsolationOptionUi;
 
 type RuntimeAvailabilityState =
   | { status: "idle" }
@@ -59,46 +90,61 @@ type RuntimeAvailabilityState =
 
 interface RuntimeOverrideCacheEntry {
   enablement: RuntimeEnablement;
-  defaultRuntime: RuntimeEnablementId | null;
+  defaultIsolation: IsolationChoice | null;
   pending: boolean;
   overridesEnabled: boolean;
 }
 
 const ALL_SCOPE_VALUE = "__all__";
 
-const RUNTIME_ROWS: RuntimeRow[] = [
-  { id: "local", ...RUNTIME_CHOICE_UI.local },
-  { id: "worktree", ...RUNTIME_CHOICE_UI.worktree },
-  { id: "ssh", ...RUNTIME_CHOICE_UI.ssh },
-  { id: "coder", ...RUNTIME_CHOICE_UI.coder },
-  { id: "docker", ...RUNTIME_CHOICE_UI.docker },
-  { id: "devcontainer", ...RUNTIME_CHOICE_UI.devcontainer },
+// Local is where the project already is, so it cannot be disabled and has no row.
+const PROJECT_ISOLATION_ROWS: RuntimeRow[] = [
+  { id: "ssh", ...PROJECT_ISOLATION_UI.ssh, options: RUNTIME_CHOICE_UI.ssh.options },
+  { id: "coder", ...PROJECT_ISOLATION_UI.coder, options: RUNTIME_CHOICE_UI.coder.options },
+];
+
+const WORKSPACE_ISOLATION_ROWS: RuntimeRow[] = WORKSPACE_ISOLATIONS.map((workspace) => {
+  const id = WORKSPACE_ISOLATION_ENABLEMENT_ID[workspace];
+  const legacyUi: RuntimeUiSpec = RUNTIME_CHOICE_UI[id];
+  return { id, ...WORKSPACE_ISOLATION_UI[workspace], options: legacyUi.options };
+});
+
+const ISOLATION_ROW_GROUPS = [
+  {
+    title: "Project isolation",
+    // Settings search target (settingsRegistry).
+    markId: "project-isolation",
+    description: "Where workspaces run. Local is always available.",
+    rows: PROJECT_ISOLATION_ROWS,
+  },
+  {
+    title: "Workspace isolation",
+    markId: "workspace-isolation",
+    description: "How each workspace is separated from the others.",
+    rows: WORKSPACE_ISOLATION_ROWS,
+  },
 ];
 
 function getProjectLabel(path: string) {
   return path.split(/[\\/]/).pop() ?? path;
 }
 
-function getFallbackRuntime(enablement: RuntimeEnablement): RuntimeEnablementId | null {
-  return RUNTIME_ROWS.find((runtime) => enablement[runtime.id])?.id ?? null;
-}
-
 function deriveProjectOverrideState(
   selectedProjectPath: string | null,
   projects: Map<string, ProjectConfig>,
   enablement: RuntimeEnablement,
-  defaultRuntime: RuntimeEnablementId | null | undefined,
+  defaultIsolation: IsolationChoice | null | undefined,
   overrideCache: Map<string, RuntimeOverrideCacheEntry>
 ): {
   projectOverrideEnabled: boolean;
   projectEnablement: RuntimeEnablement;
-  projectDefaultRuntime: RuntimeEnablementId | null;
+  projectDefaultIsolation: IsolationChoice | null;
 } {
   if (!selectedProjectPath) {
     return {
       projectOverrideEnabled: false,
       projectEnablement: enablement,
-      projectDefaultRuntime: defaultRuntime ?? null,
+      projectDefaultIsolation: defaultIsolation ?? null,
     };
   }
 
@@ -109,7 +155,7 @@ function deriveProjectOverrideState(
     return {
       projectOverrideEnabled: cached.overridesEnabled === true,
       projectEnablement: cached.enablement,
-      projectDefaultRuntime: cached.defaultRuntime ?? defaultRuntime ?? null,
+      projectDefaultIsolation: cached.defaultIsolation ?? defaultIsolation ?? null,
     };
   }
 
@@ -117,7 +163,7 @@ function deriveProjectOverrideState(
   const hasOverrides =
     projectConfig?.runtimeOverridesEnabled === true ||
     Boolean(projectConfig?.runtimeEnablement) ||
-    projectConfig?.defaultRuntime !== undefined;
+    projectConfig?.defaultIsolation !== undefined;
 
   if (hasOverrides) {
     const resolvedEnablement = normalizeRuntimeEnablement(projectConfig?.runtimeEnablement);
@@ -127,14 +173,14 @@ function deriveProjectOverrideState(
     return {
       projectOverrideEnabled: true,
       projectEnablement: resolvedEnablement,
-      projectDefaultRuntime: projectConfig?.defaultRuntime ?? defaultRuntime ?? null,
+      projectDefaultIsolation: projectConfig?.defaultIsolation ?? defaultIsolation ?? null,
     };
   }
 
   return {
     projectOverrideEnabled: false,
     projectEnablement: enablement,
-    projectDefaultRuntime: defaultRuntime ?? null,
+    projectDefaultIsolation: defaultIsolation ?? null,
   };
 }
 
@@ -183,9 +229,9 @@ function CodeWorkspaceSyncField(props: { projectPath: string }) {
     <div className="border-border-light bg-background-secondary rounded-md border px-3 py-2">
       <div className="text-foreground text-sm">VS Code workspace file</div>
       <div className="text-muted text-xs">
-        Path of a <code className="text-accent">.code-workspace</code> file kept in sync with this
-        project&apos;s active worktrees (absolute, <code className="text-accent">~</code>, or
-        relative to the project). Leave empty to disable.
+        Path of a <code className="text-accent-text">.code-workspace</code> file kept in sync with
+        this project&apos;s active worktrees (absolute, <code className="text-accent-text">~</code>,
+        or relative to the project). Leave empty to disable.
       </div>
       <div className="mt-2 flex items-center gap-2">
         <Input
@@ -220,7 +266,7 @@ function CodeWorkspaceSyncField(props: { projectPath: string }) {
 export function RuntimesSection() {
   const { api } = useAPI();
   const { userProjects, refreshProjects } = useProjectContext();
-  const { enablement, setRuntimeEnabled, defaultRuntime, setDefaultRuntime } =
+  const { enablement, setRuntimeEnabled, defaultIsolation, setDefaultIsolation } =
     useRuntimeEnablement();
   const { runtimesProjectPath, setRuntimesProjectPath } = useSettings();
 
@@ -257,20 +303,19 @@ export function RuntimesSection() {
   const selectedProjectPath = effectiveScope === ALL_SCOPE_VALUE ? null : effectiveScope;
   const isProjectScope = Boolean(selectedProjectPath);
 
-  // Per-project runtime option defaults (SSH host, Docker image, etc.).
-  // Same localStorage keys the creation flow reads, so edits here are reflected immediately.
-  const runtimeConfigKey = selectedProjectPath
-    ? getLastRuntimeConfigKey(selectedProjectPath)
-    : "__no_project_defaults__";
-  const [runtimeOptionConfigs, setRuntimeOptionConfigs] = usePersistedState<RuntimeOptionDefaults>(
-    runtimeConfigKey,
-    {},
-    { listener: true }
-  );
+  // Per-project runtime option defaults (SSH host, Docker image, etc.), shared with creation.
+  const runtimeOptionConfigs = useRuntimeOptionDefaults(selectedProjectPath);
+  const setRuntimeOptionConfigs = (
+    update: (prev: RuntimeOptionDefaults) => RuntimeOptionDefaults
+  ) => {
+    if (selectedProjectPath) {
+      updateRuntimeOptionDefaults(selectedProjectPath, update);
+    }
+  };
   const sshOptionDefaults = readSshOptionDefaults(runtimeOptionConfigs, "");
 
   // Settings-local Coder draft: absorbs hook auto-selection without persisting.
-  // Only written to localStorage after explicit user interaction.
+  // Only saved to the project defaults after explicit user interaction.
   const [coderDraftConfig, setCoderDraftConfig] = useState<CoderWorkspaceConfig | null>(null);
   const hasCoderUserInteractionRef = useRef(false);
   const selectedProjectPathRef = useRef(selectedProjectPath);
@@ -310,7 +355,7 @@ export function RuntimesSection() {
     payload: {
       projectPath: string;
       runtimeEnablement?: RuntimeEnablement | null;
-      defaultRuntime?: RuntimeEnablementId | null;
+      defaultIsolation?: IsolationChoice | null;
       runtimeOverridesEnabled?: boolean | null;
     }
   ) => {
@@ -340,18 +385,20 @@ export function RuntimesSection() {
 
   // Keep project override UI purely derived from project config + pending cache.
   // This avoids duplicated derived state and effect-driven synchronization.
-  const { projectOverrideEnabled, projectEnablement, projectDefaultRuntime } =
+  const { projectOverrideEnabled, projectEnablement, projectDefaultIsolation } =
     deriveProjectOverrideState(
       selectedProjectPath,
       userProjects,
       enablement,
-      defaultRuntime,
+      defaultIsolation,
       overrideCacheRef.current
     );
   const isProjectOverrideActive = isProjectScope && projectOverrideEnabled;
 
   const effectiveEnablement = isProjectOverrideActive ? projectEnablement : enablement;
-  const effectiveDefaultRuntime = isProjectOverrideActive ? projectDefaultRuntime : defaultRuntime;
+  const effectiveDefaultIsolation = isProjectOverrideActive
+    ? projectDefaultIsolation
+    : defaultIsolation;
   // Coder config precedence: draft (in-session auto-selection) → persisted → seed.
   // Draft-first ensures auto-selected templates/presets from useCoderWorkspace are
   // immediately reflected in the form, even when persisted config is already non-null.
@@ -375,7 +422,7 @@ export function RuntimesSection() {
       // Always update local draft for UI responsiveness.
       setCoderDraftConfig(nextConfig);
 
-      // Only persist to localStorage after explicit user interaction.
+      // Only persist to the project defaults after explicit user interaction.
       if (!hasCoderUserInteractionRef.current) {
         return;
       }
@@ -417,17 +464,22 @@ export function RuntimesSection() {
   const availabilityMap =
     runtimeAvailabilityState.status === "loaded" ? runtimeAvailabilityState.data : null;
 
-  const enabledRuntimeOptions = RUNTIME_ROWS.filter((runtime) => effectiveEnablement[runtime.id]);
-  const enabledRuntimeCount = enabledRuntimeOptions.length;
+  // Project Local is always enabled, so only the workspace axis can run out of options.
+  const enabledWorkspaceIsolationCount = WORKSPACE_ISOLATIONS.filter((workspace) =>
+    isWorkspaceIsolationEnabled(effectiveEnablement, workspace)
+  ).length;
 
-  const defaultRuntimeValue =
-    effectiveDefaultRuntime && effectiveEnablement[effectiveDefaultRuntime]
-      ? effectiveDefaultRuntime
-      : "";
-  const defaultRuntimePlaceholder =
-    enabledRuntimeOptions.length === 0 ? "No runtimes enabled" : "Select default runtime";
-  const defaultRuntimeDisabled =
-    enabledRuntimeOptions.length === 0 || (isProjectScope && !projectOverrideEnabled);
+  // What new workspaces get: the stored pair if Settings still allow it, else the nearest one.
+  const shownDefaultIsolation =
+    resolveEnabledIsolation(effectiveDefaultIsolation ?? DEFAULT_ISOLATION, effectiveEnablement) ??
+    DEFAULT_ISOLATION;
+  const defaultIsolationDisabled = isProjectScope && !projectOverrideEnabled;
+  const defaultProjectOptions = PROJECT_ISOLATIONS.filter((project) =>
+    isProjectIsolationEnabled(effectiveEnablement, project)
+  );
+  const defaultWorkspaceOptions = WORKSPACE_ISOLATIONS.filter((workspace) =>
+    isWorkspaceIsolationEnabled(effectiveEnablement, workspace)
+  );
 
   const handleOverrideToggle = (checked: boolean) => {
     if (!selectedProjectPath) {
@@ -437,14 +489,14 @@ export function RuntimesSection() {
     if (!checked) {
       const cacheEntry: RuntimeOverrideCacheEntry = {
         enablement,
-        defaultRuntime: defaultRuntime ?? null,
+        defaultIsolation: defaultIsolation ?? null,
         pending: true,
         overridesEnabled: false,
       };
       queueProjectOverrideUpdate(selectedProjectPath, cacheEntry, {
         projectPath: selectedProjectPath,
         runtimeEnablement: null,
-        defaultRuntime: null,
+        defaultIsolation: null,
         runtimeOverridesEnabled: null,
       });
       return;
@@ -453,27 +505,23 @@ export function RuntimesSection() {
     const nextEnablement = { ...enablement };
     const cacheEntry: RuntimeOverrideCacheEntry = {
       enablement: nextEnablement,
-      defaultRuntime: defaultRuntime ?? null,
+      defaultIsolation: defaultIsolation ?? null,
       pending: true,
       overridesEnabled: true,
     };
     queueProjectOverrideUpdate(selectedProjectPath, cacheEntry, {
       projectPath: selectedProjectPath,
       runtimeEnablement: nextEnablement,
-      defaultRuntime: defaultRuntime ?? null,
+      defaultIsolation: defaultIsolation ?? null,
       runtimeOverridesEnabled: true,
     });
   };
 
   const handleRuntimeToggle = (runtimeId: RuntimeEnablementId, enabled: boolean) => {
-    if (!enabled) {
-      // Keep at least one runtime enabled to avoid leaving users without a fallback.
-      const currentEnabledCount = RUNTIME_ROWS.filter(
-        (runtime) => effectiveEnablement[runtime.id]
-      ).length;
-      if (currentEnabledCount <= 1) {
-        return;
-      }
+    const isWorkspaceRow = WORKSPACE_ISOLATION_ROWS.some((row) => row.id === runtimeId);
+    // Keep at least one workspace isolation enabled so every project has a fallback.
+    if (!enabled && isWorkspaceRow && enabledWorkspaceIsolationCount <= 1) {
+      return;
     }
 
     const nextEnablement: RuntimeEnablement = {
@@ -482,19 +530,10 @@ export function RuntimesSection() {
     };
 
     if (!isProjectScope) {
-      const implicitDefault: RuntimeEnablementId = defaultRuntime ?? RUNTIME_MODE.WORKTREE;
-      let nextDefaultRuntime: RuntimeEnablementId | null = implicitDefault;
-      if (!nextEnablement[implicitDefault]) {
-        nextDefaultRuntime = getFallbackRuntime(nextEnablement);
-      }
-
-      const shouldUpdateDefault =
-        defaultRuntime !== null
-          ? nextDefaultRuntime !== defaultRuntime
-          : nextDefaultRuntime !== implicitDefault;
-
-      if (shouldUpdateDefault) {
-        setRuntimeEnabled(runtimeId, enabled, nextDefaultRuntime ?? null);
+      const implicitDefault = defaultIsolation ?? DEFAULT_ISOLATION;
+      const nextDefault = resolveEnabledIsolation(implicitDefault, nextEnablement);
+      if (!isolationEquals(nextDefault, implicitDefault)) {
+        setRuntimeEnabled(runtimeId, enabled, nextDefault);
       } else {
         setRuntimeEnabled(runtimeId, enabled);
       }
@@ -505,14 +544,12 @@ export function RuntimesSection() {
       return;
     }
 
-    const inheritedDefault = projectDefaultRuntime ?? defaultRuntime ?? null;
-    let nextDefaultRuntime = inheritedDefault;
-    if (nextDefaultRuntime && !nextEnablement[nextDefaultRuntime]) {
-      nextDefaultRuntime = getFallbackRuntime(nextEnablement);
-    }
+    const inheritedDefault = projectDefaultIsolation ?? defaultIsolation ?? null;
+    const nextDefault =
+      inheritedDefault === null ? null : resolveEnabledIsolation(inheritedDefault, nextEnablement);
     const cacheEntry: RuntimeOverrideCacheEntry = {
       enablement: nextEnablement,
-      defaultRuntime: nextDefaultRuntime,
+      defaultIsolation: nextDefault,
       pending: true,
       overridesEnabled: true,
     };
@@ -520,7 +557,7 @@ export function RuntimesSection() {
     const updatePayload: {
       projectPath: string;
       runtimeEnablement: RuntimeEnablement;
-      defaultRuntime?: RuntimeEnablementId | null;
+      defaultIsolation?: IsolationChoice | null;
       runtimeOverridesEnabled?: boolean;
     } = {
       projectPath: selectedProjectPath,
@@ -528,18 +565,21 @@ export function RuntimesSection() {
       runtimeOverridesEnabled: true,
     };
 
-    if (nextDefaultRuntime !== projectDefaultRuntime) {
-      updatePayload.defaultRuntime = nextDefaultRuntime ?? null;
+    if (!isolationEquals(nextDefault, projectDefaultIsolation)) {
+      updatePayload.defaultIsolation = nextDefault;
     }
 
     queueProjectOverrideUpdate(selectedProjectPath, cacheEntry, updatePayload);
   };
 
-  const handleDefaultRuntimeChange = (value: string) => {
-    const runtimeId = value as RuntimeEnablementId;
+  const handleDefaultIsolationChange = (choice: IsolationChoice) => {
+    // Persist what new workspaces will actually get: a pair with no backend yet, or one Settings
+    // disable, snaps to the nearest supported and enabled pair (the same rule the select shows).
+    const next =
+      resolveEnabledIsolation(choice, effectiveEnablement) ?? nearestSupportedIsolation(choice);
 
     if (!isProjectScope) {
-      setDefaultRuntime(runtimeId);
+      setDefaultIsolation(next);
       return;
     }
 
@@ -549,20 +589,21 @@ export function RuntimesSection() {
 
     const cacheEntry: RuntimeOverrideCacheEntry = {
       enablement: projectEnablement,
-      defaultRuntime: runtimeId,
+      defaultIsolation: next,
       pending: true,
       overridesEnabled: true,
     };
     queueProjectOverrideUpdate(selectedProjectPath, cacheEntry, {
       projectPath: selectedProjectPath,
-      defaultRuntime: runtimeId,
+      defaultIsolation: next,
       runtimeOverridesEnabled: true,
     });
   };
 
   return (
-    <div className="space-y-6">
-      <div className="space-y-4">
+    <div className="space-y-8">
+      <div className={cn(SETTINGS_CARD_CLASS, "space-y-4")}>
+        <SettingsMark id="runtime-scope" />
         <div className="flex items-center justify-between gap-4">
           <div>
             <div className="text-foreground text-sm">Scope</div>
@@ -607,181 +648,252 @@ export function RuntimesSection() {
         ) : null}
       </div>
 
-      <div className="space-y-4">
+      <div>
         <div
           className={cn(
-            "flex items-center justify-between gap-4",
-            isProjectScope && !projectOverrideEnabled && "opacity-60"
+            SETTINGS_CARD_CLASS,
+            "flex flex-wrap items-center justify-between gap-4",
+            defaultIsolationDisabled && "opacity-60"
           )}
         >
+          <SettingsMark id="default-isolation" />
           <div>
-            <div className="text-foreground text-sm">Default runtime</div>
+            <div className="text-foreground text-sm">Default isolation</div>
             <div className="text-muted text-xs">
               {isProjectScope
-                ? "Applied to new workspaces in this project."
-                : "Applied to new workspaces by default."}
+                ? "Where new workspaces in this project run, and how they are isolated."
+                : "Where new workspaces run, and how they are isolated."}
             </div>
           </div>
-          <Select
-            value={defaultRuntimeValue}
-            onValueChange={handleDefaultRuntimeChange}
-            disabled={defaultRuntimeDisabled}
-          >
-            <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto min-w-[180px] cursor-pointer rounded-md border px-3 text-sm transition-colors">
-              <SelectValue placeholder={defaultRuntimePlaceholder} />
-            </SelectTrigger>
-            <SelectContent>
-              {enabledRuntimeOptions.map((runtime) => (
-                <SelectItem key={runtime.id} value={runtime.id}>
-                  {runtime.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="divide-border-light divide-y">
-          {RUNTIME_ROWS.map((runtime) => {
-            const Icon = runtime.Icon;
-            const isCoder = runtime.id === "coder";
-            const availability = isCoder
-              ? null
-              : (availabilityMap?.[runtime.id as RuntimeMode] ?? null);
-            const availabilityReason = isProjectScope
-              ? isCoder
-                ? coderAvailability.state !== "available" && coderAvailability.state !== "loading"
-                  ? coderAvailability.reason
-                  : null
-                : availability && !availability.available
-                  ? availability.reason
-                  : null
-              : null;
-            const showLoading = isProjectScope
-              ? isCoder
-                ? coderAvailability.state === "loading"
-                : runtimeAvailabilityState.status === "loading"
-              : false;
-            const rowDisabled = isProjectScope && !projectOverrideEnabled;
-            const isLastEnabled = effectiveEnablement[runtime.id] && enabledRuntimeCount <= 1;
-            const switchDisabled = rowDisabled || isLastEnabled;
-            const optionSpec = getRuntimeOptionField(runtime.id);
-            const optionRuntimeMode: RuntimeMode =
-              runtime.id === "coder" ? RUNTIME_MODE.SSH : runtime.id;
-            const switchControl = (
-              <Switch
-                checked={effectiveEnablement[runtime.id]}
-                disabled={switchDisabled}
-                onCheckedChange={(checked) => handleRuntimeToggle(runtime.id, checked)}
-                aria-label={`Toggle ${runtime.label} runtime`}
-              />
-            );
-            const switchNode =
-              isLastEnabled && !rowDisabled ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="inline-flex">{switchControl}</span>
-                  </TooltipTrigger>
-                  <TooltipContent align="end">At least one runtime must be enabled.</TooltipContent>
-                </Tooltip>
-              ) : (
-                switchControl
-              );
-
-            // Inline status indicators keep availability feedback from shifting row layout.
-            return (
-              <div
-                key={runtime.id}
-                className={cn(
-                  "flex items-start justify-between gap-4 py-3",
-                  rowDisabled && "opacity-60"
-                )}
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              value={shownDefaultIsolation.project}
+              onValueChange={(value) =>
+                handleDefaultIsolationChange({
+                  project: value as ProjectIsolation,
+                  workspace: shownDefaultIsolation.workspace,
+                })
+              }
+              disabled={defaultIsolationDisabled}
+            >
+              <SelectTrigger
+                aria-label="Default project isolation"
+                className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto min-w-[120px] cursor-pointer rounded-md border px-3 text-sm transition-colors"
               >
-                <div className="flex flex-1 gap-3 pr-4">
-                  <Icon size={16} className="text-muted mt-0.5" />
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2">
-                      <div className="text-foreground text-sm">{runtime.label}</div>
-                      {availabilityReason ? (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span className="bg-warning/10 text-warning border-warning/30 inline-flex cursor-help items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px]">
-                              <AlertTriangle className="h-3 w-3" />
-                              Unavailable
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent align="start" className="max-w-64 whitespace-normal">
-                            {availabilityReason}
-                          </TooltipContent>
-                        </Tooltip>
-                      ) : null}
-                    </div>
-                    <div className="text-muted text-xs">{runtime.description}</div>
-                    {/* Configurable option inputs: project scope uses the same input component
-                        and localStorage defaults as the creation flow. */}
-                    {!optionSpec || !selectedProjectPath ? (
-                      runtime.options && !selectedProjectPath ? (
-                        <div className="text-muted/70 text-[11px]">Options: {runtime.options}</div>
-                      ) : null
-                    ) : (
-                      <RuntimeConfigInput
-                        fieldSpec={optionSpec}
-                        value={readOptionField(optionRuntimeMode, optionSpec.field)}
-                        onChange={(value) =>
-                          setOptionField(optionRuntimeMode, optionSpec.field, value)
-                        }
-                        disabled={rowDisabled}
-                        className="mt-1.5"
-                        inputClassName="w-full max-w-[260px]"
-                        ariaLabel={`${optionSpec.label} for ${runtime.label}`}
-                        stacked
-                      />
-                    )}
-                    {isCoder &&
-                    selectedProjectPath &&
-                    effectiveEnablement.coder &&
-                    coderAvailability.state === "available" ? (
-                      <CoderWorkspaceForm
-                        className="mt-3"
-                        coderConfig={coderWorkspace.coderConfig}
-                        onCoderConfigChange={(config) => {
-                          hasCoderUserInteractionRef.current = true;
-                          coderWorkspace.setCoderConfig(config);
-                        }}
-                        templates={coderWorkspace.templates}
-                        templatesError={coderWorkspace.templatesError}
-                        presets={coderWorkspace.presets}
-                        presetsError={coderWorkspace.presetsError}
-                        existingWorkspaces={coderWorkspace.existingWorkspaces}
-                        workspacesError={coderWorkspace.workspacesError}
-                        loadingTemplates={coderWorkspace.loadingTemplates}
-                        loadingPresets={coderWorkspace.loadingPresets}
-                        loadingWorkspaces={coderWorkspace.loadingWorkspaces}
-                        username={
-                          coderWorkspace.coderInfo?.state === "available"
-                            ? coderWorkspace.coderInfo.username
-                            : undefined
-                        }
-                        deploymentUrl={
-                          coderWorkspace.coderInfo?.state === "available"
-                            ? coderWorkspace.coderInfo.url
-                            : undefined
-                        }
-                        disabled={rowDisabled || coderAvailability.state !== "available"}
-                      />
-                    ) : null}
-                  </div>
-                </div>
-                <div className="flex items-center gap-3">
-                  <div className="flex h-4 w-4 items-center justify-center">
-                    {showLoading ? <Loader2 className="text-muted h-4 w-4 animate-spin" /> : null}
-                  </div>
-                  {switchNode}
-                </div>
-              </div>
-            );
-          })}
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {defaultProjectOptions.map((project) => (
+                  <SelectItem key={project} value={project}>
+                    {PROJECT_ISOLATION_UI[project].label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={shownDefaultIsolation.workspace}
+              onValueChange={(value) =>
+                handleDefaultIsolationChange({
+                  project: shownDefaultIsolation.project,
+                  workspace: value as WorkspaceIsolation,
+                })
+              }
+              disabled={defaultIsolationDisabled}
+            >
+              <SelectTrigger
+                aria-label="Default workspace isolation"
+                className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto min-w-[140px] cursor-pointer rounded-md border px-3 text-sm transition-colors"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {defaultWorkspaceOptions.map((workspace) => {
+                  const unsupportedReason = getUnsupportedIsolationReason({
+                    project: shownDefaultIsolation.project,
+                    workspace,
+                  });
+                  return (
+                    <SelectItem
+                      key={workspace}
+                      value={workspace}
+                      disabled={unsupportedReason !== null}
+                    >
+                      {WORKSPACE_ISOLATION_UI[workspace].label}
+                      {unsupportedReason !== null ? " (not yet supported)" : ""}
+                    </SelectItem>
+                  );
+                })}
+              </SelectContent>
+            </Select>
+          </div>
         </div>
+
+        {ISOLATION_ROW_GROUPS.map((group) => (
+          <section key={group.title} className="space-y-2 pt-4">
+            <SettingsMark id={group.markId} />
+            <div className="px-1">
+              <h3 className={SETTINGS_GROUP_HEADING_CLASS}>{group.title}</h3>
+              <div className="text-muted mt-1 text-xs">{group.description}</div>
+            </div>
+            <div className={SETTINGS_GROUP_CARD_CLASS}>
+              {group.rows.map((runtime) => {
+                const Icon = runtime.Icon;
+                const isCoder = runtime.id === "coder";
+                const availability = isCoder
+                  ? null
+                  : (availabilityMap?.[runtime.id as RuntimeMode] ?? null);
+                const availabilityReason = isProjectScope
+                  ? isCoder
+                    ? coderAvailability.state !== "available" &&
+                      coderAvailability.state !== "loading"
+                      ? coderAvailability.reason
+                      : null
+                    : availability && !availability.available
+                      ? availability.reason
+                      : null
+                  : null;
+                const showLoading = isProjectScope
+                  ? isCoder
+                    ? coderAvailability.state === "loading"
+                    : runtimeAvailabilityState.status === "loading"
+                  : false;
+                const rowDisabled = isProjectScope && !projectOverrideEnabled;
+                const isLastEnabled =
+                  WORKSPACE_ISOLATION_ROWS.includes(runtime) &&
+                  effectiveEnablement[runtime.id] &&
+                  enabledWorkspaceIsolationCount <= 1;
+                const switchDisabled = rowDisabled || isLastEnabled;
+                const optionSpec = getRuntimeOptionField(runtime.id);
+                const optionRuntimeMode: RuntimeMode =
+                  runtime.id === "coder" ? RUNTIME_MODE.SSH : runtime.id;
+                const switchControl = (
+                  <Switch
+                    checked={effectiveEnablement[runtime.id]}
+                    disabled={switchDisabled}
+                    onCheckedChange={(checked) => handleRuntimeToggle(runtime.id, checked)}
+                    aria-label={`Toggle ${runtime.label} isolation`}
+                  />
+                );
+                const switchNode =
+                  isLastEnabled && !rowDisabled ? (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="inline-flex">{switchControl}</span>
+                      </TooltipTrigger>
+                      <TooltipContent align="end">
+                        At least one workspace isolation must be enabled.
+                      </TooltipContent>
+                    </Tooltip>
+                  ) : (
+                    switchControl
+                  );
+
+                // Inline status indicators keep availability feedback from shifting row layout.
+                return (
+                  <div
+                    key={runtime.id}
+                    className={cn(
+                      "flex items-start justify-between gap-4 px-4 py-3",
+                      rowDisabled && "opacity-60"
+                    )}
+                  >
+                    <div className="flex flex-1 gap-3 pr-4">
+                      <Icon size={16} className="text-muted mt-0.5" />
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <div className="text-foreground text-sm">{runtime.label}</div>
+                          {availabilityReason ? (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="bg-warning/10 text-warning border-warning/30 inline-flex cursor-help items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px]">
+                                  <AlertTriangle className="h-3 w-3" />
+                                  Unavailable
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent align="start" className="max-w-64 whitespace-normal">
+                                {availabilityReason}
+                              </TooltipContent>
+                            </Tooltip>
+                          ) : null}
+                        </div>
+                        <div className="text-muted text-xs">{runtime.description}</div>
+                        {/* Configurable option inputs: project scope uses the same input component
+                        and localStorage defaults as the creation flow. */}
+                        {!optionSpec || !selectedProjectPath ? (
+                          runtime.options && !selectedProjectPath ? (
+                            <div className="text-muted/70 text-[11px]">
+                              Options: {runtime.options}
+                            </div>
+                          ) : null
+                        ) : (
+                          <RuntimeConfigInput
+                            fieldSpec={optionSpec}
+                            value={readOptionField(optionRuntimeMode, optionSpec.field)}
+                            onChange={(value) =>
+                              setOptionField(optionRuntimeMode, optionSpec.field, value)
+                            }
+                            disabled={rowDisabled}
+                            className="mt-1.5"
+                            inputClassName="w-full max-w-[260px]"
+                            ariaLabel={`${optionSpec.label} for ${runtime.label}`}
+                            stacked
+                          />
+                        )}
+                        {isCoder &&
+                        selectedProjectPath &&
+                        effectiveEnablement.coder &&
+                        coderAvailability.state === "available" ? (
+                          <CoderWorkspaceForm
+                            className="mt-3"
+                            coderConfig={coderWorkspace.coderConfig}
+                            onCoderConfigChange={(config) => {
+                              hasCoderUserInteractionRef.current = true;
+                              coderWorkspace.setCoderConfig(config);
+                            }}
+                            templates={coderWorkspace.templates}
+                            templatesError={coderWorkspace.templatesError}
+                            presets={coderWorkspace.presets}
+                            presetsError={coderWorkspace.presetsError}
+                            existingWorkspaces={coderWorkspace.existingWorkspaces}
+                            workspacesError={coderWorkspace.workspacesError}
+                            loadingTemplates={coderWorkspace.loadingTemplates}
+                            loadingPresets={coderWorkspace.loadingPresets}
+                            loadingWorkspaces={coderWorkspace.loadingWorkspaces}
+                            username={
+                              coderWorkspace.coderInfo?.state === "available"
+                                ? coderWorkspace.coderInfo.username
+                                : undefined
+                            }
+                            deploymentUrl={
+                              coderWorkspace.coderInfo?.state === "available"
+                                ? coderWorkspace.coderInfo.url
+                                : undefined
+                            }
+                            disabled={rowDisabled || coderAvailability.state !== "available"}
+                          />
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-4 w-4 items-center justify-center">
+                        {showLoading ? (
+                          <Loader2 className="text-muted h-4 w-4 animate-spin" />
+                        ) : null}
+                      </div>
+                      {switchNode}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        ))}
       </div>
+
+      {/* Global settings about where workspaces live and what archiving does to them; they used
+          to sit in General. They apply to every project, whatever the scope above shows. */}
+      <ArchiveBehaviorSettings />
+      <DefaultProjectDirSetting />
     </div>
   );
 }

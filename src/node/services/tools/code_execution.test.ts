@@ -15,6 +15,8 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { SandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
+import { registerCodexPluginHooks } from "@/node/services/agentPlugins/codexHookRunner";
+import { eventSpine } from "@/node/services/events/eventSpine";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RESULT_HANDLE_VARS_CAP_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 import { KERNEL_RETAINED_MEDIA_BUDGET_BYTES } from "@/constants/kernelOutput";
@@ -990,6 +992,8 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-offload");
     });
 
+    // Native insert/replace tools are direct-only. The legacy line-edit fixture
+    // keeps nested edit capture/budget coverage without re-exposing those tools.
     it("keeps results on persistence-critical records (file_edit_*/agent_skill_read) in kernel mode", async () => {
       // Post-compaction persistence extractors mine nested file_edit_* diffs
       // (extractEditedFileDiffs) and agent_skill_read snapshots
@@ -998,8 +1002,8 @@ describe("createCodeExecutionTool", () => {
       using tmp = new DisposableTempDir("code-exec-persist-records");
       const host = new SandboxHostService();
       const tools: Record<string, Tool> = {
-        file_edit_insert: createMockTool(
-          "file_edit_insert",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string() }),
           () => ({
             success: true,
@@ -1024,12 +1028,12 @@ describe("createCodeExecutionTool", () => {
 
       const result = (await tool.execute!(
         {
-          code: 'mux.file_edit_insert({path: "/a.ts"}); mux.agent_skill_read({name: "demo"}); return true;',
+          code: 'mux.file_edit_replace_lines({path: "/a.ts"}); mux.agent_skill_read({name: "demo"}); return true;',
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
-      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
       expect((editRecord?.result as { diff?: string })?.diff).toContain("+hello");
       const skillRecord = result.toolCalls.find((r) => r.toolName === "agent_skill_read");
       const skill = (skillRecord?.result as { skill?: { body?: string } })?.skill;
@@ -1046,8 +1050,8 @@ describe("createCodeExecutionTool", () => {
       const bigDiff = `@@ -0,0 +1 @@\n+${"x".repeat(20_000)}`;
       const mediaData = "aGVsbG8=";
       const tools: Record<string, Tool> = {
-        file_edit_replace_string: createMockTool(
-          "file_edit_replace_string",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string() }),
           () => ({ success: true, diff: bigDiff })
         ),
@@ -1068,13 +1072,13 @@ describe("createCodeExecutionTool", () => {
 
       const result = (await tool.execute!(
         {
-          code: 'mux.file_edit_replace_string({path: "/big.ts"}); mux.mcp__shots__take({}); return true;',
+          code: 'mux.file_edit_replace_lines({path: "/big.ts"}); mux.mcp__shots__take({}); return true;',
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
 
-      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_string");
+      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
       expect((editRecord?.result as { diff?: string })?.diff).toBe(bigDiff);
 
       const shotRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
@@ -1099,8 +1103,8 @@ describe("createCodeExecutionTool", () => {
       const hunk2 = `@@ -5,0 +7,1 @@\n+${"b".repeat(30_000)}\n`;
       const hugeDiff = `${hunk1}${hunk2}`;
       const tools: Record<string, Tool> = {
-        file_edit_insert: createMockTool(
-          "file_edit_insert",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string() }),
           () => ({
             success: true,
@@ -1116,11 +1120,11 @@ describe("createCodeExecutionTool", () => {
       );
 
       const result = (await tool.execute!(
-        { code: 'mux.file_edit_insert({path: "/huge.ts"}); return true;' },
+        { code: 'mux.file_edit_replace_lines({path: "/huge.ts"}); return true;' },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
-      const record = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const record = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
       const retained = record?.result as { diff?: string; diffTruncated?: boolean };
       // The first whole hunk is retained; the second (which would cross the
       // cap) is dropped, and the truncation is flagged for the extractor.
@@ -1137,8 +1141,8 @@ describe("createCodeExecutionTool", () => {
       using tmp = new DisposableTempDir("code-exec-bounded-edit-args");
       const host = new SandboxHostService();
       const tools: Record<string, Tool> = {
-        file_edit_insert: createMockTool(
-          "file_edit_insert",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string(), content: z.string() }),
           () => ({ success: true, diff: "@@ -1,0 +1,1 @@\n+hello\n" })
         ),
@@ -1152,12 +1156,12 @@ describe("createCodeExecutionTool", () => {
 
       const result = (await tool.execute!(
         {
-          code: 'mux.file_edit_insert({path: "/kept.ts", content: "x".repeat(5000)}); return true;',
+          code: 'mux.file_edit_replace_lines({path: "/kept.ts", content: "x".repeat(5000)}); return true;',
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
-      const record = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const record = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
       const args = record?.args as {
         __kernelBounded?: boolean;
         path?: string;
@@ -1318,18 +1322,13 @@ describe("createCodeExecutionTool", () => {
             value: [{ type: "media", mediaType: "image/png", data: imageData }],
           },
         })),
-        file_edit_insert: createMockTool(
-          "file_edit_insert",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string() }),
-          () => ({
-            success: true,
+          (args) => ({
+            success: !(args as { path: string }).path.endsWith("failed.ts"),
             diff: bigDiff,
           })
-        ),
-        file_edit_replace_string: createMockTool(
-          "file_edit_replace_string",
-          z.object({ path: z.string() }),
-          () => ({ success: false, diff: bigDiff })
         ),
       };
       const tool = await createCodeExecutionTool(
@@ -1343,8 +1342,8 @@ describe("createCodeExecutionTool", () => {
         {
           code:
             "for (let i = 0; i < 5; i++) { mux.mcp__shots__take({}); } " +
-            'mux.file_edit_insert({path: "/after-budget.ts"}); ' +
-            'mux.file_edit_replace_string({path: "/after-budget-failed.ts"}); return true;',
+            'mux.file_edit_replace_lines({path: "/after-budget.ts"}); ' +
+            'mux.file_edit_replace_lines({path: "/after-budget-failed.ts"}); return true;',
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
@@ -1369,11 +1368,12 @@ describe("createCodeExecutionTool", () => {
       // compaction emits the normal {ok, bytes} summary so edit extractors
       // keep PATH attribution (round 12), and a FAILED edit's success bit
       // survives through the marker instead of misreporting ok:true.
-      const editOk = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const edits = result.toolCalls.filter((r) => r.toolName === "file_edit_replace_lines");
+      expect(edits).toHaveLength(2);
+      const [editOk, editFailed] = edits;
       expect(editOk?.result).toBeUndefined();
       expect(editOk?.ok).toBe(true);
       expect((editOk?.args as { path?: string })?.path).toBe("/after-budget.ts");
-      const editFailed = result.toolCalls.find((r) => r.toolName === "file_edit_replace_string");
       expect(editFailed?.result).toBeUndefined();
       expect(editFailed?.ok).toBe(false);
       await host.disposeScope("ws-exec-budget");
@@ -2868,6 +2868,77 @@ describe("createCodeExecutionTool", () => {
       expect(errors[0]).toContain("reserved");
       expect(errors[1].length).toBeGreaterThan(0);
       await host.disposeScope("ws-load-err");
+    });
+
+    it("a PostToolUse block on file_read makes mux.load throw; vars[key] stays unset", async () => {
+      // Codex P1 (PRRT_kwDOPxxmWM6r6NnK): a post-block replaced only the hook-visible summary, so
+      // the whole file still reached vars and the script could return it to the model.
+      using tmp = new DisposableTempDir("code-exec-load-post-block");
+      await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "SECRET_VALUE_42\n", "utf8");
+      const workspaceId = "ws-load-post-block";
+      const unregister = registerCodexPluginHooks(eventSpine, {
+        workspaceId,
+        pluginName: "guard",
+        pluginInstanceId: "guard",
+        order: 0,
+        hooks: [
+          {
+            key: "hooks/hooks.json#PostToolUse[0][0]",
+            hash: "h".repeat(64),
+            event: "PostToolUse",
+            matcher: "^file_read$",
+            handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+            status: "runnable",
+            source: "hooks/hooks.json",
+          },
+        ],
+        deps: {
+          isHookAllowed: () => Promise.resolve(true),
+          canCallPluginTool: () => true,
+          callPluginTool: () =>
+            Promise.resolve({
+              structuredContent: { decision: "block", reason: "secrets stay out" },
+            }),
+          notifyUser: () => undefined,
+        },
+      });
+      const host = new SandboxHostService();
+      try {
+        const runtime = new LocalRuntime(tmp.path);
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge(fileReadTools()),
+          undefined,
+          kernelRunner(host, workspaceId, tmp.path),
+          {
+            loadFile: createKernelFileLoader({
+              cwd: tmp.path,
+              runtime,
+              hooks: { runtime, cwd: tmp.path, runtimeTempDir: tmp.path, workspaceId },
+            }),
+          }
+        );
+
+        const result = (await tool.execute!(
+          {
+            code: `
+              let error = "";
+              try { mux.load({ path: "secret.txt", key: "data" }); } catch (e) { error = String(e); }
+              return { error, data: typeof vars.data };
+            `,
+          },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+
+        expect(result.success).toBe(true);
+        const returned = result.result as { error: string; data: string };
+        expect(returned.error).toContain("[plugin:guard] secrets stay out");
+        expect(returned.data).toBe("undefined");
+        expect(JSON.stringify(result)).not.toContain("SECRET_VALUE_42");
+      } finally {
+        unregister();
+        await host.disposeScope(workspaceId);
+      }
     });
 
     it("honors grants: file_read denied => mux.load denied", async () => {

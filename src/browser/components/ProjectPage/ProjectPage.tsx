@@ -1,5 +1,4 @@
 import React, { useRef, useCallback, useState, useEffect } from "react";
-import { Menu } from "lucide-react";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { cn } from "@/common/lib/utils";
 import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
@@ -10,12 +9,14 @@ import type { ChatInputAPI, WorkspaceCreatedOptions } from "@/browser/features/C
 import { ProjectMCPOverview } from "../ProjectMCPOverview/ProjectMCPOverview";
 import { ArchivedWorkspaces } from "../ArchivedWorkspaces/ArchivedWorkspaces";
 import { useAPI } from "@/browser/contexts/API";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GitInitBanner } from "../GitInitBanner/GitInitBanner";
 import { ConfiguredProvidersBar } from "../ConfiguredProvidersBar/ConfiguredProvidersBar";
 import { ConfigureProvidersPrompt } from "../ConfigureProvidersPrompt/ConfigureProvidersPrompt";
 import { hasConfiguredProvider, useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { useCreationSendBlocked } from "./useCreationSendBlocked";
 import { AgentsInitBanner } from "../AgentsInitBanner/AgentsInitBanner";
 import {
   usePersistedState,
@@ -23,24 +24,24 @@ import {
   readPersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
-  getAgentIdKey,
+  ARCHIVED_WORKSPACES_CACHE_MAX_CHARS,
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
   getArchivedWorkspacesExpandedKey,
-  getDraftScopeId,
-  getInputKey,
-  getPendingScopeId,
-  getProjectScopeId,
+  getCreationDraftScopeId,
 } from "@/common/constants/storage";
-import { Button } from "@/browser/components/Button/Button";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { CreationDraftGate } from "@/browser/features/ChatInput/CreationDraftGate";
+import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
+import { autoFocusUnlessPhone } from "@/browser/utils/env";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { LeftSidebarToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 
 interface ProjectPageProps {
   projectPath: string;
   projectName: string;
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   /** Sub-project path for parent-owned draft creation. */
   pendingSubProjectPath?: string | null;
   /** Draft ID for UI-only workspace creation drafts (from URL) */
@@ -92,7 +93,11 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
     // Persist outside the state updater: a restore navigates away before its refresh
     // resolves, and an unmounted component's updater never runs, so the next mount
     // would otherwise start from a cache that still lists the restored workspace.
-    updatePersistedState(getArchivedWorkspacesKey(projectPath), next);
+    // The cache only seeds the first render, so keep just the leading entries that fit its budget.
+    updatePersistedState(
+      getArchivedWorkspacesKey(projectPath),
+      trimArrayToChars(next, ARCHIVED_WORKSPACES_CACHE_MAX_CHARS)
+    );
     setArchivedWorkspaces((prev) => (prev && archivedListsEqual(prev, next) ? prev : next));
   }, [projectPath]);
 
@@ -105,39 +110,32 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
     [projectPath, syncArchivedState]
   );
 
-  // Keep archived metadata off the project page startup path.
-  useEffect(() => {
-    if (!api || !archivedExpanded) return;
-    let cancelled = false;
+  // Bumped to re-list after a restore/delete: a fresh stream's snapshot stays ordered with the
+  // updates around it, unlike a separate list() (#5189).
+  const [archivedListRevision, setArchivedListRevision] = useState(0);
 
-    const loadArchived = async () => {
-      try {
-        const allArchived = await api.workspace.list({ archived: true });
-        if (cancelled) return;
-        setArchivedLoadError(undefined);
-        replaceArchivedList(allArchived);
-      } catch (error) {
-        console.error("Failed to load archived workspaces:", error);
-        if (!cancelled) setArchivedLoadError(getErrorMessage(error));
-      }
-    };
-
-    void loadArchived();
-    return () => {
-      cancelled = true;
-    };
-  }, [api, replaceArchivedList, archivedExpanded]);
-
-  // Subscribe to metadata events to reactively update archived list
+  // Keep archived metadata off the project page startup path. The stream's first event is the
+  // archived snapshot, built after the server attached the listener, so no update falls between.
   useEffect(() => {
     if (!api || !archivedExpanded) return;
     const controller = new AbortController();
+    let snapshotReceived = false;
 
     (async () => {
       try {
-        const iterator = await api.workspace.onMetadata(undefined, { signal: controller.signal });
+        const iterator = await api.workspace.onMetadata(
+          { archived: true },
+          { signal: controller.signal }
+        );
         for await (const event of iterator) {
           if (controller.signal.aborted) break;
+
+          if ("type" in event) {
+            snapshotReceived = true;
+            setArchivedLoadError(undefined);
+            replaceArchivedList(event.workspaces);
+            continue;
+          }
 
           const meta = event.metadata;
           // Only care about workspaces in this project
@@ -155,15 +153,27 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
 
           syncArchivedState();
         }
+        if (!snapshotReceived && !controller.signal.aborted) {
+          throw new Error("Archived workspace stream ended before its snapshot");
+        }
       } catch (err) {
-        if (!controller.signal.aborted) {
-          console.error("Failed to subscribe to metadata for archived workspaces:", err);
+        // A lost connection is no load failure: the reconnect opens the stream again.
+        if (isStreamFailure(err, controller.signal)) {
+          console.error("Failed to load archived workspaces:", err);
+          setArchivedLoadError(getErrorMessage(err));
         }
       }
     })();
 
     return () => controller.abort();
-  }, [api, projectPath, syncArchivedState, archivedExpanded]);
+  }, [
+    api,
+    projectPath,
+    replaceArchivedList,
+    syncArchivedState,
+    archivedExpanded,
+    archivedListRevision,
+  ]);
 
   return (
     <div className="flex justify-center px-4 pb-4">
@@ -175,8 +185,7 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
           loadError={archivedLoadError}
           onWorkspacesChanged={() => {
             // Refresh archived list after unarchive/delete
-            if (!api) return;
-            void api.workspace.list({ archived: true }).then(replaceArchivedList);
+            setArchivedListRevision((revision) => revision + 1);
           }}
         />
       </div>
@@ -192,7 +201,6 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   projectPath,
   projectName,
   leftSidebarCollapsed,
-  onToggleLeftSidebarCollapsed,
   pendingSubProjectPath,
   pendingDraftId,
   onWorkspaceCreated,
@@ -200,6 +208,13 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const { api } = useAPI();
   const chatInputRef = useRef<ChatInputAPI | null>(null);
   const pendingAgentsInitSendRef = useRef(false);
+  // #6038, #6423: "Run /init" sends through the creation composer, so it is off whenever that
+  // composer's Send is off (branch list, Coder presets, a send in flight, ...). Off until the
+  // composer of this scope reports it can send.
+  // Keyed by draft id alone: a project change keeps the same editor (file reads, voice input).
+  const creationComposerKey = pendingDraftId ?? "__pending__";
+  const [creationSendBlocked, setCreationSendBlocked] = useCreationSendBlocked(creationComposerKey);
+  const creationScopeId = pendingDraftId ? getCreationDraftScopeId(pendingDraftId) : undefined;
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(
     getAgentsInitNudgeKey(projectPath),
     false,
@@ -257,8 +272,12 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   }, [setShowAgentsInitNudge]);
 
   const handleRunAgentsInit = useCallback(() => {
-    // Switch project-scope mode to exec.
-    updatePersistedState(getAgentIdKey(getProjectScopeId(projectPath)), "exec");
+    // Run it in Exec: the draft owns its agent, so a project default would not reach this send.
+    if (pendingDraftId) {
+      getCreationDraftStore().updateExecution(pendingDraftId, {
+        agent: { id: "exec", scope: "built-in" },
+      });
+    }
 
     // Run the /init skill and start the creation chat.
     if (chatInputRef.current) {
@@ -268,15 +287,11 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
       });
     } else {
       pendingAgentsInitSendRef.current = true;
-      const pendingScopeId =
-        typeof pendingDraftId === "string" && pendingDraftId.trim().length > 0
-          ? getDraftScopeId(projectPath, pendingDraftId)
-          : getPendingScopeId(projectPath);
-      updatePersistedState(getInputKey(pendingScopeId), "/init");
+      if (pendingDraftId) getCreationDraftStore().update(pendingDraftId, { text: "/init" });
     }
 
     setShowAgentsInitNudge(false);
-  }, [projectPath, pendingDraftId, setShowAgentsInitNudge]);
+  }, [pendingDraftId, setShowAgentsInitNudge]);
 
   const handleChatReady = useCallback((api: ChatInputAPI) => {
     chatInputRef.current = api;
@@ -293,41 +308,32 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
 
     // Auto-focus the prompt once when entering the creation screen.
     // Defensive: avoid re-focusing on unrelated re-renders (e.g. workspace list updates),
-    // which can move the user's caret.
+    // which can move the user's caret. Phones skip it: focus opens the software keyboard,
+    // which covered the page from the moment the home-screen app launched.
     if (didAutoFocusRef.current) {
       return;
     }
     didAutoFocusRef.current = true;
-    api.focus();
+    autoFocusUnlessPhone(() => api.focus());
   }, []);
 
   return (
-    <AgentProvider projectPath={projectPath}>
-      <ThinkingProvider projectPath={projectPath}>
+    <AgentProvider projectPath={projectPath} scopeId={creationScopeId}>
+      <ThinkingProvider projectPath={projectPath} scopeId={creationScopeId}>
         {/* Flex container to fill parent space */}
-        <div className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
+        {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
+        <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           {/* Draggable header bar - matches WorkspaceMenuBar for consistency */}
           <div
             className={cn(
-              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
-              isDesktopMode() ? "h-10 titlebar-drag" : "h-8"
+              // Same height as the app shell's fixed sidebar toggle bar, which sits over this header
+              // while the sidebar is collapsed.
+              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2",
+              leftSidebarCollapsed && "pl-0",
+              isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
             )}
           >
-            {leftSidebarCollapsed && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onToggleLeftSidebarCollapsed}
-                title="Open sidebar"
-                aria-label="Open sidebar menu"
-                className={cn(
-                  "hidden mobile-menu-btn h-6 w-6 shrink-0 text-muted hover:text-foreground",
-                  isDesktopMode() && "titlebar-no-drag"
-                )}
-              >
-                <Menu className="h-4 w-4" />
-              </Button>
-            )}
+            {leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
           </div>
           {/* Scrollable content area. mobile-header-spacer keeps content below
               the fixed mobile header on touch devices. */}
@@ -348,21 +354,27 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                       <AgentsInitBanner
                         onRunInit={handleRunAgentsInit}
                         onDismiss={handleDismissAgentsInit}
+                        runDisabled={creationSendBlocked}
                       />
                     )}
                     {/* ChatInput for workspace creation. */}
-                    <ChatInput
-                      // Key by project + draft so project navigation and draft switches both remount
-                      // creation-local state (including any in-flight creation send).
-                      key={`${projectPath}:${pendingDraftId ?? "__pending__"}`}
-                      variant="creation"
+                    <CreationDraftGate
+                      draftId={pendingDraftId}
                       projectPath={projectPath}
-                      projectName={projectName}
-                      pendingSubProjectPath={pendingSubProjectPath}
-                      pendingDraftId={pendingDraftId}
-                      onReady={handleChatReady}
-                      onWorkspaceCreated={onWorkspaceCreated}
-                    />
+                      subProjectPath={pendingSubProjectPath ?? null}
+                    >
+                      <ChatInput
+                        key={creationComposerKey}
+                        variant="creation"
+                        projectPath={projectPath}
+                        projectName={projectName}
+                        pendingSubProjectPath={pendingSubProjectPath}
+                        pendingDraftId={pendingDraftId}
+                        onReady={handleChatReady}
+                        onCreationSendBlockedChange={setCreationSendBlocked}
+                        onWorkspaceCreated={onWorkspaceCreated}
+                      />
+                    </CreationDraftGate>
                     {providersLoading ? (
                       <div className="flex items-center justify-center gap-2 py-1.5">
                         <Skeleton className="h-7 w-32" />
@@ -392,7 +404,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
               projectName={projectName}
             />
           </div>
-        </div>
+        </main>
       </ThinkingProvider>
     </AgentProvider>
   );

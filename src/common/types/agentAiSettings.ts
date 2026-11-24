@@ -8,6 +8,8 @@
  * environment; the pure resolver only chooses values.
  */
 
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import assert from "@/common/utils/assert";
 import type { AgentAiDefaults } from "./agentAiDefaults";
@@ -31,12 +33,16 @@ export interface AgentAiSettingsLayerValues {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
+  /** Only config and definition layers carry it (see resolveAgentCacheTtl). */
+  cacheTtl?: AnthropicCacheTtl;
 }
 
 /** Agent-definition frontmatter `ai` block defaults. */
 export interface AgentAiDefinitionDefaults {
   model?: string;
   thinkingLevel?: ThinkingLevel;
+  cacheTtl?: AnthropicCacheTtl;
 }
 
 /**
@@ -52,11 +58,13 @@ export function targetWorkspaceBucketToLayer(bucket: {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }): AgentAiSettingsLayerValues {
   return {
     model: bucket.model,
     thinkingLevel: bucket.thinkingLevel,
     reasoningMode: coerceOpenAIReasoningMode(bucket.reasoningMode) ?? "standard",
+    ...(bucket.serviceTier != null ? { serviceTier: bucket.serviceTier } : {}),
   };
 }
 
@@ -69,6 +77,7 @@ export interface TaskAiPins {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }
 
 /** Per-field flags marking which AI fields a user deliberately picked before a send. */
@@ -76,6 +85,7 @@ export interface AiSelectionIntent {
   model?: true;
   thinkingLevel?: true;
   reasoningMode?: true;
+  serviceTier?: true;
 }
 
 /**
@@ -91,7 +101,9 @@ export function taskAiPinsToLayer(raw: unknown): AgentAiSettingsLayerValues {
     typeof record.model === "string" && record.model.trim().length > 0
       ? record.model.trim()
       : undefined;
+  const serviceTier = ServiceTierSchema.safeParse(record.serviceTier).data;
   const layer: AgentAiSettingsLayerValues = {
+    ...(serviceTier != null ? { serviceTier } : {}),
     ...(model != null ? { model } : {}),
     ...(coerceThinkingLevel(record.thinkingLevel) != null
       ? { thinkingLevel: coerceThinkingLevel(record.thinkingLevel) }
@@ -115,7 +127,12 @@ export function taskAiPinsToLayer(raw: unknown): AgentAiSettingsLayerValues {
 export function applyAiSelectionIntentToPins(
   pins: TaskAiPins,
   intent: AiSelectionIntent,
-  sent: { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+  sent: {
+    model: string;
+    thinkingLevel: ThinkingLevel;
+    reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
+  }
 ): TaskAiPins {
   assert(pins != null && typeof pins === "object", "applyAiSelectionIntentToPins: pins required");
   assert(sent.model.trim().length > 0, "applyAiSelectionIntentToPins: sent model required");
@@ -124,7 +141,9 @@ export function applyAiSelectionIntentToPins(
   if (intent.thinkingLevel === true) next.thinkingLevel = sent.thinkingLevel;
   // A saved bucket's absent reasoning mode means standard, so pin that choice explicitly.
   if (intent.reasoningMode === true) next.reasoningMode = sent.reasoningMode ?? "standard";
+  if (intent.serviceTier === true && sent.serviceTier != null) next.serviceTier = sent.serviceTier;
   const changed =
+    next.serviceTier !== pins.serviceTier ||
     next.model !== pins.model ||
     next.thinkingLevel !== pins.thinkingLevel ||
     next.reasoningMode !== pins.reasoningMode;
@@ -166,6 +185,7 @@ export interface ResolveAgentAiSettingsInput {
     model?: string;
     thinkingLevel?: ParsedThinkingInput;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   /** Tier 2: the target workspace's per-agent bucket (existing target workspaces only). */
   targetWorkspaceSettings?: AgentAiSettingsLayerValues;
@@ -203,17 +223,20 @@ export interface ResolvedAgentAiSettings {
     model: string;
     thinkingLevel: ThinkingLevel;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   /** Provider-safe values after normalization, clamping, and capability gating. */
   effective: {
     model: string;
     thinkingLevel: ThinkingLevel;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   sources: {
     model: AiSettingSource;
     thinkingLevel: AiSettingSource;
     reasoningMode?: AiSettingSource;
+    serviceTier?: AiSettingSource;
   };
   /** Skipped-candidate notes for adapters to log; never logged here. */
   diagnostics: string[];

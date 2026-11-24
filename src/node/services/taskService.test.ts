@@ -11,6 +11,8 @@ import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRu
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
+import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
+import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
 import type { SendMessageError } from "@/common/types/errors";
 import { createMuxMessage } from "@/common/types/message";
 import { type DynamicToolPart } from "@/common/types/toolParts";
@@ -211,6 +213,7 @@ describe("TaskService", () => {
     const reportMarkdown = "The delegated investigation is complete.";
     const completed = { status: "completed", taskId, reportMarkdown };
     const awaitOutput = { results: [completed] };
+    const pagedCompleted = { ...completed, nextCharOffset: reportMarkdown.length };
     const toolPart = (toolName: string, output: unknown): DynamicToolPart => ({
       type: "dynamic-tool",
       toolCallId: "await-report",
@@ -372,6 +375,10 @@ describe("TaskService", () => {
         true,
         1,
       ],
+      // A long foreground report is one page plus nextCharOffset. A projection without the
+      // marker hides that more text exists, so it does not deliver the report.
+      ["paged report without its marker", "task", pagedCompleted, completed, true, 1],
+      ["paged report with its marker", "task", pagedCompleted, pagedCompleted, true, 0],
     ] satisfies Array<[string, string, unknown, unknown, boolean, number]>) {
       test("kernel report visibility: " + name, async () => {
         const fixture = await setup();
@@ -500,6 +507,78 @@ describe("TaskService", () => {
           }
         );
       }
+    }
+
+    // A foreground workspace turn (and a task_await read) returns one page of a long report.
+    // The page proves delivery only when it is that exact report's text at the page's offset.
+    const longTurnReport = `${"a".repeat(TOOL_TEXT_PAGE_MAX_CHARS)}${"b".repeat(1_000)}`;
+    const firstTurnPage = pageTaskReportForResult("wst_paged", longTurnReport, undefined);
+    const lastTurnPage = pageTaskReportForResult(
+      "wst_paged",
+      longTurnReport,
+      firstTurnPage.nextCharOffset
+    );
+    for (const [name, toolName, page, expectedWakes] of [
+      [
+        "a foreground first page with its continuation note",
+        "task",
+        {
+          reportMarkdown: firstTurnPage.text,
+          nextCharOffset: firstTurnPage.nextCharOffset,
+          note: firstTurnPage.note,
+        },
+        0,
+      ],
+      [
+        "a task_await continuation page",
+        "task_await",
+        { reportMarkdown: lastTurnPage.text, startCharOffset: lastTurnPage.startCharOffset },
+        0,
+      ],
+      [
+        "a page of a different report",
+        "task",
+        {
+          reportMarkdown: "c".repeat(TOOL_TEXT_PAGE_MAX_CHARS),
+          nextCharOffset: TOOL_TEXT_PAGE_MAX_CHARS,
+        },
+        1,
+      ],
+      [
+        "a page at another offset",
+        "task_await",
+        { reportMarkdown: lastTurnPage.text, startCharOffset: 0 },
+        1,
+      ],
+    ] satisfies Array<[string, string, Record<string, unknown>, number]>) {
+      test("paged workspace-turn receipt: " + name, async () => {
+        const record = workspaceTurnRecord("owner", taskId, "wst_paged", "completed", {
+          messageId: "workspace-final",
+          reportMarkdown: longTurnReport,
+        });
+        const fixture = await setup({
+          generationId: [record.handleId, record.status, record.updatedAt].join(":"),
+        });
+        await new TaskHandleStore(fixture.config).upsertWorkspaceTurn({
+          ...record,
+          ownerWorkspaceId: fixture.parentId,
+        });
+        const receipt = {
+          status: "completed",
+          taskId: record.handleId,
+          handleKind: "workspace_turn",
+          workspaceId: taskId,
+          messageId: record.messageId,
+          ...page,
+        };
+        fixture.assistant.parts = [
+          toolPart(toolName, toolName === "task" ? receipt : { results: [receipt] }),
+        ];
+        await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+        await fixture.drain();
+        await fixture.drain();
+        expect(fixture.resumeStream).toHaveBeenCalledTimes(expectedWakes);
+      });
     }
 
     test("reconciles a covered response in the drain without a stream-end callback", async () => {
@@ -1400,8 +1479,10 @@ describe("TaskService", () => {
     const sweep = () => sweepOwnerWorkflowRunAttention(taskService, parentId);
 
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(parentId, new Set([runId]));
 
     await drain(parentId);
     ownerBusy = false;
@@ -1731,8 +1812,10 @@ describe("TaskService", () => {
     // Residual private seed: noteWorkflowRunTerminalAttention would also start a drain that
     // delivers and settles this run itself, racing the two settlements under test.
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(parentId, new Set([runId]));
 
     // Park the older generation's settlement inside its first marker write: the newer
     // generation's settlement (started while the older one is parked) can then only
@@ -1990,8 +2073,13 @@ describe("TaskService", () => {
     // Residual private seed: noteWorkflowRunTerminalAttention would also start a drain that
     // evaluates this entry concurrently with the settlement calls under test.
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set(["wfr_marker_soft_fail"]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(
+      parentId,
+      new Set(["wfr_marker_soft_fail"])
+    );
     const settleSpy = spyOn(terminalAttentionStore, "recordSettled")
       // Lazy rejection: an eager mockRejectedValueOnce promise trips bun's unhandled-rejection
       // detector on this host before the call consumes it.
@@ -2216,8 +2304,10 @@ describe("TaskService", () => {
     // Residual private seed so ONE drain observes both runs: a second note would schedule a
     // second drain, giving the older group another chance outside the cycle under test.
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
 
     taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
@@ -2342,8 +2432,10 @@ describe("TaskService", () => {
     // Residual private seed so ONE drain observes both runs: a second note would schedule a
     // second drain that could deliver the older group even if the same-cycle re-poke broke.
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
 
     taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
@@ -2952,8 +3044,13 @@ describe("TaskService", () => {
     // and the second drain would deliver the other group before the assertions below.
     const terminalAttentionStore = new TerminalAttentionStore(config);
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set(["wfr_split_plan", "wfr_split_exec"]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(
+      parentId,
+      new Set(["wfr_split_plan", "wfr_split_exec"])
+    );
     taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
 
@@ -3037,8 +3134,10 @@ describe("TaskService", () => {
     const terminalAttentionStore = new TerminalAttentionStore(config);
     // Residual private seed so ONE drain observes both runs (see the test above).
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(
       parentId,
       new Set(["wfr_pin_split_pinned", "wfr_pin_split_unpinned"])
     );

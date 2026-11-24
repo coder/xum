@@ -34,16 +34,18 @@ describe("Known Models Integration", () => {
     ["sonnet", /^anthropic:claude-sonnet-/],
     ["haiku", /^anthropic:claude-haiku-/],
     ["gpt", /^openai:gpt-[\d.]+-sol$/],
-    ["gpt-pro", /^openai:gpt-[\d.]+-pro$/],
     // GPT tier names users type with /model (tier, not version, so they survive releases).
     ["sol", /^openai:gpt-[\d.]+-sol$/],
-    ["terra", /^openai:gpt-[\d.]+-terra$/],
     ["luna", /^openai:gpt-[\d.]+-luna$/],
     ["astra", /^openai:gpt-[\d.]+-astra$/],
-    ["codex", /^openai:gpt-[\d.]+-codex$/],
     ["gemini", /^google:gemini-.*pro/],
+    ["argon", /^google:gemini-4-argon/],
+    ["carbon", /^google:gemini-4-carbon/],
+    ["neon", /^google:gemini-4-neon/],
     ["gemini-flash", /^google:gemini-.*flash/],
     ["grok", /^xai:grok-/],
+    ["muse", /^meta:muse-wonder-/],
+    ["wonder", /^meta:muse-wonder-/],
     ["deepseek", /^deepseek:deepseek-.*pro/],
     ["kimi", /^moonshotai:kimi-/],
     ["glm", /^zai:glm-/],
@@ -63,8 +65,11 @@ describe("Known Models Integration", () => {
   test.each([
     ["anthropic:claude-opus-5", "anthropic/claude-opus-4.5"],
     ["anthropic:claude-sonnet-5", "anthropic/claude-sonnet-4.5"],
-    ["openai:gpt-5.6-sol", "openai/gpt-5"],
-    ["openai:gpt-5.6-luna", "openai/gpt-5"],
+    ["anthropic:claude-haiku-4-5", "anthropic/claude-3.5-haiku"],
+    ["anthropic:claude-fable-5-1", "anthropic/claude-opus-4.5"],
+    ["anthropic:claude-mythos-5-1", "anthropic/claude-opus-4.5"],
+    ["openai:gpt-6.1-sol", "openai/gpt-5"],
+    ["openai:gpt-6-astra", "openai/gpt-5"],
   ])("retired id %s keeps its tokenizer override", (modelId, tokenizer) => {
     expect(TOKENIZER_MODEL_OVERRIDES[modelId]).toBe(tokenizer);
   });

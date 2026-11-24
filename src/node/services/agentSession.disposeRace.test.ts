@@ -19,7 +19,7 @@ import {
 import {
   createAgentSessionAIServiceFake,
   createAgentSessionHarness,
-  createStreamLifecycleMocks,
+  createTestStreamManager,
 } from "./agentSession.testHarness";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -67,7 +67,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -152,7 +152,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const workspaceId = "ws-branch-summary-dispose";
@@ -185,13 +185,13 @@ describe("AgentSession disposal race conditions", () => {
         releaseModel = resolve;
       });
       const gatedAiService = {
-        createModelWithPinnedMetadata: async () => {
+        createModelWithPinnedOptions: async () => {
           await modelGate;
           return Err({ type: "api_key_not_found" as const, provider: "anthropic" });
         },
         // Side-channel candidates are confined to workspace-configured
         // providers; metadata must resolve with a model or the writer settles
-        // null before createModelWithPinnedMetadata — the gate above would
+        // null before createModelWithPinnedOptions — the gate above would
         // never park the send.
         getWorkspaceMetadata: () =>
           Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-sonnet-4-5" } })),
@@ -206,7 +206,7 @@ describe("AgentSession disposal race conditions", () => {
           createMuxMessage("bs-u", "user", filler, { timestamp: 1 }),
           createMuxMessage("bs-a", "assistant", filler, { timestamp: 2 }),
         ],
-        experiments: { rlm: true, programmaticToolCalling: true },
+        isExperimentEnabled: () => true,
         guardTailMessageId: "bs-a",
       });
 
@@ -279,7 +279,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -355,7 +355,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -433,7 +433,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -565,7 +565,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -614,7 +614,7 @@ describe("AgentSession awaitable disposal", () => {
       const background = Promise.withResolvers<void>();
       const workspaceId = "disposal-fence";
       const streamManager = {
-        ...createStreamLifecycleMocks(),
+        ...createTestStreamManager(),
         getStreamInfo: () => ({
           messageId: "old",
           model: "openai:gpt-4o",

@@ -1,21 +1,30 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
+import { workspaceSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { secretsToRecord } from "@/common/types/secrets";
 import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
+import { codexPluginHookService } from "./agentPlugins/codexHookService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
+import {
+  runMessageSendHooks,
+  runTurnStopHooks,
+  type MessageSendHookInput,
+  type MessageSendHookOutcome,
+  type TurnStopHookInput,
+  type TurnStopHookOutcome,
+} from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
-import * as fs from "fs/promises";
 
-import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
+  type LoopHostServices,
   type TurnRequestBuilderBindings,
   resolveXumToolScope,
   type StreamMessageOptions,
@@ -28,6 +37,11 @@ export type { StreamMessageOptions } from "./turnRequestBuilder";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
+import { LRUCache } from "lru-cache";
+import {
+  DEBUG_LLM_REQUEST_MAX_BYTES,
+  DEBUG_LLM_REQUEST_MAX_WORKSPACES,
+} from "@/constants/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -40,19 +54,15 @@ import {
   type Config,
   type WorkspaceMetadataOptions,
 } from "@/node/config";
-import { ContainerManager } from "@/node/multiProject/containerManager";
-import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
-  createRuntimeContextForWorkspace,
-  createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
   type WorkspaceRuntimeContext,
 } from "@/node/runtime/runtimeHelpers";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import {
@@ -61,6 +71,9 @@ import {
 } from "@/node/utils/journal/durableEventJournal";
 import type { InitStateManager } from "./initStateManager";
 import { log } from "./log";
+import { nodeClock } from "@/node/utils/hostClock";
+import { resolveAgentForStream } from "./agentResolution";
+import { formatSendMessageError } from "./utils/sendMessageError";
 import {
   StreamManager,
   type TurnCompletion,
@@ -83,16 +96,27 @@ import {
   resolveMemoryProjectIdentity,
   type MemorySessionContext,
 } from "@/node/services/memoryService";
-import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
-import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
+import type { CompletedMessagePart } from "@/common/types/stream";
+import { needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
+import {
+  workspaceHasNewLayoutIssueAtTurnEnd,
+  type WorkspaceTurnEndLayoutAudit,
+} from "./layoutAudit/turnEndLayoutAudit";
+import { isStatusPageAgentEnabledInSettings } from "./statusPageAgentService";
+import {
+  LAYOUT_TURN_END_NUDGE,
+  STATUS_PAGE_AGENT_TURN_END_NUDGE,
+  STATUS_PAGE_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
+import { isMockAiMode } from "./mock/mockAiMode";
 import { ProviderModelFactory } from "./providerModelFactory";
 
 interface ToolExecutionContext {
@@ -111,13 +135,46 @@ function isToolExecutionContext(value: unknown): value is ToolExecutionContext {
   );
 }
 
+/**
+ * One JSON pass per set, the same order of cost as the structuredClone every set already does.
+ * A snapshot JSON cannot serialize (a BigInt) counts as the whole limit, so it is kept alone.
+ */
+function estimateDebugSnapshotBytes(snapshot: DebugLlmRequestSnapshot): number {
+  return jsonBytes(snapshot) ?? DEBUG_LLM_REQUEST_MAX_BYTES;
+}
+
+/** UTF-8 bytes of the value's JSON, or undefined when JSON cannot serialize it (a BigInt). */
+function jsonBytes(value: unknown): number | undefined {
+  try {
+    // UTF-8 bytes, not UTF-16 units: a CJK character is one unit but three bytes.
+    return Math.max(1, Buffer.byteLength(JSON.stringify(value), "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/** `{...request, response}` serializes as the request's JSON plus this key and the response. */
+const RESPONSE_FIELD_JSON_BYTES = Buffer.byteLength(',"response":', "utf8");
+
+/**
+ * JSON bytes of `{...request, response}` from the request's stored size, without serializing
+ * the request again. Any doubt (no stored size, a request or response JSON cannot serialize)
+ * returns undefined, so the cache measures the whole snapshot as before.
+ */
+function attachedSnapshotBytes(requestBytes: number | undefined, response: unknown) {
+  if (requestBytes == null || requestBytes >= DEBUG_LLM_REQUEST_MAX_BYTES) return undefined;
+  const responseBytes = jsonBytes(response);
+  return responseBytes == null
+    ? undefined
+    : requestBytes + RESPONSE_FIELD_JSON_BYTES + responseBytes;
+}
+
 export class AIService extends EventEmitter {
   private readonly streamManager: StreamManager;
   private readonly turnRequestBuilder: TurnRequestBuilder;
   private readonly historyService: HistoryService;
   private readonly config: Config;
   private readonly workspaceMcpOverridesService: WorkspaceMcpOverridesService;
-  private readonly policyService?: PolicyService;
   private readonly telemetryService?: TelemetryService;
   private readonly initStateManager: InitStateManager;
   private mockModeEnabled: boolean;
@@ -129,6 +186,8 @@ export class AIService extends EventEmitter {
   private readonly devToolsService?: DevToolsService;
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly experimentsService?: ExperimentsService;
+  /** Builds every runtime of this service and of its sessions (AgentSessionAIService). */
+  readonly runtimeFactory: RuntimeFactory;
 
   /**
    * Tracks queued DevTools run metadata by assistant message id so stream-end/abort
@@ -140,7 +199,14 @@ export class AIService extends EventEmitter {
   >();
 
   // Debug: captured LLM request payloads for last send per workspace
-  private lastLlmRequestByWorkspace = new Map<string, DebugLlmRequestSnapshot>();
+  // Bounded by count and by bytes: each snapshot is a full copy of a request and its response,
+  // and an unbounded map kept one per workspace the server ever sent from (F12, #6754). Removal
+  // and archive drop their entry too (handleWorkspaceMetadata).
+  private readonly lastLlmRequestByWorkspace = new LRUCache<string, DebugLlmRequestSnapshot>({
+    max: DEBUG_LLM_REQUEST_MAX_WORKSPACES,
+    maxSize: DEBUG_LLM_REQUEST_MAX_BYTES,
+    sizeCalculation: estimateDebugSnapshotBytes,
+  });
 
   constructor(
     config: Config,
@@ -150,7 +216,6 @@ export class AIService extends EventEmitter {
     backgroundProcessManager?: BackgroundProcessManager,
     sessionUsageService?: SessionUsageService,
     workspaceMcpOverridesService?: WorkspaceMcpOverridesService,
-    policyService?: PolicyService,
     telemetryService?: TelemetryService,
     devToolsService?: DevToolsService,
     experimentsService?: ExperimentsService,
@@ -159,12 +224,19 @@ export class AIService extends EventEmitter {
     providersConfigStore?: ProvidersConfigStore,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    /** Absent members: the Node layer (`new AIService(` in tests passes none). */
+    private readonly hostServices: LoopHostServices = {}
   ) {
     super();
-    // Increase max listeners to accommodate multiple concurrent workspace listeners
-    // Each workspace subscribes to stream events, and we expect >10 concurrent workspaces
-    this.setMaxListeners(50);
+    // No listener cap: every live AgentSession adds one listener per forwarded event, and a
+    // session lives from first use of its workspace until archive, removal or shutdown, so the
+    // count tracks how many workspaces this process has touched. Any fixed cap is a false
+    // MaxListenersExceededWarning for a user with many workspaces or sub-agents. A leak (a
+    // disposed session that keeps its listeners) is caught by
+    // workspaceService.sessionListeners.test.ts instead.
+    this.setMaxListeners(0);
+    this.runtimeFactory = hostServices.runtimeFactory ?? nodeRuntimeFactory;
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
@@ -173,7 +245,6 @@ export class AIService extends EventEmitter {
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
     this.sessionUsageService = sessionUsageService;
-    this.policyService = policyService;
     this.telemetryService = telemetryService;
     this.experimentsService = experimentsService;
     this.providerService = providerService;
@@ -188,7 +259,6 @@ export class AIService extends EventEmitter {
     this.providerModelFactory = new ProviderModelFactory(
       config,
       providerService,
-      policyService,
       turnRequestBuilderBindings,
       devToolsService,
       this.providersConfigStore
@@ -203,7 +273,6 @@ export class AIService extends EventEmitter {
       providerModelFactory: this.providerModelFactory,
       streamManager: this.streamManager,
       workspaceMcpOverridesService: this.workspaceMcpOverridesService,
-      policyService: this.policyService,
       telemetryService: this.telemetryService,
       backgroundProcessManager: this.backgroundProcessManager,
       sessionUsageService: this.sessionUsageService,
@@ -211,6 +280,8 @@ export class AIService extends EventEmitter {
       experimentsService: this.experimentsService,
       lastLlmRequestByWorkspace: this.lastLlmRequestByWorkspace,
       bindings: this.turnRequestBuilderBindings,
+      hostServices,
+      runtimeFactory: this.runtimeFactory,
       emit: (event, ...args) => this.emit(event, ...args),
       createAbortedTurnHandle: (messageId, signal) =>
         this.createAbortedTurnHandle(messageId, signal),
@@ -220,7 +291,6 @@ export class AIService extends EventEmitter {
       createWorkspaceRuntimeContext: (workspaceId, metadata) =>
         this.createWorkspaceRuntimeContext(workspaceId, metadata),
       isClaudeSkillsCompatEnabled: () => this.isClaudeSkillsCompatEnabled(),
-      isAgentPluginsEnabled: () => this.isAgentPluginsEnabled(),
       wrapToolsForDelegation: (workspaceId, tools, delegatedToolNames) =>
         this.wrapToolsForDelegation(workspaceId, tools, delegatedToolNames),
       durableEventJournalFor: (workspaceId) => this.durableEventJournalFor(workspaceId),
@@ -233,7 +303,7 @@ export class AIService extends EventEmitter {
     void this.ensureSessionsDir();
     this.mockModeEnabled = false;
 
-    if (resolveXumEnvironmentValue("MOCK_AI", process.env) === "1") {
+    if (isMockAiMode()) {
       log.info("AIService running in MUX_MOCK_AI mode");
       this.enableMockMode();
     }
@@ -251,9 +321,8 @@ export class AIService extends EventEmitter {
 
   /**
    * Build the session-segment memory context: the index snapshot advertised
-   * in the memory tool description, plus the hot-memories block (pinned +
-   * frequently used memory files; memory-hot-set sub-experiment). Returns
-   * null when the memory experiment is off.
+   * in the memory tool description. Returns null when the memory experiment
+   * is off.
    *
    * Callers (AgentSession) cache the result per model and recompute it only
    * on the first use of a model in a session segment, or at compaction
@@ -264,13 +333,9 @@ export class AIService extends EventEmitter {
    */
   async buildMemorySessionContext(
     workspaceId: string,
-    modelString: string,
-    options?: {
-      includeHotMemories?: boolean;
-      tokenBudgetActive?: boolean;
-      /** Context-budget flush turns: expose only the workspace context notes. */
-      onlyContextNotes?: boolean;
-    }
+    // The memory context does not depend on the model; the parameter keeps
+    // AgentSession's per-model cache contract unchanged.
+    _modelString: string
   ): Promise<MemorySessionContext | null> {
     if (!this.turnRequestBuilderBindings.memoryService) return null;
     if (this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) !== true) {
@@ -280,7 +345,7 @@ export class AIService extends EventEmitter {
       const metadataResult = await this.getWorkspaceMetadata(workspaceId);
       if (!metadataResult.success) return null;
       const metadata = metadataResult.data;
-      const runtime = createRuntimeForWorkspace(metadata);
+      const runtime = this.runtimeFactory.createRuntimeForWorkspace(metadata);
       const ctx = {
         runtime,
         checkoutCwd: "",
@@ -289,51 +354,9 @@ export class AIService extends EventEmitter {
         // disables project memory when no single project identity exists.
         projectPath: resolveMemoryProjectIdentity(metadata),
       };
-      const onlyNotes = (entry: { path: string }) => entry.path === CONTEXT_NOTES_MEMORY_PATH;
-      const allIndexEntries =
-        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx);
       const indexEntries =
-        options?.onlyContextNotes === true ? allIndexEntries.filter(onlyNotes) : allIndexEntries;
-      // Hot preloading is a sub-experiment: without it, memories stay
-      // pull-based like skills (index only, contents fetched on demand).
-      let hotMemoriesBlock: string | null = null;
-      if (
-        options?.includeHotMemories !== false &&
-        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true
-      ) {
-        try {
-          const metadataModel = resolveModelForMetadata(
-            modelString,
-            this.providerService.getConfig()
-          );
-          const tokenizer = await getTokenizerForModel(modelString, metadataModel);
-          // Flush turns select the notes alone under their own caps inside the selector (a
-          // post-filter would keep an item fitted under the larger ordinary per-item budget).
-          const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
-            countTokens: (text) => tokenizer.countTokens(text),
-            tokenBudgetActive: options?.tokenBudgetActive === true,
-            onlyContextNotes: options?.onlyContextNotes === true,
-          });
-          assert(
-            options?.onlyContextNotes !== true || items.every(onlyNotes),
-            "flush turns must preload only the context notes"
-          );
-          hotMemoriesBlock =
-            items.length === 0
-              ? null
-              : formatHotMemoriesBlock(items, {
-                  flushPreload: options?.onlyContextNotes === true,
-                });
-        } catch (error) {
-          // Hot preloading is best-effort context. Preserve the pull-based
-          // memory index when tokenizer setup or ranked selection fails.
-          log.warn("Failed to build hot memories; continuing with memory index only", {
-            workspaceId,
-            error,
-          });
-        }
-      }
-      return { indexEntries, hotMemoriesBlock };
+        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx);
+      return { indexEntries };
     } catch (error) {
       // Self-healing: memory context is best-effort, never a stream blocker.
       log.warn("Failed to build memory session context", { workspaceId, error });
@@ -343,6 +366,11 @@ export class AIService extends EventEmitter {
 
   getProvidersConfig(): ProvidersConfigMap | null {
     return this.providerService.getConfig();
+  }
+
+  /** The workspace's secrets, for agent definition reads outside a turn (ResolveAgentOptions). */
+  async getWorkspaceSandboxEnv(metadata: WorkspaceMetadata): Promise<Record<string, string>> {
+    return secretsToRecord(workspaceSecrets(metadata, this.secretsStore, this.config));
   }
 
   private emitEngineEvent(event: TurnEngineEvent): void | Promise<void> {
@@ -355,27 +383,7 @@ export class AIService extends EventEmitter {
     if (event.type === "stream-end") {
       this.clearTrackedPendingDevToolsRunMetadata(event.messageId);
 
-      try {
-        const snapshot = this.lastLlmRequestByWorkspace.get(event.workspaceId);
-        if (snapshot) {
-          const shouldAttach = snapshot.messageId === event.messageId || snapshot.messageId == null;
-          if (shouldAttach) {
-            const updated: DebugLlmRequestSnapshot = {
-              ...snapshot,
-              response: {
-                capturedAt: Date.now(),
-                metadata: event.metadata,
-                parts: event.parts,
-              },
-            };
-
-            this.lastLlmRequestByWorkspace.set(event.workspaceId, structuredClone(updated));
-          }
-        }
-      } catch (error) {
-        const errMsg = getErrorMessage(error);
-        log.warn("Failed to capture debug LLM response snapshot", { error: errMsg });
-      }
+      this.attachDebugLlmResponse(event);
 
       this.emit("stream-end", event);
       return;
@@ -390,6 +398,40 @@ export class AIService extends EventEmitter {
     }
 
     this.emit(event.type, event);
+  }
+
+  /** Adds stream-end's response to the workspace's debug LLM request snapshot. */
+  private attachDebugLlmResponse(event: Extract<TurnEngineEvent, { type: "stream-end" }>): void {
+    try {
+      const snapshot = this.lastLlmRequestByWorkspace.get(event.workspaceId);
+      if (snapshot == null) return;
+      if (snapshot.messageId != null && snapshot.messageId !== event.messageId) return;
+      // The request half is already this cache's own copy (the turn builder cloned it), so
+      // copy and measure only the response. Re-cloning and re-serializing the whole request
+      // here doubled the per-turn event-loop cost at a full context (#6912).
+      const response = structuredClone({
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        capturedAt: nodeClock.nowMs(),
+        metadata: event.metadata,
+        parts: event.parts,
+      });
+      // The size stored with the request. Not used when a response is already attached,
+      // because that size counts the earlier response too.
+      const size = attachedSnapshotBytes(
+        snapshot.response == null
+          ? this.lastLlmRequestByWorkspace.info(event.workspaceId)?.size
+          : undefined,
+        response
+      );
+      this.lastLlmRequestByWorkspace.set(
+        event.workspaceId,
+        { ...snapshot, response },
+        size == null ? undefined : { size }
+      );
+    } catch (error) {
+      const errMsg = getErrorMessage(error);
+      log.warn("Failed to capture debug LLM response snapshot", { error: errMsg });
+    }
   }
 
   private createSettledTurnHandle(messageId: string, completion: TurnCompletion): TurnStreamHandle {
@@ -492,7 +534,7 @@ export class AIService extends EventEmitter {
 
   private async ensureSessionsDir(): Promise<void> {
     try {
-      await ensurePrivateDir(this.config.sessionsDir);
+      await this.historyService.files.ensurePrivateDir(this.config.sessionsDir);
     } catch (error) {
       log.error("Failed to create sessions directory:", error);
     }
@@ -504,7 +546,11 @@ export class AIService extends EventEmitter {
    * vars-snapshot writer (independent instances would corrupt seq ordering).
    */
   private durableEventJournalFor(workspaceId: string): DurableEventJournal {
-    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
+    // The history's layers: a memory graph keeps the turn's journal rows and blobs in its volume.
+    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId), {
+      files: this.historyService.files,
+      locks: this.historyService.locks,
+    });
   }
 
   /** Reconcile lazy workspace hooks before pinning a rollover's request-assembly contract. */
@@ -519,14 +565,190 @@ export class AIService extends EventEmitter {
       config: this.config,
       metadata: metadata.data,
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
-      enabled: this.isAgentPluginsEnabled(),
       journal: this.durableEventJournalFor(workspaceId),
+      mcpServerManager: this.turnRequestBuilderBindings.mcpServerManager,
+      hostFiles: this.hostServices.hostFiles,
+      hostPaths: this.hostServices.hostPaths,
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
   }
 
+  /**
+   * Load the workspace's lazy hooks, then report whether any message.send hook applies to it.
+   * The accepted-send check reads this: before the load, a first send after a restart saw no
+   * hook and skipped the check, so a retry could run a stateful hook twice (Codex
+   * PRRT_kwDOPxxmWM6rSBny). Another workspace's hooks do not count (PRRT_kwDOPxxmWM6rQd90).
+   */
+  async prepareMessageSendHooks(workspaceId: string): Promise<boolean> {
+    await this.loadRequestHooksForPrompt(workspaceId);
+    return eventSpine.hasMiddlewareFor("message.send", workspaceId);
+  }
+
+  /**
+   * Run the message.send prompt-hook chain for one new message (fail-open). Loads the
+   * workspace's lazy hooks first (the same setup as request building), so the first send after a
+   * restart sees them too.
+   */
+  async runMessageSendHooks(
+    workspaceId: string,
+    input: MessageSendHookInput,
+    cancelSignal?: AbortSignal,
+    /** prepareMessageSendHooks already ran the lazy load for this send. */
+    hooksLoaded = false
+  ): Promise<MessageSendHookOutcome> {
+    if (!hooksLoaded) await this.loadRequestHooksForPrompt(workspaceId);
+    // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
+    // after this chain: start it first (the turn's own startup, bounded), or the first prompt
+    // after a restart misses the hooks. A canceled send ends this wait and its hook calls (see
+    // MessageSendContext.signal).
+    await codexPluginHookService.prepareForPromptHooks(
+      workspaceId,
+      (signal) => this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal),
+      cancelSignal
+    );
+    // After the setup above, so the check sees the hooks it loaded.
+    const cwd = eventSpine.hasMiddlewareFor("message.send", workspaceId)
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runMessageSendHooks(eventSpine, workspaceId, { ...input, cwd, signal: cancelSignal });
+  }
+
+  /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
+  async runTurnStopHooks(
+    workspaceId: string,
+    input: TurnStopHookInput
+  ): Promise<TurnStopHookOutcome> {
+    const cwd = eventSpine.hasMiddlewareFor("turn.stop", workspaceId)
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /**
+   * The Agent interface view's turn-end status page nudge that the turn that streamed `messageId`
+   * earns (needsStatusPageTurnEndNudge), or null. In status page agent mode it asks for a
+   * status_update call instead of an edit. Consumes the turn's state, so a second call is null.
+   */
+  async statusPageTurnEndNudge(
+    workspaceId: string,
+    input: { messageId: string; parts: readonly CompletedMessagePart[] }
+  ): Promise<string | null> {
+    const taken = this.turnRequestBuilder.takeAgentInterfaceStatusPageTurn(
+      workspaceId,
+      input.messageId
+    );
+    // Switched off since the turn started: the status page agent drops its queued updates, so
+    // a status_update the turn sent counts for nothing and the agent must edit the page.
+    const turn = taken && {
+      ...taken,
+      statusPageAgent: taken.statusPageAgent === true && this.isStatusPageAgentStillOn(),
+    };
+    const needed = await needsStatusPageTurnEndNudge({
+      turn,
+      viewEnabled:
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) &&
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+      parts: input.parts,
+    });
+    if (!needed) return null;
+    return turn?.statusPageAgent === true
+      ? STATUS_PAGE_AGENT_TURN_END_NUDGE
+      : STATUS_PAGE_TURN_END_NUDGE;
+  }
+
+  /**
+   * The turn-end layout nudge (see turnEndLayoutAudit.ts), or null: audits the published HTML
+   * artifacts that are due, and asks for the nudge only when one has an issue no publish result
+   * has listed. A turn that changed nothing finds no page due, so nothing is audited (the
+   * turn's own tool calls are not read: a compaction can end the stream that held them).
+   * Fail-soft: a turn that ended must still end.
+   */
+  async layoutTurnEndNudge(
+    workspaceId: string,
+    input: { messageId: string; abortSignal: AbortSignal }
+  ): Promise<string | null> {
+    if (!this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) return null;
+    // The nudge asks for a publish, and its continuation keeps the turn's agent and tools. A
+    // page stays due, so a later turn that can publish audits it.
+    if (!this.turnRequestBuilder.turnCanRepublishArtifacts(workspaceId, input.messageId)) {
+      return null;
+    }
+    try {
+      const target = await this.layoutAuditTarget(workspaceId);
+      if (target == null) return null;
+      const found = await workspaceHasNewLayoutIssueAtTurnEnd({
+        workspaceId,
+        config: this.config,
+        ...target,
+        abortSignal: input.abortSignal,
+      });
+      return found ? LAYOUT_TURN_END_NUDGE : null;
+    } catch (error) {
+      log.debug("Turn-end layout audit failed", { workspaceId, error: getErrorMessage(error) });
+      return null;
+    }
+  }
+
+  /** Where the turn-end layout audit of a workspace runs, or null when that cannot be resolved. */
+  private async layoutAuditTarget(
+    workspaceId: string
+  ): Promise<Pick<WorkspaceTurnEndLayoutAudit, "metadata" | "runtime" | "cwd"> | null> {
+    const metadata = await this.getWorkspaceMetadata(workspaceId);
+    const workspace = this.config.findWorkspace(workspaceId);
+    if (!metadata.success || !workspace) return null;
+    const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+    if (!context.success) return null;
+    return {
+      // As createWorkspaceRuntimeContext: the persisted workspace root, not a derived one.
+      metadata: { ...metadata.data, namedWorkspacePath: workspace.workspacePath },
+      runtime: context.data.runtime,
+      cwd: context.data.workspacePath,
+    };
+  }
+
+  private isStatusPageAgentStillOn(): boolean {
+    return (
+      this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT) &&
+      isStatusPageAgentEnabledInSettings(this.config.loadConfigOrDefault())
+    );
+  }
+
+  /** The lazy hook setup of request building, fail-soft: the hooks already loaded still run. */
+  private async loadRequestHooksForPrompt(workspaceId: string): Promise<void> {
+    const snapshot = await this.captureRequestAssemblySnapshot(workspaceId).catch(
+      (error: unknown) => {
+        log.warn("Prompt hooks: hook setup failed; running the hooks already loaded", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+        return null;
+      }
+    );
+    if (snapshot?.success === false) {
+      log.debug("Prompt hooks: hook setup skipped", { workspaceId, error: snapshot.error });
+    }
+  }
+
+  /** The workspace path prompt hooks see as `cwd` (the tools' cwd); undefined when unreadable. */
+  private async resolvePromptHookCwd(workspaceId: string): Promise<string | undefined> {
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) return undefined;
+      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      return context.success ? context.data.workspacePath : undefined;
+    } catch {
+      return undefined; // fail open: the hook runs without cwd
+    }
+  }
+
   releaseMockStreamStartGate(workspaceId: string): void {
     this.mockAiStreamPlayer?.releaseStreamStartGate(workspaceId);
+  }
+
+  /** Release a mock stream held before its tool calls (MockAiRouterReply.holdToolCalls). */
+  releaseMockToolCalls(workspaceId: string): void {
+    assert(this.mockAiStreamPlayer, "mock mode is off");
+    this.mockAiStreamPlayer.releaseToolCalls(workspaceId);
   }
 
   enableMockMode(): void {
@@ -535,6 +757,7 @@ export class AIService extends EventEmitter {
     this.mockAiStreamPlayer ??= new MockAiStreamPlayer({
       aiService: this,
       historyService: this.historyService,
+      sessionsDir: this.config.sessionsDir,
     });
     this.streamManager.setMockStreamLifecycle(this.mockAiStreamPlayer);
   }
@@ -724,6 +947,41 @@ export class AIService extends EventEmitter {
     return `Workspace ${workspaceId} reached multi-project AI runtime execution while ${EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES} is disabled`;
   }
 
+  /**
+   * Pre-dispatch check for an automatic goal turn (#5402): the same strict resolution its stream
+   * runs, returning why the agent cannot run, or null. The stream-time resolution stays the
+   * authoritative gate, so a failed check (runtime unreachable, not ready) returns null.
+   */
+  async getAutomaticGoalTurnAgentRefusal(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">
+  ): Promise<string | null> {
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) return null;
+      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      if (!context.success) return null;
+      const ready = await context.data.runtime.ensureReady();
+      if (!ready.ready) return null;
+      const resolution = await resolveAgentForStream({
+        workspaceId,
+        metadata: metadata.data,
+        runtime: context.data.runtime,
+        workspacePath: context.data.workspacePath,
+        runtimeFactory: this.runtimeFactory,
+        requestedAgentId: options.agentId,
+        disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
+        automaticGoalTurn: true,
+        callerToolPolicy: undefined,
+        cfg: this.config.loadConfigOrDefault(),
+        emitError: () => undefined,
+      });
+      return resolution.success ? null : formatSendMessageError(resolution.error).message;
+    } catch {
+      return null; // unreadable runtime: the stream-time gate decides
+    }
+  }
+
   /** Builds the runtime context shared by stream startup and MCP prompt discovery. */
   createWorkspaceRuntimeContext(
     workspaceId: string,
@@ -757,35 +1015,32 @@ export class AIService extends EventEmitter {
 
     const singleProjectContext = isMultiProject(metadata)
       ? undefined
-      : createRuntimeContextForWorkspace(metadataWithPath);
+      : this.runtimeFactory.createRuntimeContextForWorkspace(metadataWithPath);
     const runtime = singleProjectContext
       ? singleProjectContext.runtime
-      : new MultiProjectRuntime(
-          new ContainerManager(getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir),
-          getProjects(metadata).map((project) => ({
+      : this.runtimeFactory.createMultiProjectRuntime({
+          runtimeConfig: metadata.runtimeConfig,
+          srcBaseDir: getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir,
+          workspaceName: metadata.name,
+          projects: getProjects(metadata).map((project) => ({
             projectPath: project.projectPath,
             projectName: project.projectName,
-            runtime: createRuntime(metadata.runtimeConfig, {
-              projectPath: project.projectPath,
-              workspaceName: metadata.name,
-              workspacePath: isSSHRuntime(metadata.runtimeConfig)
-                ? getWorkspacePathHintForProject(
-                    {
-                      workspaceId,
-                      workspaceName: metadata.name,
-                      workspacePath: workspace.workspacePath,
-                      runtimeConfig: metadata.runtimeConfig,
-                      projectPath: metadata.projectPath,
-                      projectName: metadata.projectName,
-                      projects: metadata.projects,
-                    },
-                    project.projectPath
-                  )
-                : undefined,
-            }),
+            workspacePath: isSSHRuntime(metadata.runtimeConfig)
+              ? getWorkspacePathHintForProject(
+                  {
+                    workspaceId,
+                    workspaceName: metadata.name,
+                    workspacePath: workspace.workspacePath,
+                    runtimeConfig: metadata.runtimeConfig,
+                    projectPath: metadata.projectPath,
+                    projectName: metadata.projectName,
+                    projects: metadata.projects,
+                  },
+                  project.projectPath
+                )
+              : undefined,
           })),
-          metadata.name
-        );
+        });
 
     const workspacePath =
       singleProjectContext?.workspacePath ??
@@ -848,16 +1103,6 @@ export class AIService extends EventEmitter {
   }
 
   /**
-   * Host-evaluated gate for the agent-plugins experiment: when enabled, skill
-   * discovery/read paths also scan Agent Plugins containers (.xum/plugins,
-   * .agents/plugins, ~/.xum/plugins, ~/.agents/plugins; read-only, lowest
-   * precedence). Public for the same reason as isClaudeSkillsCompatEnabled.
-   */
-  isAgentPluginsEnabled(): boolean {
-    return this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS) === true;
-  }
-
-  /**
    * Resolve the XumToolScope a workspace's tools receive, including the checkout
    * boundary used for subproject skill inheritance. Host-local scopes also use
    * this root to anchor Agent Plugins containers.
@@ -889,11 +1134,11 @@ export class AIService extends EventEmitter {
         ? AbortSignal.any([opts.abortSignal, controller.signal])
         : controller.signal,
       syntheticMessageId: createAssistantMessageId(),
-      startTime: Date.now(),
+      startTime: this.streamManager.hostClock.nowMs(),
       startupPhaseTimingsMs,
       startupState: { pendingRunMetadataId: null },
       recordStartupPhaseTiming: (phase, started) => {
-        startupPhaseTimingsMs[phase] = Date.now() - started;
+        startupPhaseTimingsMs[phase] = this.streamManager.hostClock.nowMs() - started;
       },
       admissionOnly: true,
     };
@@ -935,7 +1180,7 @@ export class AIService extends EventEmitter {
       abortSignal,
       acpPromptId: opts.acpPromptId,
     });
-    const startTime = prepared?.context.startTime ?? Date.now();
+    const startTime = prepared?.context.startTime ?? this.streamManager.hostClock.nowMs();
     const syntheticMessageId = pendingStart.syntheticMessageId;
     opts.onStreamStarting?.(syntheticMessageId);
     const combinedAbortSignal = pendingStart.abortSignal;
@@ -945,7 +1190,7 @@ export class AIService extends EventEmitter {
     if (combinedAbortSignal.aborted) forwardCancellation();
     else combinedAbortSignal.addEventListener("abort", forwardCancellation, { once: true });
     const recordStartupPhaseTiming = (phase: string, phaseStartedAt: number): void => {
-      startupPhaseTimingsMs[phase] = Date.now() - phaseStartedAt;
+      startupPhaseTimingsMs[phase] = this.streamManager.hostClock.nowMs() - phaseStartedAt;
     };
     const startupState = prepared?.context.startupState ?? {
       pendingRunMetadataId: null as string | null,
@@ -986,12 +1231,12 @@ export class AIService extends EventEmitter {
           lastMessage?.role
       );
 
-      const commitPartialStartedAt = Date.now();
+      const commitPartialStartedAt = this.streamManager.hostClock.nowMs();
       await this.historyService.commitPartial(workspaceId);
       recordStartupPhaseTiming("commitPartialMs", commitPartialStartedAt);
 
       const buildOutcome = prepared
-        ? await prepared.request.start(opts.activeTurnThinkingOverride)
+        ? await prepared.request.start(opts.activeTurnThinkingOverride, opts.onTurnStartStage)
         : await this.turnRequestBuilder.build(opts, {
             abortSignal: combinedAbortSignal,
             syntheticMessageId,
@@ -1022,7 +1267,7 @@ export class AIService extends EventEmitter {
         buildOutcome.logStartOutcome("stream_start_failed", "stop_in_progress");
         pendingStart.abort("startup");
       }
-      const startStreamStartedAt = Date.now();
+      const startStreamStartedAt = this.streamManager.hostClock.nowMs();
       const streamResult = await this.streamManager.startStream(buildOutcome.turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 
@@ -1082,10 +1327,29 @@ export class AIService extends EventEmitter {
     return Ok(this.lastLlmRequestByWorkspace.get(workspaceId) ?? null);
   }
 
+  /**
+   * Wired to WorkspaceService "metadata" events (like ComputerUseService): a removed (null) or
+   * archived workspace drops its in-memory request-building state, so it does not grow for the
+   * whole app run. An un-archived workspace rebuilds that state on its next send.
+   */
+  handleWorkspaceMetadata(event: {
+    workspaceId: string;
+    metadata: { archivedAt?: string; unarchivedAt?: string } | null;
+  }): void {
+    if (
+      event.metadata != null &&
+      !isWorkspaceArchived(event.metadata.archivedAt, event.metadata.unarchivedAt)
+    ) {
+      return;
+    }
+    this.turnRequestBuilder.forgetWorkspace(event.workspaceId);
+    this.lastLlmRequestByWorkspace.delete(event.workspaceId);
+  }
+
   async deleteWorkspace(workspaceId: string): Promise<Result<void>> {
     try {
       const workspaceDir = path.join(this.config.sessionsDir, workspaceId);
-      await fs.rm(workspaceDir, { recursive: true, force: true });
+      await this.historyService.files.promises.rm(workspaceDir, { recursive: true, force: true });
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);

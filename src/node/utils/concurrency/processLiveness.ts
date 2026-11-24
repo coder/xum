@@ -91,10 +91,13 @@ export function linuxBirth(pid: number): string | null {
 /**
  * Process identity recorded by holders. Linux: `birth` is the /proc
  * starttime and `bootId`/`pidNs` define the PID domain in which a pid is
- * meaningful. `machineId` and `platform` count only when both sides have
- * them and they DIFFER (a positively different domain; see judgeHolder()).
- * `hostname` is diagnostic only: macOS hostnames change with networks, so
- * refusing on a mismatch would keep a crashed holder's lock refused forever.
+ * meaningful. `platform` counts only when both sides have it and they DIFFER
+ * (a positively different OS; see judgeHolder()). `machineId` and `hostname`
+ * are diagnostic only. /etc/machine-id belongs to the file system, not the PID
+ * domain: a `--pid=host` container has its own, and it can be rewritten while a
+ * holder runs, so a mismatch would reclaim a live same-domain holder. macOS
+ * hostnames change with networks, so refusing on a mismatch would keep a crashed
+ * holder's lock refused forever.
  */
 export interface ProcessIdentity {
   birth: string | null;
@@ -163,9 +166,11 @@ export function parseProcessIdentity(record: Record<string, unknown>): ProcessId
   };
 }
 
-export type Verdict = { dead: true } | { dead: false; why: string };
+/** Only a verified local PID sets running. Unknown identity evidence still blocks automatic mutation. */
+export type Verdict = { dead: true } | { dead: false; why: string; running?: true };
 const DEAD: Verdict = { dead: true };
 const refuse = (why: string): Verdict => ({ dead: false, why });
+const running = (why: string): Verdict => ({ dead: false, why, running: true });
 
 function pidGone(pid: number): boolean {
   try {
@@ -190,9 +195,11 @@ export interface HolderEvidence {
  * or indeterminate and is never reclaimed; age never reclaims.
  *
  * 1. A POSITIVELY different PID domain is retired by contract ⇒ dead:
- *    machine-ids both present and different; platforms both recorded and
- *    different; on Linux (both sides naming boot id and PID namespace) a
- *    different boot id or namespace. Hostname is diagnostic, not evidence.
+ *    platforms both recorded and different; on Linux (both sides naming boot
+ *    id and PID namespace) a different boot id or namespace. Machine id and
+ *    hostname are diagnostic, not evidence: equal boot id and namespace prove
+ *    the same domain whatever the machine id says, and an equal machine id
+ *    with another boot id (a reboot) is already decided by the boot id.
  * 2. UNKNOWN domain evidence is not dead ⇒ refuse: a record missing its
  *    boot id/namespace while we have ours, or naming one we cannot read.
  * 3. Same domain (proven on Linux): ESRCH or a different starttime ⇒ dead;
@@ -215,12 +222,12 @@ export function judgeHolder(holder: HolderEvidence, ownTokenLive: boolean): Verd
     const current = recorded?.startsWith("linux-ticks:") ? linuxBirth(pid) : null;
     return current !== null && current !== recorded
       ? DEAD
-      : refuse("it was written by an older Xum build and that pid is running");
+      : running("it was written by an older Xum build and that pid is running");
   }
   const self = getSelfIdentity();
   const differs = (a: string | null, b: string | null) => a !== null && b !== null && a !== b;
   // Positively different PID domain: retired by the deployment contract.
-  if (differs(record.platform, self.platform) || differs(record.machineId, self.machineId)) {
+  if (differs(record.platform, self.platform)) {
     return DEAD;
   }
   const linuxDomain = self.bootId !== null && self.pidNs !== null;
@@ -235,13 +242,13 @@ export function judgeHolder(holder: HolderEvidence, ownTokenLive: boolean): Verd
     return refuse("it names a PID domain this process cannot verify");
   }
   if (pid === process.pid) {
-    return ownTokenLive ? refuse("it is held by this process") : DEAD;
+    return ownTokenLive ? running("it is held by this process") : DEAD;
   }
   if (pidGone(pid)) {
     return DEAD;
   }
   if (!linuxDomain) {
-    return refuse("that pid is running");
+    return running("that pid is running");
   }
   if (record.birth === null) {
     return refuse("its process start time is unknown");
@@ -250,5 +257,5 @@ export function judgeHolder(holder: HolderEvidence, ownTokenLive: boolean): Verd
   if (current === null) {
     return refuse("its process start time cannot be read");
   }
-  return current === record.birth ? refuse("that process is running") : DEAD;
+  return current === record.birth ? running("that process is running") : DEAD;
 }

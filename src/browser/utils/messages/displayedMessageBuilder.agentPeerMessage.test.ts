@@ -237,6 +237,35 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
     expect(row.agentPeerMessageTrigger).toBe(true);
   });
 
+  test.each(["main_chat", "side_chat"] as const)(
+    "preserves %s attribution while normalizing the payload and trigger",
+    (relationship) => {
+      const attribution = { fromWorkspaceId: "linked-chat", relationship };
+      const row = buildAssistantRow(
+        { type: "agent-peer-message", ...attribution },
+        {
+          text: formatAgentMessageEnvelope({
+            from: "linked-chat",
+            relationship,
+            message: "A finding",
+          }),
+        }
+      );
+      expect(row.agentPeerMessage).toEqual(attribution);
+      const trigger = createMuxMessage("trigger", "user", "Message received", {
+        synthetic: true,
+        muxMetadata: { type: "agent-peer-message", ...attribution },
+      });
+      const [displayed] = buildDisplayedMessagesForMessage({
+        message: trigger,
+        hasActiveStream: false,
+        isContextBoundaryMessage: () => false,
+      });
+      if (displayed?.type !== "user") throw new Error("Expected user-role trigger");
+      expect(displayed.agentPeerMessageTrigger).toBe(true);
+    }
+  );
+
   test("requires the envelope relationship to match the metadata", () => {
     // Metadata says `unrelated` while the envelope claims `sibling`: collapsing would show the
     // server-computed badge over text that tells the model a closer relationship. Fall back.

@@ -2,7 +2,7 @@ import { describe, it, expect, mock } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import { createAgentReportTool } from "./agent_report";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createTestToolConfig, zodInputSchemaOf } from "./testHelpers";
 import type { TaskService } from "@/node/services/taskService";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -48,7 +48,7 @@ describe("agent_report tool", () => {
       taskService,
     });
 
-    const inputSchema = tool.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    const inputSchema = zodInputSchemaOf(tool);
     expect(inputSchema.safeParse({ reportMarkdown: "done", title: null }).success).toBe(true);
     expect(
       inputSchema.safeParse({
@@ -83,7 +83,7 @@ describe("agent_report tool", () => {
       allowLegacyInvalidWorkflowAgentOutputSchema: true,
     });
 
-    const inputSchema = tool.inputSchema as { safeParse(value: unknown): { success: boolean } };
+    const inputSchema = zodInputSchemaOf(tool);
     expect(inputSchema.safeParse({ reportMarkdown: "done", title: null }).success).toBe(true);
     expect(
       inputSchema.safeParse({ reportMarkdown: "done", structuredOutput: {}, title: null }).success

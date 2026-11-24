@@ -11,6 +11,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { renderLegendLabel } from "./chartLegend";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import type {
   AsyncState,
@@ -24,6 +25,7 @@ import {
   CHART_TOOLTIP_CONTENT_STYLE,
   formatProjectDisplayName,
   formatUsd,
+  formatUsdAxisTick,
 } from "./analyticsUtils";
 
 interface ModelBreakdownProps {
@@ -78,7 +80,7 @@ export function ModelBreakdown(props: ModelBreakdownProps) {
                 <XAxis
                   type="number"
                   tick={CHART_AXIS_TICK}
-                  tickFormatter={(value: number) => formatUsd(Number(value))}
+                  tickFormatter={(value: number) => formatUsdAxisTick(Number(value))}
                   stroke={CHART_AXIS_STROKE}
                 />
                 <YAxis
@@ -142,12 +144,7 @@ export function ModelBreakdown(props: ModelBreakdownProps) {
                   labelStyle={{ color: "var(--color-foreground)" }}
                   itemStyle={{ color: "var(--color-foreground)" }}
                 />
-                <Legend
-                  wrapperStyle={{ fontSize: "11px" }}
-                  formatter={(value) => (
-                    <span style={{ color: "var(--color-foreground)" }}>{value}</span>
-                  )}
-                />
+                <Legend wrapperStyle={{ fontSize: "11px" }} formatter={renderLegendLabel} />
               </PieChart>
             </ResponsiveContainer>
           </div>

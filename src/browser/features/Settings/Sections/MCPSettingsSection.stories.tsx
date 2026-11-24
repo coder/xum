@@ -1,20 +1,20 @@
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { wrapAsyncIterator } from "@orpc/shared";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
 import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
@@ -60,6 +60,8 @@ interface MCPSectionStoryOptions {
   testResults?: Record<string, string[]>;
   secrets?: Secret[];
   preCacheTools?: boolean;
+  experiments?: Partial<Record<ExperimentId, boolean>>;
+  mcpAppViewDomainsListError?: string;
 }
 
 function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): APIClient {
@@ -98,6 +100,8 @@ function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): API
     globalSecrets: options.secrets ?? [],
     mcpTestResults,
     mcpOauthAuthStatus: options.mcpOauthAuthStatus,
+    experiments: options.experiments,
+    mcpAppViewDomainsListError: options.mcpAppViewDomainsListError,
   });
 }
 
@@ -110,16 +114,13 @@ const MCPSettingsSectionStoryShell: FC<{ setup: () => APIClient; children: React
   if (clientRef.current === null || setupRef.current !== setup) {
     setupRef.current = setup;
     clientRef.current = setup();
+    getAppConfigStore().setClient(clientRef.current);
   }
 
   return (
     <ThemeProvider>
       <TooltipProvider>
-        <APIProvider client={clientRef.current}>
-          <ExperimentsProvider>
-            <PolicyProvider>{children}</PolicyProvider>
-          </ExperimentsProvider>
-        </APIProvider>
+        <APIProvider client={clientRef.current}>{children}</APIProvider>
       </TooltipProvider>
     </ThemeProvider>
   );
@@ -550,16 +551,76 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
   },
 };
 
+/**
+ * #6622: the server refused a tool call with 403 insufficient_scope. The tokens stay, and the row
+ * names the scopes and the next step. Phone width: long scope URLs wrap. Out of Pixel snapshots
+ * (snapshot budget); the play checks it.
+ */
+export const ProjectSettingsOAuthInsufficientScope: Story = {
+  decorators: withDesktopWindowApi,
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() =>
+        setupMCPSettingsSectionStory({
+          servers: {
+            "remote-oauth": {
+              transport: "http",
+              url: "https://example.com/mcp",
+              disabled: false,
+            },
+          },
+          mcpOauthAuthStatus: new Map<string, MCPOAuthAuthStatus>([
+            [
+              "https://example.com/mcp",
+              {
+                serverUrl: "https://example.com/mcp",
+                isLoggedIn: true,
+                hasRefreshToken: true,
+                updatedAtMs: Date.now() - 60_000,
+                insufficientScopes: ["https://www.googleapis.com/auth/drive.file", "files.write"],
+              },
+            ],
+          ]),
+        })
+      }
+    >
+      <div style={{ width: 375 }}>
+        <MCPSettingsSection />
+      </div>
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    await body.findByText(/Logged in/i);
+    const scopes = "https://www.googleapis.com/auth/drive.file files.write";
+    // By role, not by copy: the prompt is the status line that names the scopes.
+    const prompt = (await body.findAllByRole("status")).find((el) =>
+      el.textContent?.includes(scopes)
+    );
+    if (!prompt) throw new Error("The sign-in prompt must name the requested scopes");
+    await expect(prompt.textContent).toContain(scopes);
+    await expect(prompt.scrollWidth).toBeLessThanOrEqual(prompt.clientWidth + 1);
+  },
+};
+
 function setupDesignStory(
   enabled = true,
   reuseEnabled = false,
-  sibling?: { disconnect: () => void }
+  sibling?: { disconnect: () => void },
+  pendingDisable?: { finish: () => void }
 ): APIClient {
-  const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+  // One stream per subscription, like the backend: the section and its card both subscribe.
+  const subscribers: Array<(update: { enabled: boolean; revision: number }) => void> = [];
   let revision = 0;
-  updates.push({ enabled, revision });
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), enabled);
+  let streamEnabled = enabled;
+  const publish = () => {
+    revision++;
+    for (const push of subscribers) push({ enabled: streamEnabled, revision });
+  };
   const client = setupMCPSettingsSectionStory({
+    // A pending disable: the config snapshot already reads off while the stream still reports on.
+    experiments: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled && !pendingDisable },
     servers: enabled
       ? {
           claude_design: {
@@ -583,11 +644,23 @@ function setupDesignStory(
   };
   client.experiments = {
     onDesignChange: (_input, { signal } = {}) => {
+      const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+      updates.push({ enabled: streamEnabled, revision });
+      subscribers.push(updates.push);
       signal?.addEventListener("abort", updates.end, { once: true });
       return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
     },
-    getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
-    setOverride: () => Promise.resolve(),
+    set: () => Promise.resolve(),
+    // The flight recorder status stream: off, like a fresh profile.
+    onPerfFlightRecorderChange: () =>
+      Promise.resolve(
+        wrapAsyncIterator(
+          (async function* () {
+            yield await Promise.resolve({ enabled: false, state: "off" as const });
+          })(),
+          {}
+        )
+      ),
   };
   client.mcp.designStatus = () => Promise.resolve(status);
   client.mcp.configureDesign = (settings) => {
@@ -596,7 +669,7 @@ function setupDesignStory(
       settings: { ...status.settings, ...settings },
       state: settings.reuseEnabled ? "not_configured" : "disabled",
     };
-    updates.push({ enabled, revision: ++revision });
+    publish();
     return Promise.resolve(status);
   };
   if (sibling) {
@@ -615,7 +688,15 @@ function setupDesignStory(
         state: "disabled",
         settings: { ...status.settings, reuseEnabled: false, serverEnabled: false },
       };
-      updates.push({ enabled, revision: ++revision });
+      publish();
+    };
+  }
+  if (pendingDisable) {
+    pendingDisable.finish = () => {
+      streamEnabled = false;
+      publish();
+      // An update from before the disable that arrives late.
+      for (const push of subscribers) push({ enabled: true, revision: revision - 1 });
     };
   }
   client.mcp.test = () => {
@@ -667,6 +748,32 @@ export const ClaudeDesignPhone: Story = {
   },
 };
 
+// A failed load of the MCP App view-domain approvals shows its error with a Retry instead of an
+// empty list (#6181). Phone width: the error wraps and Retry stays on screen.
+export const ViewDomainsLoadErrorPhone: Story = {
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  // The test-runner ignores viewport globals; the wrapper enforces the width there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell
+        setup={() =>
+          setupMCPSettingsSectionStory({ mcpAppViewDomainsListError: "The backend is busy" })
+        }
+      >
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const error = await canvas.findByText(/Could not load allowed view domains: The backend/);
+    const row = error.parentElement!;
+    await expect(within(row).getByRole("button", { name: "Retry" })).toBeVisible();
+    await expect(row.getBoundingClientRect().right).toBeLessThanOrEqual(375);
+  },
+};
+
 export const ClaudeDesignDisabled: Story = {
   tags: ["claude-design"],
   render: () => (
@@ -685,7 +792,7 @@ export const ClaudeDesignConflictDisconnect: Story = {
   tags: ["claude-design"],
   render: () => (
     <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
-      <ClaudeDesignCard conflict remoteDisabled={false} onChange={() => Promise.resolve()} />
+      <ClaudeDesignCard conflict onChange={() => Promise.resolve()} />
     </MCPSettingsSectionStoryShell>
   ),
   play: async ({ canvasElement }) => {
@@ -694,26 +801,6 @@ export const ClaudeDesignConflictDisconnect: Story = {
     await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
     await expect(disconnect).toBeEnabled();
     await userEvent.click(disconnect);
-    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
-    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
-  },
-};
-
-export const ClaudeDesignPolicyDisconnect: Story = {
-  ...ClaudeDesignConflictDisconnect,
-  tags: ["claude-design"],
-  render: () => (
-    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
-      <ClaudeDesignCard conflict={false} remoteDisabled onChange={() => Promise.resolve()} />
-    </MCPSettingsSectionStoryShell>
-  ),
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const disconnect = await canvas.findByRole("button", { name: "Disconnect" });
-    await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
-    await expect(disconnect).toBeEnabled();
-    disconnect.focus();
-    await userEvent.keyboard("{Control>}{Shift>}d{/Shift}{/Control}");
     await canvas.findByRole("button", { name: "Use Claude Code credentials" });
     await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
   },
@@ -743,5 +830,28 @@ export const ClaudeDesignSiblingDisconnect: Story = {
     await expect(
       canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
     ).not.toBeChecked();
+  },
+};
+
+const pendingDesignDisable: { finish: () => void } = { finish: () => undefined };
+
+export const ClaudeDesignHidesAfterRetirement: Story = {
+  tags: ["claude-design"],
+  parameters: { pixel: { exclude: true } },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() => setupDesignStory(true, false, undefined, pendingDesignDisable)}
+    >
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The Design stream reports a disable only after the backend retired affected clients.
+    await canvas.findByRole("region", { name: "Claude Design" });
+    // A direct call, not a click, so React renders the disable and the late older update
+    // together: the card hides only if the older update is ignored.
+    pendingDesignDisable.finish();
+    await waitFor(() => expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull());
   },
 };

@@ -16,6 +16,7 @@ import {
   GOAL_CONTINUATION_KIND,
 } from "@/constants/goals";
 import { createMuxMessage } from "@/common/types/message";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -527,40 +528,64 @@ describe("WorkspaceGoalService", () => {
     expect(reconciled).toMatchObject({ status: "active" });
   });
 
-  test("getGoal keeps a never-driven goal active when a hidden plan snapshot follows the processed prompt", async () => {
-    // A plan turn that sets a goal and calls propose_plan appends a hidden snapshot record
-    // between the manual row and the completed assistant row; the record is state, not a turn,
-    // so the initiating prompt still counts as processed after candidate loss.
-    await appendUserHistoryMessage(historyService, workspaceId, "Plan it and set a goal");
-    const snapshot: PlanReviewRecord = {
-      v: 1,
-      kind: "snapshot",
-      recordId: "rec_goal_snap",
-      snapshotId: "snap_goal",
-      planPath: "/plans/p.md",
-      contentHash: "a".repeat(64),
-      content: "# Plan\n",
-    };
-    const appended = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("goal-test-snapshot", "user", formatPlanReviewEnvelope(snapshot), {
-        timestamp: Date.now(),
-        synthetic: true,
-        muxMetadata: buildPlanReviewMetadata(snapshot),
-      })
-    );
-    expect(appended.success).toBe(true);
-    await appendAssistantHistoryMessage(historyService, workspaceId, "Plan proposed, goal set");
-    await setGoalOk(service, {
-      workspaceId,
-      objective: "Processed prompt behind a snapshot",
-      initiator: "model",
-    });
+  const goalSnapshotRecord: PlanReviewRecord = {
+    v: 1,
+    kind: "snapshot",
+    recordId: "rec_goal_snap",
+    snapshotId: "snap_goal",
+    planPath: "/plans/p.md",
+    contentHash: "a".repeat(64),
+    content: "# Plan\n",
+  };
+  test.each([
+    {
+      row: "a hidden plan snapshot",
+      // A plan turn that sets a goal and calls propose_plan appends a hidden snapshot record
+      // between the manual row and the completed assistant row.
+      build: () =>
+        createMuxMessage(
+          "goal-test-snapshot",
+          "user",
+          formatPlanReviewEnvelope(goalSnapshotRecord),
+          {
+            timestamp: Date.now(),
+            synthetic: true,
+            muxMetadata: buildPlanReviewMetadata(goalSnapshotRecord),
+          }
+        ),
+    },
+    {
+      row: "a Token Budget warning",
+      // The Token Budget warning row is appended right after the user row it warns about.
+      build: () =>
+        createContextBudgetWarning({
+          contextTokens: 90_000,
+          maxTokens: 128_000,
+          budgetTokens: 119_808,
+          handoff: true,
+          sessionHistoryAvailable: true,
+        }),
+    },
+  ])(
+    "getGoal keeps a never-driven goal active when $row follows the processed prompt",
+    async ({ build }) => {
+      // The interposed row is state or a notice, not a turn, so the initiating prompt still counts
+      // as processed after candidate loss.
+      await appendUserHistoryMessage(historyService, workspaceId, "Plan it and set a goal");
+      const appended = await historyService.appendToHistory(workspaceId, build());
+      expect(appended.success).toBe(true);
+      await appendAssistantHistoryMessage(historyService, workspaceId, "Plan proposed, goal set");
+      await setGoalOk(service, {
+        workspaceId,
+        objective: "Processed prompt behind a snapshot",
+        initiator: "model",
+      });
 
-    const reconciled = await service.getGoal(workspaceId);
+      const reconciled = await service.getGoal(workspaceId);
 
-    expect(reconciled).toMatchObject({ status: "active" });
-  });
+      expect(reconciled).toMatchObject({ status: "active" });
+    }
+  );
 
   test("getGoal pauses a never-driven goal when a manual row was authored after the goal", async () => {
     // Crash-recovery self-healing: if the dispatch-time auto-pause was lost
@@ -1126,31 +1151,6 @@ describe("WorkspaceGoalService", () => {
       goalId: resumed.goalId,
       status: "active",
     });
-  });
-
-  test("strips set_goal capability from synthetic goal continuations", async () => {
-    const created = await setGoalOk(service, { workspaceId, objective: "Continue safely" });
-    const dispatcher = new IdleDispatcher();
-    const executed: Array<Parameters<GoalContinuationRuntimeBridge["executeGoalContinuation"]>[0]> =
-      [];
-    service.registerGoalContinuationConsumer(
-      dispatcher,
-      continuationBridge((input) => {
-        executed.push(input);
-        return Promise.resolve(true);
-      })
-    );
-
-    await service.requestContinuationAfterStreamEnd({
-      workspaceId,
-      sendOptions: { model: "openai:gpt-4o", agentId: "exec", allowAgentSetGoal: true },
-      streamEndedAtMs: created.createdAtMs + 1,
-    });
-    await dispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME);
-
-    expect(executed).toHaveLength(1);
-    expect(executed[0]?.kind).toBe(GOAL_CONTINUATION_KIND);
-    expect(executed[0]?.options.allowAgentSetGoal).toBeUndefined();
   });
 
   test("replacing a goal while a stale continuation candidate exists arms the new goal", async () => {

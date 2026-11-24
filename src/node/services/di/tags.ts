@@ -21,11 +21,13 @@ import type {
 } from "@/node/config";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { AgentStatusService } from "@/node/services/agentStatusService";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
 import type { AIService } from "@/node/services/aiService";
 import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { BackupService } from "@/node/services/backup/backupService";
+import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
 import type { AgentBrowserSessionDiscoveryService } from "@/node/services/browser/AgentBrowserSessionDiscoveryService";
 import type { BrowserBridgeServer } from "@/node/services/browser/BrowserBridgeServer";
 import type { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserBridgeTokenManager";
@@ -39,9 +41,11 @@ import type { ContextManagementService } from "@/node/services/contextManagement
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ReviewStateService } from "@/node/services/reviewStateService";
+import type { DraftService } from "@/node/services/draftService";
 import type { EditorService } from "@/node/services/editorService";
 import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -59,9 +63,6 @@ import type { MemoryConsolidationService } from "@/node/services/memoryConsolida
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MenuEventService } from "@/node/services/menuEventService";
-import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import type { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProjectService } from "@/node/services/projectService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -69,6 +70,10 @@ import type { PTYService } from "@/node/services/ptyService";
 import type { RefineService } from "@/node/services/refinement/refineService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { ServerService } from "@/node/services/serverService";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import type { HostProcesses } from "@/node/services/hostProcesses/hostProcesses";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -76,6 +81,11 @@ import type { StreamManager } from "@/node/services/streamManager";
 import type { TaskService } from "@/node/services/taskService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import type { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
+import type { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import type { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import type { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
+import type { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { TokenizerService } from "@/node/services/tokenizerService";
@@ -91,13 +101,35 @@ import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager"
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { AppFiberScopeTag } from "./appFiberScope";
 import type { EffectRunnerTag } from "./effectRunner";
+import type { HostClockTag } from "./hostClockLive";
 import type { CoreOptionsTag } from "./layers/core";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export class ConfigTag extends Context.Service<ConfigTag, Config>()("xum/Config") {}
 export class SessionLocatorTag extends Context.Service<
   SessionLocatorTag,
   WorkspaceSessionLocator
 >()("xum/SessionLocator") {}
+/** The host file calls of the history layer (sessionFiles/sessionFiles.ts). */
+export class SessionFilesTag extends Context.Service<SessionFilesTag, SessionFiles>()(
+  "xum/SessionFiles"
+) {}
+/** Host files outside the session dirs (hostFiles/hostFiles.ts). */
+export class HostFilesTag extends Context.Service<HostFilesTag, HostFiles>()("xum/HostFiles") {}
+/** The Xum home, the user home and the temp folder (hostFiles/hostFiles.ts). */
+export class HostPathsTag extends Context.Service<HostPathsTag, HostPaths>()("xum/HostPaths") {}
+/** Host git spawns and network calls of loop code (hostProcesses/hostProcesses.ts). */
+export class HostProcessesTag extends Context.Service<HostProcessesTag, HostProcesses>()(
+  "xum/HostProcesses"
+) {}
+/** Every runtime that loop code builds (runtimeFactory/runtimeFactoryService.ts). */
+export class RuntimeFactoryTag extends Context.Service<RuntimeFactoryTag, RuntimeFactory>()(
+  "xum/RuntimeFactory"
+) {}
+/** Every lock that guards a session write (phase 4); StoresLive gives the Node layer. */
+export class SessionLocksTag extends Context.Service<SessionLocksTag, SessionLocks>()(
+  "xum/SessionLocks"
+) {}
 export class ProvidersConfigStoreTag extends Context.Service<
   ProvidersConfigStoreTag,
   ProvidersConfigStore
@@ -105,6 +137,11 @@ export class ProvidersConfigStoreTag extends Context.Service<
 export class SecretsStoreTag extends Context.Service<SecretsStoreTag, SecretsStore>()(
   "xum/SecretsStore"
 ) {}
+/** OS notifications of the notify tool (desktopNotifications/). */
+export class DesktopNotificationsTag extends Context.Service<
+  DesktopNotificationsTag,
+  DesktopNotifications
+>()("xum/DesktopNotifications") {}
 export class FileLeaseManagerTag extends Context.Service<FileLeaseManagerTag, FileLeaseManager>()(
   "xum/FileLeaseManager"
 ) {}
@@ -139,7 +176,7 @@ export class AutoModelRouterTag extends Context.Service<AutoModelRouterTag, Auto
   "xum/AutoModelRouter"
 ) {}
 
-/** Headless `experimental_evaluate` wrapper for the workflow `evaluate()` primitive. */
+/** Headless `experimental_decide` wrapper for the workflow `evaluate()` primitive. */
 export class Evaluation extends Context.Service<Evaluation, EvaluationService>()(
   "xum/Evaluation"
 ) {}
@@ -175,6 +212,33 @@ export class TerminalAttentionStoreTag extends Context.Service<
   TerminalAttentionStoreTag,
   TerminalAttentionStore
 >()("xum/TerminalAttentionStore") {}
+/**
+ * Which workspaces this backend is renaming, removing or archiving; shared by WorkspaceService and
+ * the services split out of it (not a `CoreServices` field).
+ */
+export class WorkspaceLifecycleGatesTag extends Context.Service<
+  WorkspaceLifecycleGatesTag,
+  WorkspaceLifecycleGates
+>()("xum/WorkspaceLifecycleGates") {}
+/** External editor opens of each workspace, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceExternalEditorsTag extends Context.Service<
+  WorkspaceExternalEditorsTag,
+  WorkspaceExternalEditors
+>()("xum/WorkspaceExternalEditors") {}
+/** In-process naming claims of each workspace, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceNamingTag extends Context.Service<WorkspaceNamingTag, WorkspaceNaming>()(
+  "xum/WorkspaceNaming"
+) {}
+/** Active workflow runs of each workspace, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceWorkflowRunsTag extends Context.Service<
+  WorkspaceWorkflowRunsTag,
+  WorkspaceWorkflowRuns
+>()("xum/WorkspaceWorkflowRuns") {}
+/** Archive admission of non-send operations, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceOperationAdmissionTag extends Context.Service<
+  WorkspaceOperationAdmissionTag,
+  WorkspaceOperationAdmission
+>()("xum/WorkspaceOperationAdmission") {}
 /** Late-bound collaborators of the turn request builder (a mutable record, filled by wiring). */
 export class TurnRequestBuilderBindingsTag extends Context.Service<
   TurnRequestBuilderBindingsTag,
@@ -183,7 +247,6 @@ export class TurnRequestBuilderBindingsTag extends Context.Service<
 
 // Desktop cross-cutting services that the core graph's options derive from
 // (`CrossCuttingLive` in ./layers/desktop.ts).
-export class Policy extends Context.Service<Policy, PolicyService>()("xum/Policy") {}
 export class Telemetry extends Context.Service<Telemetry, TelemetryService>()("xum/Telemetry") {}
 export class Experiments extends Context.Service<Experiments, ExperimentsService>()(
   "xum/Experiments"
@@ -196,6 +259,7 @@ export class DevTools extends Context.Service<DevTools, DevToolsService>()("xum/
 export class ReviewState extends Context.Service<ReviewState, ReviewStateService>()(
   "xum/ReviewState"
 ) {}
+export class Drafts extends Context.Service<Drafts, DraftService>()("xum/Drafts") {}
 export class WorkspaceMcpOverrides extends Context.Service<
   WorkspaceMcpOverrides,
   WorkspaceMcpOverridesService
@@ -227,6 +291,10 @@ export class DesktopSessionManagerTag extends Context.Service<
   DesktopSessionManagerTag,
   DesktopSessionManager
 >()("xum/DesktopSessionManager") {}
+export class ComputerUseServiceTag extends Context.Service<
+  ComputerUseServiceTag,
+  ComputerUseService
+>()("xum/ComputerUseService") {}
 export class DesktopTokenManagerTag extends Context.Service<
   DesktopTokenManagerTag,
   DesktopTokenManager
@@ -276,12 +344,6 @@ export class WorktreeArchiveSnapshot extends Context.Service<
 >()("xum/WorktreeArchiveSnapshot") {}
 // OAuth flows (all need the WindowService for the browser hand-off).
 export class McpOauth extends Context.Service<McpOauth, McpOauthService>()("xum/McpOauth") {}
-export class MuxGatewayOauth extends Context.Service<MuxGatewayOauth, MuxGatewayOauthService>()(
-  "xum/MuxGatewayOauth"
-) {}
-export class MuxGovernorOauth extends Context.Service<MuxGovernorOauth, MuxGovernorOauthService>()(
-  "xum/MuxGovernorOauth"
-) {}
 export class CodexOauth extends Context.Service<CodexOauth, CodexOauthService>()(
   "xum/CodexOauth"
 ) {}
@@ -306,24 +368,39 @@ export class Refine extends Context.Service<Refine, RefineService>()("xum/Refine
 export class AgentStatus extends Context.Service<AgentStatus, AgentStatusService>()(
   "xum/AgentStatus"
 ) {}
+export class BashAiProxy extends Context.Service<BashAiProxy, BashAiProxyService>()(
+  "xum/BashAiProxy"
+) {}
 
-/** The process's config stores (`ConfigStores`), one tag per store. */
+/**
+ * The process's config stores (`ConfigStores`), one tag per store, and the Node layers of the
+ * host services that agent-loop code reads instead of importing host modules.
+ */
 export type StoreTags =
   | ConfigTag
   | SessionLocatorTag
+  | SessionFilesTag
+  | HostFilesTag
+  | HostPathsTag
+  | HostProcessesTag
+  | RuntimeFactoryTag
+  | SessionLocksTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
-  | FileLeaseManagerTag;
+  | FileLeaseManagerTag
+  | DesktopNotificationsTag;
 
 /**
  * The runtime seams provided at the base of every graph (`./effectRunner.ts`,
- * `./appFiberScope.ts`); their tags live next to their layers.
+ * `./hostClockLive.ts`, `./appFiberScope.ts`); their tags live next to their
+ * layers.
  */
-export type RuntimeSeamTags = EffectRunnerTag | AppFiberScopeTag;
+export type RuntimeSeamTags = EffectRunnerTag | HostClockTag | AppFiberScopeTag;
 
 /**
  * Everything `CoreLive` (./layers/core.ts) provides: every `CoreServices`
- * field plus the graph-internal `TerminalAttentionStore`.
+ * field plus the graph-internal `TerminalAttentionStore`, `WorkspaceLifecycleGates` and
+ * `WorkspaceExternalEditors`.
  */
 export type CoreTags =
   | ContextManagement
@@ -349,6 +426,11 @@ export type CoreTags =
   | MemoryConsolidation
   | DesktopInputCoordinatorTag
   | TerminalAttentionStoreTag
+  | WorkspaceLifecycleGatesTag
+  | WorkspaceExternalEditorsTag
+  | WorkspaceNamingTag
+  | WorkspaceWorkflowRunsTag
+  | WorkspaceOperationAdmissionTag
   | TurnRequestBuilderBindingsTag;
 
 /**
@@ -364,13 +446,13 @@ export type CoreRootTags =
 
 /** The desktop cross-cutting services provided by `CrossCuttingLive`. */
 export type CrossCuttingTags =
-  | Policy
   | Telemetry
   | Experiments
   | SessionTiming
   | Analytics
   | DevTools
   | ReviewState
+  | Drafts
   | WorkspaceMcpOverrides;
 
 /** The desktop-only services provided by the `DesktopLive` group layers, by group. */
@@ -382,6 +464,7 @@ export type BrowserTags =
   | BrowserBridgeServerTag;
 export type DesktopBridgeTags =
   | DesktopSessionManagerTag
+  | ComputerUseServiceTag
   | DesktopTokenManagerTag
   | DesktopBridgeServerTag;
 export type TerminalEditorTags = PTY | Terminal | Editor | Tokenizer | Instructions;
@@ -400,14 +483,8 @@ export type MiscDesktopTags =
   | ServerAuth
   | WorkspaceLifecycleHooksTag
   | WorktreeArchiveSnapshot;
-export type OauthTags =
-  | McpOauth
-  | MuxGatewayOauth
-  | MuxGovernorOauth
-  | CodexOauth
-  | CoderOauth
-  | CopilotOauth;
-export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus;
+export type OauthTags = McpOauth | CodexOauth | CoderOauth | CopilotOauth;
+export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus | BashAiProxy;
 export type DesktopTags =
   | BrowserTags
   | DesktopBridgeTags

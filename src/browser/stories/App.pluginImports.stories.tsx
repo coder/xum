@@ -1,9 +1,8 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
 
@@ -16,11 +15,19 @@ const preview: AgentPluginInstallPreview = {
     ref: "main",
     refType: "branch",
   },
+  method: { kind: "agent-plugin" },
+  methods: [{ kind: "agent-plugin" }],
+  skillsCliSkills: [],
   lockedSha: "a".repeat(40),
   manifest: { name: "review-tools", version: "1.0.0", description: "Review and research tools" },
   targetPath: "~/.xum/plugins/review-tools",
   skills: [
-    { name: "review", description: "Review a change" },
+    // Long prose description: at phone width it must wrap between words, not mid-word.
+    {
+      name: "review",
+      description:
+        "Picks the smallest change that fully solves the task, then reviews it for scope creep",
+    },
     { name: "research", description: "Research a topic" },
   ],
   mcpServers: [
@@ -31,15 +38,22 @@ const preview: AgentPluginInstallPreview = {
     },
   ],
   agents: ["reviewer.md"],
+  readonlyAgents: [],
+  shellRemovedAgents: [],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
+  consentDigest: "c".repeat(64),
+  reviewedComponents: [],
+  codexHooks: [],
+  fileChanges: [],
   hook: { path: "hooks.js", toolGrants: ["file_read"] },
   warnings: [],
+  notApplied: [],
 };
 
 function setupPluginSettings(installed = false, conflict = false) {
   expandLeftSidebar();
-  const client = setupSettingsStory({ experiments: { [EXPERIMENT_IDS.AGENT_PLUGINS]: true } });
+  const client = setupSettingsStory({});
   let entry: AgentPluginInstallEntry = {
     name: preview.manifest.name,
     scope: "global",
@@ -54,7 +68,6 @@ function setupPluginSettings(installed = false, conflict = false) {
     composition: {
       get: () =>
         Promise.resolve({
-          agentPluginsEnabled: true,
           plugins: [],
           diagnostics: [],
           skills: [],
@@ -66,7 +79,8 @@ function setupPluginSettings(installed = false, conflict = false) {
         }),
     },
   };
-  client.agentPlugins.preview = () => Promise.resolve({ success: true, data: preview });
+  client.agentPlugins.preview = () =>
+    Promise.resolve({ success: true, data: { kind: "plugin", preview } });
   client.agentPlugins.checkUpdates = () => Promise.resolve({ success: true, data: [] });
   client.agentPlugins.list = () =>
     Promise.resolve({
@@ -86,6 +100,11 @@ function setupPluginSettings(installed = false, conflict = false) {
           ]
         : [],
     });
+  // Settings → Plugins lists through listForSettings (#6627).
+  client.agentPlugins.listForSettings = async () => ({
+    list: await client.agentPlugins.list(),
+    pendingSignOuts: { kind: "none" },
+  });
   client.agentPlugins.getComponents = () =>
     Promise.resolve({
       success: true,
@@ -127,6 +146,21 @@ async function checkPhoneBounds() {
   for (const group of within(getSettingsDialog()).getAllByRole("group")) {
     await expect(group.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
   }
+}
+
+/**
+ * Pin the Settings content's scroll offset to the top. The snapshot includes it, and the play
+ * leaves it to timing: focusing "Save changes" scrolls the content down, and closing the panel
+ * shrinks it. The browser clamps the offset at the next layout, so the content ended at the top
+ * when a frame ran between "Done" and the reopened panel, and scrolled down when none did.
+ */
+function scrollSettingsContentToStart(inside: HTMLElement) {
+  let scroller = inside.parentElement;
+  while (scroller !== null && getComputedStyle(scroller).overflowY !== "auto") {
+    scroller = scroller.parentElement;
+  }
+  if (scroller === null) throw new Error("Settings content has no vertical scroller");
+  scroller.scrollTop = 0;
 }
 
 export const PreviewDesktop: AppStory = {
@@ -184,6 +218,9 @@ export const ManageComponentsDesktop: AppStory = {
     await expect(canvas.getByRole("checkbox", { name: "research" })).toBeChecked();
     await expect(canvas.getByRole("button", { name: "Save changes" })).toBeDisabled();
     await checkPhoneBounds();
+    scrollSettingsContentToStart(
+      canvas.getByRole("button", { name: "Manage components for review-tools" })
+    );
   },
 };
 

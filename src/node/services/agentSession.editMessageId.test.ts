@@ -34,12 +34,14 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 1000): Pro
 describe("AgentSession.sendMessage (editMessageId)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
-  async function createSessionHarness(
-    workspaceId: string,
-    streamHandler: StreamMessageHandler = (opts: StreamMessageOptions) =>
-      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
-  ) {
-    const streamMessage = mock(streamHandler);
+  async function createSessionHarness(workspaceId: string, streamHandler?: StreamMessageHandler) {
+    // The default turn ends when the session closes: the harness cleanup disposes the session,
+    // and the mocked stopStream never aborts the turn's own abortSignal (#7526).
+    const streamMessage = mock(
+      streamHandler ??
+        ((_opts: StreamMessageOptions) =>
+          Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal))))
+    );
     const harness = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {

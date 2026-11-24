@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import type { ReactElement } from "react";
@@ -33,14 +34,14 @@ const SCOPE = '[data-testid="session-history-scope"]';
 
 describe("SessionHistoryToolCall", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
   });
 
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("list_windows renders one rail row per run; unknown boundary kinds keep their raw label", () => {

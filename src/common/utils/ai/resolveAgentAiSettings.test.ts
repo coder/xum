@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 
 import type { ResolveAgentAiSettingsInput } from "@/common/types/agentAiSettings";
 import { collectDeclaredAncestorLayers } from "./agentAncestorLayers";
-import { InvalidExplicitAiSettingError, resolveAgentAiSettings } from "./resolveAgentAiSettings";
+import {
+  InvalidExplicitAiSettingError,
+  resolveAgentAiSettings,
+  resolveAgentCacheTtl,
+} from "./resolveAgentAiSettings";
 
 // Unrecognized providers fall through to the shared default thinking policy
 // (["off","low","medium","high"], floor "off"), so precedence assertions are
@@ -10,7 +14,7 @@ import { InvalidExplicitAiSettingError, resolveAgentAiSettings } from "./resolve
 const MODEL_A = "custom:model-a";
 const MODEL_B = "custom:model-b";
 const MODEL_C = "custom:model-c";
-const PRO_MODEL = "openai:gpt-5.6";
+const PRO_MODEL = "openai:gpt-6.1-sol";
 
 function base(overrides: Partial<ResolveAgentAiSettingsInput>): ResolveAgentAiSettingsInput {
   return {
@@ -432,6 +436,24 @@ describe("resolveAgentAiSettings normalization and clamping", () => {
     expect(result.effective.reasoningMode).toBeUndefined();
   });
 
+  it("keeps selected cyber but drops it from effective settings where Cyber is unavailable", () => {
+    const resolve = (model: string, cyberModelEnabled = true) =>
+      resolveAgentAiSettings(
+        base({
+          targetWorkspaceSettings: { model, reasoningMode: "cyber" },
+          providersConfig: {
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true, cyberModelEnabled },
+          },
+        })
+      );
+
+    expect(resolve(PRO_MODEL).effective.reasoningMode).toBe("cyber");
+    for (const result of [resolve(PRO_MODEL, false), resolve("openai:gpt-6-luna")]) {
+      expect(result.selected.reasoningMode).toBe("cyber");
+      expect(result.effective.reasoningMode).toBeUndefined();
+    }
+  });
+
   it("invalid persisted candidates fall through with diagnostics", () => {
     const result = resolveAgentAiSettings(
       base({
@@ -448,6 +470,64 @@ describe("resolveAgentAiSettings normalization and clamping", () => {
       InvalidExplicitAiSettingError
     );
   });
+});
+
+describe("resolveAgentCacheTtl precedence", () => {
+  const cases: Array<{
+    name: string;
+    input: Parameters<typeof resolveAgentCacheTtl>[0];
+    expected: ReturnType<typeof resolveAgentCacheTtl>;
+  }> = [
+    {
+      name: "the agent's Settings value beats its own frontmatter",
+      input: {
+        targetAgentId: "explore",
+        agentAiDefaults: { explore: { cacheTtl: "1h" } },
+        targetDefinitionAiDefaults: { cacheTtl: "5m" },
+        ancestors: [{ agentId: "exec" }],
+      },
+      expected: { value: "1h", source: { tier: "config", agentId: "explore" } },
+    },
+    {
+      name: "the agent's own frontmatter beats its base's Settings value",
+      input: {
+        targetAgentId: "explore",
+        agentAiDefaults: { exec: { cacheTtl: "1h" } },
+        targetDefinitionAiDefaults: { cacheTtl: "5m" },
+        ancestors: [{ agentId: "exec" }],
+      },
+      expected: { value: "5m", source: { tier: "definition", agentId: "explore" } },
+    },
+    {
+      name: "a base's Settings value beats that base's frontmatter",
+      input: {
+        targetAgentId: "worker",
+        agentAiDefaults: { exec: { cacheTtl: "1h" } },
+        ancestors: [{ agentId: "exec", definitionAiDefaults: { cacheTtl: "5m" } }],
+      },
+      expected: { value: "1h", source: { tier: "config", agentId: "exec" } },
+    },
+    {
+      name: "an agent without a declared base gets no implicit Exec value",
+      input: { targetAgentId: "worker", agentAiDefaults: { exec: { cacheTtl: "1h" } } },
+      expected: undefined,
+    },
+    {
+      name: "an invalid persisted value falls through to the frontmatter",
+      input: {
+        targetAgentId: "worker",
+        agentAiDefaults: { worker: { cacheTtl: "2h" as "1h" } },
+        targetDefinitionAiDefaults: { cacheTtl: "1h" },
+      },
+      expected: { value: "1h", source: { tier: "definition", agentId: "worker" } },
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(testCase.name, () => {
+      expect(resolveAgentCacheTtl(testCase.input)).toEqual(testCase.expected);
+    });
+  }
 });
 
 describe("collectDeclaredAncestorLayers", () => {

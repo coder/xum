@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 import { z } from "zod";
+import { guardAgainstBrotliResponses } from "@/node/utils/network/brotliResponseGuard";
 import {
   SERVER_UPDATE_CHECK_TIMEOUT_MS,
   SERVER_UPDATE_INSTALL_TIMEOUT_MS,
@@ -24,10 +25,12 @@ function requestOptions(signal: AbortSignal): RequestInit & { dispatcher: Dispat
   // registry rewrite the tags; explicit options win over that process-wide default, for direct
   // (connect) and proxied (requestTls) connections alike. Redirects are refused because a
   // redirect target may leave HTTPS; the configured registry must answer every request itself.
-  dispatcher ??= new EnvHttpProxyAgent({
-    connect: { rejectUnauthorized: true },
-    requestTls: { rejectUnauthorized: true },
-  });
+  dispatcher ??= guardAgainstBrotliResponses(
+    new EnvHttpProxyAgent({
+      connect: { rejectUnauthorized: true },
+      requestTls: { rejectUnauthorized: true },
+    })
+  );
   return { dispatcher, redirect: "error", signal };
 }
 

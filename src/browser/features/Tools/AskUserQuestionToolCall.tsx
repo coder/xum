@@ -1,19 +1,45 @@
 import assert from "@/common/utils/assert";
 
-import { AlertTriangle, Check } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  type RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
+import {
+  CLOSED_UNANSWERED_MESSAGES,
+  type ClosedUnansweredReason,
+  useNonBlockingQuestionAnswers,
+} from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
+import { useAskUserQuestionPlacement } from "@/browser/features/Tools/AskUserQuestion/askUserQuestionPlacement";
+import {
+  ASK_USER_QUESTION_HINTS,
+  AskUserQuestionForm,
+  AskUserQuestionHeader,
+} from "@/browser/features/Tools/AskUserQuestion/AskUserQuestionForm";
+import {
+  applyDraftEdit,
+  buildAnswerSelections,
+  buildAnswersRecord,
+  createInitialDrafts,
+  deleteCachedDraftState,
+  type DraftAnswer,
+  type DraftAnswers,
+  getCachedDraftState,
+  getDescriptionsForLabels,
+  getDraftStateKey,
+  setCachedDraftState,
+} from "@/browser/features/Tools/AskUserQuestion/askUserQuestionDrafts";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
-import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
-import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
-import { cn } from "@/common/lib/utils";
-import { Button } from "@/browser/components/Button/Button";
 import {
   ErrorBox,
-  ExpandIcon,
   StatusIndicator,
   ToolContainer,
   ToolDetails,
@@ -34,23 +60,11 @@ import type {
   ToolErrorResult,
 } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
+import { isAsyncAskUserQuestionOutput } from "@/common/utils/tools/askUserQuestionSummary";
 import { getErrorMessage } from "@/common/utils/errors";
+import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
-
-const OTHER_VALUE = "__other__";
-
-interface DraftAnswer {
-  selected: string[];
-  otherText: string;
-}
-
-interface CachedState {
-  draftAnswers: Record<string, DraftAnswer>;
-  activeIndex: number;
-}
-
-// Cache draft state by toolCallId so it survives workspace switches
-const draftStateCache = new Map<string, CachedState>();
 
 function unwrapJsonContainer(value: unknown): unknown {
   if (!value || typeof value !== "object") {
@@ -97,151 +111,142 @@ function isToolErrorResult(val: unknown): val is ToolErrorResult {
   return record.success === false && typeof record.error === "string";
 }
 
-function parsePrefilledAnswer(question: AskUserQuestionQuestion, answer: string): DraftAnswer {
-  const trimmed = answer.trim();
-  if (trimmed.length === 0) {
-    return { selected: [], otherText: "" };
-  }
-
-  const optionLabels = new Set(question.options.map((o) => o.label));
-
-  if (!question.multiSelect) {
-    if (optionLabels.has(trimmed)) {
-      return { selected: [trimmed], otherText: "" };
-    }
-
-    return { selected: [OTHER_VALUE], otherText: trimmed };
-  }
-
-  const tokens = trimmed
-    .split(",")
-    .map((t) => t.trim())
-    .filter((t) => t.length > 0);
-
-  const selected: string[] = [];
-  const otherParts: string[] = [];
-
-  for (const token of tokens) {
-    if (optionLabels.has(token)) {
-      selected.push(token);
-    } else {
-      otherParts.push(token);
-    }
-  }
-
-  if (otherParts.length > 0) {
-    selected.push(OTHER_VALUE);
-  }
-
-  return { selected, otherText: otherParts.join(", ") };
-}
-
-function isQuestionAnswered(_question: AskUserQuestionQuestion, draft: DraftAnswer): boolean {
-  if (draft.selected.length === 0) {
-    return false;
-  }
-
-  if (draft.selected.includes(OTHER_VALUE)) {
-    return draft.otherText.trim().length > 0;
-  }
-
-  return true;
-}
-
-function draftToAnswerString(question: AskUserQuestionQuestion, draft: DraftAnswer): string {
-  assert(isQuestionAnswered(question, draft), "draftToAnswerString requires a complete answer");
-
-  const parts: string[] = [];
-  for (const label of draft.selected) {
-    if (label === OTHER_VALUE) {
-      parts.push(draft.otherText.trim());
-    } else {
-      parts.push(label);
-    }
-  }
-
-  if (!question.multiSelect) {
-    assert(parts.length === 1, "Single-select questions must have exactly one answer");
-    return parts[0];
-  }
-
-  return parts.join(", ");
-}
-
 /**
- * Get descriptions for selected answer labels from a question's options.
- * Filters out "Other" and labels not found in options.
+ * A finished question: the submitted answers, one row per question with the picked options'
+ * descriptions, or a note when a non-blocking question closed unanswered.
  */
-function getDescriptionsForLabels(question: AskUserQuestionQuestion, labels: string[]): string[] {
-  return labels
-    .filter((label) => label !== OTHER_VALUE)
-    .map((label) => question.options.find((o) => o.label === label)?.description)
-    .filter((d): d is string => d !== undefined);
-}
-
-/** Auto-resizing textarea for "Other" text input. */
-function AutoResizeTextarea(props: {
-  value: string;
-  onChange: (value: string) => void;
-  onSubmit: () => void;
-  placeholder?: string;
-}): JSX.Element {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  useAutoResizeTextarea(textareaRef, props.value, 30);
-
+function AnsweredQuestions(props: {
+  result: { questions: AskUserQuestionQuestion[]; answers: Record<string, string> } | null;
+  closedUnanswered: ClosedUnansweredReason | null;
+}): JSX.Element | null {
+  const result = props.result;
+  if (result == null) {
+    return props.closedUnanswered !== null ? (
+      <div className="text-muted text-[11px] italic">
+        Not answered. {CLOSED_UNANSWERED_MESSAGES[props.closedUnanswered]}
+      </div>
+    ) : null;
+  }
   return (
-    <textarea
-      ref={textareaRef}
-      // Keep the empty natural height at one line (textareas default to rows=2) so
-      // useAutoResizeTextarea can leave empty drafts to CSS sizing without measuring.
-      rows={1}
-      placeholder={props.placeholder}
-      value={props.value}
-      onChange={(e) => props.onChange(e.target.value)}
-      onKeyDown={(e) => {
-        // Submit on Enter without shift (shift+Enter for newline)
-        if (e.key === "Enter" && !e.shiftKey && props.value.trim().length > 0) {
-          e.preventDefault();
-          props.onSubmit();
-        }
-      }}
-      className={cn(
-        "border border-white/10 bg-code-bg text-foreground placeholder:text-muted",
-        "w-full rounded-md px-3 py-2 text-sm",
-        "transition-colors hover:border-white/20",
-        "focus-visible:border-accent focus-visible:ring-1 focus-visible:ring-accent/50 focus-visible:outline-none",
-        "resize-none min-h-[2.5rem] max-h-[30vh] overflow-y-auto"
-      )}
-    />
+    <div className="flex flex-col gap-1.5">
+      <div className="text-secondary text-[10px] tracking-wide uppercase">User answered</div>
+      {Object.entries(result.answers).map(([question, answer]) => {
+        const questionDef = result.questions.find((q) => q.question === question);
+        // Parse answer labels (could be comma-separated for multi-select)
+        const answerLabels = answer.split(",").map((s) => s.trim());
+        const descriptions = questionDef ? getDescriptionsForLabels(questionDef, answerLabels) : [];
+        const header = questionDef?.header ?? question;
+
+        return (
+          <div
+            key={question}
+            className="bg-code-bg flex flex-col gap-0.5 rounded border border-white/5 px-2.5 py-1.5"
+          >
+            <div className="text-secondary text-[10px] tracking-wide uppercase">{header}</div>
+            <div className="text-foreground text-sm leading-snug">{answer}</div>
+            {descriptions.length > 0 && (
+              <div className="text-muted-foreground text-[11px] italic">
+                {descriptions.join("; ")}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
-export function AskUserQuestionToolCall(props: {
+/**
+ * A docked card stays mounted after its questions close until nothing is left to finish: no
+ * submit in flight and no auto-retry rollback waiting on the resumed stream. Then the dock
+ * unmounts it, so closed cards do not pile up. Reruns on every workspace update, which is when
+ * the rollback settles.
+ */
+function useReleaseSettledDockCard(args: {
+  rowId: string | undefined;
+  isAnswering: boolean;
+  isSubmitting: boolean;
+  rollbackPendingRef: RefObject<boolean>;
+  workspaceState: unknown;
+}): void {
+  const placement = useAskUserQuestionPlacement();
+  const release = placement.kind === "dock" ? placement.release : null;
+  const { rowId, isAnswering, isSubmitting, rollbackPendingRef, workspaceState } = args;
+  useEffect(() => {
+    if (
+      release === null ||
+      rowId == null ||
+      isAnswering ||
+      isSubmitting ||
+      rollbackPendingRef.current
+    ) {
+      return;
+    }
+    release(rowId);
+  }, [release, rowId, isAnswering, isSubmitting, rollbackPendingRef, workspaceState]);
+}
+
+interface AskUserQuestionToolCallProps {
   args: AskUserQuestionToolArgs;
   result: AskUserQuestionToolResult | null;
   status: ToolStatus;
   toolCallId: string;
   workspaceId?: string;
-}): JSX.Element {
-  const { api } = useAPI();
+  /** The transcript row's display id: tells apart rows that reuse a tool call id. */
+  rowId?: string;
+}
 
-  // A live, blocking question must never be hidden behind a collapsed "tools"
-  // preference, so force it open while executing. forceExpanded only overrides the
-  // initial seed; once answered the row follows the sticky preference like any tool.
-  const { expanded, toggleExpanded } = useToolExpansion(false, {
-    forceExpanded: props.status === "executing",
-  });
-  const statusDisplay = getStatusDisplay(props.status);
+/**
+ * The transcript row of a question that is open in the dock above the chat input: the form lives
+ * there (sticky to the bottom of the chat), so only one copy of it takes answers.
+ */
+function DockedQuestionStub(props: { status: ToolStatus }): JSX.Element {
+  return (
+    <ToolContainer expanded={false}>
+      <ToolHeader className="cursor-default">
+        <ToolIcon toolName="ask_user_question" />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <ToolName>ask_user_question</ToolName>
+          <div className="text-secondary text-[10px] leading-tight">
+            Answer in the panel above the chat input.
+          </div>
+        </div>
+        <StatusIndicator status={props.status}>{getStatusDisplay(props.status)}</StatusIndicator>
+      </ToolHeader>
+    </ToolContainer>
+  );
+}
 
-  const argsAnswers = props.args.answers ?? {};
+/** The registered ask_user_question card: the form, or a stub while the dock holds the form. */
+export function PlacedAskUserQuestionToolCall(
+  props: AskUserQuestionToolCallProps
+): JSX.Element | null {
+  const placement = useAskUserQuestionPlacement();
+  if (
+    placement.kind === "transcript" &&
+    placement.workspaceId === props.workspaceId &&
+    props.rowId != null &&
+    placement.dockedRowIds.has(props.rowId)
+  ) {
+    return <DockedQuestionStub status={props.status} />;
+  }
+  return <AskUserQuestionToolCall {...props} docked={placement.kind === "dock"} />;
+}
+
+export function AskUserQuestionToolCall(
+  props: AskUserQuestionToolCallProps & {
+    /** Rendered in the dock above the chat input: nothing once the questions close. */
+    docked?: boolean;
+  }
+): JSX.Element | null {
+  const draftStateKey = getDraftStateKey(props);
 
   // Restore from cache if available (survives workspace switches)
-  const cachedState = draftStateCache.get(props.toolCallId);
+  const cachedState = getCachedDraftState(draftStateKey);
 
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-
   const workspaceStore = useWorkspaceStoreRaw();
   const workspaceState = useSyncExternalStore(
     (listener) => {
@@ -265,16 +270,44 @@ export function AskUserQuestionToolCall(props: {
       }
     }
   );
+
+  // Codex-style questions (non-plan agents) returned without waiting: the tool is complete, but
+  // the questions stay answerable until they are answered from this card or an answer message
+  // for this tool call is in history.
+  const isAsyncQuestion = isAsyncAskUserQuestionOutput(props.result);
+  const nonBlocking = useNonBlockingQuestionAnswers({
+    enabled: isAsyncQuestion,
+    workspaceId: props.workspaceId,
+    toolCallId: props.toolCallId,
+    rowId: props.rowId,
+    questions: props.args.questions,
+    transcript: workspaceState?.messages,
+  });
+  const isAnswering = props.status === "executing" || nonBlocking.isOpen;
+  const answeringHints = isAsyncQuestion
+    ? ASK_USER_QUESTION_HINTS.nonBlocking
+    : ASK_USER_QUESTION_HINTS.blocking;
+
+  // A question awaiting answers must never be hidden behind a collapsed "tools"
+  // preference, so force it open while answerable. forceExpanded only overrides the
+  // initial seed; once answered the row follows the sticky preference like any tool.
+  const { expanded, toggleExpanded } = useToolExpansion(false, {
+    forceExpanded: isAnswering,
+  });
+
   const autoRetryRollbackWorkspaceIdRef = useRef<string | null>(null);
   const autoRetryRollbackPendingRef = useRef(false);
   const autoRetryRollbackArmedRef = useRef(false);
   const autoRetryRollbackBaselineMessageCountRef = useRef<number | null>(null);
   const isMountedRef = useRef(true);
-  const apiRef = useRef(api);
+  // The rollback skips while offline, as it did when useAPI() went null in the gap.
+  const liveApi = useLiveAPI();
+  const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
+  const apiRef = useRef(liveApi);
 
   useEffect(() => {
-    apiRef.current = api;
-  }, [api]);
+    apiRef.current = liveApi;
+  }, [liveApi]);
 
   const rollbackAutoRetryIfNeeded = useCallback(
     async (options?: { suppressErrors?: boolean }): Promise<void> => {
@@ -372,33 +405,28 @@ export function AskUserQuestionToolCall(props: {
     workspaceState?.canInterrupt,
     workspaceState?.messages.length,
   ]);
-
-  const [draftAnswers, setDraftAnswers] = useState<Record<string, DraftAnswer>>(() => {
-    if (cachedState) {
-      return cachedState.draftAnswers;
-    }
-
-    const initial: Record<string, DraftAnswer> = {};
-    for (const q of props.args.questions) {
-      const prefilled = argsAnswers[q.question];
-      if (typeof prefilled === "string") {
-        initial[q.question] = parsePrefilledAnswer(q, prefilled);
-      } else {
-        initial[q.question] = { selected: [], otherText: "" };
-      }
-    }
-    return initial;
+  // After the rollback effects above, so a rollback that just ran in this commit counts as settled.
+  useReleaseSettledDockCard({
+    rowId: props.rowId,
+    isAnswering,
+    isSubmitting,
+    rollbackPendingRef: autoRetryRollbackPendingRef,
+    workspaceState,
   });
+
+  const [draftAnswers, setDraftAnswers] = useState<DraftAnswers>(
+    () => cachedState?.draftAnswers ?? createInitialDrafts(props.args.questions, props.args.answers)
+  );
 
   // Sync draft state to cache so it survives workspace switches
   useEffect(() => {
-    if (props.status === "executing") {
-      draftStateCache.set(props.toolCallId, { draftAnswers, activeIndex });
+    if (isAnswering) {
+      setCachedDraftState(draftStateKey, { draftAnswers, activeIndex });
     } else {
-      // Clean up cache when tool completes
-      draftStateCache.delete(props.toolCallId);
+      // Clean up cache once the questions are answered (or the tool failed)
+      deleteCachedDraftState(draftStateKey);
     }
-  }, [props.toolCallId, props.status, draftAnswers, activeIndex]);
+  }, [draftStateKey, isAnswering, draftAnswers, activeIndex]);
 
   const resultUnwrapped = useMemo(() => {
     if (!props.result) {
@@ -410,43 +438,14 @@ export function AskUserQuestionToolCall(props: {
 
   const uiOnlyPayload = getToolOutputUiOnly(resultUnwrapped)?.ask_user_question;
 
-  const successResult =
+  const toolResultPayload =
     uiOnlyPayload ??
     (resultUnwrapped && isAskUserQuestionPayload(resultUnwrapped) ? resultUnwrapped : null);
+  // A non-blocking question's tool result carries no answers; they come from the answer message.
+  const successResult = isAsyncQuestion ? nonBlocking.answered : toolResultPayload;
 
   const errorResult =
     resultUnwrapped && isToolErrorResult(resultUnwrapped) ? resultUnwrapped : null;
-
-  const isComplete = useMemo(() => {
-    return props.args.questions.every((q) => {
-      const draft = draftAnswers[q.question];
-      return draft ? isQuestionAnswered(q, draft) : false;
-    });
-  }, [draftAnswers, props.args.questions]);
-
-  const submitButtonRef = useRef<HTMLButtonElement>(null);
-
-  const summaryIndex = props.args.questions.length;
-  const isOnSummary = activeIndex === summaryIndex;
-
-  // Focus submit button when reaching summary so Enter submits
-  useEffect(() => {
-    if (props.status === "executing" && isOnSummary) {
-      submitButtonRef.current?.focus();
-    }
-  }, [isOnSummary, props.status]);
-
-  const currentQuestion = isOnSummary
-    ? null
-    : props.args.questions[Math.min(activeIndex, props.args.questions.length - 1)];
-  const currentDraft = currentQuestion ? draftAnswers[currentQuestion.question] : undefined;
-
-  const unansweredCount = useMemo(() => {
-    return props.args.questions.filter((q) => {
-      const draft = draftAnswers[q.question];
-      return !draft || !isQuestionAnswered(q, draft);
-    }).length;
-  }, [draftAnswers, props.args.questions]);
 
   const handleSubmit = (): void => {
     setIsSubmitting(true);
@@ -456,20 +455,14 @@ export function AskUserQuestionToolCall(props: {
     let workspaceId: string;
 
     try {
-      answers = {};
-      for (const q of props.args.questions) {
-        const draft = draftAnswers[q.question];
-        if (draft && isQuestionAnswered(q, draft)) {
-          answers[q.question] = draftToAnswerString(q, draft);
-        } else {
-          // Unanswered questions get empty string
-          answers[q.question] = "";
-        }
-      }
+      answers = buildAnswersRecord(props.args.questions, draftAnswers);
 
-      assert(api, "API not connected");
+      assert(liveApi, "API not connected");
       assert(props.workspaceId, "workspaceId is required");
       workspaceId = props.workspaceId;
+      // The composer's barrier: the dock shows open questions before a replay catches up, and a
+      // blocking answer resumes the turn, so never answer from a stale copy of the question.
+      assert(isTranscriptMutationAllowed(workspaceId), TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       setSubmitError(errorMessage);
@@ -477,7 +470,19 @@ export function AskUserQuestionToolCall(props: {
       return;
     }
 
-    api.workspace
+    if (isAsyncQuestion) {
+      nonBlocking
+        .send(buildAnswerSelections(props.args.questions, draftAnswers), answers)
+        .finally(() => {
+          setIsSubmitting(false);
+        })
+        .then(setSubmitError, (error: unknown) => {
+          setSubmitError(getErrorMessage(error));
+        });
+      return;
+    }
+
+    liveApi.workspace
       .answerAskUserQuestion({
         workspaceId,
         toolCallId: props.toolCallId,
@@ -506,7 +511,7 @@ export function AskUserQuestionToolCall(props: {
           );
         }
 
-        const enableResult = await api.workspace.setAutoRetryEnabled?.({
+        const enableResult = await liveApi.workspace.setAutoRetryEnabled?.({
           workspaceId,
           enabled: true,
           persist: false,
@@ -520,7 +525,7 @@ export function AskUserQuestionToolCall(props: {
           // Ask-user resume temporarily enables auto-retry for this attempt.
           // Roll back only after the resumed stream reaches a terminal outcome.
           if (!isMountedRef.current) {
-            await api.workspace.setAutoRetryEnabled?.({
+            await liveApi.workspace.setAutoRetryEnabled?.({
               workspaceId,
               enabled: false,
               persist: false,
@@ -533,7 +538,7 @@ export function AskUserQuestionToolCall(props: {
           }
         }
 
-        const resumeResult = await api.workspace.resumeStream({
+        const resumeResult = await liveApi.workspace.resumeStream({
           workspaceId,
           options: sendOptions,
         });
@@ -566,353 +571,54 @@ export function AskUserQuestionToolCall(props: {
         setIsSubmitting(false);
       });
   };
-  const title = "ask_user_question";
-  const totalCount = props.args.questions.length;
-  const answeredCount = totalCount - unansweredCount;
+  // The dock only holds questions that take answers; the transcript row shows the outcome. The
+  // dock keeps a closed card mounted (rendering nothing) so the auto-retry rollback above still
+  // sees the resumed stream settle, as the transcript card did when it owned the form.
+  if (props.docked === true && !isAnswering) {
+    return null;
+  }
+
+  const changeDraft = (
+    _groupKey: string,
+    question: string,
+    update: (draft: DraftAnswer) => DraftAnswer
+  ) => {
+    setDraftAnswers((prev) => applyDraftEdit(prev, question, update));
+  };
 
   return (
     <ToolContainer expanded={expanded}>
-      <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
-        <ToolIcon toolName="ask_user_question" />
-        <div className="flex min-w-0 flex-1 flex-col">
-          <ToolName>{title}</ToolName>
-          {props.status === "executing" && (
-            <div className="text-secondary text-[10px] leading-tight">
-              Answer below, or type a message in chat to cancel.
-            </div>
-          )}
-        </div>
-        <StatusIndicator status={props.status}>{statusDisplay}</StatusIndicator>
-      </ToolHeader>
+      <AskUserQuestionHeader
+        expanded={expanded}
+        onToggle={toggleExpanded}
+        hint={isAnswering ? answeringHints.header : null}
+        status={props.status}
+      />
 
       {expanded && (
         <ToolDetails>
           <div className="flex flex-col gap-3">
-            {props.status === "executing" && (
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {props.args.questions.map((q, idx) => {
-                    const draft = draftAnswers[q.question];
-                    const answered = draft ? isQuestionAnswered(q, draft) : false;
-                    const isActive = idx === activeIndex;
-                    return (
-                      <button
-                        key={q.question}
-                        type="button"
-                        className={cn(
-                          "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors",
-                          isActive
-                            ? "border-accent bg-accent text-accent-foreground shadow-sm"
-                            : answered
-                              ? "border-success/40 bg-success/10 text-success hover:bg-success/20"
-                              : "border-white/10 bg-white/5 text-secondary hover:border-white/20 hover:text-foreground"
-                        )}
-                        onClick={() => setActiveIndex(idx)}
-                      >
-                        {q.header}
-                        {answered && !isActive && <Check aria-hidden="true" className="h-3 w-3" />}
-                      </button>
-                    );
-                  })}
-                  <button
-                    type="button"
-                    className={cn(
-                      "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors",
-                      isOnSummary
-                        ? "border-accent bg-accent text-accent-foreground shadow-sm"
-                        : isComplete
-                          ? "border-success/40 bg-success/10 text-success hover:bg-success/20"
-                          : "border-white/10 bg-white/5 text-secondary hover:border-white/20 hover:text-foreground"
-                    )}
-                    onClick={() => setActiveIndex(summaryIndex)}
-                  >
-                    Summary
-                    {isComplete && !isOnSummary && <Check aria-hidden="true" className="h-3 w-3" />}
-                  </button>
-                  {totalCount > 0 && (
-                    <span className="text-muted counter-nums ml-auto text-[10px]">
-                      {answeredCount}/{totalCount} answered
-                    </span>
-                  )}
-                </div>
-
-                {!isOnSummary && currentQuestion && currentDraft && (
-                  <>
-                    <div className="flex flex-col gap-0.5">
-                      <div className="text-foreground text-sm leading-snug font-medium">
-                        {currentQuestion.question}
-                      </div>
-                      <div className="text-secondary text-[10px] tracking-wide uppercase">
-                        {currentQuestion.multiSelect ? "Select one or more" : "Select one"}
-                      </div>
-                    </div>
-
-                    <div className="-mx-2 flex flex-col gap-0.5">
-                      {/* Render option checkboxes */}
-                      {[
-                        ...currentQuestion.options.map((opt) => ({
-                          label: opt.label,
-                          displayLabel: opt.label,
-                          description: opt.description,
-                        })),
-                        {
-                          label: OTHER_VALUE,
-                          displayLabel: "Other",
-                          description: "Provide a custom answer.",
-                        },
-                      ].map((opt) => {
-                        const checked = currentDraft.selected.includes(opt.label);
-
-                        const toggle = () => {
-                          const isSelecting = !checked;
-
-                          setDraftAnswers((prev) => {
-                            const draft = prev[currentQuestion.question] ?? {
-                              selected: [],
-                              otherText: "",
-                            };
-
-                            if (currentQuestion.multiSelect) {
-                              // Multi-select: toggle this option
-                              const selected = new Set(draft.selected);
-                              if (selected.has(opt.label)) {
-                                selected.delete(opt.label);
-                              } else {
-                                selected.add(opt.label);
-                              }
-                              return {
-                                ...prev,
-                                [currentQuestion.question]: {
-                                  ...draft,
-                                  selected: Array.from(selected),
-                                },
-                              };
-                            } else {
-                              // Single-select: replace selection (clear otherText if not Other)
-                              return {
-                                ...prev,
-                                [currentQuestion.question]: {
-                                  selected: checked ? [] : [opt.label],
-                                  otherText: opt.label === OTHER_VALUE ? draft.otherText : "",
-                                },
-                              };
-                            }
-                          });
-
-                          // For single-select questions, auto-advance *only* when the user selects
-                          // a non-Other option (avoid useEffect auto-advance that breaks back-nav).
-                          if (
-                            !currentQuestion.multiSelect &&
-                            isSelecting &&
-                            opt.label !== OTHER_VALUE
-                          ) {
-                            setActiveIndex((idx) => idx + 1);
-                          }
-                        };
-
-                        return (
-                          <div
-                            key={opt.label}
-                            role="button"
-                            tabIndex={0}
-                            className={cn(
-                              "flex cursor-pointer items-start gap-2.5 rounded px-2 py-1.5 transition-colors select-none",
-                              checked ? "bg-accent/10 hover:bg-accent/15" : "hover:bg-white/5"
-                            )}
-                            onClick={toggle}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                toggle();
-                              }
-                            }}
-                          >
-                            <Checkbox
-                              checked={checked}
-                              onCheckedChange={toggle}
-                              onClick={(e) => e.stopPropagation()}
-                              className="mt-0.5"
-                            />
-                            <div className="flex min-w-0 flex-col">
-                              <div
-                                className={cn(
-                                  "text-sm leading-snug",
-                                  checked ? "text-foreground font-medium" : "text-foreground"
-                                )}
-                              >
-                                {opt.displayLabel}
-                              </div>
-                              <div className="text-muted-foreground text-[11px] leading-snug">
-                                {opt.description}
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-
-                      {currentDraft.selected.includes(OTHER_VALUE) && (
-                        <div className="mt-1.5 px-2">
-                          <AutoResizeTextarea
-                            placeholder="Type your answer"
-                            value={currentDraft.otherText}
-                            onChange={(value) => {
-                              setDraftAnswers((prev) => ({
-                                ...prev,
-                                [currentQuestion.question]: {
-                                  ...(prev[currentQuestion.question] ?? {
-                                    selected: [],
-                                    otherText: "",
-                                  }),
-                                  otherText: value,
-                                },
-                              }));
-                            }}
-                            onSubmit={() => setActiveIndex(activeIndex + 1)}
-                          />
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-
-                {isOnSummary && (
-                  <div className="flex flex-col gap-2">
-                    <div className="text-foreground text-sm font-medium">Review your answers</div>
-                    {unansweredCount > 0 && (
-                      <div className="border-warning/30 bg-warning/10 text-warning flex items-center gap-1.5 rounded border px-2 py-1 text-[11px]">
-                        <AlertTriangle aria-hidden="true" className="h-3 w-3 shrink-0" />
-                        <span>
-                          {unansweredCount} question{unansweredCount > 1 ? "s" : ""} not answered
-                        </span>
-                      </div>
-                    )}
-                    <div className="flex flex-col gap-1">
-                      {props.args.questions.map((q, idx) => {
-                        const draft = draftAnswers[q.question];
-                        const answered = draft ? isQuestionAnswered(q, draft) : false;
-                        const answerText = answered ? draftToAnswerString(q, draft) : null;
-                        const descriptions = answered
-                          ? getDescriptionsForLabels(q, draft.selected)
-                          : [];
-                        return (
-                          <div
-                            key={q.question}
-                            role="button"
-                            tabIndex={0}
-                            className="bg-code-bg flex cursor-pointer items-start gap-2 rounded border border-white/5 px-2.5 py-1.5 transition-colors hover:border-white/15 hover:bg-white/5"
-                            onClick={() => setActiveIndex(idx)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                setActiveIndex(idx);
-                              }
-                            }}
-                          >
-                            {answered ? (
-                              <Check
-                                aria-hidden="true"
-                                className="text-success mt-0.5 h-3 w-3 shrink-0"
-                              />
-                            ) : (
-                              <AlertTriangle
-                                aria-hidden="true"
-                                className="text-warning mt-0.5 h-3 w-3 shrink-0"
-                              />
-                            )}
-                            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                              <div className="text-secondary text-[10px] tracking-wide uppercase">
-                                {q.header}
-                              </div>
-                              <div className="text-sm leading-snug">
-                                {answered ? (
-                                  <span className="text-foreground">{answerText}</span>
-                                ) : (
-                                  <span className="text-muted italic">Not answered</span>
-                                )}
-                              </div>
-                              {descriptions.length > 0 && (
-                                <div className="text-muted-foreground text-[11px] italic">
-                                  {descriptions.join("; ")}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {submitError && <ErrorBox>{submitError}</ErrorBox>}
-              </div>
-            )}
-
-            {props.status !== "executing" && (
+            {isAnswering ? (
+              <AskUserQuestionForm
+                groups={[
+                  { key: "questions", questions: props.args.questions, drafts: draftAnswers },
+                ]}
+                activeIndex={activeIndex}
+                onActivate={setActiveIndex}
+                onDraftChange={changeDraft}
+                onSubmit={handleSubmit}
+                isSubmitting={isSubmitting}
+                submitError={submitError}
+                footerHint={answeringHints.footer}
+              />
+            ) : (
               <div className="flex flex-col gap-2">
-                {successResult && (
-                  <div className="flex flex-col gap-1.5">
-                    <div className="text-secondary text-[10px] tracking-wide uppercase">
-                      User answered
-                    </div>
-                    {Object.entries(successResult.answers).map(([question, answer]) => {
-                      const questionDef = successResult.questions.find(
-                        (q) => q.question === question
-                      );
-                      // Parse answer labels (could be comma-separated for multi-select)
-                      const answerLabels = answer.split(",").map((s) => s.trim());
-                      const descriptions = questionDef
-                        ? getDescriptionsForLabels(questionDef, answerLabels)
-                        : [];
-                      const header = questionDef?.header ?? question;
-
-                      return (
-                        <div
-                          key={question}
-                          className="bg-code-bg flex flex-col gap-0.5 rounded border border-white/5 px-2.5 py-1.5"
-                        >
-                          <div className="text-secondary text-[10px] tracking-wide uppercase">
-                            {header}
-                          </div>
-                          <div className="text-foreground text-sm leading-snug">{answer}</div>
-                          {descriptions.length > 0 && (
-                            <div className="text-muted-foreground text-[11px] italic">
-                              {descriptions.join("; ")}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+                <AnsweredQuestions
+                  result={successResult}
+                  closedUnanswered={nonBlocking.closedUnanswered}
+                />
 
                 {errorResult && <ErrorBox>{errorResult.error}</ErrorBox>}
-              </div>
-            )}
-
-            {props.status === "executing" && (
-              <div className="flex items-center justify-between gap-3 border-t border-white/5 pt-2">
-                <div className="text-muted min-w-0 flex-1 text-[10px] italic">
-                  Tip: type a message in chat to cancel these questions.
-                </div>
-                {isOnSummary ? (
-                  <Button
-                    ref={submitButtonRef}
-                    disabled={isSubmitting}
-                    onClick={handleSubmit}
-                    size="sm"
-                  >
-                    {isSubmitting ? "Submitting…" : "Submit answers"}
-                  </Button>
-                ) : (
-                  <Button
-                    onClick={() => setActiveIndex(activeIndex + 1)}
-                    size="sm"
-                    variant="outline"
-                  >
-                    Next
-                  </Button>
-                )}
               </div>
             )}
           </div>

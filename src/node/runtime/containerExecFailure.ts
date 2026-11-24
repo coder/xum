@@ -36,16 +36,28 @@ const CONTAINER_UNAVAILABLE_PATTERNS: readonly RegExp[] = [
  * Refusals that only a configuration change fixes, so retrying is pointless:
  * an API version mismatch (moby daemon/server/middleware/version.go), an
  * authorization plugin denial (moby daemon/pkg/authorization/authz.go), and a
- * socket the user may not open (a connection line ending in the dial error
- * "permission denied"). They stay non-transport and fail loudly as unreadable
- * reads.
+ * socket or named pipe the user may not open: a connection line whose dial
+ * error is an OS access denial. That class is matched by the OS error text,
+ * not by docker wording: EACCES "permission denied", EPERM "operation not
+ * permitted", and Windows ERROR_ACCESS_DENIED "Access is denied." (#5018).
+ * They stay non-transport and fail loudly as unreadable reads.
  */
 const PERMANENT_REFUSALS: readonly RegExp[] = [
   /^(?:docker: )?Error response from daemon: (?:client version \S+ is too (?:new|old)\b|authorization denied by plugin )/m,
-  /^(?:docker: )?(?:Cannot connect to the Docker daemon|failed to connect to the docker API at |error during connect: )[^\n]*permission denied/im,
+  /^(?:docker: )?(?:Cannot connect to the Docker daemon|failed to connect to the docker API at |error during connect: )[^\n]*(?:permission denied|operation not permitted|access is denied)/im,
 ];
 
-/** docker exec statuses for a command that could not be invoked or was not found. */
+/**
+ * docker exec statuses for a command that could not be invoked or was not found.
+ *
+ * Exit 137 (SIGKILL) with empty output is deliberately NOT transport (#5021).
+ * Measured on docker 27.5.1, a probe cut off by a dying container and a probe
+ * OOM-killed inside a container that keeps running give the same exit code and
+ * the same empty stdout/stderr. Only an async container-state check could tell
+ * them apart, and this classifier is a synchronous predicate over (exit, stderr).
+ * So it stays a loud read failure; the next send's ensureReady restarts a
+ * stopped container.
+ */
 const COMMAND_NOT_INVOKABLE_EXITS: ReadonlySet<number> = new Set([126, 127]);
 
 export function isContainerUnavailableExit(exitCode: number, stderr: string): boolean {

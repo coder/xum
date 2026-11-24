@@ -28,6 +28,7 @@ import { resolveCapabilityGrants, type CapabilityGrants } from "@/common/types/c
 import {
   sharedDurableEventJournal,
   type DurableEventJournal,
+  type DurableEventWriteOptions,
 } from "@/node/utils/journal/durableEventJournal";
 import {
   canDeleteEvictedBlob,
@@ -127,7 +128,8 @@ function reclamationStateFor(journal: DurableEventJournal): JournalReclamationSt
 export async function reclaimSupersededSnapshotBlobs(
   journal: DurableEventJournal,
   scopeKey: string,
-  latestRef: BlobRef
+  latestRef: BlobRef,
+  writeOptions?: DurableEventWriteOptions
 ): Promise<void> {
   assert(scopeKey.length > 0, "reclaimSupersededSnapshotBlobs requires a scopeKey");
   await journal.withBlobLock(async () => {
@@ -183,7 +185,7 @@ export async function reclaimSupersededSnapshotBlobs(
       if (!deletable) continue;
       await journal.deleteBlobUnderLock(ref);
     }
-  });
+  }, writeOptions);
 }
 
 /**
@@ -201,7 +203,8 @@ export async function reclaimSupersededSnapshotBlobs(
  */
 export async function reclaimExcessResultHandleBlobs(
   journal: DurableEventJournal,
-  published?: BlobQuotaEntry
+  published?: BlobQuotaEntry,
+  writeOptions?: DurableEventWriteOptions
 ): Promise<void> {
   await journal.withBlobLock(async () => {
     const state = reclamationStateFor(journal);
@@ -247,7 +250,7 @@ export async function reclaimExcessResultHandleBlobs(
       if (!deletable) continue;
       await journal.deleteBlobUnderLock(ref);
     }
-  });
+  }, writeOptions);
 }
 
 export type SandboxMountLifetime = "ephemeral" | "persistent";
@@ -802,6 +805,17 @@ export class SandboxHostService {
    * failing component; the reset caller is told loudly).
    */
   private readonly pendingDiscards = new Set<string>();
+  /**
+   * Scopes of removed workspaces (#7484): acquisition refuses to mount them.
+   * A code_execution of the aborted turn can reach the scope lock only after
+   * removal's dropScopeForRemoval released it; without this it would build a
+   * fresh mount (leaked in persistentMounts) and journal into the session
+   * dir removal deletes next. Removal-only, not part of dropScope: plugin
+   * hook teardown also drops its scopes and mounts the same keys again on
+   * reload. Holds one entry per removed workspace for the process lifetime
+   * (workspace IDs are never reused); an aborted removal calls reinstateScope.
+   */
+  private readonly removedScopes = new Set<string>();
 
   private lockFor(scopeKey: string): AsyncMutex {
     let lock = this.scopeLocks.get(scopeKey);
@@ -868,6 +882,7 @@ export class SandboxHostService {
     const sessionDir = options.sessionDir;
     assert(scopeKey, "persistent mounts require a scopeKey");
     assert(sessionDir, "persistent mounts require a sessionDir");
+    this.assertScopeNotRemoved(scopeKey);
     const journal = this.journalFor(sessionDir);
 
     const existing = this.persistentMounts.get(scopeKey);
@@ -1015,6 +1030,9 @@ export class SandboxHostService {
                 );
               }
             },
+            // A live workspace's session dir always exists: never recreate
+            // one that workspace removal deleted (#7484).
+            createSessionDir: false,
           }
         );
         // Our own publish is now the scope's newest snapshot row: advance the
@@ -1026,7 +1044,7 @@ export class SandboxHostService {
         // version for the life of the session). Failure must never fail the
         // persist — reclamation is best-effort bookkeeping.
         try {
-          await reclaimSupersededSnapshotBlobs(journal, scopeKey, ref);
+          await reclaimSupersededSnapshotBlobs(journal, scopeKey, ref, { createSessionDir: false });
         } catch (error) {
           log.debug("SandboxHostService: snapshot blob reclamation failed; continuing", { error });
         }
@@ -1037,15 +1055,19 @@ export class SandboxHostService {
         // The blob is the durable copy of the full offloaded value; the event
         // row carries exactly the model-visible {handle, preview, size}. Both
         // publish as one unit under the journal blob lock (see publishWithBlob).
-        const { ref, size } = await journal.publishWithBlob(serialized, (blobHash, blobSize) => ({
-          workspaceId: scopeKey,
-          kind: "result-handle",
-          data: { handle, preview, blobHash, size: blobSize },
-        }));
+        const { ref, size } = await journal.publishWithBlob(
+          serialized,
+          (blobHash, blobSize) => ({
+            workspaceId: scopeKey,
+            kind: "result-handle",
+            data: { handle, preview, blobHash, size: blobSize },
+          }),
+          { createSessionDir: false }
+        );
         // Bound retained handle payloads per session (best-effort — failure
         // must never fail the persist, mirroring snapshot reclamation).
         try {
-          await reclaimExcessResultHandleBlobs(journal, { ref, size });
+          await reclaimExcessResultHandleBlobs(journal, { ref, size }, { createSessionDir: false });
         } catch (error) {
           log.debug("SandboxHostService: result-handle blob reclamation failed; continuing", {
             error,
@@ -1267,6 +1289,28 @@ export class SandboxHostService {
     if (mount && !mount.isDisposed) {
       mount.dispose();
     }
+  }
+
+  /**
+   * dropScope for workspace removal: also refuse every later mount of the
+   * scope (see removedScopes). Marked before taking the scope lock, so every
+   * call still waiting for the lock is refused when it gets it.
+   */
+  async dropScopeForRemoval(scopeKey: string): Promise<void> {
+    this.removedScopes.add(scopeKey);
+    await this.dropScope(scopeKey);
+  }
+
+  /** Refuse a mount for a removed workspace (see removedScopes). Caller holds the scope lock. */
+  private assertScopeNotRemoved(scopeKey: string): void {
+    if (this.removedScopes.has(scopeKey)) {
+      throw new Error(`sandbox scope '${scopeKey}' belongs to a removed workspace`);
+    }
+  }
+
+  /** Undo dropScopeForRemoval after an aborted removal: the workspace stays usable. */
+  reinstateScope(scopeKey: string): void {
+    this.removedScopes.delete(scopeKey);
   }
 
   /**

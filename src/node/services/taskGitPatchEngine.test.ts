@@ -12,6 +12,9 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { setAgentSandboxTargets } from "@/node/runtime/sandbox/agentSandboxTargets";
+import { isAgentSandboxSupported } from "@/node/runtime/sandbox/macosSandbox";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function initGitRepo(repoPath: string): void {
   execSync("git init -b main", { cwd: repoPath, stdio: "ignore" });
@@ -89,6 +92,7 @@ async function writePatchArtifact(params: {
   >;
 }) {
   await upsertSubagentGitPatchArtifact({
+    locks: nodeSessionLocks,
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.sessionDir,
     childTaskId: params.childTaskId,
@@ -205,6 +209,7 @@ describe("task git patch engine", () => {
       ],
     });
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -270,6 +275,7 @@ describe("task git patch engine", () => {
       ],
     });
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -453,6 +459,7 @@ describe("task git patch engine", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: rootWorkspaceId,
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -539,6 +546,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -609,6 +617,9 @@ describe("task git patch engine", () => {
         stdio: "ignore",
       }
     );
+    // `git init` creates `.git/info` only from its template; a global
+    // `init.templateDir` without that folder leaves it missing.
+    await fsPromises.mkdir(path.join(targetRepo, ".git", "info"), { recursive: true });
     await fsPromises.writeFile(
       path.join(targetRepo, ".git", "info", "attributes"),
       "*.md merge=evil\n",
@@ -645,6 +656,7 @@ describe("task git patch engine", () => {
       ],
     });
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -718,6 +730,7 @@ describe("task git patch engine", () => {
       ],
     });
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -763,6 +776,9 @@ describe("task git patch engine", () => {
       stdio: "ignore",
     });
     execSync("git config filter.evil.required true", { cwd: targetRepo, stdio: "ignore" });
+    // `git init` creates `.git/info` only from its template; a global
+    // `init.templateDir` without that folder leaves it missing.
+    await fsPromises.mkdir(path.join(targetRepo, ".git", "info"), { recursive: true });
     await fsPromises.writeFile(
       path.join(targetRepo, ".git", "info", "attributes"),
       "*.md filter=evil\n",
@@ -801,6 +817,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -878,6 +895,7 @@ describe("task git patch engine", () => {
     }).trim();
 
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -916,6 +934,104 @@ describe("task git patch engine", () => {
     expect(status).toContain(" M notes.txt");
     expect(status).toContain("?? temp.log");
   }, 20_000);
+
+  // Once the dry-run worktree exists, the sandbox keeps its metadata in the main .git read-only,
+  // so a sandboxed `git worktree remove` and `prune` left both behind after every dry run.
+  it.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
+    "removes the dry-run worktree while the macOS agent sandbox is on",
+    async () => {
+      // Real path: Seatbelt matches real paths only, and os.tmpdir() is under the /var symlink.
+      const realRoot = await fsPromises.realpath(rootDir);
+      const childRepo = path.join(realRoot, "child-sandboxed-dry-run");
+      const targetRepo = path.join(realRoot, "target-sandboxed-dry-run");
+      for (const repo of [childRepo, targetRepo]) {
+        await fsPromises.mkdir(repo, { recursive: true });
+        initGitRepo(repo);
+      }
+      await commitFile(childRepo, "README.md", "hello", "base");
+      await commitFile(targetRepo, "README.md", "hello", "base");
+      const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+      await commitFile(childRepo, "README.md", "hello\nchild", "child change");
+      const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+      const sessionDir = path.join(realRoot, "session-sandboxed-dry-run");
+      await fsPromises.mkdir(sessionDir, { recursive: true });
+      const childTaskId = "child-task-sandboxed-dry-run";
+      await writePatchArtifact({
+        sessionDir,
+        workspaceId: "test-workspace",
+        childTaskId,
+        projectArtifacts: [
+          await buildReadyProjectArtifact({
+            sessionDir,
+            childTaskId,
+            storageKey: "target",
+            projectPath: targetRepo,
+            projectName: "target",
+            childRepo,
+            baseSha,
+            headSha,
+          }),
+        ],
+      });
+      const runtimeTempDir = path.join(realRoot, "runtime-tmp-sandboxed-dry-run");
+      // A sandboxed command can plant a git in a PATH folder that it writes (an activated .venv/bin).
+      const plantedBin = path.join(realRoot, "planted-bin");
+      const plantedLog = path.join(realRoot, "planted-git.log");
+      await fsPromises.mkdir(plantedBin);
+      await fsPromises.writeFile(
+        path.join(plantedBin, "git"),
+        `#!/bin/sh\necho "$*" >> '${plantedLog}'\nexec /usr/bin/git "$@"\n`,
+        { mode: 0o755 }
+      );
+      const inheritedPath = process.env.PATH;
+      process.env.PATH = `${plantedBin}:${inheritedPath ?? ""}`;
+
+      setAgentSandboxTargets({
+        fallback: {
+          enabled: true,
+          network: "loopback",
+          allowedHosts: [],
+          extraWritePaths: [],
+          extraReadPaths: [],
+        },
+        byProject: new Map(),
+      });
+      try {
+        const dryRun = await taskGitPatchEngine.applyPatch(
+          {
+            sessionLocks: nodeSessionLocks,
+            workspaceId: "test-workspace",
+            cwd: targetRepo,
+            runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+            runtimeTempDir,
+            workspaceSessionDir: sessionDir,
+          },
+          { task_id: childTaskId, dry_run: true, three_way: true },
+          {}
+        );
+        expect(dryRun.success).toBe(true);
+      } finally {
+        setAgentSandboxTargets(null);
+        process.env.PATH = inheritedPath;
+      }
+      // The sandboxed git calls ran it, Xum's cleanup outside the sandbox did not.
+      const plantedCalls = await fsPromises.readFile(plantedLog, "utf-8");
+      expect(plantedCalls).toContain("am --abort");
+      expect(plantedCalls).not.toMatch(/^worktree (remove|prune)/m);
+
+      const worktrees = execSync("git worktree list --porcelain", {
+        cwd: targetRepo,
+        encoding: "utf-8",
+      });
+      expect(worktrees.match(/^worktree /gm)).toHaveLength(1);
+      expect(
+        await fsPromises.readdir(path.join(targetRepo, ".git", "worktrees")).catch(() => [])
+      ).toEqual([]);
+      expect(await fsPromises.readdir(runtimeTempDir).catch(() => [])).toEqual([]);
+    },
+    30_000
+  );
 
   it("rejects staged unrelated changes before git am", async () => {
     const childRepo = path.join(rootDir, "child-staged-unrelated");
@@ -962,6 +1078,7 @@ describe("task git patch engine", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1028,6 +1145,7 @@ describe("task git patch engine", () => {
     }).trim();
 
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1117,6 +1235,7 @@ describe("task git patch engine", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1175,6 +1294,7 @@ describe("task git patch engine", () => {
     });
 
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1233,6 +1353,7 @@ describe("task git patch engine", () => {
     await fsPromises.mkdir(path.dirname(escapedPath), { recursive: true });
     await fsPromises.writeFile(escapedPath, "do not delete", "utf-8");
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1306,6 +1427,7 @@ describe("task git patch engine", () => {
     await fsPromises.mkdir(path.dirname(escapedPath), { recursive: true });
     await fsPromises.writeFile(escapedPath, "do not delete", "utf-8");
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1375,6 +1497,7 @@ describe("task git patch engine", () => {
       encoding: "utf-8",
     }).trim();
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1462,6 +1585,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1560,6 +1684,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1636,6 +1761,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1708,6 +1834,7 @@ describe("task git patch engine", () => {
     const markReadyCalls: Array<Promise<void>> = [];
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1773,6 +1900,7 @@ describe("task git patch engine", () => {
     const startedAtMs = Date.now();
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1851,6 +1979,7 @@ describe("task git patch engine", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepoA,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1940,6 +2069,7 @@ describe("task git patch engine", () => {
     const startedAtMs = Date.now();
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: currentWorkspaceId,
         cwd: targetRepoA,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -2005,6 +2135,7 @@ describe("task git patch engine", () => {
     );
     const appliedAtMs = Date.now();
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: ancestorWorkspaceId,
       workspaceSessionDir: ancestorSessionDir,
       childTaskId,
@@ -2064,6 +2195,7 @@ describe("task git patch engine", () => {
     );
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),

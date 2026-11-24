@@ -2,17 +2,19 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { Cause, Effect, Exit, Option } from "effect";
 import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError } from "ai";
-import { Experimental_EvaluationMockModelV4 } from "ai/test";
+import { Experimental_DecisionMockModelV4 } from "ai/test";
 import type {
   JSONValue,
-  Experimental_EvaluationModelV4,
-  Experimental_EvaluationModelV4Answer,
-  Experimental_EvaluationModelV4CallOptions,
+  Experimental_DecisionModelV4,
+  Experimental_DecisionModelV4Answer,
+  Experimental_DecisionModelV4CallOptions,
 } from "@ai-sdk/provider";
 import type { EvaluationQuestions } from "@/common/types/evaluation";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import {
   EvaluationError,
   classifyEvaluationError,
+  evaluationModelFromLanguageModel,
   makeEvaluationService,
   type EvaluationCall,
 } from "./evaluationService";
@@ -39,27 +41,27 @@ const VALID_ANSWERS = {
 
 const SENTINEL = "SENTINEL-RESPONSE-BODY-7f3a";
 
-type DoEvaluate = Experimental_EvaluationModelV4["doEvaluate"];
+type DoDecide = Experimental_DecisionModelV4["doDecide"];
 
-function mockModel(doEvaluate: DoEvaluate): {
-  model: Experimental_EvaluationMockModelV4;
-  calls: Experimental_EvaluationModelV4CallOptions[];
+function mockModel(doDecide: DoDecide): {
+  model: Experimental_DecisionMockModelV4;
+  calls: Experimental_DecisionModelV4CallOptions[];
 } {
-  const calls: Experimental_EvaluationModelV4CallOptions[] = [];
-  const model = new Experimental_EvaluationMockModelV4({
+  const calls: Experimental_DecisionModelV4CallOptions[] = [];
+  const model = new Experimental_DecisionMockModelV4({
     provider: "mock",
     modelId: "mock-judge",
     supportedQuestionTypes: ["choice", "score", "boolean"],
-    doEvaluate: (options) => {
+    doDecide: (options) => {
       calls.push(options);
-      return doEvaluate(options);
+      return doDecide(options);
     },
   });
   return { model, calls };
 }
 
 function call<Q extends EvaluationQuestions>(
-  model: Experimental_EvaluationMockModelV4,
+  model: Experimental_DecisionMockModelV4,
   questions: Q
 ): EvaluationCall<Q> {
   return { model, state: { title: "hello" }, questions };
@@ -120,7 +122,18 @@ describe("EvaluationService.evaluate", () => {
     expect(result.warningsCount).toBe(1);
     expect(JSON.stringify(result)).not.toContain(SENTINEL);
     expect(calls).toHaveLength(1);
-    expect(calls[0].state).toEqual({ title: "hello" });
+    expect(calls[0].state).toEqual([{ type: "json", value: { title: "hello" } }]);
+  });
+
+  it("sends a JSON array state as one json part, not as state parts", async () => {
+    // experimental_decide reads a top-level array as ordered state parts, so the
+    // array must arrive whole or the model never sees its elements as data.
+    const { model, calls } = mockModel(() =>
+      Promise.resolve({ answers: VALID_ANSWERS, warnings: [] })
+    );
+    const state = ["first issue", { title: "second issue" }];
+    await Effect.runPromise(service.evaluate({ model, state, questions: QUESTIONS }));
+    expect(calls.map((options) => options.state)).toEqual([[{ type: "json", value: state }]]);
   });
 
   it("never logs provider warnings, even when no other module disabled SDK warning logging", async () => {
@@ -204,6 +217,49 @@ describe("EvaluationService.evaluate", () => {
     expect(JSON.stringify(result)).not.toContain("NaN");
   });
 
+  it("prices Anthropic 1h cache writes from the raw response usage at the 1h rate", async () => {
+    const evaluateWithSplit = async (fiveMinute: number, oneHour: number) => {
+      const { model } = mockModel(() =>
+        Promise.resolve({
+          answers: VALID_ANSWERS,
+          usage: { inputTokens: 5_000, outputTokens: 10 },
+          // AI SDK 7 Anthropic metadata: the write total and split live only in raw usage.
+          providerMetadata: {
+            anthropic: {
+              usage: {
+                cache_creation_input_tokens: fiveMinute + oneHour,
+                cache_creation: {
+                  ephemeral_5m_input_tokens: fiveMinute,
+                  ephemeral_1h_input_tokens: oneHour,
+                },
+              },
+            },
+          },
+          warnings: [],
+        })
+      );
+      const result = await Effect.runPromise(service.evaluate(call(model, QUESTIONS)));
+      const metadata = result.usageProviderMetadata as Record<string, unknown>;
+      const usage = createDisplayUsage(
+        { inputTokens: 5_000, outputTokens: 10 },
+        "anthropic:claude-sonnet-5-5",
+        metadata
+      );
+      return { usage, metadata };
+    };
+    const fiveMinute = await evaluateWithSplit(4_000, 0);
+    const oneHour = await evaluateWithSplit(0, 4_000);
+    expect(fiveMinute.usage?.cacheCreate.tokens).toBe(4_000);
+    expect(oneHour.usage?.cacheCreate.tokens).toBe(4_000);
+    expect(oneHour.usage?.cacheCreate.cost_usd).toBeGreaterThan(
+      fiveMinute.usage?.cacheCreate.cost_usd ?? Infinity
+    );
+    // Only counts are projected, never the raw usage object.
+    expect(oneHour.metadata).toEqual({
+      anthropic: { cacheCreationInputTokens: 4_000, cacheCreation1hInputTokens: 4_000 },
+    });
+  });
+
   it("bounds the provider-reported response model id", async () => {
     const { model: oversized } = mockModel(() =>
       Promise.resolve({
@@ -234,7 +290,7 @@ describe("EvaluationService.evaluate", () => {
     expect(result.responseModelId).toBe("mock-judge");
   });
 
-  const MALFORMED_ANSWERS: Array<[string, Record<string, Experimental_EvaluationModelV4Answer>]> = [
+  const MALFORMED_ANSWERS: Array<[string, Record<string, Experimental_DecisionModelV4Answer>]> = [
     ["unknown choice", { ...VALID_ANSWERS, injection: { type: "choice", choice: "definitely" } }],
     ["out-of-range score", { ...VALID_ANSWERS, severity: { type: "score", score: 7 } }],
     ["missing question", { injection: VALID_ANSWERS.injection, severity: VALID_ANSWERS.severity }],
@@ -288,11 +344,11 @@ describe("EvaluationService.evaluate", () => {
     expect(JSON.stringify(error)).not.toContain(SENTINEL);
   });
 
-  it("fails with unsupported when the model does not support a question type (no doEvaluate call)", async () => {
+  it("fails with unsupported when the model does not support a question type (no doDecide call)", async () => {
     const calls: unknown[] = [];
-    const model = new Experimental_EvaluationMockModelV4({
+    const model = new Experimental_DecisionMockModelV4({
       supportedQuestionTypes: ["boolean"],
-      doEvaluate: (options) => {
+      doDecide: (options) => {
         calls.push(options);
         return Promise.resolve({ answers: VALID_ANSWERS, warnings: [] });
       },
@@ -341,8 +397,8 @@ describe("EvaluationService.evaluate", () => {
 });
 
 /**
- * A Responses API fake for `createOpenAI().evaluationModel()`: the real
- * provider-utils evaluation adapter parses `text` as its JSON answer object.
+ * A Responses API fake for `evaluationModelFromLanguageModel`: the real
+ * provider-utils decision adapter parses `text` as its JSON answer object.
  */
 function fakeResponsesFetch(
   text: string,
@@ -428,13 +484,16 @@ describe("EvaluationService.evaluate billed usage on rejected answers (#4728)", 
     });
   });
 
-  it("keeps the usage of an answer the real OpenAI evaluation adapter rejects inside doEvaluate", async () => {
+  it("keeps the usage of an answer the real OpenAI evaluation adapter rejects inside doDecide", async () => {
     // q0 is the choice question; "c9" is not one of its option codes, so the
     // provider-utils adapter throws before it would return usage.
-    const model = createOpenAI({
-      apiKey: "test",
-      fetch: fakeResponsesFetch(JSON.stringify({ q0: "c9", q1: 1, q2: 0.25 })),
-    }).evaluationModel("gpt-6-sol");
+    const model = evaluationModelFromLanguageModel(
+      createOpenAI({
+        apiKey: "test",
+        fetch: fakeResponsesFetch(JSON.stringify({ q0: "c9", q1: 1, q2: 0.25 })),
+      }).responses("gpt-6-sol"),
+      "openai"
+    );
     const error = expectFailure(
       await runExit(service.evaluate({ model, state: { title: "hello" }, questions: QUESTIONS }))
     );
@@ -447,13 +506,16 @@ describe("EvaluationService.evaluate billed usage on rejected answers (#4728)", 
   });
 
   it("carries no billed usage when the provider call itself failed", async () => {
-    const model = createOpenAI({
-      apiKey: "test",
-      fetch: (() =>
-        Promise.resolve(
-          new Response(`{"error":"${SENTINEL}"}`, { status: 500 })
-        )) as unknown as typeof fetch,
-    }).evaluationModel("gpt-6-sol");
+    const model = evaluationModelFromLanguageModel(
+      createOpenAI({
+        apiKey: "test",
+        fetch: (() =>
+          Promise.resolve(
+            new Response(`{"error":"${SENTINEL}"}`, { status: 500 })
+          )) as unknown as typeof fetch,
+      }).responses("gpt-6-sol"),
+      "openai"
+    );
     const error = expectFailure(
       await runExit(service.evaluate({ model, state: { title: "hello" }, questions: QUESTIONS }))
     );
@@ -461,10 +523,13 @@ describe("EvaluationService.evaluate billed usage on rejected answers (#4728)", 
     expect(error.billedUsage).toBeUndefined();
   });
 
-  it("contract: the OpenAI evaluation model keeps its inner LanguageModelV4 on `model`", () => {
+  it("contract: the language-model evaluation adapter keeps its inner LanguageModelV4 on `model`", () => {
     // evaluationService reads this SDK-internal field to capture the usage of a
     // response the adapter rejects. If an SDK upgrade moves it, fail here loudly.
-    const model = createOpenAI({ apiKey: "test" }).evaluationModel("gpt-6-sol");
+    const model = evaluationModelFromLanguageModel(
+      createOpenAI({ apiKey: "test" }).responses("gpt-6-sol"),
+      "openai"
+    );
     const inner = (
       model as unknown as { model?: { specificationVersion?: unknown; doGenerate?: unknown } }
     ).model;
@@ -494,8 +559,7 @@ describe("EvaluationService.evaluate service tier (#4352)", () => {
     expect(await run("priority")).toEqual({
       openai: { reasoningTokens: 1, serviceTier: "priority" },
     });
-    // Ultrafast has no published rate, but it must survive so pricing can apply
-    // the unknown-tier (highest published card) rule instead of Standard.
+    // Ultrafast must survive so pricing applies its 6x premium instead of Standard.
     expect(await run("ultrafast")).toEqual({
       openai: { reasoningTokens: 1, serviceTier: "ultrafast" },
     });

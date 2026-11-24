@@ -710,13 +710,28 @@ export async function getDevcontainerContainerName(
   });
 }
 
-export async function stopDevcontainer(workspacePath: string): Promise<DevcontainerStopResult> {
+/**
+ * Remove the containers labeled with a workspace's host path. By default only running ones match
+ * ("Stop runtime", rename). `includeStopped` also matches stopped ones, for deletion (#5124): a
+ * stopped container still holds the workspace's files, including its plan, and a later workspace
+ * at the same path would reuse it.
+ */
+export async function stopDevcontainer(
+  workspacePath: string,
+  options?: { includeStopped?: boolean }
+): Promise<DevcontainerStopResult> {
   const labelValue = workspacePath;
 
   return new Promise((resolve) => {
     const proc = spawn(
       "docker",
-      ["ps", "-q", "--filter", `label=devcontainer.local_folder=${labelValue}`],
+      [
+        "ps",
+        ...(options?.includeStopped === true ? ["-a"] : []),
+        "-q",
+        "--filter",
+        `label=devcontainer.local_folder=${labelValue}`,
+      ],
       {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 10_000,
@@ -749,13 +764,18 @@ export async function stopDevcontainer(workspacePath: string): Promise<Devcontai
         return;
       }
 
-      const containerId = stdout.trim().split("\n")[0];
-      if (!containerId) {
+      // Every match is removed: with stopped containers included, a stale stopped one and the
+      // running one can share the label, and removing only the first would leave the other.
+      const containerIds = stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      if (containerIds.length === 0) {
         resolve({ kind: "absent" });
         return;
       }
 
-      const removeProc = spawn("docker", ["rm", "-f", containerId], {
+      const removeProc = spawn("docker", ["rm", "-f", ...containerIds], {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: DEFAULT_CLEANUP_TIMEOUT_MS,
       });
@@ -798,7 +818,7 @@ export async function stopDevcontainer(workspacePath: string): Promise<Devcontai
 export async function devcontainerDown(
   workspaceFolder: string,
   _configPath?: string,
-  _timeoutMs = 60_000
-): Promise<void> {
-  await stopDevcontainer(workspaceFolder);
+  options?: { includeStopped?: boolean }
+): Promise<DevcontainerStopResult> {
+  return stopDevcontainer(workspaceFolder, options);
 }

@@ -60,7 +60,7 @@ export interface WorkspaceUI {
     close(): Promise<void>;
     expectOpen(): Promise<void>;
     expectClosed(): Promise<void>;
-    selectSection(section: "General" | "Providers" | "Models"): Promise<void>;
+    selectSection(section: "Appearance" | "Providers" | "Models"): Promise<void>;
     expandProvider(providerName: string): Promise<void>;
   };
   readonly context: DemoProjectConfig;
@@ -219,7 +219,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         throw new Error("Message must not be empty");
       }
       const input = page.getByRole("textbox", {
-        name: /Message Claude|Edit your last message/,
+        name: /^(Message|Edit message)$/,
       });
       await expect(input).toBeVisible();
       await input.fill(message);
@@ -276,7 +276,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         throw new Error("sendCommandAndExpectStatus expects a slash command");
       }
       const input = page.getByRole("textbox", {
-        name: /Message Claude|Edit your last message/,
+        name: /^(Message|Edit message)$/,
       });
       await expect(input).toBeVisible();
 
@@ -510,13 +510,43 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
   };
 
+  /**
+   * Open a tool from the right sidebar's New tab launcher. The strip's "+" button first adds or
+   * shows the New tab.
+   */
+  async function openFromNewTab(toolName: string): Promise<void> {
+    const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
+    // Tools are opt-in now: wait for either the collapsed sidebar's toggle or the open strip.
+    const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
+    const newTabButton = sidebar.getByRole("button", { name: "New tab", exact: true }).first();
+    await expect(expandButton.or(newTabButton)).toBeVisible();
+    if (await expandButton.isVisible()) await expandButton.click();
+    await expect(newTabButton).toBeVisible();
+    await newTabButton.click();
+    const row = sidebar.getByRole("tabpanel").getByRole("button", { name: toolName, exact: true });
+    await expect(row).toBeVisible();
+    await row.click();
+  }
+
   const metaSidebar = {
     async expectVisible(): Promise<void> {
-      await expect(page.getByRole("complementary", { name: "Workspace insights" })).toBeVisible();
+      // Collapsed (a fresh workspace's state), the sidebar is 0px wide and only its toggle shows
+      // (the overview card floats outside the sidebar's box), so either state counts.
+      const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
+      const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
+      await expect
+        .poll(async () => (await sidebar.isVisible()) || (await expandButton.isVisible()), {
+          message: "neither the expanded right sidebar nor its Expand toggle is visible",
+        })
+        .toBe(true);
     },
 
     async selectTab(label: string): Promise<void> {
       const tab = page.getByRole("tab", { name: label });
+      // The strip shows only opened tabs; open a missing tool from a New tab's launcher.
+      if (!(await tab.isVisible())) {
+        await openFromNewTab(label);
+      }
       await expect(tab).toBeVisible();
       await tab.click();
       const selected = await tab.getAttribute("aria-selected");
@@ -526,15 +556,13 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
 
     async addTerminal(): Promise<void> {
-      // Click the "+" button to add a new terminal tab
-      const addButton = page.getByRole("button", { name: "New terminal" });
-      await expect(addButton).toBeVisible();
-      await addButton.click();
+      // A New tab's launcher (opened with the strip's "+") has the Terminal row.
+      await openFromNewTab("Terminal");
       // Wait for a terminal tab to appear (name may be "Terminal" or include cwd path)
-      // and be selected. Use a locator that matches tabs containing "Terminal" or terminal icon.
+      // and be selected. Only terminal tabs have a "Close terminal" button.
       const terminalTab = page
         .locator('[role="tab"]')
-        .filter({ has: page.locator("svg") })
+        .filter({ has: page.getByRole("button", { name: "Close terminal" }) })
         .last();
       await expect(terminalTab).toBeVisible({ timeout: 5000 });
       await expect(terminalTab).toHaveAttribute("aria-selected", "true");
@@ -666,7 +694,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       await expect(settingsDialog).toBeHidden({ timeout: 5000 });
     },
 
-    async selectSection(section: "General" | "Providers" | "Models"): Promise<void> {
+    async selectSection(section: "Appearance" | "Providers" | "Models"): Promise<void> {
       const sectionButton = settingsDialog.getByRole("button", { name: section, exact: true });
       await expect(sectionButton).toBeVisible();
       await sectionButton.click();

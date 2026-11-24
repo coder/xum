@@ -1,4 +1,8 @@
 import {
+  forgetSettingsToolRuns,
+  forgetSettingsToolRunsExcept,
+} from "@/browser/components/WorkspaceMCPModal/settingsToolRuns";
+import {
   createContext,
   useCallback,
   useContext,
@@ -13,295 +17,49 @@ import {
 import { useLocation } from "react-router-dom";
 import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
 import {
-  deleteWorkspaceStorage,
-  getAgentIdKey,
-  getDraftScopeId,
-  getInputAttachmentsKey,
-  getInputKey,
-  getModelKey,
-  getPendingScopeId,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-  getWorkspaceNameStateKey,
-  migrateWorkspaceStorage,
-  DEFAULT_MODEL_KEY,
-  DEFAULT_RUNTIME_KEY,
-  GATEWAY_ENABLED_KEY,
-  GATEWAY_MODELS_KEY,
-  HIDDEN_MODELS_KEY,
-  LAUNCH_BEHAVIOR_KEY,
-  RUNTIME_ENABLEMENT_KEY,
   SELECTED_WORKSPACE_KEY,
-  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-  type LaunchBehavior,
 } from "@/common/constants/storage";
+import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { useAPI } from "@/browser/contexts/API";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
-import {
-  readPersistedState,
-  readPersistedString,
-  subscribePersistedStateWrites,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isTerminalTab } from "@/browser/types/rightSidebar";
 import {
   collectAllTabs,
   parseRightSidebarLayoutState,
   removeTabEverywhere,
 } from "@/browser/utils/rightSidebarLayout";
-import { seedConfigMirrors } from "@/browser/utils/configMirrors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
-import { normalizeSelectedModel } from "@/common/utils/ai/models";
-import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import {
-  hasPendingAiSelectionIntent,
-  type AiSelectionField,
-} from "@/browser/utils/aiSelectionIntent";
+import { setWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
 import { collectOrphanedWorkspaceStorage } from "@/browser/utils/workspaceStorageGc";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
-
-/**
- * Preserve legacy local model choices across port/origin changes.
- * Exported for focused migration tests.
- */
-export function migrateLocalModelPrefsToBackend(
-  api: APIClient,
-  cfg: Pick<
-    Awaited<ReturnType<APIClient["config"]["getConfig"]>>,
-    "defaultModel" | "hiddenModels" | "hiddenModelsInitialized"
-  >,
-  dirtyKeys: ReadonlySet<string> = new Set()
-) {
-  if (!api.config.updateModelPreferences) return cfg;
-
-  const localDefaultModelRaw = readPersistedString(DEFAULT_MODEL_KEY);
-  const localDefaultModel =
-    typeof localDefaultModelRaw === "string"
-      ? normalizeSelectedModel(localDefaultModelRaw).trim()
-      : undefined;
-  const localHiddenModels = readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null);
-
-  const patch: {
-    defaultModel?: string;
-    hiddenModels?: string[];
-  } = {};
-
-  // localStorage presence implies explicit user choice (usePersistedState never
-  // writes fallback defaults). Always migrate to backend so the preference
-  // survives future changes to the built-in default constant.
-  if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && cfg.defaultModel === undefined && localDefaultModel) {
-    patch.defaultModel = localDefaultModel;
-  }
-
-  if (
-    !dirtyKeys.has(HIDDEN_MODELS_KEY) &&
-    (cfg.hiddenModelsInitialized === false ||
-      (cfg.hiddenModels === undefined &&
-        Array.isArray(localHiddenModels) &&
-        localHiddenModels.length > 0))
-  ) {
-    // Backend defaults are not evidence that legacy local preferences were imported.
-    patch.hiddenModels = [
-      ...new Set([
-        ...(cfg.hiddenModels ?? []),
-        ...(Array.isArray(localHiddenModels) ? localHiddenModels : []),
-      ]),
-    ];
-  }
-
-  if (Object.keys(patch).length > 0) {
-    // Migration persistence must not delay hydration of unrelated settings.
-    api.config.updateModelPreferences(patch).catch(() => undefined);
-  }
-  return { ...cfg, ...patch };
-}
-
-/**
- * One-time best-effort migration for gateway preferences.
- * Users upgrading from builds that only stored gateway state in localStorage
- * (keys: "gateway-enabled", "gateway-models") need their preferences migrated
- * to config.json so they aren't lost when localStorage is no longer read.
- */
-function migrateLocalGatewayPrefsToBackend(
-  api: APIClient,
-  cfg: { muxGatewayEnabled?: boolean; muxGatewayModels?: string[] }
-): void {
-  // Only migrate if the backend doesn't have these values yet
-  if (cfg.muxGatewayEnabled !== undefined && cfg.muxGatewayModels !== undefined) return;
-
-  // Read legacy localStorage keys
-  const localEnabled = readPersistedState<boolean>(GATEWAY_ENABLED_KEY, true);
-  const localModels = readPersistedState<string[]>(GATEWAY_MODELS_KEY, []);
-
-  const shouldMigrateEnabled = cfg.muxGatewayEnabled === undefined && localEnabled === false;
-  const shouldMigrateModels = cfg.muxGatewayModels === undefined && localModels.length > 0;
-
-  const clearLegacyGatewayPrefs = () => {
-    updatePersistedState<boolean | undefined>(GATEWAY_ENABLED_KEY, undefined);
-    updatePersistedState<string[] | undefined>(GATEWAY_MODELS_KEY, undefined);
-  };
-
-  if (shouldMigrateEnabled || shouldMigrateModels) {
-    api.config
-      .updateMuxGatewayPrefs({
-        muxGatewayEnabled: cfg.muxGatewayEnabled ?? localEnabled,
-        muxGatewayModels: cfg.muxGatewayModels ?? localModels,
-      })
-      .then(clearLegacyGatewayPrefs)
-      .catch(() => {
-        // Best-effort only.
-      });
-  }
-}
-
-/**
- * Seed per-workspace localStorage from backend workspace metadata.
- *
- * This keeps a workspace's model/thinking consistent across devices/browsers.
- */
-/** The metadata fields the seeding reads; the VS Code webview only receives these (#4738). */
-export type WorkspaceAiSeedSource = Pick<
-  FrontendWorkspaceMetadata,
-  "id" | "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings" | "aiSettingsByAgent"
->;
-
-export function seedWorkspaceLocalStorageFromBackend(
-  metadata: WorkspaceAiSeedSource,
-  previous?: WorkspaceAiSeedSource
-): void {
-  // Snapshot all main-workspace choices on client load, not on navigation.
-  // Later metadata must not overwrite unsent choices; reload to restore backend settings.
-  if (metadata.parentWorkspaceId == null && previous != null) {
-    return;
-  }
-  // Cache keyed by agentId (string) - includes exec, plan, and custom agents
-  type WorkspaceAISettingsByAgentCache = Partial<
-    Record<
-      string,
-      { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-    >
-  >;
-
-  const workspaceId = metadata.id;
-
-  const metadataAgentId = resolvePersistedAgentId(metadata, "");
-  if (metadataAgentId.length > 0) {
-    const key = getAgentIdKey(workspaceId);
-    const normalized = normalizeAgentId(metadataAgentId);
-    const existing = readPersistedState<string | undefined>(key, undefined);
-    if (existing !== normalized) {
-      updatePersistedState(key, normalized);
-    }
-  }
-
-  const aiByAgent =
-    metadata.aiSettingsByAgent ??
-    (metadata.aiSettings
-      ? {
-          plan: metadata.aiSettings,
-          exec: metadata.aiSettings,
-        }
-      : undefined);
-
-  if (!aiByAgent) {
-    return;
-  }
-
-  const activeAgentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
-  // Sub-agent metadata can arrive (e.g. after a reawakening) between a deliberate pick and
-  // the send that pins it; keep the unsent pick instead of reseeding over it. Picks are
-  // scoped to the active agent, so a pending Plan pick never blocks Exec reseeding.
-  const keepsUnsentPick = (field: AiSelectionField, localValue: string | undefined) =>
-    metadata.parentWorkspaceId != null &&
-    hasPendingAiSelectionIntent(workspaceId, activeAgentId, field, localValue);
-
-  // Merge backend values into a per-workspace per-agent cache.
-  const byAgentKey = getWorkspaceAISettingsByAgentKey(workspaceId);
-  const existingByAgent = readPersistedState<WorkspaceAISettingsByAgentCache>(byAgentKey, {});
-  const nextByAgent: WorkspaceAISettingsByAgentCache = { ...existingByAgent };
-
-  for (const [agentKey, entry] of Object.entries(aiByAgent)) {
-    if (!entry) continue;
-    if (typeof entry.model !== "string" || entry.model.length === 0) continue;
-
-    const existing = agentKey === activeAgentId ? existingByAgent[agentKey] : undefined;
-    const reasoningMode =
-      existing != null && keepsUnsentPick("reasoningMode", existing.reasoningMode)
-        ? existing.reasoningMode
-        : entry.reasoningMode;
-    nextByAgent[agentKey] = {
-      model:
-        existing != null && keepsUnsentPick("model", existing.model) ? existing.model : entry.model,
-      thinkingLevel:
-        existing != null && keepsUnsentPick("thinkingLevel", existing.thinkingLevel)
-          ? existing.thinkingLevel
-          : entry.thinkingLevel,
-      ...(reasoningMode != null ? { reasoningMode } : {}),
-    };
-  }
-
-  if (JSON.stringify(existingByAgent) !== JSON.stringify(nextByAgent)) {
-    updatePersistedState(byAgentKey, nextByAgent);
-  }
-
-  // Seed the active agent into the existing keys to avoid UI flash.
-  const active = nextByAgent[activeAgentId] ?? nextByAgent.exec ?? nextByAgent.plan;
-  if (!active) {
-    return;
-  }
-
-  const modelKey = getModelKey(workspaceId);
-  const existingModel = readPersistedState<string | undefined>(modelKey, undefined);
-  if (existingModel !== active.model && !keepsUnsentPick("model", existingModel)) {
-    setWorkspaceModelWithOrigin(workspaceId, active.model, "sync");
-  }
-
-  const thinkingKey = getThinkingLevelKey(workspaceId);
-  const existingThinking = readPersistedState<ThinkingLevel | undefined>(thinkingKey, undefined);
-  if (
-    existingThinking !== active.thinkingLevel &&
-    !keepsUnsentPick("thinkingLevel", existingThinking)
-  ) {
-    updatePersistedState(thinkingKey, active.thinkingLevel);
-  }
-
-  // Absent reasoningMode means "standard": seed it explicitly so switching to
-  // an agent whose settings never carried the field cannot inherit another
-  // agent's "pro" from the shared workspace-scoped key.
-  const reasoningKey = getReasoningModeKey(workspaceId);
-  const nextReasoning = active.reasoningMode ?? "standard";
-  const existingReasoning = readPersistedState<OpenAIReasoningMode | undefined>(
-    reasoningKey,
-    undefined
-  );
-  if (existingReasoning !== nextReasoning && !keepsUnsentPick("reasoningMode", existingReasoning)) {
-    updatePersistedState(reasoningKey, nextReasoning);
-  }
-}
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import {
+  getCreationDraftStore,
+  useCreationDraftListState,
+  useCreationDraftField,
+  useCreationDraftsByProject,
+} from "@/browser/stores/CreationDraftStore";
+import type { CreationDraftSummary } from "@/common/orpc/schemas/drafts";
+import { useDiscardSideChatOnLeave } from "@/browser/hooks/useDiscardSideChatOnLeave";
 
 export function toWorkspaceSelection(metadata: FrontendWorkspaceMetadata): WorkspaceSelection {
   return {
@@ -310,6 +68,16 @@ export function toWorkspaceSelection(metadata: FrontendWorkspaceMetadata): Works
     projectName: metadata.projectName,
     namedWorkspacePath: metadata.namedWorkspacePath,
   };
+}
+
+function getParentWorkspaceSelection(
+  metadata: FrontendWorkspaceMetadata | null | undefined,
+  workspaceMetadata: ReadonlyMap<string, FrontendWorkspaceMetadata>
+): WorkspaceSelection | null {
+  const parentMeta = metadata?.parentWorkspaceId
+    ? workspaceMetadata.get(metadata.parentWorkspaceId)
+    : undefined;
+  return parentMeta ? toWorkspaceSelection(parentMeta) : null;
 }
 
 /**
@@ -326,130 +94,9 @@ function ensureCreatedAt(metadata: FrontendWorkspaceMetadata): void {
   }
 }
 
-export interface WorkspaceDraft {
-  draftId: string;
-  subProjectPath: string | null;
-  createdAt: number;
-}
-
-type WorkspaceDraftsByProject = Record<string, WorkspaceDraft[]>;
-
-type WorkspaceMetadataLoadResult = "api-unavailable" | "failed" | "loaded";
+type WorkspaceDraftsByProject = Record<string, CreationDraftSummary[]>;
 
 type WorkspaceDraftPromotionsByProject = Record<string, Record<string, FrontendWorkspaceMetadata>>;
-
-function isWorkspaceDraft(value: unknown): value is WorkspaceDraft {
-  if (!value || typeof value !== "object") return false;
-
-  const record = value as { draftId?: unknown; subProjectPath?: unknown; createdAt?: unknown };
-  return (
-    typeof record.draftId === "string" &&
-    record.draftId.trim().length > 0 &&
-    typeof record.createdAt === "number" &&
-    Number.isFinite(record.createdAt) &&
-    (record.subProjectPath === null ||
-      record.subProjectPath === undefined ||
-      typeof record.subProjectPath === "string")
-  );
-}
-
-function normalizeWorkspaceDraftsByProject(value: unknown): WorkspaceDraftsByProject {
-  if (!value || typeof value !== "object") {
-    return {};
-  }
-
-  const result: WorkspaceDraftsByProject = {};
-
-  for (const [projectPath, drafts] of Object.entries(value as Record<string, unknown>)) {
-    if (!Array.isArray(drafts)) continue;
-
-    const nextDrafts: WorkspaceDraft[] = [];
-    for (const draft of drafts) {
-      if (!isWorkspaceDraft(draft)) continue;
-
-      const normalizedSubProjectPath =
-        typeof draft.subProjectPath === "string" && draft.subProjectPath.trim().length > 0
-          ? draft.subProjectPath
-          : null;
-
-      nextDrafts.push({
-        draftId: draft.draftId,
-        subProjectPath: normalizedSubProjectPath,
-        createdAt: draft.createdAt,
-      });
-    }
-
-    if (nextDrafts.length > 0) {
-      result[projectPath] = nextDrafts;
-    }
-  }
-
-  return result;
-}
-
-function createWorkspaceDraftId(): string {
-  const maybeCrypto = globalThis.crypto;
-  if (maybeCrypto && typeof maybeCrypto.randomUUID === "function") {
-    const id = maybeCrypto.randomUUID();
-    if (typeof id === "string" && id.length > 0) {
-      return id;
-    }
-  }
-
-  return `draft_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-}
-
-/**
- * Check if a draft workspace is empty (no input text, no attachments, and no workspace name set).
- * An empty draft can be reused when the user clicks "New Workspace" instead of creating another.
- */
-function isDraftEmpty(projectPath: string, draftId: string): boolean {
-  const scopeId = getDraftScopeId(projectPath, draftId);
-
-  const inputText = readPersistedState<string>(getInputKey(scopeId), "");
-  if (inputText.trim().length > 0) {
-    return false;
-  }
-
-  // Check for attachments
-  const attachments = readPersistedState<unknown[]>(getInputAttachmentsKey(scopeId), []);
-  if (Array.isArray(attachments) && attachments.length > 0) {
-    return false;
-  }
-
-  // Check for workspace name state (auto-generated or manual)
-  const nameState = readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null);
-  if (nameState !== null) {
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Find an existing empty draft for a project (optionally within a specific sub-project).
- * Returns the draft ID if found, or null if no empty draft exists.
- */
-function findExistingEmptyDraft(
-  workspaceDrafts: WorkspaceDraft[],
-  projectPath: string,
-  subProjectPath?: string
-): string | null {
-  const normalizedSubProjectPath = subProjectPath ?? null;
-
-  for (const draft of workspaceDrafts) {
-    // Keep draft reuse scoped to the current sub-project. When subProjectPath is undefined
-    // (project-level "New Workspace"), only reuse drafts with a null sub-project so
-    // we don't silently move sub-project-specific drafts into the root flow.
-    if ((draft.subProjectPath ?? null) !== normalizedSubProjectPath) {
-      continue;
-    }
-    if (isDraftEmpty(projectPath, draft.draftId)) {
-      return draft.draftId;
-    }
-  }
-  return null;
-}
 
 // ─── Metadata context (changes on every workspace create/archive/rename) ─────
 // Separated so components that only need actions/selection don't re-render on
@@ -495,6 +142,11 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     workspaceId: string,
     options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
   ) => Promise<WorkspaceRemoveResult>;
+  /** User-confirmed removal of a sub-agent, even one holding unpreserved work (#5106). */
+  removeSubagent: (
+    workspaceId: string,
+    acknowledgedWork: Parameters<APIClient["tasks"]["remove"]>[0]["acknowledgedWork"]
+  ) => Promise<WorkspaceRemoveResult>;
   updateWorkspaceTitle: (
     workspaceId: string,
     newTitle: string
@@ -511,7 +163,10 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
   ) => Promise<{ success: boolean; error?: string; data?: ArchivePreflightResult }>;
   archiveWorkspace: (
     workspaceId: string,
-    options?: { acknowledgedUntrackedPaths?: string[] }
+    options?: {
+      acknowledgedUntrackedPaths?: string[];
+      acknowledgedSubagentUntrackedPaths?: Record<string, string[]>;
+    }
   ) => Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }>;
   unarchiveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
   /**
@@ -537,7 +192,7 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
   /** Draft ID to open when creating a UI-only workspace draft (from URL) */
   pendingNewWorkspaceDraftId: string | null;
   /** Legacy entry point: open the creation screen (no new draft is created) */
-  beginWorkspaceCreation: (projectPath: string) => void;
+  beginWorkspaceCreation: (projectPath: string, draftId?: string) => void;
 
   // UI-only workspace creation drafts (placeholders)
   workspaceDraftsByProject: WorkspaceDraftsByProject;
@@ -679,74 +334,38 @@ function getMostRecentVisibleWorkspaceScope(
     : null;
 }
 
+// Skips archived rows and records AI metadata for the resolver; callers decide how the map is applied.
+function buildActiveWorkspaceMetadataMap(
+  metadataList: FrontendWorkspaceMetadata[]
+): Map<string, FrontendWorkspaceMetadata> {
+  const metadataMap = new Map<string, FrontendWorkspaceMetadata>();
+  for (const metadata of metadataList) {
+    // Skip archived workspaces - they should not be tracked by the app
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
+
+    ensureCreatedAt(metadata);
+    // Use stable workspace ID as key (not path, which can change)
+    setWorkspaceAiMetadata(metadata.id, metadata);
+    metadataMap.set(metadata.id, metadata);
+  }
+  return metadataMap;
+}
+
+/** The workspace IDs whose last metadata update arrived after `arrival` (an arrival count). */
+function getIdsArrivedAfter(lastByWorkspaceId: Map<string, number>, arrival: number): Set<string> {
+  const ids = new Set<string>();
+  for (const [workspaceId, arrivedAt] of lastByWorkspaceId) {
+    if (arrivedAt > arrival) ids.add(workspaceId);
+  }
+  return ids;
+}
+
 export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const { api } = useAPI();
+  // Handlers use only the live client: offline they keep returning their result (for example
+  // { success: false }), even while useAPI() keeps the last client during a reconnect.
+  const liveApi = useLiveAPI();
 
-  // Cache global agent defaults (plus legacy mode defaults) so non-react code paths can read them.
-  useEffect(() => {
-    if (!api?.config?.getConfig) return;
-
-    let active = true;
-    // Track writes, not just equality: toggling twice is still local intent.
-    const dirtyKeys = new Set<string>();
-    const initialPreferences = [
-      DEFAULT_MODEL_KEY,
-      HIDDEN_MODELS_KEY,
-      RUNTIME_ENABLEMENT_KEY,
-      DEFAULT_RUNTIME_KEY,
-    ].map((key) => ({
-      key,
-      value: JSON.stringify(readPersistedState<unknown>(key, undefined)),
-    }));
-    const markDirty = (key: string | null) => {
-      for (const preference of initialPreferences) {
-        if (key === null || key === preference.key) dirtyKeys.add(preference.key);
-      }
-    };
-    const unsubscribeWrites = subscribePersistedStateWrites(({ key, source }) => {
-      if (source === "local") markDirty(key);
-    });
-    const storageWindow = window;
-    const onStorage = (event: StorageEvent) => {
-      if (event.storageArea === storageWindow.localStorage) markDirty(event.key);
-    };
-    storageWindow.addEventListener("storage", onStorage);
-    const stopTrackingWrites = () => {
-      unsubscribeWrites();
-      storageWindow.removeEventListener("storage", onStorage);
-    };
-
-    api.config
-      .getConfig()
-      .then((cfg) => {
-        if (!active) return;
-        // Cross-tab writes can land before their queued storage events arrive.
-        for (const { key, value } of initialPreferences) {
-          if (JSON.stringify(readPersistedState<unknown>(key, undefined)) !== value)
-            dirtyKeys.add(key);
-        }
-        // Read legacy local preferences before backend hydration can overwrite them.
-        // Seeding from the backend is what lets a port switch keep the same UI state.
-        seedConfigMirrors(
-          { ...cfg, ...migrateLocalModelPrefsToBackend(api, cfg, dirtyKeys) },
-          dirtyKeys
-        );
-
-        // One-time gateway pref migration: if the backend doesn't have gateway prefs yet,
-        // check if the user had non-default values in the old localStorage keys.
-        // This covers users upgrading from builds that only stored gateway state locally.
-        migrateLocalGatewayPrefsToBackend(api, cfg);
-      })
-      .catch(() => {
-        // Best-effort only.
-      })
-      .finally(stopTrackingWrites);
-
-    return () => {
-      active = false;
-      stopTrackingWrites();
-    };
-  }, [api]);
   // Get project refresh function from ProjectContext
   const {
     resolveProjectPath,
@@ -773,8 +392,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const workspaceStore = useWorkspaceStoreRaw();
 
   useLayoutEffect(() => {
-    // Settings keeps the workspace it was opened over in currentWorkspaceId. Analytics and cold
-    // settings links carry none, but should still preserve the active workspace subscription
+    // Settings and analytics keep the workspace they were opened over in currentWorkspaceId.
+    // Cold modal links carry none, but should still preserve the active workspace subscription
     // so chat messages aren't cleared.
     if (currentWorkspaceId) {
       workspaceStore.setActiveWorkspaceId(currentWorkspaceId);
@@ -802,23 +421,20 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     },
     [workspaceStore]
   );
+  // The discard waits for a live server: useAPI().api can keep the last client while offline.
+  useDiscardSideChatOnLeave(liveApi, currentWorkspaceId, workspaceMetadata);
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
+  // For the metadata effect: a new client shows the loader again until a first snapshot loads.
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [workspaceDraftPromotionsByProject, setWorkspaceDraftPromotionsByProject] =
     useState<WorkspaceDraftPromotionsByProject>({});
-  const [workspaceDraftsByProjectState, setWorkspaceDraftsByProjectState] =
-    usePersistedState<WorkspaceDraftsByProject>(
-      WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-      {},
-      { listener: true }
-    );
-
-  const workspaceDraftsByProject = useMemo(
-    () => normalizeWorkspaceDraftsByProject(workspaceDraftsByProjectState),
-    [workspaceDraftsByProjectState]
-  );
+  // One backend record per creation draft, listed once per client (CreationDraftStore).
+  const workspaceDraftsByProject = useCreationDraftsByProject();
+  const draftsReady = useCreationDraftListState().status !== "loading";
 
   const pendingDeepLinksRef = useRef<DeepLinkPayload[]>([]);
 
@@ -859,34 +475,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
       // IMPORTANT: Deep links should always create a fresh draft, even if an existing draft
       // is empty. This keeps deep-link navigations predictable and avoids surprising reuse.
-      const draftId = createWorkspaceDraftId();
-      const createdAt = Date.now();
-
-      setWorkspaceDraftsByProjectState((prev) => {
-        const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[owningProjectPath] ?? [];
-
-        return {
-          ...current,
-          [owningProjectPath]: [
-            ...existing,
-            {
-              draftId,
-              subProjectPath: normalizedSubProjectPath,
-              createdAt,
-            },
-          ],
-        };
-      });
-
       const prompt =
         typeof payload.prompt === "string" && payload.prompt.trim().length > 0
           ? payload.prompt
-          : null;
-
-      if (prompt) {
-        updatePersistedState(getInputKey(getDraftScopeId(owningProjectPath, draftId)), prompt);
-      }
+          : undefined;
+      const draftId = getCreationDraftStore().create(owningProjectPath, normalizedSubProjectPath, {
+        text: prompt,
+      });
 
       navigateToProject(owningProjectPath, draftId);
     },
@@ -897,7 +492,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       resolveNewChatProjectPath,
       getProjectConfig,
       hasAnyProject,
-      setWorkspaceDraftsByProjectState,
     ]
   );
 
@@ -996,13 +590,22 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
   // pendingNewWorkspaceProject is derived from current project in URL/state
   const pendingNewWorkspaceProject = currentProjectPath;
-  const pendingNewWorkspaceDraftId = pendingNewWorkspaceProject ? pendingDraftId : null;
-  const pendingNewWorkspaceSubProjectPathRaw =
-    pendingNewWorkspaceProject && pendingNewWorkspaceDraftId
-      ? ((workspaceDraftsByProject[pendingNewWorkspaceProject] ?? []).find(
-          (draft) => draft.draftId === pendingNewWorkspaceDraftId
-        )?.subProjectPath ?? null)
-      : null;
+  // A bare project route opens the project's newest draft, else a blank one (after the list loads).
+  const pendingNewWorkspaceDraftId = pendingNewWorkspaceProject
+    ? (pendingDraftId ??
+      (draftsReady ? getCreationDraftStore().draftIdForProject(pendingNewWorkspaceProject) : null))
+    : null;
+  // The open draft's own fields (the composer shows only a loaded draft): the sidebar list
+  // follows confirmed saves, so a sub-project picked just before Send would read the old one.
+  const pendingDraftProjectPath = useCreationDraftField(
+    pendingNewWorkspaceDraftId ?? "",
+    "projectPath"
+  );
+  const pendingDraftSubProjectPath = useCreationDraftField(
+    pendingNewWorkspaceDraftId ?? "",
+    "subProjectPath"
+  );
+  const pendingNewWorkspaceSubProjectPathRaw = pendingDraftSubProjectPath ?? null;
   // Drop the draft's stored sub-project path if the sub-project has since been
   // removed/unregistered. WorkspaceService.create rejects unknown sub-project
   // paths under the parent, so leaking a stale value would brick reopening a
@@ -1016,6 +619,24 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       ? pendingNewWorkspaceSubProjectPathRaw
       : null;
   })();
+  // A route can name a draft that a project change moved away (browser Back): open it where it
+  // lives, so a Send never pairs this page's project with choices made for another one. Replace,
+  // so Back is not trapped bouncing between the two routes. CreationDraftGate waits meanwhile.
+  useEffect(() => {
+    if (
+      pendingNewWorkspaceDraftId &&
+      pendingDraftProjectPath &&
+      pendingNewWorkspaceProject &&
+      pendingDraftProjectPath !== pendingNewWorkspaceProject
+    ) {
+      navigateToProject(pendingDraftProjectPath, pendingNewWorkspaceDraftId, { replace: true });
+    }
+  }, [
+    pendingNewWorkspaceDraftId,
+    pendingDraftProjectPath,
+    pendingNewWorkspaceProject,
+    navigateToProject,
+  ]);
 
   // selectedWorkspace is derived from currentWorkspaceId in URL + workspaceMetadata
   const selectedWorkspace = useMemo(() => {
@@ -1089,8 +710,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (newValue) {
         hasExplicitRootRouteRef.current = false;
         navigateToWorkspace(newValue.workspaceId);
-        // Persist to localStorage for next session
-        updatePersistedState(SELECTED_WORKSPACE_KEY, newValue);
+        // Persist only the id for next session: readers re-derive the rest from metadata, and the
+        // paths would make the value grow with the project path.
+        updatePersistedState(SELECTED_WORKSPACE_KEY, { workspaceId: newValue.workspaceId });
       } else {
         hasExplicitRootRouteRef.current = true;
         navigateToHome();
@@ -1122,83 +744,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     workspaceMetadataRef.current = workspaceMetadata;
   }, [workspaceMetadata]);
 
-  const loadWorkspaceMetadata = useCallback(async (): Promise<WorkspaceMetadataLoadResult> => {
-    if (!api) {
-      setLoaded(false);
-      setLoadError("API not connected");
-      return "api-unavailable";
-    }
-
-    try {
-      const metadataList = await api.workspace.list();
-
-      const metadataMap = new Map<string, FrontendWorkspaceMetadata>();
-      for (const metadata of metadataList) {
-        // Skip archived workspaces - they should not be tracked by the app
-        if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
-
-        ensureCreatedAt(metadata);
-        // Use stable workspace ID as key (not path, which can change)
-        seedWorkspaceLocalStorageFromBackend(
-          metadata,
-          workspaceMetadataRef.current.get(metadata.id)
-        );
-        metadataMap.set(metadata.id, metadata);
-      }
-
-      setWorkspaceMetadata(metadataMap);
-      setLoaded(true);
-      setLoadError(null);
-      return "loaded";
-    } catch (error) {
-      console.error("Failed to load workspace metadata:", error);
-      // Keep the previous metadata map on failure so scoped preferences are not pruned.
-      setLoadError(getErrorMessage(error));
-      return "failed";
-    }
-  }, [setWorkspaceMetadata, api]);
-
-  // Load metadata once on mount (and again when api becomes available)
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-
-    const initialLoad = async () => {
-      const result = await loadWorkspaceMetadata();
-      if (result === "api-unavailable" || cancelled) {
-        // api not available yet - effect will run again when api connects
-        return;
-      }
-      // After loading metadata (which may trigger migration), reload projects
-      // to ensure frontend has the updated config with workspace IDs
-      await refreshProjects();
-      if (!cancelled) {
-        setLoading(false);
-      }
-      // Orphaned-key GC runs only after a successful startup load, never from later refreshes
-      // (see workspaceStorageGc.ts). Not awaited so it cannot block or break startup.
-      if (!cancelled && api && result === "loaded") {
-        collectOrphanedWorkspaceStorage({
-          listKnownWorkspaceIds: async () =>
-            (await api.workspace.listKnownIdsForStorageGc()).workspaceIds,
-        }).catch((error: unknown) => {
-          console.error("Failed to collect orphaned workspace storage:", error);
-        });
-      }
-    };
-
-    const loadPromise = initialLoad();
-    loadPromise.catch((error) => {
-      if (!cancelled) {
-        setLoadError(getErrorMessage(error));
-        setLoading(false);
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, loadWorkspaceMetadata, refreshProjects]);
+  // Arrival order of metadata stream deliveries, so a separate list() (refreshWorkspaceMetadata)
+  // never overwrites a snapshot or update that arrived after it was requested (#5189).
+  const metadataArrivalsRef = useRef({
+    count: 0,
+    lastSnapshot: 0,
+    lastByWorkspaceId: new Map<string, number>(),
+  });
 
   // URL restoration is now handled by RouterContext which parses the URL on load
   // and provides currentWorkspaceId/currentProjectId that we derive state from.
@@ -1303,11 +855,47 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     setSelectedWorkspace(null);
   }, [loading, loaded, loadError, currentWorkspaceId, workspaceMetadata, setSelectedWorkspace]);
 
-  // Subscribe to metadata updates (for create/rename/delete operations)
+  // The metadata stream owns the initial load: its first event is a snapshot built after the
+  // server attached the listener, so no change can fall between the load and the updates (#5189).
   useEffect(() => {
-    if (!api) return;
+    // After a first snapshot, a new client (reconnect) reloads behind the shown metadata, so
+    // neither `loading` nor `loaded` resets here.
+    if (!api) {
+      // api not available yet - effect will run again when api connects
+      setLoadError("API not connected");
+      return;
+    }
+    // No snapshot loaded yet (a failure or a lost connection ended the last load): the new client
+    // shows the loader again, or the app would leave it with an empty metadata map.
+    if (!loadedRef.current) setLoading(true);
     const controller = new AbortController();
     const { signal } = controller;
+    let snapshotApplied = false;
+
+    const finishInitialLoad = async (snapshotLoaded: boolean) => {
+      // After loading metadata (which may trigger migration), reload projects
+      // to ensure frontend has the updated config with workspace IDs
+      try {
+        await refreshProjects();
+      } catch (error) {
+        if (!signal.aborted) {
+          setLoadError(getErrorMessage(error));
+          setLoading(false);
+        }
+        return;
+      }
+      if (signal.aborted) return;
+      setLoading(false);
+      // Orphaned-key GC runs only after a successful startup load, never from later refreshes
+      // (see workspaceStorageGc.ts). Not awaited so it cannot block or break startup.
+      if (!snapshotLoaded) return;
+      collectOrphanedWorkspaceStorage({
+        listKnownWorkspaceIds: async () =>
+          (await api.workspace.listKnownIdsForStorageGc()).workspaceIds,
+      }).catch((error: unknown) => {
+        console.error("Failed to collect orphaned workspace storage:", error);
+      });
+    };
 
     (async () => {
       try {
@@ -1315,6 +903,26 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         for await (const event of iterator) {
           if (signal.aborted) break;
+
+          const arrivals = metadataArrivalsRef.current;
+          arrivals.count++;
+          if ("type" in event) {
+            arrivals.lastSnapshot = arrivals.count;
+            arrivals.lastByWorkspaceId.clear();
+            setWorkspaceMetadata(buildActiveWorkspaceMetadataMap(event.workspaces));
+            forgetSettingsToolRunsExcept(new Set(event.workspaces.map((w) => w.id)));
+            setLoaded(true);
+            setLoadError(null);
+            if (!snapshotApplied) {
+              snapshotApplied = true;
+              // Not awaited: updates must keep applying while the projects refresh is pending.
+              finishInitialLoad(true).catch((error: unknown) => {
+                console.error("Failed to finish the initial workspace load:", error);
+              });
+            }
+            continue;
+          }
+          arrivals.lastByWorkspaceId.set(event.workspaceId, arrivals.count);
 
           const meta = event.metadata;
 
@@ -1324,7 +932,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // Archived metadata never enters the active map or needs renderer settings.
           if (meta !== null && !isNowArchived) {
             ensureCreatedAt(meta);
-            seedWorkspaceLocalStorageFromBackend(meta, workspaceMetadataRef.current.get(meta.id));
+            setWorkspaceAiMetadata(meta.id, meta);
           }
 
           // If the currently-selected workspace is being archived, navigate away *before*
@@ -1393,24 +1001,20 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           if (meta === null) {
             deleteWorkspaceStorage(event.workspaceId);
             getReviewStateStore().removeWorkspace(event.workspaceId);
+            getDraftStore().forgetWorkspace(event.workspaceId);
+            forgetSettingsToolRuns(event.workspaceId);
 
             // Navigate away only if the deleted workspace was selected
             const currentSelection = selectedWorkspaceRef.current;
             if (currentSelection?.workspaceId !== event.workspaceId) continue;
 
             // Try parent workspace first
-            const parentWorkspaceId = deletedMeta?.parentWorkspaceId;
-            const parentMeta = parentWorkspaceId
-              ? workspaceMetadataRef.current.get(parentWorkspaceId)
-              : null;
-
-            if (parentMeta) {
-              setSelectedWorkspace({
-                workspaceId: parentMeta.id,
-                projectPath: parentMeta.projectPath,
-                projectName: parentMeta.projectName,
-                namedWorkspacePath: parentMeta.namedWorkspacePath,
-              });
+            const parentSelection = getParentWorkspaceSelection(
+              deletedMeta,
+              workspaceMetadataRef.current
+            );
+            if (parentSelection) {
+              setSelectedWorkspace(parentSelection);
               continue;
             }
 
@@ -1437,9 +1041,17 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             }
           }
         }
+        if (!snapshotApplied && !signal.aborted) {
+          throw new Error("Workspace metadata stream ended before its snapshot");
+        }
       } catch (err) {
         if (!signal.aborted && !isAbortError(err)) {
           console.error("Failed to subscribe to metadata:", err);
+          // Keep the previous metadata map on failure so scoped preferences are not pruned.
+          if (!snapshotApplied) {
+            setLoadError(getErrorMessage(err));
+            await finishInitialLoad(false);
+          }
         }
       }
     })();
@@ -1456,12 +1068,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       trunkBranch: string,
       runtimeConfig?: RuntimeConfig
     ) => {
-      if (!api) throw new Error("API not connected");
+      if (!liveApi) throw new Error("API not connected");
       console.assert(
         typeof trunkBranch === "string" && trunkBranch.trim().length > 0,
         "Expected trunk branch to be provided when creating a workspace"
       );
-      const result = await api.workspace.create({
+      const result = await liveApi.workspace.create({
         projectPath,
         branchName,
         trunkBranch,
@@ -1473,10 +1085,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         // Update metadata immediately to avoid race condition with validation effect
         ensureCreatedAt(result.metadata);
-        seedWorkspaceLocalStorageFromBackend(
-          result.metadata,
-          workspaceMetadataRef.current.get(result.metadata.id)
-        );
+        setWorkspaceAiMetadata(result.metadata.id, result.metadata);
         setWorkspaceMetadata((prev) => {
           const updated = new Map(prev);
           updated.set(result.metadata.id, result.metadata);
@@ -1494,15 +1103,17 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         throw new Error(result.error);
       }
     },
-    [api, refreshProjects, setWorkspaceMetadata]
+    [liveApi, refreshProjects, setWorkspaceMetadata]
   );
 
-  const removeWorkspace = useCallback(
+  // Shared by workspace removal and user-confirmed sub-agent removal (#5106): both end with the
+  // same local cleanup and navigation.
+  const runWorkspaceRemoval = useCallback(
     async (
       workspaceId: string,
-      options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
+      remove: (client: APIClient) => Promise<WorkspaceRemoveResult>
     ): Promise<WorkspaceRemoveResult> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       // Capture state before the async operation.
       // We check currentWorkspaceId (from URL) rather than selectedWorkspace
@@ -1512,13 +1123,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const projectPath = metadata
         ? getWorkspaceProjectRoutePath(metadata)
         : selectedWorkspace?.projectPath;
+      const parentSelection = getParentWorkspaceSelection(metadata, workspaceMetadata);
 
       try {
-        const result = await api.workspace.remove({ workspaceId, options });
+        const result = await remove(liveApi);
         if (result.success) {
           // Clean up workspace-specific localStorage keys
           deleteWorkspaceStorage(workspaceId);
           getReviewStateStore().removeWorkspace(workspaceId);
+          getDraftStore().forgetWorkspace(workspaceId);
+          forgetSettingsToolRuns(workspaceId);
 
           // Optimistically remove from the local metadata map so the sidebar updates immediately.
           // Relying on the metadata subscription can leave the item visible until the next refresh.
@@ -1535,13 +1149,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // No need to refetch all metadata - this avoids expensive post-compaction
           // state checks for all workspaces.
 
-          // If the removed workspace was selected (URL was on this workspace),
-          // navigate to its project page instead of bouncing through root.
-          if (wasSelected && projectPath) {
+          // If the removed workspace was selected (URL was on this workspace), return a sub-agent
+          // to its parent like the deletion handler (#5190); otherwise go to its project page.
+          if (wasSelected && parentSelection) {
+            setSelectedWorkspace(parentSelection);
+          } else if (wasSelected && projectPath) {
             navigateToProject(projectPath);
           }
           // If not selected, don't navigate at all - stay where we are
-          return { success: true };
+          // Keep the warnings: forced callers show what the removal left behind (#5143).
+          return { success: true, ...(result.warnings ? { warnings: result.warnings } : {}) };
         } else {
           console.error("Failed to remove workspace:", result.error);
           return result;
@@ -1557,10 +1174,36 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       navigateToProject,
       refreshProjects,
       selectedWorkspace,
+      setSelectedWorkspace,
       workspaceMetadata,
-      api,
+      liveApi,
       setWorkspaceMetadata,
     ]
+  );
+
+  const removeWorkspace = useCallback(
+    (
+      workspaceId: string,
+      options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
+    ): Promise<WorkspaceRemoveResult> =>
+      runWorkspaceRemoval(workspaceId, (client) =>
+        client.workspace.remove({ workspaceId, options })
+      ),
+    [runWorkspaceRemoval]
+  );
+
+  const removeSubagent = useCallback(
+    (
+      workspaceId: string,
+      acknowledgedWork: Parameters<APIClient["tasks"]["remove"]>[0]["acknowledgedWork"]
+    ): Promise<WorkspaceRemoveResult> =>
+      runWorkspaceRemoval(workspaceId, async (client) => {
+        const result = await client.tasks.remove({ taskId: workspaceId, acknowledgedWork });
+        return result.success
+          ? { success: true, ...(result.data.warnings ? { warnings: result.data.warnings } : {}) }
+          : { success: false, error: result.error };
+      }),
+    [runWorkspaceRemoval]
   );
 
   /**
@@ -1577,9 +1220,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       workspaceId: string,
       newTitle: string
     ): Promise<{ success: boolean; error?: string }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
       try {
-        const result = await api.workspace.updateTitle({ workspaceId, title: newTitle });
+        const result = await liveApi.workspace.updateTitle({ workspaceId, title: newTitle });
         if (result.success) {
           // Workspace metadata subscription handles the title update automatically.
           // No need to refetch all metadata - this avoids expensive post-compaction
@@ -1595,7 +1238,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api]
+    [liveApi]
   );
 
   /**
@@ -1606,7 +1249,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
    */
   const setWorkspacePinned = useCallback(
     async (workspaceId: string, pinned: boolean): Promise<{ success: boolean; error?: string }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       let previousPinnedAtById: Map<string, string | undefined> | null = null;
       setWorkspaceMetadata((prev) => {
@@ -1651,7 +1294,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       };
 
       try {
-        const result = await api.workspace.setPinned({ workspaceId, pinned });
+        const result = await liveApi.workspace.setPinned({ workspaceId, pinned });
         if (result.success) {
           return { success: true };
         }
@@ -1665,7 +1308,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api, setWorkspaceMetadata]
+    [liveApi, setWorkspaceMetadata]
   );
 
   /**
@@ -1677,7 +1320,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
    */
   const reorderPinnedWorkspaces = useCallback(
     async (workspaceIds: string[]): Promise<{ success: boolean; error?: string }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       let previousPinnedAtById: Map<string, string> | undefined;
       let optimisticPinnedAtById: Map<string, string> | undefined;
@@ -1727,7 +1370,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       };
 
       try {
-        const result = await api.workspace.reorderPinned({ workspaceIds });
+        const result = await liveApi.workspace.reorderPinned({ workspaceIds });
         if (result.success) {
           return { success: true };
         }
@@ -1741,7 +1384,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api, setWorkspaceMetadata]
+    [liveApi, setWorkspaceMetadata]
   );
 
   const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<ReadonlySet<string>>(
@@ -1753,14 +1396,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     async (
       workspaceId: string
     ): Promise<{ success: boolean; error?: string; data?: ArchivePreflightResult }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       try {
         const result = await trackArchivingRequest(
           archivingRequestCounts.current,
           setArchivingWorkspaceIds,
           workspaceId,
-          () => api.workspace.preflightArchive({ workspaceId })
+          () => liveApi.workspace.preflightArchive({ workspaceId })
         );
         if (result.success) {
           return { success: true, data: result.data };
@@ -1770,15 +1413,18 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: getErrorMessage(error) };
       }
     },
-    [api]
+    [liveApi]
   );
 
   const archiveWorkspace = useCallback(
     async (
       workspaceId: string,
-      options?: { acknowledgedUntrackedPaths?: string[] }
+      options?: {
+        acknowledgedUntrackedPaths?: string[];
+        acknowledgedSubagentUntrackedPaths?: Record<string, string[]>;
+      }
     ): Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       try {
         const result = await trackArchivingRequest(
@@ -1786,9 +1432,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           setArchivingWorkspaceIds,
           workspaceId,
           () =>
-            api.workspace.archive({
+            liveApi.workspace.archive({
               workspaceId,
-              acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
+              ...options,
             })
         );
         if (result.success) {
@@ -1806,7 +1452,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             if (rawLayout != null) {
               // Use parseRightSidebarLayoutState to handle legacy migrations
               // (e.g. "stats" tab stripped) before cleaning terminal tabs.
-              const layout = parseRightSidebarLayoutState(rawLayout, "costs");
+              const layout = parseRightSidebarLayoutState(rawLayout);
               const terminalTabs = collectAllTabs(layout.root).filter(isTerminalTab);
               let cleanedLayout = layout;
               for (const tab of terminalTabs) {
@@ -1831,14 +1477,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api]
+    [liveApi]
   );
 
   const unarchiveWorkspace = useCallback(
     async (workspaceId: string): Promise<{ success: boolean; error?: string }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
       try {
-        const result = await api.workspace.unarchive({ workspaceId });
+        const result = await liveApi.workspace.unarchive({ workspaceId });
         if (result.success) {
           // Workspace metadata subscription handles the state update automatically.
           return { success: true };
@@ -1852,27 +1498,56 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api]
+    [liveApi]
   );
 
   const refreshWorkspaceMetadata = useCallback(async () => {
-    await loadWorkspaceMetadata();
-  }, [loadWorkspaceMetadata]);
+    if (!api) {
+      // Keep `loaded` and the shown metadata: the reconnect reloads them.
+      setLoadError("API not connected");
+      return;
+    }
+    const arrivals = metadataArrivalsRef.current;
+    const requestedAt = arrivals.count;
+    try {
+      const metadataList = await api.workspace.list();
+      // A snapshot that arrived after the request, plus the updates after it, supersedes this list.
+      if (arrivals.lastSnapshot > requestedAt) return;
+      // Rows an update touched after the request keep their current state, including a deletion.
+      const touchedIds = getIdsArrivedAfter(arrivals.lastByWorkspaceId, requestedAt);
+      const listed = buildActiveWorkspaceMetadataMap(
+        metadataList.filter((metadata) => !touchedIds.has(metadata.id))
+      );
+      setWorkspaceMetadata((prev) => {
+        const next = new Map(listed);
+        for (const workspaceId of touchedIds) {
+          const current = prev.get(workspaceId);
+          if (current) next.set(workspaceId, current);
+        }
+        return next;
+      });
+      setLoaded(true);
+      setLoadError(null);
+    } catch (error) {
+      // A lost connection is no load error: the reconnect reloads.
+      if (isConnectionLostError(error)) return;
+      console.error("Failed to load workspace metadata:", error);
+      // Keep the previous metadata map on failure so scoped preferences are not pruned.
+      setLoadError(getErrorMessage(error));
+    }
+  }, [api, setWorkspaceMetadata]);
 
   const getWorkspaceInfo = useCallback(
     async (workspaceId: string) => {
-      if (!api) return null;
-      const metadata = await api.workspace.getInfo({ workspaceId });
+      if (!liveApi) return null;
+      const metadata = await liveApi.workspace.getInfo({ workspaceId });
       if (metadata) {
         ensureCreatedAt(metadata);
-        seedWorkspaceLocalStorageFromBackend(
-          metadata,
-          workspaceMetadataRef.current.get(metadata.id)
-        );
+        setWorkspaceAiMetadata(metadata.id, metadata);
       }
       return metadata;
     },
-    [api]
+    [liveApi]
   );
 
   const promoteWorkspaceDraft = useCallback(
@@ -1899,8 +1574,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     []
   );
   const beginWorkspaceCreation = useCallback(
-    (projectPath: string) => {
-      navigateToProject(projectPath);
+    (projectPath: string, draftId?: string) => {
+      navigateToProject(projectPath, draftId);
     },
     [navigateToProject]
   );
@@ -1915,107 +1590,27 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           ? subProjectPath
           : null;
 
-      setWorkspaceDraftsByProjectState((prev) => {
-        const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[projectPath] ?? [];
-        if (existing.length === 0) {
-          return prev;
-        }
-
-        let didUpdate = false;
-        const nextDrafts = existing.map((draft) => {
-          if (draft.draftId !== draftId) {
-            return draft;
-          }
-          if (draft.subProjectPath === normalizedSubProjectPath) {
-            return draft;
-          }
-          didUpdate = true;
-          return {
-            ...draft,
-            subProjectPath: normalizedSubProjectPath,
-          };
-        });
-
-        if (!didUpdate) {
-          return prev;
-        }
-
-        return {
-          ...current,
-          [projectPath]: nextDrafts,
-        };
-      });
+      getCreationDraftStore().update(draftId, { subProjectPath: normalizedSubProjectPath });
 
       navigateToProject(projectPath, draftId);
     },
-    [navigateToProject, setWorkspaceDraftsByProjectState]
+    [navigateToProject]
   );
 
   const createWorkspaceDraft = useCallback(
     (projectPath: string, subProjectPath?: string, options?: { replace?: boolean }) => {
-      // Read directly from localStorage to get the freshest value, avoiding stale closure issues.
-      // The React state (workspaceDraftsByProject) may be out of date if this is called rapidly.
-      const freshDrafts = normalizeWorkspaceDraftsByProject(
-        readPersistedState<WorkspaceDraftsByProject>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {})
-      );
-      const existingDrafts = freshDrafts[projectPath] ?? [];
-
-      // If there's an existing empty draft (optionally in the same sub-project), reuse it
-      // instead of creating yet another empty draft.
-      const existingEmptyDraftId = findExistingEmptyDraft(
-        existingDrafts,
-        projectPath,
-        subProjectPath
-      );
-      if (existingEmptyDraftId) {
-        navigateToProject(projectPath, existingEmptyDraftId, {
-          replace: options?.replace,
-        });
-        return;
-      }
-
-      const draftId = createWorkspaceDraftId();
-      const createdAt = Date.now();
-      const draft: WorkspaceDraft = {
-        draftId,
-        subProjectPath: subProjectPath ?? null,
-        createdAt,
-      };
-
-      setWorkspaceDraftsByProjectState((prev) => {
-        const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[projectPath] ?? [];
-
-        // One-time migration: if the user has an old per-project pending draft, move it
-        // into the first draft scope so it stays accessible.
-        if (existing.length === 0) {
-          const pendingScopeId = getPendingScopeId(projectPath);
-          const legacyInput = readPersistedState<string>(getInputKey(pendingScopeId), "");
-          const legacyAttachments = readPersistedState<unknown>(
-            getInputAttachmentsKey(pendingScopeId),
-            []
-          );
-          const hasLegacyAttachments =
-            Array.isArray(legacyAttachments) && legacyAttachments.length > 0;
-          if (legacyInput.trim().length > 0 || hasLegacyAttachments) {
-            migrateWorkspaceStorage(pendingScopeId, getDraftScopeId(projectPath, draftId));
-          }
-        }
-
-        return {
-          ...current,
-          [projectPath]: [...existing, draft],
-        };
-      });
-
+      // Explicit New: always a fresh id. Its row appears once the user writes something
+      // (CreationDraftStore), so New clicks and launches do not pile up empty rows.
+      const draftId = getCreationDraftStore().create(projectPath, subProjectPath ?? null);
       navigateToProject(projectPath, draftId, { replace: options?.replace });
     },
-    [navigateToProject, setWorkspaceDraftsByProjectState]
+    [navigateToProject]
   );
 
   useEffect(() => {
-    if (loading || projectsLoading || hasHandledStartupRootRouteRef.current) return;
+    if (loading || projectsLoading || !draftsReady || hasHandledStartupRootRouteRef.current) {
+      return;
+    }
 
     if (
       shouldBlockStartupAutoNavigation({
@@ -2026,7 +1621,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       return;
     }
 
-    const behavior = readPersistedState<LaunchBehavior>(LAUNCH_BEHAVIOR_KEY, "dashboard");
+    const behavior = getUserPreferences().navigation?.launchBehavior ?? "dashboard";
     let cancelled = false;
 
     const resolveStartupRootRoute = async () => {
@@ -2067,6 +1662,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     api,
     loading,
     projectsLoading,
+    draftsReady,
     hasBlockingStartupRouteState,
     resolveFallbackWorkspaceScope,
     createWorkspaceDraft,
@@ -2120,23 +1716,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return next;
       });
 
-      deleteWorkspaceStorage(getDraftScopeId(projectPath, draftId));
-
-      setWorkspaceDraftsByProjectState((prev) => {
-        const current = normalizeWorkspaceDraftsByProject(prev);
-        const existing = current[projectPath] ?? [];
-        const nextDrafts = existing.filter((draft) => draft.draftId !== draftId);
-
-        const next: WorkspaceDraftsByProject = { ...current };
-        if (nextDrafts.length === 0) {
-          delete next[projectPath];
-        } else {
-          next[projectPath] = nextDrafts;
-        }
-        return next;
-      });
+      getCreationDraftStore()
+        .delete(draftId)
+        .catch((error: unknown) => console.error("Failed to delete a creation draft:", error));
     },
-    [setWorkspaceDraftPromotionsByProject, setWorkspaceDraftsByProjectState]
+    [setWorkspaceDraftPromotionsByProject]
   );
 
   // Split into two context values so metadata-Map churn doesn't re-render
@@ -2150,6 +1734,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     () => ({
       createWorkspace,
       removeWorkspace,
+      removeSubagent,
       updateWorkspaceTitle,
       setWorkspacePinned,
       reorderPinnedWorkspaces,
@@ -2177,6 +1762,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [
       createWorkspace,
       removeWorkspace,
+      removeSubagent,
       updateWorkspaceTitle,
       setWorkspacePinned,
       reorderPinnedWorkspaces,

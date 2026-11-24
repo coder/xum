@@ -7,6 +7,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   AgentDefinitionRequestCache,
@@ -14,10 +15,17 @@ import {
   resolveAgentBody,
 } from "./agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "./agentDefinitions/resolveAgentInheritanceChain";
+import { resolveChainAgentCacheTtl } from "./agentDefinitions/resolveNodeAgentAiSettings";
 import * as agentDefinitionsService from "./agentDefinitions/agentDefinitionsService";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { buildStreamSystemContext } from "./turnContextAssembler";
+import { applyToolPolicyAndExperiments } from "./toolAssembly";
+import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import type { Tool } from "ai";
+import { z } from "zod";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 
 const PARENT_WORKSPACE_ID = "parent-workspace";
 const CHILD_WORKSPACE_ID = "child-workspace";
@@ -37,60 +45,6 @@ function createSubagentMetadata(params: {
     agentId: params.agentId,
     agentType: params.agentType ?? params.agentId,
   };
-}
-
-async function resolvePolicyForAgent(params: {
-  agentId: string;
-  agentAiDefaults?: ProjectsConfig["agentAiDefaults"];
-}) {
-  using tempDir = new DisposableTempDir("agent-resolution-advisor-defaults");
-  const projectPath = path.join(tempDir.path, "project");
-  await fs.mkdir(projectPath, { recursive: true });
-
-  const metadata = createSubagentMetadata({
-    projectPath,
-    agentId: params.agentId,
-  });
-  const cfg: ProjectsConfig = {
-    projects: new Map([
-      [
-        projectPath,
-        {
-          trusted: true,
-          workspaces: [
-            { id: PARENT_WORKSPACE_ID, name: PARENT_WORKSPACE_ID, path: projectPath },
-            {
-              id: CHILD_WORKSPACE_ID,
-              name: CHILD_WORKSPACE_ID,
-              path: projectPath,
-              parentWorkspaceId: PARENT_WORKSPACE_ID,
-              agentId: params.agentId,
-              agentType: params.agentId,
-            },
-          ],
-        },
-      ],
-    ]),
-    ...(params.agentAiDefaults ? { agentAiDefaults: params.agentAiDefaults } : {}),
-  };
-
-  const result = await resolveAgentForStream({
-    workspaceId: CHILD_WORKSPACE_ID,
-    metadata,
-    runtime: new LocalRuntime(projectPath),
-    workspacePath: projectPath,
-    requestedAgentId: params.agentId,
-    disableWorkspaceAgents: false,
-    callerToolPolicy: undefined,
-    cfg,
-    emitError: () => undefined,
-    isAdvisorExperimentEnabled: true,
-  });
-
-  if (!result.success) {
-    throw new Error("Expected agent resolution to succeed");
-  }
-  return result.data.effectiveToolPolicy ?? [];
 }
 
 describe("getLegacyModeForAgentMetadata", () => {
@@ -139,6 +93,7 @@ describe("resolveAgentForStream transport failures (#4438)", () => {
     );
     try {
       return await resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
         workspaceId: CHILD_WORKSPACE_ID,
         metadata,
         runtime: new LocalRuntime(projectPath),
@@ -148,7 +103,6 @@ describe("resolveAgentForStream transport failures (#4438)", () => {
         callerToolPolicy: undefined,
         cfg,
         emitError: () => undefined,
-        isAdvisorExperimentEnabled: true,
       }).catch((error: unknown) => error);
     } finally {
       read.mockRestore();
@@ -202,6 +156,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(projectPath),
@@ -211,7 +166,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -269,6 +223,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -278,7 +233,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -287,6 +241,74 @@ describe("resolveAgentForStream agent identity", () => {
     expect(result.data.effectiveAgentId).toBe(customAgentId);
     expect(result.data.agentIsPlanLike).toBe(true);
     expect(result.data.effectiveMode).toBe("plan");
+  });
+
+  test("builds the parent's discovery runtime through the RuntimeFactory it was given", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-parent-factory");
+    const projectPath = path.join(tempDir.path, "project");
+    const parentPath = path.join(projectPath, "parent");
+    const childPath = path.join(projectPath, "child");
+    const customAgentId = "factory-reviewer";
+    await fs.mkdir(path.join(parentPath, ".mux", "agents"), { recursive: true });
+    await fs.mkdir(childPath, { recursive: true });
+    await fs.writeFile(
+      path.join(parentPath, ".mux", "agents", `${customAgentId}.md`),
+      ["---", "name: Factory Reviewer", "subagent:", "  runnable: true", "---", "Body.", ""].join(
+        "\n"
+      )
+    );
+    // The config points the parent at a folder that does not exist: only the factory's
+    // context reaches the parent checkout.
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              {
+                id: PARENT_WORKSPACE_ID,
+                name: PARENT_WORKSPACE_ID,
+                path: path.join(projectPath, "missing"),
+              },
+              {
+                id: CHILD_WORKSPACE_ID,
+                name: CHILD_WORKSPACE_ID,
+                path: childPath,
+                parentWorkspaceId: PARENT_WORKSPACE_ID,
+                agentId: "",
+                agentType: customAgentId,
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    const runtimeFactory: RuntimeFactory = {
+      ...nodeRuntimeFactory,
+      createRuntimeContextForWorkspace: () => ({
+        runtime: new LocalRuntime(parentPath),
+        workspacePath: parentPath,
+      }),
+    };
+
+    const result = await resolveAgentForStream({
+      runtimeFactory,
+      workspaceId: CHILD_WORKSPACE_ID,
+      metadata: createSubagentMetadata({ projectPath, agentId: "", agentType: customAgentId }),
+      runtime: new LocalRuntime(childPath),
+      workspacePath: childPath,
+      requestedAgentId: "exec",
+      disableWorkspaceAgents: false,
+      callerToolPolicy: undefined,
+      cfg,
+      emitError: () => undefined,
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.agentDiscoveryPath).toBe(parentPath);
+    expect(result.data.effectiveAgentId).toBe(customAgentId);
   });
 
   test("tries legacy project agentType before stale built-in agentId fallback", async () => {
@@ -339,6 +361,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -348,7 +371,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -407,6 +429,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -416,7 +439,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -461,6 +483,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -470,7 +493,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -526,6 +548,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -535,7 +558,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -589,6 +611,7 @@ describe("resolveAgentForStream strict resolution", () => {
       ...(params.agentAiDefaults ? { agentAiDefaults: params.agentAiDefaults } : {}),
     };
     return await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: PARENT_WORKSPACE_ID,
       metadata: createTopLevelMetadata(params.projectPath),
       runtime: new LocalRuntime(params.projectPath),
@@ -599,7 +622,6 @@ describe("resolveAgentForStream strict resolution", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: (event) => params.onError?.(event),
-      isAdvisorExperimentEnabled: false,
     });
   }
 
@@ -887,28 +909,6 @@ describe("resolveAgentForStream strict resolution", () => {
   });
 });
 
-describe("resolveAgentForStream advisor defaults", () => {
-  test("enables advisor by default for Exec and Plan sub-agents when the experiment is enabled", async () => {
-    const [execPolicy, planPolicy] = await Promise.all([
-      resolvePolicyForAgent({ agentId: "exec" }),
-      resolvePolicyForAgent({ agentId: "plan" }),
-    ]);
-
-    expect(execPolicy).toContainEqual({ regex_match: "advisor", action: "enable" });
-    expect(planPolicy).toContainEqual({ regex_match: "advisor", action: "enable" });
-  });
-
-  test("keeps explicit advisor disable overrides authoritative for default-enabled agents", async () => {
-    const policy = await resolvePolicyForAgent({
-      agentId: "exec",
-      agentAiDefaults: { exec: { advisorEnabled: false } },
-    });
-
-    expect(policy).toContainEqual({ regex_match: "advisor", action: "disable" });
-    expect(policy).not.toContainEqual({ regex_match: "advisor", action: "enable" });
-  });
-});
-
 describe("resolveAgentForStream per-request agent definition cache", () => {
   /** Counts agent definition file reads (`<root>/agents/<id>.md`) by path. */
   class CountingRuntime extends LocalRuntime {
@@ -946,6 +946,7 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       runtimeConfig: DEFAULT_RUNTIME_CONFIG,
     };
     const resolved = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: metadata.id,
       metadata,
       runtime,
@@ -973,8 +974,8 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       modelString: "openai:gpt-5.2",
       cfg: params.cfg,
       providersConfig: null,
-      mcpServers: {},
       agentDefinitionCache: params.cache,
+      runtimeFactory: nodeRuntimeFactory,
     });
     const totalReads = [...runtime.definitionReads.values()].reduce((sum, n) => sum + n, 0);
     return { agent, context, metadata, reads: runtime.definitionReads, totalReads };
@@ -1058,8 +1059,12 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       const again = await runTurn({ projectPath, cfg, cache });
       const repeatRuntime = again.agent.agentDiscoveryRuntime as CountingRuntime;
       const readsAfterTurn = new Map(repeatRuntime.definitionReads);
+      // The cache keys reads by trust (#6426), so repeat the turn's trust value.
+      const projectPluginsTrusted = again.agent.projectPluginsTrusted;
       const repeatedBody = await resolveAgentBody(repeatRuntime, projectPath, "reviewer", {
         cache,
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       await resolveAgentInheritanceChain({
         runtime: repeatRuntime,
@@ -1068,6 +1073,8 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
         agentDefinition: again.agent.agentDefinition,
         workspaceId: again.metadata.id,
         cache,
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       expect(repeatedBody).toBe(again.context.agentSystemPromptSections[0]);
       expect(repeatRuntime.definitionReads).toEqual(readsAfterTurn);
@@ -1105,15 +1112,388 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
     const runtime = new LocalRuntime(projectPath);
     const cache = new AgentDefinitionRequestCache();
 
-    const override = await readAgentDefinition(runtime, projectPath, "exec", { cache });
+    const override = await readAgentDefinition(runtime, projectPath, "exec", {
+      cache,
+      runtimeFactory: nodeRuntimeFactory,
+    });
     const base = await readAgentDefinition(runtime, projectPath, "exec", {
       cache,
       skipScopesAbove: "project",
+      runtimeFactory: nodeRuntimeFactory,
     });
 
     expect(override.scope).toBe("project");
     expect(base.scope).not.toBe("project");
     // Repeated lookups in the same request return the memoized winner.
-    expect(await readAgentDefinition(runtime, projectPath, "exec", { cache })).toBe(override);
+    expect(
+      await readAgentDefinition(runtime, projectPath, "exec", {
+        cache,
+        runtimeFactory: nodeRuntimeFactory,
+      })
+    ).toBe(override);
+  });
+});
+
+describe("resolveAgentForStream caller tool policy keeps the advertised tool set", () => {
+  // A per-turn caller policy must refuse calls, not remove tools: a removed tool changes the
+  // tool block and misses the whole prompt cache (the turn-end TODO nudge did this).
+  const toolNames = ["bash", "file_read", "file_edit_insert", "todo_write", "task", "agent_report"];
+  const fakeTools = (): Record<string, Tool> =>
+    Object.fromEntries(
+      toolNames.map((name) => [
+        name,
+        {
+          description: name,
+          inputSchema: z.object({}),
+          execute: () => Promise.resolve({ success: true }),
+        } as unknown as Tool,
+      ])
+    );
+  const callerDeny: ToolPolicy = [{ regex_match: "bash", action: "disable" }];
+
+  function createConfig(projectPath: string): ProjectsConfig {
+    return {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: PARENT_WORKSPACE_ID, name: PARENT_WORKSPACE_ID, path: projectPath },
+              {
+                id: CHILD_WORKSPACE_ID,
+                name: CHILD_WORKSPACE_ID,
+                path: projectPath,
+                parentWorkspaceId: PARENT_WORKSPACE_ID,
+                agentId: "explore",
+                agentType: "explore",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+  }
+
+  interface ResolveParams {
+    projectPath: string;
+    subagent: boolean;
+    callerToolPolicy: ToolPolicy | undefined;
+  }
+
+  async function resolve(params: ResolveParams) {
+    const metadata: WorkspaceMetadata = params.subagent
+      ? createSubagentMetadata({ projectPath: params.projectPath, agentId: "explore" })
+      : {
+          id: PARENT_WORKSPACE_ID,
+          name: PARENT_WORKSPACE_ID,
+          projectName: path.basename(params.projectPath),
+          projectPath: params.projectPath,
+          runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        };
+    const resolved = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
+      workspaceId: metadata.id,
+      metadata,
+      runtime: new LocalRuntime(params.projectPath),
+      workspacePath: params.projectPath,
+      requestedAgentId: params.subagent ? "explore" : "exec",
+      disableWorkspaceAgents: false,
+      callerToolPolicy: params.callerToolPolicy,
+      cfg: createConfig(params.projectPath),
+      emitError: () => undefined,
+    });
+    if (!resolved.success) throw new Error("agent resolution failed");
+    return resolved.data;
+  }
+
+  async function advertisedTools(params: ResolveParams): Promise<Record<string, Tool>> {
+    const resolved = await resolve(params);
+    return applyToolPolicyAndExperiments({
+      allTools: fakeTools(),
+      effectiveToolPolicy: resolved.effectiveToolPolicy,
+      switchableAgentToolPolicies: resolved.switchableAgents?.map((agent) => agent.toolPolicy),
+      callerToolPolicy: params.callerToolPolicy,
+      activeAgentId: resolved.effectiveAgentId,
+      emitNestedToolEvent: () => undefined,
+    });
+  }
+
+  const callOptions = { toolCallId: "call-1", messages: [], context: undefined };
+
+  test("a root exec turn with a caller deny advertises the same tools and refuses the call", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-caller-policy-root");
+    const projectPath = path.join(tempDir.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const plain = await advertisedTools({
+      projectPath,
+      subagent: false,
+      callerToolPolicy: undefined,
+    });
+    const denied = await advertisedTools({
+      projectPath,
+      subagent: false,
+      callerToolPolicy: callerDeny,
+    });
+
+    expect(plain.bash).toBeDefined();
+    expect(Object.keys(denied)).toEqual(Object.keys(plain));
+    expect(await denied.bash.execute!({}, callOptions)).toEqual({
+      success: false,
+      error: "Tool 'bash' is disabled for this turn.",
+    });
+  });
+
+  test("a sub-agent keeps its tool set under a caller deny, and is unchanged without one", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-caller-policy-subagent");
+    const projectPath = path.join(tempDir.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const plain = await advertisedTools({
+      projectPath,
+      subagent: true,
+      callerToolPolicy: undefined,
+    });
+    const denied = await advertisedTools({
+      projectPath,
+      subagent: true,
+      callerToolPolicy: callerDeny,
+    });
+
+    // Without a caller policy the one-policy union gives the plain policy result.
+    const explorePolicy = (
+      await resolve({ projectPath, subagent: true, callerToolPolicy: undefined })
+    ).effectiveToolPolicy;
+    expect(Object.keys(plain)).toEqual(Object.keys(applyToolPolicy(fakeTools(), explorePolicy)));
+    expect(plain.bash).toBeDefined();
+    expect(Object.keys(denied)).toEqual(Object.keys(plain));
+    expect(await denied.bash.execute!({}, callOptions)).toEqual({
+      success: false,
+      error: "Tool 'bash' is disabled for this turn.",
+    });
+  });
+});
+
+describe("resolveAgentForStream agentAiSettingsChain (Cursor model: fast)", () => {
+  async function resolveChild(agentFrontmatter: string) {
+    using tempDir = new DisposableTempDir("agent-resolution-settings-base");
+    const projectPath = path.join(tempDir.path, "project");
+    const agentsRoot = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsRoot, "ci-watcher.md"),
+      `---\nname: ci-watcher\nbase: exec\nsubagent:\n  runnable: true\n${agentFrontmatter}---\nWatch CI.\n`
+    );
+    const metadata = createSubagentMetadata({ projectPath, agentId: "ci-watcher" });
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: PARENT_WORKSPACE_ID, name: PARENT_WORKSPACE_ID, path: projectPath },
+              {
+                id: CHILD_WORKSPACE_ID,
+                name: CHILD_WORKSPACE_ID,
+                path: projectPath,
+                parentWorkspaceId: PARENT_WORKSPACE_ID,
+                agentId: "ci-watcher",
+                agentType: "ci-watcher",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = path.join(tempDir.path, "xum-home");
+    try {
+      const result = await resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: CHILD_WORKSPACE_ID,
+        metadata,
+        runtime: new LocalRuntime(projectPath),
+        workspacePath: projectPath,
+        requestedAgentId: "exec",
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg,
+        emitError: () => undefined,
+      });
+      if (!result.success) throw new Error("Expected agent resolution to succeed");
+      return result.data;
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }
+
+  test("equals the inheritance chain for an agent without settingsBase", async () => {
+    const agent = await resolveChild("");
+    expect(agent.agentAiSettingsChain).toEqual(agent.agentInheritanceChain);
+  });
+
+  test("runs a fast agent's AI settings through Explore and keeps its own tool policy", async () => {
+    const fast = await resolveChild("ai:\n  settingsBase: explore\n");
+    const plain = await resolveChild("");
+    expect(fast.agentAiSettingsChain.map((hop) => hop.id)).toEqual([
+      "ci-watcher",
+      "explore",
+      "exec",
+    ]);
+    expect(fast.agentInheritanceChain.map((hop) => hop.id)).toEqual(["ci-watcher", "exec"]);
+    // Explore's built-in prompt-cache TTL, with no Settings entry setting one.
+    expect(resolveChainAgentCacheTtl("ci-watcher", undefined, fast.agentAiSettingsChain)).toBe(
+      "5m"
+    );
+    expect(fast.effectiveToolPolicy).toEqual(plain.effectiveToolPolicy);
+  });
+});
+
+describe("resolveAgentForStream with an unreachable foreign plugin agent (plugin install methods RFC, A4)", () => {
+  test("a foreign plugin exec that names its plugin folder, on an SSH workspace, leaves main-chat resolution and a base chain through exec unchanged", async () => {
+    using hostHome = new DisposableTempDir("agent-resolution-unreachable-home");
+    using checkoutDir = new DisposableTempDir("agent-resolution-unreachable-checkout");
+    const checkout = await fs.realpath(checkoutDir.path);
+    const pluginDir = path.join(hostHome.path, "plugins", "egm");
+    await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "egm",
+      })
+    );
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "exec.md"),
+      "---\nname: Plugin Exec\ndescription: Foreign exec\n---\nRead ${CLAUDE_PLUGIN_ROOT}/agents/exec.md\n"
+    );
+    await fs.mkdir(path.join(checkout, ".xum", "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(checkout, ".xum", "agents", "child.md"),
+      "---\nname: Child\nbase: exec\n---\nChild body\n"
+    );
+    const runtime = new HostKeyShellRemoteRuntime(checkout, "agent-resolution-unreachable");
+    const metadata: WorkspaceMetadata = {
+      id: "main-workspace",
+      name: "main-workspace",
+      projectName: path.basename(checkout),
+      projectPath: checkout,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          checkout,
+          {
+            trusted: true,
+            workspaces: [{ id: "main-workspace", name: "main-workspace", path: checkout }],
+          },
+        ],
+      ]),
+    };
+    const resolve = (requestedAgentId: string) =>
+      resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: "main-workspace",
+        metadata,
+        runtime,
+        workspacePath: checkout,
+        requestedAgentId,
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg,
+        emitError: () => undefined,
+      });
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = hostHome.path;
+    try {
+      // The main chat resolves the plugin's `exec` with the placeholder as written, because only
+      // a `task` spawn refuses an unreachable folder.
+      const exec = await resolve("exec");
+      expect(exec.success).toBe(true);
+      if (!exec.success) return;
+      expect(exec.data.effectiveAgentId).toBe("exec");
+      expect(exec.data.agentDefinition.scope).toBe("global");
+      expect(exec.data.agentDefinition.body).toContain("${CLAUDE_PLUGIN_ROOT}/agents/exec.md");
+
+      const child = await resolve("child");
+      expect(child.success).toBe(true);
+      if (!child.success) return;
+      expect(child.data.effectiveAgentId).toBe("child");
+      expect(child.data.agentInheritanceChain.map((entry) => `${entry.id}:${entry.scope}`)).toEqual(
+        ["child:project", "exec:global", "exec:built-in"]
+      );
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }, 60_000);
+});
+
+// Codex review: the agent sandbox hides a checkout file that a project secret names, so a turn
+// passes the secrets its commands start with to every agent definition read.
+describe("resolveAgentForStream with the project's secrets", () => {
+  test("skips a project agent that links to a file a project secret names", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-sandbox-env");
+    const root = await fs.realpath(tempDir.path);
+    const projectPath = path.join(root, "project");
+    const secret = path.join(projectPath, "secrets", "reviewer.md");
+    const projectAgents = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(path.dirname(secret), { recursive: true });
+    await fs.mkdir(projectAgents, { recursive: true });
+    await fs.writeFile(secret, "---\nname: Reviewer\n---\nSecret file.\n");
+    await fs.symlink(secret, path.join(projectAgents, "reviewer.md"));
+    const runtime = new LocalRuntime(projectPath);
+    runtime.agentSandboxPolicy = (input) => ({
+      writeRoots: [projectPath],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+      allowRead: [projectPath],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+    const metadata: WorkspaceMetadata = {
+      id: "sandbox-env-ws",
+      name: "sandbox-env-ws",
+      projectName: "project",
+      projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const resolve = (sandboxEnv?: NodeJS.ProcessEnv) =>
+      resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: metadata.id,
+        metadata,
+        runtime,
+        workspacePath: projectPath,
+        requestedAgentId: "reviewer",
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg: { projects: new Map([[projectPath, { trusted: true, workspaces: [] }]]) },
+        emitError: () => undefined,
+        sandboxEnv,
+      });
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = path.join(root, "xum-home");
+    try {
+      expect(await resolve()).toMatchObject({
+        success: true,
+        data: { effectiveAgentId: "reviewer" },
+      });
+      expect(await resolve({ HF_TOKEN_PATH: secret })).toMatchObject({
+        success: true,
+        data: { effectiveAgentId: "exec" },
+      });
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
   });
 });

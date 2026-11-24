@@ -43,7 +43,7 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
         // Ensure the workspace view (and chat subscription) is live before sending.
         await waitFor(
           () => {
-            const el = view.container.querySelector('textarea[aria-label="Message Claude"]');
+            const el = view.container.querySelector('textarea[aria-label="Message"]');
             if (!el) throw new Error("Chat textarea not found");
           },
           { timeout: 10_000 }
@@ -98,7 +98,7 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
         // Ensure the workspace view (and chat subscription) is live before sending.
         await waitFor(
           () => {
-            const el = view.container.querySelector('textarea[aria-label="Message Claude"]');
+            const el = view.container.querySelector('textarea[aria-label="Message"]');
             if (!el) throw new Error("Chat textarea not found");
           },
           { timeout: 10_000 }

@@ -276,7 +276,7 @@ describe("mapChatEventToTimeline", () => {
       kind: "compaction.triggered",
       status: "started",
     });
-    // HeartbeatService records heartbeat.dispatched, so this turn would only duplicate it.
+    // The heartbeat path (WorkspaceService.executeHeartbeat) records heartbeat.dispatched, so this turn would only duplicate it.
     expect(heartbeatTurn.drafts).toEqual([]);
   });
 

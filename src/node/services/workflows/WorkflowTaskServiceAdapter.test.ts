@@ -11,6 +11,7 @@ import type { TaskCreateResult } from "@/node/services/taskService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 
 const patchToolConfig: TaskGitPatchApplyConfig = {
+  sessionLocks: nodeSessionLocks,
   cwd: "/repo",
   runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
   runtimeTempDir: "/tmp",
@@ -20,6 +21,7 @@ import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "./WorkflowTaskServiceAdapter";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("WorkflowTaskServiceAdapter", () => {
   test("spawns a workflow child task with workflow metadata and returns its report", async () => {
@@ -92,35 +94,6 @@ describe("WorkflowTaskServiceAdapter", () => {
     await expect(adapter.runAgent({ id: "verify", prompt: "Verify claims" })).rejects.toThrow(
       refusalMessage
     );
-  });
-
-  test("inherits experiments for task creation", async () => {
-    let createArgs: unknown;
-    const create = mock(async (args: unknown) => {
-      createArgs = args;
-      return Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const });
-    });
-    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
-    const adapter = new WorkflowTaskServiceAdapter({
-      taskService: { create, waitForAgentReport },
-      parentWorkspaceId: "parent_1",
-      workflowRunId: "wfr_123",
-      defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
-    });
-
-    await adapter.runAgent({
-      id: "claims",
-      agentId: "exec",
-      prompt: "Extract claims",
-      outputSchema: { type: "object" },
-    });
-
-    expect(createArgs).toMatchObject({
-      agentId: "exec",
-      prompt: "Extract claims",
-      experiments: { dynamicWorkflows: true },
-    });
   });
 
   test("passes onRefusal and isolation through to task creation", async () => {
@@ -220,29 +193,6 @@ describe("WorkflowTaskServiceAdapter", () => {
     });
   });
 
-  test("passes workflow experiments to Explore workflow task creation", async () => {
-    let createArgs: unknown;
-    const create = mock(async (args: unknown) => {
-      createArgs = args;
-      return Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const });
-    });
-    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
-    const adapter = new WorkflowTaskServiceAdapter({
-      taskService: { create, waitForAgentReport },
-      parentWorkspaceId: "parent_1",
-      workflowRunId: "wfr_123",
-      defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
-    });
-
-    await adapter.runAgent({ id: "source", prompt: "Read source" });
-
-    expect(createArgs).toMatchObject({
-      agentId: "explore",
-      experiments: { dynamicWorkflows: true },
-    });
-  });
-
   test("bulk creates workflow child tasks with workflow metadata", async () => {
     const createMany = mock(
       async (
@@ -270,7 +220,6 @@ describe("WorkflowTaskServiceAdapter", () => {
       parentWorkspaceId: "parent_1",
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
     });
 
     const created: Array<[number, string]> = [];
@@ -302,7 +251,6 @@ describe("WorkflowTaskServiceAdapter", () => {
         prompt: "Do first",
         title: "First",
         workflowTask: { runId: "wfr_123", stepId: "first" },
-        experiments: { dynamicWorkflows: true },
       },
       {
         parentWorkspaceId: "parent_1",
@@ -311,7 +259,6 @@ describe("WorkflowTaskServiceAdapter", () => {
         prompt: "Do second",
         title: "second",
         workflowTask: { runId: "wfr_123", stepId: "second", outputSchema: { type: "object" } },
-        experiments: { dynamicWorkflows: true },
       },
     ]);
     const createManyOptions: unknown = createMany.mock.calls[0]?.[1];
@@ -415,12 +362,19 @@ describe("WorkflowTaskServiceAdapter", () => {
         taskService: { ...withoutCreateMany, claimRetiredAttempt },
       })
     ).toThrow(/createMany/);
-    expect(
+    expect(() =>
       createProductionWorkflowTaskAdapter({
         ...options,
         taskService: { ...base, claimRetiredAttempt },
-      }).claimRetiredAttempt
-    ).toBeDefined();
+      })
+    ).toThrow(/tombstoneUnpublishedReservation/);
+    const tombstoneUnpublishedReservation = mock(async () => Ok(undefined));
+    const adapter = createProductionWorkflowTaskAdapter({
+      ...options,
+      taskService: { ...base, claimRetiredAttempt, tombstoneUnpublishedReservation },
+    });
+    expect(adapter.claimRetiredAttempt).toBeDefined();
+    expect(adapter.tombstoneUnpublishedTask).toBeDefined();
   });
 
   test("forwards run-end lifecycle hooks to the task service", async () => {

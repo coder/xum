@@ -1,12 +1,21 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  spyOn,
+  beforeEach,
+  afterEach,
+  setDefaultTimeout,
+} from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "child_process";
 import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { Config } from "@/node/config";
+import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { upsertSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -14,7 +23,7 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { defaultModel } from "@/common/utils/ai/models";
-import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceMetadata, WorkspaceRemoveWarning } from "@/common/types/workspace";
 import assert from "node:assert";
 import {
   createAIServiceMocks,
@@ -37,6 +46,13 @@ import {
   removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { LossyWorkPolicy } from "@/node/services/taskService";
+
+// The real-git removal tests run several git commands each, which at bun's 5 s default times out
+// on a loaded host. A timed-out test keeps running while afterEach deletes its root, and that
+// breaks the next tests ("missing ancestor lineage").
+setDefaultTimeout(30_000);
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -279,6 +295,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentWorkspaceId,
       workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
@@ -349,9 +366,9 @@ describe("TaskService", () => {
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const { workspaceService } = createWorkspaceServiceMocks({ removeWhileTaskTreeLocked: remove });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const removeAsModel = (taskId: string) =>
+    const removeAsModel = (taskId: string, lossyWorkPolicy: LossyWorkPolicy = "refuse") =>
       taskService.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId, {
-        lossyWorkPolicy: "refuse",
+        lossyWorkPolicy,
       });
     return { config, projectPath, childPath, remove, taskService, workspaceService, removeAsModel };
   }
@@ -381,6 +398,324 @@ describe("TaskService", () => {
       )
     ).toEqual(Ok(undefined));
     expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  test("the force policy removes a child holding an uncommitted file and an uncaptured commit, and reports both", async () => {
+    const parentWorkspaceId = "parent-remove-forced";
+    const childTaskId = "child-remove-forced";
+    const { config, childPath, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    await fsPromises.writeFile(path.join(childPath, "committed.txt"), "committed\n");
+    execSync('git add committed.txt && git commit -m "uncaptured"', {
+      cwd: childPath,
+      stdio: "ignore",
+    });
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+
+    // The default policy still refuses this very checkout, so only the policy differs below.
+    expect(await removeAsModel(childTaskId, "refuse")).toMatchObject(Ok({ status: "error" }));
+    expect(remove).not.toHaveBeenCalled();
+
+    const forced = await removeAsModel(childTaskId, "force");
+    assert(forced.success && forced.data.status === "removed", "force must remove the child");
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(forced.data.paths).toEqual(["notes.txt"]);
+    // The report names every kind of work lost, and where it was: the files (listed in paths),
+    // the commit count, the checkout and the task branch.
+    expect(forced.data.deletedWork).toContain("1 commit(s) not captured");
+    expect(forced.data.deletedWork).toContain(childPath);
+    expect(forced.data.deletedWork).toContain("Branch: child.");
+    expect(forced.data.error).toBeUndefined();
+    // A removed row now reads as already removed: the tombstone was written.
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        project.workspaces = project.workspaces.filter((row) => row.id !== childTaskId);
+      }
+      return cfg;
+    });
+    expect(await removeAsModel(childTaskId, "force")).toMatchObject(
+      Ok({ status: "already_removed" })
+    );
+  });
+
+  test("the force policy reports a checkout it could not check and still removes it", async () => {
+    const parentWorkspaceId = "parent-remove-forced-unverifiable";
+    const childTaskId = "child-remove-forced-unverifiable";
+    const { config, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    // Without a task base commit the commits cannot be counted: the check fails closed.
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const child = project.workspaces.find((row) => row.id === childTaskId);
+        if (child != null) delete child.taskBaseCommitSha;
+      }
+      return cfg;
+    });
+    const refusal = await removeAsModel(childTaskId, "refuse");
+    assert(refusal.success && refusal.data.status === "error", "an unverifiable child refuses");
+    expect(remove).not.toHaveBeenCalled();
+    // The refusal is how a model learns that the override exists, and no file was found to list.
+    expect(refusal.data.error).toContain("force: true");
+    expect(refusal.data.paths).toBeUndefined();
+
+    const forced = await removeAsModel(childTaskId, "force");
+    assert(forced.success && forced.data.status === "removed", "force must remove the child");
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(forced.data.deletedWork).toContain("could not be checked");
+    expect(forced.data.paths).toBeUndefined();
+  });
+
+  test("the force policy reports nothing when the child holds no unsaved work", async () => {
+    const { remove, removeAsModel } = await createChildCheckoutHarness(
+      "parent-remove-forced-clean",
+      "child-remove-forced-clean"
+    );
+    const result = await removeAsModel("child-remove-forced-clean", "force");
+    assert(result.success && result.data.status === "removed", "a clean child is removed");
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(result.data.deletedWork).toBeUndefined();
+    expect(result.data.paths).toBeUndefined();
+  });
+
+  test("removal warnings reach a handler when the caller gives one and do not fail a caller without one", async () => {
+    const parentWorkspaceId = "parent-remove-warnings";
+    const childTaskId = "child-remove-warnings";
+    const { remove, taskService, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    const warnings: WorkspaceRemoveWarning[] = [{ kind: "leftover", description: "/leftover" }];
+    const withWarnings: Result<void> & { warnings?: WorkspaceRemoveWarning[] } = {
+      ...Ok(undefined),
+      warnings,
+    };
+    remove.mockImplementation(() => Promise.resolve(withWarnings));
+
+    // No options at all, and options without a handler (the model's): neither may call a missing one.
+    expect(
+      await taskService.removeInactiveDescendantAgentTask(parentWorkspaceId, childTaskId)
+    ).toMatchObject(Ok({ status: "removed" }));
+    expect(await removeAsModel(childTaskId, "force")).toMatchObject(Ok({ status: "removed" }));
+
+    const received: WorkspaceRemoveWarning[] = [];
+    await taskService.removeInactiveDescendantAgentTask(parentWorkspaceId, childTaskId, {
+      onRemovalWarnings: (removalWarnings) => received.push(...removalWarnings),
+    });
+    expect(received).toEqual(warnings);
+  });
+
+  test("a forced removal that leaves part of the checkout behind says so instead of claiming a full deletion", async () => {
+    const parentWorkspaceId = "parent-remove-forced-leftover";
+    const childTaskId = "child-remove-forced-leftover";
+    const { childPath, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+
+    const complete = await removeAsModel(childTaskId, "force");
+    assert(complete.success && complete.data.status === "removed", "force must remove the child");
+    const completeReport = complete.data.deletedWork;
+    assert(completeReport != null, "a forced removal of unsaved work reports it");
+    // A complete deletion carries no caveat about work that remains.
+    expect(completeReport).not.toContain("may remain");
+
+    // Forced removal succeeds when the runtime cannot delete everything: it returns warnings.
+    const leftover = "/devcontainer-left-behind was left behind; remove it manually.";
+    const withLeftover: Result<void> & { warnings?: WorkspaceRemoveWarning[] } = {
+      ...Ok(undefined),
+      warnings: [{ kind: "leftover", description: leftover }],
+    };
+    remove.mockImplementation(() => Promise.resolve(withLeftover));
+    const partial = await removeAsModel(childTaskId, "force");
+    assert(partial.success && partial.data.status === "removed", "force still removes the row");
+    // The report keeps what was found, names what remains, and lists the same paths.
+    expect(partial.data.deletedWork).toContain(completeReport);
+    expect(partial.data.deletedWork).toContain(leftover);
+    expect(partial.data.paths).toEqual(["notes.txt"]);
+  });
+
+  test("a forced removal that fails reports what it may have deleted, and a clean one reports nothing", async () => {
+    const parentWorkspaceId = "parent-remove-forced-failed";
+    const childTaskId = "child-remove-forced-failed";
+    const { childPath, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+    // The removal can fail after it deleted the checkout (the row's config write fails last), and
+    // a retry then finds no unsaved work to report: the failure itself must carry the report.
+    remove.mockImplementation(() => Promise.resolve(Err("Failed to remove workspace: disk full")));
+
+    const failed = await removeAsModel(childTaskId, "force");
+    assert(failed.success && failed.data.status === "error", "a failed removal is an error");
+    expect(failed.data.error).toContain("disk full");
+    expect(failed.data.deletedWork).toContain("may have deleted");
+    expect(failed.data.deletedWork).toContain(childPath);
+    expect(failed.data.paths).toEqual(["notes.txt"]);
+
+    // Without unsaved work there is nothing to report, even when the removal fails.
+    await fsPromises.rm(path.join(childPath, "notes.txt"));
+    const cleanFailure = await removeAsModel(childTaskId, "force");
+    assert(cleanFailure.success && cleanFailure.data.status === "error", "still an error");
+    expect(cleanFailure.data.deletedWork).toBeUndefined();
+    expect(cleanFailure.data.paths).toBeUndefined();
+  });
+
+  // The force policy skips only the unsaved-work refusal. The checks below are about the child
+  // being busy or not the caller's, so each must still stop a removal that force would complete.
+  test("the force policy keeps the refusals for scope, descendants, an active child and a pending patch", async () => {
+    const parentWorkspaceId = "parent-remove-forced-guards";
+    const childTaskId = "child-remove-forced-guards";
+    const { config, projectPath, childPath, remove, removeAsModel } =
+      await createChildCheckoutHarness(parentWorkspaceId, childTaskId);
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+    const editRows = (edit: (rows: WorkspaceConfigEntry[]) => WorkspaceConfigEntry[]) =>
+      config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project != null, "the test project exists");
+        project.workspaces = edit(project.workspaces);
+        return cfg;
+      });
+    const setChildStatus = (taskStatus: "running" | "reported") =>
+      editRows((rows) =>
+        rows.map((row) => (row.id === childTaskId ? { ...row, taskStatus } : row))
+      );
+    const forcedRemoval = async (taskId: string) => {
+      const result = await removeAsModel(taskId, "force");
+      assert(result.success, "a refused removal still returns a result");
+      return result.data;
+    };
+
+    // Out of scope: another tree's child.
+    await editRows((rows) => [
+      ...rows,
+      projectWorkspace(projectPath, "other", "other-root"),
+      projectWorkspace(projectPath, "foreign", "foreign", {
+        parentWorkspaceId: "other-root",
+        taskStatus: "reported",
+      }),
+    ]);
+    expect((await forcedRemoval("foreign")).status).toBe("invalid_scope");
+
+    // A descendant remains.
+    await editRows((rows) => [
+      ...rows,
+      projectWorkspace(projectPath, "grandchild", "grandchild", {
+        parentWorkspaceId: childTaskId,
+        taskStatus: "reported",
+      }),
+    ]);
+    const withDescendant = await forcedRemoval(childTaskId);
+    assert(withDescendant.status === "error", "descendants refuse");
+    expect(withDescendant.descendantTaskIds).toEqual(["grandchild"]);
+    await editRows((rows) => rows.filter((row) => row.id !== "grandchild"));
+
+    // The child is still running.
+    await setChildStatus("running");
+    expect((await forcedRemoval(childTaskId)).status).toBe("active");
+    await setChildStatus("reported");
+
+    // Its patch artifact is still being written.
+    await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
+      workspaceId: parentWorkspaceId,
+      workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
+      childTaskId,
+      updater: () => ({
+        childTaskId,
+        parentWorkspaceId,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+        status: "pending",
+        projectArtifacts: [
+          { projectPath, projectName: "repo", storageKey: "repo", status: "pending" },
+        ],
+        readyProjectCount: 0,
+        failedProjectCount: 0,
+        skippedProjectCount: 0,
+        totalCommitCount: 0,
+      }),
+    });
+    const pending = await forcedRemoval(childTaskId);
+    assert(pending.status === "error", "a pending patch artifact refuses");
+    expect(pending.error).toContain("patch artifact");
+
+    expect(remove).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
+    await fsPromises.access(path.join(childPath, "notes.txt"));
+  });
+
+  test("the user can preview and then confirm removing a sub-agent the model must not remove (#5106)", async () => {
+    const parentWorkspaceId = "parent-remove-user";
+    const childTaskId = "child-remove-user";
+    const { childPath, remove, taskService, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    expect(await taskService.previewSubagentRemoval(childTaskId)).toEqual(
+      Ok({ summary: null, paths: [] })
+    );
+
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
+    // The confirmation lists the same work the model's refusal reports.
+    const preview = await taskService.previewSubagentRemoval(childTaskId);
+    assert(preview.success && preview.data.summary != null, "dirty checkout must be reported");
+    expect(preview.data.paths).toEqual(["notes.txt"]);
+    expect(remove).not.toHaveBeenCalled();
+
+    // Work that appears after the confirmation was shown refuses the removal: the user never
+    // loses what the dialog did not list.
+    await fsPromises.writeFile(path.join(childPath, "later.txt"), "written after preview\n");
+    expect(await taskService.removeSubagentForUser(childTaskId, preview.data)).toMatchObject({
+      success: false,
+    });
+    expect(remove).not.toHaveBeenCalled();
+
+    // Only the user-confirmed path force-removes it.
+    const current = await taskService.previewSubagentRemoval(childTaskId);
+    assert(current.success, "preview must succeed");
+    expect(current.data.paths).toEqual(["later.txt", "notes.txt"]);
+    expect(await taskService.removeSubagentForUser(childTaskId, current.data)).toEqual(Ok({}));
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  test("user-confirmed sub-agent removal refuses active sub-agents and non-sub-agents (#5106)", async () => {
+    const parentWorkspaceId = "parent-remove-user-active";
+    const childTaskId = "child-remove-user-active";
+    const { config, projectPath, remove, taskService } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    const nothing = { summary: null, paths: [] };
+    expect(await taskService.removeSubagentForUser(parentWorkspaceId, nothing)).toMatchObject({
+      success: false,
+    });
+    expect(await taskService.previewSubagentRemoval(parentWorkspaceId)).toMatchObject({
+      success: false,
+    });
+    await config.editConfig((cfg) => {
+      const child = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((workspace) => workspace.id === childTaskId);
+      assert(child != null, "child workspace must exist");
+      child.taskStatus = "running";
+      return cfg;
+    });
+    // Confirming removal does not grant consent to stop a running sub-agent, and the preview
+    // refuses up front instead of asking the user to confirm a removal that cannot happen.
+    expect(await taskService.previewSubagentRemoval(childTaskId)).toMatchObject({
+      success: false,
+    });
+    expect(await taskService.removeSubagentForUser(childTaskId, nothing)).toMatchObject({
+      success: false,
+    });
+    expect(remove).not.toHaveBeenCalled();
   });
 
   test("model-driven task removal still removes clean and shared-checkout children", async () => {
@@ -464,56 +799,62 @@ describe("TaskService", () => {
   // removal. Model-driven removal takes the archive path's admission hold, refuses while such
   // activity exists, and keeps the hold (no new sends, bash, terminals or opens) through the
   // check and the removal.
-  test("model-driven task removal refuses live writers and holds admission through the check and removal", async () => {
-    const parentWorkspaceId = "parent-remove-live";
-    const childTaskId = "child-remove-live";
-    const { config, remove, workspaceService, removeAsModel } = await createChildCheckoutHarness(
-      parentWorkspaceId,
-      childTaskId
-    );
-    const events: string[] = [];
-    let liveActivity: string | undefined = "open terminal sessions";
-    const hold = spyOn(workspaceService, "acquirePreInterruptionArchiveHold").mockImplementation(
-      (workspaceId: string) => {
-        expect(workspaceId).toBe(childTaskId);
-        if (liveActivity !== undefined) return Err(`Workspace has live activity (${liveActivity})`);
-        events.push("hold");
-        return Ok({ [Symbol.dispose]: () => events.push("release") });
-      }
-    );
-    let editorOpen = false;
-    spyOn(workspaceService, "hasUntrackableExternalAppOpen").mockImplementation(() =>
-      Promise.resolve(editorOpen)
-    );
-    // The fresh check (exit statuses refreshed, crash orphans included) refuses before the hold.
-    let backgroundRunning = true;
-    spyOn(workspaceService, "hasRunningBackgroundBashProcesses").mockImplementation(() =>
-      Promise.resolve(backgroundRunning)
-    );
-    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
-    expect(hold).not.toHaveBeenCalled();
-    backgroundRunning = false;
-    remove.mockImplementation(() => {
-      events.push("remove");
-      return Promise.resolve(Ok(undefined));
-    });
+  // The force policy skips only the unsaved-work refusal: someone still working in the checkout
+  // is not unsaved work, so both policies keep these guards.
+  test.each<LossyWorkPolicy>(["refuse", "force"])(
+    "model-driven task removal with the %s policy refuses live writers and holds admission through the check and removal",
+    async (policy) => {
+      const parentWorkspaceId = "parent-remove-live";
+      const childTaskId = "child-remove-live";
+      const { config, remove, workspaceService, removeAsModel } = await createChildCheckoutHarness(
+        parentWorkspaceId,
+        childTaskId
+      );
+      const events: string[] = [];
+      let liveActivity: string | undefined = "open terminal sessions";
+      const hold = spyOn(workspaceService, "acquirePreInterruptionArchiveHold").mockImplementation(
+        (workspaceId: string) => {
+          expect(workspaceId).toBe(childTaskId);
+          if (liveActivity !== undefined)
+            return Err(`Workspace has live activity (${liveActivity})`);
+          events.push("hold");
+          return Ok({ [Symbol.dispose]: () => events.push("release") });
+        }
+      );
+      let editorOpen = false;
+      spyOn(workspaceService, "hasUntrackableExternalAppOpen").mockImplementation(() =>
+        Promise.resolve(editorOpen)
+      );
+      // The fresh check (exit statuses refreshed, crash orphans included) refuses before the hold.
+      let backgroundRunning = true;
+      spyOn(workspaceService, "hasRunningBackgroundBashProcesses").mockImplementation(() =>
+        Promise.resolve(backgroundRunning)
+      );
+      expect(await removeAsModel(childTaskId, policy)).toMatchObject(Ok({ status: "error" }));
+      expect(hold).not.toHaveBeenCalled();
+      backgroundRunning = false;
+      remove.mockImplementation(() => {
+        events.push("remove");
+        return Promise.resolve(Ok(undefined));
+      });
 
-    const refusal = await removeAsModel(childTaskId);
-    assert(refusal.success && refusal.data.status === "error", "live writers must refuse");
-    expect(refusal.data.error).toContain("open terminal sessions");
-    // An external editor opened earlier is untrackable: it refuses too, and releases the hold.
-    liveActivity = undefined;
-    editorOpen = true;
-    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
-    expect(events).toEqual(["hold", "release"]);
-    expect(remove).not.toHaveBeenCalled();
-    expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
+      const refusal = await removeAsModel(childTaskId, policy);
+      assert(refusal.success && refusal.data.status === "error", "live writers must refuse");
+      expect(refusal.data.error).toContain("open terminal sessions");
+      // An external editor opened earlier is untrackable: it refuses too, and releases the hold.
+      liveActivity = undefined;
+      editorOpen = true;
+      expect(await removeAsModel(childTaskId, policy)).toMatchObject(Ok({ status: "error" }));
+      expect(events).toEqual(["hold", "release"]);
+      expect(remove).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
 
-    editorOpen = false;
-    events.length = 0;
-    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "removed" }));
-    expect(events).toEqual(["hold", "remove", "release"]);
-  });
+      editorOpen = false;
+      events.length = 0;
+      expect(await removeAsModel(childTaskId, policy)).toMatchObject(Ok({ status: "removed" }));
+      expect(events).toEqual(["hold", "remove", "release"]);
+    }
+  );
 
   test("task removal preserves an inactive child while its patch artifact is pending", async () => {
     const config = await createTestConfig(rootDir);
@@ -536,6 +877,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentWorkspaceId,
       workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
@@ -580,6 +922,7 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
 
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentWorkspaceId,
       workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
@@ -1395,8 +1738,9 @@ describe("TaskService", () => {
     const interruptedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
     expect(interruptedTaskIds).toEqual([childTaskId, parentTaskId]);
 
-    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId);
-    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId);
+    // The cascade hands queued user input back instead of discarding it.
+    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId, { preserveUserInput: true });
+    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId, { preserveUserInput: true });
     expect(stopStream).toHaveBeenNthCalledWith(
       1,
       childTaskId,
@@ -1595,6 +1939,7 @@ describe("TaskService", () => {
     );
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: rootWorkspaceId,
       workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       childTaskId: removedWorkflowChildTaskId,
@@ -2185,72 +2530,78 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, queuedChildId)?.taskPrompt).toBe("queued work");
   });
 
-  test("initialize recovers parent tasks after interrupting inactive workflow children", async () => {
-    const config = await createTestConfig(rootDir);
+  // An archived child keeps its active taskStatus (see isActiveAgentTaskEntry). Workflow
+  // cancellation still settles it, or it would resurface as an active task on unarchive.
+  test.each([{ archived: false }, { archived: true }])(
+    "initialize recovers parent tasks after interrupting inactive workflow children (%j)",
+    async ({ archived }) => {
+      const config = await createTestConfig(rootDir);
 
-    const projectPath = path.join(rootDir, "repo");
-    const rootId = "root-workflow-child-interrupted";
-    const parentTaskId = "parent-awaiting-after-child-interrupt";
-    const childTaskId = "child-running-inactive-workflow";
-    const workflowRunId = "wfr_child_inactive_owner";
+      const projectPath = path.join(rootDir, "repo");
+      const rootId = "root-workflow-child-interrupted";
+      const parentTaskId = "parent-awaiting-after-child-interrupt";
+      const childTaskId = "child-running-inactive-workflow";
+      const workflowRunId = "wfr_child_inactive_owner";
 
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", rootId),
-        projectWorkspace(projectPath, "parent", parentTaskId, {
-          name: "agent_explore_parent",
-          parentWorkspaceId: rootId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "awaiting_report",
-          taskModelString: defaultModel,
-        }),
-        projectWorkspace(projectPath, "child", childTaskId, {
-          name: "agent_explore_child",
-          parentWorkspaceId: parentTaskId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "running",
-          taskModelString: defaultModel,
-          workflowTask: { runId: workflowRunId, stepId: "child" },
-        }),
-      ],
-      testTaskSettings(10, 3)
-    );
-    const runStore = new WorkflowRunStore({
-      sessionDir: path.join(config.sessionsDir, parentTaskId),
-    });
-    await runStore.createRun({
-      id: workflowRunId,
-      workspaceId: parentTaskId,
-      workflow: {
-        name: "interrupted",
-        description: "Interrupted",
-        scope: "built-in",
-        executable: true,
-      },
-      source: "export default function workflow() { return {}; }\n",
-      args: {},
-      now: "2026-05-29T00:00:00.000Z",
-    });
-    await runStore.appendStatus(workflowRunId, "interrupted", "2026-05-29T00:00:01.000Z");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "root", rootId),
+          projectWorkspace(projectPath, "parent", parentTaskId, {
+            name: "agent_explore_parent",
+            parentWorkspaceId: rootId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "awaiting_report",
+            taskModelString: defaultModel,
+          }),
+          projectWorkspace(projectPath, "child", childTaskId, {
+            name: "agent_explore_child",
+            parentWorkspaceId: parentTaskId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "running",
+            taskModelString: defaultModel,
+            workflowTask: { runId: workflowRunId, stepId: "child" },
+            ...(archived ? { archivedAt: "2026-05-29T00:00:02.000Z" } : {}),
+          }),
+        ],
+        testTaskSettings(10, 3)
+      );
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(config.sessionsDir, parentTaskId),
+      });
+      await runStore.createRun({
+        id: workflowRunId,
+        workspaceId: parentTaskId,
+        workflow: {
+          name: "interrupted",
+          description: "Interrupted",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return {}; }\n",
+        args: {},
+        now: "2026-05-29T00:00:00.000Z",
+      });
+      await runStore.appendStatus(workflowRunId, "interrupted", "2026-05-29T00:00:01.000Z");
 
-    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+      const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await taskService.initialize();
+      await taskService.initialize();
 
-    expect(findWorkspaceInConfig(config, childTaskId)?.taskStatus).toBe("interrupted");
-    expect(sendMessage).toHaveBeenCalledWith(
-      parentTaskId,
-      expect.stringContaining("awaiting its final assistant response"),
-      expect.any(Object),
-      expect.objectContaining({ synthetic: true })
-    );
-  });
+      expect(findWorkspaceInConfig(config, childTaskId)?.taskStatus).toBe("interrupted");
+      expect(sendMessage).toHaveBeenCalledWith(
+        parentTaskId,
+        expect.stringContaining("awaiting its final assistant response"),
+        expect.any(Object),
+        expect.objectContaining({ synthetic: true })
+      );
+    }
+  );
 
   // Archive mock that mirrors the real WorkspaceService.archive persistence effect
   // (sets archivedAt in config) so tests can assert the sidebar-relevant state rather
@@ -2411,6 +2762,68 @@ describe("TaskService", () => {
     const userInterrupted = findWorkspaceInConfig(config, userInterruptedId);
     expect(userInterrupted?.archivedAt).toBeUndefined();
     expect(userInterrupted?.taskStatus).toBe("interrupted");
+  });
+
+  // #5398 item 3: the run-end hook also fires when the runner throws with the journal still
+  // `running` (WorkflowRunner.run), and a pipeline's fail-fast interruptRun sweeps mid-run. The
+  // sweep must leave a still-active run's children alone and prune them once the run has ended.
+  test("markWorkflowRunEnded leaves the children of a still-running run until it ends", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-run-still-active";
+    const interruptedChildId = "interrupted-child-of-running-run";
+    const workflowRunId = "wfr_still_running_sweep";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        projectWorkspace(projectPath, "interrupted-child", interruptedChildId, {
+          name: "agent_explore_interrupted_active_run",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "child" },
+        }),
+      ],
+      testTaskSettings(10, 3)
+    );
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, rootId) });
+    await runStore.createRun({
+      id: workflowRunId,
+      workspaceId: rootId,
+      workflow: { name: "running", description: "Running", scope: "built-in", executable: true },
+      source: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.appendStatus(workflowRunId, "running", "2026-05-29T00:00:01.000Z");
+
+    const archive = createConfigMutatingArchiveMock(() => config);
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+    const { workspaceService } = createWorkspaceServiceMocks({ archive });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.markWorkflowRunEnded(workflowRunId);
+    expect(findWorkspaceInConfig(config, interruptedChildId)?.archivedAt).toBeUndefined();
+
+    await runStore.appendStatus(workflowRunId, "failed", "2026-05-29T00:00:02.000Z");
+    // An I/O error on the run record (EISDIR here) proves nothing: still left alone.
+    const runFile = path.join(config.sessionsDir, rootId, "workflows", workflowRunId, "run.json");
+    const runRecord = await fsPromises.readFile(runFile, "utf-8");
+    await fsPromises.rm(runFile);
+    await fsPromises.mkdir(runFile);
+    await taskService.markWorkflowRunEnded(workflowRunId);
+    expect(findWorkspaceInConfig(config, interruptedChildId)?.archivedAt).toBeUndefined();
+
+    await fsPromises.rmdir(runFile);
+    await fsPromises.writeFile(runFile, runRecord, "utf-8");
+    await taskService.markWorkflowRunEnded(workflowRunId);
+    expect(findWorkspaceInConfig(config, interruptedChildId)?.archivedAt).toBeString();
   });
 
   test("terminateAllDescendantAgentTasks archives run-scoped interrupted children immediately", async () => {

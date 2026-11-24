@@ -98,7 +98,7 @@ test("remote connection isolates the page and returns to the same local renderer
   });
   expect(localProjects.length).toBeGreaterThan(0);
   await ui.settings.open();
-  await page.getByRole("button", { name: "Remote Connection", exact: true }).click();
+  await page.getByRole("button", { name: "Remote connection", exact: true }).click();
   const localWindow = await app.browserWindow(page);
   const localRenderer = await page.evaluateHandle(() => document.documentElement);
   const url = remoteServer.url + "/?token=e2e-private-token";
@@ -234,7 +234,7 @@ test("Coder path-mounted servers retain their URL and isolate sibling sessions",
   remoteServer,
 }) => {
   await ui.settings.open();
-  await page.getByRole("button", { name: "Remote Connection", exact: true }).click();
+  await page.getByRole("button", { name: "Remote connection", exact: true }).click();
   const firstServerUrl = remoteServer.url + "/@alice/first/apps/xum";
   const secondServerUrl = remoteServer.url + "/@alice/second/apps/xum";
   const connections = [
@@ -287,6 +287,13 @@ test("remote app popups and blob attachments retain isolation and close on disco
   remoteServer,
 }) => {
   await page.waitForFunction(() => Boolean(window.api?.remoteConnection));
+  // The local window shows itself late, on ready-to-show. Under Xvfb with no window manager,
+  // that show() takes focus from a remote popup, and the popup's clipboard write needs focus
+  // (#5993). Wait for it once here: it shows only once, so both popups below keep their focus.
+  const localWindow = await app.browserWindow(page);
+  await expect
+    .poll(() => localWindow.evaluate((window: BrowserWindow) => window.isVisible()))
+    .toBe(true);
   const base = remoteServer.url + "/@user/workspace/apps/xum/";
   const opened = app.waitForEvent("window");
   await page.evaluate((url) => window.api!.remoteConnection!.connect(url), base);

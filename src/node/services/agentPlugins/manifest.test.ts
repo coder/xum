@@ -218,6 +218,40 @@ describe("validatePluginManifest", () => {
     }
   });
 
+  test("contributes.skills takes a list of roots: bad entries warn, duplicates and extras drop", () => {
+    const read = (skills: unknown) => {
+      const result = validatePluginManifest(minimalManifest({ contributes: { skills } }));
+      if (!result.ok) throw new Error("expected ok");
+      return result;
+    };
+    const kept = read(["a", "b"]);
+    expect(kept.manifest.contributes?.skills).toEqual(["a", "b"]);
+    expect(kept.warnings).toEqual([]);
+
+    // One warning counts every ignored entry, however many there are.
+    const mixed = read(["a", "../escape", 7, "a", "b"]);
+    expect(mixed.manifest.contributes?.skills).toEqual(["a", "b"]);
+    expect(mixed.warnings).toHaveLength(1);
+    expect(mixed.warnings[0]).toContain("invalid entries (2)");
+
+    // Repeated and invalid entries do not use up the root cap (Codex PRRT_kwDOPxxmWM6sPFP6).
+    expect(read([...Array<string>(16).fill("core"), "extra"]).manifest.contributes?.skills).toEqual(
+      ["core", "extra"]
+    );
+    expect(read([...Array<string>(16).fill("/abs"), "late"]).manifest.contributes?.skills).toEqual([
+      "late",
+    ]);
+
+    // No valid entry: the default skills/ location applies, as for a bad single path.
+    for (const skills of [[], ["/abs"]]) {
+      expect(read(skills).manifest.contributes?.skills).toBeUndefined();
+    }
+
+    const many = read(Array.from({ length: 40 }, (_, index) => `root-${index}`));
+    expect(many.manifest.contributes?.skills).toHaveLength(16);
+    expect(many.warnings).toHaveLength(1);
+  });
+
   test("invalid slash command entries are skipped without breaking valid siblings", () => {
     const result = validatePluginManifest(
       minimalManifest({

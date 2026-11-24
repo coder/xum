@@ -1,5 +1,6 @@
 import type { ComponentType } from "react";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createGitStatusExecutor } from "@/browser/stories/helpers/git";
 import {
@@ -114,6 +115,15 @@ export const DevcontainerRunning: AppStory = {
  */
 export const DevcontainerStopped: AppStory = {
   render: () => <AppWithMocks setup={() => createDevcontainerClient("stopped")} />,
+  // The chip label reaches WCAG AA in every theme; it was 1.8-2.9:1 on its muted tint (#6544).
+  play: async ({ canvasElement }) => {
+    const chip = await within(canvasElement).findByText(
+      "Devcontainer Stopped",
+      {},
+      { timeout: 15_000 }
+    );
+    await expect(textsBelowAaInThemes(() => [chip]).join("\n")).toBe("");
+  },
 };
 
 /** Devcontainer with unknown runtime status — no status chip should be visible. */
@@ -172,7 +182,7 @@ export const ArchivingPhone: AppStory = {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
     await userEvent.click(
-      await waitFor(() => within(document.body).getByRole("button", { name: /Archive chat/ }))
+      await waitFor(() => within(document.body).getByRole("button", { name: /Archive workspace/ }))
     );
 
     await waitFor(() => {

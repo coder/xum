@@ -12,7 +12,7 @@ import { stableStringify } from "@/common/utils/stableStringify";
 
 /**
  * Shared shapes for the workflow `evaluate()` primitive: the question/answer
- * contract of AI SDK `experimental_evaluate` (choice | score | boolean) plus the
+ * contract of AI SDK `experimental_decide` (choice | score | boolean) plus the
  * pure, question-aware answer validator that guards both fresh provider output
  * and replayed step results.
  *
@@ -47,7 +47,7 @@ export const EvaluationJsonValueSchema: z.ZodType<EvaluationJsonValue> = z.lazy(
 /**
  * Shared state and structured instructions: string | JSON object | JSON array.
  * Bare numbers, booleans and null are rejected (mirrors the SDK's
- * `EvaluationModelV4Input`), so a sandbox passing `evaluate(42, …)` fails as
+ * `DecisionModelV4Input`), so a sandbox passing `evaluate(42, …)` fails as
  * invalid input instead of becoming a billable request.
  */
 export const EvaluationInputSchema = z.union([
@@ -55,7 +55,6 @@ export const EvaluationInputSchema = z.union([
   z.array(EvaluationJsonValueSchema),
   z.record(z.string(), EvaluationJsonValueSchema),
 ]);
-export type EvaluationInput = z.infer<typeof EvaluationInputSchema>;
 
 export const EvaluationStateSchema = EvaluationInputSchema;
 export type EvaluationState = z.infer<typeof EvaluationStateSchema>;
@@ -116,7 +115,6 @@ export const EvaluationProviderOptionsSchema = z.record(
   z.string(),
   z.record(z.string(), EvaluationJsonValueSchema)
 );
-export type EvaluationProviderOptions = z.infer<typeof EvaluationProviderOptionsSchema>;
 
 /**
  * The sandbox-facing `evaluate(state, spec)` options (consumed by the workflow
@@ -237,7 +235,12 @@ export const EvaluationAdmissionSchema = z.object({
     configFingerprint: z.string(),
   }),
   timeoutMs: z.number().int().positive(),
-  attemptDeadlineAt: z.string().datetime({ offset: true }),
+  // Persisted in workflow step records, so it accepts the same minute-precision form as the
+  // other workflow timestamps (IsoDateTimeSchema in orpc/schemas/workflow.ts).
+  attemptDeadlineAt: z.union([
+    z.iso.datetime({ offset: true }),
+    z.iso.datetime({ offset: true, precision: -1 }),
+  ]),
   providerOptions: EvaluationProviderOptionsSchema.optional(),
   stateSha256: z.string(),
   stateBytes: z.number().int().nonnegative(),
@@ -614,6 +617,7 @@ export function jsonDepth(value: unknown, limit: number): number {
   const stack: Array<[object, number]> = [[value, 1]];
   let deepest = 1;
   while (stack.length > 0) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const [container, depth] = stack.pop()!;
     if (depth > deepest) {
       deepest = depth;

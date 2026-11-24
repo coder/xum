@@ -14,6 +14,7 @@ import {
 } from "@/node/services/workspaceTurnManager.testHarness";
 import type { ErrorEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
+import { createContextBudgetWarning } from "@/node/services/contextWindowRollover";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -776,10 +777,39 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
-  test("a trailing hidden plan-review record does not block reviving a retrying workspace turn", async () => {
-    // Plan-review resolve/reopen rows are persisted as `role: user` rows but are UI state, not
-    // prompts (isModelHiddenMessage). Reconciliation must treat them like the absence of a row:
-    // the correlated prompt is still the newest PROMPT, so the retrying child revives the handle.
+  const resolveRecord = {
+    v: 1 as const,
+    kind: "resolve" as const,
+    recordId: "rec_1",
+    threadId: "thr_1",
+  };
+  test.each([
+    {
+      row: "hidden plan-review record",
+      // Plan-review resolve/reopen rows are persisted as `role: user` rows but are UI state, not
+      // prompts (isModelHiddenMessage).
+      build: () =>
+        createMuxMessage("msg_plan_review", "user", formatPlanReviewEnvelope(resolveRecord), {
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(resolveRecord),
+        }),
+    },
+    {
+      row: "Token Budget warning",
+      // A Token Budget warning is a UI-visible synthetic user row appended after the prompt it
+      // warns about: a notice, not a newer prompt that supersedes the correlated one.
+      build: () =>
+        createContextBudgetWarning({
+          contextTokens: 90_000,
+          maxTokens: 128_000,
+          budgetTokens: 119_808,
+          handoff: true,
+          sessionHistoryAvailable: true,
+        }),
+    },
+  ])("a trailing $row does not block reviving a retrying workspace turn", async ({ build }) => {
+    // Reconciliation must treat these rows like the absence of a row: the correlated prompt is
+    // still the newest PROMPT, so the retrying child revives the handle.
     const hasPendingAutoRetry = mock((workspaceId: string) => workspaceId === "childworkspace");
     const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest(
       rootDir,
@@ -801,23 +831,7 @@ describe("WorkspaceTurnManager", () => {
         )
       ).success
     ).toBe(true);
-    const resolve = {
-      v: 1 as const,
-      kind: "resolve" as const,
-      recordId: "rec_1",
-      threadId: "thr_1",
-    };
-    expect(
-      (
-        await historyService.appendToHistory(
-          "childworkspace",
-          createMuxMessage("msg_plan_review", "user", formatPlanReviewEnvelope(resolve), {
-            synthetic: true,
-            muxMetadata: buildPlanReviewMetadata(resolve),
-          })
-        )
-      ).success
-    ).toBe(true);
+    expect((await historyService.appendToHistory("childworkspace", build())).success).toBe(true);
     await new TaskHandleStore(config).upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "interrupted", {
         createdWorkspace: true,

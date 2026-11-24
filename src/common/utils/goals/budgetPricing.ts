@@ -49,12 +49,12 @@ function modelStatsHasBillableCosts(
   return (
     stats.input_cost_per_token > 0 ||
     stats.output_cost_per_token > 0 ||
-    (stats.input_cost_per_token_above_200k_tokens ?? 0) > 0 ||
-    (stats.output_cost_per_token_above_200k_tokens ?? 0) > 0 ||
+    (stats.input_cost_per_token_above_threshold ?? 0) > 0 ||
+    (stats.output_cost_per_token_above_threshold ?? 0) > 0 ||
     (stats.cache_creation_input_token_cost ?? 0) > 0 ||
-    (stats.cache_creation_input_token_cost_above_200k_tokens ?? 0) > 0 ||
+    (stats.cache_creation_input_token_cost_above_threshold ?? 0) > 0 ||
     (stats.cache_read_input_token_cost ?? 0) > 0 ||
-    (stats.cache_read_input_token_cost_above_200k_tokens ?? 0) > 0
+    (stats.cache_read_input_token_cost_above_threshold ?? 0) > 0
   );
 }
 

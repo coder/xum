@@ -1,14 +1,21 @@
 import assert from "@/common/utils/assert";
+import {
+  requestToolCards,
+  requestToolCardsForRows,
+} from "@/browser/features/Tools/Shared/toolCardsStore";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 import type {
+  ChatMuxMessage,
   HeldInput,
   HistoryEditPrecondition,
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
+  OnChatEvent,
   WorkspaceStatsSnapshot,
   OnChatMode,
   ProvidersConfigMap,
@@ -20,7 +27,10 @@ import type { TodoItem } from "@/common/types/tools";
 import type { AssistedReviewHunk } from "@/common/types/review";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { TimelineEvent, TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
-import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
+import {
+  applyWorkspaceChatEventToAggregator,
+  isSessionTapeReplayRenderer,
+} from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import {
   StreamingMessageAggregator,
   type LoadedSkill,
@@ -36,16 +46,14 @@ import {
   type ResponseCompleteHandler,
 } from "@/browser/utils/messages/responseCompletionMetadata";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import { isSessionTapeReplayRefusal } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import {
   SUBSCRIPTION_RETRY_BASE_MS,
   calculateSubscriptionBackoffMs,
   runSubscriptionLoop,
   sleepWithAbort,
 } from "@/browser/stores/subscriptionTransport";
-import {
-  ADVISOR_LIVE_OUTPUT_MAX_CHARS,
-  BASH_TRUNCATE_MAX_TOTAL_BYTES,
-} from "@/common/constants/toolLimits";
+import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { LiveBashOutputSourceContext } from "@/browser/stores/liveBashOutputSource";
@@ -58,20 +66,19 @@ import {
   isInitEnd,
   isInitOutput,
   isInitStart,
-  isAdvisorOutputEvent,
-  isAdvisorReasoningOutputEvent,
-  isAdvisorPhaseEvent,
   isBashOutputEvent,
+  isBashSandboxApprovalEvent,
   isTaskCreatedEvent,
   isWorkflowRunAttachedEvent,
   isMuxMessage,
   isHeldInputsChanged,
   isQueuedMessageChanged,
+  isGoalBudgetLimitedEvent,
+  isPluginHookNoticeEvent,
   isRestoreToInput,
   isRuntimeStatus,
 } from "@/common/orpc/types";
 import {
-  type AdvisorPhaseEvent,
   type StreamAbortEvent,
   type StreamAbortReasonSnapshot,
   type StreamDeltaEvent,
@@ -80,21 +87,24 @@ import {
   type ReasoningDeltaEvent,
   type StreamStartEvent,
   type RuntimeStatusEvent,
+  type BashSandboxApprovalEvent,
 } from "@/common/types/stream";
 import { MapStore } from "./MapStore";
 import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
-import { deriveTodoStatus } from "@/common/utils/todoList";
+import { getCacheHealth, type TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
+import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
+import { deriveTodoStatus, isTodoListFinished } from "@/common/utils/todoList";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import { isDurableCompactionBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import { WorkspaceConsumerManager } from "./WorkspaceConsumerManager";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
+import { addModelUsage, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import type { z } from "zod";
-import type { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
+import { isInheritedForkRow, type SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import {
   applyLiveBashOutputEvent,
@@ -102,11 +112,16 @@ import {
   type LiveBashOutputView,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoRetryKey, getPinnedTodoExpandedKey } from "@/common/constants/storage";
+import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { getAutoRetryKey } from "@/common/constants/storage";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
+import {
+  isAutoRetryStatusEvent,
+  type AutoRetryStatus,
+} from "@/browser/utils/messages/autoRetryStatus";
 import {
   markChatSwitchMilestone,
   markChatSwitchStart,
@@ -114,6 +129,7 @@ import {
 
 /** Stable empty reference returned when a workspace has no assisted hunks; keeps useSyncExternalStore snapshot identity stable. */
 const EMPTY_ASSISTED_REVIEW: AssistedReviewHunk[] = [];
+const EMPTY_TODOS: TodoItem[] = [];
 
 export function mergeTimelineEvents(
   preferred: TimelineEvent[],
@@ -182,22 +198,6 @@ const EMPTY_TIMELINE_SNAPSHOT: WorkspaceTimelineSnapshot = {
   loadError: null,
   loadErrorKind: null,
 };
-
-export type AutoRetryStatus = Extract<
-  WorkspaceChatMessage,
-  | { type: "auto-retry-scheduled" }
-  | { type: "auto-retry-starting" }
-  | { type: "auto-retry-abandoned" }
->;
-
-function isAutoRetryStatusEvent(msg: WorkspaceChatMessage): msg is AutoRetryStatus {
-  const type = (msg as { type?: string }).type;
-  return (
-    type === "auto-retry-scheduled" ||
-    type === "auto-retry-starting" ||
-    type === "auto-retry-abandoned"
-  );
-}
 
 export type HistoryLoadResult = "loaded" | "exhausted" | "busy" | "unavailable" | "failed";
 
@@ -396,6 +396,7 @@ export interface WorkspaceUsageState {
   };
   /** Last message's context usage (last step only, for context window display) */
   lastContextUsage?: ChatUsageDisplay;
+  /** Tokens of sessionTotal only (no open sub-agents or live stream); displays use sumSessionTokens. */
   totalTokens: number;
   /** Live context usage during streaming (last step's inputTokens = current context window) */
   liveUsage?: ChatUsageDisplay;
@@ -407,7 +408,109 @@ export interface WorkspaceUsageState {
    * it over re-resolving the raw model against a refreshed providers config.
    */
   liveMetadataModel?: string;
+  /** Prompt-cache health of the most recent completed assistant turns, newest first. */
+  recentTurnCacheHealth?: TurnCacheHealth[];
+  /**
+   * Usage of sub-agents that still exist. Their spend reaches sessionTotal only when they are
+   * removed, so cost displays add this to show what the whole tree has spent so far.
+   */
+  subagentTotal?: ChatUsageDisplay;
+  subagentByModel?: Record<string, ChatUsageDisplay>;
+  /** Open sub-agent workspaces counted in subagentTotal. */
+  subagentCount?: number;
 }
+
+/** trailing: another refresh was asked for while this fetch ran. */
+interface SubagentUsageFetch {
+  trailing: boolean;
+}
+
+type SubagentUsageByChild = Awaited<
+  ReturnType<RouterClient<AppRouter>["workspace"]["getSubagentUsage"]>
+>;
+
+type ActivitySubscriptionEvent =
+  Awaited<
+    ReturnType<RouterClient<AppRouter>["workspace"]["activity"]["subscribe"]>
+  > extends AsyncIterable<infer TEvent>
+    ? TEvent
+    : never;
+
+function sumSubtreesNotRolledUp(
+  children: SubagentUsageByChild["children"],
+  rolledUpFrom: Readonly<Record<string, unknown>>
+): { byModel: Record<string, ChatUsageDisplay>; count: number } {
+  const byModel: Record<string, ChatUsageDisplay> = {};
+  let count = 0;
+  for (const [childId, subtree] of Object.entries(children)) {
+    if (rolledUpFrom[childId]) continue;
+    count += subtree.workspaceCount;
+    for (const [model, usage] of Object.entries(subtree.byModel)) {
+      addModelUsage(byModel, model, usage);
+    }
+  }
+  return { byModel, count };
+}
+
+/**
+ * A child already in the ledger's rolledUpFrom is dropped here, on every read, not when the
+ * projection arrives: the projection and the ledger are separate fetches, and a removal can
+ * roll the child up between them (or a delta can add it later), which would count it twice.
+ */
+function getSubagentUsageFields(
+  data: SubagentUsageByChild | undefined,
+  ledger: { rolledUpFrom?: Readonly<Record<string, unknown>> } | undefined
+): Pick<WorkspaceUsageState, "subagentTotal" | "subagentByModel" | "subagentCount"> {
+  const { byModel, count } = sumSubtreesNotRolledUp(
+    data?.children ?? {},
+    ledger?.rolledUpFrom ?? {}
+  );
+  const models = Object.values(byModel);
+  if (models.length === 0) {
+    return {};
+  }
+  return { subagentByModel: byModel, subagentTotal: sumUsageHistory(models), subagentCount: count };
+}
+
+/**
+ * Prompt-cache health of the newest completed assistant turns, newest first.
+ *
+ * A turn sums every usage the session ledger charges for its message (its own usage plus
+ * model-backed tool and refused-attempt usage), so a turn's rewrite cost matches its share
+ * of the session cost.
+ */
+function getRecentTurnCacheHealth(
+  messages: readonly MuxMessage[],
+  forkedAt: number | undefined
+): TurnCacheHealth[] {
+  const turns: TurnCacheHealth[] = [];
+  for (let i = messages.length - 1; i >= 0 && turns.length < RECENT_TURN_CACHE_HEALTH_LIMIT; i--) {
+    const turn = getTurnCacheHealth(messages[i], forkedAt);
+    if (turn) turns.push(turn);
+  }
+  return turns;
+}
+
+/** One message's turn row, or undefined when the message is not a priced own turn. */
+function getTurnCacheHealth(
+  msg: MuxMessage,
+  forkedAt: number | undefined
+): TurnCacheHealth | undefined {
+  const metadata = msg.metadata;
+  // Compaction summaries keep `usage` but CompactionHandler strips their
+  // providerMetadata (cache-write counts included), so their cache health is unknown.
+  if (msg.role !== "assistant" || metadata === undefined || metadata.compacted) return undefined;
+  // Rows a fork copied from its parent are not the fork's own turns.
+  if (isInheritedForkRow(metadata.timestamp, forkedAt)) return undefined;
+  // Priced exactly as SessionUsageService's history rebuild: neither the current
+  // model nor the live provider mapping, only the record-time model identity.
+  const turnUsages = getAssistantMessageModelUsages(metadata);
+  if (turnUsages.length === 0) return undefined;
+  return { messageId: msg.id, timestamp: metadata.timestamp, ...getCacheHealth(turnUsages) };
+}
+
+/** Turns shown in the Costs tab's prompt-cache table; bounds work per usage bump. */
+const RECENT_TURN_CACHE_HEALTH_LIMIT = 10;
 
 /**
  * Consumer breakdown requiring tokenization (lazy calculation).
@@ -421,23 +524,16 @@ export interface WorkspaceConsumersState {
   topFilePaths?: Array<{ path: string; tokens: number }>; // Top 10 files aggregated across all file tools
 }
 
-export interface AdvisorLivePhaseState {
-  phase: AdvisorPhaseEvent["phase"];
-  timestamp: number;
-}
-
-export interface AdvisorLiveTextState {
-  text: string;
-  timestamp: number;
-}
-
-export type AdvisorLiveOutputState = AdvisorLiveTextState;
-export type AdvisorLiveReasoningState = AdvisorLiveTextState;
-
 export interface WorkflowToolLiveRunState {
   runId: string;
   run?: WorkflowRunRecord;
 }
+
+/** A bash call that waits for the user to let it run once outside the sandbox. */
+export type BashSandboxApprovalView = Pick<
+  BashSandboxApprovalEvent,
+  "workspaceId" | "toolCallId" | "script" | "reason" | "timestamp"
+>;
 
 interface WorkspaceChatTransientState {
   /** The current attempt delivered its caught-up: live events now flow to the aggregator. */
@@ -465,9 +561,8 @@ interface WorkspaceChatTransientState {
   queuedMessage: QueuedMessage | null;
   heldInputs: readonly HeldInput[];
   liveBashOutput: Map<string, LiveBashOutputInternal>;
-  liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
-  liveAdvisorReasoning: Map<string, AdvisorLiveReasoningState>;
-  liveAdvisorPhase: Map<string, AdvisorLivePhaseState>;
+  /** Bash calls that wait for the user to let them run outside the sandbox, by toolCallId. */
+  sandboxApprovals: Map<string, BashSandboxApprovalView>;
   liveTaskIds: Map<string, string[]>;
   liveWorkflowRuns: Map<string, WorkflowToolLiveRunState>;
   autoRetryStatus: AutoRetryStatus | null;
@@ -558,6 +653,91 @@ function getBufferedActiveStreamStart(
 }
 
 /**
+ * The stream identity a workspace shows. The live aggregator is trusted once it is active and
+ * caught up; before that, a buffered replayed stream-start, then the activity snapshot.
+ */
+function resolveWorkspaceStreamIdentity(input: {
+  aggregator: StreamingMessageAggregator;
+  useAggregatorState: boolean;
+  hasInterruptibleActiveStream: boolean;
+  bufferedActiveStreamStart: Pick<StreamStartEvent, "model" | "thinkingLevel"> | null;
+  activity: WorkspaceActivitySnapshot | undefined;
+}): Pick<WorkspaceState, "canInterrupt" | "currentModel" | "currentThinkingLevel"> {
+  const {
+    aggregator,
+    useAggregatorState,
+    hasInterruptibleActiveStream,
+    bufferedActiveStreamStart,
+    activity,
+  } = input;
+  const canInterrupt = useAggregatorState
+    ? hasInterruptibleActiveStream
+    : bufferedActiveStreamStart !== null
+      ? true
+      : (activity?.streaming ?? hasInterruptibleActiveStream);
+  const currentModel = useAggregatorState
+    ? (aggregator.getCurrentModel() ?? null)
+    : (bufferedActiveStreamStart?.model ??
+      activity?.lastModel ??
+      aggregator.getCurrentModel() ??
+      null);
+  const currentThinkingLevel = useAggregatorState
+    ? (aggregator.getCurrentThinkingLevel() ?? null)
+    : (bufferedActiveStreamStart?.thinkingLevel ??
+      activity?.lastThinkingLevel ??
+      aggregator.getCurrentThinkingLevel() ??
+      null);
+  return { canInterrupt, currentModel, currentThinkingLevel };
+}
+
+/** The newer of the aggregator's and the activity snapshot's recency, when either has one. */
+function mergeRecencyTimestamp(
+  aggregatorRecency: number | null,
+  activityRecency: number | undefined
+): number | null {
+  return aggregatorRecency === null
+    ? (activityRecency ?? null)
+    : Math.max(aggregatorRecency, activityRecency ?? aggregatorRecency);
+}
+
+/** Transcript hydration flags of an onChat replay (skeleton, stale cached rows, since catch-up). */
+function resolveTranscriptHydrationState(input: {
+  aggregator: StreamingMessageAggregator;
+  transient: WorkspaceChatTransientState;
+  isActiveWorkspace: boolean;
+  hasRunningInitMessage: boolean;
+  displayedMessages: DisplayedMessage[];
+}): Pick<WorkspaceState, "isHydratingTranscript" | "isTranscriptStale" | "isIncrementalCatchUp"> {
+  const { aggregator, transient, isActiveWorkspace, hasRunningInitMessage, displayedMessages } =
+    input;
+  // Only actively running init output should bypass transcript hydration. Completed init
+  // rows are still replayed, but they should not suppress the normal catch-up placeholder
+  // for stale cached transcript content on reconnect.
+  const isHydratingTranscript =
+    isActiveWorkspace &&
+    transient.isHydratingTranscript &&
+    !transient.caughtUp &&
+    !hasRunningInitMessage;
+  // Only painted rows can be stale; an empty transcript hydrates through the skeleton
+  // regardless. A full replay rebuilds the transcript from scratch, so the one row it
+  // can apply before caught-up (the replayed init card bypasses buffering) is partial
+  // too, whereas a since replay's cached init-only transcript is trustworthy.
+  const displayedOnlyReplayedInitCards =
+    transient.fullReplayInFlight &&
+    displayedMessages.every((message) => message.type === "workspace-init");
+  const isTranscriptStale =
+    isHydratingTranscript &&
+    displayedMessages.length > 0 &&
+    !transient.staleSkeletonExpired &&
+    (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
+  const isIncrementalCatchUp =
+    isHydratingTranscript &&
+    !transient.fullReplayInFlight &&
+    getOnChatReplayMode(aggregator)?.type === "since";
+  return { isHydratingTranscript, isTranscriptStale, isIncrementalCatchUp };
+}
+
+/**
  * Message whose content the buffered stream replay rebuilds: the server replays stream-start
  * (replay: true) and then the parts after the stream cursor, or every part when it applied no
  * cursor. A replayed history row for the same message must not seed that rebuild.
@@ -572,27 +752,6 @@ function getBufferedReplayedStreamMessageId(events: WorkspaceChatMessage[]): str
   return messageId;
 }
 
-function appendAdvisorLiveText(
-  liveTextByToolCallId: Map<string, AdvisorLiveTextState>,
-  toolCallId: string,
-  chunk: string,
-  timestamp: number
-): boolean {
-  const prev = liveTextByToolCallId.get(toolCallId);
-  const appendedText = `${prev?.text ?? ""}${chunk}`;
-  const text =
-    appendedText.length > ADVISOR_LIVE_OUTPUT_MAX_CHARS
-      ? appendedText.slice(-ADVISOR_LIVE_OUTPUT_MAX_CHARS)
-      : appendedText;
-
-  if (prev?.text === text && prev.timestamp === timestamp) {
-    return false;
-  }
-
-  liveTextByToolCallId.set(toolCallId, { text, timestamp });
-  return true;
-}
-
 // Same resilience rationale as the chat view's decoration deadline: a subscribe attempt
 // that never resolves (hung backend) must not hide a readable cached conversation behind
 // the skeleton forever. A since replay normally lands well within a second, so this only
@@ -600,8 +759,14 @@ function appendAdvisorLiveText(
 // cached-rows-plus-dock-shimmer catch-up UI.
 const STALE_TRANSCRIPT_SKELETON_TIMEOUT_MS = 10_000;
 
+// One getSubagentUsage fetch runs per workspace at a time, so one that never settles (a stalled
+// backend read) would hold back every later refresh: past this deadline it fails and the
+// trailing fetch runs. A projection read normally takes milliseconds.
+const SUBAGENT_USAGE_FETCH_TIMEOUT_MS = 30_000;
+
 export interface WorkspaceStoreOptions {
   staleTranscriptSkeletonTimeoutMs?: number;
+  subagentUsageFetchTimeoutMs?: number;
 }
 
 function createInitialChatTransientState(): WorkspaceChatTransientState {
@@ -620,82 +785,47 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     queuedMessage: null,
     heldInputs: NO_HELD_INPUTS,
     liveBashOutput: new Map(),
-    liveAdvisorOutput: new Map(),
-    liveAdvisorReasoning: new Map(),
-    liveAdvisorPhase: new Map(),
+    sandboxApprovals: new Map(),
     liveTaskIds: new Map(),
     liveWorkflowRuns: new Map(),
     autoRetryStatus: null,
   };
 }
 
-interface ValidationIssue {
-  path?: Array<string | number>;
-  message?: string;
+/** Drops the live state of tool calls the transcript no longer shows. */
+function deleteInactiveToolCalls(liveState: Map<string, unknown>, activeToolCallIds: Set<string>) {
+  for (const toolCallId of Array.from(liveState.keys())) {
+    if (!activeToolCallIds.has(toolCallId)) liveState.delete(toolCallId);
+  }
 }
 
-type IteratorValidationFailedError = Error & {
-  code: "EVENT_ITERATOR_VALIDATION_FAILED";
-  cause?: {
-    issues?: ValidationIssue[];
-    data?: unknown;
-  };
-};
+/** Clears the live tool-call UI that a caught-up makes stale. */
+function clearStaleLiveToolState(
+  transient: WorkspaceChatTransientState,
+  replay: { replacesHistory: boolean; streamGone: boolean }
+): void {
+  // Live tool-call UI is tied to the active stream context; clear it when replay
+  // replaces history, reports no active stream, or reports a different stream ID.
+  if (replay.replacesHistory || replay.streamGone) {
+    transient.liveBashOutput.clear();
+    transient.liveWorkflowRuns.clear();
+    transient.liveTaskIds.clear();
+  }
+  // Every replay re-sends the approvals still pending, buffered until after this reset, so a
+  // card answered while disconnected cannot linger.
+  transient.sandboxApprovals.clear();
+}
 
-function isIteratorValidationFailed(error: unknown): error is IteratorValidationFailedError {
+/**
+ * The error oRPC (and the server's own onChat validation, #4868) raises when a yielded chat
+ * event fails the output schema. The client receives only its code and message: oRPC does not
+ * serialize the error's `cause`, so the schema issues stay on the server (#5082).
+ */
+function isIteratorValidationFailed(error: unknown): error is Error {
   return (
     error instanceof Error &&
-    (error as { code?: unknown }).code === "EVENT_ITERATOR_VALIDATION_FAILED"
+    (error as { code?: unknown }).code === "ASYNC_ITERATOR_OBJECT_VALIDATION_FAILED"
   );
-}
-
-/**
- * Extract a human-readable summary from an iterator validation error.
- * ORPC wraps Zod issues in error.cause with { issues: [...], data: ... }
- */
-function formatValidationError(error: IteratorValidationFailedError): string {
-  const cause = error.cause;
-  if (!cause) {
-    return "Unknown validation error (no cause)";
-  }
-
-  const issues = cause.issues ?? [];
-  if (issues.length === 0) {
-    return `Unknown validation error (no issues). Data: ${JSON.stringify(cause.data)}`;
-  }
-
-  // Format issues like: "type: Invalid discriminator value" or "metadata.usage.inputTokens: Expected number"
-  const issuesSummary = issues
-    .slice(0, 3) // Limit to first 3 issues
-    .map((issue) => {
-      const path = issue.path?.join(".") ?? "(root)";
-      const message = issue.message ?? "Unknown issue";
-      return `${path}: ${message}`;
-    })
-    .join("; ");
-
-  const moreCount = issues.length > 3 ? ` (+${issues.length - 3} more)` : "";
-
-  // Include the event type if available
-  const data = cause.data as { type?: string } | undefined;
-  const eventType = data?.type ? ` [event: ${data.type}]` : "";
-
-  return `${issuesSummary}${moreCount}${eventType}`;
-}
-
-/**
- * Auto-collapse the pinned TODO panel when a workspace's stream stops.
- * Lives in the store (not the component) because PinnedTodoList is only
- * mounted for the active workspace — background workspaces would miss
- * the transition. Callers supply the authoritative hasTodos value: the
- * live aggregator for active workspaces, the backend snapshot for background ones.
- */
-function collapsePinnedTodoOnStreamStop(workspaceId: string, hasTodos: boolean): void {
-  if (!hasTodos) {
-    return;
-  }
-
-  updatePersistedState(getPinnedTodoExpandedKey(workspaceId), false);
 }
 
 const EMPTY_ACTIVE_WORKFLOW_RUN_IDS: string[] = [];
@@ -728,6 +858,32 @@ function areAgentStatusesEqual(
   return a.emoji === b.emoji && a.message === b.message && (a.url ?? null) === (b.url ?? null);
 }
 
+/**
+ * Compares the goal fields whose change re-renders the workspace on an activity snapshot.
+ * startedAtMs and completionSummary are not compared: a change to only those fields does
+ * not re-render, as before this comparison moved out of applyWorkspaceActivitySnapshot.
+ * A missing goal (null or undefined) equals only another missing goal.
+ */
+export function areActivityGoalsEqual(
+  a: GoalSnapshot | null | undefined,
+  b: GoalSnapshot | null | undefined
+): boolean {
+  if (a == null || b == null) {
+    return a == null && b == null;
+  }
+
+  return (
+    a.goalId === b.goalId &&
+    a.status === b.status &&
+    a.objective === b.objective &&
+    a.costCents === b.costCents &&
+    a.turnsUsed === b.turnsUsed &&
+    a.budgetCents === b.budgetCents &&
+    a.turnCap === b.turnCap &&
+    a.pendingPersistence === b.pendingPersistence
+  );
+}
+
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
   for (const message of messages) {
@@ -743,11 +899,11 @@ function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
 }
 
 /**
- * Detect gateway-billed (costs-included) usage entries.
+ * Detect costs-included usage entries.
  * `createDisplayUsage` sets `costsIncluded: true` when
  * `providerMetadata.mux.costsIncluded` is true. These entries should
- * not be repriced when model mappings change because the provider
- * gateway already handles billing.
+ * not be repriced when model mappings change because the route
+ * already billed them.
  */
 function isCostsIncludedEntry(
   usage: ChatUsageDisplay,
@@ -758,7 +914,7 @@ function isCostsIncludedEntry(
     return true;
   }
 
-  // Unknown-cost rows are not gateway-billed by definition; they indicate
+  // Unknown-cost rows are not costs-included by definition; they indicate
   // missing pricing metadata and should be eligible for repricing when a
   // mapping is later configured.
   if (usage.hasUnknownCosts === true) {
@@ -766,9 +922,9 @@ function isCostsIncludedEntry(
   }
 
   // Backward-compatibility: older session-usage.json entries may have been
-  // gateway-billed with all costs explicitly zeroed before the costsIncluded
+  // costs-included with all costs explicitly zeroed before the costsIncluded
   // marker was persisted. Treat those all-zero entries as costs-included so
-  // repricing doesn't inflate historical gateway-billed totals after upgrade.
+  // repricing doesn't inflate historical costs-included totals after upgrade.
   //
   // Guardrail: only apply this legacy heuristic for models that have non-zero
   // billable pricing in model stats. Use the resolved metadata model so mapped
@@ -800,12 +956,32 @@ function isCostsIncludedEntry(
   return hasTokens;
 }
 
+function repriceUsageByModel(
+  byModel: Record<string, ChatUsageDisplay>,
+  config: ProvidersConfigMap
+): void {
+  for (const [model, entry] of Object.entries(byModel)) {
+    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
+    const resolved = resolveModelForMetadata(model, config);
+    // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
+    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs.
+    byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
+  }
+}
+
+/** The projection has no fingerprint to compare, so it is repriced on every apply. */
+function repriceSubagentUsage(data: SubagentUsageByChild, config: ProvidersConfigMap): void {
+  for (const subtree of Object.values(data.children)) {
+    repriceUsageByModel(subtree.byModel, config);
+  }
+}
+
 /**
  * Recompute cost aggregates for a single session-usage entry so session totals
  * and last-request costs reflect the current model mapping.
  *
  * Skips non-model aggregate buckets (e.g. "historical" from legacy compaction
- * summaries) and costs-included entries (gateway-billed requests where cost_usd
+ * summaries) and costs-included entries (requests where cost_usd
  * was explicitly zeroed).
  */
 function repriceSessionUsage(
@@ -816,14 +992,7 @@ function repriceSessionUsage(
   if (usage.tokenStatsCache?.providersConfigVersion !== providersConfigFingerprint) {
     usage.tokenStatsCache = undefined;
   }
-  for (const [model, entry] of Object.entries(usage.byModel)) {
-    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
-    const resolved = resolveModelForMetadata(model, config);
-    // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
-    // the summed token totals alone. recomputeUsageCosts() preserves those stored costs and marks
-    // them approximate when the effective model has non-linear pricing.
-    usage.byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
-  }
+  repriceUsageByModel(usage.byModel, config);
   if (
     usage.lastRequest &&
     !isCostsIncludedEntry(usage.lastRequest.usage, usage.lastRequest.model, config)
@@ -831,6 +1000,126 @@ function repriceSessionUsage(
     const resolved = resolveModelForMetadata(usage.lastRequest.model, config);
     usage.lastRequest.usage = recomputeUsageCosts(usage.lastRequest.usage, resolved);
   }
+}
+
+/**
+ * Sidebar status precedence, split into four tiers so each signal
+ * wins exactly when it should. Active and inactive workspaces draw
+ * from different sources but resolve through the same priority.
+ *
+ *   1. displayStatus (inactive only): system-driven transient status
+ *      from disk, e.g. "Compacting idle workspace…". Always wins.
+ *   2. liveTodoStatus (active only): the agent's most recent
+ *      `todo_write`, processed synchronously by the aggregator.
+ *      Beats the aggregator's persisted status_set value because
+ *      todo_write is the freshest explicit signal; beats persisted
+ *      todoStatus because the live aggregator state is ahead of
+ *      the async setTodoStatus + activity-emit round-trip.
+ *   3. fallbackAgentStatus (active only): aggregator.getAgentStatus()
+ *      — a blend of heartbeat / idle-compaction / background-turn
+ *      `displayStatus` events (genuinely transient) and the agent's
+ *      own `status_set` tool result (a pinned high-level intent).
+ *      Wins over persisted todoStatus so an AI-generated summary
+ *      doesn't mask an explicit system or agent-set message.
+ *   4. persistedTodoStatus: activity.todoStatus from disk. Either
+ *      a stale todo derivation or an AgentStatusService AI summary —
+ *      both writers target the same slot, last write wins. The
+ *      lowest tier so a newer in-memory signal always preempts.
+ *      For inactive workspaces, `hasTodos === false` blocks the
+ *      legacy aggregator-derive fallback so a freshly cleared todo
+ *      list doesn't briefly resurrect the stale derivation.
+ */
+export function resolveSidebarAgentStatus(input: {
+  /** Active (live onChat) and caught up: the aggregator is authoritative. */
+  useAggregatorState: boolean;
+  activity: WorkspaceActivitySnapshot | undefined;
+  todos: readonly TodoItem[];
+  aggregatorAgentStatus: WorkspaceState["agentStatus"];
+}): WorkspaceState["agentStatus"] {
+  const { useAggregatorState, activity, todos } = input;
+  const displayStatus = useAggregatorState ? undefined : (activity?.displayStatus ?? undefined);
+  const liveTodoStatus = useAggregatorState ? deriveTodoStatus(todos) : undefined;
+  const fallbackAgentStatus = useAggregatorState ? input.aggregatorAgentStatus : undefined;
+  const persistedTodoStatus = useAggregatorState
+    ? (activity?.todoStatus ?? undefined)
+    : (activity?.todoStatus ??
+      (activity?.hasTodos === false ? undefined : deriveTodoStatus(todos)));
+  return displayStatus ?? liveTodoStatus ?? fallbackAgentStatus ?? persistedTodoStatus;
+}
+
+/**
+ * Context usage of the newest assistant message in the current compaction epoch, for the
+ * context indicator. Pre-boundary messages carry stale contextUsage from before compaction;
+ * including them inflates the usage indicator and triggers premature auto-compaction.
+ */
+export function findLastContextUsage(
+  messages: readonly MuxMessage[],
+  currentModel: string | undefined,
+  resolveMetadataModel: (model: string) => string
+): ChatUsageDisplay | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (isDurableCompactionBoundaryMarker(msg)) {
+      // Idle/manual compaction boundary messages can include a post-compaction
+      // context estimate. Read it before breaking so context usage does not
+      // disappear when switching back to a compacted workspace.
+      const rawUsage = msg.metadata?.contextUsage;
+      if (rawUsage && msg.role === "assistant") {
+        const msgModel = msg.metadata?.model ?? currentModel ?? "unknown";
+        return createDisplayUsage(rawUsage, msgModel, undefined);
+      }
+      break;
+    }
+    if (msg.role === "assistant") {
+      if (msg.metadata?.compacted) continue;
+      const rawUsage = msg.metadata?.contextUsage;
+      const providerMeta = msg.metadata?.contextProviderMetadata ?? msg.metadata?.providerMetadata;
+      if (rawUsage) {
+        const msgModel = msg.metadata?.model ?? currentModel ?? "unknown";
+        return createDisplayUsage(rawUsage, msgModel, providerMeta, resolveMetadataModel(msgModel));
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * onChat subscribe input. A boolean auto-retry setting left in localStorage by older builds
+ * is forwarded once as `legacyAutoRetryEnabled` (the caller drops it after the subscribe
+ * succeeds); any other stored value is malformed and is dropped here.
+ */
+export function buildOnChatInput(
+  workspaceId: string,
+  mode: OnChatMode | undefined
+): {
+  input: {
+    workspaceId: string;
+    mode: OnChatMode | undefined;
+    legacyAutoRetryEnabled?: boolean;
+    batchReplay: true;
+    replayWindow: true;
+  };
+  legacyAutoRetryEnabled: boolean | undefined;
+} {
+  const autoRetryKey = getAutoRetryKey(workspaceId);
+  const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
+  const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
+  if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
+    updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+  // batchReplay: this store unpacks `message-batch` replay events (#4868).
+  // replayWindow: a full replay sends only the newest rows of the active epoch; older rows
+  // load through loadOlderHistory (#4961).
+  const input =
+    legacyAutoRetryEnabled === undefined
+      ? { workspaceId, mode, batchReplay: true as const, replayWindow: true as const }
+      : {
+          workspaceId,
+          mode,
+          legacyAutoRetryEnabled,
+          batchReplay: true as const,
+          replayWindow: true as const,
+        };
+  return { input, legacyAutoRetryEnabled };
 }
 
 /**
@@ -843,10 +1132,6 @@ function repriceSessionUsage(
  */
 function getStreamingMessageKey(workspaceId: string, messageId: string): string {
   return workspaceId + "\0" + messageId;
-}
-
-function getAdvisorLiveKey(workspaceId: string, toolCallId: string): string {
-  return workspaceId + "\0" + toolCallId;
 }
 
 export class WorkspaceStore {
@@ -893,19 +1178,21 @@ export class WorkspaceStore {
 
   // Supporting data structures
   private aggregators = new Map<string, StreamingMessageAggregator>();
-  // Active onChat subscription cleanup handlers (must stay size <= 1).
-  private ipcUnsubscribers = new Map<string, () => void>();
+  // Live onChat loops cover only the registered active workspace and mounted side chats.
+  // Membership is the "has a live subscription" check. The controller's signal is the loop
+  // signal, so a refresh request can bind to the loop it was made under.
+  private onChatControllers = new Map<string, AbortController>();
 
   // Workspace selected in the UI (set from WorkspaceContext routing state).
   private activeWorkspaceId: string | null = null;
+  private toolCardsPreloadScheduled = false;
+  // Split tabsets can show several side chats at once. Count their mounted owners so closing
+  // one pane never unsubscribes another, without keeping hidden background chats subscribed.
+  private pinnedWorkspaces = new Map<string, { count: number }>();
 
-  // Workspace currently owning the live onChat subscription.
-  private activeOnChatWorkspaceId: string | null = null;
   // Workspaces whose first onChat replay since activation has not settled yet (#4662).
   // Kept outside chatTransientState because full-replay resets replace transient objects.
   private chatReplayPendingWorkspaces = new Set<string>();
-  // Loop signal of that subscription, so a refresh request can bind to the loop it was made under.
-  private activeOnChatSignal: AbortSignal | null = null;
   // The in-flight onChat attempt per workspace (set in subscribe, cleared when the attempt finishes).
   private currentOnChatAttempts = new Map<string, OnChatAttemptContext>();
   // At most one pending transcript refresh request per workspace (see requestTranscriptRefresh).
@@ -914,6 +1201,7 @@ export class WorkspaceStore {
   // Lightweight activity snapshots from workspace.activity.list/subscribe.
   private workspaceActivity = new Map<string, WorkspaceActivitySnapshot>();
   private readonly staleSkeletonTimeoutMs: number;
+  private readonly subagentUsageFetchTimeoutMs: number;
   // Per-workspace bound on the stale-cache skeleton for the current subscribe attempt.
   private staleSkeletonDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
   // Recency timestamp observed when a workspace transitions into streaming=true.
@@ -995,6 +1283,9 @@ export class WorkspaceStore {
 
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
+  private subagentUsage = new Map<string, SubagentUsageByChild>();
+  /** The getSubagentUsage fetch in flight per workspace. */
+  private subagentUsageFetches = new Map<string, SubagentUsageFetch>();
 
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
   private navigateToWorkspaceCallback: ((workspaceId: string) => void) | null = null;
@@ -1018,7 +1309,6 @@ export class WorkspaceStore {
   // release it even when no terminal chat event names the message.
   private streamingMessageKeys = new Map<string, string>();
   private streamingMessageStore = new MapStore<string, void>();
-  private advisorLiveStore = new MapStore<string, void>();
   private streamingStatsStore = new MapStore<string, WorkspaceStreamingStats | null>();
 
   /**
@@ -1056,6 +1346,8 @@ export class WorkspaceStore {
     ) => void
   > = {
     "stream-start": (workspaceId, aggregator, data) => {
+      // A stream can call tools: load the lazy cards before its first tool row mounts.
+      requestToolCards();
       applyWorkspaceChatEventToAggregator(aggregator, data);
       if (this.onModelUsed) {
         this.onModelUsed((data as { model: string }).model);
@@ -1087,6 +1379,7 @@ export class WorkspaceStore {
     "stream-end": (workspaceId, aggregator, data) => {
       const streamEndData = data as StreamEndEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamEndData);
+      getDraftStore().onSendEvent(workspaceId);
       this.releaseStreamingMessageChannel(workspaceId);
 
       // Track stream completion telemetry
@@ -1125,15 +1418,12 @@ export class WorkspaceStore {
             byModel: {},
             version: 1 as const,
           };
-          const existing = current.byModel[normalizedModel];
           // CRITICAL: Accumulate, don't overwrite (same logic as backend)
-          current.byModel[normalizedModel] = existing ? sumUsageHistory([existing, usage])! : usage;
+          addModelUsage(current.byModel, normalizedModel, usage);
           current.lastRequest = { model: normalizedModel, usage, timestamp: Date.now() };
           this.sessionUsage.set(workspaceId, current);
         }
       }
-
-      collapsePinnedTodoOnStreamStop(workspaceId, aggregator.getCurrentTodos().length > 0);
 
       // Flush any pending debounced bump before final bump to avoid double-bump
       this.cancelPendingIdleBump(workspaceId);
@@ -1163,8 +1453,6 @@ export class WorkspaceStore {
         );
       }
 
-      collapsePinnedTodoOnStreamStop(workspaceId, aggregator.getCurrentTodos().length > 0);
-
       // Flush any pending debounced bump before final bump to avoid double-bump
       this.cancelPendingIdleBump(workspaceId);
       this.cancelPendingStreamingBump(workspaceId);
@@ -1175,6 +1463,10 @@ export class WorkspaceStore {
     "tool-call-start": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.states.bump(workspaceId);
+      // The aggregator counts the tool's input tokens here. Without this bump a reader that
+      // cached the stats before this event shows the old count until the next delta, so the
+      // "~N tokens" readout depended on whether React rendered between the two events.
+      this.streamingStatsStore.bump(workspaceId);
     },
     "tool-call-execution-start": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1182,6 +1474,9 @@ export class WorkspaceStore {
     },
     "tool-call-delta": (workspaceId, aggregator, data) => {
       this.applyStreamingDelta(workspaceId, aggregator, data as ToolCallDeltaEvent);
+    },
+    "bash-sandbox-approval": (workspaceId, _aggregator, data) => {
+      if (isBashSandboxApprovalEvent(data)) this.applySandboxApproval(workspaceId, data);
     },
     "tool-call-end": (workspaceId, aggregator, data) => {
       const toolCallEnd = data as Extract<WorkspaceChatMessage, { type: "tool-call-end" }>;
@@ -1197,13 +1492,6 @@ export class WorkspaceStore {
         );
       }
 
-      // Cleanup ephemeral advisor/task state once the actual tool result is available.
-      if (toolCallEnd.toolName === "advisor") {
-        transient?.liveAdvisorOutput.delete(toolCallEnd.toolCallId);
-        transient?.liveAdvisorReasoning.delete(toolCallEnd.toolCallId);
-        transient?.liveAdvisorPhase.delete(toolCallEnd.toolCallId);
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallEnd.toolCallId));
-      }
       if (toolCallEnd.toolName === "task") {
         transient?.liveTaskIds.delete(toolCallEnd.toolCallId);
       }
@@ -1228,8 +1516,10 @@ export class WorkspaceStore {
       this.consumerManager.scheduleCalculation(workspaceId, aggregator);
 
       // Track file-modifying tools for ReviewPanel diff refresh.
+      // Not for a replayed session tape (perf harness): its tools never ran here.
       const shouldTriggerReviewPanelRefresh =
-        toolCallEnd.toolName.startsWith("file_edit_") || toolCallEnd.toolName === "bash";
+        (toolCallEnd.toolName.startsWith("file_edit_") || toolCallEnd.toolName === "bash") &&
+        !isSessionTapeReplayRenderer();
 
       if (shouldTriggerReviewPanelRefresh) {
         this.fileModifyingToolMs.set(workspaceId, Date.now());
@@ -1263,18 +1553,31 @@ export class WorkspaceStore {
     "session-usage-delta": (workspaceId, _aggregator, data) => {
       const usageDelta = data as Extract<WorkspaceChatMessage, { type: "session-usage-delta" }>;
 
+      // A self delta's write (headless spend) also sent usage-changed for this workspace, and
+      // the ledger refetch for it shows the spend. Adding it here could count it twice (that
+      // refetch can land first), and refetching again would supersede that refetch.
+      const childId = usageDelta.sourceWorkspaceId;
+      if (childId === workspaceId) {
+        return;
+      }
       const current = this.sessionUsage.get(workspaceId) ?? {
         byModel: {},
         version: 1 as const,
       };
-
-      for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
-        const existing = current.byModel[model];
-        current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+      // A child's delta is its one-time roll-up. A ledger fetched after the roll-up already
+      // holds it, and adding it again would count it twice; recording it in rolledUpFrom also
+      // drops it from the projection.
+      if (!current.rolledUpFrom?.[childId]) {
+        for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
+          addModelUsage(current.byModel, model, usage);
+        }
       }
-
+      current.rolledUpFrom = { ...current.rolledUpFrom, [childId]: true };
       this.sessionUsage.set(workspaceId, current);
       this.usageStore.bump(workspaceId);
+      // A ledger fetch still in flight read the file before the roll-up and would overwrite
+      // this merge: refetch, so the newer response wins (it also refreshes the projection).
+      this.refreshSessionUsage(workspaceId);
     },
     "usage-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1302,6 +1605,15 @@ export class WorkspaceStore {
       this.cancelPendingIdleBump(workspaceId);
       this.states.bump(workspaceId);
     },
+    // Toast-only events (the aggregator queues the toast and changes no rows). Both are live
+    // only: handleChatMessage processes them at once, never buffered, so they always show their
+    // toast (unlike stream-error, whose replay must not re-show it).
+    "plugin-hook-notice": (_workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+    },
+    "goal-budget-limited": (_workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+    },
     "queued-message-changed": (workspaceId, aggregator, data) => {
       if (!isQueuedMessageChanged(data)) return;
 
@@ -1322,12 +1634,17 @@ export class WorkspaceStore {
               data.reviews?.map((review) => [review.filePath, review.lineRange]) ?? [],
               data.queueDispatchMode,
               data.hasCompactionRequest,
+              data.artifactInteraction?.id,
             ])}`,
             content: data.displayText,
             fileParts: data.fileParts,
             reviews: data.reviews,
             queueDispatchMode: data.queueDispatchMode,
             hasCompactionRequest: data.hasCompactionRequest,
+            ...(data.sendIds != null && data.sendIds.length > 0 ? { sendIds: data.sendIds } : {}),
+            ...(data.artifactInteraction != null
+              ? { artifactInteraction: data.artifactInteraction }
+              : {}),
           }
         : null;
 
@@ -1336,6 +1653,9 @@ export class WorkspaceStore {
       aggregator.setActiveQueuedFollowUp(data.hasQueuedMessages ?? queuedMessage !== null);
       this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
       this.states.bump(workspaceId);
+      // Queued ids reached the receiver; a queued send may have left the queue (run, held or
+      // dropped): look the pending sends up.
+      getDraftStore().onQueuedSends(workspaceId, data.sendIds ?? []);
     },
     "held-inputs-changed": (workspaceId, _aggregator, data) => {
       if (!isHeldInputsChanged(data)) return;
@@ -1352,9 +1672,12 @@ export class WorkspaceStore {
         }
       }
       this.states.bump(workspaceId);
+      // A released held input is no longer pending: its send resolves (e.g. not accepted).
+      getDraftStore().onSendEvent(workspaceId);
     },
-    "restore-to-input": (_workspaceId, _aggregator, data) => {
+    "restore-to-input": (workspaceId, _aggregator, data) => {
       if (!isRestoreToInput(data)) return;
+      getDraftStore().onSendEvent(workspaceId);
 
       // mode="restore", not "replace": a newer draft typed while the message was queued must
       // survive (#4431).
@@ -1369,6 +1692,8 @@ export class WorkspaceStore {
           workspaceId: data.workspaceId,
           // The composer that applies the restore acknowledges these (acceptRestoredHeldInputs).
           heldInputIds: data.heldInputIds,
+          // Per send, with ids: a composer that still retains a send does not insert it again.
+          inputs: data.inputs,
         })
       );
     },
@@ -1387,6 +1712,8 @@ export class WorkspaceStore {
     this.onModelUsed = onModelUsed;
     this.staleSkeletonTimeoutMs =
       options?.staleTranscriptSkeletonTimeoutMs ?? STALE_TRANSCRIPT_SKELETON_TIMEOUT_MS;
+    this.subagentUsageFetchTimeoutMs =
+      options?.subagentUsageFetchTimeoutMs ?? SUBAGENT_USAGE_FETCH_TIMEOUT_MS;
 
     // Initialize consumer calculation manager
     this.consumerManager = new WorkspaceConsumerManager(
@@ -1424,6 +1751,7 @@ export class WorkspaceStore {
 
     const requestVersion = (this.sessionUsageRequestVersion.get(workspaceId) ?? 0) + 1;
     this.sessionUsageRequestVersion.set(workspaceId, requestVersion);
+    this.refreshSubagentUsage(workspaceId);
 
     client.workspace
       .getSessionUsage({ workspaceId })
@@ -1470,6 +1798,119 @@ export class WorkspaceStore {
       });
   }
 
+  private refreshSubagentUsage(workspaceId: string): void {
+    const client = this.client;
+    if (!client || !this.isWorkspaceRegistered(workspaceId)) {
+      return;
+    }
+    // One fetch per workspace at a time: a burst of usage changes from many sub-agents asks
+    // again while it runs, and one trailing fetch then reads all of them.
+    const inFlight = this.subagentUsageFetches.get(workspaceId);
+    if (inFlight) {
+      inFlight.trailing = true;
+      return;
+    }
+    const request = { trailing: false };
+    this.subagentUsageFetches.set(workspaceId, request);
+    // No gate on known children: a parent registers before its children do, so frontend
+    // metadata cannot tell that a workspace has none.
+    client.workspace
+      .getSubagentUsage(
+        { workspaceId },
+        { signal: AbortSignal.timeout(this.subagentUsageFetchTimeoutMs) }
+      )
+      .then((data) => this.applySubagentUsage(workspaceId, request, data))
+      .catch((error) => {
+        console.warn(`Failed to fetch sub-agent usage for ${workspaceId}:`, error);
+      })
+      .finally(() => {
+        // A removal or client change dropped this fetch; a newer one owns the slot.
+        if (this.subagentUsageFetches.get(workspaceId) !== request) return;
+        this.subagentUsageFetches.delete(workspaceId);
+        if (request.trailing) {
+          this.refreshSubagentUsage(workspaceId);
+        }
+      });
+  }
+
+  private applySubagentUsage(
+    workspaceId: string,
+    request: SubagentUsageFetch,
+    data: SubagentUsageByChild
+  ): void {
+    // A removal or client change dropped this fetch: the workspace can be a new incarnation
+    // with its own fetch.
+    if (this.subagentUsageFetches.get(workspaceId) !== request) {
+      return;
+    }
+    if (this.providersConfig) {
+      repriceSubagentUsage(data, this.providersConfig);
+    }
+    this.subagentUsage.set(workspaceId, data);
+    this.usageStore.bump(workspaceId);
+  }
+
+  /**
+   * The backend sends usage-changed on every write to a workspace's usage files: a stream's
+   * finished step or its settle, headless usage, a sub-agent rolled up into it. Its own ledger
+   * and every ancestor's sub-agent projection can have changed.
+   */
+  private refreshUsageAfterChange(workspaceId: string): void {
+    if (this.isUsageShown(workspaceId) && !this.isOwnStreamLive(workspaceId)) {
+      this.refreshSessionUsage(workspaceId);
+    }
+    this.refreshAncestorSubagentUsage(workspaceId);
+  }
+
+  /**
+   * The workspace's chat shows its own stream live: its stream-end adds the stream's usage, and
+   * every terminal event refetches the ledger (finalizeUsageStats, stream-error). A usage-change
+   * refetch before that can already hold the settled stream, and stream-end would add it again.
+   */
+  private isOwnStreamLive(workspaceId: string): boolean {
+    return (
+      this.isOnChatSubscriptionActive(workspaceId) &&
+      this.aggregators.get(workspaceId)?.getActiveStreamMessageId() !== undefined
+    );
+  }
+
+  /**
+   * A nested sub-agent rolls into its own parent's ledger, and no session-usage-delta reaches the
+   * higher ancestors, so their projections are refetched here.
+   */
+  private refreshAncestorSubagentUsage(workspaceId: string): void {
+    for (const ancestorId of this.listAncestorIds(workspaceId)) {
+      if (this.isUsageShown(ancestorId)) {
+        this.refreshSubagentUsage(ancestorId);
+      }
+    }
+  }
+
+  private isUsageShown(workspaceId: string): boolean {
+    return this.isWorkspaceOnScreen(workspaceId) || this.usageStore.hasKeySubscribers(workspaceId);
+  }
+
+  private listAncestorIds(workspaceId: string): string[] {
+    const ancestors: string[] = [];
+    const seen = new Set<string>([workspaceId]);
+    let parentId = this.workspaceMetadata.get(workspaceId)?.parentWorkspaceId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      ancestors.push(parentId);
+      parentId = this.workspaceMetadata.get(parentId)?.parentWorkspaceId;
+    }
+    return ancestors;
+  }
+
+  private repriceAllUsage(config: ProvidersConfigMap, fingerprint: number): void {
+    for (const [, usage] of this.sessionUsage) {
+      repriceSessionUsage(usage, config, fingerprint);
+    }
+    for (const [, usage] of this.subagentUsage) {
+      repriceSubagentUsage(usage, config);
+    }
+  }
+
   private async refreshProvidersConfig(client: RouterClient<AppRouter>): Promise<void> {
     // Version counter prevents an older, slower response from overwriting a newer one.
     // We bump eagerly so concurrent requests each get unique versions, then only apply
@@ -1498,9 +1939,7 @@ export class WorkspaceStore {
         // so mapped-model changes take effect on next access.
         this.consumerManager.invalidateAll();
 
-        for (const [, usage] of this.sessionUsage) {
-          repriceSessionUsage(usage, config, nextFingerprint);
-        }
+        this.repriceAllUsage(config, nextFingerprint);
       }
 
       // Bump usage-store subscribers AFTER repricing so observers see
@@ -1604,6 +2043,8 @@ export class WorkspaceStore {
     this.client = client;
     this.clientChangeController.abort();
     this.clientChangeController = new AbortController();
+    // A fetch on the old client may never settle; it must not block the new client's fetches.
+    this.subagentUsageFetches.clear();
 
     this.bumpAllUsageStoreEntries();
 
@@ -1621,10 +2062,7 @@ export class WorkspaceStore {
     }
 
     for (const workspaceId of this.workspaceMetadata.keys()) {
-      if (
-        this.activeWorkspaceId === workspaceId ||
-        this.usageStore.hasKeySubscribers(workspaceId)
-      ) {
+      if (this.isWorkspaceOnScreen(workspaceId) || this.usageStore.hasKeySubscribers(workspaceId)) {
         this.refreshSessionUsage(workspaceId);
       }
     }
@@ -1637,7 +2075,7 @@ export class WorkspaceStore {
       this.subscribeToTimeline(workspaceId);
     }
 
-    this.ensureActiveOnChatSubscription();
+    this.ensureOnChatSubscriptions();
     void this.refreshProvidersConfig(client);
     this.subscribeToProvidersConfig(client);
   }
@@ -1658,7 +2096,7 @@ export class WorkspaceStore {
       // Chat-switch User Timing origin (#4504): every switch milestone is measured from here.
       markChatSwitchStart(workspaceId);
     }
-    this.ensureActiveOnChatSubscription();
+    this.ensureOnChatSubscriptions();
 
     // Re-hydrate persisted session usage so cost totals reflect any
     // session-usage-delta events that arrived while this workspace was inactive.
@@ -1667,7 +2105,7 @@ export class WorkspaceStore {
     }
 
     // Invalidate cached workspace state for both the old and new active
-    // workspaces. getWorkspaceState() uses activeOnChatWorkspaceId to decide
+    // workspaces. getWorkspaceState() uses the live onChat subscription set to decide
     // whether to trust aggregator data or activity snapshots, so a switch
     // requires recomputation even if no new events arrived.
     if (previousActiveId) {
@@ -1678,13 +2116,59 @@ export class WorkspaceStore {
     }
   }
 
+  /** Keep a mounted side chat live until this owner's idempotent release is called. */
+  acquirePinnedWorkspace(workspaceId: string): () => void {
+    assert(
+      typeof workspaceId === "string" && workspaceId.length > 0,
+      "acquirePinnedWorkspace requires a non-empty workspaceId"
+    );
+
+    const pin = this.pinnedWorkspaces.get(workspaceId) ?? { count: 0 };
+    this.pinnedWorkspaces.set(workspaceId, pin);
+    pin.count++;
+    if (pin.count === 1) {
+      this.ensureOnChatSubscriptions();
+      // Same as activation: usage deltas that arrived while unsubscribed are only on disk.
+      if (this.isWorkspaceRegistered(workspaceId)) {
+        this.refreshSessionUsage(workspaceId);
+        this.states.bump(workspaceId);
+      }
+    }
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      // Removal/disposal invalidates old owners; their cleanup must not release a new pin
+      // acquired later under the same workspace id.
+      if (this.pinnedWorkspaces.get(workspaceId) !== pin) return;
+      if (--pin.count > 0) return;
+
+      this.pinnedWorkspaces.delete(workspaceId);
+      this.ensureOnChatSubscriptions();
+      // Subscription membership changes whether selectors trust live state or activity.
+      if (this.isWorkspaceRegistered(workspaceId)) {
+        this.states.bump(workspaceId);
+      }
+    };
+  }
+
   isOnChatSubscriptionActive(workspaceId: string): boolean {
     assert(
       typeof workspaceId === "string" && workspaceId.length > 0,
       "isOnChatSubscriptionActive requires a non-empty workspaceId"
     );
 
-    return this.activeOnChatWorkspaceId === workspaceId;
+    return this.onChatControllers.has(workspaceId);
+  }
+
+  /**
+   * Whether the workspace's chat is rendered on screen: the routed chat or the pinned side
+   * chat. Background-only behavior (activity-driven completion notifications, stale stream
+   * cleanup) must skip these because their live onChat subscription is authoritative.
+   */
+  private isWorkspaceOnScreen(workspaceId: string): boolean {
+    return workspaceId === this.activeWorkspaceId || this.pinnedWorkspaces.has(workspaceId);
   }
 
   private ensureActivitySubscription(): void {
@@ -1713,24 +2197,28 @@ export class WorkspaceStore {
     }
   }
 
-  private assertSingleActiveOnChatSubscription(): void {
-    assert(
-      this.ipcUnsubscribers.size <= 1,
-      `[WorkspaceStore] Expected at most one active onChat subscription, found ${this.ipcUnsubscribers.size}`
-    );
-
-    if (this.activeOnChatWorkspaceId === null) {
-      assert(
-        this.ipcUnsubscribers.size === 0,
-        "[WorkspaceStore] onChat unsubscribe map must be empty when no active workspace is subscribed"
-      );
-      return;
+  /** Registered workspaces that should own a live onChat subscription right now. */
+  private getDesiredOnChatWorkspaceIds(): Set<string> {
+    const desired = new Set<string>();
+    for (const workspaceId of [this.activeWorkspaceId, ...this.pinnedWorkspaces.keys()]) {
+      if (workspaceId && this.isWorkspaceRegistered(workspaceId)) {
+        desired.add(workspaceId);
+      }
     }
+    return desired;
+  }
 
+  private assertOnChatSubscriptionsMatch(desired: ReadonlySet<string>): void {
     assert(
-      this.ipcUnsubscribers.has(this.activeOnChatWorkspaceId),
-      `[WorkspaceStore] Missing onChat unsubscribe handler for ${this.activeOnChatWorkspaceId}`
+      this.onChatControllers.size === desired.size,
+      `[WorkspaceStore] Expected ${desired.size} live onChat subscriptions, found ${this.onChatControllers.size}`
     );
+    for (const workspaceId of this.onChatControllers.keys()) {
+      assert(
+        desired.has(workspaceId),
+        `[WorkspaceStore] onChat subscription for ${workspaceId} is neither active nor pinned`
+      );
+    }
   }
 
   private clearReplayBuffers(workspaceId: string): void {
@@ -1793,76 +2281,77 @@ export class WorkspaceStore {
     }
   }
 
-  private ensureActiveOnChatSubscription(): void {
-    const targetWorkspaceId =
-      this.activeWorkspaceId && this.isWorkspaceRegistered(this.activeWorkspaceId)
-        ? this.activeWorkspaceId
-        : null;
+  /**
+   * Reconcile live onChat subscriptions with the active and mounted side workspaces: stop
+   * loops for workspaces that left the set, start loops for ones that joined. Active/pinned
+   * overlap keeps one loop, and switching the active workspace never disturbs pinned loops.
+   */
+  private ensureOnChatSubscriptions(): void {
+    const desired = this.getDesiredOnChatWorkspaceIds();
 
-    if (this.activeOnChatWorkspaceId === targetWorkspaceId) {
-      this.assertSingleActiveOnChatSubscription();
-      return;
+    // Teardown first so hidden workspaces stop receiving events before new panes start.
+    for (const workspaceId of Array.from(this.onChatControllers.keys())) {
+      if (!desired.has(workspaceId)) {
+        this.stopOnChatSubscription(workspaceId);
+      }
+    }
+    for (const workspaceId of desired) {
+      if (!this.onChatControllers.has(workspaceId)) {
+        this.startOnChatSubscription(workspaceId);
+      }
     }
 
-    if (this.activeOnChatWorkspaceId) {
-      const previousActiveWorkspaceId = this.activeOnChatWorkspaceId;
-      const previousTransient = this.chatTransientState.get(previousActiveWorkspaceId);
-      if (previousTransient) {
-        previousTransient.isHydratingTranscript = false;
-        // Leaving mid-hydration or mid-stream leaves the cached rows incomplete: stream
-        // deltas are never delivered to an unsubscribed aggregator, and an activity
-        // snapshot carrying the same streamingGeneration cannot reveal that afterwards.
-        // The aggregator, not the activity snapshot, decides "mid-stream" here: while
-        // subscribed it saw stream-end over onChat, whereas the streaming=false activity
-        // update is published asynchronously after it and can still lag at this point.
-        // Read caughtUp before clearReplayBuffers resets it below.
-        const previousAggregator = this.aggregators.get(previousActiveWorkspaceId);
-        if (
-          !previousTransient.caughtUp ||
-          previousAggregator?.hasInterruptibleActiveStream() === true
-        ) {
-          previousTransient.cachedTranscriptStale = true;
-        }
-        this.resetStaleSkeletonDeadline(previousActiveWorkspaceId);
-      }
+    this.assertOnChatSubscriptionsMatch(desired);
+  }
 
-      // Clear replay buffers before aborting so a fast workspace switch/reopen
-      // cannot replay stale buffered rows from the previous subscription attempt.
-      this.clearReplayBuffers(previousActiveWorkspaceId);
-      // Navigation settles a pending refresh synchronously; the composer that asked is gone.
-      this.settleTranscriptRefresh(previousActiveWorkspaceId, { kind: "cancelled" });
-
-      const unsubscribe = this.ipcUnsubscribers.get(previousActiveWorkspaceId);
-      if (unsubscribe) {
-        unsubscribe();
+  private stopOnChatSubscription(workspaceId: string): void {
+    const previousTransient = this.chatTransientState.get(workspaceId);
+    if (previousTransient) {
+      previousTransient.isHydratingTranscript = false;
+      // Leaving mid-hydration or mid-stream leaves the cached rows incomplete: stream
+      // deltas are never delivered to an unsubscribed aggregator, and an activity
+      // snapshot carrying the same streamingGeneration cannot reveal that afterwards.
+      // The aggregator, not the activity snapshot, decides "mid-stream" here: while
+      // subscribed it saw stream-end over onChat, whereas the streaming=false activity
+      // update is published asynchronously after it and can still lag at this point.
+      // Read caughtUp before clearReplayBuffers resets it below.
+      const previousAggregator = this.aggregators.get(workspaceId);
+      if (
+        !previousTransient.caughtUp ||
+        previousAggregator?.hasInterruptibleActiveStream() === true
+      ) {
+        previousTransient.cachedTranscriptStale = true;
       }
-      this.ipcUnsubscribers.delete(previousActiveWorkspaceId);
-      this.chatReplayPendingWorkspaces.delete(previousActiveWorkspaceId);
-      this.activeOnChatWorkspaceId = null;
-      this.activeOnChatSignal = null;
+      this.resetStaleSkeletonDeadline(workspaceId);
     }
 
-    if (targetWorkspaceId) {
-      const transient = this.chatTransientState.get(targetWorkspaceId);
-      if (transient) {
-        transient.caughtUp = false;
-        transient.historyVerified = false;
-        // Only show transcript hydration once we can actually establish onChat.
-        // When the ORPC client is unavailable, avoid pinning the pane in loading.
-        transient.isHydratingTranscript = this.client !== null;
-      }
+    // Clear replay buffers before aborting so a fast workspace switch/reopen
+    // cannot replay stale buffered rows from the previous subscription attempt.
+    this.clearReplayBuffers(workspaceId);
+    // Navigation settles a pending refresh synchronously; the composer that asked is gone.
+    this.settleTranscriptRefresh(workspaceId, { kind: "cancelled" });
 
-      const controller = new AbortController();
-      this.ipcUnsubscribers.set(targetWorkspaceId, () => controller.abort());
-      // Set even without a client: probes cannot run without one either, and the replay
-      // starts once the client arrives.
-      this.chatReplayPendingWorkspaces.add(targetWorkspaceId);
-      this.activeOnChatWorkspaceId = targetWorkspaceId;
-      this.activeOnChatSignal = controller.signal;
-      void this.runOnChatSubscription(targetWorkspaceId, controller.signal);
+    this.onChatControllers.get(workspaceId)?.abort();
+    this.onChatControllers.delete(workspaceId);
+    this.chatReplayPendingWorkspaces.delete(workspaceId);
+  }
+
+  private startOnChatSubscription(workspaceId: string): void {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) {
+      transient.caughtUp = false;
+      transient.historyVerified = false;
+      // Only show transcript hydration once we can actually establish onChat.
+      // When the ORPC client is unavailable, avoid pinning the pane in loading.
+      transient.isHydratingTranscript = this.client !== null;
     }
 
-    this.assertSingleActiveOnChatSubscription();
+    const controller = new AbortController();
+    this.onChatControllers.set(workspaceId, controller);
+    // Set even without a client: probes cannot run without one either, and the replay
+    // starts once the client arrives.
+    this.chatReplayPendingWorkspaces.add(workspaceId);
+    void this.runOnChatSubscription(workspaceId, controller.signal);
   }
 
   /**
@@ -1941,6 +2430,23 @@ export class WorkspaceStore {
     );
 
     this.deltaIdleHandles.set(workspaceId, handle);
+  }
+
+  /**
+   * #6823: on desktop the lazy tool cards' chunk, requested at the first replayed tool row,
+   * evaluated after the first rows committed (header-only cards for 1-2 frames). #7004: a request
+   * on every selection made chats without tool rows wait ~50-100 ms for it. So load it once, when
+   * the renderer is idle after the first transcript caught up; later opens find it loaded. Not in
+   * the browser: a chat without tool calls must not download the cards there (T3 #5971).
+   */
+  private preloadToolCardsOnce(): void {
+    if (this.toolCardsPreloadScheduled || !isDesktopMode()) return;
+    this.toolCardsPreloadScheduled = true;
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(requestToolCards, { timeout: 2_000 }); // load it even if busy
+    } else {
+      setTimeout(requestToolCards, 0);
+    }
   }
 
   private releaseStreamingMessageChannel(workspaceId: string): void {
@@ -2050,7 +2556,8 @@ export class WorkspaceStore {
    * Get current live streaming stats for a workspace, or null if no stream is active.
    *
    * Cached per MapStore version: changes only when {@link streamingStatsStore} is
-   * bumped (stream-start + every coalesced delta + every terminal stream event).
+   * bumped (stream-start + every coalesced delta + every tool-call-start + every terminal
+   * stream event).
    * Reading uses Date.now() at the bump point, so the trailing-window TPS is
    * always current relative to the latest delta.
    */
@@ -2106,6 +2613,7 @@ export class WorkspaceStore {
 
     (async () => {
       try {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const subscribedIterator = await this.client!.workspace.stats.subscribe(
           { workspaceId },
           { signal }
@@ -2256,6 +2764,7 @@ export class WorkspaceStore {
     let recencyChanged = false;
 
     for (const workspaceId of this.aggregators.keys()) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const aggregator = this.aggregators.get(workspaceId)!;
       const currentRecency = aggregator.getRecencyTimestamp();
       const cachedRecency = this.recencyCache.get(workspaceId);
@@ -2279,22 +2788,17 @@ export class WorkspaceStore {
     if (!transient) return;
     if (
       transient.liveBashOutput.size === 0 &&
-      transient.liveAdvisorOutput.size === 0 &&
-      transient.liveAdvisorReasoning.size === 0 &&
+      transient.sandboxApprovals.size === 0 &&
       transient.liveWorkflowRuns.size === 0
     ) {
       return;
     }
 
     const activeBashToolCallIds = new Set<string>();
-    const activeAdvisorToolCallIds = new Set<string>();
     const activeWorkflowToolCallIds = new Set<string>();
     const collectToolCallId = (toolName: string, toolCallId: string) => {
       if (toolName === "bash") {
         activeBashToolCallIds.add(toolCallId);
-      }
-      if (toolName === "advisor") {
-        activeAdvisorToolCallIds.add(toolCallId);
       }
       if (isWorkflowRunEmittingToolName(toolName)) {
         activeWorkflowToolCallIds.add(toolCallId);
@@ -2312,33 +2816,9 @@ export class WorkspaceStore {
       }
     }
 
-    for (const toolCallId of Array.from(transient.liveBashOutput.keys())) {
-      if (!activeBashToolCallIds.has(toolCallId)) {
-        transient.liveBashOutput.delete(toolCallId);
-      }
-    }
-
-    for (const toolCallId of Array.from(transient.liveAdvisorReasoning.keys())) {
-      if (!activeAdvisorToolCallIds.has(toolCallId)) {
-        transient.liveAdvisorReasoning.delete(toolCallId);
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-      }
-    }
-
-    for (const toolCallId of Array.from(transient.liveAdvisorOutput.keys())) {
-      if (!activeAdvisorToolCallIds.has(toolCallId)) {
-        transient.liveAdvisorOutput.delete(toolCallId);
-        // Release the keyed channel version too; once the transient entry is
-        // gone, the workspace-removal sweep can no longer discover this key.
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-      }
-    }
-
-    for (const toolCallId of Array.from(transient.liveWorkflowRuns.keys())) {
-      if (!activeWorkflowToolCallIds.has(toolCallId)) {
-        transient.liveWorkflowRuns.delete(toolCallId);
-      }
-    }
+    deleteInactiveToolCalls(transient.liveBashOutput, activeBashToolCallIds);
+    deleteInactiveToolCalls(transient.sandboxApprovals, activeBashToolCallIds);
+    deleteInactiveToolCalls(transient.liveWorkflowRuns, activeWorkflowToolCallIds);
   }
 
   /**
@@ -2361,10 +2841,6 @@ export class WorkspaceStore {
     return this.states.subscribeKey(workspaceId, listener);
   };
 
-  subscribeAdvisorLive(workspaceId: string, toolCallId: string, listener: () => void): () => void {
-    return this.advisorLiveStore.subscribeKey(getAdvisorLiveKey(workspaceId, toolCallId), listener);
-  }
-
   getBashToolLiveOutput(workspaceId: string, toolCallId: string): LiveBashOutputView | null {
     const state = this.chatTransientState.get(workspaceId)?.liveBashOutput.get(toolCallId);
 
@@ -2373,26 +2849,32 @@ export class WorkspaceStore {
     return state ?? null;
   }
 
-  getAdvisorToolLiveOutput(workspaceId: string, toolCallId: string): AdvisorLiveOutputState | null {
-    const state = this.chatTransientState.get(workspaceId)?.liveAdvisorOutput.get(toolCallId);
-
-    return state ?? null;
+  private applySandboxApproval(workspaceId: string, data: BashSandboxApprovalEvent): void {
+    const approvals = this.assertChatTransientState(workspaceId).sandboxApprovals;
+    if (data.pending) {
+      const { toolCallId, script, reason, timestamp } = data;
+      approvals.set(toolCallId, { workspaceId, toolCallId, script, reason, timestamp });
+    } else if (!approvals.delete(data.toolCallId)) {
+      return;
+    }
+    // Low-frequency, and the user acts on it: bump at once like task-created.
+    this.states.bump(workspaceId);
   }
 
-  getAdvisorToolLiveReasoning(
-    workspaceId: string,
-    toolCallId: string
-  ): AdvisorLiveReasoningState | null {
-    const state = this.chatTransientState.get(workspaceId)?.liveAdvisorReasoning.get(toolCallId);
-
-    return state ?? null;
+  getBashSandboxApproval(workspaceId: string, toolCallId: string): BashSandboxApprovalView | null {
+    return this.chatTransientState.get(workspaceId)?.sandboxApprovals.get(toolCallId) ?? null;
   }
 
-  getAdvisorToolLivePhase(
-    workspaceId: string,
-    toolCallId: string
-  ): AdvisorLivePhaseState | undefined {
-    return this.chatTransientState.get(workspaceId)?.liveAdvisorPhase.get(toolCallId);
+  /** The toolCallId of the newest approval the workspace waits for; the shortcuts answer it. */
+  getLatestBashSandboxApprovalToolCallId(workspaceId: string): string | null {
+    const approvals = this.chatTransientState.get(workspaceId)?.sandboxApprovals;
+    let latest: { toolCallId: string; timestamp: number } | null = null;
+    for (const [toolCallId, approval] of approvals ?? []) {
+      if (latest === null || approval.timestamp >= latest.timestamp) {
+        latest = { toolCallId, timestamp: approval.timestamp };
+      }
+    }
+    return latest?.toolCallId ?? null;
   }
 
   getTaskToolLiveTaskIds(workspaceId: string, toolCallId: string): string[] | null {
@@ -2480,7 +2962,8 @@ export class WorkspaceStore {
         this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
       const hasInterruptibleActiveStream = aggregator.hasInterruptibleActiveStream();
       const activity = this.workspaceActivity.get(workspaceId);
-      const isActiveWorkspace = this.activeOnChatWorkspaceId === workspaceId;
+      // "Active" here means "has a live onChat subscription" (routed or pinned side chat).
+      const isActiveWorkspace = this.onChatControllers.has(workspaceId);
       const messages = aggregator.getAllMessages();
       const metadata = this.workspaceMetadata.get(workspaceId);
       const pendingStreamStartTime = aggregator.getPendingStreamStartTime();
@@ -2503,94 +2986,43 @@ export class WorkspaceStore {
       // activity snapshot's streaming state, which is updated via the lightweight activity
       // subscription for all workspaces.
       const useAggregatorState = isActiveWorkspace && transient.caughtUp;
-      const canInterrupt = useAggregatorState
-        ? hasInterruptibleActiveStream
-        : bufferedActiveStreamStart !== null
-          ? true
-          : (activity?.streaming ?? hasInterruptibleActiveStream);
-      const currentModel = useAggregatorState
-        ? (aggregator.getCurrentModel() ?? null)
-        : (bufferedActiveStreamStart?.model ??
-          activity?.lastModel ??
-          aggregator.getCurrentModel() ??
-          null);
-      const currentThinkingLevel = useAggregatorState
-        ? (aggregator.getCurrentThinkingLevel() ?? null)
-        : (bufferedActiveStreamStart?.thinkingLevel ??
-          activity?.lastThinkingLevel ??
-          aggregator.getCurrentThinkingLevel() ??
-          null);
+      const { canInterrupt, currentModel, currentThinkingLevel } = resolveWorkspaceStreamIdentity({
+        aggregator,
+        useAggregatorState,
+        hasInterruptibleActiveStream,
+        bufferedActiveStreamStart,
+        activity,
+      });
       const activePendingStreamStartTime = isActiveWorkspace ? pendingStreamStartTime : null;
-      const aggregatorRecency = aggregator.getRecencyTimestamp();
-      const recencyTimestamp =
-        aggregatorRecency === null
-          ? (activity?.recency ?? null)
-          : Math.max(aggregatorRecency, activity?.recency ?? aggregatorRecency);
+      const recencyTimestamp = mergeRecencyTimestamp(
+        aggregator.getRecencyTimestamp(),
+        activity?.recency
+      );
       // Keep the startup barrier mounted until stream-start makes the turn interruptible;
       // stream-lifecycle can report "streaming" slightly earlier.
       const isStreamStarting =
         isActiveWorkspace &&
         !canInterrupt &&
         (streamLifecycle?.phase === "preparing" || activePendingStreamStartTime !== null);
-      // Only actively running init output should bypass transcript hydration. Completed init
-      // rows are still replayed, but they should not suppress the normal catch-up placeholder
-      // for stale cached transcript content on reconnect.
-      const isHydratingTranscript =
-        isActiveWorkspace &&
-        transient.isHydratingTranscript &&
-        !transient.caughtUp &&
-        !hasRunningInitMessage;
-      // Only painted rows can be stale; an empty transcript hydrates through the skeleton
-      // regardless. A full replay rebuilds the transcript from scratch, so the one row it
-      // can apply before caught-up (the replayed init card bypasses buffering) is partial
-      // too, whereas a since replay's cached init-only transcript is trustworthy.
-      const displayedOnlyReplayedInitCards =
-        transient.fullReplayInFlight &&
-        displayedMessages.every((message) => message.type === "workspace-init");
-      const isTranscriptStale =
-        isHydratingTranscript &&
-        displayedMessages.length > 0 &&
-        !transient.staleSkeletonExpired &&
-        (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
-      const isIncrementalCatchUp =
-        isHydratingTranscript &&
-        !transient.fullReplayInFlight &&
-        getOnChatReplayMode(aggregator)?.type === "since";
+      const { isHydratingTranscript, isTranscriptStale, isIncrementalCatchUp } =
+        resolveTranscriptHydrationState({
+          aggregator,
+          transient,
+          isActiveWorkspace,
+          hasRunningInitMessage,
+          displayedMessages,
+        });
       const aggregatorTodos = aggregator.getCurrentTodos();
-      // Sidebar status precedence, split into four tiers so each signal
-      // wins exactly when it should. Active and inactive workspaces draw
-      // from different sources but resolve through the same priority.
-      //
-      //   1. displayStatus (inactive only): system-driven transient status
-      //      from disk, e.g. "Compacting idle workspace…". Always wins.
-      //   2. liveTodoStatus (active only): the agent's most recent
-      //      `todo_write`, processed synchronously by the aggregator.
-      //      Beats the aggregator's persisted status_set value because
-      //      todo_write is the freshest explicit signal; beats persisted
-      //      todoStatus because the live aggregator state is ahead of
-      //      the async setTodoStatus + activity-emit round-trip.
-      //   3. fallbackAgentStatus (active only): aggregator.getAgentStatus()
-      //      — a blend of heartbeat / idle-compaction / background-turn
-      //      `displayStatus` events (genuinely transient) and the agent's
-      //      own `status_set` tool result (a pinned high-level intent).
-      //      Wins over persisted todoStatus so an AI-generated summary
-      //      doesn't mask an explicit system or agent-set message.
-      //   4. persistedTodoStatus: activity.todoStatus from disk. Either
-      //      a stale todo derivation or an AgentStatusService AI summary —
-      //      both writers target the same slot, last write wins. The
-      //      lowest tier so a newer in-memory signal always preempts.
-      //      For inactive workspaces, `hasTodos === false` blocks the
-      //      legacy aggregator-derive fallback so a freshly cleared todo
-      //      list doesn't briefly resurrect the stale derivation.
-      const displayStatus = useAggregatorState ? undefined : (activity?.displayStatus ?? undefined);
-      const liveTodoStatus = useAggregatorState ? deriveTodoStatus(aggregatorTodos) : undefined;
-      const fallbackAgentStatus = useAggregatorState ? aggregator.getAgentStatus() : undefined;
-      const persistedTodoStatus = useAggregatorState
-        ? (activity?.todoStatus ?? undefined)
-        : (activity?.todoStatus ??
-          (activity?.hasTodos === false ? undefined : deriveTodoStatus(aggregatorTodos)));
-      const agentStatus =
-        displayStatus ?? liveTodoStatus ?? fallbackAgentStatus ?? persistedTodoStatus;
+      const agentStatus = resolveSidebarAgentStatus({
+        useAggregatorState,
+        activity,
+        // A finished plan stays in the TODO chip until the next turn starts. Between turns the
+        // sidebar keeps the agent's own status (its status_set, or the AI summary) instead of
+        // the plan's last step, as when the plan cleared at the turn's end.
+        todos: canInterrupt || !isTodoListFinished(aggregatorTodos) ? aggregatorTodos : EMPTY_TODOS,
+        // A plain getter: reading it for inactive workspaces too has no side effect.
+        aggregatorAgentStatus: aggregator.getAgentStatus(),
+      });
       const activeWorkflowRunIds = activity?.activeWorkflowRunIds ?? EMPTY_ACTIVE_WORKFLOW_RUN_IDS;
       const activeWorkflowRunCount = activity?.activeWorkflowRunCount ?? 0;
       const activeBashMonitorCount = activity?.activeBashMonitorCount ?? 0;
@@ -2638,7 +3070,7 @@ export class WorkspaceStore {
     const aggregator = this.assertGet(workspaceId);
     const transient = this.assertChatTransientState(workspaceId);
     const hasMessages = aggregator.hasMessages();
-    const isActiveWorkspace = this.activeOnChatWorkspaceId === workspaceId;
+    const isActiveWorkspace = this.onChatControllers.has(workspaceId);
 
     // Keep this selector lighter than getWorkspaceState(): the shell only needs enough
     // state to decide placeholder vs mounted chat. Avoid rebuilding the full displayed
@@ -2769,11 +3201,17 @@ export class WorkspaceStore {
   }
 
   /**
-   * A composer applied a restore naming these held inputs (#4448): hide them now and ask the
-   * backend to drop its copy. If the backend refuses, show them again: a visible duplicate of
-   * what the composer holds is recoverable, a hidden held copy is not.
+   * A composer applied a restore naming these held inputs (#4448): hide them now (the composer
+   * shows the restored draft), and once `durable` resolves true (the draft write is confirmed by
+   * the backend) ask the backend to drop its copy. If the draft is not durable or the backend
+   * refuses, show them again: a visible duplicate of what the composer holds is recoverable, a
+   * hidden held copy is not.
    */
-  acceptRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
+  acceptRestoredHeldInputs(
+    workspaceId: string,
+    heldInputIds: readonly string[],
+    durable: Promise<boolean>
+  ): void {
     assert(workspaceId.length > 0, "acceptRestoredHeldInputs requires a workspaceId");
     assert(heldInputIds.length > 0, "acceptRestoredHeldInputs requires held input ids");
     this.acceptedRestoreHeldInputs.set(
@@ -2782,6 +3220,25 @@ export class WorkspaceStore {
     );
     this.states.bump(workspaceId);
 
+    durable.then(
+      (isDurable) => {
+        if (isDurable) {
+          this.discardRestoredHeldInputs(workspaceId, heldInputIds);
+          return;
+        }
+        for (const heldInputId of heldInputIds) {
+          this.showRestoredHeldInputAgain(workspaceId, heldInputId, "restored draft not durable");
+        }
+      },
+      (error: unknown) => {
+        for (const heldInputId of heldInputIds) {
+          this.showRestoredHeldInputAgain(workspaceId, heldInputId, error);
+        }
+      }
+    );
+  }
+
+  private discardRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
     const client = this.client;
     for (const heldInputId of heldInputIds) {
       if (!client) {
@@ -2907,6 +3364,7 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
+  /** Loads the page before the oldest loaded row: a bounded (windowed) page of the epoch (#4961). */
   async loadOlderHistory(workspaceId: string): Promise<HistoryLoadResult> {
     assert(
       typeof workspaceId === "string" && workspaceId.length > 0,
@@ -2956,10 +3414,20 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
 
     try {
-      const result = await client.workspace.history.loadMore({
+      let result = await client.workspace.history.loadMore({
         workspaceId,
         cursor: requestedCursor,
+        windowed: true,
       });
+      if (result.notPageable === true) {
+        // The rows before the cursor cannot be cut into bounded pages: today's unbounded page
+        // for the same cursor is contiguous with what this client holds. Accepted limitation:
+        // such sessions (rare) load the rest of the epoch at once.
+        console.debug(
+          `[WorkspaceStore] windowed loadMore not pageable for ${workspaceId}; loading an unbounded page`
+        );
+        result = await client.workspace.history.loadMore({ workspaceId, cursor: requestedCursor });
+      }
 
       const aggregator = this.aggregators.get(workspaceId);
       const latestPagination = this.historyPagination.get(workspaceId);
@@ -2987,12 +3455,16 @@ export class WorkspaceStore {
         );
       }
 
+      requestToolCardsForRows(historicalMessages);
       if (historicalMessages.length > 0) {
         aggregator.loadHistoricalMessages(historicalMessages, false, {
           mode: "append",
           skipDerivedState: true,
         });
         this.consumerManager.scheduleCalculation(workspaceId, aggregator);
+      }
+      if (!result.hasOlder || historicalMessages.some(isDurableCompactionBoundaryMarker)) {
+        aggregator.markEpochStartLoaded();
       }
 
       this.historyPagination.set(workspaceId, {
@@ -3002,6 +3474,9 @@ export class WorkspaceStore {
       });
       if (historicalMessages.length > 0) {
         this.lastUserPromptStore.bump(workspaceId);
+        // The per-turn prompt-cache table reads the aggregator's messages: older turns
+        // must show without waiting for an unrelated usage update.
+        this.usageStore.bump(workspaceId);
       }
       return "loaded";
     } catch (error) {
@@ -3098,8 +3573,7 @@ export class WorkspaceStore {
     );
 
     const { promise, resolve } = Promise.withResolvers<TranscriptRefreshOutcome>();
-    const loopSignal =
-      this.activeOnChatWorkspaceId === workspaceId ? this.activeOnChatSignal : null;
+    const loopSignal = this.onChatControllers.get(workspaceId)?.signal ?? null;
     if (!loopSignal) {
       // Not subscribed: the composer that asked is no longer looking at this workspace.
       resolve({ kind: "cancelled" });
@@ -3291,8 +3765,7 @@ export class WorkspaceStore {
    */
   isWorkspaceChatReplayPending(workspaceId: string): boolean {
     return (
-      this.activeOnChatWorkspaceId === workspaceId &&
-      this.chatReplayPendingWorkspaces.has(workspaceId)
+      this.onChatControllers.has(workspaceId) && this.chatReplayPendingWorkspaces.has(workspaceId)
     );
   }
 
@@ -3396,42 +3869,11 @@ export class WorkspaceStore {
         }
       }
 
-      // Get last message's context usage — only search within the current
-      // compaction epoch. Pre-boundary messages carry stale contextUsage from
-      // before compaction; including them inflates the usage indicator and
-      // triggers premature auto-compaction.
-      const lastContextUsage = (() => {
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const msg = messages[i];
-          if (isDurableCompactionBoundaryMarker(msg)) {
-            // Idle/manual compaction boundary messages can include a post-compaction
-            // context estimate. Read it before breaking so context usage does not
-            // disappear when switching back to a compacted workspace.
-            const rawUsage = msg.metadata?.contextUsage;
-            if (rawUsage && msg.role === "assistant") {
-              const msgModel = msg.metadata?.model ?? model ?? "unknown";
-              return createDisplayUsage(rawUsage, msgModel, undefined);
-            }
-            break;
-          }
-          if (msg.role === "assistant") {
-            if (msg.metadata?.compacted) continue;
-            const rawUsage = msg.metadata?.contextUsage;
-            const providerMeta =
-              msg.metadata?.contextProviderMetadata ?? msg.metadata?.providerMetadata;
-            if (rawUsage) {
-              const msgModel = msg.metadata?.model ?? model ?? "unknown";
-              return createDisplayUsage(
-                rawUsage,
-                msgModel,
-                providerMeta,
-                this.resolveMetadataModel(msgModel)
-              );
-            }
-          }
-        }
-        return undefined;
-      })();
+      const lastContextUsage = findLastContextUsage(messages, model, (msgModel) =>
+        this.resolveMetadataModel(msgModel)
+      );
+
+      const recentTurnCacheHealth = getRecentTurnCacheHealth(messages, sessionData?.forkedAt);
 
       // Live streaming data (unchanged)
       const activeStreamId = aggregator.getActiveStreamMessageId();
@@ -3475,12 +3917,14 @@ export class WorkspaceStore {
       return {
         sessionTotal,
         sessionByModel,
+        ...getSubagentUsageFields(this.subagentUsage.get(workspaceId), sessionData),
         lastRequest,
         lastContextUsage,
         totalTokens,
         liveUsage,
         liveCostUsage,
         liveMetadataModel,
+        recentTurnCacheHealth,
       };
     });
   }
@@ -3638,10 +4082,7 @@ export class WorkspaceStore {
         }
         this.workspaceStats.delete(workspaceId);
 
-        // Clear MapStore caches for this workspace.
-        // MapStore.delete() is version-gated, so bump first to ensure we clear even
-        // if the key was only ever read (get()) and never bumped.
-        this.statsStore.bump(workspaceId);
+        // delete also clears snapshots that were read before the first update.
         this.statsStore.delete(workspaceId);
         return;
       }
@@ -3778,6 +4219,8 @@ export class WorkspaceStore {
     // - Clear liveUsage once the active stream ends
     // - Pick up lastContextUsage changes from merged message metadata
     this.usageStore.bump(workspaceId);
+    // Usage changes were skipped while the stream was live (isOwnStreamLive).
+    this.refreshSessionUsage(workspaceId);
 
     // Always schedule consumer calculation (tool calls, text, etc. need tokenization)
     // Even streams without usage metadata need token counts recalculated
@@ -3880,14 +4323,7 @@ export class WorkspaceStore {
       (previous?.activeBashMonitorCount ?? 0) !== (snapshot?.activeBashMonitorCount ?? 0) ||
       !areAgentStatusesEqual(previous?.displayStatus, snapshot?.displayStatus) ||
       !areAgentStatusesEqual(previous?.todoStatus, snapshot?.todoStatus) ||
-      previous?.goal?.goalId !== snapshot?.goal?.goalId ||
-      previous?.goal?.status !== snapshot?.goal?.status ||
-      previous?.goal?.objective !== snapshot?.goal?.objective ||
-      previous?.goal?.costCents !== snapshot?.goal?.costCents ||
-      previous?.goal?.turnsUsed !== snapshot?.goal?.turnsUsed ||
-      previous?.goal?.budgetCents !== snapshot?.goal?.budgetCents ||
-      previous?.goal?.turnCap !== snapshot?.goal?.turnCap ||
-      previous?.goal?.pendingPersistence !== snapshot?.goal?.pendingPersistence;
+      !areActivityGoalsEqual(previous?.goal, snapshot?.goal);
 
     if (!changed) {
       return;
@@ -3904,7 +4340,7 @@ export class WorkspaceStore {
     }
 
     const didBackgroundStreamingGenerationAdvance =
-      workspaceId !== this.activeWorkspaceId &&
+      !this.isWorkspaceOnScreen(workspaceId) &&
       previous?.streaming === true &&
       snapshot?.streaming === true &&
       previous.streamingGeneration !== undefined &&
@@ -3919,14 +4355,10 @@ export class WorkspaceStore {
 
     const stoppedStreamingSnapshot =
       previous?.streaming === true && snapshot?.streaming === false ? snapshot : null;
-    // Activity snapshots only collapse for background workspaces — active workspaces
-    // already collapse from onChat stream-end/stream-abort, which is faster and authoritative.
-    // Firing here too would let a late async snapshot override the user re-expanding the panel.
-    if (stoppedStreamingSnapshot && !this.isOnChatSubscriptionActive(workspaceId)) {
-      collapsePinnedTodoOnStreamStop(workspaceId, stoppedStreamingSnapshot.hasTodos === true);
-    }
+    // The pinned side chat is on screen with a live onChat loop, so like the routed chat it
+    // gets completion from onChat stream-end, never an activity-driven background notification.
     const isBackgroundStreamingStop =
-      stoppedStreamingSnapshot !== null && workspaceId !== this.activeWorkspaceId;
+      stoppedStreamingSnapshot !== null && !this.isWorkspaceOnScreen(workspaceId);
     const streamStartRecency = this.activityStreamingStartRecency.get(workspaceId);
     const recencyAdvancedSinceStreamStart =
       stoppedStreamingSnapshot !== null &&
@@ -3987,6 +4419,7 @@ export class WorkspaceStore {
     snapshots: Record<string, WorkspaceActivitySnapshot>,
     skipWorkspaceIds?: ReadonlySet<string>
   ): void {
+    this.refreshShownUsageAfterResubscribe();
     const seenWorkspaceIds = new Set<string>();
 
     for (const [workspaceId, snapshot] of Object.entries(snapshots)) {
@@ -4188,8 +4621,7 @@ export class WorkspaceStore {
         if (event.type === "heartbeat") return;
         queueMicrotask(() => {
           if (signal.aborted || attemptSignal.aborted) return;
-          this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
-          this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
+          this.applyActivityEvent(event);
         });
       },
       onUnexpectedEnd: () =>
@@ -4204,6 +4636,40 @@ export class WorkspaceStore {
         }
       },
     });
+  }
+
+  private applyActivityEvent(
+    event: Exclude<ActivitySubscriptionEvent, { type: "heartbeat" }>
+  ): void {
+    if (event.type === "usage-changed") {
+      // Not tracked for a list retry: the list's activity for this id is still the newest.
+      this.refreshUsageAfterChange(event.workspaceId);
+      return;
+    }
+    this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
+    this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
+  }
+
+  /**
+   * A resubscribed activity subscription does not replay the usage-changed events it missed,
+   * so every shown workspace refetches its usage as for a change of its own. The first list
+   * needs none: registration and activation fetch.
+   */
+  private refreshShownUsageAfterResubscribe(): void {
+    if (!this.activityAuthoritative) {
+      return;
+    }
+    for (const workspaceId of this.workspaceMetadata.keys()) {
+      if (!this.isUsageShown(workspaceId)) {
+        continue;
+      }
+      // The ledger waits for a live own stream's end (isOwnStreamLive); the projection does not.
+      if (this.isOwnStreamLive(workspaceId)) {
+        this.refreshSubagentUsage(workspaceId);
+      } else {
+        this.refreshSessionUsage(workspaceId);
+      }
+    }
   }
 
   /**
@@ -4344,17 +4810,6 @@ export class WorkspaceStore {
 
     // Reset per-workspace transient state so the next replay rebuilds from the backend source of truth.
     const previousTransient = this.chatTransientState.get(workspaceId);
-    // Release keyed advisor channels before the transient maps are replaced:
-    // they are the only record of these tool-call IDs, so the caught-up and
-    // workspace-removal sweeps can never rediscover the keys afterwards.
-    if (previousTransient) {
-      for (const toolCallId of new Set([
-        ...previousTransient.liveAdvisorOutput.keys(),
-        ...previousTransient.liveAdvisorReasoning.keys(),
-      ])) {
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-      }
-    }
     const nextTransient = createInitialChatTransientState();
 
     // Preserve active hydration across full replay resets so workspace-switch catch-up
@@ -4377,6 +4832,36 @@ export class WorkspaceStore {
   }
 
   /**
+   * onChat loop error policy: log the error, and return true to stop the loop when retrying
+   * cannot help (a refused session tape replay, or a workspace removed during validation).
+   */
+  private handleOnChatError(workspaceId: string, error: unknown, attemptAborted: boolean): boolean {
+    const abortError = isAbortError(error);
+    if (attemptAborted) {
+      if (!abortError)
+        console.warn(
+          "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
+        );
+    } else if (isSessionTapeReplayRefusal(error)) {
+      // Perf harness (XUM_REPLAY_TAPES): this workspace is mapped to a tape the backend
+      // cannot serve. Retrying cannot help and there is no live fallback: show the refusal
+      // and stop the loop.
+      this.showSessionTapeReplayRefusal(workspaceId, error.message);
+      return true;
+    } else if (isIteratorValidationFailed(error)) {
+      if (!this.isWorkspaceRegistered(workspaceId)) return true;
+      console.error(
+        "[WorkspaceStore] Event validation failed for " + workspaceId + ": " + error.message
+      );
+    } else if (!abortError)
+      console.error(
+        "[WorkspaceStore] Error in onChat subscription for " + workspaceId + ":",
+        error
+      );
+    return false;
+  }
+
+  /**
    * Subscribe to workspace chat events (history replay + live streaming).
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
    */
@@ -4386,65 +4871,12 @@ export class WorkspaceStore {
       signal,
       // A failed replay still delivers queue snapshots and a caught-up; only a complete
       // replay proves the attempt worked, so only that resets the retry backoff.
-      isSuccessEvent: (event: WorkspaceChatMessage) =>
-        isCaughtUpMessage(event) && event.historyReplayStatus === "complete",
+      isSuccessEvent: (event: OnChatEvent) =>
+        event.type === "caught-up" && event.historyReplayStatus === "complete",
       getClient: async (attemptSignal) => this.client ?? (await this.waitForClient(attemptSignal)),
       getClientChangeSignal: () => this.clientChangeController.signal,
-      subscribe: async (client, attemptSignal, abortAttempt) => {
-        const transient = this.chatTransientState.get(workspaceId);
-        if (transient) {
-          transient.caughtUp = false;
-          transient.historyVerified = false;
-          // Every attempt replays, including retries that keep the same client and cached rows.
-          if (!transient.isHydratingTranscript) {
-            transient.isHydratingTranscript = true;
-            this.states.bump(workspaceId);
-          }
-          if (transient.cachedTranscriptStale) {
-            this.armStaleSkeletonDeadline(workspaceId);
-          }
-        }
-        const aggregator = this.aggregators.get(workspaceId);
-        let mode: OnChatMode | undefined;
-        const attemptContext: OnChatAttemptContext = { abort: abortAttempt, loopSignal: signal };
-        // A refresh request pending at attempt start owns this attempt (and every retry the
-        // loop makes until it settles); its caught-up is the request's fresh baseline.
-        const refreshRequest = this.transcriptRefreshRequests.get(workspaceId);
-        if (refreshRequest) attemptContext.refreshRequest = refreshRequest;
-        this.currentOnChatAttempts.set(workspaceId, attemptContext);
-        if (aggregator) {
-          mode = getOnChatReplayMode(aggregator);
-          if (mode?.type === "since") {
-            attemptContext.since = {
-              requestedAnchorSequence: mode.cursor.history.historySequence,
-              localActiveStreamMessageId: mode.cursor.stream?.messageId,
-            };
-          }
-        }
-        const autoRetryKey = getAutoRetryKey(workspaceId);
-        const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
-        const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
-        if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
-          updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        const input =
-          legacyAutoRetryEnabled === undefined
-            ? { workspaceId, mode }
-            : { workspaceId, mode, legacyAutoRetryEnabled };
-        const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
-        if (legacyAutoRetryEnabled !== undefined)
-          updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        const isFullReplay = !mode || mode.type === "full";
-        if (isFullReplay) this.resetChatStateForReplay(workspaceId);
-        const established = this.chatTransientState.get(workspaceId);
-        if (established) {
-          established.onChatIteratorOpen = true;
-          established.fullReplayInFlight = isFullReplay;
-          if (isFullReplay) {
-            this.armStaleSkeletonDeadline(workspaceId);
-          }
-        }
-        return { events: iterator, context: attemptContext };
-      },
+      subscribe: (client, attemptSignal, abortAttempt) =>
+        this.openOnChatAttempt(workspaceId, signal, client, attemptSignal, abortAttempt),
       onEvent: (data, attemptContext, attemptSignal) =>
         queueMicrotask(() => {
           if (!signal.aborted && !attemptSignal.aborted)
@@ -4458,53 +4890,9 @@ export class WorkspaceStore {
                 workspaceId +
                 "; retrying..."
         ),
-      onError: (error, { attemptAborted }) => {
-        const abortError = isAbortError(error);
-        if (attemptAborted) {
-          if (!abortError)
-            console.warn(
-              "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
-            );
-        } else if (isIteratorValidationFailed(error)) {
-          if (!this.isWorkspaceRegistered(workspaceId)) return true;
-          console.error(
-            "[WorkspaceStore] Event validation failed for " +
-              workspaceId +
-              ": " +
-              formatValidationError(error)
-          );
-        } else if (!abortError)
-          console.error(
-            "[WorkspaceStore] Error in onChat subscription for " + workspaceId + ":",
-            error
-          );
-      },
-      onAttemptFinished: () => {
-        // The transport withholds this callback once the loop signal is aborted, so the entry
-        // is this loop's own attempt; the guard keeps that true by construction should a
-        // replacement loop (switch away and back) ever register first.
-        if (this.currentOnChatAttempts.get(workspaceId)?.loopSignal === signal) {
-          this.currentOnChatAttempts.delete(workspaceId);
-        }
-        if (!this.isWorkspaceRegistered(workspaceId)) return;
-        this.clearReplayBuffers(workspaceId);
-        // An attempt that ended without caught-up (transport error, stall watchdog) opens
-        // the replay gate anyway, so deferred git/PR probes cannot wait forever on retries.
-        const openedReplayGate = this.chatReplayPendingWorkspaces.delete(workspaceId);
-        const transient = this.chatTransientState.get(workspaceId);
-        if (transient) {
-          // Backoff is still catch-up; cleared stream buffers must also invalidate cached barriers.
-          transient.isHydratingTranscript = true;
-        }
-        if (transient || openedReplayGate) {
-          this.states.bump(workspaceId);
-        }
-        if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
-          this.usageStore.bump(workspaceId);
-        const existingPagination =
-          this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
-        this.historyPagination.set(workspaceId, { ...existingPagination, loading: false });
-      },
+      onError: (error, { attemptAborted }) =>
+        this.handleOnChatError(workspaceId, error, attemptAborted),
+      onAttemptFinished: () => this.finishOnChatAttempt(workspaceId, signal),
     });
     // The loop is over (signal aborted, client gone, or a stop from onError): no attempt of
     // this loop can deliver a baseline anymore. Switch/dispose already settled `cancelled`;
@@ -4519,6 +4907,114 @@ export class WorkspaceStore {
         error: TRANSCRIPT_REFRESH_SUBSCRIPTION_ENDED_ERROR,
       });
     }
+  }
+
+  /**
+   * Open one onChat attempt of the subscription loop: mark the transcript as hydrating, tag the
+   * attempt (refresh ownership, since cursor), subscribe, and reset for a full replay.
+   */
+  private async openOnChatAttempt(
+    workspaceId: string,
+    signal: AbortSignal,
+    client: RouterClient<AppRouter>,
+    attemptSignal: AbortSignal,
+    abortAttempt: () => void
+  ): Promise<{ events: AsyncIterable<OnChatEvent>; context: OnChatAttemptContext }> {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) {
+      transient.caughtUp = false;
+      transient.historyVerified = false;
+      // Every attempt replays, including retries that keep the same client and cached rows.
+      if (!transient.isHydratingTranscript) {
+        transient.isHydratingTranscript = true;
+        this.states.bump(workspaceId);
+      }
+      if (transient.cachedTranscriptStale) {
+        this.armStaleSkeletonDeadline(workspaceId);
+      }
+    }
+    const aggregator = this.aggregators.get(workspaceId);
+    let mode: OnChatMode | undefined;
+    const attemptContext: OnChatAttemptContext = { abort: abortAttempt, loopSignal: signal };
+    // A refresh request pending at attempt start owns this attempt (and every retry the
+    // loop makes until it settles); its caught-up is the request's fresh baseline.
+    const refreshRequest = this.transcriptRefreshRequests.get(workspaceId);
+    if (refreshRequest) attemptContext.refreshRequest = refreshRequest;
+    this.currentOnChatAttempts.set(workspaceId, attemptContext);
+    if (aggregator) {
+      mode = getOnChatReplayMode(aggregator);
+      if (mode?.type === "since") {
+        attemptContext.since = {
+          requestedAnchorSequence: mode.cursor.history.historySequence,
+          localActiveStreamMessageId: mode.cursor.stream?.messageId,
+        };
+      }
+    }
+    const { input, legacyAutoRetryEnabled } = buildOnChatInput(workspaceId, mode);
+    const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
+    // The backend took over the legacy setting: drop it only after the subscribe succeeded.
+    if (legacyAutoRetryEnabled !== undefined)
+      updatePersistedState<boolean | undefined>(getAutoRetryKey(workspaceId), undefined);
+    const isFullReplay = !mode || mode.type === "full";
+    if (isFullReplay) this.resetChatStateForReplay(workspaceId);
+    const established = this.chatTransientState.get(workspaceId);
+    if (established) {
+      established.onChatIteratorOpen = true;
+      established.fullReplayInFlight = isFullReplay;
+      if (isFullReplay) {
+        this.armStaleSkeletonDeadline(workspaceId);
+      }
+    }
+    return { events: iterator, context: attemptContext };
+  }
+
+  /** Clean up after one onChat attempt ended, before the loop retries (or stops). */
+  private finishOnChatAttempt(workspaceId: string, signal: AbortSignal): void {
+    // The transport withholds this callback once the loop signal is aborted, so the entry
+    // is this loop's own attempt; the guard keeps that true by construction should a
+    // replacement loop (switch away and back) ever register first.
+    if (this.currentOnChatAttempts.get(workspaceId)?.loopSignal === signal) {
+      this.currentOnChatAttempts.delete(workspaceId);
+    }
+    if (!this.isWorkspaceRegistered(workspaceId)) return;
+    this.clearReplayBuffers(workspaceId);
+    // An attempt that ended without caught-up (transport error, stall watchdog) opens
+    // the replay gate anyway, so deferred git/PR probes cannot wait forever on retries.
+    const openedReplayGate = this.chatReplayPendingWorkspaces.delete(workspaceId);
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) {
+      // Backoff is still catch-up; cleared stream buffers must also invalidate cached barriers.
+      transient.isHydratingTranscript = true;
+    }
+    if (transient || openedReplayGate) {
+      this.states.bump(workspaceId);
+    }
+    if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
+      this.usageStore.bump(workspaceId);
+    const existingPagination =
+      this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
+    this.historyPagination.set(workspaceId, { ...existingPagination, loading: false });
+  }
+
+  /**
+   * End hydration for a workspace whose session tape replay was refused and show the reason as
+   * an error row. The onChat loop stops (no attempt-finished hook runs), so this also clears the
+   * attempt's buffers and opens the replay gate. History stays unverified, so the send barrier
+   * stays closed.
+   */
+  private showSessionTapeReplayRefusal(workspaceId: string, message: string): void {
+    if (!this.isWorkspaceRegistered(workspaceId)) return;
+    this.clearReplayBuffers(workspaceId);
+    this.chatReplayPendingWorkspaces.delete(workspaceId);
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) transient.isHydratingTranscript = false;
+    this.assertGet(workspaceId).handleStreamError({
+      type: "stream-error",
+      messageId: "session-tape-replay-refused",
+      error: message,
+      errorType: "session_tape_replay",
+    });
+    this.states.bump(workspaceId);
   }
 
   /**
@@ -4544,6 +5040,9 @@ export class WorkspaceStore {
     // Store metadata for name lookup
     this.workspaceMetadata.set(workspaceId, metadata);
     this.derived.bump("workspaces");
+    // A new sub-agent changes its ancestors' open sub-agents, and its usage may have changed
+    // before this parent link was known (listAncestorIds found no ancestors then).
+    this.refreshAncestorSubagentUsage(workspaceId);
 
     // Backend guarantees createdAt via config.ts - this should never be undefined
     assert(
@@ -4578,7 +5077,7 @@ export class WorkspaceStore {
     aggregator.clearActiveStreams();
 
     // Registration must not fetch usage for every workspace in the sidebar.
-    if (this.activeWorkspaceId === workspaceId || this.usageStore.hasKeySubscribers(workspaceId)) {
+    if (this.isWorkspaceOnScreen(workspaceId) || this.usageStore.hasKeySubscribers(workspaceId)) {
       this.refreshSessionUsage(workspaceId);
     }
 
@@ -4586,7 +5085,7 @@ export class WorkspaceStore {
     this.subscribeToStats(workspaceId);
     this.subscribeToTimeline(workspaceId);
 
-    this.ensureActiveOnChatSubscription();
+    this.ensureOnChatSubscriptions();
 
     if (!this.client) {
       console.warn(`[WorkspaceStore] No ORPC client available for workspace ${workspaceId}`);
@@ -4647,6 +5146,9 @@ export class WorkspaceStore {
    * Remove a workspace and clean up subscriptions.
    */
   removeWorkspace(workspaceId: string): void {
+    // Before the metadata goes: the ancestor walk reads this workspace's parent link.
+    this.refreshAncestorSubagentUsage(workspaceId);
+
     // Clean up consumer manager state
     this.consumerManager.removeWorkspace(workspaceId);
 
@@ -4655,21 +5157,13 @@ export class WorkspaceStore {
     this.cancelPendingStreamingBump(workspaceId);
     this.streamingStatsStore.delete(workspaceId);
     this.releaseStreamingMessageChannel(workspaceId);
-    const transientForRemoval = this.chatTransientState.get(workspaceId);
-    if (transientForRemoval) {
-      for (const toolCallId of new Set([
-        ...transientForRemoval.liveAdvisorOutput.keys(),
-        ...transientForRemoval.liveAdvisorReasoning.keys(),
-      ])) {
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-      }
-    }
     this.lastUserPromptStore.bump(workspaceId);
     this.lastUserPromptStore.delete(workspaceId);
 
     if (this.activeWorkspaceId === workspaceId) {
       this.activeWorkspaceId = null;
     }
+    this.pinnedWorkspaces.delete(workspaceId);
 
     const statsUnsubscribe = this.statsUnsubscribers.get(workspaceId);
     if (statsUnsubscribe) {
@@ -4682,15 +5176,8 @@ export class WorkspaceStore {
       this.timelineUnsubscribers.delete(workspaceId);
     }
 
-    const unsubscribe = this.ipcUnsubscribers.get(workspaceId);
-    if (unsubscribe) {
-      unsubscribe();
-      this.ipcUnsubscribers.delete(workspaceId);
-    }
-    if (this.activeOnChatWorkspaceId === workspaceId) {
-      this.activeOnChatWorkspaceId = null;
-      this.activeOnChatSignal = null;
-    }
+    this.onChatControllers.get(workspaceId)?.abort();
+    this.onChatControllers.delete(workspaceId);
     this.chatReplayPendingWorkspaces.delete(workspaceId);
     this.currentOnChatAttempts.delete(workspaceId);
     // A pending refresh can never get its baseline from a removed workspace.
@@ -4731,8 +5218,10 @@ export class WorkspaceStore {
     this.preReplayUsageSnapshot.delete(workspaceId);
     this.sessionUsage.delete(workspaceId);
     this.sessionUsageRequestVersion.delete(workspaceId);
+    this.subagentUsage.delete(workspaceId);
+    this.subagentUsageFetches.delete(workspaceId);
 
-    this.ensureActiveOnChatSubscription();
+    this.ensureOnChatSubscriptions();
     this.derived.bump("recency");
   }
 
@@ -4761,13 +5250,13 @@ export class WorkspaceStore {
       }
     }
 
-    // Re-evaluate the active subscription after additions/removals.
-    // removeWorkspace can null activeWorkspaceId when the removed workspace
-    // was active (e.g., stale singleton state between integration tests),
-    // leaving addWorkspace's ensureActiveOnChatSubscription targeting the
-    // old workspace. This final call reconciles the subscription with the
-    // current activeWorkspaceId + registration state.
-    this.ensureActiveOnChatSubscription();
+    // Re-evaluate live subscriptions after additions/removals.
+    // removeWorkspace can clear active/pinned ownership when the removed workspace
+    // was visible (e.g., stale singleton state between integration tests),
+    // leaving addWorkspace's ensureOnChatSubscriptions targeting the old workspace.
+    // This final call reconciles the subscriptions with the current active/pinned ids
+    // + registration state.
+    this.ensureOnChatSubscriptions();
   }
 
   /**
@@ -4792,10 +5281,10 @@ export class WorkspaceStore {
     }
     this.currentOnChatAttempts.clear();
 
-    for (const unsubscribe of this.ipcUnsubscribers.values()) {
-      unsubscribe();
+    for (const controller of this.onChatControllers.values()) {
+      controller.abort();
     }
-    this.ipcUnsubscribers.clear();
+    this.onChatControllers.clear();
 
     if (this.activityAbortController) {
       this.activityAbortController.abort();
@@ -4812,8 +5301,7 @@ export class WorkspaceStore {
     this.clientChangeController.abort();
 
     this.activeWorkspaceId = null;
-    this.activeOnChatWorkspaceId = null;
-    this.activeOnChatSignal = null;
+    this.pinnedWorkspaces.clear();
     this.chatReplayPendingWorkspaces.clear();
     this.pendingReplayReset.clear();
     this.states.clear();
@@ -4919,9 +5407,11 @@ export class WorkspaceStore {
       this.workspaceCreatedAt.set(workspaceId, createdAt);
     } else if (unarchivedAt) {
       // Update unarchivedAt on existing aggregator (e.g., after restore from archive)
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       this.aggregators.get(workspaceId)!.setUnarchivedAt(unarchivedAt);
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     return this.aggregators.get(workspaceId)!;
   }
 
@@ -4947,14 +5437,11 @@ export class WorkspaceStore {
       return false;
     }
 
-    // Buffer high-frequency stream events (including bash/task/advisor live updates) until
+    // Buffer high-frequency stream events (including bash/task live updates) until
     // caught-up so full-replay reconnects can deterministically rebuild transient state.
     return (
       data.type in this.bufferedEventHandlers ||
       data.type === "bash-output" ||
-      data.type === "advisor-output" ||
-      data.type === "advisor-reasoning-output" ||
-      data.type === "advisor-phase" ||
       data.type === "task-created" ||
       data.type === "workflow-run-attached"
     );
@@ -4962,9 +5449,15 @@ export class WorkspaceStore {
 
   private handleChatMessage(
     workspaceId: string,
-    data: WorkspaceChatMessage,
+    data: OnChatEvent,
     attemptContext?: OnChatAttemptContext
   ): void {
+    // Replay batch (#4868): consecutive history rows grouped to save one frame per row. Each row
+    // takes the single-row path, which old servers and non-batchable rows still use.
+    if (data.type === "message-batch") {
+      for (const row of data.messages) this.handleChatMessage(workspaceId, row, attemptContext);
+      return;
+    }
     // Aggregator must exist - workspaces are initialized in addWorkspace() before subscriptions run.
     const aggregator = this.assertGet(workspaceId);
 
@@ -4981,9 +5474,9 @@ export class WorkspaceStore {
         // closed, and abort the attempt so the loop retries with increasing backoff.
         assert(!transient.caughtUp, "a failed caught-up must not arrive after catch-up");
         transient.historicalMessages.length = 0;
-        // The retry snapshot is only replayed while a retry is scheduled, so its absence is
-        // authoritative: a retry that resolved while disconnected must not keep its banner
-        // (and Stop) alive through the outage.
+        // The retry snapshot is only replayed while a retry is scheduled or abandoned, so its
+        // absence is authoritative: a retry that resolved while disconnected must not keep its
+        // banner (and Stop) alive through the outage.
         transient.autoRetryStatus = null;
         // Held inputs are replayed only while non-empty (like the retry snapshot).
         transient.heldInputs = NO_HELD_INPUTS;
@@ -5102,27 +5595,16 @@ export class WorkspaceStore {
         // Clear stale interruption suppression state so retry UI is derived solely
         // from the replayed transcript instead of a pre-disconnect abort reason.
         aggregator.clearLastAbortReason();
+
+        // Every full replay replaces the window seed (#4961), absent included: a stale seed must
+        // not survive a window that reached the epoch start.
+        aggregator.setWindowSeed(data.windowSeed ?? null);
       }
 
-      if (replay === "full" || !data.cursor?.stream || streamContextMismatched) {
-        // Live tool-call UI is tied to the active stream context; clear it when replay
-        // replaces history, reports no active stream, or reports a different stream ID.
-        const clearedAdvisorToolCallIds = new Set([
-          ...transient.liveAdvisorOutput.keys(),
-          ...transient.liveAdvisorReasoning.keys(),
-        ]);
-        transient.liveBashOutput.clear();
-        transient.liveAdvisorOutput.clear();
-        transient.liveAdvisorReasoning.clear();
-        transient.liveAdvisorPhase.clear();
-        transient.liveWorkflowRuns.clear();
-        transient.liveTaskIds.clear();
-        // delete() notifies subscribers, so mounted advisor cards re-read null
-        // instead of keeping pre-reconnect live output.
-        for (const toolCallId of clearedAdvisorToolCallIds) {
-          this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-        }
-      }
+      clearStaleLiveToolState(transient, {
+        replacesHistory: replay === "full",
+        streamGone: !data.cursor?.stream || streamContextMismatched,
+      });
 
       if (sinceContext) {
         // Since replay: the replayed rows are the authoritative suffix for
@@ -5202,6 +5684,7 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
       // No-op unless this is the workspace the latest switch targeted.
       markChatSwitchMilestone(workspaceId, "caught-up", { replay });
+      this.preloadToolCardsOnce();
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
 
       // Replay resets clear the aggregator before history is rebuilt. Drop the temporary
@@ -5276,6 +5759,14 @@ export class WorkspaceStore {
       return;
     }
 
+    if (isPluginHookNoticeEvent(data) || isGoalBudgetLimitedEvent(data)) {
+      // Live-only toasts: the server never saves or replays them, and they change no rows. Show
+      // them at once, never buffered, so no caught-up outcome (a failed replay drops the buffer)
+      // can lose them.
+      this.processStreamEvent(workspaceId, aggregator, data);
+      return;
+    }
+
     if (!transient.caughtUp && this.isBufferedEvent(data)) {
       const shouldApplyImmediately =
         isStreamLifecycle(data) ||
@@ -5312,6 +5803,36 @@ export class WorkspaceStore {
     this.processStreamEvent(workspaceId, aggregator, data);
   }
 
+  /** Applies a whole message that arrived live, after the history caught up. */
+  private applyLiveMuxMessage(
+    workspaceId: string,
+    aggregator: StreamingMessageAggregator,
+    data: ChatMuxMessage
+  ): void {
+    applyWorkspaceChatEventToAggregator(aggregator, data);
+    // The row that accepts a send carries its id: resolve that send's draft entry.
+    if (data.role === "user" && Array.isArray(data.metadata?.sendIds)) {
+      getDraftStore().onSendEvent(workspaceId, data.metadata.sendIds);
+    }
+
+    const muxMeta = data.metadata?.muxMetadata as { type?: string } | undefined;
+    const isCompactionBoundarySummary =
+      data.role === "assistant" &&
+      (data.metadata?.compactionBoundary === true || muxMeta?.type === "compaction-summary");
+
+    if (isCompactionBoundarySummary) {
+      // Live compaction prunes older messages inside the aggregator; refresh the
+      // pagination cursor so "Load more" starts from the new oldest visible sequence.
+      this.historyPagination.set(workspaceId, this.deriveHistoryPaginationState(aggregator));
+    }
+
+    // Whole messages can change the last human prompt; token/tool deltas cannot.
+    this.lastUserPromptStore.bump(workspaceId);
+    this.states.bump(workspaceId);
+    this.usageStore.bump(workspaceId);
+    this.checkAndBumpRecencyIfChanged();
+  }
+
   private processStreamEvent(
     workspaceId: string,
     aggregator: StreamingMessageAggregator,
@@ -5322,9 +5843,8 @@ export class WorkspaceStore {
       const transient = this.assertChatTransientState(workspaceId);
 
       // Suppress side effects during buffered replay (we're just hydrating UI state), but allow
-      // live errors to trigger mux-gateway session-expired handling even before we're "caught up".
-      // In particular, mux-gateway 401s can surface as a pre-stream stream-error (before any
-      // stream-start) during startup/reconnect.
+      // them for live errors even before we're "caught up": a pre-stream stream-error (before any
+      // stream-start) can arrive during startup/reconnect.
       const allowSideEffects = !transient.replayingHistory;
 
       applyWorkspaceChatEventToAggregator(aggregator, data, { allowSideEffects });
@@ -5339,6 +5859,8 @@ export class WorkspaceStore {
       this.releaseStreamingMessageChannel(workspaceId);
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
+      // Usage changes were skipped while the stream was live (isOwnStreamLive).
+      this.refreshSessionUsage(workspaceId);
       return;
     }
 
@@ -5367,61 +5889,6 @@ export class WorkspaceStore {
 
       // High-frequency: throttle UI updates like other delta-style events.
       this.scheduleIdleStateBump(workspaceId);
-      return;
-    }
-
-    if (isAdvisorOutputEvent(data)) {
-      if (data.text.length === 0) return;
-
-      const transient = this.assertChatTransientState(workspaceId);
-      if (
-        !appendAdvisorLiveText(
-          transient.liveAdvisorOutput,
-          data.toolCallId,
-          data.text,
-          data.timestamp
-        )
-      ) {
-        return;
-      }
-
-      this.advisorLiveStore.bump(getAdvisorLiveKey(workspaceId, data.toolCallId));
-      return;
-    }
-
-    if (isAdvisorReasoningOutputEvent(data)) {
-      if (data.text.length === 0) return;
-
-      const transient = this.assertChatTransientState(workspaceId);
-      if (
-        !appendAdvisorLiveText(
-          transient.liveAdvisorReasoning,
-          data.toolCallId,
-          data.text,
-          data.timestamp
-        )
-      ) {
-        return;
-      }
-
-      this.advisorLiveStore.bump(getAdvisorLiveKey(workspaceId, data.toolCallId));
-      return;
-    }
-
-    if (isAdvisorPhaseEvent(data)) {
-      const transient = this.assertChatTransientState(workspaceId);
-      const prev = transient.liveAdvisorPhase.get(data.toolCallId);
-
-      // Avoid unnecessary re-renders if the phase is unchanged.
-      if (prev?.phase === data.phase) return;
-
-      transient.liveAdvisorPhase.set(data.toolCallId, {
-        phase: data.phase,
-        timestamp: data.timestamp,
-      });
-
-      // Low-frequency: bump immediately so advisor progress updates feel responsive.
-      this.states.bump(workspaceId);
       return;
     }
 
@@ -5465,28 +5932,13 @@ export class WorkspaceStore {
       const transient = this.assertChatTransientState(workspaceId);
 
       if (!transient.caughtUp) {
-        // Buffer historical XumMessages
+        // Buffer historical XumMessages. A tool call starts the lazy cards' download, which
+        // then runs in parallel with the rest of the replay.
+        requestToolCardsForRows([data]);
         transient.historicalMessages.push(data);
       } else {
         // Process live events immediately (after history loaded)
-        applyWorkspaceChatEventToAggregator(aggregator, data);
-
-        const muxMeta = data.metadata?.muxMetadata as { type?: string } | undefined;
-        const isCompactionBoundarySummary =
-          data.role === "assistant" &&
-          (data.metadata?.compactionBoundary === true || muxMeta?.type === "compaction-summary");
-
-        if (isCompactionBoundarySummary) {
-          // Live compaction prunes older messages inside the aggregator; refresh the
-          // pagination cursor so "Load more" starts from the new oldest visible sequence.
-          this.historyPagination.set(workspaceId, this.deriveHistoryPaginationState(aggregator));
-        }
-
-        // Whole messages can change the last human prompt; token/tool deltas cannot.
-        this.lastUserPromptStore.bump(workspaceId);
-        this.states.bump(workspaceId);
-        this.usageStore.bump(workspaceId);
-        this.checkAndBumpRecencyIfChanged();
+        this.applyLiveMuxMessage(workspaceId, aggregator, data);
       }
       return;
     }
@@ -5632,6 +6084,21 @@ export function useWorkspaceShellStatus(workspaceId: string): WorkspaceShellStat
 }
 
 /**
+ * Keep `workspaceId`'s onChat subscription live while the calling component is mounted (the
+ * /side chat tab pane renders a second transcript next to the routed chat). Pass null to opt
+ * out without unmounting.
+ */
+export function usePinnedWorkspaceChat(workspaceId: string | null): void {
+  // Each mounted pane owns its release, so split-pane unmount order cannot unpin its peers.
+  useEffect(() => {
+    if (!workspaceId) {
+      return;
+    }
+    return getStoreInstance().acquirePinnedWorkspace(workspaceId);
+  }, [workspaceId]);
+}
+
+/**
  * Hook to access the raw store for imperative operations.
  */
 export function useWorkspaceStoreRaw(): WorkspaceStore {
@@ -5759,66 +6226,23 @@ export function useBashToolLiveOutput(
 }
 
 /**
- * Hook to get UI-only live output for a running advisor tool call.
+ * The sandbox approval a bash call waits for (null when none), and whether it is the newest one
+ * of its workspace, which the keyboard shortcuts answer.
  */
-export function useAdvisorToolLiveOutput(
+export function useBashSandboxApproval(
   workspaceId: string | undefined,
   toolCallId: string | undefined
-): AdvisorLiveOutputState | null {
+): { approval: BashSandboxApprovalView; isLatest: boolean } | null {
   const store = getStoreInstance();
-
-  return useSyncExternalStore(
-    (listener) => {
-      if (!workspaceId || !toolCallId) return () => undefined;
-      return store.subscribeAdvisorLive(workspaceId, toolCallId, listener);
-    },
-    () => {
-      if (!workspaceId || !toolCallId) return null;
-      return store.getAdvisorToolLiveOutput(workspaceId, toolCallId);
-    }
+  const subscribe = (listener: () => void) =>
+    workspaceId ? store.subscribeKey(workspaceId, listener) : () => undefined;
+  const approval = useSyncExternalStore(subscribe, () =>
+    workspaceId && toolCallId ? store.getBashSandboxApproval(workspaceId, toolCallId) : null
   );
-}
-
-/**
- * Hook to get UI-only live reasoning for a running advisor tool call.
- */
-export function useAdvisorToolLiveReasoning(
-  workspaceId: string | undefined,
-  toolCallId: string | undefined
-): AdvisorLiveReasoningState | null {
-  const store = getStoreInstance();
-
-  return useSyncExternalStore(
-    (listener) => {
-      if (!workspaceId || !toolCallId) return () => undefined;
-      return store.subscribeAdvisorLive(workspaceId, toolCallId, listener);
-    },
-    () => {
-      if (!workspaceId || !toolCallId) return null;
-      return store.getAdvisorToolLiveReasoning(workspaceId, toolCallId);
-    }
+  const latestToolCallId = useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getLatestBashSandboxApprovalToolCallId(workspaceId) : null
   );
-}
-
-/**
- * Hook to get UI-only live advisor phase for a running advisor tool call.
- */
-export function useAdvisorToolLivePhase(
-  workspaceId: string | undefined,
-  toolCallId: string | undefined
-): AdvisorLivePhaseState | undefined {
-  const store = getStoreInstance();
-
-  return useSyncExternalStore(
-    (listener) => {
-      if (!workspaceId) return () => undefined;
-      return store.subscribeKey(workspaceId, listener);
-    },
-    () => {
-      if (!workspaceId || !toolCallId) return undefined;
-      return store.getAdvisorToolLivePhase(workspaceId, toolCallId);
-    }
-  );
+  return approval ? { approval, isLatest: latestToolCallId === approval.toolCallId } : null;
 }
 
 /**
@@ -5981,6 +6405,31 @@ export function removeEphemeralMessage(workspaceId: string, messageId: string): 
 }
 
 /**
+ * Session cost usage as the cost displays show it: the persisted ledger (own turns plus removed
+ * sub-agents), open sub-agents, and the running stream.
+ */
+export function sumSessionCostUsage(usage: WorkspaceUsageState): ChatUsageDisplay | undefined {
+  const parts: ChatUsageDisplay[] = [];
+  if (usage.sessionTotal) parts.push(usage.sessionTotal);
+  if (usage.subagentTotal) parts.push(usage.subagentTotal);
+  if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
+  return parts.length > 0 ? sumUsageHistory(parts) : undefined;
+}
+
+/** Token count of sumSessionCostUsage, so every session token display shows the same tree total. */
+export function sumSessionTokens(usage: WorkspaceUsageState): number {
+  const total = sumSessionCostUsage(usage);
+  if (!total) return 0;
+  return (
+    total.input.tokens +
+    total.cached.tokens +
+    total.cacheCreate.tokens +
+    total.output.tokens +
+    total.reasoning.tokens
+  );
+}
+
+/**
  * Hook for usage metadata (instant, no tokenization).
  * Updates immediately when usage metadata arrives from API responses.
  */
@@ -6059,7 +6508,8 @@ export function useWorkspaceStreamingStats(workspaceId: string): WorkspaceStream
     () => store.getWorkspaceStreamingStats(workspaceId),
     [store, workspaceId]
   );
-  return useSyncExternalStore(subscribe, getSnapshot);
+  // Server rendering of TypewriterMarkdown (static workspace view) needs a server snapshot.
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
 /**

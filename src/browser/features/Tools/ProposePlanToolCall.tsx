@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useSyncExternalStore } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import type {
   ProposePlanToolResult,
   ProposePlanToolError,
@@ -28,7 +28,9 @@ import {
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { useStartHere } from "@/browser/hooks/useStartHere";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { createMuxMessage } from "@/common/types/message";
@@ -36,54 +38,26 @@ import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { TranscriptQuoteRoot } from "../Messages/TranscriptQuoteBoundary";
 import { cn } from "@/common/lib/utils";
 import { useAPI } from "@/browser/contexts/API";
-import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  getAgentIdKey,
-  getModelKey,
-  getReasoningModeKey,
-  getAutoRoutingChoiceByAgentKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
-import {
-  isModelAllowedByPolicyOnActiveRoute,
-  isProviderConfigured,
-} from "@/common/utils/ai/selectableModels";
-import { isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
-import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
-import type { EffectivePolicy } from "@/common/orpc/types";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import { applyAutoRoutingOutcome, setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   useHostTranscriptMutationAllowed,
   useHostTranscriptMutationCheck,
 } from "@/browser/utils/transcriptBarrier";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { flushUserPreferences, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
-import {
-  resolveAutoRoutingForAgent,
-  resolveWorkspaceAiSettingsForAgent,
-  type AutoRoutingChoiceByAgent,
-  type AutoRoutingOutcome,
-  type WorkspaceAISettingsCache,
-} from "@/browser/utils/workspaceModeAi";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ReviewActionCallbacks } from "../Shared/InlineReviewNote";
 import { isPlanFilePath, normalizePlanFilePath } from "@/common/types/review";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import {
   Check,
   Clipboard,
@@ -102,7 +76,6 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
-import { normalizeSelectedModel } from "@/common/utils/ai/models";
 
 /**
  * Check if the result is a successful file-based propose_plan result.
@@ -160,26 +133,6 @@ function isLegacyProposePlanArgs(args: unknown): args is LegacyProposePlanToolAr
 }
 
 /**
- * #4980: whether admin policy lets `model` run, checked on the route the backend would use (the
- * model picker's check). Null while the providers or routing config is unknown: the route is
- * unknown then (a gateway may be allowed), so the backend decides. Reads the shared stores at
- * dispatch time instead of subscribing every plan card to them.
- */
-function isPlanModelAllowedByPolicy(policy: EffectivePolicy | null, model: string): boolean | null {
-  const providersConfig = getProvidersConfigStore().getConfig();
-  const routing = getAppConfigStore().getSnapshot();
-  if (providersConfig === null || routing === null) return null;
-  return isModelAllowedByPolicyOnActiveRoute(
-    policy,
-    normalizeSelectedModel(model),
-    routing.routePriority ?? DEFAULT_ROUTE_PRIORITY,
-    routing.routeOverrides ?? {},
-    (provider) => isProviderConfigured(providersConfig, provider),
-    (gateway, modelId) => isGatewayModelAccessibleForUi(policy, providersConfig, gateway, modelId)
-  );
-}
-
-/**
  * True while the user is typing in a field that has content. The plan-action shortcut must not
  * fire then (#4963); from an empty composer it may.
  */
@@ -190,17 +143,6 @@ function isTypingInNonEmptyField(element: Element | null): boolean {
     return element.value.trim() !== "";
   }
   return (element.textContent ?? "").trim() !== "";
-}
-
-/** Resolved (not yet persisted) AI settings for a plan action's target agent. */
-interface TargetAgentSettings {
-  resolvedModel: string;
-  resolvedThinking: ThinkingLevel;
-  resolvedReasoningMode: OpenAIReasoningMode;
-  existingModel: string;
-  existingThinking: ThinkingLevel;
-  existingReasoning: OpenAIReasoningMode;
-  autoRouting: AutoRoutingOutcome;
 }
 
 interface ProposePlanToolCallProps {
@@ -271,9 +213,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // also implicitly scopes lookups away from neighbouring tool calls/transcripts.
   const planContentRef = useRef<HTMLDivElement>(null);
   const { api } = useAPI();
-  const { waitForPreferencePersisted } = useUserPreferencePersistence();
-  const { agentId: currentAgentId, agents } = useAgent();
-  const autoRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const { agentId: currentAgentId } = useAgent();
   const isAutoMode = currentAgentId === "auto";
   const openInEditor = useOpenInEditor();
   const workspaceContext = useOptionalWorkspaceContext();
@@ -300,18 +240,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // silently sending without the replacement.
   // Live from the shared app config store (refreshed on config changes), so a setting change
   // while the card is mounted updates the affordance. Dispatch re-reads the config anyway.
-  const appConfig = useSyncExternalStore(
-    getAppConfigStore().subscribe,
-    getAppConfigStore().getSnapshot
-  );
-  const implementReplacesChatHistory = appConfig?.proposePlanImplementReplacesChatHistory ?? false;
+  const implementReplacesChatHistory =
+    useAppConfig((config) => config.proposePlanImplementReplacesChatHistory) ?? false;
   const canReplaceChatHistory =
     useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
-  // #4980: before the first policy answer, PolicyProvider reports no policy, so nothing is refused.
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (remount case) - not for in-flight tools
@@ -473,6 +406,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     setAnnotateMode(false);
   }, [canAnnotate]);
 
+  // The latest plan in the main chat and in the /side chat tab can both be mounted; only the pane
+  // owning the focused element toggles its plan's annotate mode.
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     // Scope the global annotate shortcut to the latest non-ephemeral plan tool call.
     // Ephemeral previews can still use the button, but should not all toggle together.
@@ -484,7 +420,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || isEditableElement(event.target)) {
+      if (
+        event.defaultPrevented ||
+        isEditableElement(event.target) ||
+        !paneHandlesKeyEvent(paneScope, event.target)
+      ) {
         return;
       }
 
@@ -504,7 +444,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canAnnotate, isPlanVisible, isLatest, isEphemeralPreviewMode]);
+  }, [canAnnotate, isPlanVisible, isLatest, isEphemeralPreviewMode, paneScope]);
 
   // When using "Start Here" (replace chat history), the plan is already included in the
   // conversation *only* when the Propose Plan tool result includes full plan text.
@@ -560,93 +500,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
   };
 
-  // User request: propose_plan primary actions send immediately after agent switch.
-  // Resolve and persist model/thinking synchronously here so the follow-up message
-  // uses the target agent defaults instead of stale planning-mode preferences.
-  /**
-   * The AI settings a plan action switches the workspace to. Pure read: nothing is persisted
-   * until `persistTargetAgentSettings` runs, so the handlers can await their preconditions
-   * (preference persistence, the transcript barrier) before any side effect.
-   */
-  const resolveTargetAgentSettings = (args: {
-    workspaceId: string;
-    targetAgentId: "auto" | "exec";
-  }): TargetAgentSettings => {
-    const modelKey = getModelKey(args.workspaceId);
-    const thinkingKey = getThinkingLevelKey(args.workspaceId);
-    const reasoningKey = getReasoningModeKey(args.workspaceId);
-    const fallbackModel = getDefaultModel();
-
-    const existingModel = readPersistedState<string>(modelKey, fallbackModel);
-    const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
-    const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
-    const agentAiDefaults = readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {});
-    const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
-      getWorkspaceAISettingsByAgentKey(args.workspaceId),
-      {}
-    );
-
-    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
-    const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
-      resolveWorkspaceAiSettingsForAgent({
-        agentId: args.targetAgentId,
-        agentAiDefaults,
-        // Propose-plan actions are explicit mode switches; honor any per-agent
-        // workspace override before inheriting the previously active plan settings.
-        workspaceByAgent,
-        useWorkspaceByAgentFallback: true,
-        fallbackModel,
-        existingModel,
-        existingThinking,
-        existingReasoningMode: existingReasoning,
-        agentBaseById,
-      });
-    const autoRouting = resolveAutoRoutingForAgent({
-      agentId: args.targetAgentId,
-      agentAiDefaults,
-      agentBaseById,
-      explicitSwitch: true,
-      experimentEnabled: autoRoutingEnabled,
-      routingChoices: readPersistedState<AutoRoutingChoiceByAgent>(
-        getAutoRoutingChoiceByAgentKey(args.workspaceId),
-        {}
-      ),
-    });
-
-    return {
-      resolvedModel,
-      resolvedThinking,
-      resolvedReasoningMode,
-      existingModel,
-      existingThinking,
-      existingReasoning,
-      autoRouting,
-    };
-  };
-
-  /** Switch the workspace to the resolved agent settings (synchronous, right before the send). */
-  const persistTargetAgentSettings = (args: {
-    workspaceId: string;
-    targetAgentId: "auto" | "exec";
-    settings: TargetAgentSettings;
-  }): void => {
-    const { settings } = args;
-    updatePersistedState(getAgentIdKey(args.workspaceId), args.targetAgentId);
-
-    if (settings.existingModel !== settings.resolvedModel) {
-      setWorkspaceModelWithOrigin(args.workspaceId, settings.resolvedModel, "agent");
-    }
-    if (settings.existingThinking !== settings.resolvedThinking) {
-      updatePersistedState(getThinkingLevelKey(args.workspaceId), settings.resolvedThinking);
-    }
-    // Persist before getSendOptionsFromStorage reads the key for the follow-up send.
-    if (settings.existingReasoning !== settings.resolvedReasoningMode) {
-      updatePersistedState(getReasoningModeKey(args.workspaceId), settings.resolvedReasoningMode);
-    }
-    // Persist routing for later composer sends; the immediate action below disables routing.
-    applyAutoRoutingOutcome(args.workspaceId, settings.autoRouting);
-  };
-
   /**
    * One plan action ("Implement the plan" as exec, or Continue in Auto). Ordering matters:
    * every await and the final barrier check come BEFORE the irreversible steps (the optional
@@ -672,27 +525,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
     if (shouldReplaceChatHistory && !canReplaceChatHistory) return null;
 
-    const settings = resolveTargetAgentSettings({
-      workspaceId,
-      targetAgentId: args.targetAgentId,
-    });
-    // #4980: a target model the admin policy excludes would switch the workspace (and maybe
-    // replace history) and then be rejected by the backend. There is no policy fallback here:
-    // the desktop composer has none, and substituting a model would silently change what runs.
-    // Refuse before any side effect and say why. The backend stays authoritative for policy
-    // changes after this render; its rejection is shown below.
-    if (isPlanModelAllowedByPolicy(effectivePolicy, settings.resolvedModel) === false) {
-      const agentName =
-        agents.find((agent) => agent.id === args.targetAgentId)?.name ?? args.targetAgentId;
-      return `Admin policy does not allow ${settings.resolvedModel}, the model for ${agentName}. Choose an allowed model for that agent and try again.`;
-    }
     // Same barrier as the composer: the backend reads the send model's auto-compaction
     // threshold from persisted preferences, so a slider move right before this click must
     // reach config.json first. A failed save lands in the handlers' best-effort catch.
-    await waitForPreferencePersisted(
-      { kind: "autoCompactionThreshold", model: settings.resolvedModel },
-      new AbortController().signal
-    );
+    await flushUserPreferences();
 
     // Final re-check after every await; nothing has been changed yet.
     if (!isTranscriptMutationAllowed(workspaceId)) return null;
@@ -702,24 +538,38 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         errorContext: args.replacementErrorContext,
       });
     }
-    persistTargetAgentSettings({ workspaceId, targetAgentId: args.targetAgentId, settings });
+    setWorkspaceAgentPick(workspaceId, args.targetAgentId);
+    // The target agent's resolved model, thinking level and Auto choices.
     const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
+    const options = {
+      ...sendMessageOptions,
+      agentId: args.targetAgentId,
+      // The target agent's model and thinking level are explicit; classifying
+      // "Implement the plan" would reroute them based on a prompt that says nothing
+      // about the plan's difficulty.
+      autoModelRouting: false,
+      autoThinkingLevel: false,
+      // The agent's later composer sends keep its Auto choices.
+      savedAutoRouting: {
+        model: sendMessageOptions.autoModelRouting === true,
+        thinkingLevel: sendMessageOptions.autoThinkingLevel === true,
+      },
+    };
+    // Picks the send carries, consumed like a composer send's.
+    const aiSelection = getAiSelectionIntentForSendOptions(
+      workspaceId,
+      args.targetAgentId,
+      options
+    );
     const sendResult = await api.workspace.sendMessage({
       workspaceId,
       message: "Implement the plan",
-      options: {
-        ...sendMessageOptions,
-        agentId: args.targetAgentId,
-        model: settings.resolvedModel,
-        thinkingLevel: settings.resolvedThinking,
-        // The target agent's model and thinking level are explicit; classifying
-        // "Implement the plan" would reroute them based on a prompt that says nothing
-        // about the plan's difficulty.
-        autoModelRouting: false,
-        autoThinkingLevel: false,
-      },
+      options,
     });
-    if (sendResult.success) return null;
+    if (sendResult.success) {
+      consumeAiSelectionIntent(workspaceId, args.targetAgentId, aiSelection);
+      return null;
+    }
     const formatted = formatSendMessageError(sendResult.error);
     return formatted.resolutionHint
       ? `${formatted.message} ${formatted.resolutionHint}`
@@ -913,9 +763,18 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       if (!matchesKeybind(event, KEYBINDS.RUN_LATEST_PLAN_ACTION)) return;
       // A focused control already handled it (the agent picker treats Alt+Enter as Enter).
       if (event.defaultPrevented) return;
+      // The /side chat tab's transcript is never the selected workspace, so it is gated by focus
+      // instead: it runs its plan only while focus is inside the side pane, the main one otherwise.
+      if (!paneHandlesKeyEvent(paneScope, event.target)) return;
       // Only the selected workspace's transcript (a sub-agent transcript may show its own plan).
       // Hosts without a workspace context (the webview) show one transcript.
-      if (selectedWorkspaceId !== undefined && selectedWorkspaceId !== workspaceId) return;
+      if (
+        paneScope === "main" &&
+        selectedWorkspaceId !== undefined &&
+        selectedWorkspaceId !== workspaceId
+      ) {
+        return;
+      }
       if (isTypingInNonEmptyField(document.activeElement)) return;
       event.preventDefault();
       if (event.repeat) return;
@@ -1050,7 +909,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         <ClipboardList aria-hidden="true" className="h-4 w-4" />
         <div className="text-plan-mode font-mono text-[13px] font-semibold">{planTitle}</div>
         {annotateMode && (
-          <div className="bg-accent/10 text-accent rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
+          <div className="bg-accent/10 text-accent-text rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
             Annotating
           </div>
         )}

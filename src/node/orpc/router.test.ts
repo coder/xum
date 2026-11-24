@@ -1,20 +1,31 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/require-await, local/no-sync-fs-methods */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_OVERRIDES_FILE_NAME,
+  ExperimentsService,
+} from "@/node/services/experimentsService";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import { Err, Ok, type Result } from "@/common/types/result";
+import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
 import { AutoModelRouterTag } from "@/node/services/di/tags";
 import type { AutoModelRouter, AutoModelRouterFailure } from "@/node/services/autoModelRouter";
 
+import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 import { inFlightProcedureCount } from "./inFlightProcedures";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { router } from "./router";
+// The Node layer: the skill routes read through host runtimes.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 describe("config.previewAutoModelRouting", () => {
   const PREVIEW_TIERS = {
@@ -28,9 +39,9 @@ describe("config.previewAutoModelRouting", () => {
   function createPreviewClient(outcome: Result<AutoModelRoutingDecision, AutoModelRouterFailure>) {
     const classifyEffect = mock((_input: unknown) => Effect.succeed(outcome));
     const recordHeadlessUsage = mock((..._args: unknown[]) => Promise.resolve(undefined));
-    const context = {
+    const context = orpcContextFromDoubles({
       config: {
-        loadConfigOrDefault: () => ({}),
+        loadConfigOrDefault: () => ({ projects: new Map() }),
         // Only ws-live is registered; a stale persisted selection resolves to nothing.
         findWorkspace: (workspaceId: string) =>
           workspaceId === "ws-live" ? { workspacePath: "/repo/ws", projectPath: "/repo" } : null,
@@ -40,7 +51,7 @@ describe("config.previewAutoModelRouting", () => {
       "effect/context": Context.make(AutoModelRouterTag, {
         classifyEffect,
       } as unknown as AutoModelRouter),
-    } as unknown as ORPCContext;
+    });
     return {
       client: createRouterClient(router(), { context }),
       classifyEffect,
@@ -139,14 +150,32 @@ describe("config.previewAutoModelRouting", () => {
   });
 });
 
+describe("router drafts.update", () => {
+  test("the size refusal reaches the client with its message, so it is not retried", async () => {
+    const message = draftTooLargeMessage(41 * 1024 * 1024);
+    const context = orpcContextFromDoubles({
+      draftService: { update: mock(() => Promise.reject(new Error(message))) },
+    });
+    const client = createRouterClient(router(), { context });
+
+    let refused: unknown;
+    await client.drafts
+      .update({ scope: { kind: "workspace", workspaceId: "ws-1" }, text: "x" })
+      .catch((error: unknown) => (refused = error));
+    expect(refused).toBeInstanceOf(ORPCError);
+    expect((refused as ORPCError<string, unknown>).code).toBe("BAD_REQUEST");
+    expect(isDraftTooLargeError(refused)).toBe(true);
+  });
+});
+
 describe("router terminal.create", () => {
   test("a structural mutation's refusal reaches the client with its message (#4476)", async () => {
     const message = "Workspace ws-1 is being renamed, removed or archived by pid 42";
-    const context = {
+    const context = orpcContextFromDoubles({
       terminalService: {
         create: mock(() => Promise.reject(new WorkspaceMutationInProgressError(message))),
       },
-    } as unknown as ORPCContext;
+    });
     const client = createRouterClient(router(), { context });
 
     let refused: unknown;
@@ -203,36 +232,37 @@ describe("router agent skill routes", () => {
         "dir"
       );
 
-      const context = {
+      const context = orpcContextFromDoubles({
         config: new Config(tempDir),
         initStateManager: { waitForInit: mock(async () => undefined) },
         aiService: {
+          runtimeFactory: nodeRuntimeFactory,
           resolveXumToolScopeForWorkspace: mock(() => ({
-            type: "project",
+            type: "project" as const,
             xumHome: tempDir,
             projectRoot: subProjectPath,
-            projectStorageAuthority: "host-local",
+            projectStorageAuthority: "host-local" as const,
             checkoutRoot,
           })),
           getWorkspaceMetadata: mock(async () => ({
-            success: true,
+            success: true as const,
             data: {
               id: "workspace-1",
               name: "workspace-1",
+              projectName: "repo",
               projectPath: checkoutRoot,
-              namedWorkspacePath: checkoutRoot,
               subProjectPath,
               runtimeConfig: { type: "local", srcBaseDir: tempDir },
-            },
+            } satisfies WorkspaceMetadata,
           })),
         },
         experimentsService: {
           isExperimentEnabled: mock(() => false),
         },
-      } as unknown as ORPCContext;
+      });
       const client = createRouterClient(router(), { context });
 
-      const skills = await client.agentSkills.list({ workspaceId: "workspace-1" });
+      const { skills } = await client.agentSkills.list({ workspaceId: "workspace-1" });
       expect(skills.find((skill) => skill.name === "parent-only")).toMatchObject({
         description: "from checkout",
         scope: "project",
@@ -271,39 +301,42 @@ describe("router agent skill routes", () => {
         "---\nname: parent-only\ndescription: Parent skill\n---\nHost parent body\n"
       );
 
-      const context = {
+      const context = orpcContextFromDoubles({
         config: new Config(tempDir),
         initStateManager: { waitForInit: mock(async () => undefined) },
         aiService: {
+          runtimeFactory: nodeRuntimeFactory,
           resolveXumToolScopeForWorkspace: mock(() => ({
-            type: "project",
+            type: "project" as const,
             xumHome: tempDir,
             projectRoot: subProjectPath,
-            projectStorageAuthority: "host-local",
+            projectStorageAuthority: "host-local" as const,
             checkoutRoot,
           })),
           getWorkspaceMetadata: mock(async () => ({
-            success: true,
+            success: true as const,
             data: {
               id: "workspace-1",
               name: "workspace-1",
+              projectName: "repo",
               projectPath: checkoutRoot,
-              namedWorkspacePath: checkoutRoot,
               subProjectPath,
               runtimeConfig: {
                 type: "devcontainer",
                 configPath: ".devcontainer/devcontainer.json",
               },
-            },
+            } satisfies WorkspaceMetadata,
           })),
         },
         experimentsService: {
           isExperimentEnabled: mock(() => false),
         },
-      } as unknown as ORPCContext;
+      });
       const client = createRouterClient(router(), { context });
 
-      await expect(client.agentSkills.list({ workspaceId: "workspace-1" })).resolves.toContainEqual(
+      await expect(
+        client.agentSkills.list({ workspaceId: "workspace-1" }).then((result) => result.skills)
+      ).resolves.toContainEqual(
         expect.objectContaining({
           name: "parent-only",
           description: "Parent skill",
@@ -340,16 +373,17 @@ describe("router agent skill routes", () => {
         });
         return current;
       });
-      const context = {
+      const context = orpcContextFromDoubles({
         config,
+        aiService: { runtimeFactory: nodeRuntimeFactory },
         experimentsService: {
           isExperimentEnabled: mock(() => false),
         },
-      } as unknown as ORPCContext;
+      });
       const client = createRouterClient(router(), { context });
 
       await expect(
-        client.agentSkills.list({ projectPath: subProjectPath })
+        client.agentSkills.list({ projectPath: subProjectPath }).then((result) => result.skills)
       ).resolves.toContainEqual(
         expect.objectContaining({
           name: "parent-only",
@@ -377,9 +411,155 @@ describe("router config transcript mutation", () => {
   });
 
   function createContext(): ORPCContext {
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- Only Config is used by this route.
-    return { config } as ORPCContext;
+    const telemetryService = {
+      setFeatureFlagVariant: () => undefined,
+    } as unknown as TelemetryService;
+    return orpcContextFromDoubles({
+      config,
+      experimentsService: new ExperimentsService({ telemetryService, xumHome: tempDir }),
+      taskService: { maybeStartQueuedTasks: () => Promise.resolve() },
+      perfFlightRecorder: {
+        beginRpcCall: () => null,
+        openRpcSubscription: () => null,
+        setEnabled: () => undefined,
+      },
+      perfCaptures: { setEnabled: () => undefined },
+    });
   }
+
+  test("experiments.set signals onConfigChanged and the next getConfig carries the value", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(false);
+
+    const controller = new AbortController();
+    const changes = await client.config.onConfigChanged(undefined, { signal: controller.signal });
+    const changed = changes.next();
+    await client.experiments.set({ experimentId: ptc, enabled: true });
+    expect((await changed).done).toBe(false);
+    controller.abort();
+
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(true);
+  });
+
+  test("getConfig adopts experiment writes another backend made on disk", async () => {
+    const context = createContext();
+    const recorderEnabled = spyOn(context.perfFlightRecorder, "setEnabled");
+    const client = createRouterClient(router(), { context });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    const perf = EXPERIMENT_IDS.PERF_FLIGHT_RECORDER;
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(false);
+
+    fs.writeFileSync(
+      path.join(tempDir, EXPERIMENT_OVERRIDES_FILE_NAME),
+      JSON.stringify({ version: 1, experiments: {}, overrides: { [ptc]: true, [perf]: true } })
+    );
+
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(true);
+    expect(recorderEnabled).toHaveBeenLastCalledWith(true);
+  });
+
+  test("updateUserPreferences refuses an invalid value and keeps the stored one", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    await client.config.updateUserPreferences({
+      patches: [{ appearance: { transcriptDensity: "hyper" } }],
+    });
+
+    const outcome = await client.config
+      .updateUserPreferences({ patches: [{ appearance: { transcriptDensity: "bogus" } }] })
+      .then(
+        () => "resolved",
+        (error: ORPCError<string, unknown>) => error.code
+      );
+
+    expect(outcome).toBe("BAD_REQUEST");
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { transcriptDensity: "hyper" },
+    });
+  });
+
+  test("updateUserPreferences refuses values that loading would discard", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    const stored = {
+      navigation: { projectOrder: ["/repo/a"] },
+      ai: { projectDefaults: { "/repo/a": { model: "openai:gpt-4.1" } } },
+    };
+    await client.config.updateUserPreferences({ patches: [stored] });
+
+    const badge = { enabled: true, template: "", position: "top-left", fontSize: 20, opacity: 0 };
+    for (const patch of [
+      { ai: { projectDefaults: { "/repo/a": { model: "nonsense" } } } },
+      { ai: { projectDefaults: { "/repo/a": { agentId: " " } } } },
+      { ai: { globalDefaults: { agentId: " " } } },
+      { navigation: { projectOrder: ["/repo/a", " "] } },
+      { appearance: { terminalBadgeConfig: badge } },
+      { appearance: { terminalFontConfig: { fontFamily: " " } } },
+      { appearance: { editorConfig: { editor: "custom", customCommand: " " } } },
+      { workspaceCreation: { byProject: { "/repo/a": { trunkBranch: " " } } } },
+      { review: { defaultBaseByProject: { "/repo/a": " " } } },
+    ]) {
+      const outcome = await client.config.updateUserPreferences({ patches: [patch] }).then(
+        () => "resolved",
+        (error: ORPCError<string, unknown>) => error.code
+      );
+      expect(outcome).toBe("BAD_REQUEST");
+    }
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual(stored);
+  });
+
+  test("terminal font family and size are patched and cleared independently", async () => {
+    const clientA = createRouterClient(router(), { context: createContext() });
+    const clientB = createRouterClient(router(), { context: createContext() });
+
+    await clientA.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontSize: 16 } } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontFamily: "Menlo" } } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontFamily: null } } }],
+    });
+
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { terminalFontConfig: { fontSize: 16 } },
+    });
+  });
+
+  test("updateUserPreferences merges patches from separate clients and null deletes a key", async () => {
+    const clientA = createRouterClient(router(), { context: createContext() });
+    const clientB = createRouterClient(router(), { context: createContext() });
+
+    await clientA.config.updateUserPreferences({
+      patches: [{ appearance: { vimEnabled: true } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { theme: "dark" } }, { navigation: { launchBehavior: "new-chat" } }],
+    });
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { vimEnabled: true, theme: "dark" },
+      navigation: { launchBehavior: "new-chat" },
+    });
+
+    await clientA.config.updateUserPreferences({ patches: [{ appearance: { vimEnabled: null } }] });
+    expect((await clientB.config.getConfig()).userPreferences).toEqual({
+      appearance: { theme: "dark" },
+      navigation: { launchBehavior: "new-chat" },
+    });
+  });
+
+  test("saveConfig ignores a full userPreferences snapshot from an old bundle", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    await client.config.updateUserPreferences({ patches: [{ appearance: { theme: "dark" } }] });
+
+    await client.config.saveConfig({
+      userPreferences: { appearance: { theme: "light" } },
+    } as Parameters<typeof client.config.saveConfig>[0]);
+
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { theme: "dark" },
+    });
+  });
 
   test("persists the full-width chat transcript config flag", async () => {
     const client = createRouterClient(router(), { context: createContext() });
@@ -411,12 +591,25 @@ describe("router config transcript mutation", () => {
     expect(config.getKeepScreenAwakeEnabled()).toBe(false);
   });
 
+  test("persists the tool-search opt-out and treats an absent key as enabled", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(true);
+    await client.config.updateToolSearchEnabled({ enabled: false });
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(false);
+    expect(new Config(config.rootDir).loadConfigOrDefault().toolSearchEnabled).toBe(false);
+
+    await client.config.updateToolSearchEnabled({ enabled: true });
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(true);
+    expect(new Config(config.rootDir).loadConfigOrDefault().toolSearchEnabled).toBeUndefined();
+  });
+
   test("refuses procedure calls once the server has begun shutting down", async () => {
     let shuttingDown = false;
-    const context = {
+    const context = orpcContextFromDoubles({
       config,
       serverService: { isShuttingDown: () => shuttingDown },
-    } as unknown as ORPCContext;
+    });
     const client = createRouterClient(router(), { context });
     expect(await client.general.ping("alive")).toBe("Pong: alive");
 
@@ -436,14 +629,14 @@ describe("router config transcript mutation", () => {
     const writeStarted = new Promise<void>((resolve) => (started = resolve));
     let finish!: () => void;
     const write = new Promise<void>((resolve) => (finish = resolve));
-    const context = {
+    const context = orpcContextFromDoubles({
       config: {
         markSplashScreenViewed: () => {
           started();
           return write;
         },
       },
-    } as unknown as ORPCContext;
+    });
     const client = createRouterClient(router(), { context });
     const controller = new AbortController();
     const call = client.splashScreens

@@ -13,6 +13,25 @@ export const WORKSPACE_STREAMING_STATUS_TRANSITION_MS = 150;
  */
 export const APPROX_CHARS_PER_TOKEN = 4;
 
+/**
+ * Largest streaming row (in UTF-16 chars) that paints synchronously when it mounts mid-stream
+ * (#5555). Above it the row keeps Streamdown's deferred streaming mode and can show empty for a
+ * few frames. Measured in production Chrome with code-heavy replies (a ts fence and a table about
+ * every 520 chars), flushSync mount p50/p95: 20k chars 37.7/40.8 ms, 30k chars 69.8/74.8 ms. The
+ * cap keeps the synchronous mount under the 50 ms budget with margin.
+ */
+export const STATIC_STREAMING_MOUNT_MAX_CHARS = 20_000;
+
+/**
+ * Rows above STATIC_STREAMING_MOUNT_MAX_CHARS that mount mid-stream render as chunks of whole
+ * markdown blocks, each a static render, so no transition is needed (#5647). A chunk of about
+ * this many chars keeps each chunk render, and so each streaming delta, short.
+ */
+export const CHUNKED_STREAMING_CHUNK_CHARS = 2_000;
+
+/** Older chunks of such a row mount this many per animation frame, after its last chunk. */
+export const CHUNKED_STREAMING_CHUNKS_PER_FRAME = 4;
+
 export const STREAM_SMOOTHING = {
   /** Baseline reveal speed in characters per second when no live model rate is known yet. */
   BASE_CHARS_PER_SEC: 72,

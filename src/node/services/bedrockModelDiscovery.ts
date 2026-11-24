@@ -12,24 +12,21 @@ import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig
 import type { ProviderModelDiscoveryResult } from "@/common/orpc/types";
 import { MODEL_DISCOVERY_LIMITS } from "@/constants/modelDiscovery";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
-import type { ModelDiscoveryRequest } from "./providerModelDiscovery";
 
 type Unavailable = Exclude<ProviderModelDiscoveryResult, { status: "ok" }>;
 interface Source {
   config: BaseProviderConfig;
   enabled: boolean;
-  policy: ModelDiscoveryRequest["policy"];
 }
 type Credentials = Awaited<ReturnType<BedrockClient["config"]["credentials"]>>;
 type Snapshot = Source & { region: string; bearer?: string; credentials?: Credentials };
 const nonblank = (value: unknown): value is string => typeof value === "string" && !!value.trim();
 
 function snapshot(source: Source): Snapshot | Unavailable {
-  const { config, policy } = source;
+  const { config } = source;
   if (!source.enabled) return { status: "not-configured" };
   // Runtime URLs and injected providers cannot establish a control-plane identity.
   if (
-    policy.forcedBaseUrl ||
     [
       "baseUrl",
       "baseURL",
@@ -302,8 +299,7 @@ export async function discoverBedrockModels(
     await agent.destroy().catch(() => undefined);
     agent = undefined;
     current();
-    const allowed = source.policy.allowedModels;
-    return { status: "ok", modelIds: [...ids].filter((id) => !allowed || allowed.includes(id)) };
+    return { status: "ok", modelIds: [...ids] };
   } catch {
     return {
       status: "error",

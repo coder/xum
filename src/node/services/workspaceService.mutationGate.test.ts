@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { localBgWorkspaceDir } from "@/node/services/backgroundProcessExecutor";
 import { spawn } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as path from "path";
@@ -6,6 +8,7 @@ import * as readline from "node:readline";
 
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok } from "@/common/types/result";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { Runtime, WorkspaceInitParams } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { HistoryService } from "@/node/services/historyService";
@@ -18,6 +21,7 @@ import {
   saveWorkspaces,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
+import { EditorService } from "@/node/services/editorService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { TerminalService } from "@/node/services/terminalService";
 import * as bashToolModule from "@/node/services/tools/bash";
@@ -77,6 +81,20 @@ describe("structural workspace mutations across two backends on one root", () =>
   let deleteWorkspace: ReturnType<typeof mock>;
   let ensureReady: ReturnType<typeof mock>;
   const leases: WorkspaceUseLease[] = [];
+  const processRecordDirs: string[] = [];
+
+  async function createProcessRecord(
+    meta?: { pid: number; status: string },
+    workspaceId = rootId
+  ): Promise<string> {
+    const recordPath = path.join(localBgWorkspaceDir(workspaceId), `recovery-${randomUUID()}`);
+    processRecordDirs.push(recordPath);
+    await fsPromises.mkdir(recordPath, { recursive: true });
+    if (meta != null) {
+      await fsPromises.writeFile(path.join(recordPath, "meta.json"), JSON.stringify(meta));
+    }
+    return recordPath;
+  }
 
   beforeEach(async () => {
     const fixture = await createTestHistoryService();
@@ -110,6 +128,9 @@ describe("structural workspace mutations across two backends on one root", () =>
 
   afterEach(async () => {
     for (const lease of leases.splice(0)) await lease.release();
+    for (const recordPath of processRecordDirs.splice(0)) {
+      await fsPromises.rm(recordPath, { recursive: true, force: true });
+    }
     mock.restore();
     await cleanupFixture();
   });
@@ -215,6 +236,80 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(await a.workspaceService.remove(rootId, true)).toMatchObject({ success: true });
     expect(deleteWorkspace).toHaveBeenCalledTimes(1);
     expect(rowOf(a.config, rootId)).toBeUndefined();
+  });
+
+  test("force alone refuses unknown process records; exact confirmation permits removal", async () => {
+    const recordPath = await createProcessRecord();
+    const refused = await a.workspaceService.remove(rootId, true);
+    expect(refused).toMatchObject({
+      success: false,
+      backgroundProcesses: [{ recordPath, state: "unknown", workspaceId: rootId }],
+    });
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    expect(rowOf(a.config, rootId)?.pendingRemoval).toBeUndefined();
+
+    const removed = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [recordPath],
+    });
+    expect(removed.success).toBe(true);
+    expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    expect(deleteWorkspace.mock.calls[0]?.[5]).toBeUndefined();
+    // Recovery authorizes deletion, not removal of process evidence.
+    expect(await fsPromises.readdir(recordPath)).toEqual([]);
+  });
+
+  test("confirmation does not cover a new unknown process record", async () => {
+    const acknowledged = await createProcessRecord();
+    const newRecord = await createProcessRecord();
+    const refused = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [acknowledged],
+    });
+    expect(refused).toMatchObject({
+      success: false,
+      backgroundProcesses: [{ recordPath: newRecord, state: "unknown" }],
+    });
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("unknown-record confirmation cannot bypass a running process", async () => {
+    const unknown = await createProcessRecord();
+    const live = await createProcessRecord({ pid: process.pid, status: "running" });
+    const refused = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [unknown, live],
+    });
+    expect(refused).toMatchObject({
+      success: false,
+      backgroundProcesses: [{ recordPath: live, state: "running" }],
+    });
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("unknown-record confirmation cannot bypass another backend's lease", async () => {
+    const recordPath = await createProcessRecord();
+    await hold(b, rootId, "turn");
+    const refused = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [recordPath],
+    });
+    expect(errorOf(refused)).toContain(inUseElsewhere);
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("confirmation for the parent cannot bypass a shared-checkout sibling's unknown record", async () => {
+    await a.config.editConfig((config) => {
+      config.projects.get(projectPath)!.workspaces.push({
+        ...projectWorkspace(projectPath, "root", sharedChildId, { name: "shared" }),
+        parentWorkspaceId: rootId,
+        taskIsolation: "none",
+        runtimeConfig: { type: "worktree", srcBaseDir },
+      });
+      return config;
+    });
+    const recordPath = await createProcessRecord(undefined, sharedChildId);
+    const refused = await a.workspaceService.remove(rootId, true, {
+      acknowledgedUnknownProcessRecords: [recordPath],
+    });
+    expect(errorOf(refused)).toContain("running background process");
+    expect(deleteWorkspace).not.toHaveBeenCalled();
   });
 
   test("remove still ends this backend's own turn and terminals itself", async () => {
@@ -616,6 +711,72 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(rowOf(a.config, rootId)).toBeDefined();
   });
 
+  // #4909: a custom-command editor launches in this backend after its recording, so the open
+  // must stay counted until the launcher returns, or the rename/removal moves the checkout first.
+  test("this backend's rename and removal refuse while its own custom-editor launch is in flight", async () => {
+    const reached = Promise.withResolvers<void>();
+    const held = Promise.withResolvers<void>();
+    // The launcher's first await; only the command check and the synchronous spawn follow it.
+    const editorService = new EditorService(
+      {
+        getAllWorkspaceMetadata: async () => {
+          reached.resolve();
+          await held.promise;
+          return a.config.getAllWorkspaceMetadata();
+        },
+      },
+      a.workspaceService
+    );
+    const opening = editorService.openInEditor({
+      workspaceId: rootId,
+      targetPath: path.join(srcBaseDir, "repo", "root"),
+      // Not installed: the launch fails at its command check, so no process is spawned.
+      editorConfig: { editor: "custom", customCommand: "/nonexistent/xum-4909-editor" },
+    });
+    await reached.promise;
+
+    expect(errorOf(await a.workspaceService.rename(rootId, "renamed"))).toContain(
+      "an external editor is being opened"
+    );
+    expect(errorOf(await a.workspaceService.remove(rootId, true))).toContain(
+      "an external editor is being opened"
+    );
+    expect(renameWorkspace).not.toHaveBeenCalled();
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+
+    held.resolve();
+    expect(errorOf(await opening)).toContain("Editor command not found");
+    // The failed launch ended the in-flight count: the own rename tolerates the editor again.
+    await a.workspaceService.rename(rootId, "renamed");
+    expect(renameWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test("a custom-editor open that starts during this backend's own rename is refused and never launches", async () => {
+    const renameReached = Promise.withResolvers<void>();
+    const renameHeld = Promise.withResolvers<void>();
+    renameWorkspace.mockImplementationOnce(async () => {
+      renameReached.resolve();
+      await renameHeld.promise;
+      return { success: false as const, error: "stub move" };
+    });
+    const getAllWorkspaceMetadata = mock(() => a.config.getAllWorkspaceMetadata());
+    const editorService = new EditorService({ getAllWorkspaceMetadata }, a.workspaceService);
+
+    const renaming = a.workspaceService.rename(rootId, "renamed");
+    await renameReached.promise;
+    // Refused, not queued behind the rename: the launch never starts.
+    const opened = await editorService.openInEditor({
+      workspaceId: rootId,
+      targetPath: path.join(srcBaseDir, "repo", "root"),
+      editorConfig: { editor: "custom", customCommand: "/nonexistent/xum-4909-editor" },
+    });
+    expect(errorOf(opened)).toContain("being renamed, removed or archived");
+    expect(getAllWorkspaceMetadata).not.toHaveBeenCalled();
+
+    renameHeld.resolve();
+    expect(errorOf(await renaming)).toContain("stub move");
+  });
+
   test("own MCP servers, init hook and one-off commands follow what each mutator ends", async () => {
     // Rename moves the checkout under its own MCP servers (their processes follow it) and
     // in-flight commands, as before, but nothing stops its own init hook.
@@ -735,8 +896,11 @@ describe("structural workspace mutations across two backends on one root", () =>
       srcBaseDir: "/home/coder/src",
       coder: { workspaceName: "xum-root", existingWorkspace: false },
     };
+    // A fixed past archive time: comparing it with the unarchive's wall-clock stamp must not
+    // depend on the two landing in different milliseconds (#5380).
+    const archivedAt = "2020-01-01T00:00:00.000Z";
     await editRow(rootId, (row) => {
-      row.archivedAt = new Date().toISOString();
+      row.archivedAt = archivedAt;
       row.runtimeConfig = coderRuntime;
     });
     let archiveDuringStart: Awaited<ReturnType<WorkspaceService["archive"]>> | undefined;
@@ -752,7 +916,10 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(await a.workspaceService.unarchive(rootId)).toMatchObject({ success: true });
     expect(errorOf(archiveDuringStart!)).toContain(inUseElsewhere);
     const row = rowOf(a.config, rootId)!;
-    expect(row.unarchivedAt! > row.archivedAt!).toBe(true);
+    // The refused archive wrote nothing, and the unarchive stuck.
+    expect(row.archivedAt).toBe(archivedAt);
+    expect(row.unarchivedAt).toBeDefined();
+    expect(isWorkspaceArchived(row.archivedAt, row.unarchivedAt)).toBe(false);
   });
 
   // #4871: stopping or deleting a dedicated Coder workspace ends the other backend's turn in it.

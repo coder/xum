@@ -15,6 +15,7 @@ export function createHistoryStringEvidence(prefixChars: number, expected?: stri
   return {
     push(chunk: string) {
       prefix += chunk.slice(0, Math.max(0, prefixChars - prefix.length));
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       matches &&= expected!.startsWith(chunk, length);
       length += chunk.length;
       // Preserve JS string equality, including distinct lone surrogates and chunk splits.
@@ -25,6 +26,7 @@ export function createHistoryStringEvidence(prefixChars: number, expected?: stri
         prefix,
         length,
         sha256: hash.digest("hex"),
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         matchesExpected: matches && length === expected!.length,
       };
     },
@@ -164,11 +166,13 @@ export function createHistoryCanonicalEvidence(sourceByteLimit: number) {
           frames.pop();
           break;
         case "startKey":
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           if (frames.at(-1)!.count++ > 0) write(",");
           key = createHistoryStringEvidence(10);
           write('"');
           break;
         case "endKey": {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const value = key!.finish();
           const index = Number(value.prefix);
           const isIndex =
@@ -177,6 +181,7 @@ export function createHistoryCanonicalEvidence(sourceByteLimit: number) {
             index >= 0 &&
             index < 0xffffffff &&
             String(index) === value.prefix;
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const frame = frames.at(-1)!;
           if (isIndex) {
             canonical &&= !frame.sawStringKey && index > frame.lastIndex;
@@ -203,9 +208,11 @@ export function createHistoryCanonicalEvidence(sourceByteLimit: number) {
           number = createHistoryNumberEvidence(sourceByteLimit);
           break;
         case "numberChunk":
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           number!.push(token.value);
           break;
         case "endNumber": {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const value = number!.finish();
           canonical &&= value.canonical;
           write(JSON.stringify(value.value));

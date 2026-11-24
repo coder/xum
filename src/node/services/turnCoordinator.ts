@@ -1106,7 +1106,17 @@ export class TurnCoordinator {
     return typeof outcome === "string" ? outcome : undefined;
   }
   async waitForCompactionDecision(messageId: string, allowPending: boolean): Promise<boolean> {
-    if (allowPending && !this.disposed)
+    // A pending wait is only ever resolved by the policy of the compaction operation that streamed
+    // this message, so only that operation may register one. A caller reading another stream's
+    // decision (e.g. a compact-agent resume without compaction-request metadata, read late behind
+    // TaskService's event lock while a later compaction prepares or streams, or with no current
+    // operation and a stale request) must not create a wait that nothing resolves (#5326).
+    // Retained decisions are still read below, whatever the current operation.
+    const operation = this.state.turn.operation;
+    const ownCompactionStream =
+      operation?.compaction === true &&
+      (operation.messageId === messageId || operation.startupMessageId === messageId);
+    if (allowPending && ownCompactionStream && !this.disposed)
       this.dispatch({ type: "decision", kind: "compaction", messageId });
     const decision = this.state.decisions.find(
       (entry) => entry.kind === "compaction" && entry.messageId === messageId

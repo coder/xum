@@ -1,16 +1,17 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { APIProvider } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers.js";
 import type {
   MemoryConsolidationRecordPayload,
+  MemoryConsolidationStatusPayload,
   MemoryFileInfo,
+  MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MemoryTab } from "./MemoryTab";
 
 const meta: Meta<typeof MemoryTab> = {
@@ -86,6 +87,22 @@ const MEMORY_FILES: MemoryFileInfo[] = [
   },
 ];
 
+const PREFERENCES_CONTENT = `---
+description: Coding style and tooling preferences
+---
+# Preferences
+
+- Use \`bun\` for every package script.
+- Keep diffs small and reviewable.
+- Prefer \`rg\` over \`grep\` when searching.
+
+## Validation
+
+\`\`\`bash
+make static-check
+\`\`\`
+`;
+
 const CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
   lastRunAt: Date.now() - 30 * 60 * 1000,
   trigger: "manual",
@@ -93,30 +110,46 @@ const CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
   ops: [{ command: "delete", path: "/memories/project/duplicate.md", applied: true }],
 };
 
+const HARVEST_RECORD: MemoryHarvestRecordPayload = {
+  status: "completed",
+  startedAt: Date.now() - 45 * 60 * 1000,
+  completedAt: Date.now() - 44 * 60 * 1000,
+  attemptCount: 1,
+  boundaryKey: "summary-story",
+  compactionEpoch: 3,
+  acceptedCandidates: 2,
+  skippedCandidates: 1,
+  nextChunk: 1,
+  ops: [
+    { command: "create", path: "/memories/workspace/build.md", applied: true },
+    { command: "str_replace", path: "/memories/workspace/build.md", applied: true },
+    {
+      command: "create",
+      path: "/memories/global/build.md",
+      applied: false,
+      note: "Consolidation may not modify /memories/global/build.md",
+    },
+  ],
+};
+
+const DEFAULT_STATUS: MemoryConsolidationStatusPayload = {
+  workspaceRecord: null,
+  projectRecord: CONSOLIDATION_RECORD,
+  globalRecord: CONSOLIDATION_RECORD,
+  latestHarvestRecord: HARVEST_RECORD,
+  projectAvailable: true,
+};
+
 // The Memory tab lives in the narrow right sidebar, so pin the story to a
 // sidebar-like width (also exercises the ~375px mobile layout contract).
-function renderTab(width: string) {
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_CONSOLIDATION), true);
+function renderTab(width: string, status: Partial<MemoryConsolidationStatusPayload> = {}) {
   return (
     <APIProvider
       client={createMockORPCClient({
+        experiments: { [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true },
         memoryFiles: MEMORY_FILES,
-        memoryConsolidationStatus: {
-          workspaceRecord: null,
-          projectRecord: CONSOLIDATION_RECORD,
-          globalRecord: CONSOLIDATION_RECORD,
-          latestHarvestRecord: {
-            status: "completed",
-            startedAt: Date.now() - 45 * 60 * 1000,
-            completedAt: Date.now() - 44 * 60 * 1000,
-            attemptCount: 1,
-            boundaryKey: "summary-story",
-            compactionEpoch: 3,
-            acceptedCandidates: 2,
-            skippedCandidates: 1,
-          },
-          projectAvailable: true,
-        },
+        memoryFileContents: new Map([["/memories/global/preferences.md", PREFERENCES_CONTENT]]),
+        memoryConsolidationStatus: { ...DEFAULT_STATUS, ...status },
       })}
     >
       <div className="border-border-light h-[480px] border" style={{ width }}>
@@ -139,7 +172,7 @@ export const List: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText("preferences.md");
     await canvas.findByText(/Project:/);
-    await canvas.findByText(/Harvest: completed/);
+    await canvas.findByText("Harvest: completed: 2 edits / 1 rejected");
     await canvas.findByText("scratch.md");
   },
 };
@@ -150,9 +183,75 @@ export const Editor: Story = {
     const canvas = within(canvasElement);
     const row = await canvas.findByText("preferences.md");
     await userEvent.click(row);
-    await canvas.findByLabelText("Memory file content");
-    // Hide the focused textarea caret before Pixel captures the editor state.
+    // Markdown files open in the rendered preview, frontmatter as a yaml block.
+    await canvas.findByRole("heading", { name: "Preferences" });
+    // Wait for Shiki tokens so the snapshot never captures unhighlighted code.
+    await waitFor(() => {
+      for (const language of ["yaml", "bash"]) {
+        if (!canvasElement.querySelector(`[data-code-language="${language}"] .code-line span`)) {
+          throw new Error(`${language} block is not highlighted yet`);
+        }
+      }
+    });
+    await expect(canvas.queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    // Pixel does not emulate touch, so pin the class that hides the shortcut on touch screens.
+    const toggle = canvas.getByRole("button", { name: "Preview" });
+    await userEvent.hover(toggle);
+    const tooltip = await within(document.body).findByRole("tooltip");
+    await expect(tooltip.querySelector(".mobile-hide-shortcut-hints")).not.toBeNull();
+    await userEvent.unhover(toggle);
+    // Radix keeps a hoverable tooltip open after pointerleave until a pointermove leaves its
+    // grace area, which a synthetic unhover never sends, so close it with Escape.
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(within(document.body).queryByRole("tooltip")).toBeNull());
     await userEvent.hover(canvasElement);
     blurActiveElement();
+  },
+};
+
+// A completed run that read only part of its epoch says so at the end of the harvest line. On a
+// touch screen that note has no tooltip to fall back on, so a clipped line hides it.
+export const HarvestNoteAtPhoneWidth: Story = {
+  parameters: {
+    // The play assertion pins the wrap; a snapshot of the same tab adds budget, not coverage.
+    pixel: { exclude: true },
+  },
+  render: () =>
+    renderTab("375px", {
+      latestHarvestRecord: {
+        ...HARVEST_RECORD,
+        note: "edit budget spent: chunks 2-3 of 3 were not read",
+      },
+    }),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const line = await canvas.findByText(/^Harvest: completed/);
+    await expect(line.textContent).toContain("chunks 2-3 of 3 were not read");
+    // Clipped text has more content than box: scrollWidth passes clientWidth.
+    await expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
+    // Wrapped onto a second line, so it is taller than one 12px text line.
+    await expect(line.getBoundingClientRect().height).toBeGreaterThan(20);
+  },
+};
+
+// One organizer pass writes the same record to each scope it covers: each scope line counts its
+// own changes, and the run's cost and ceiling note sit on one line, not on all three.
+export const SharedRunAtPhoneWidth: Story = {
+  parameters: {
+    // The play assertion pins the wrap; a snapshot of the same tab adds budget, not coverage.
+    pixel: { exclude: true },
+  },
+  render: () => {
+    const run = {
+      ...CONSOLIDATION_RECORD,
+      spentUsd: 0.9,
+      note: "stopped at the cost ceiling after $0.90",
+    };
+    return renderTab("375px", { workspaceRecord: run, projectRecord: run, globalRecord: run });
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const line = await canvas.findByText(/^Run cost \(workspace, project, global\)/);
+    await expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
   },
 };

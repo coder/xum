@@ -15,6 +15,7 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 
 const channelDescriptions: Record<UpdateChannel, string> = {
   stable: "Official releases only.",
@@ -138,7 +139,8 @@ export function AboutDialog() {
           }
         }
       } catch (error) {
-        if (!signal.aborted) {
+        // A lost connection is not a stream error: the next client opens the stream again.
+        if (isStreamFailure(error, signal)) {
           console.error("Update status stream error:", error);
         }
       }
@@ -474,7 +476,7 @@ export function AboutDialog() {
             href="https://github.com/coder/mux/releases"
             target="_blank"
             rel="noopener noreferrer"
-            className="titlebar-no-drag text-accent inline-block text-xs hover:underline"
+            className="titlebar-no-drag text-accent-text inline-block text-xs hover:underline"
           >
             View all releases
           </a>

@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, fn, mocked, userEvent, waitFor, within } from "storybook/test";
 import { useState, type ComponentProps } from "react";
+import { waitForModalLayer } from "@/browser/stories/storyPlayHelpers";
 import { ForceDeleteModal } from "./ForceDeleteModal";
 
 const descendants = [
@@ -38,10 +39,15 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
+/** The open dialog, once it takes pointer input (#7646). */
+async function openDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
+  return waitForModalLayer(await within(canvasElement.ownerDocument.body).findByRole("dialog"));
+}
+
 export const ExplicitScope: Story = {
   play: async ({ canvasElement, args }) => {
     const page = within(canvasElement.ownerDocument.body);
-    const dialog = await page.findByRole("dialog");
+    const dialog = await openDialog(canvasElement);
     const scope = within(dialog).getByRole("region", { name: "Descendant workspaces" });
     await expect(within(scope).getAllByRole("listitem")).toHaveLength(2);
     await expect(args.onForceDelete).not.toHaveBeenCalled();
@@ -60,7 +66,7 @@ export const ActiveDescendantBlocksShortcut: Story = {
   args: { descendants: [{ ...descendants[0], active: true }] },
   play: async ({ canvasElement, args }) => {
     const page = within(canvasElement.ownerDocument.body);
-    const dialog = await page.findByRole("dialog");
+    const dialog = await openDialog(canvasElement);
     await expect(within(dialog).getAllByRole("button")).toHaveLength(1);
     dialog.focus();
     await userEvent.keyboard("y");
@@ -83,7 +89,7 @@ export const RetryRefreshesScope: Story = {
   },
   play: async ({ canvasElement, args }) => {
     const page = within(canvasElement.ownerDocument.body);
-    const dialog = await page.findByRole("dialog");
+    const dialog = await openDialog(canvasElement);
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Delete Workspace and Descendants" })
     );
@@ -113,7 +119,7 @@ export const RetryBecomesBlocked: Story = {
   },
   play: async ({ canvasElement, args }) => {
     const page = within(canvasElement.ownerDocument.body);
-    const dialog = await page.findByRole("dialog");
+    const dialog = await openDialog(canvasElement);
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Delete Workspace and Descendants" })
     );
@@ -132,7 +138,7 @@ export const RejectedRetryRemainsVisible: Story = {
   },
   play: async ({ canvasElement, args }) => {
     const page = within(canvasElement.ownerDocument.body);
-    const dialog = await page.findByRole("dialog");
+    const dialog = await openDialog(canvasElement);
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Delete Workspace and Descendants" })
     );

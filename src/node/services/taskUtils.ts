@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { RuntimeConfig } from "@/common/types/runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import { resolveModelFallbackChain } from "@/common/utils/ai/modelFallbacks";
@@ -67,6 +68,45 @@ export async function tryReadGitCurrentBranch(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The branch to start from where a caller defaults to its parent workspace's branch. A local
+ * worktree's branch can differ from its workspace name: create() renames an auto-named
+ * workspace's branch after the workspace opens, and a slash branch's workspace name is
+ * sanitized. So a worktree's branch is read from its checkout (made only then). Other runtimes,
+ * a detached HEAD or an unreadable checkout keep the workspace name.
+ */
+export async function readWorkspaceBranch(
+  runtimeConfig: RuntimeConfig,
+  workspaceName: string,
+  checkout: () => { runtime: Runtime; workspacePath: string }
+): Promise<string> {
+  if (runtimeConfig.type !== "worktree") return workspaceName;
+  const { runtime, workspacePath } = checkout();
+  return (await tryReadGitCurrentBranch(runtime, workspacePath)) ?? workspaceName;
+}
+
+/**
+ * The branch actually checked out in a task's parent checkout. When the parent is itself an
+ * isolation: "none" task, its workspace name is a synthetic agent workspace name with no real
+ * branch: the shared checkout sits on the parent's own persisted taskTrunkBranch. Any other
+ * parent's branch is readWorkspaceBranch's.
+ */
+export async function readTaskParentBranch(
+  parentEntry: { workspace: WorkspaceConfigEntry } | null,
+  parentMeta: { name: string; runtimeConfig: RuntimeConfig },
+  checkout: () => { runtime: Runtime; workspacePath: string }
+): Promise<string | undefined> {
+  if (parentEntry?.workspace.taskIsolation === "none") {
+    return (
+      coerceNonEmptyString(parentEntry.workspace.taskTrunkBranch) ??
+      coerceNonEmptyString(parentMeta.name)
+    );
+  }
+  return coerceNonEmptyString(
+    await readWorkspaceBranch(parentMeta.runtimeConfig, parentMeta.name, checkout)
+  );
 }
 
 /**
@@ -178,6 +218,21 @@ export function findWorkspaceEntry(
 }
 
 /**
+ * Attempt compare-and-swap for a task-row write made on behalf of one attempt (stream end, report
+ * publication, recovery, terminal failure, resume rollback). Evaluated inside the write's own
+ * editWorkspaceEntry transform: true when the caller captured an attempt and the row now names
+ * another one — another writer (e.g. a second backend) re-admitted it, so the row is theirs and
+ * the write is abandoned. A write with no captured attempt (legacy/pre-identity) is never held
+ * back, which keeps today's behavior for it.
+ */
+export function rowSupersedes(
+  row: Pick<WorkspaceConfigEntry, "taskAttemptId"> | undefined,
+  expectedAttemptId: string | null | undefined
+): boolean {
+  return expectedAttemptId != null && row?.taskAttemptId !== expectedAttemptId;
+}
+
+/**
  * Walk the parentWorkspaceId chain to compute task nesting depth.
  * Detects cycles (max 32 hops).
  */
@@ -210,4 +265,17 @@ export function getTaskDepthFromConfig(
   }
 
   return depth;
+}
+
+/**
+ * The one termination protocol for sub-agent goals: every write that closes a task attempt
+ * (interrupt, report, terminal failure, retirement) records the owed goal pause in the SAME
+ * config write, unconditionally (never from an earlier goal snapshot), keyed by the closing
+ * attempt. The writer then settles it (TaskService.settleChildGoalPause) once its locks are
+ * released; a failed or interrupted settle keeps the marker, which fences every goal activation
+ * (WorkspaceGoalService childActivationGate) and is retried before the task runs again.
+ */
+export function markChildGoalPauseOwed(workspace: WorkspaceConfigEntry): void {
+  if (workspace.parentWorkspaceId == null) return;
+  workspace.taskGoalPauseOwed = workspace.taskAttemptId ?? "*";
 }

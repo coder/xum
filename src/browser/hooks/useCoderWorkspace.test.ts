@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { createElement, type ComponentProps, type ReactNode } from "react";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
@@ -130,6 +131,7 @@ describe("buildAutoSelectedTemplateConfig", () => {
 
 describe("useCoderWorkspace coder auth refresh", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
 
@@ -150,8 +152,7 @@ describe("useCoderWorkspace coder auth refresh", () => {
   afterEach(() => {
     cleanup();
     mock.restore();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("mount-only policy does not refetch on focus", async () => {

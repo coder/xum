@@ -1,4 +1,3 @@
-import { execFileSync } from "child_process";
 import { existsSync } from "fs";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -13,6 +12,7 @@ import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { execFileAsync } from "@/node/utils/disposableExec";
+import { findExecutableOnPath, isExecutableFile } from "@/node/utils/findExecutableOnPath";
 
 interface PortableDesktopStartupInfo {
   width: number;
@@ -58,25 +58,13 @@ export class PortableDesktopBinaryNotFoundError extends Error {
 function resolvePortableDesktopBinary(rootDir: string): string {
   assert(rootDir.length > 0, "PortableDesktop rootDir must be a non-empty path");
 
-  const lookupCommand = process.platform === "win32" ? "where" : "which";
-
+  // Runs on every agent turn (prereq status). Deliberately uncached: the scan is a few stat
+  // calls, and no cache means installing or removing the binary takes effect immediately.
   const shouldSearchPath = (process.env.PATH ?? "").trim().length > 0;
   if (shouldSearchPath) {
-    try {
-      const lookupOutput = execFileSync(lookupCommand, [DESKTOP_DEFAULTS.BINARY_NAME], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true,
-      });
-      const resolvedFromPath = lookupOutput
-        .split(/\r?\n/)
-        .map((entry) => entry.trim())
-        .find((entry) => entry.length > 0);
-      if (resolvedFromPath) {
-        return resolvedFromPath;
-      }
-    } catch {
-      // Fall back to the cached binary location below.
+    const resolvedFromPath = findExecutableOnPath(DESKTOP_DEFAULTS.BINARY_NAME);
+    if (resolvedFromPath) {
+      return resolvedFromPath;
     }
   }
 
@@ -86,7 +74,9 @@ function resolvePortableDesktopBinary(rootDir: string): string {
       : DESKTOP_DEFAULTS.BINARY_NAME;
   const cacheDir = path.join(rootDir, "cache", DESKTOP_DEFAULTS.CACHE_DIR_NAME);
   const cachedBinaryPath = path.join(cacheDir, binaryFileName);
-  if (existsSync(cachedBinaryPath)) {
+  // Executable, not just present: a cached file without the execute bit fails to start with
+  // EACCES, so it must not count as available (#5574).
+  if (isExecutableFile(cachedBinaryPath)) {
     return cachedBinaryPath;
   }
 

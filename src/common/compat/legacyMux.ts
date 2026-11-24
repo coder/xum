@@ -21,6 +21,11 @@ export const LEGACY_MUX_HOME_DIR_NAME = ".mux";
 export const LEGACY_CMUX_HOME_DIR_NAME = ".cmux";
 export const LEGACY_REMOTE_MUX_HOME = "~/.mux";
 export const LEGACY_MUX_PROTOCOL_SCHEME = "mux";
+/**
+ * Global skills dir, relative to the user home, that `npx skills add -g --agent mux` writes even
+ * when ~/.xum is the Xum home. Xum reads it as a read-only global skills root.
+ */
+export const LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR = `${LEGACY_MUX_HOME_DIR_NAME}/skills`;
 
 /**
  * Sibling marker next to `~/.xum` / `~/.xum-dev`. Contents are a single known

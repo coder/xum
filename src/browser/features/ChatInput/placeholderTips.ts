@@ -49,46 +49,25 @@ const TIP_ROTATION_INTERVAL_MS = 20 * 60 * 1000; // 20 minutes
  */
 const STORYBOOK_PINNED_TIP_INDEX = 0;
 
-export interface PlaceholderTipOptions {
-  /** Dynamic Workflows experiment state; selects the `selfExtensionTip` variant. */
-  dynamicWorkflows?: boolean;
-}
-
-/**
- * Self-extension tip. Users rarely realize Xum can extend and debug itself:
- * it can author skills (`.xum/skills/<name>/SKILL.md`), author durable
- * workflows (built-in `workflow-authoring` skill), and investigate its own
- * behavior from session logs. The durable-workflow clause is shown only when
- * the Dynamic Workflows experiment is on, because `workflow_run` is not
- * registered otherwise and the agent would dead-end after writing the script.
- */
-function selfExtensionTip(dynamicWorkflows: boolean): string {
-  return dynamicWorkflows
-    ? "Ask Xum to write a skill or durable workflow, or to investigate an issue in Xum"
-    : "Ask Xum to write a skill, or to investigate an issue in Xum";
-}
-
-export function getPlaceholderTips(options?: PlaceholderTipOptions): readonly string[] {
-  return [
-    "Try /orchestrate to coordinate sub-agents and integrate their patches",
-    selfExtensionTip(options?.dynamicWorkflows === true),
-    "Try /spawn <task> to offload it to a single sub-agent and preserve context",
-    "Try /haiku <msg> to send just this message on a different model",
-    "Try /+high <msg> to crank up reasoning for this message only",
-    "Try /compact to summarize the conversation when context gets tight",
-    "Try /fork <start> to branch this chat into a new workspace",
-    "Try /plan to view or edit the current plan inline",
-    "Try /clear --soft to reset context while keeping the chat visible",
-    "Try /new <start> to start a fresh workspace from the trunk branch",
-    "Try /vim to toggle vim keybindings in the chat input",
-    "Try \\alpha or \\sum to insert LaTeX-style symbols like α and ∑ as you type",
-    // Keybind tip (kept last so it never displaces the Storybook-pinned lead tip).
-    `Press ${formatKeybind(KEYBINDS.INCREASE_THINKING)} / ${formatKeybind(KEYBINDS.DECREASE_THINKING)} to raise or lower thinking effort`,
-  ];
-}
-
-/** Tip list with every experiment off. */
-export const PLACEHOLDER_TIPS: readonly string[] = getPlaceholderTips();
+// Users rarely realize Xum can extend and debug itself: it can author skills
+// (`.xum/skills/<name>/SKILL.md`), author durable workflows (built-in
+// `workflow-authoring` skill), and investigate its own behavior from session logs.
+export const PLACEHOLDER_TIPS: readonly string[] = [
+  "Try /orchestrate to coordinate sub-agents and integrate their patches",
+  "Ask Xum to write a skill or durable workflow, or to investigate an issue in Xum",
+  "Try /spawn <task> to offload it to a single sub-agent and preserve context",
+  "Try /haiku <msg> to send just this message on a different model",
+  "Try /+high <msg> to crank up reasoning for this message only",
+  "Try /compact to summarize the conversation when context gets tight",
+  "Try /fork <start> to branch this chat into a new workspace",
+  "Try /plan to view or edit the current plan inline",
+  "Try /clear --soft to reset context while keeping the chat visible",
+  "Try /new <start> to start a fresh workspace from the trunk branch",
+  "Try /vim to toggle vim keybindings in the chat input",
+  "Try \\alpha or \\sum to insert LaTeX-style symbols like α and ∑ as you type",
+  // Keybind tip (kept last so it never displaces the Storybook-pinned lead tip).
+  `Press ${formatKeybind(KEYBINDS.INCREASE_THINKING)} / ${formatKeybind(KEYBINDS.DECREASE_THINKING)} to raise or lower thinking effort`,
+];
 
 /**
  * Detect Storybook runtime via a global flag set by `.storybook/preview.tsx`.
@@ -117,16 +96,15 @@ function isStorybookRuntime(): boolean {
  * Under Storybook the tip is fixed (`STORYBOOK_PINNED_TIP_INDEX`) so visual
  * baselines are insulated from tip-list reordering.
  */
-export function getPlaceholderTip(options?: PlaceholderTipOptions): string {
-  const tips = getPlaceholderTips(options);
+export function getPlaceholderTip(): string {
   if (isStorybookRuntime()) {
-    return tips[STORYBOOK_PINNED_TIP_INDEX];
+    return PLACEHOLDER_TIPS[STORYBOOK_PINNED_TIP_INDEX];
   }
   const ts = Date.now();
   if (!Number.isFinite(ts) || ts < 0) {
-    return tips[0];
+    return PLACEHOLDER_TIPS[0];
   }
   const bucket = Math.floor(ts / TIP_ROTATION_INTERVAL_MS);
-  const index = bucket % tips.length;
-  return tips[index];
+  const index = bucket % PLACEHOLDER_TIPS.length;
+  return PLACEHOLDER_TIPS[index];
 }

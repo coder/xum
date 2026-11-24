@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type React from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import {
   extractAttachmentsFromClipboard,
   extractAttachmentsFromDrop,
@@ -44,7 +44,7 @@ export function estimateBase64DataUrlBytes(dataUrl: string): number | null {
   return Math.floor((base64.length * 3) / 4) - padding;
 }
 export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { setAttachments, editingMessage, pushToast, variant, workspaceId } = options;
   const [processingAttachmentCount, setProcessingAttachmentCount] = useState(0);
 
@@ -70,10 +70,10 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
       stageAttachment:
         variant === "workspace"
           ? async (file, dataBase64) => {
-              if (!api) throw new Error("Not connected to server");
+              if (!liveApi) throw new Error("Not connected to server");
               if (workspaceId == null)
                 throw new Error("Files can be staged after opening a workspace.");
-              const result = await api.workspace.stageAttachment({
+              const result = await liveApi.workspace.stageAttachment({
                 workspaceId,
                 filename: file.name,
                 mediaType: file.type || null,

@@ -19,6 +19,7 @@ import {
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 import {
   createDeferred,
   createMockAIService,
@@ -567,6 +568,7 @@ describe("WorkspaceService regenerateTitle", () => {
         "ws-regenerate-title-compacted",
         "ws-regenerate-title-first-plus-last-three",
         "title-hidden-review",
+        "title-budget-warning",
       ].map((id) => ({ id, name: id, path: `/tmp/proj/${id}` })),
       {
         agentAiDefaults: {
@@ -626,6 +628,38 @@ describe("WorkspaceService regenerateTitle", () => {
       expect(call?.[3]).toContain(feedbackText);
       expect(call?.[3]).not.toContain("HIDDEN_REVIEW_SENTINEL");
       expect(call?.[4]).toBe(feedbackText);
+    } finally {
+      generate.mockRestore();
+    }
+  });
+
+  test("a trailing Token Budget warning stays in the context but is not the latest request", async () => {
+    const workspaceId = "title-budget-warning";
+    const warning = createContextBudgetWarning({
+      contextTokens: 80_000,
+      maxTokens: 100_000,
+      budgetTokens: 90_000,
+      sessionHistoryAvailable: true,
+      handoff: true,
+    });
+    const warningText = warning.parts[0]?.type === "text" ? warning.parts[0].text : "";
+    expect(warningText.length).toBeGreaterThan(0);
+    const rows = [
+      createMuxMessage("objective", "user", "visible objective"),
+      createMuxMessage("answer", "assistant", "visible progress"),
+      createMuxMessage("follow-up", "user", "visible follow-up request"),
+      warning,
+    ];
+    for (const row of rows)
+      expect((await historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+    const generate = spyOn(workspaceTitleGenerator, "generateWorkspaceIdentity").mockResolvedValue(
+      Ok({ name: "visible-title", title: "Visible title", modelUsed: "test:model" })
+    );
+    try {
+      expect((await workspaceService.regenerateTitle(workspaceId)).success).toBe(true);
+      const call = generate.mock.calls[0];
+      expect(call?.[3]).toContain(warningText);
+      expect(call?.[4]).toBe("visible follow-up request");
     } finally {
       generate.mockRestore();
     }

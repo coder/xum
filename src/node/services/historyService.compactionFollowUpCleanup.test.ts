@@ -345,6 +345,18 @@ describe("conditional compaction follow-up cleanup", () => {
         const expected = summary();
         await store.historyService.appendToHistory(workspaceId, expected);
         let replacementSummary = expected;
+        if (changed === "id") {
+          // updateHistory keeps row identity, so reach "same sequence, new id" the way it
+          // happens for real: an edit truncation, then a fresh append that reuses the sequence.
+          expect(
+            (await store.historyService.truncateAfterMessage(workspaceId, expected.id)).success
+          ).toBe(true);
+          replacementSummary = { ...summary(), id: "replacement" };
+          await store.historyService.appendToHistory(workspaceId, replacementSummary);
+          expect(replacementSummary.metadata?.historySequence).toBe(
+            expected.metadata?.historySequence
+          );
+        }
         if (changed === "sequence") {
           await store.historyService.deleteMessage(workspaceId, expected.id);
           replacementSummary = summary();

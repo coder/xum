@@ -292,6 +292,7 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
     if (!diffsByPath.has(filePath)) {
       diffsByPath.set(filePath, []);
     }
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     diffsByPath.get(filePath)!.push(diff);
     bumpRecency(filePath);
   };
@@ -353,6 +354,7 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
   const results: FileEditDiff[] = [];
   for (let i = editOrder.length - 1; i >= 0 && results.length < MAX_EDITED_FILES; i--) {
     const filePath = editOrder[i];
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const diffs = diffsByPath.get(filePath)!;
 
     const combined = combineDiffs(filePath, diffs);

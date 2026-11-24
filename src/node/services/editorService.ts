@@ -62,7 +62,7 @@ export interface OpenInEditorInput {
   editorConfig: EditorConfig;
 }
 
-type ExternalEditorOpenRecorder = Pick<WorkspaceService, "recordExternalEditorOpenForLaunch">;
+type ExternalEditorOpenRecorder = Pick<WorkspaceService, "launchExternalEditor">;
 
 /**
  * Service for opening workspaces in code editors.
@@ -80,19 +80,11 @@ export class EditorService {
     input: OpenInEditorInput
   ): Promise<{ success: true; data: void } | { success: false; error: string }> {
     // Detached editor processes cannot be tracked, so archive gating must record the open first.
-    const recorded = await this.externalEditorOpenRecorder.recordExternalEditorOpenForLaunch(
-      input.workspaceId
+    // The launch runs inside that recording so this backend's own rename or removal cannot move
+    // the checkout between the recording and the spawn (#4909); a failed launch is rolled back.
+    return this.externalEditorOpenRecorder.launchExternalEditor(input.workspaceId, () =>
+      this.launchEditor(input)
     );
-    if (!recorded.success) {
-      return recorded;
-    }
-
-    const result = await this.launchEditor(input);
-    if (!result.success) {
-      // Pre-spawn failures must not leave a marker that permanently blocks later archives.
-      await recorded.data.rollbackAfterFailedLaunch();
-    }
-    return result;
   }
 
   private async launchEditor(

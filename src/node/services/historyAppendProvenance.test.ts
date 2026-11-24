@@ -10,6 +10,7 @@ import { HistoryService } from "./historyService";
 import {
   HistoryAppendProvenance,
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
+  historyAppendReceiptKey,
   type HistoryAppendReceipt,
 } from "./historyAppendProvenance";
 import type { HistoryScanState } from "./historyCursor";
@@ -18,7 +19,12 @@ import {
   SESSION_HISTORY_MAX_SCAN_ROWS,
 } from "@/common/constants/contextBudget";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
-import { historyWriteLockPath, removeSessionDirUnderMemoryLocks } from "./workspaceRemoval";
+import {
+  historyWriteLockPath,
+  removeSessionDirUnderMemoryLocks,
+  workspaceRemovalTombstonePath,
+} from "./workspaceRemoval";
+import { CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
 
 let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
 let store: HistoryAppendProvenance;
@@ -240,7 +246,7 @@ if (!result.success) throw new Error(result.error);
     );
   });
 
-  test("tool-result commitPartial certifies append but invalidates an update", async () => {
+  test("a certified placeholder append survives, its tool-result commitPartial update invalidates", async () => {
     const cursor = await startCursor();
     const partial = createMuxMessage("tool-result", "assistant", "", { historySequence: 3 }, [
       {
@@ -252,11 +258,12 @@ if (!result.success) throw new Error(result.error);
         output: { success: true },
       },
     ]);
-    expect((await fixture.historyService.writePartial(ws, partial)).success).toBe(true);
-    expect((await fixture.historyService.commitPartial(ws)).success).toBe(true);
+    // Streams append their empty placeholder row first; commitPartial then updates that row.
+    expect(
+      (await fixture.historyService.appendToHistory(ws, { ...partial, parts: [] })).success
+    ).toBe(true);
     expect((await resume(cursor)).map((row) => row.id)).toEqual(["row-1", "row-2"]);
     const after = await startCursor();
-    partial.parts.push({ type: "text", text: "update committed output" });
     expect((await fixture.historyService.writePartial(ws, partial)).success).toBe(true);
     expect((await fixture.historyService.commitPartial(ws)).success).toBe(true);
     await assertStale(after);
@@ -634,4 +641,72 @@ if (!result.success) throw new Error(result.error);
     });
     expect((await store.read()).receipt?.epoch).not.toBe(next.provenanceEpoch);
   });
+});
+
+describe("token stats receipt key", () => {
+  test("is canonical: key order of the parsed receipt does not matter", () => {
+    const stamp = { dev: "1", ino: "2", size: "3", mtimeNs: "4", ctimeNs: "5" };
+    const epoch = "00000000-0000-4000-8000-000000000000";
+    const a: HistoryAppendReceipt = {
+      version: 1,
+      epoch,
+      state: "stable",
+      files: { chat: stamp, archive: null },
+    };
+    const b = JSON.parse(
+      JSON.stringify({
+        files: {
+          archive: null,
+          chat: { ctimeNs: "5", mtimeNs: "4", size: "3", ino: "2", dev: "1" },
+        },
+        state: "stable",
+        epoch,
+        version: 1,
+      })
+    ) as HistoryAppendReceipt;
+    expect(JSON.stringify(a)).not.toBe(JSON.stringify(b));
+    expect(historyAppendReceiptKey(b)).toBe(historyAppendReceiptKey(a));
+    expect(
+      historyAppendReceiptKey({ ...a, files: { chat: { ...stamp, size: "4" }, archive: null } })
+    ).not.toBe(historyAppendReceiptKey(a));
+  });
+
+  test("is stable across no-op captures and changes after an append", async () => {
+    const first = await fixture.historyService.captureTokenStatsReceiptKey(ws);
+    expect(first).not.toBeNull();
+    expect(await fixture.historyService.captureTokenStatsReceiptKey(ws)).toBe(first);
+    await fixture.historyService.appendToHistory(ws, createMuxMessage("row-x", "user", "more"));
+    const next = await fixture.historyService.captureTokenStatsReceiptKey(ws);
+    expect(next).not.toBeNull();
+    expect(next).not.toBe(first);
+  });
+
+  test("fails closed for a missing workspace without creating its session dir", async () => {
+    expect(await fixture.historyService.captureTokenStatsReceiptKey("missing-ws")).toBeNull();
+    const created = await fs.stat(path.join(fixture.config.sessionsDir, "missing-ws")).then(
+      () => true,
+      () => false
+    );
+    expect(created).toBe(false);
+  });
+
+  test("fails closed for a removal-tombstoned workspace", async () => {
+    const tombstone = workspaceRemovalTombstonePath(fixture.config.rootDir, ws);
+    await fs.mkdir(path.dirname(tombstone), { recursive: true });
+    await fs.writeFile(tombstone, "{}");
+    expect(await fixture.historyService.captureTokenStatsReceiptKey(ws)).toBeNull();
+  });
+
+  for (const suffix of [".truncate.json", ".truncate"]) {
+    test(`fails closed while a truncate marker (${suffix}) exists`, async () => {
+      expect(await fixture.historyService.captureTokenStatsReceiptKey(ws)).not.toBeNull();
+      const marker = path.join(
+        fixture.config.sessionsDir,
+        ws,
+        `${CHAT_ARCHIVE_FILE_NAME}${suffix}`
+      );
+      await fs.writeFile(marker, "{}");
+      expect(await fixture.historyService.captureTokenStatsReceiptKey(ws)).toBeNull();
+    });
+  }
 });

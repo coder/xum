@@ -9,10 +9,14 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     sendMessage: () => Promise.resolve(Ok(undefined)),
     grantPendingDefaultUnrelatedWorkspaceConsent: () => Promise.resolve(),
     clearPendingDefaultUnrelatedConsent: () => Promise.resolve(),
+    clearDelegatedCreationMark: () => Promise.resolve(),
+    markDelegatedCreationInterrupted: () => Promise.resolve(false),
     resumeStream: () => Promise.resolve(Ok({ started: true })),
     clearQueue: () => Ok(undefined),
+    abandonAutoRetry: () => undefined,
     replaceHistory: () => Promise.resolve(Ok(undefined)),
     waitForIdleAndNoQueuedMessages: () => Promise.resolve(),
+    refuseUnavailableGoalTurnAgent: () => Promise.resolve(null),
     // No session behind the fake, so no compaction decision (WorkspaceService without a session).
     // Tests that model a compaction handing completion to its durable follow-up override this.
     waitForPendingCompactionCompletionDecision: () => Promise.resolve(undefined),
@@ -48,6 +52,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     archiveWhileTaskTreeLocked: () => Promise.resolve(Ok({ kind: "archived" })),
     unarchiveWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     preflightArchive: () => Promise.resolve(Ok({ kind: "ready" })),
+    preflightArchiveCascade: () => Promise.resolve(Ok({ targetPaths: [], subagents: [] })),
     // No live activity grants the hold so task tests reach interruption behavior.
     acquirePreInterruptionArchiveHold: () => Ok({ [Symbol.dispose]: () => undefined }),
     listLiveWorkspaceActivity: () => ({
@@ -66,6 +71,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     remove: () => Promise.resolve(Ok(undefined)),
     removeWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     create: () => Promise.resolve(Err("workspaceHost.create not mocked")),
+    createScratch: () => Promise.resolve(Err("workspaceHost.createScratch not mocked")),
     // Task-create tests exercise launch flow, not plugin-override sanitization.
     sanitizeMaterializedTaskWorkspace: () => Promise.resolve(undefined),
     discardExtensionMetadataEntry: () => Promise.resolve(),
@@ -109,7 +115,9 @@ export function makeAgentTaskIntegrationFake(
     latchHardInterruptCascade: () => undefined,
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
     noteWorkspaceUnarchived: () => Promise.resolve(),
+    settleOwedChildGoalPause: () => Promise.resolve(),
     isWorkspaceStopInProgress: () => false,
+    isWorkspaceTurnStopped: () => Promise.resolve(false),
     getWorkspaceStopEpoch: () => 0,
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),
     // Derived from the (possibly overridden) boolean rescue, so suites that script only

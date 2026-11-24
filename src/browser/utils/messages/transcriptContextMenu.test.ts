@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import MarkdownIt from "markdown-it";
 import {
@@ -30,13 +31,13 @@ function getFirstTextNode(element: Element | null): Text {
 
 describe("transcriptContextMenu", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
   });
 
   afterEach(() => {
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   describe("selected Markdown", () => {

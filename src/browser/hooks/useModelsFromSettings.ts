@@ -1,15 +1,12 @@
 import { useCallback, useMemo } from "react";
-import { readPersistedString, usePersistedState } from "./usePersistedState";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
-import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
+import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { useProvidersConfig } from "./useProvidersConfig";
 import { useRouting } from "./useRouting";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
 import { isValidProvider } from "@/common/constants/providers";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
-import { isGatewayModelAccessibleForUi, isModelAllowedByPolicy } from "@/browser/utils/policyUi";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
 import {
   getExplicitGatewayPrefix,
   normalizeSelectedModel,
@@ -17,7 +14,11 @@ import {
 } from "@/common/utils/ai/models";
 import { isModelAvailable } from "@/common/routing";
 import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
-import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
+import {
+  getAppConfigStore,
+  saveConfigOptimistically,
+  useAppConfig,
+} from "@/browser/stores/AppConfigStore";
 
 import {
   BUILT_IN_MODELS,
@@ -25,27 +26,24 @@ import {
   dedupeKeepFirst,
   filterHiddenModels,
   getCustomModels,
-  getSuggestedModels,
   isAuthoritativeProviderModelAccessible as isAuthoritativeProviderModelAccessibleIn,
-  isModelAllowedByPolicyOnActiveRoute,
   isProviderConfigured,
-  resolvesToDirectOpenAI,
 } from "@/common/utils/ai/selectableModels";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 
 // The selector pipeline lives in @/common (shared with the backend models_list
-// tool); these two stay exported for existing importers/tests.
-export { filterHiddenModels, getSuggestedModels };
+// tool); this one stays exported for existing importers.
+export { filterHiddenModels };
 
 const BUILT_IN_MODEL_SET = new Set<string>(BUILT_IN_MODELS);
+// Module-level so the default keeps a stable identity across renders.
+const NO_HIDDEN_MODELS: string[] = [];
 
 function getAllCustomModels(config: ProvidersConfigMap | null): string[] {
   if (!config) return [];
 
   const models: string[] = [];
   for (const [provider, info] of Object.entries(config)) {
-    // Skip mux-gateway - those models are accessed via the cloud toggle, not listed separately
-    if (provider === "mux-gateway") continue;
     // Keep github-copilot's persisted catalog for authoritative model gating, not direct selector entries.
     if (provider === "github-copilot") continue;
     if (!info.models) continue;
@@ -73,13 +71,23 @@ function isSupportedSettingsProvider(
   return info?.isCustom === true && isCustomProviderConfig(info);
 }
 
-export function getDefaultModel(): string {
-  const fallback = WORKSPACE_DEFAULTS.model;
-  const persisted = readPersistedString(DEFAULT_MODEL_KEY);
-  if (!persisted) return fallback;
+function getHiddenModels(): string[] {
+  return getAppConfigStore().getSnapshot()?.hiddenModels ?? NO_HIDDEN_MODELS;
+}
 
-  const selectedModel = normalizeSelectedModel(persisted);
-  return selectedModel || fallback;
+function resolveDefaultModel(persisted: string | undefined): string {
+  const fallback = WORKSPACE_DEFAULTS.model;
+  if (!persisted) return fallback;
+  return normalizeSelectedModel(persisted) || fallback;
+}
+
+export function getDefaultModel(): string {
+  return resolveDefaultModel(getAppConfigStore().getSnapshot()?.defaultModel);
+}
+
+/** getDefaultModel for values captured at render: re-renders once the configured default loads. */
+export function useDefaultModel(): string {
+  return resolveDefaultModel(useAppConfig((appConfig) => appConfig.defaultModel));
 }
 
 /**
@@ -90,102 +98,56 @@ export function getDefaultModel(): string {
  * discoverable/manageable there.
  */
 export function useModelsFromSettings() {
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
   const { api } = useAPI();
 
   const persistModelPrefs = useCallback(
     (patch: { defaultModel?: string; hiddenModels?: string[] }) => {
-      if (!api?.config?.updateModelPreferences) {
-        return;
-      }
-
-      api.config.updateModelPreferences(patch).catch(() => {
-        // Best-effort only; startup seeding will heal the cache next time.
-      });
+      saveConfigOptimistically(api, patch, (client) => client.config.updateModelPreferences(patch));
     },
     [api]
   );
   const { config, refresh } = useProvidersConfig();
   const { routePriority, routeOverrides } = useRouting();
 
-  const [defaultModel, setDefaultModel] = usePersistedState<string>(
-    DEFAULT_MODEL_KEY,
-    WORKSPACE_DEFAULTS.model,
-    { listener: true }
-  );
+  const defaultModel =
+    useAppConfig((appConfig) => appConfig.defaultModel) ?? WORKSPACE_DEFAULTS.model;
 
   const setDefaultModelAndPersist = useCallback(
     (next: string | ((prev: string) => string)) => {
-      setDefaultModel((prev) => {
-        const resolved = typeof next === "function" ? next(prev) : next;
-        const selectedModel = normalizeSelectedModel(resolved);
-        const previousSelectedModel = normalizeSelectedModel(prev);
-
-        if (selectedModel !== previousSelectedModel) {
-          persistModelPrefs({ defaultModel: selectedModel });
-        }
-
-        return selectedModel;
-      });
+      const prev = getAppConfigStore().getSnapshot()?.defaultModel ?? WORKSPACE_DEFAULTS.model;
+      const resolved = typeof next === "function" ? next(prev) : next;
+      const selectedModel = normalizeSelectedModel(resolved);
+      if (selectedModel !== normalizeSelectedModel(prev)) {
+        persistModelPrefs({ defaultModel: selectedModel });
+      }
     },
-    [persistModelPrefs, setDefaultModel]
+    [persistModelPrefs]
   );
 
-  const [hiddenModels, setHiddenModels] = usePersistedState<string[]>(
-    HIDDEN_MODELS_KEY,
-    DEFAULT_HIDDEN_MODELS,
-    {
-      listener: true,
-    }
-  );
+  const hiddenModels = useAppConfig((appConfig) => appConfig.hiddenModels) ?? NO_HIDDEN_MODELS;
 
   const isConfigured = useCallback(
     (provider: string) => isProviderConfigured(config, provider),
     [config]
   );
 
-  const isGatewayModelAccessible = useCallback(
-    (gateway: string, modelId: string) =>
-      isGatewayModelAccessibleForUi(effectivePolicy, config, gateway, modelId),
-    [config, effectivePolicy]
-  );
+  const { isGatewayModelAccessible, resolveGatewayModelId } = createGatewayRouting(config);
 
   const isAuthoritativeProviderModelAccessible = useCallback(
     (modelString: string) => isAuthoritativeProviderModelAccessibleIn(config, modelString),
     [config]
   );
 
-  const customModels = useMemo(() => {
-    const next = filterHiddenModels(getCustomModels(config), hiddenModels).filter(
-      isAuthoritativeProviderModelAccessible
-    );
-    return effectivePolicy ? next.filter((m) => isModelAllowedByPolicy(effectivePolicy, m)) : next;
-  }, [config, hiddenModels, effectivePolicy, isAuthoritativeProviderModelAccessible]);
+  const customModels = useMemo(
+    () =>
+      filterHiddenModels(getCustomModels(config), hiddenModels).filter(
+        isAuthoritativeProviderModelAccessible
+      ),
+    [config, hiddenModels, isAuthoritativeProviderModelAccessible]
+  );
 
   const openaiApiKeySet = config === null ? null : config.openai?.apiKeySet === true;
   const codexOauthSet = config === null ? null : config.openai?.codexOauthSet === true;
-
-  const isAllowedByPolicyOnActiveRoute = (modelId: string) =>
-    isModelAllowedByPolicyOnActiveRoute(
-      effectivePolicy,
-      modelId,
-      routePriority,
-      routeOverrides,
-      isConfigured,
-      isGatewayModelAccessible
-    );
-
-  const requiresCodexOauth = (modelId: string) =>
-    isCodexOauthRequiredModel(modelId, config) &&
-    resolvesToDirectOpenAI(
-      modelId,
-      routePriority,
-      routeOverrides,
-      isConfigured,
-      isGatewayModelAccessible
-    );
 
   const providerHiddenModels = useMemo(() => {
     if (config == null) {
@@ -198,7 +160,7 @@ export function useModelsFromSettings() {
     const hasOpenaiApiKey = openaiApiKeySet === true;
     const hasCodexOauth = codexOauthSet === true;
 
-    const next = allModels.filter((modelId) => {
+    return allModels.filter((modelId) => {
       if (userHiddenSet.has(modelId)) {
         return false;
       }
@@ -213,7 +175,8 @@ export function useModelsFromSettings() {
           routePriority,
           routeOverrides,
           isConfigured,
-          isGatewayModelAccessible
+          isGatewayModelAccessible,
+          resolveGatewayModelId
         )
       ) {
         return false;
@@ -221,27 +184,19 @@ export function useModelsFromSettings() {
 
       // Exclude OpenAI models that would also be filtered by OAuth gating.
       // Surfacing them in the hidden bucket would let users select models that
-      // fail at send time (oauth_not_connected / api_key_not_found).
-      if (modelId.startsWith("openai:")) {
-        if (!hasOpenaiApiKey && hasCodexOauth) {
-          return isCodexOauthAllowedModel(modelId, config);
-        }
-        if (hasOpenaiApiKey && hasCodexOauth) {
-          return true;
-        }
-        return !isCodexOauthRequiredModel(modelId, config);
+      // fail at send time (api_key_not_found).
+      if (modelId.startsWith("openai:") && !hasOpenaiApiKey && hasCodexOauth) {
+        return isCodexOauthAllowedModel(modelId, config);
       }
 
       return true;
     });
-
-    return effectivePolicy ? next.filter((m) => isModelAllowedByPolicy(effectivePolicy, m)) : next;
   }, [
     config,
     hiddenModels,
-    effectivePolicy,
     isConfigured,
     isGatewayModelAccessible,
+    resolveGatewayModelId,
     isAuthoritativeProviderModelAccessible,
     routePriority,
     routeOverrides,
@@ -254,17 +209,15 @@ export function useModelsFromSettings() {
     [hiddenModels, providerHiddenModels]
   );
 
-  // Shared with the backend models_list tool so the picker and the tool cannot drift.
   const models = useMemo(
     () =>
       computeSelectableModels({
         providersConfig: config,
         hiddenModels,
-        effectivePolicy,
         routePriority,
         routeOverrides,
       }),
-    [config, hiddenModels, effectivePolicy, routePriority, routeOverrides]
+    [config, hiddenModels, routePriority, routeOverrides]
   );
 
   /**
@@ -279,9 +232,6 @@ export function useModelsFromSettings() {
 
       const canonicalModel = normalizeToCanonical(selectedModel).trim();
       if (BUILT_IN_MODEL_SET.has(canonicalModel)) return;
-      if (!isModelAllowedByPolicy(effectivePolicy, canonicalModel)) {
-        return;
-      }
       if (getExplicitGatewayPrefix(selectedModel)) return;
 
       const colonIndex = selectedModel.indexOf(":");
@@ -306,7 +256,7 @@ export function useModelsFromSettings() {
         // Ignore failures - user can still manage models via Settings
       });
     },
-    [api, config, refresh, effectivePolicy]
+    [api, config, refresh]
   );
 
   // Hidden-model preferences use the gateway-preserving identity: model lists
@@ -321,17 +271,12 @@ export function useModelsFromSettings() {
         return;
       }
 
-      setHiddenModels((prev) => {
-        if (prev.includes(canonical)) {
-          return prev;
-        }
-
-        const nextHiddenModels = [...prev, canonical];
-        persistModelPrefs({ hiddenModels: nextHiddenModels });
-        return nextHiddenModels;
-      });
+      const prev = getHiddenModels();
+      if (!prev.includes(canonical)) {
+        persistModelPrefs({ hiddenModels: [...prev, canonical] });
+      }
     },
-    [persistModelPrefs, setHiddenModels]
+    [persistModelPrefs]
   );
 
   const unhideModel = useCallback(
@@ -341,17 +286,13 @@ export function useModelsFromSettings() {
         return;
       }
 
-      setHiddenModels((prev) => {
-        const nextHiddenModels = prev.filter((m) => m !== canonical);
-        if (nextHiddenModels.length === prev.length) {
-          return prev;
-        }
-
+      const prev = getHiddenModels();
+      const nextHiddenModels = prev.filter((m) => m !== canonical);
+      if (nextHiddenModels.length !== prev.length) {
         persistModelPrefs({ hiddenModels: nextHiddenModels });
-        return nextHiddenModels;
-      });
+      }
     },
-    [persistModelPrefs, setHiddenModels]
+    [persistModelPrefs]
   );
 
   return {
@@ -366,7 +307,5 @@ export function useModelsFromSettings() {
     setDefaultModel: setDefaultModelAndPersist,
     openaiApiKeySet,
     codexOauthSet,
-    requiresCodexOauth,
-    isAllowedByPolicyOnActiveRoute,
   };
 }

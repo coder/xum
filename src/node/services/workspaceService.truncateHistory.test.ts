@@ -26,6 +26,7 @@ import { WorkspaceGoalService } from "./workspaceGoalService";
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import type { BashMonitorWakeReconciler } from "./bashMonitorWakeReconciler";
+import type { ContextMutationGate } from "./contextMutationGate";
 import { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import {
   createCompactionAdmissionMocks,
@@ -343,6 +344,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const fakeSession = {
         ...createCompactionAdmissionMocks(),
         isBusy: mock(() => false),
+        hasQueuedMessages: mock(() => false),
         emitMetadata: mock(() => undefined),
         drainQueuedMessagesIfIdle: mock(() => undefined),
         onChatEvent: mock(() => () => undefined),
@@ -547,10 +549,10 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const internal = workspaceService as unknown as {
         bashMonitorRecoveryPromise: Promise<void>;
         bashMonitorWakeReconciler: BashMonitorWakeReconciler;
-        contextMutationEpochs: Map<string, number>;
+        contextMutationGate: ContextMutationGate;
       };
       await internal.bashMonitorRecoveryPromise;
-      const priorEpoch = internal.contextMutationEpochs.get(id) ?? 0;
+      const priorEpoch = internal.contextMutationGate.epoch(id);
       const finish = spyOn(internal.bashMonitorWakeReconciler, "finishFullHistoryClear");
       const emit = spyOn(h.session, "emitChatEvent");
       if (failure === "barrier") {
@@ -578,7 +580,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         failure === "barrier" ? ["old"] : []
       );
       expect(await storage.read()).toBeNull();
-      expect(internal.contextMutationEpochs.get(id) ?? 0).toBe(
+      expect(internal.contextMutationGate.epoch(id)).toBe(
         priorEpoch + (failure === "post-deletion" ? 1 : 0)
       );
       if (failure === "post-deletion") {
@@ -747,6 +749,38 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       expect(
         await historyService.getCompactionCancellationStorage(workspaceId).read()
       ).toMatchObject({ retainUntilReplacement: true });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a zero-percent truncation refuses while a stream is active and keeps history", async () => {
+    let streaming = true;
+    const { config, historyService, workspaceService, cleanup } = await createServices(
+      createMockAIService({ isStreaming: mock(() => streaming) })
+    );
+    const workspaceId = "zero-truncate-workspace";
+    try {
+      await config.addWorkspace("/tmp/zero-truncate-project", {
+        id: workspaceId,
+        name: "zero-truncate-workspace",
+        projectName: "zero-truncate-project",
+        projectPath: "/tmp/zero-truncate-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("zero-truncate-row", "user", "kept", { timestamp: Date.now() })
+      );
+
+      expect((await workspaceService.truncateHistory(workspaceId, 0)).success).toBe(false);
+      // The same request succeeds once the stream ends, so the refusal came from the stream.
+      streaming = false;
+      expect((await workspaceService.truncateHistory(workspaceId, 0)).success).toBe(true);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success ? history.data.map((row) => row.id) : null).toEqual([
+        "zero-truncate-row",
+      ]);
     } finally {
       await cleanup();
     }
@@ -1250,7 +1284,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           return stat(...args);
         }) as typeof fsPromises.stat);
         const proof = spyOn(historyScanner, "readCompactionPendingHistoryObservation");
-        const fallback = spyOn(historyService, "getHistoryFromLatestBoundary");
+        const fallback = spyOn(historyService, "getHistoryForTokenStats");
         using _spies = {
           [Symbol.dispose]: () => {
             probe.mockRestore();
@@ -1264,7 +1298,8 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           ).toEqual(["/tmp/from-history.ts"]);
         }
         expect(proof).toHaveBeenCalledTimes(state === "absent" ? 0 : 2);
-        expect(fallback).toHaveBeenCalledTimes(2);
+        // The unchanged history is read once; the second call reuses its receipt-keyed paths.
+        expect(fallback).toHaveBeenCalledTimes(1);
         probe.mockRestore();
 
         // A fresh store models another backend publishing after the earlier absence checks.
@@ -1940,7 +1975,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       }),
     ];
     const summaryAiService: BranchSummaryAiService = {
-      createModelWithPinnedMetadata: (modelString: string) =>
+      createModelWithPinnedOptions: (modelString: string) =>
         Promise.resolve(
           Ok({
             model: new MockLanguageModelV3({
@@ -1964,8 +1999,13 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
                 }),
             }),
             metadataModel: modelString,
+            effectiveModelString: modelString,
+            wireProviderName: "anthropic",
+            optionsModelString: modelString,
+            optionsProvidersConfig: {},
+            optionsMuxProviderOptions: {},
           })
-        ) as ReturnType<BranchSummaryAiService["createModelWithPinnedMetadata"]>,
+        ) as ReturnType<BranchSummaryAiService["createModelWithPinnedOptions"]>,
       getWorkspaceMetadata: () =>
         Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-haiku-4-5" } })) as ReturnType<
           BranchSummaryAiService["getWorkspaceMetadata"]
@@ -1976,7 +2016,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       aiService: summaryAiService,
       workspaceId,
       abandonedMessages,
-      experiments: { rlm: true, programmaticToolCalling: true },
+      isExperimentEnabled: () => true,
       guardTailMessageId: "m2",
     });
     // Wait for the background generation to append + settle WITHOUT
@@ -2306,6 +2346,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       });
       workspaceService.setWorkspaceGoalService({
         requireUserAcknowledgment: mock(() => Promise.reject(new Error("goal write failed"))),
+        wakeContinuationBlockedByUserInput: () => undefined,
       } as unknown as WorkspaceGoalService);
       const seedResult = await historyService.appendToHistory(
         workspaceId,

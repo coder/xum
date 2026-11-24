@@ -5,10 +5,12 @@ import { InitStateManager } from "./initStateManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { Err } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 // NOTE: These tests focus on the event wiring (tool-call-end -> callback).
 // The actual post-compaction state computation is covered elsewhere.
@@ -126,40 +128,45 @@ describe("AgentSession post-compaction refresh trigger", () => {
       workspaceId,
       createMuxMessage("before-failed-follow-up", "user", "Preserve this context")
     );
-    await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("failed-follow-up-request", "user", "Please compact", {
-        muxMetadata: {
-          type: "compaction-request",
-          rawCommand: "/compact",
-          parsed: {
-            followUpContent: {
-              text: "Continue delegated work",
-              model: "openai:gpt-4o",
-              agentId: "exec",
-            },
-          },
-        },
-      })
-    );
-
     const internals = session as unknown as {
-      activeCompactionRequest?: { id: string; modelString: string };
       dispatchPendingFollowUp: () => Promise<boolean>;
-    };
-    internals.activeCompactionRequest = {
-      id: "failed-follow-up-request",
-      modelString: "openai:gpt-4o",
     };
     internals.dispatchPendingFollowUp = mock(() =>
       Promise.reject(new Error("follow-up startup failed"))
     );
-    const decision = session.waitForPendingCompactionCompletionDecision("failed-follow-up-summary");
+    // A real compaction turn owns the decision: only the operation that streamed a message may
+    // register a wait for it (#5326), so start one and supply its stream identity.
+    const summaryId = "test-assistant-message";
+    const compacting = await session.sendMessage("Please compact", {
+      model: "openai:gpt-4o",
+      agentId: "compact",
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: {
+          followUpContent: {
+            text: "Continue delegated work",
+            model: "openai:gpt-4o",
+            agentId: "exec",
+          },
+        },
+      },
+    });
+    expect(compacting.success).toBe(true);
+    aiEmitter.emit("stream-start", {
+      type: "stream-start",
+      workspaceId,
+      messageId: summaryId,
+      model: "openai:gpt-4o",
+      historySequence: 1,
+      startTime: Date.now(),
+    });
+    const decision = session.waitForPendingCompactionCompletionDecision(summaryId);
 
     void runSessionTerminalPolicy(session, aiEmitter, {
       type: "stream-end",
       workspaceId,
-      messageId: "failed-follow-up-summary",
+      messageId: summaryId,
       metadata: { model: "openai:gpt-4o", agentId: "compact", finishReason: "stop" },
       parts: [{ type: "text", text: "Compacted context" }],
     } satisfies StreamEndEvent);
@@ -178,6 +185,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
       );
     const aiService: AgentSessionAIService = {
       ...createStreamLifecycleMocks(),
+      runtimeFactory: nodeRuntimeFactory,
       on(eventName: string, listener: (...args: unknown[]) => void) {
         handlers.set(eventName, listener);
       },
@@ -185,18 +193,20 @@ describe("AgentSession post-compaction refresh trigger", () => {
         return undefined;
       },
       createModelWithPinnedOptions: mock(modelUnavailable),
-      createModelWithPinnedMetadata: mock(modelUnavailable),
       getWorkspaceMetadata: mock((workspaceId: string) =>
         Promise.resolve(Err(`Workspace ${workspaceId} not found`))
       ),
       getProvidersConfig: mock(() => null),
+      getWorkspaceSandboxEnv: mock(() => Promise.resolve({})),
       isExperimentEnabled: mock(() => false),
       streamMessage: mock(() =>
         Promise.resolve(Err({ type: "unknown" as const, raw: "no stream in this test" }))
       ),
     };
 
-    const { historyService, config, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService({
+      files: SessionFilesMemory,
+    });
     historyCleanup = cleanup;
 
     const onPostCompactionStateChange = mock(() => undefined);
@@ -208,7 +218,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
       aiService,
       initStateManager: new InitStateManager(config),
       backgroundProcessManager: {
-        setMessageQueued: mock(() => undefined),
+        getForegroundToolCallIds: mock(() => []),
         cleanup: mock(() => Promise.resolve()),
       } as unknown as BackgroundProcessManager,
       onPostCompactionStateChange,

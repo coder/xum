@@ -9,8 +9,7 @@ import * as path from "node:path";
 
 import { Command } from "commander";
 
-import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
-import type { ProjectConfig } from "@/common/types/project";
+import type { ExperimentId } from "@/common/constants/experiments";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
   DEFAULT_THINKING_LEVEL,
@@ -26,17 +25,27 @@ import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import { createConfigStores } from "@/node/config";
 import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
+import { AgentSandboxService } from "@/node/services/agentSandbox/agentSandboxService";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
-import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "@/node/services/providerService";
 import { createCoreServices } from "@/node/services/coreServicesRoot";
+import {
+  collectHeadlessExperiments,
+  createHeadlessExperimentsService,
+} from "./headlessExperiments";
 import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRuntime";
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowService } from "@/node/services/workflows/WorkflowService";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
@@ -48,9 +57,8 @@ import { hasAnyConfiguredProvider, buildProvidersFromEnv } from "@/node/utils/pr
 import { runBestEffortCleanup } from "./runCleanup";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
-import { resolveProjectDir, resolveProjectTrusted } from "./trust";
+import { replaceRunConfig, resolveProjectDir, resolveProjectTrusted } from "./trust";
 
-const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
 const THINKING_LABELS_LIST = [...new Set(Object.values(THINKING_DISPLAY_LABELS))].join(", ");
 
 export interface ParseWorkflowArgsInput {
@@ -75,7 +83,7 @@ interface WorkflowCLIOptions {
   argsJson?: string;
   argsFile?: string;
   argsStdin?: boolean;
-  experiment: string[];
+  experiment: ExperimentId[];
 }
 
 type WorkflowServices = ReturnType<typeof createCoreServices>;
@@ -94,7 +102,8 @@ interface WorkflowContext {
   codexOauthService: CodexOauthService;
   coderOauthService: CoderOauthService;
   realProviderService: ProviderService;
-  policyService: PolicyService;
+  agentResourceLimits: AgentResourceLimitsService;
+  agentSandbox: AgentSandboxService;
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
@@ -170,22 +179,6 @@ async function gatherStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-function collectExperiments(value: string, previous: string[]): string[] {
-  let experimentId = value.trim().toLowerCase();
-  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
-  // flag activates exactly the old exclusive posture — keep existing
-  // automation that passes the removed ID working instead of erroring.
-  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
-    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
-  }
-  if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
-    throw new Error(
-      `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
-    );
-  }
-  return previous.includes(experimentId) ? previous : [...previous, experimentId];
-}
-
 function parseRuntimeConfig(value: string | undefined): RuntimeConfig {
   if (!value) return { type: "local" };
   const parsed = parseRuntimeModeAndHost(value);
@@ -232,53 +225,29 @@ async function copyPersistentConfig(
     await runStores.secretsStore.saveSecretsConfig(existingSecrets);
   }
 
-  const existingConfig = realConfig.loadConfigOrDefault();
-  const trustOnlyProjects = new Map<string, ProjectConfig>();
-  for (const [projectPath, projectConfig] of existingConfig.projects) {
-    if (projectConfig.trusted !== undefined) {
-      trustOnlyProjects.set(projectPath, { workspaces: [], trusted: projectConfig.trusted });
-    }
-  }
-  if (trustOnlyProjects.size > 0) {
-    // Config.saveConfig is private (lost-update safety); route through the queue.
-    await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
-  }
-}
-
-function buildExperimentsObject(experimentIds: readonly string[]) {
-  return {
-    // RLM implies the PTC parent flag: tool assembly only builds
-    // code_execution when the PTC flag is set, so rlm-mode alone would be inert
-    // (the desktop can't express that state — Settings nests RLM under PTC).
-    programmaticToolCalling:
-      experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) ||
-      experimentIds.includes(EXPERIMENT_IDS.RLM),
-    // RLM rides the PTC parent; without this passthrough `-e rlm-mode` was
-    // silently dropped and workflow sends ran the non-kernel PTC toolset.
-    rlm: experimentIds.includes(EXPERIMENT_IDS.RLM),
-    // Invoking `xum workflow` is an explicit opt-in, so the dynamic-workflows
-    // experiment is enabled implicitly for this invocation (never persisted).
-    dynamicWorkflows: true,
-    workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-    // Loading third-party plugin code stays an explicit per-invocation opt-in.
-    agentPlugins: experimentIds.includes(EXPERIMENT_IDS.AGENT_PLUGINS),
-  };
+  await replaceRunConfig(realConfig, config);
 }
 
 async function disposeWorkflowResources(input: {
   tempDir: DisposableTempDir;
+  config: Config;
   services?: WorkflowServices;
   session?: AgentSession;
   codexOauthService?: CodexOauthService;
   coderOauthService?: CoderOauthService;
   realProviderService?: ProviderService;
-  policyService?: PolicyService;
+  agentResourceLimits?: AgentResourceLimitsService;
+  agentSandbox: AgentSandboxService;
 }): Promise<void> {
   const services = input.services;
   // Same shape as `xum run`'s list: every step is contained, reported, and
   // timed as a `[shutdown]` line; a failing step never skips the ones after it.
   await runBestEffortCleanup(
     [
+      // First: stop the config.json watches before the services go, so no watch callback
+      // reaches a torn-down service. A failed setup stops them too.
+      { name: "config.stopWatchingConfigFile", run: () => input.config.stopWatchingConfigFile() },
+      { name: "agentResourceLimits.dispose", run: () => input.agentResourceLimits?.dispose() },
       ...(services
         ? [
             // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
@@ -299,11 +268,13 @@ async function disposeWorkflowResources(input: {
       { name: "codexOauthService.dispose", run: () => input.codexOauthService?.dispose() },
       { name: "coderOauthService.dispose", run: () => input.coderOauthService?.dispose() },
       { name: "realProviderService.dispose", run: () => input.realProviderService?.dispose() },
-      { name: "policyService.dispose", run: () => input.policyService?.dispose() },
       {
         name: "backgroundProcessManager.terminateAll",
         run: () => services?.backgroundProcessManager.terminateAll(),
       },
+      // After the agent fibers stop, as in `xum run`: a command that one starts after this
+      // would start srt's proxy and log monitor again (Codex review).
+      { name: "agentSandbox.dispose", run: () => input.agentSandbox.dispose() },
       // Last: release the Effect runtime that owns the core graph; never rejects.
       ...(services
         ? [{ name: "appRuntime.dispose", run: () => disposeAppRuntime(services.runtime.managed) }]
@@ -321,12 +292,14 @@ async function disposeWorkflowResources(input: {
 async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
   await disposeWorkflowResources({
     tempDir: ctx.tempDir,
+    config: ctx.config,
     services: ctx.services,
     session: ctx.session,
     codexOauthService: ctx.codexOauthService,
     coderOauthService: ctx.coderOauthService,
     realProviderService: ctx.realProviderService,
-    policyService: ctx.policyService,
+    agentResourceLimits: ctx.agentResourceLimits,
+    agentSandbox: ctx.agentSandbox,
   });
 }
 
@@ -335,17 +308,22 @@ async function createWorkflowContext(options: {
   projectDir: string;
 }): Promise<WorkflowContext> {
   const tempDir = new DisposableTempDir("mux-workflow");
+  // Outside the try: the stores only build paths, and the setup-failure cleanup below needs
+  // the run config to stop its config.json watches.
+  const runStores = createConfigStores(tempDir.path);
+  const config = runStores.config;
+  const realStores = createConfigStores();
+  const realConfig = realStores.config;
+  // Constructed before the try, so the cleanup can always dispose it; a service that never
+  // started has nothing to stop.
+  const agentSandbox = new AgentSandboxService(realConfig, { privateConfigRoot: tempDir.path });
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;
   let coderOauthService: CoderOauthService | undefined;
   let realProviderService: ProviderService | undefined;
-  let policyService: PolicyService | undefined;
+  let agentResourceLimits: AgentResourceLimitsService | undefined;
   try {
-    const realStores = createConfigStores();
-    const realConfig = realStores.config;
-    const runStores = createConfigStores(tempDir.path);
-    const config = runStores.config;
     await copyPersistentConfig(realStores, runStores);
 
     const realProvidersStore = realStores.providersConfigStore;
@@ -366,19 +344,14 @@ async function createWorkflowContext(options: {
     const runtimeConfig = parseRuntimeConfig(options.opts.runtime);
     const projectTrusted = await resolveProjectTrusted(realConfig, options.projectDir);
 
-    // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless
-    // workflows too, matching the desktop wiring: without this, `xum workflow`
-    // would keep using providers/models/credentials that providerAccess now
-    // denies. Bind to the REAL config so governor enrollment settings
-    // (muxGovernorUrl/Token) are honored.
-    policyService = new PolicyService(realConfig);
-    await policyService.initialize();
-
     services = createCoreServices({
       ...runStores,
-      policyService,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
+      experimentsService: await createHeadlessExperimentsService(
+        tempDir.path,
+        options.opts.experiment
+      ),
     });
     codexOauthService = new CodexOauthService(runProvidersStore, services.providerService);
     services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
@@ -386,22 +359,19 @@ async function createWorkflowContext(options: {
     // Coder rotates the refresh token on every use, so persisting rotations
     // only to tempDir would strand ~/.xum/providers.jsonc with a consumed
     // (dead) refresh token once this CLI session exits.
-    realProviderService = new ProviderService(
-      realConfig,
-      policyService,
-      realProvidersStore,
-      realFileLeaseManager
-    );
+    realProviderService = new ProviderService(realConfig, realProvidersStore, realFileLeaseManager);
     coderOauthService = new CoderOauthService(
       realProvidersStore,
       realFileLeaseManager,
-      realProviderService,
-      undefined,
-      // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
-      // for token refreshes/issuer checks, and denied providers fail closed.
-      policyService
+      realProviderService
     );
     services.turnRequestBuilderBindings.coderOauthService = coderOauthService;
+    // The workflow's agent commands start from this process, so it applies the limits that
+    // Settings saved in the real config, as the server does.
+    agentResourceLimits = new AgentResourceLimitsService(realConfig);
+    await agentResourceLimits.start();
+    await agentSandbox.start();
+    sandboxApprovalManager.denyAllRequests();
 
     // Const capture: `services` is a `let`, so the deferred sanitize closure
     // below would lose TypeScript's definite-assignment narrowing.
@@ -456,17 +426,20 @@ async function createWorkflowContext(options: {
       codexOauthService,
       coderOauthService,
       realProviderService,
-      policyService,
+      agentResourceLimits,
+      agentSandbox,
     };
   } catch (error) {
     await disposeWorkflowResources({
       tempDir,
+      config,
       services,
       session,
       codexOauthService,
       coderOauthService,
       realProviderService,
-      policyService,
+      agentResourceLimits,
+      agentSandbox,
     });
     throw error;
   }
@@ -478,7 +451,6 @@ function createWorkflowService(input: {
   model: string;
   thinkingLevel: ParsedThinkingInput;
 }): WorkflowService {
-  const experiments = buildExperimentsObject(input.opts.experiment);
   const runtime = createRuntime(input.ctx.runtimeConfig, {
     projectPath: input.ctx.projectDir,
     workspaceName: input.ctx.workspaceId,
@@ -494,7 +466,7 @@ function createWorkflowService(input: {
       evaluationService: input.ctx.services.evaluationService,
       aiService: input.ctx.services.aiService,
       sessionUsageService: input.ctx.services.sessionUsageService,
-      // The ephemeral run config copies only providers/secrets/trust, so the
+      // The ephemeral run config copies only providers/secrets/trust/tool search, so the
       // Settings default (`evaluationDefaults.model`) must be read from the
       // real config. Precedence: per-call `model` > --evaluation-model > Settings.
       config: input.ctx.realConfig,
@@ -509,7 +481,6 @@ function createWorkflowService(input: {
         parentWorkspaceId: input.ctx.workspaceId,
         workflowRunId: runId,
         defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
-        experiments,
         modelString: input.model,
         thinkingLevel: input.thinkingLevel,
         getProjectTrusted: () => input.ctx.projectTrusted,
@@ -520,6 +491,7 @@ function createWorkflowService(input: {
           runtimeTempDir: runtime.normalizePath(".xum/tmp", input.ctx.workspacePath),
           workspaceSessionDir,
           trusted: input.ctx.projectTrusted,
+          sessionLocks: input.ctx.services.historyService.locks,
         },
       }),
     resolveWorkflowScript: (scriptPath) =>
@@ -528,7 +500,17 @@ function createWorkflowService(input: {
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,
-        includeAgentPlugins: experiments.agentPlugins,
+        // Outside the agent loop: the headless CLI builds host runtimes.
+        runtimeFactory: nodeRuntimeFactory,
+      }),
+    assertStoredPluginWorkflowReviewed: (stored) =>
+      assertStoredPluginWorkflowReviewed({
+        ...stored,
+        runtime,
+        workspacePath: input.ctx.workspacePath,
+        projectTrusted: input.ctx.projectTrusted,
+        // Outside the agent loop: the headless CLI builds host runtimes.
+        runtimeFactory: nodeRuntimeFactory,
       }),
     getCurrentProjectTrusted: () => input.ctx.projectTrusted,
     runnerId: input.ctx.workspaceId,
@@ -585,7 +567,8 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
       runtime,
       workspacePath: ctx.workspacePath,
       projectTrusted: ctx.projectTrusted,
-      includeAgentPlugins: buildExperimentsObject(options.experiment).agentPlugins,
+      // Outside the agent loop: the headless CLI builds host runtimes.
+      runtimeFactory: nodeRuntimeFactory,
     });
     const result = await workflowService.startWorkflow({
       script,
@@ -640,9 +623,7 @@ export async function main(): Promise<number> {
   const program = new Command();
   program
     .name("xum workflow")
-    .description(
-      "Run xum workflow scripts by explicit script path.\n\nExperimental: invoking this command implicitly enables the dynamic-workflows\nexperiment for this invocation only."
-    )
+    .description("Run xum workflow scripts by explicit script path.")
     .option("-d, --dir <path>", "project directory")
     .option("-r, --runtime <runtime>", "runtime type (currently only local is supported)", "local")
     .option("-m, --model <model>", "model to use for workflow-owned agents", defaultModel)
@@ -669,7 +650,7 @@ export async function main(): Promise<number> {
     .option(
       "-e, --experiment <id>",
       "enable an additional experiment for workflow-owned child agents (can be repeated)",
-      collectExperiments,
+      collectHeadlessExperiments,
       []
     )
     .option("-v, --verbose", "show info-level logs")

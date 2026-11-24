@@ -8,34 +8,27 @@ import {
 
 describe("isAllowedOrpcPath", () => {
   test("allows known procedures", () => {
-    expect(isAllowedOrpcPath(["general", "ping"]))
-      .toBe(true);
-    expect(isAllowedOrpcPath(["workspace", "sendMessage"]))
-      .toBe(true);
-    expect(isAllowedOrpcPath(["providers", "getConfig"]))
-      .toBe(true);
+    expect(isAllowedOrpcPath(["general", "ping"])).toBe(true);
+    expect(isAllowedOrpcPath(["workspace", "sendMessage"])).toBe(true);
+    expect(isAllowedOrpcPath(["providers", "getConfig"])).toBe(true);
   });
 
   test("rejects unknown roots and procedures", () => {
-    expect(isAllowedOrpcPath(["server", "getApiServerStatus"]))
-      .toBe(false);
-    expect(isAllowedOrpcPath(["workspace", "create"]))
-      .toBe(false);
-    expect(isAllowedOrpcPath(["providers", "setProviderConfig"]))
-      .toBe(false);
+    expect(isAllowedOrpcPath(["server", "getApiServerStatus"])).toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "create"])).toBe(false);
+    expect(isAllowedOrpcPath(["providers", "setProviderConfig"])).toBe(false);
   });
 
-  test("rejects nested routers", () => {
-    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe"]))
-      .toBe(false);
+  test("rejects nested routers other than the background processes strip's", () => {
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "sendToBackground"])).toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "goal", "get"])).toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe", "x"])).toBe(false);
   });
 
   test("rejects invalid segments", () => {
     expect(isAllowedOrpcPath([])).toBe(false);
-    expect(isAllowedOrpcPath(["workspace", "__proto__"]))
-      .toBe(false);
-    expect(isAllowedOrpcPath(["workspace", "send-message"]))
-      .toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "__proto__"])).toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "send-message"])).toBe(false);
   });
 });
 
@@ -111,7 +104,7 @@ describe("plan implement setting (#4942)", () => {
 });
 
 describe("webview preferences (#4972, #4962)", () => {
-  test("forwards a valid bash collapsed-summary mode and transcript density and nothing else from userPreferences", () => {
+  test("forwards a valid bash collapsed-summary mode, transcript density and vim flag and nothing else from userPreferences", () => {
     expect(
       redactWebviewOrpcResult(["config", "getConfig"], {
         userPreferences: {
@@ -131,7 +124,11 @@ describe("webview preferences (#4972, #4962)", () => {
       })
     ).toEqual({
       userPreferences: {
-        appearance: { bashCollapsedSummaryMode: "intent", transcriptDensity: "hyper" },
+        appearance: {
+          bashCollapsedSummaryMode: "intent",
+          transcriptDensity: "hyper",
+          vimEnabled: true,
+        },
       },
     });
   });
@@ -165,6 +162,34 @@ describe("webview preferences (#4972, #4962)", () => {
         },
       })
     ).toEqual({ userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } } });
+  });
+
+  test("forwards the numeric per-model compaction thresholds and no other AI preference", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: {
+          ai: {
+            projectDefaults: { "/home/alice/secret-project": { model: "openai:gpt-5" } },
+            autoCompactionThresholdByModel: {
+              "anthropic:claude-opus-5-5": 60,
+              "openai:gpt-5": "70",
+            },
+          },
+        },
+      })
+    ).toEqual({
+      userPreferences: {
+        ai: { autoCompactionThresholdByModel: { "anthropic:claude-opus-5-5": 60 } },
+      },
+    });
+  });
+
+  test("forwards the CDN script toggle and no other UI preference", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: { ui: { artifactsAllowCdnScripts: false, sidebarFlatMode: true } },
+      })
+    ).toEqual({ userPreferences: { ui: { artifactsAllowCdnScripts: false } } });
   });
 
   test("forwards agentAiDefaults rebuilt from named fields, without invalid agents", () => {
@@ -218,50 +243,107 @@ describe("held inputs (#4771)", () => {
   });
 });
 
-describe("policy (#4739)", () => {
-  test("allows reading the effective policy and its change signal only", () => {
-    expect(isAllowedOrpcPath(["policy", "get"])).toBe(true);
-    expect(isAllowedOrpcPath(["policy", "onChanged"])).toBe(true);
-    expect(isAllowedOrpcPath(["policy", "refresh"])).toBe(false);
+describe("retry barrier (#5092)", () => {
+  const known = new Set(["ws-1"]);
+
+  test("resumes a known workspace's stream with only its ID and send options", () => {
+    const options = { model: "anthropic:claude-sonnet-4-5", agentId: "exec" };
+    expect(isAllowedOrpcPath(["workspace", "resumeStream"])).toBe(true);
+    // Retry resumes only; the webview never toggles the auto-retry preference.
+    expect(isAllowedOrpcPath(["workspace", "setAutoRetryEnabled"])).toBe(false);
+    expect(
+      sanitizeWebviewOrpcInput(
+        ["workspace", "resumeStream"],
+        { workspaceId: "ws-1", options, extra: true },
+        known
+      )
+    ).toEqual({ ok: true, input: { workspaceId: "ws-1", options } });
   });
 
-  test("strips provider forcedBaseUrl from policy.get and keeps everything else", () => {
-    const response = {
-      source: "governor",
-      status: { state: "enforced" },
-      policy: {
-        policyFormatVersion: "0.1",
-        providerAccess: [
-          {
-            id: "openai",
-            forcedBaseUrl: "https://user:token@gateway.corp.example/v1",
-            allowedModels: ["gpt-5.6-terra"],
-          },
-          { id: "anthropic", allowedModels: null },
-        ],
-        mcp: { allowUserDefined: { stdio: false, remote: true } },
-        runtimes: ["worktree"],
-      },
+  test("rejects unknown workspaces and malformed input", () => {
+    for (const [procedure, input] of [
+      ["resumeStream", { workspaceId: "ws-2", options: {} }],
+      ["resumeStream", null],
+    ] as const) {
+      expect(sanitizeWebviewOrpcInput(["workspace", procedure], input, known).ok).toBe(false);
+    }
+  });
+});
+
+describe("background processes strip (#5092)", () => {
+  const known = new Set(["ws-1"]);
+  const path = (procedure: string) => ["workspace", "backgroundBashes", procedure];
+
+  test("lists, terminates and reads a known workspace's processes with only the fields each needs", () => {
+    for (const [procedure, input, forwarded] of [
+      ["subscribe", { workspaceId: "ws-1", processId: "p1" }, { workspaceId: "ws-1" }],
+      [
+        "terminate",
+        { workspaceId: "ws-1", processId: "p1", extra: true },
+        { workspaceId: "ws-1", processId: "p1" },
+      ],
+      // The output dialog's reads (#5196): an offset of 0 is kept, non-numeric windows and extra
+      // fields are dropped.
+      [
+        "getOutput",
+        { workspaceId: "ws-1", processId: "p1", fromOffset: 0, extra: true },
+        { workspaceId: "ws-1", processId: "p1", fromOffset: 0 },
+      ],
+      [
+        "getOutput",
+        { workspaceId: "ws-1", processId: "p1", tailBytes: 64000, fromOffset: "5" },
+        { workspaceId: "ws-1", processId: "p1", tailBytes: 64000 },
+      ],
+    ] as const) {
+      expect(isAllowedOrpcPath(path(procedure))).toBe(true);
+      expect(sanitizeWebviewOrpcInput(path(procedure), input, known)).toEqual({
+        ok: true,
+        input: forwarded,
+      });
+    }
+  });
+
+  test("empties monitor match lines before the process state reaches the webview", () => {
+    const monitor = {
+      filter: "ERROR",
+      totalMatches: 2,
+      lastLines: ["ERROR token=abc"],
+      stopped: false,
     };
-    expect(redactWebviewOrpcResult(["policy", "get"], response)).toEqual({
-      ...response,
-      policy: {
-        ...response.policy,
-        providerAccess: [
-          { id: "openai", allowedModels: ["gpt-5.6-terra"] },
-          { id: "anthropic", allowedModels: null },
-        ],
-      },
+    const state = {
+      processes: [
+        { id: "p1", script: "tail -f log", status: "running", monitor },
+        { id: "p2", script: "sleep 5", status: "running" },
+      ],
+      foregroundToolCallIds: ["call-1"],
+    };
+    expect(redactWebviewOrpcResult(path("subscribe"), state)).toEqual({
+      processes: [
+        {
+          id: "p1",
+          script: "tail -f log",
+          status: "running",
+          monitor: { ...monitor, lastLines: [] },
+        },
+        { id: "p2", script: "sleep 5", status: "running" },
+      ],
+      foregroundToolCallIds: ["call-1"],
     });
-    // The input object is not mutated.
-    expect(response.policy.providerAccess[0].forcedBaseUrl).toBeDefined();
+    // The host's copy is not mutated.
+    expect(monitor.lastLines).toEqual(["ERROR token=abc"]);
   });
 
-  test("passes other results and policy-less responses through unchanged", () => {
-    const noPolicy = { source: "none", status: { state: "disabled" }, policy: null };
-    expect(redactWebviewOrpcResult(["policy", "get"], noPolicy)).toEqual(noPolicy);
-    const other = { forcedBaseUrl: "kept" };
-    expect(redactWebviewOrpcResult(["workspace", "getPlanContent"], other)).toBe(other);
+  test("rejects unknown workspaces and malformed input", () => {
+    for (const [procedure, input] of [
+      ["subscribe", { workspaceId: "ws-2" }],
+      ["subscribe", null],
+      ["terminate", { workspaceId: "ws-2", processId: "p1" }],
+      ["terminate", { workspaceId: "ws-1" }],
+      ["getOutput", { workspaceId: "ws-2", processId: "p1" }],
+      ["getOutput", { workspaceId: "ws-1", tailBytes: 64000 }],
+    ] as const) {
+      expect(sanitizeWebviewOrpcInput(path(procedure), input, known).ok).toBe(false);
+    }
   });
 });
 
@@ -273,20 +355,23 @@ describe("app and providers config (#4766)", () => {
     expect(isAllowedOrpcPath(["config", "updateRoutePreferences"])).toBe(false);
   });
 
-  test("projects config.getConfig to the model-routing and thinking-floor fields", () => {
+  test("projects config.getConfig to the model-routing, thinking-floor and model-preference fields", () => {
     const config = {
-      routePriority: ["mux-gateway", "direct"],
+      routePriority: ["openrouter", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
-      muxGovernorUrl: "https://governor.corp.example",
+      defaultModel: "openai:gpt-5.6-terra",
+      hiddenModels: ["anthropic:claude-opus-5-5"],
       heartbeatDefaultPrompt: "private prompt",
       userPreferences: { name: "alice" },
       taskSettings: { maxParallelAgentTasks: 3 },
     };
     expect(redactWebviewOrpcResult(["config", "getConfig"], config)).toEqual({
-      routePriority: ["mux-gateway", "direct"],
+      routePriority: ["openrouter", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+      defaultModel: "openai:gpt-5.6-terra",
+      hiddenModels: ["anthropic:claude-opus-5-5"],
     });
   });
 

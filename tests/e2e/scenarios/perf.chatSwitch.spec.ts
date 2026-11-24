@@ -33,7 +33,6 @@ import {
   CHAT_SWITCH_MARK_PREFIX,
   CHAT_SWITCH_START_MARK,
 } from "../../../src/browser/utils/perf/chatSwitchTiming";
-import { TUTORIAL_STATE_KEY, type TutorialState } from "../../../src/common/constants/storage";
 import { ONCHAT_REPLAY_TIMING_LOG_MESSAGE } from "../../../src/node/services/onChatReplayTiming";
 
 /**
@@ -458,18 +457,9 @@ test.describe("chat switch performance profiling", () => {
       expect(openResult).toEqual({ status: "shown" });
       const serverPage = await opened;
       // The server window has no preload, so it misses the local window's e2e setup: the
-      // `page` fixture sets the viewport and disables tutorials, and window.api.isE2E hides the
-      // onboarding splash. Match the viewport so both transports lay out the same transcript.
+      // `page` fixture sets the viewport, and window.api.isE2E hides the onboarding splash.
+      // Match the viewport so both transports lay out the same transcript.
       await serverPage.setViewportSize(page.viewportSize() ?? { width: 1600, height: 900 });
-      const tutorialState: TutorialState = {
-        disabled: true,
-        completed: { creation: true, workspace: true, review: true },
-      };
-      await serverPage.evaluate(
-        ({ key, state }) => localStorage.setItem(key, JSON.stringify(state)),
-        { key: TUTORIAL_STATE_KEY, state: tutorialState }
-      );
-      await serverPage.reload();
       await serverPage.getByRole("button", { name: "Skip" }).click({ timeout: 30_000 });
       await expect(serverPage.getByRole("navigation", { name: "Projects" })).toBeVisible({
         timeout: 30_000,

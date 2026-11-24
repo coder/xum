@@ -9,6 +9,8 @@ description: An opt-in automatic reset policy with bounded retrieval and a manua
 
 Accepted. Amends only consequence 2 of [ADR 0003](./0003-context-boundaries-for-compaction-and-reset.md) for automatic token-budget rollover.
 
+Note: Xum later removed the Memory Hot Set experiment. The hot-memory selection that the Decision section extends with the `context-notes.md` excerpt no longer exists.
+
 ## Context
 
 Repeated automatic summaries lose detail and consume inference tokens. An opt-in policy can instead start a fresh Active Conversation Context while retaining Transcript History for explicit, bounded retrieval. Manual resets must keep their privacy semantics.

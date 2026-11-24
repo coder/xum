@@ -54,6 +54,7 @@ export class SummarizeStrategy {
         agentInitiated: streamContext.agentInitiated,
         goalKind: streamContext.goalKind,
         goalId: streamContext.goalId,
+        taskTurnKind: streamContext.taskTurnKind,
         modelForStream: streamContext.modelString,
         muxMetadata: streamContext.workspaceTurnMetadata,
         autoModelRouting: streamContext.autoModelRouting,

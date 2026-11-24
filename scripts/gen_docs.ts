@@ -367,6 +367,7 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   anthropic: "Anthropic",
   openai: "OpenAI",
   google: "Google",
+  "google-vertex": "Google Vertex AI",
   xai: "xAI",
   deepseek: "DeepSeek",
   moonshotai: "Moonshot AI",
@@ -386,7 +387,9 @@ function generateProviderEnvVarsBlock(): string {
     const displayName = PROVIDER_DISPLAY_NAMES[provider] ?? provider;
     let envVars: string;
 
-    if (vars.apiKey?.length) {
+    if (vars.project?.length && vars.apiKey?.length) {
+      envVars = `\`${vars.project[0]}\` (ADC) or \`${vars.apiKey[0]}\` (express mode)`;
+    } else if (vars.apiKey?.length) {
       envVars = vars.apiKey.map((v) => `\`${v}\``).join(" or ");
     } else if (vars.region?.length) {
       envVars = `\`${vars.region[0]}\` (credentials via AWS SDK chain)`;
@@ -419,6 +422,12 @@ function generateProviderEnvVarsBlock(): string {
       lines.push(
         `| ${displayName.padEnd(12)} | \`${vars.organization[0]}\``.padEnd(42) +
           " | Organization ID     |"
+      );
+    }
+    if (vars.location?.length) {
+      lines.push(
+        `| ${displayName.padEnd(12)} | \`${vars.location[0]}\``.padEnd(42) +
+          " | GCP location        |"
       );
     }
   }

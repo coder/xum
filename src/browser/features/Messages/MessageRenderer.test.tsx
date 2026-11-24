@@ -1,17 +1,25 @@
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { TooltipProvider } from "@radix-ui/react-tooltip";
 import type { DisplayedMessage } from "@/common/types/message";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
-import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import {
+  BACKGROUND_WORK_WAKE_OPENINGS,
+  LAYOUT_TURN_END_NUDGE,
+  STATUS_PAGE_AGENT_TURN_END_NUDGE,
+  STATUS_PAGE_TURN_END_NUDGE,
+  TODO_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
 import { buildWorkflowResultContextMessage } from "@/common/utils/workflowRunMessages";
 import { MessageRenderer } from "./MessageRenderer";
 import { parseSubagentReportEnvelope } from "./SubagentReportMessageContent";
 
 describe("MessageRenderer goal continuation rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -20,9 +28,7 @@ describe("MessageRenderer goal continuation rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   test("budget warnings collapse machine text without hiding ordinary user input", () => {
@@ -305,6 +311,7 @@ Live goal accounting at limit:
 
 describe("MessageRenderer subagent report rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -313,9 +320,7 @@ describe("MessageRenderer subagent report rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   function createReportMessage(content: string, synthetic = true): DisplayedMessage {
@@ -502,6 +507,7 @@ This was typed by a user.
 
 describe("MessageRenderer subagent failure rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -509,9 +515,7 @@ describe("MessageRenderer subagent failure rows", () => {
 
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   function failureMessage(
@@ -596,6 +600,7 @@ This sub-agent task failed terminally and will not produce a report. Do not re-a
 
 describe("MessageRenderer background work wake rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -604,9 +609,7 @@ describe("MessageRenderer background work wake rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   const wakePrompt =
@@ -694,8 +697,143 @@ describe("MessageRenderer background work wake rows", () => {
   });
 });
 
+/** The TODO nudge text that #7027 shipped; histories still hold it. */
+const NUDGE_TEXT_7027 =
+  "<notification>\nYou ended your turn, but your TODO list still has pending or in-progress items. First finish the open items that are still in scope and that you can do now. Then update the list with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item stays open on purpose, for example because it waits for the user, keep it and say why in one sentence.\n</notification>";
+
+describe("MessageRenderer TODO nudge rows", () => {
+  beforeEach(() => {
+    saveDomGlobals();
+    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.document = globalThis.window.document;
+    globalThis.localStorage = globalThis.window.localStorage;
+  });
+
+  afterEach(() => {
+    cleanup();
+    restoreDomGlobals();
+  });
+
+  function renderNudge(content: string, isSynthetic: boolean) {
+    const message: DisplayedMessage = {
+      type: "user",
+      id: "todo-nudge",
+      historyId: "todo-nudge",
+      content,
+      historySequence: 40,
+      ...(isSynthetic ? { isSynthetic: true } : {}),
+    };
+    return render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+  }
+
+  test("collapses the synthetic nudge and keeps its prompt on demand", () => {
+    const view = renderNudge(TODO_TURN_END_NUDGE, true);
+    expect(view.container.querySelector("[data-todo-turn-end-nudge]")).not.toBeNull();
+    expect(view.queryByText(/todo_write/)).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: /show details/i }));
+    expect(view.getByText(/todo_write/)).toBeDefined();
+  });
+
+  test("collapses a nudge stored with the text that #6720 shipped", () => {
+    const legacy =
+      "<notification>\nYou ended your turn, but your TODO list still has pending or in-progress items. Update it now with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item is still open on purpose, keep it and say why in one sentence. Do not start new work.\n</notification>";
+    const view = renderNudge(legacy, true);
+    expect(view.container.querySelector("[data-todo-turn-end-nudge]")).not.toBeNull();
+    // Those turns were todo_write-only: the summary must not claim they finished work.
+    expect(view.getByText("Asked the agent to update its TODO list")).toBeDefined();
+    expect(view.queryByText(/finish open items/)).toBeNull();
+    cleanup();
+    const current = renderNudge(TODO_TURN_END_NUDGE, true);
+    expect(
+      current.getByText("Asked the agent to update its TODO list and finish open items")
+    ).toBeDefined();
+  });
+
+  test("collapses a nudge stored with the text that #7027 shipped as a current nudge", () => {
+    const view = renderNudge(NUDGE_TEXT_7027, true);
+    expect(view.container.querySelector("[data-todo-turn-end-nudge]")).not.toBeNull();
+    expect(
+      view.getByText("Asked the agent to update its TODO list and finish open items")
+    ).toBeDefined();
+  });
+
+  test("keeps a full bubble for typed lookalikes and plugin-joined prompts", () => {
+    const typed = renderNudge(TODO_TURN_END_NUDGE, false);
+    expect(typed.container.querySelector("[data-todo-turn-end-nudge]")).toBeNull();
+    cleanup();
+    const joined = renderNudge(`Run the failing tests again.\n\n${TODO_TURN_END_NUDGE}`, true);
+    expect(joined.container.querySelector("[data-todo-turn-end-nudge]")).toBeNull();
+    expect(joined.getByText(/Run the failing tests again/)).toBeDefined();
+  });
+
+  test("collapses a TODO and status page nudge stored with the #7027 TODO text", () => {
+    const both = renderNudge(`${NUDGE_TEXT_7027}\n\n${STATUS_PAGE_TURN_END_NUDGE}`, true);
+    expect(both.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
+    expect(both.getByText("Asked the agent to update its TODO list and status page")).toBeDefined();
+  });
+
+  test.each([STATUS_PAGE_TURN_END_NUDGE, STATUS_PAGE_AGENT_TURN_END_NUDGE])(
+    "collapses a status page nudge, alone or after the TODO nudge, but not a typed copy",
+    (nudge) => {
+      const alone = renderNudge(nudge, true);
+      expect(alone.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
+      cleanup();
+      const both = renderNudge(`${TODO_TURN_END_NUDGE}\n\n${nudge}`, true);
+      expect(both.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
+      expect(both.queryByText(/status page the user sees/)).toBeNull();
+      cleanup();
+      const typed = renderNudge(nudge, false);
+      expect(typed.container.querySelector("[data-status-page-turn-end-nudge]")).toBeNull();
+    }
+  );
+
+  // The summary is the only text of the collapsed row, so it names each joined nudge's ask.
+  test.each([
+    { name: "alone", content: LAYOUT_TURN_END_NUDGE, asks: [] },
+    {
+      name: "after the TODO nudge",
+      content: `${TODO_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["TODO list"],
+    },
+    {
+      name: "after the status page nudge",
+      content: `${STATUS_PAGE_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["status page"],
+    },
+    {
+      name: "after both",
+      content: `${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_AGENT_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["TODO list", "status page"],
+    },
+  ])("collapses a layout nudge $name and names each ask", ({ content, asks }) => {
+    const view = renderNudge(content, true);
+    const row = view.container.querySelector("[data-layout-turn-end-nudge]");
+    expect(row).not.toBeNull();
+    const summary = view.getByText(/^Asked the agent to /).textContent ?? "";
+    expect(summary).toContain("layout issues");
+    const named: readonly string[] = asks;
+    for (const ask of ["TODO list", "status page"]) {
+      expect(summary.includes(ask)).toBe(named.includes(ask));
+    }
+  });
+
+  test("keeps a full bubble for a typed layout nudge and one joined to a plugin's prompt", () => {
+    const typed = renderNudge(LAYOUT_TURN_END_NUDGE, false);
+    expect(typed.container.querySelector("[data-layout-turn-end-nudge]")).toBeNull();
+    cleanup();
+    const joined = renderNudge(`Run the failing tests again.\n\n${LAYOUT_TURN_END_NUDGE}`, true);
+    expect(joined.container.querySelector("[data-layout-turn-end-nudge]")).toBeNull();
+    expect(joined.getByText(/Run the failing tests again/)).toBeDefined();
+  });
+});
+
 describe("MessageRenderer bash monitor wake rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -704,9 +842,7 @@ describe("MessageRenderer bash monitor wake rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   const wakePrompt = `A background bash monitor matched output.
@@ -828,6 +964,7 @@ This is a condition-driven wake-up. Continue from this event.`;
 
 describe("MessageRenderer compaction boundary rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
   });
@@ -835,8 +972,7 @@ describe("MessageRenderer compaction boundary rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("renders start compaction boundary rows", () => {
@@ -923,6 +1059,7 @@ describe("MessageRenderer compaction boundary rows", () => {
 
 describe("MessageRenderer agent peer message rows", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -931,9 +1068,7 @@ describe("MessageRenderer agent peer message rows", () => {
   afterEach(() => {
     cleanup();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
   // Peer payloads are assistant-role synthetic rows (peer bytes never gain user-role authority).

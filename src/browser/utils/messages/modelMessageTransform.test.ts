@@ -543,6 +543,35 @@ describe("modelMessageTransform", () => {
       );
     });
 
+    // Text, a PNG, then an SVG inlined as text (inlineSvgAsTextForProvider): the model must see
+    // the parts in the order the user attached them.
+    it("keeps each merged message's parts in order, joining text only across the boundary", () => {
+      const png = { type: "file" as const, mediaType: "image/png", data: "AAAA" };
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "Context" }] },
+        {
+          role: "user",
+          content: [{ type: "text", text: "Request" }, png, { type: "text", text: "<svg/>" }],
+        },
+        { role: "user", content: [png] },
+        { role: "user", content: "Last" },
+      ];
+
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toEqual([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Context\nRequest" },
+            png,
+            { type: "text", text: "<svg/>" },
+            png,
+            { type: "text", text: "Last" },
+          ],
+        },
+      ]);
+    });
+
     it("should not merge user messages separated by assistant message", () => {
       const messages: ModelMessage[] = [
         {
@@ -892,6 +921,172 @@ describe("modelMessageTransform", () => {
     });
   });
 
+  describe("Anthropic preserved thinking blocks", () => {
+    // Newer Claude models bind every replayed thinking block to its prefix, so
+    // each block must go back as returned: own signature, own position.
+    const thinkingOn = { anthropicThinkingEnabled: true };
+    const sig = (signature: string) => ({ anthropic: { signature } });
+
+    function assistantContent(messages: ModelMessage[]) {
+      const assistant = messages.find(
+        (msg): msg is AssistantModelMessage => msg.role === "assistant"
+      );
+      expect(assistant).toBeDefined();
+      return assistant?.content;
+    }
+
+    it("joins the streamed deltas of one block but keeps adjacent signed blocks apart", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            // Block 1 streamed as two deltas; Anthropic signs the last one.
+            { type: "reasoning", text: "pl" },
+            { type: "reasoning", text: "an", providerOptions: sig("sig-1") },
+            // Block 2 directly follows block 1.
+            { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+            // Block 3: empty thinking with only a signature.
+            { type: "reasoning", text: "", providerOptions: sig("sig-3") },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual([
+        { type: "reasoning", text: "plan", providerOptions: sig("sig-1") },
+        { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+        { type: "reasoning", text: "", providerOptions: sig("sig-3") },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    it("keeps redacted_thinking blocks in place and never merges them with neighbors", () => {
+      const redacted = { anthropic: { redactedData: "opaque" } };
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "", providerOptions: redacted },
+            { type: "reasoning", text: "", providerOptions: redacted },
+            // An unsigned delta after a redacted block starts a new block.
+            { type: "reasoning", text: "next", providerOptions: sig("sig-1") },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual([
+        { type: "reasoning", text: "", providerOptions: redacted },
+        { type: "reasoning", text: "", providerOptions: redacted },
+        { type: "reasoning", text: "next", providerOptions: sig("sig-1") },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    it("still merges OpenAI reasoning deltas that carry the itemId on the first part", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "a",
+              providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+            },
+            { type: "reasoning", text: "b" },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "openai"))).toEqual([
+        {
+          type: "reasoning",
+          text: "ab",
+          providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+        },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    // #5887: interleaved thinking can put text between two thinking blocks before a tool
+    // call. Moving the second block forward edits the prefix every later block is bound to.
+    it("replays a tool-call message that starts with thinking in its original block order", () => {
+      const redacted = { anthropic: { redactedData: "opaque" } };
+      const toolCall = {
+        type: "tool-call",
+        toolCallId: "c1",
+        toolName: "bash",
+        input: {},
+      } as const;
+      const toolResult: ToolModelMessage = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "bash",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      };
+      const openers = [
+        { type: "reasoning", text: "plan", providerOptions: sig("sig-1") },
+        { type: "reasoning", text: "", providerOptions: redacted },
+      ] as const;
+      for (const opener of openers) {
+        const content: AssistantModelMessage["content"] = [
+          opener,
+          { type: "text", text: "Let me check." },
+          { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+          toolCall,
+        ];
+        const messages: ModelMessage[] = [
+          { role: "user", content: [{ type: "text", text: "go" }] },
+          { role: "assistant", content },
+          toolResult,
+        ];
+
+        expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual(
+          content
+        );
+      }
+    });
+
+    it("still moves thinking first when a tool-call message starts with text", () => {
+      // Manual extended thinking requires the final assistant turn to start with thinking.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Let me check." },
+            { type: "reasoning", text: "check", providerOptions: sig("sig-1") },
+            { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "c1",
+              toolName: "bash",
+              output: { type: "text", value: "ok" },
+            },
+          ],
+        },
+      ];
+
+      expect(
+        assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))?.[0]
+      ).toEqual({ type: "reasoning", text: "check", providerOptions: sig("sig-1") });
+    });
+  });
+
   describe("reasoning part handling for OpenAI", () => {
     it("should preserve reasoning parts for OpenAI provider (managed via explicit history)", () => {
       const messages: ModelMessage[] = [
@@ -1191,6 +1386,49 @@ describe("injectAgentTransition", () => {
     expect(result[0]).toEqual(messages[0]);
     expect(result[1]).toEqual(messages[1]);
     expect(result[3]).toEqual(messages[2]); // Last user message shifted
+  });
+
+  it("injects the transition before the user prompt, not before a trailing Token Budget warning", () => {
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Here's the plan..." }],
+        metadata: { timestamp: 1000, agentId: "plan" },
+      },
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Now execute it" }],
+        metadata: { timestamp: 2000 },
+      },
+      {
+        id: "warning-1",
+        role: "user",
+        parts: [{ type: "text", text: "Token budget warning" }],
+        metadata: {
+          timestamp: 3000,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "context-budget-warning",
+            contextTokens: 80,
+            maxTokens: 100,
+            budgetTokens: 90,
+          },
+        },
+      },
+    ];
+
+    const result = injectAgentTransition(messages, "exec");
+
+    expect(result.map((message) => message.id)).toEqual([
+      "assistant-1",
+      result[1].id,
+      "user-1",
+      "warning-1",
+    ]);
+    expect(result[1].metadata?.synthetic).toBe(true);
   });
 
   it("should not inject transition when agent is the same", () => {
@@ -1760,7 +1998,7 @@ describe("filterEmptyAssistantMessages", () => {
 });
 
 describe("injectPostCompactionAttachments", () => {
-  it("inserts after the compaction summary and enforces a size budget", () => {
+  it("inserts before the request after a compaction summary and enforces a size budget", () => {
     const messages: MuxMessage[] = [
       {
         id: "compaction-summary",
@@ -1809,98 +2047,34 @@ describe("injectPostCompactionAttachments", () => {
     expect(text).toContain("post-compaction context truncated");
   });
 
-  it("falls back to a legacy compacted summary when durable boundary metadata is missing", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "legacy-summary",
-        role: "assistant",
-        parts: [{ type: "text", text: "Legacy compacted summary" }],
-        metadata: {
-          timestamp: 1000,
-          compacted: true,
-        },
-      },
-      {
-        id: "assistant-1",
-        role: "assistant",
-        parts: [{ type: "text", text: "Assistant context after summary" }],
-        metadata: { timestamp: 1050 },
-      },
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Continue" }],
-        metadata: { timestamp: 1100 },
-      },
-    ];
-
+  it("goes before the newest user message, past Token Budget warnings, or last without one", () => {
+    const row = (id: string, role: "user" | "assistant", extra = {}): MuxMessage => ({
+      id,
+      role,
+      parts: [{ type: "text", text: id }],
+      metadata: { timestamp: 1000, ...extra },
+    });
+    const warning = row("warning", "user", { muxMetadata: { type: "context-budget-warning" } });
     const attachments = [
       {
         type: "plan_file_reference" as const,
         planFilePath: "PLAN.md",
-        planContent: "Legacy plan",
+        planContent: "Plan",
       },
     ];
+    const ids = (messages: MuxMessage[]) =>
+      injectPostCompactionAttachments(messages, attachments).map((message) =>
+        message.metadata?.synthetic === true ? "attachments" : message.id
+      );
 
-    const result = injectPostCompactionAttachments(messages, attachments);
-
-    expect(result).toHaveLength(4);
-    expect(result[0].id).toBe("legacy-summary");
-
-    const injected = result[1];
-    expect(injected.metadata?.synthetic).toBe(true);
-    expect(injected.metadata?.timestamp).toBe(1000);
-    const text = (injected.parts[0] as { type: "text"; text: string }).text;
-    expect(text).toContain("<system-update>");
-
-    expect(result[2].id).toBe("assistant-1");
-    expect(result[3].id).toBe("user-1");
+    // Request-only and re-injected every few turns: the rows before the current request stay.
+    expect(
+      ids([row("user-1", "user"), row("assistant-1", "assistant"), row("user-2", "user"), warning])
+    ).toEqual(["user-1", "assistant-1", "attachments", "user-2", "warning"]);
+    expect(ids([row("assistant-1", "assistant")])).toEqual(["assistant-1", "attachments"]);
   });
 
-  it("appends at the end when no compaction indicators are present", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Initial question" }],
-        metadata: { timestamp: 1000 },
-      },
-      {
-        id: "assistant-1",
-        role: "assistant",
-        parts: [{ type: "text", text: "Initial response" }],
-        metadata: { timestamp: 1010 },
-      },
-      {
-        id: "user-2",
-        role: "user",
-        parts: [{ type: "text", text: "Follow-up" }],
-        metadata: { timestamp: 1020 },
-      },
-    ];
-
-    const attachments = [
-      {
-        type: "plan_file_reference" as const,
-        planFilePath: "PLAN.md",
-        planContent: "Fallback plan",
-      },
-    ];
-
-    const result = injectPostCompactionAttachments(messages, attachments);
-
-    expect(result).toHaveLength(4);
-    expect(result[0].id).toBe("user-1");
-    expect(result[1].id).toBe("assistant-1");
-    expect(result[2].id).toBe("user-2");
-
-    const appended = result[3];
-    expect(appended.metadata?.synthetic).toBe(true);
-    const text = (appended.parts[0] as { type: "text"; text: string }).text;
-    expect(text).toContain("<system-update>");
-  });
-
-  it("inserts after the latest compaction boundary when multiple summaries exist", () => {
+  it("inserts before the newest request when multiple summaries exist", () => {
     const messages: MuxMessage[] = [
       {
         id: "summary-1",

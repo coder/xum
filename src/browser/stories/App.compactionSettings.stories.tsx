@@ -1,22 +1,19 @@
-import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 import { wrapAsyncIterator } from "@orpc/shared";
 import type { APIClient } from "@/browser/contexts/API";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 export default { ...appMeta, title: "App/CompactionSettings" };
 
-const setOverride = fn<APIClient["experiments"]["setOverride"]>(() => Promise.resolve());
-const getOverrides = fn<APIClient["experiments"]["getOverrides"]>(() => Promise.resolve({}));
+const set = fn<APIClient["experiments"]["set"]>();
 
 function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "legacy") {
   expandLeftSidebar();
-  setOverride.mockClear();
-  getOverrides.mockClear();
   const client = setupSettingsStory({
     experiments: {
       ...(mode === "defaults"
@@ -25,18 +22,30 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
             [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: mode === "legacy",
             [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
           }),
+      [EXPERIMENT_IDS.MEMORY]: true,
       [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: mode === "conflict",
       [EXPERIMENT_IDS.RLM]: mode === "conflict",
     },
   });
+  set.mockReset();
+  set.mockImplementation(client.experiments.set);
   client.experiments = {
-    setOverride,
-    getOverrides,
+    set,
     onDesignChange: () =>
       Promise.resolve(
         wrapAsyncIterator(
           (async function* () {
             yield await Promise.resolve({ enabled: false, revision: 0 });
+          })(),
+          {}
+        )
+      ),
+    // The flight recorder status stream: off, like a fresh profile.
+    onPerfFlightRecorderChange: () =>
+      Promise.resolve(
+        wrapAsyncIterator(
+          (async function* () {
+            yield await Promise.resolve({ enabled: false, state: "off" as const });
           })(),
           {}
         )
@@ -47,32 +56,28 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
 
 async function openCompactionSettings(canvasElement: HTMLElement) {
   const canvas = within(await openSettingsDialog(canvasElement));
+  // Compaction is agent context behavior: it lives in Settings → Behavior.
+  await userEvent.click(await canvas.findByRole("button", { name: "Behavior" }));
   const trigger = await canvas.findByRole("combobox", { name: "Compaction strategy" });
   trigger.scrollIntoView({ block: "center" });
-  // Initial local-override uploads belong to provider reconciliation, not a dropdown choice.
-  await waitFor(async () => expect(getOverrides).toHaveBeenCalled());
-  setOverride.mockClear();
   return trigger;
 }
 
 async function expectPersistedStrategy(continuous: boolean, budget: boolean) {
   await waitFor(async () => {
-    await expect(
-      readPersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), undefined)
-    ).toBe(continuous);
-    await expect(readPersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), undefined)).toBe(
-      budget
-    );
+    const experiments = getAppConfigStore().getSnapshot()?.experiments;
+    await expect(experiments?.[EXPERIMENT_IDS.CONTINUOUS_COMPACTION] === true).toBe(continuous);
+    await expect(experiments?.[EXPERIMENT_IDS.TOKEN_BUDGET] === true).toBe(budget);
   });
 }
 
 async function expectStrategyWrites(continuous: boolean, budget: boolean) {
-  await waitFor(async () => expect(setOverride).toHaveBeenCalledTimes(2));
-  await expect(setOverride).toHaveBeenCalledWith({
+  await waitFor(async () => expect(set).toHaveBeenCalledTimes(2));
+  await expect(set).toHaveBeenCalledWith({
     experimentId: EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
     enabled: continuous,
   });
-  await expect(setOverride).toHaveBeenCalledWith({
+  await expect(set).toHaveBeenCalledWith({
     experimentId: EXPERIMENT_IDS.TOKEN_BUDGET,
     enabled: budget,
   });
@@ -82,11 +87,11 @@ async function dismissWithoutChoosing(trigger: HTMLElement) {
   await userEvent.click(trigger);
   await userEvent.keyboard("{Escape}");
   await expect(trigger).toHaveAttribute("aria-expanded", "false");
-  await expect(setOverride).not.toHaveBeenCalled();
+  await expect(set).not.toHaveBeenCalled();
 }
 
 async function selectStrategy(trigger: HTMLElement, name: string) {
-  setOverride.mockClear();
+  set.mockClear();
   await userEvent.click(trigger);
   const body = within(trigger.ownerDocument.body);
   await userEvent.click(await body.findByRole("option", { name }));
@@ -97,7 +102,7 @@ async function selectStrategy(trigger: HTMLElement, name: string) {
 
 async function exerciseCompactionSettings(canvasElement: HTMLElement) {
   const trigger = await openCompactionSettings(canvasElement);
-  await expect(trigger).toHaveTextContent("Continuous");
+  await waitFor(() => expect(trigger).toHaveTextContent("Continuous"));
   await expectPersistedStrategy(true, true);
   await dismissWithoutChoosing(trigger);
 
@@ -159,9 +164,7 @@ export const ExplicitSummarize: AppStory = {
   play: async ({ canvasElement }) => {
     const trigger = await openCompactionSettings(canvasElement);
     await expect(trigger).toHaveTextContent("Summarize");
-    for (const id of [EXPERIMENT_IDS.CONTINUOUS_COMPACTION, EXPERIMENT_IDS.TOKEN_BUDGET]) {
-      await expect(readPersistedState(getExperimentKey(id), undefined)).toBeUndefined();
-    }
+    await expectPersistedStrategy(false, false);
     await dismissWithoutChoosing(trigger);
     // Keyboard activation must commit the current default just like a pointer selection.
     await userEvent.click(trigger);
@@ -179,7 +182,7 @@ export const TokenBudgetConflict: AppStory = {
   play: async ({ canvasElement }) => {
     const trigger = await openCompactionSettings(canvasElement);
     const canvas = within(getSettingsDialog());
-    await expect(trigger).toHaveTextContent("Token Budget");
+    await waitFor(() => expect(trigger).toHaveTextContent("Token Budget"));
     const warning = canvas.getByRole("status");
     await expect(warning).toBeVisible();
     await expect(trigger).toHaveAttribute("aria-describedby", warning.id);

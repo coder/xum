@@ -8,6 +8,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { renderLegendLabel } from "./chartLegend";
 import { capitalize } from "@/common/utils/capitalize";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import type { DelegationSummary } from "@/browser/hooks/useAnalytics";
@@ -221,7 +222,7 @@ export function DelegationChart(props: DelegationChartProps) {
                   cursor={{ fill: "var(--color-hover)" }}
                   content={(tooltipProps) => <DelegationTooltipContent {...tooltipProps} />}
                 />
-                <Legend wrapperStyle={{ fontSize: "11px" }} />
+                <Legend wrapperStyle={{ fontSize: "11px" }} formatter={renderLegendLabel} />
                 <Bar
                   dataKey="inputTokens"
                   stackId="tokens"

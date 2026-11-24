@@ -69,9 +69,21 @@ export const WorkspaceHeartbeatSettingsSchema = z.object({
   enabled: z.boolean().meta({
     description: "Whether scheduled workspace heartbeats are enabled for this workspace.",
   }),
-  intervalMs: z.number().int().min(HEARTBEAT_MIN_INTERVAL_MS).max(HEARTBEAT_MAX_INTERVAL_MS).meta({
-    description: "Heartbeat interval in milliseconds for this workspace.",
-  }),
+  // Optional (#5692): an absent interval follows the global default
+  // (`heartbeatDefaultIntervalMs`) at read time, so "Use default" is a real default
+  // that tracks later global changes. Older builds read an absent or invalid value as
+  // the global default too (normalizeWorkspaceMetadataHeartbeat), so this is
+  // downgrade-safe.
+  intervalMs: z
+    .number()
+    .int()
+    .min(HEARTBEAT_MIN_INTERVAL_MS)
+    .max(HEARTBEAT_MAX_INTERVAL_MS)
+    .optional()
+    .meta({
+      description:
+        "Heartbeat interval override in milliseconds for this workspace. Absent means the global default interval.",
+    }),
   message: z.string().optional().meta({
     description:
       "Optional custom instruction body appended after the fixed workspace heartbeat lead-in.",
@@ -139,6 +151,46 @@ export function getValidUnrelatedWorkspaceConsent(value: unknown): string | unde
     return undefined;
   }
   return value.trim() === value ? value : undefined;
+}
+
+/**
+ * Shared description for the messaging tag on persisted config and published metadata.
+ * A root chat carries at most one tag (stored without the leading `@`); chats sharing a tag may
+ * message each other. No agent tool writes this field; it is set only through the local API
+ * (`workspace.setMessagingTag`), which carries the user's authority, so a shell-capable agent
+ * running as the same OS user can reach it too. Removing it revokes the link. Absent means untagged.
+ */
+export const MESSAGING_TAG_DESCRIPTION =
+  "Messaging tag (without the leading @) linking this root chat to other root chats that share the same tag so their agents can message each other. No agent tool can set or clear it; it changes only through the local workspace.setMessagingTag API, which acts with the user's authority. Absent means untagged, and removing it revokes the link.";
+
+const MESSAGING_TAG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+/**
+ * Normalizes user-entered tag text: trims, strips one leading `@`, and lowercases. Returns null
+ * when the result is not a valid tag, so callers can reject it instead of persisting junk.
+ */
+export function normalizeMessagingTag(raw: string): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim();
+  const stripped = trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
+  const normalized = stripped.toLowerCase();
+  return MESSAGING_TAG_PATTERN.test(normalized) ? normalized : null;
+}
+
+/**
+ * Fail-closed reader for the persisted messaging tag. Config entries are loaded without
+ * per-field schema validation, so only an already-normalized valid tag is published; anything
+ * else (blank, padded, `@`-prefixed, uppercase, malformed) reads as untagged rather than
+ * making the workspace unloadable.
+ */
+export function getValidMessagingTag(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = normalizeMessagingTag(value);
+  return normalized != null && normalized === value ? value : undefined;
 }
 
 /**
@@ -220,12 +272,21 @@ export const WorkspaceMetadataSchema = z.object({
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   }),
+  // Passed through from config so API clients read the tag from metadata instead of keeping
+  // a duplicate copy; only a validated (normalized) tag is published.
+  messagingTag: z.string().optional().meta({
+    description: MESSAGING_TAG_DESCRIPTION,
+  }),
   agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
     description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   }),
   parentWorkspaceId: z.string().optional().meta({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
+  }),
+  sideChatParentWorkspaceId: z.string().optional().meta({
+    description:
+      "If set, this workspace is an ephemeral /side chat forked from the given workspace: it shares that workspace's checkout, is hidden from the sidebar, and is discarded when the user leaves it.",
   }),
   agentType: z.string().optional().meta({
     description: 'If set, selects an agent preset for this workspace (e.g., "explore" or "exec").',
@@ -270,6 +331,10 @@ export const WorkspaceMetadataSchema = z.object({
     }),
   taskLaunchError: z.string().optional().meta({
     description: "Startup failure recorded before an agent task could begin streaming.",
+  }),
+  delegatedCreationInterrupted: z.literal(true).optional().meta({
+    description:
+      "The delegated task that created this workspace died before its setup finished, so the task never started here and its owner cannot reach it (#4983). The user removes or keeps it.",
   }),
   reportedAt: z.string().optional().meta({
     description: "ISO 8601 timestamp for when an agent task reported completion (optional).",
@@ -343,9 +408,6 @@ export const WorkspaceMetadataSchema = z.object({
 });
 
 export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
-  rootWorkspaceId: z.string().optional().meta({
-    description: "Task-family root derived from complete metadata, including archived ancestors.",
-  }),
   namedWorkspacePath: z
     .string()
     .meta({ description: "Worktree path (uses workspace name as directory)" }),
@@ -456,8 +518,30 @@ export const WorkspaceRemovalDescendantSchema = z.object({
   title: z.string(),
   active: z.boolean(),
 });
+/**
+ * Something a successful (forced) removal could not clean up (#5143). Forced paths that skip the
+ * Force Delete dialog (bulk delete, cancel-creation, shift-click) show these to the user.
+ */
+export const WorkspaceRemoveWarningSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("leftover"),
+    /** Names the leftover (a path, or a container by label) and what the user should do. */
+    description: z.string(),
+  }),
+]);
+/** A process record that blocks deletion until exit or explicit recovery. */
+export const WorkspaceBackgroundProcessBlockerSchema = z.object({
+  workspaceId: z.string(),
+  processId: z.string(),
+  recordPath: z.string(),
+  state: z.enum(["running", "unknown"]),
+  reason: z.string(),
+});
+
 export const WorkspaceRemoveResultSchema = z.object({
   success: z.boolean(),
   error: z.string().optional(),
   descendants: z.array(WorkspaceRemovalDescendantSchema).optional(),
+  backgroundProcesses: z.array(WorkspaceBackgroundProcessBlockerSchema).optional(),
+  warnings: z.array(WorkspaceRemoveWarningSchema).optional(),
 });

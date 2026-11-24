@@ -22,6 +22,7 @@ import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessi
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
 import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
 import { createWorkspaceServiceHarness } from "./workspaceService.testHarness";
@@ -148,6 +149,43 @@ describe("WorkspaceService remove lifecycle coordination", () => {
     );
     expect(withTaskTreeLifecycleLock).toHaveBeenCalledWith(workspaceId, expect.any(Function));
     expect(hasDescendantAgentTasks).toHaveBeenCalledWith(workspaceId);
+  });
+
+  // #5397 item 3: init is aborted only once the removal can no longer be refused; a refused
+  // removal leaves the workspace's running init alone (nothing reruns an aborted one).
+  test.each([
+    ["refused", true],
+    ["proceeding", false],
+  ] as const)("a %s removal aborts in-progress init only when it proceeds", async (_, refused) => {
+    const workspaceId = "remove-during-init";
+    await using harness = await createWorkspaceServiceHarness();
+    const workspaceService = harness.service;
+    const initAbort = new AbortController();
+    (
+      workspaceService as unknown as { initAbortControllers: Map<string, AbortController> }
+    ).initAbortControllers.set(workspaceId, initAbort);
+    let abortedAtDescendantCheck: boolean | undefined;
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        hasDescendantAgentTasks: mock(() => {
+          abortedAtDescendantCheck = initAbort.signal.aborted;
+          return refused;
+        }),
+      })
+    );
+    const result = await workspaceService.remove(workspaceId, true);
+    expect(abortedAtDescendantCheck).toBe(false);
+    if (refused) {
+      expect(result).toEqual(
+        Err(
+          "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent."
+        )
+      );
+      // Pre-fix: aborted before the refusal.
+      expect(initAbort.signal.aborted).toBe(false);
+    } else {
+      expect(initAbort.signal.aborted).toBe(true);
+    }
   });
 });
 
@@ -505,6 +543,85 @@ describe("WorkspaceService remove shared-workspace guard", () => {
       }
       expect(terminalGuardDuringRemoval).toBe(true);
       expect(terminalGuard?.(workspaceId)).toBe(false);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  // #4967, B2: background cleanup() refuses migrations and spawns only while it runs, and it
+  // returns before the checkout is deleted. A command that reaches beginMigration or spawn() in
+  // between would register and keep running in the deleted checkout, so removal keeps both
+  // refused until it settles.
+  test("refuses background migrations and spawns until the removal settles", async () => {
+    for (const deletion of ["succeeds", "fails"] as const) {
+      let admittedAtDeletion: boolean | undefined;
+      let spawnedAtDeletion: boolean | undefined;
+      let manager: WorkspaceServiceHarness["backgroundProcessManager"] | undefined;
+      const deleteWorkspace = mock(async () => {
+        using migration = manager?.beginMigration(workspaceId);
+        admittedAtDeletion = migration?.admitted;
+        const spawned = await manager?.spawn(new LocalRuntime(process.cwd()), workspaceId, "true", {
+          cwd: process.cwd(),
+          displayName: "during-removal",
+        });
+        spawnedAtDeletion = spawned?.success;
+        return Promise.resolve(
+          deletion === "succeeds"
+            ? { success: true as const, deletedPath: sharedPath }
+            : { success: false as const, error: "delete failed" }
+        );
+      });
+      const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        deleteWorkspace,
+      } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+      try {
+        await using harness = await createChildHarness(undefined);
+        manager = harness.backgroundProcessManager;
+
+        const result = await harness.service.remove(workspaceId, false);
+
+        expect(result.success).toBe(deletion === "succeeds");
+        expect(admittedAtDeletion).toBe(false);
+        expect(spawnedAtDeletion).toBe(false);
+        // A failed removal keeps the workspace, which must be able to background commands again.
+        using after = harness.backgroundProcessManager.beginMigration(workspaceId);
+        expect(after.admitted).toBe(true);
+      } finally {
+        createRuntimeSpy.mockRestore();
+      }
+    }
+  });
+
+  // Fail-safe: if this backend cannot stop its background processes, the removal fails before it
+  // deletes the checkout (forced removals too), rather than delete it under a running process.
+  test("fails before deleting the checkout when stopping background processes throws", async () => {
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
+    try {
+      await using harness = await createChildHarness(undefined);
+      const manager = harness.backgroundProcessManager;
+      const spawned = await manager.spawn(
+        new LocalRuntime(process.cwd()),
+        workspaceId,
+        "sleep 30",
+        {
+          cwd: process.cwd(),
+          displayName: "unstoppable",
+        }
+      );
+      if (!spawned.success) throw new Error(spawned.error);
+      // Injected at the termination boundary: the handle cannot be released, so terminate()
+      // and with it cleanup() reject.
+      const proc = await manager.getProcess(spawned.processId);
+      if (proc === null) throw new Error("the spawned process must be tracked");
+      spyOn(proc.handle, "dispose").mockRejectedValue(new Error("dispose failed"));
+
+      const result = await harness.service.remove(workspaceId, true);
+
+      expect(result).toEqual(Err("Failed to remove workspace: dispose failed"));
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(harness.config.findWorkspace(workspaceId)).toBeDefined();
+      // Still tracked, so a retried removal or archive stops it again.
+      expect((await manager.list(workspaceId)).map((p) => p.id)).toEqual([spawned.processId]);
     } finally {
       createRuntimeSpy.mockRestore();
     }
@@ -1299,6 +1416,7 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       const usageByWorkspace = new Map<string, Record<string, unknown>>();
       const rollupCalls: Array<{ parent: string; child: string; byModel: object }> = [];
       const sessionUsageService = {
+        onUsageChanged: () => undefined,
         getSessionUsage: (workspaceId: string) =>
           Promise.resolve({ byModel: usageByWorkspace.get(workspaceId) ?? {} }),
         rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
@@ -1309,7 +1427,16 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       const cancelInFlightRefinePass = mock((workspaceId: string) => {
         // The drained pass settles and records its spend against the child.
         usageByWorkspace.set(workspaceId, {
+          ...usageByWorkspace.get(workspaceId),
           "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } },
+        });
+        return Promise.resolve();
+      });
+      // A status page agent pass records its usage as it settles too.
+      const cancelInFlightPass = mock((workspaceId: string) => {
+        usageByWorkspace.set(workspaceId, {
+          ...usageByWorkspace.get(workspaceId),
+          "anthropic:claude-haiku-5-5": { input: { tokens: 7, cost_usd: 0.001 } },
         });
         return Promise.resolve();
       });
@@ -1321,6 +1448,7 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
         { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
       ]);
       service.setRefinePassCanceller({ cancelInFlightRefinePass });
+      service.setStatusPageAgentCanceller({ cancelInFlightPass });
 
       const result = await service.remove(childId);
       expect(result.success).toBe(true);
@@ -1330,7 +1458,10 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       expect(rollupCalls).toHaveLength(1);
       expect(rollupCalls[0].parent).toBe(parentId);
       expect(rollupCalls[0].child).toBe(childId);
-      expect(Object.keys(rollupCalls[0].byModel)).toContain("anthropic:claude-sonnet-4-5");
+      expect(Object.keys(rollupCalls[0].byModel).sort()).toEqual([
+        "anthropic:claude-haiku-5-5",
+        "anthropic:claude-sonnet-4-5",
+      ]);
     } finally {
       await fsPromises.rm(projectDir, { recursive: true, force: true });
     }
@@ -1362,6 +1493,7 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       };
       const usageRollups: Array<{ parent: string; child: string; byModel: object }> = [];
       const sessionUsageService = {
+        onUsageChanged: () => undefined,
         getSessionUsage: () => Promise.resolve({ byModel: { ...childUsage } }),
         rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
           usageRollups.push({ parent, child, byModel });

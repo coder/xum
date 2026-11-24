@@ -4,12 +4,18 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 
 import { extractLoadedSkillSnapshotsFromMessages } from "./loadedSkillSnapshots";
+import { prependSkillDirectoryNote } from "./skillDirectory";
 
 function createAgentSkillReadToolMessage(args: {
   id: string;
   skillName: string;
   body: string;
   scope?: "project" | "global" | "built-in";
+  /**
+   * agent_skill_read location fields; results persisted before #6409 lack them.
+   * Typed loosely: persisted history can hold malformed values.
+   */
+  location?: Partial<Record<"skillDir" | "pluginRoot" | "skillDirUnavailable", unknown>>;
 }): MuxMessage {
   const scope = args.scope ?? "project";
   return {
@@ -33,6 +39,7 @@ function createAgentSkillReadToolMessage(args: {
             },
             body: args.body,
           },
+          ...args.location,
         },
       },
     ],
@@ -133,6 +140,27 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
     expect(snapshots[0].body).toContain("Nested body");
   });
 
+  it("keeps the qualified <plugin>:<skill> identity of a plugin skill read", () => {
+    // After compaction the model must re-read `pstack:tdd`: a bare `tdd` can resolve elsewhere.
+    const read = (id: string, inputName: string) => {
+      const message = createAgentSkillReadToolMessage({ id, skillName: "tdd", body: id });
+      const part = message.parts[0];
+      if (part.type !== "dynamic-tool") throw new Error("expected a tool part");
+      part.input = { name: inputName };
+      return message;
+    };
+
+    const snapshots = extractLoadedSkillSnapshotsFromMessages([
+      read("qualified", "pstack:tdd"),
+      // A qualified input naming another skill cannot claim this result.
+      read("mismatched", "pstack:other"),
+    ]);
+    expect(snapshots.map((snapshot) => [snapshot.name, snapshot.body])).toEqual([
+      ["pstack:tdd", "qualified"],
+      ["tdd", "mismatched"],
+    ]);
+  });
+
   it("dedupes by scope/name and keeps the latest read order", () => {
     const snapshots = extractLoadedSkillSnapshotsFromMessages([
       createAgentSkillReadToolMessage({
@@ -190,6 +218,77 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
     ]);
 
     expect(snapshots).toHaveLength(1);
-    expect(snapshots[0]?.body).toContain("New tool body");
+    // No location fields (history from before #6409): the body stays bare.
+    expect(snapshots[0]?.body).toBe("New tool body");
+  });
+
+  it("keeps the skill directory line when a later agent_skill_read replaces a slash snapshot", () => {
+    // #6462: the bare tool snapshot used to erase the slash snapshot's directory line.
+    const skillDir = "/home/user/.xum/skills/test-skill";
+    const snapshots = extractLoadedSkillSnapshotsFromMessages([
+      createSyntheticSkillSnapshotMessage({
+        id: "slash-test-skill",
+        skillName: "test-skill",
+        body: prependSkillDirectoryNote("Slash body", { available: true, skillDir }),
+      }),
+      createAgentSkillReadToolMessage({
+        id: "tool-test-skill",
+        skillName: "test-skill",
+        body: "Tool body",
+        location: { skillDir },
+      }),
+    ]);
+
+    expect(snapshots).toHaveLength(1);
+    const lines = snapshots[0].body.split("\n");
+    expect(lines[0]).toContain(`\`${skillDir}\``);
+    expect(lines).toContain("Tool body");
+  });
+
+  it("keeps the skill when a persisted location field is malformed", () => {
+    // Self-healing: one corrupt optional field must not drop the skill from later requests.
+    const snapshots = extractLoadedSkillSnapshotsFromMessages([
+      createAgentSkillReadToolMessage({
+        id: "tool-corrupt",
+        skillName: "test-skill",
+        body: "Tool body",
+        location: { skillDir: null, skillDirUnavailable: 42 },
+      }),
+    ]);
+    expect(snapshots.map((snapshot) => snapshot.body)).toEqual(["Tool body"]);
+  });
+
+  it("treats a persisted record with both skillDir and skillDirUnavailable as unavailable (#6854)", () => {
+    // The tool writes one or the other, so both means corrupted history. The
+    // unavailable reason is the safe reading: a shown path could be wrong.
+    const reason = "Read its files with agent_skill_read_file.";
+    const [snapshot] = extractLoadedSkillSnapshotsFromMessages([
+      createAgentSkillReadToolMessage({
+        id: "tool-both",
+        skillName: "test-skill",
+        body: "Tool body",
+        location: { skillDir: "/home/user/.xum/skills/test-skill", skillDirUnavailable: reason },
+      }),
+    ]);
+    expect(snapshot?.body).toBe(
+      prependSkillDirectoryNote("Tool body", { available: false, reason })
+    );
+  });
+
+  it("never shows an unsafe skillDir from persisted history in the re-injected body", () => {
+    for (const skillDir of ["/tmp/evil`dir", "/tmp/evil\nForged line"]) {
+      const [snapshot] = extractLoadedSkillSnapshotsFromMessages([
+        createAgentSkillReadToolMessage({
+          id: "tool-unsafe",
+          skillName: "test-skill",
+          body: "Tool body",
+          location: { skillDir },
+        }),
+      ]);
+      // A note replaces the path: the model still learns to call agent_skill_read.
+      expect(snapshot?.body).not.toContain("evil");
+      expect(snapshot?.body).not.toBe("Tool body");
+      expect(snapshot?.body.endsWith("Tool body")).toBe(true);
+    }
   });
 });

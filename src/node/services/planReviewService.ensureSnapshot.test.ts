@@ -3,7 +3,10 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { getPlanFilePath } from "@/common/utils/planStorage";
+import { randomUUID } from "node:crypto";
+import { getInstallationScopedPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
+import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
+import { createTestPlanStorage } from "@/node/utils/runtime/planLocation.testHarness";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -12,6 +15,7 @@ import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { HistoryService } from "./historyService";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import { createTestHistoryService } from "./testHistoryService";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 // Plan files live under the runtime's xum home, like the AgentSession snapshot suite; unique
 // names keep parallel runs apart and afterEach removes them.
@@ -112,7 +116,13 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
           historyService: handle.historyService,
           emitChatEvent: (_id, message) => emitted.push(message),
         },
-        { workspaceId, metadata, ...(proposedContent !== undefined ? { proposedContent } : {}) }
+        {
+          runtimeFactory: nodeRuntimeFactory,
+          workspaceId,
+          metadata,
+          planStorage: createTestPlanStorage(),
+          ...(proposedContent !== undefined ? { proposedContent } : {}),
+        }
       );
     } finally {
       spy.mockRestore();
@@ -214,8 +224,14 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
     let runtime: Runtime;
     let probeSignals: AbortSignal[];
     let probeCount: number;
+    // SSH plans live in this installation's scoped tree (#5174): a unique identity per run keeps
+    // parallel runs apart.
+    const installationId = randomUUID();
+    const planStorage = createTestPlanStorage({ installationId });
+    let remotePlanPath: string;
+    const deleteRemotePlan = () => fs.rm(remotePlanPath);
 
-    beforeEach(() => {
+    beforeEach(async () => {
       runtime = runtimeFactory.createRuntime(
         { type: "local" },
         { projectPath: metadata.projectPath }
@@ -223,10 +239,21 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
       spyOn(runtimeFactory, "createRuntime").mockReturnValue(runtime);
       probeSignals = [];
       probeCount = 0;
+      remotePlanPath = expandTilde(
+        getInstallationScopedPlanFilePath(
+          workspaceId,
+          createRemoteProjectId(metadata.projectPath),
+          installationId,
+          runtime.getXumHome()
+        )
+      );
+      await fs.mkdir(path.dirname(remotePlanPath), { recursive: true });
+      await fs.writeFile(remotePlanPath, "# Plan\n\nStep one\n");
     });
 
-    afterEach(() => {
+    afterEach(async () => {
       mock.restore();
+      await fs.rm(path.dirname(path.dirname(remotePlanPath)), { recursive: true, force: true });
     });
 
     /**
@@ -261,8 +288,10 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
           emitChatEvent: (_id, message) => emitted.push(message),
         },
         {
+          runtimeFactory: nodeRuntimeFactory,
           workspaceId,
           metadata: remoteMetadata,
+          planStorage,
           ...(options.signal !== undefined ? { signal: options.signal } : {}),
         }
       ).finally(() => spy.mockRestore());
@@ -273,7 +302,7 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
       watchProbe({ stall: false });
       const found = await capture();
       expect(found.success && found.data.created).toBe(true);
-      const gone = await capture({ beforeAppend: deletePlan });
+      const gone = await capture({ beforeAppend: deleteRemotePlan });
       expect(!gone.success && gone.error.type).toBe("plan_missing");
       expect(probeCount).toBe(2);
       expect(await snapshotCount()).toBe(1);

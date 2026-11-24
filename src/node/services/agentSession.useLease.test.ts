@@ -2,12 +2,24 @@ import { describe, expect, mock, test } from "bun:test";
 
 import { Err, Ok } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
+import { describeHolder } from "@/node/utils/main/crossProcessLock";
 import type { AgentSessionAIService } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import {
+  foreignPid,
+  foreignRecord,
+  liveBlocker,
+  makeForeignHolders,
+  withForeignHolders,
+} from "./sessionLocks/foreignHolders.testHarness";
+import { SessionLocksNode } from "./sessionLocks/nodeSessionLocks";
 import type { TurnCompletion } from "./streamManager";
 import { createTestConfig } from "./taskService.testHarness";
+import { createTestHistoryService } from "./testHistoryService";
 import {
   WorkspaceBusyError,
+  workspaceMutationInProgressMessage,
+  workspaceMutationLockPath,
   workspaceUseLeasesFor,
   type WorkspaceUseLeases,
 } from "./workspaceUseLeases";
@@ -151,6 +163,51 @@ describe("AgentSession turn use lease across two backends on one root", () => {
     } finally {
       await b.session.dispose();
       await b.cleanup();
+    }
+  });
+
+  test("a live foreign mutation gate refuses B's turn at once with today's text", async () => {
+    // Phase 4: the lease comes from the history service's SessionLocks, so a fake layer plays
+    // the other backend's gate. It leaves no gate file on disk, so only that path refuses.
+    const holders = makeForeignHolders();
+    const history = await createTestHistoryService({
+      locks: withForeignHolders(SessionLocksNode, holders),
+    });
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Err({ type: "unknown", raw: "provider down" }))
+    );
+    const b = await createAgentSessionHarness({
+      workspaceId,
+      config: history.config,
+      historyService: history.historyService,
+      aiServiceOverrides: { streamMessage },
+    });
+    try {
+      const gatePath = workspaceMutationLockPath(history.config.rootDir, workspaceId);
+      const pid = foreignPid();
+      holders.hold(gatePath, "live", { pid });
+
+      const result = await b.session.sendMessage("blocked", sendOptions);
+      expect(result.success).toBe(false);
+      // The refusal is the lease error's own text, not the fail-closed wrapper.
+      expect(!result.success && result.error.type === "unknown" && result.error.raw).toBe(
+        workspaceMutationInProgressMessage(workspaceId, {
+          holder: describeHolder(foreignRecord(pid)),
+          why: liveBlocker(pid).why,
+        })
+      );
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(b.session.isBusy()).toBe(false);
+      expect(workspaceUseLeasesFor(b.config).heldCount(workspaceId)).toBe(0);
+
+      // The other backend finished: B's next turn is admitted again.
+      holders.release(gatePath);
+      await b.session.sendMessage("admitted", sendOptions);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      await b.session.dispose();
+      await b.cleanup();
+      await history.cleanup();
     }
   });
 

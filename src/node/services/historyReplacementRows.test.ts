@@ -283,9 +283,11 @@ describe("replacement history row evidence", () => {
       '"metadata":{"contextBoundaryKind":"other","other":"reset",'
     );
     expect(hasRawResetMarker(rawOnly)).toBe(true);
+    // The reverse token probe skips separators inside tokens as the raw rule does, so it also
+    // floors this row now; the raw rule still decides rows it misses.
     const reverseProbe = createUnreadableHistoryResetProbe();
     reverseProbe.push(Buffer.from(rawOnly));
-    expect(reverseProbe.hasReset()).toBe(false);
+    expect(reverseProbe.hasReset()).toBe(true);
     expect(hasRawResetMarker(reverseOnly)).toBe(false);
     expect(hasUnreadableHistoryResetEvidence([Buffer.from(reverseOnly)])).toBe(true);
     const rows = await collect(rawOnly + "\n" + reverseOnly);

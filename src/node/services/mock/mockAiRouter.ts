@@ -2,6 +2,7 @@ import { getCompactionFollowUpContent } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
 import type { StreamErrorType } from "@/common/types/errors";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 
 export interface MockAiRouterRequest {
   messages: MuxMessage[];
@@ -28,6 +29,12 @@ export interface MockAiRouterReply {
   /** Optional: delay before mock tool calls begin (useful for interaction-driven queue tests). */
   toolCallDelayMs?: number;
 
+  /**
+   * Optional: keep the stream open before its first tool call until the test calls
+   * `aiService.releaseMockToolCalls(workspaceId)`, so the test acts mid-stream without a race.
+   */
+  holdToolCalls?: boolean;
+
   /** Optional: mock tool calls to emit before assistant text streaming. */
   toolCalls?: MockAiToolCall[];
 
@@ -38,6 +45,8 @@ export interface MockAiRouterReply {
   error?: {
     message: string;
     type: StreamErrorType;
+    /** Optional: the provider's Retry-After in ms, as StreamManager reads it for `rate_limit`. */
+    retryAfterMs?: number;
   };
 }
 
@@ -205,7 +214,9 @@ function buildPermissionExecReply(): MockAiRouterReply {
 function buildParallelToolStepReply(): MockAiRouterReply {
   return {
     assistantText: "Finished both sibling tool calls before continuing.",
-    toolCallDelayMs: 10_000,
+    // The test queues a follow-up while this turn streams, then releases the tool calls. A
+    // fixed delay here raced that step under load (#6143).
+    holdToolCalls: true,
     toolCalls: [
       {
         toolCallId: "tool-parallel-step-a",
@@ -256,6 +267,66 @@ function buildToolReadmeReply(): MockAiRouterReply {
           content: "1\tMock README content for tool flow test.",
           lease: "lease-readme-v1",
         },
+      },
+    ],
+  };
+}
+
+/**
+ * `[mock:todo-nudge]`: a turn that writes a TODO list, finishes one item and ends with one item
+ * still pending. The mock player writes the list to disk like the real tool, so Xum sends its
+ * real turn-end TODO nudge after this turn (needsTodoTurnEndNudge).
+ */
+function buildTodoNudgeReply(): MockAiRouterReply {
+  return {
+    assistantText: "I fixed the bug. Verifying the fix is still open.",
+    toolCalls: [
+      {
+        toolCallId: "tool-todo-write-open",
+        toolName: "todo_write",
+        args: {
+          todos: [
+            { content: "Fixed the bug", status: "completed" },
+            { content: "Verify the fix", status: "pending" },
+          ],
+        },
+        result: { success: true, count: 2 },
+      },
+    ],
+  };
+}
+
+/**
+ * The reply to Xum's turn-end TODO nudge: the nudged turn keeps the turn's tools, so it finishes
+ * the open item with a non-todo tool, then marks the list complete.
+ */
+function buildTodoNudgeContinuationReply(): MockAiRouterReply {
+  return {
+    assistantText: "Verified the fix in README.md. The TODO list is complete.",
+    toolCalls: [
+      {
+        toolCallId: "tool-file-read-verify",
+        toolName: "file_read",
+        args: { path: "README.md" },
+        result: {
+          success: true,
+          file_size: 64,
+          modifiedTime: "2024-01-01T00:00:00.000Z",
+          lines_read: 1,
+          content: "1\tMock README content for tool flow test.",
+          lease: "lease-todo-nudge-verify",
+        },
+      },
+      {
+        toolCallId: "tool-todo-write-done",
+        toolName: "todo_write",
+        args: {
+          todos: [
+            { content: "Fixed the bug", status: "completed" },
+            { content: "Verify the fix", status: "completed" },
+          ],
+        },
+        result: { success: true, count: 2 },
       },
     ],
   };
@@ -417,6 +488,8 @@ function buildRateLimitErrorReply(): MockAiRouterReply {
     error: {
       message: "Rate limit exceeded. Please retry after 60 seconds.",
       type: "rate_limit",
+      // Match the text, like a real Retry-After: without it auto-retry fired after 2 s (#5700).
+      retryAfterMs: 60_000,
     },
   };
 }
@@ -489,6 +562,9 @@ const defaultHandlers: MockAiRouterHandler[] = [
     respond: () => buildPermissionExecReply(),
   },
   {
+    // This reply sets holdToolCalls: a hand-typed `[mock:tool:parallel-step]` prompt (a bug
+    // bash, a dogfood run) keeps streaming with no tool call until a test calls
+    // aiService.releaseMockToolCalls(workspaceId), or the user presses Stop.
     match: (request) => hasMockMarker(request.latestUserText, "tool:parallel-step"),
     respond: () => buildParallelToolStepReply(),
   },
@@ -497,6 +573,15 @@ const defaultHandlers: MockAiRouterHandler[] = [
       hasMockMarker(request.latestUserText, "tool:file-read") ||
       normalizeText(request.latestUserText) === "what's in readme.md?",
     respond: () => buildToolReadmeReply(),
+  },
+  {
+    match: (request) => hasMockMarker(request.latestUserText, "todo-nudge"),
+    respond: () => buildTodoNudgeReply(),
+  },
+  {
+    // Exact prompt match: a nudge joined to a plugin's turn.stop prompt gets the default reply.
+    match: (request) => request.latestUserText.trim() === TODO_TURN_END_NUDGE.trim(),
+    respond: () => buildTodoNudgeContinuationReply(),
   },
   {
     match: (request) =>

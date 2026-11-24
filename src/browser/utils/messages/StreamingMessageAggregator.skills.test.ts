@@ -235,6 +235,27 @@ describe("Loaded skills tracking", () => {
     ]);
   });
 
+  it("tracks a qualified <plugin>:<skill> read under its qualified name", () => {
+    // The SkillIndicator must mark `pstack:tdd` loaded, not a different skill named `tdd`.
+    const aggregator = createAggregator();
+    startStream(aggregator);
+    emitSkillReadResult(aggregator, {
+      toolCallId: "tool-1",
+      skillName: "pstack:tdd",
+      result: {
+        success: true,
+        skill: {
+          scope: "global",
+          directoryName: "tdd",
+          frontmatter: { name: "tdd", description: "Plugin tdd" },
+          body: "# Content",
+        },
+      },
+    });
+
+    expect(aggregator.getLoadedSkills().map((skill) => skill.name)).toEqual(["pstack:tdd"]);
+  });
+
   it("tracks skills from agentSkillSnapshot messages via handleMessage", () => {
     const aggregator = createAggregator();
     const snapshot = createSkillSnapshotMessage({ skillName: "pull-requests" });

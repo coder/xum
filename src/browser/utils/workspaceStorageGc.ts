@@ -17,21 +17,18 @@
  *   the backend returns a new id, i.e. after its config entry is persisted, so a workspace created
  *   after the snapshot either has no candidate keys or is in the backend set.
  * - Only keys of stable-format workspace ids are ever collected (see
- *   findOrphanedWorkspaceStorageKeys). Creation-draft scopes are never collected: the drafts map is
- *   not authoritative (a routed draft id can be in use without a map entry, and a malformed or
- *   newer-format bucket hides live drafts), and drafts move to the backend in a follow-up.
- * - Keys are removed through updatePersistedState so mounted usePersistedState consumers and
- *   write listeners observe the removal instead of writing a stale value back.
+ *   findOrphanedWorkspaceStorageKeys). Creation-draft scopes are never collected here; the
+ *   creation-draft pass (creationDraftStorageGc.ts) checks them against the backend draft list.
+ * - Keys are removed through removePersistedStateKeys so mounted usePersistedState consumers
+ *   observe the removal instead of writing a stale value back.
  *
  * Known limitation: localStorage is per origin. Two XUM roots served on the same origin over time
  * (e.g. dev servers reusing a port) share it, so GC under one root removes the other root's
  * workspace keys. Desktop remote windows use per-URL partitions and are unaffected.
  */
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  findOrphanedWorkspaceStorageKeys,
-  listWorkspaceStorageGcCandidateKeys,
-} from "@/common/constants/storage";
+import { removePersistedStateKeys } from "@/browser/hooks/usePersistedState";
+import { findOrphanedWorkspaceStorageKeys } from "@/common/constants/storage";
+import { listWorkspaceStorageGcCandidateKeys } from "@/browser/utils/workspaceStorage";
 
 let gcStarted = false;
 
@@ -67,8 +64,6 @@ export async function collectOrphanedWorkspaceStorage(
     candidateKeys,
     new Set(knownWorkspaceIds as string[])
   );
-  for (const key of orphans) {
-    updatePersistedState(key, null);
-  }
+  removePersistedStateKeys(orphans);
   return orphans;
 }

@@ -92,8 +92,7 @@ function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
     origin: baseUrl,
     url: "/orpc",
   });
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- needed for tsgo typecheck
-  return createORPCClient(link) as RouterClient<AppRouter>;
+  return createORPCClient<RouterClient<AppRouter>>(link);
 }
 
 // --- WebSocket Client Factory ---
@@ -114,8 +113,7 @@ async function createWebSocketClient(wsUrl: string): Promise<WebSocketClientHand
 
   // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
   const link = new WebSocketRPCLink({ connect: () => ws as unknown as globalThis.WebSocket });
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- needed for tsgo typecheck
-  const client = createORPCClient(link) as RouterClient<AppRouter>;
+  const client = createORPCClient<RouterClient<AppRouter>>(link);
 
   return {
     client,
@@ -224,7 +222,7 @@ describe("oRPC Server Endpoints", () => {
         const skillContent = `---\nname: ${skillName}\ndescription: Test skill\n---\n\nTest body\n`;
         await fs.writeFile(path.join(skillDir, "SKILL.md"), skillContent, "utf-8");
 
-        const descriptors = await client.agentSkills.list({ projectPath });
+        const { skills: descriptors } = await client.agentSkills.list({ projectPath });
         expect(descriptors.some((d) => d.name === skillName && d.scope === "project")).toBe(true);
 
         const pkg = await client.agentSkills.get({ projectPath, skillName });

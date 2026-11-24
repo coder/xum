@@ -583,7 +583,7 @@ describeIntegration("ReviewPanel auto refresh (UI + ORPC)", () => {
           "value"
         )?.set;
         valueSetter?.call(textarea, NOTE_TEXT);
-        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.dispatchEvent(new window.Event("input", { bubbles: true }));
 
         // Allow React to commit the onChange update before submitting.
         await waitFor(() => {

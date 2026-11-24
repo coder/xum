@@ -1,6 +1,6 @@
-import * as fsPromises from "fs/promises";
 import * as path from "path";
 
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
@@ -16,7 +16,7 @@ export type ResolvedAgentsPath =
 export async function resolveAgentsPathWithinRoot(agentsRoot: string): Promise<ResolvedAgentsPath> {
   let rootReal: string;
   try {
-    rootReal = await fsPromises.realpath(agentsRoot);
+    rootReal = await nodeHostFiles.promises.realpath(agentsRoot);
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
       // Root directory does not exist yet (for example, first run or ~/.xum removed).
@@ -34,7 +34,7 @@ export async function resolveAgentsPathWithinRoot(agentsRoot: string): Promise<R
   const candidate = path.join(rootReal, "AGENTS.md");
 
   try {
-    const realPath = await fsPromises.realpath(candidate);
+    const realPath = await nodeHostFiles.promises.realpath(candidate);
     if (!isPathInsideRoot(rootReal, realPath)) {
       return { kind: "error", error: "Refusing AGENTS.md path (path escapes expected root)" };
     }
@@ -45,7 +45,7 @@ export async function resolveAgentsPathWithinRoot(agentsRoot: string): Promise<R
     }
 
     // ENOENT can mean either missing file OR dangling symlink target.
-    const linkStat = await fsPromises.lstat(candidate).catch(() => null);
+    const linkStat = await nodeHostFiles.promises.lstat(candidate).catch(() => null);
     if (linkStat?.isSymbolicLink()) {
       return { kind: "error", error: "Refusing AGENTS.md dangling symlink" };
     }

@@ -1,3 +1,4 @@
+import { formatFrontmatterBlock } from "@/common/utils/markdownFrontmatter";
 import type { DisplayedUserMessage, InlineSkillSnapshotForDisplay } from "@/common/types/message";
 
 type SlashAgentSkillSnapshot = NonNullable<
@@ -22,7 +23,7 @@ export function buildAgentSkillSnapshotMarkdown(
     return null;
   }
 
-  const yamlBlock = frontmatterYaml ? `\`\`\`yaml\n---\n${frontmatterYaml}\n---\n\`\`\`\n\n` : "";
+  const yamlBlock = frontmatterYaml ? `${formatFrontmatterBlock(frontmatterYaml)}\n\n` : "";
 
   return `${yamlBlock}${body ?? ""}`;
 }

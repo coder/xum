@@ -59,10 +59,6 @@
     --color-runtime-devcontainer-text: #34d399; /* emerald-400 */
 
     /* Background & Layout */
-    /* iOS standalone PWA status-bar band backdrop. Deliberately NOT overridden by
-       light themes: black-translucent renders white status-bar glyphs in every
-       theme, so the exposed band needs a constant dark surface behind them. */
-    --color-ios-status-bar-backdrop: hsla(240, 10%, 4%, 1);
     --color-background: hsl(0 0% 12%);
     --color-background-secondary: hsl(60 1% 15%);
     --color-border: #262626; /* neutral-800 */
@@ -74,8 +70,20 @@
     --color-content-secondary: hsla(240, 5%, 65%);
     --color-content-tertiary: hsla(240, 5%, 34%);
     --color-content-disabled: hsl(240, 5%, 26%);
+    /* Coder product link and highlight colors, from coder/coder site/src/index.css via Coder Kit.
+       Light values live in globals.css. */
+    --color-content-link: hsl(213 94% 68%);
+    --color-highlight-purple: hsl(269 100% 74%);
+    --color-highlight-sky: hsl(188 75% 80%);
+    --color-highlight-orange: hsl(31 100% 70%);
+    --color-highlight-magenta: hsl(292 100% 78%);
+    --color-highlight-green: hsl(141 79% 85%);
+    --color-highlight-red: hsl(0 91% 71%);
     --color-muted-foreground: hsl(0 0% 60%);
-    --color-secondary: hsl(0 0% 42%);
+    /* Lightened to reach WCAG AA (4.5:1) on the dark surfaces, down to the slash command rows
+       (#262626, 5.05:1) (#6021). It is about the same gray as --color-muted (#999999, #6544): the
+       user accepted that the two read alike. Also reaches the VS Code webview, which imports this file. */
+    --color-secondary: #969696;
     --color-surface-primary: hsla(240, 10%, 4%, 1);
     --color-surface-secondary: hsla(240, 6%, 10%, 1);
     --color-content-destructive: hsla(0, 91%, 71%, 1);
@@ -90,6 +98,8 @@
 
     /* Code */
     --color-code-bg: hsl(0 6.43% 8.04%);
+    /* Inline code in chat messages. Light themes override it with a darker shade (#5980). */
+    --color-code-inline: #d19a66;
 
     /* Buttons */
     --color-button-bg: hsl(0 0% 24%);
@@ -180,7 +190,9 @@
     /* Status */
     --color-interrupted: hsl(0 0% 53%);
     --color-backgrounded: hsl(200 70% 55%); /* cyan-ish blue for backgrounded processes */
-    --color-review-accent: hsl(210 100% 65%); /* sky blue — distinct from amber/yellow warning states */
+    --color-review-accent: hsl(
+      210 100% 65%
+    ); /* sky blue — distinct from amber/yellow warning states */
     --color-git-dirty: hsl(38 92% 50%);
     --color-error: hsl(0 70% 50%);
     --color-error-bg: hsl(0 32% 18%);
@@ -192,7 +204,10 @@
     --color-input-border-focus: hsl(193 91% 64%);
 
     /* Additional Semantic Colors */
-    --color-muted: hsl(0 0% 53%); /* #888 - muted text */
+    /* WCAG AA (4.5:1) on every raised dark surface, down to tooltips #313130 (4.57:1). 53% was
+       4.16:1 on cards (#272726) and 3.78:1 on modals (#6544). It matches --color-muted-foreground
+       and is nearly --color-secondary: the user accepted that muted and secondary read alike. */
+    --color-muted: hsl(0 0% 60%); /* #999 - muted text */
     --color-muted-light: hsl(0 0% 50%); /* #808080 - muted light */
     --color-muted-dark: hsl(0 0% 43%); /* #6e6e6e - muted darker */
     --color-placeholder: hsl(0 0% 42%); /* #6b6b6b - placeholder */
@@ -212,7 +227,7 @@
     --color-border-subtle: hsl(0 0% 40%); /* #666 - subtle border */
     --color-border-gray: hsl(240 1% 31%); /* #4e4e52 - gray border */
 
-    --color-dark: #1D1D1D; /* dark backgrounds */
+    --color-dark: #1d1d1d; /* dark backgrounds */
     --color-darker: hsl(0 0% 8.6%); /* #161616 - darker backgrounds */
     --color-hover: hsl(0 0% 16.5%); /* #2a2a2b - hover states */
     --color-bg-medium: hsl(0 0% 27%); /* #454545 - medium bg */
@@ -227,19 +242,40 @@
       theme's palette rather than introducing a fixed dark popover. */
     --color-tooltip-bg: color-mix(in srgb, var(--color-modal-bg) 88%, var(--color-background) 12%);
     --color-tooltip-border: color-mix(in srgb, var(--color-foreground) 16%, transparent);
-    --color-tooltip-foreground: color-mix(in srgb, var(--color-foreground) 92%, var(--color-content-primary) 8%);
-    --shadow-tooltip: 0 12px 30px hsl(0 0% 0% / 0.28), 0 3px 10px hsl(0 0% 0% / 0.2), inset 0 1px 0 hsl(0 0% 100% / 0.04);
-    --color-inline-code-dark-bg: hsl(0 0% 18%); /* #2d2d30 - always dark, for inline code that should stay dark in all themes */
+    --color-tooltip-foreground: color-mix(
+      in srgb,
+      var(--color-foreground) 92%,
+      var(--color-content-primary) 8%
+    );
+    --shadow-tooltip:
+      0 12px 30px hsl(0 0% 0% / 0.28), 0 3px 10px hsl(0 0% 0% / 0.2),
+      inset 0 1px 0 hsl(0 0% 100% / 0.04);
+    --color-inline-code-dark-bg: hsl(
+      0 0% 18%
+    ); /* #2d2d30 - always dark, for inline code that should stay dark in all themes */
 
     --color-accent: hsl(207 100% 40%); /* #007acc - VS Code blue */
     --color-accent-hover: hsl(207 100% 45%); /* #1177bb - accent hover */
     --color-accent-dark: hsl(207 100% 37%); /* #0e639c - darker accent */
+    /* Hover background of primary (bg-accent + text-accent-foreground) buttons. A theme whose
+       accent text is dark (flexoki-dark) overrides it with a lighter color (#6022). */
+    --color-accent-button-hover: var(--color-accent-dark);
     --color-accent-darker: hsl(202 100% 23%); /* #094771 - even darker accent */
     --color-accent-light: hsl(198 100% 65%); /* #4db8ff - lighter accent */
+    /* Accent as a text color (links, accent labels). --color-accent stays the button fill and focus
+       ring: white text on it needs that darker blue. This one reaches WCAG AA (4.5:1) on every dark
+       surface, down to the modal background #2e2e2e (4.51:1); #0070cc was 3.36:1 on dialogs (#5946). */
+    --color-accent-text: #1a98ff;
     --color-accent-foreground: hsl(0 0% 100%); /* readable text/icons on accent surfaces */
 
     --color-success: hsl(122 39% 49%); /* #4caf50 - success green */
     --color-success-light: hsl(123 46% 64%); /* #4ade80 - lighter success */
+    /* Success as a text color. The dark themes' success already reaches WCAG AA as text, so it is
+       the same color here. The light themes set a darker one (#6882). */
+    --color-success-text: var(--color-success);
+    /* Text-only variant of --color-success-light. Dark keeps the lighter green: it reaches AA as
+       text. The light themes set the success text color (#6885). */
+    --color-success-light-text: var(--color-success-light);
     --color-on-success: hsl(0 0% 100%);
 
     --color-danger: hsl(4 90% 58%); /* #f44336 - error red */
@@ -249,6 +285,9 @@
 
     --color-warning: hsl(45 100% 51%); /* #ffc107 - warning yellow */
     --color-warning-light: hsl(0 91% 71%); /* #f87171 - lighter warning/error */
+    /* Text-only variant of --color-warning-light. Dark keeps the same color: it reaches AA as
+       text. The light themes set a darker one (#6935). */
+    --color-warning-light-text: var(--color-warning-light);
     --color-warning-text: var(--color-warning);
 
     /* Code syntax highlighting */
@@ -275,7 +314,9 @@
 
     /* Toast and notification backgrounds */
     /* Use solid colors to avoid transparency bleed from underlying elements */
-    --color-toast-success-bg: hsl(207 42% 18%); /* solid approximation of #0e639c @ 13% on dark bg */
+    --color-toast-success-bg: hsl(
+      207 42% 18%
+    ); /* solid approximation of #0e639c @ 13% on dark bg */
     --color-toast-success-text: hsl(207 100% 60%); /* #3794ff */
     --color-toast-error-bg: hsl(5 35% 20%); /* solid approximation of #f14836 @ 15% on dark bg */
     --color-toast-error-text: hsl(5 89% 60%); /* #f14836 */
@@ -311,9 +352,25 @@
 
     /* Radius */
     --radius: 0.5rem;
+
+    /* Layout: the centered transcript column, shared by every docked surface under it
+       (`max-w-chat`). A comfortable reading measure that also leaves room for the collapsed right
+       sidebar's overview card beside it on laptop widths (see globals.css). */
+    --container-chat: 48rem;
   }
 
   --plan-mode-rgb: 31, 107, 184;
+
+  /* The folded iPhone Duo's cover display keeps an 84 pt status column on the right of its 466 pt
+     width. iOS 27.1 reports it as `env(safe-area-inset-right)`; iOS 27.2 reports nothing and lays
+     the page out without it, and iosCoverColumn.ts lays the page out across it again and sets
+     `--ios-cover-column`. This is the right inset either way, so overlays that keep clear of a
+     right inset keep clear of the column. Shared components (Dialog, toasts) read it, so the
+     webview defines it too. */
+  --safe-area-right: max(env(safe-area-inset-right, 0px), var(--ios-cover-column, 0px));
+  /* The top inset the app shell and its phone header keep clear of. globals.css lowers it on the
+     iPhone Duo's inner display in portrait, where the status bar is only a corner. */
+  --safe-area-top: env(safe-area-inset-top, 0px);
 
   --font-primary:
     -apple-system, BlinkMacSystemFont, "Geist", system-ui, "Segoe UI", "Roboto", "Helvetica Neue",
@@ -322,4 +379,22 @@
   --font-monospace:
     "Monaco", "Menlo", "Geist Mono", "Ubuntu Mono", "Consolas", "Courier New", monospace,
     "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+}
+
+/* Settings dialog surfaces. Defined here (shared with the VS Code webview, which can import
+   Settings code) rather than in globals.css. The rest of the app sits on the surface tokens
+   (sidebar, main pane), while settings sections were written against the older gray background
+   tokens and looked gray inside the dialog. Remapping those tokens for the dialog's subtree gives every section,
+   converted to the shared settings layout or not, the same surfaces in every theme. */
+.settings-surfaces {
+  --color-background: var(--color-surface-primary);
+  --color-background-secondary: var(--color-surface-secondary);
+  --color-modal-bg: var(--color-surface-secondary);
+  --color-hover: var(--color-surface-tertiary);
+}
+
+/* Settings search: the row or block a result opened (SettingsAnchor, SettingsMark). */
+[data-search-focused="true"] {
+  background-color: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 60%, transparent);
 }

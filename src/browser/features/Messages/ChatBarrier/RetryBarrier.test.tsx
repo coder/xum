@@ -1,11 +1,12 @@
 import "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../../tests/ui/domGlobals";
 import { createTestApiClient } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import { APIProvider } from "@/browser/contexts/API";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
@@ -110,18 +111,17 @@ const apiClient = createTestApiClient({
   },
 });
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceStore =
-  require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Snapshot the real exports before this file mocks the module. Do not load a second copy with
+// require("...WorkspaceStore?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so a
+// later second copy replaces WorkspaceStore.test.ts's coverage of WorkspaceStore.ts in the shard.
+const actualWorkspaceStore = { ...RealWorkspaceStoreModule };
 
 // The overlay also changes the store identity, so it must stay local to this suite.
 restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);
 
-// Overlay (not replace) the raw store: bun evaluates every test file before running tests
-// and static import bindings freeze at eval time, so this file-scope mock is what any
-// later-evaluated file in the same bun process gets forever. A bare fake missing store
-// methods breaks those files' cleanup and cascades.
+// Overlay (not replace) the raw store: this file-scope mock stays in place for the whole
+// file, and for every later test file if the restore does not run. A bare fake missing
+// store methods breaks those files' cleanup and cascades.
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
   useWorkspaceState: () => currentWorkspaceState,
@@ -133,22 +133,26 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
 
 // No usePersistedState module mock: the real hook returns [false, setter] for the unset
 // vim key in a fresh happy-dom localStorage (what the old fake hardcoded), and a partial
-// module replacement here leaks process-wide (bun evaluates every test file before running
-// tests), turning later-evaluated suites' persistence into no-ops (seen as GeneralSection
-// CI failures).
+// module replacement here leaks process-wide (a module mock outlives its test file),
+// turning later suites' persistence into no-ops (seen as GeneralSection CI failures).
 
 import { RetryBarrier } from "./RetryBarrier";
 
-function Barrier() {
+function Barrier(props: { visible?: boolean }) {
   return (
     <APIProvider client={apiClient}>
-      <RetryBarrier workspaceId="ws-1" />
+      <RetryBarrier workspaceId="ws-1" visible={props.visible} />
     </APIProvider>
   );
 }
 
+function pressShiftR(target: Element | Window = window) {
+  fireEvent.keyDown(target, { key: "R", shiftKey: true });
+}
+
 describe("RetryBarrier", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
 
@@ -163,8 +167,65 @@ describe("RetryBarrier", () => {
   afterEach(() => {
     cleanup();
     mock.restore();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
+  });
+
+  test("names a user stop in plain words but keeps an error type as sent", () => {
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-abandoned", reason: "user_interrupt" },
+    });
+    const view = render(<Barrier />);
+    expect(view.getByText(/you stopped it/)).toBeTruthy();
+    expect(view.queryByText(/user_interrupt/)).toBeNull();
+    cleanup();
+
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-abandoned", reason: "rate_limit" },
+    });
+    expect(render(<Barrier />).getByText(/rate_limit/)).toBeTruthy();
+  });
+
+  test("titles a stopped retry by its error kind and keeps 'Stream interrupted' for interruptions", () => {
+    const streamError = (errorType: string) => ({
+      autoRetryStatus: { type: "auto-retry-abandoned" as const, reason: "user_interrupt" },
+      messages: [{ type: "stream-error", messageId: "assistant-1", error: "boom", errorType }],
+    });
+    currentWorkspaceState = createWorkspaceState(streamError("api"));
+    let view = render(<Barrier />);
+    expect(view.getByText("API error")).toBeTruthy();
+    expect(view.queryByText("Stream interrupted")).toBeNull();
+    cleanup();
+
+    currentWorkspaceState = createWorkspaceState(streamError("server_error"));
+    expect(render(<Barrier />).getByText("Server error")).toBeTruthy();
+    cleanup();
+
+    // A partial assistant reply is a real interruption, not an error.
+    currentWorkspaceState = createWorkspaceState({
+      messages: [
+        {
+          type: "assistant",
+          id: "assistant-1",
+          historyId: "assistant-1",
+          content: "Half an answer",
+          historySequence: 2,
+          isPartial: true,
+        },
+      ],
+    });
+    view = render(<Barrier />);
+    expect(view.getByText("Stream interrupted")).toBeTruthy();
+  });
+
+  test("prefixes an active retry with the error kind, not only for rate limits", () => {
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-starting", attempt: 2 },
+      messages: [
+        { type: "stream-error", messageId: "assistant-1", error: "boom", errorType: "network" },
+      ],
+    });
+    const view = render(<Barrier />);
+    expect(view.getByText(/Network error — Retrying/)).toBeTruthy();
   });
 
   test("uses delayed-start copy while the first response is still starting", () => {
@@ -203,7 +264,10 @@ describe("RetryBarrier", () => {
     await waitFor(() => {
       expect(view.getByText("Retry failed:")).toBeTruthy();
     });
-    expect(view.getByText(/Runtime failed to start/)).toBeTruthy();
+    // The barrier title names the same error kind; check the details row itself.
+    expect(view.getByText("Retry failed:").parentElement?.textContent).toContain(
+      "Runtime failed to start"
+    );
 
     expect(setAutoRetryEnabled).toHaveBeenNthCalledWith(1, {
       workspaceId: "ws-1",
@@ -421,5 +485,44 @@ describe("RetryBarrier", () => {
     });
     // No separate opt-out call: it would release the retry idle gate ahead of the Stop.
     expect(setAutoRetryEnabled).not.toHaveBeenCalled();
+  });
+
+  // #5111: every operation has a shortcut; Shift+R retries from the visible barrier.
+  test("Shift+R retries from the visible barrier like its Retry button", async () => {
+    render(<Barrier />);
+
+    pressShiftR();
+
+    await waitFor(() => expect(resumeStream).toHaveBeenCalledTimes(1));
+    expect(setAutoRetryEnabled).toHaveBeenCalledWith({
+      workspaceId: "ws-1",
+      enabled: true,
+      persist: false,
+    });
+  });
+
+  test("Shift+R does not retry while typing, while the barrier is hidden, or during auto-retry", async () => {
+    const typing = render(<Barrier />);
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+    input.focus();
+    pressShiftR(input);
+    typing.unmount();
+    input.remove();
+
+    const hidden = render(<Barrier visible={false} />);
+    pressShiftR();
+    hidden.unmount();
+
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-starting", attempt: 1 },
+    });
+    render(<Barrier />);
+    pressShiftR();
+
+    // A retry would have called setAutoRetryEnabled before resumeStream; let it settle.
+    await Promise.resolve();
+    expect(setAutoRetryEnabled).not.toHaveBeenCalled();
+    expect(resumeStream).not.toHaveBeenCalled();
   });
 });

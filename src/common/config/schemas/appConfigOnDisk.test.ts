@@ -99,6 +99,33 @@ describe("AppConfigOnDiskSchema", () => {
     ).toBe(true);
   });
 
+  it("accepts defaultIsolation alongside its legacy defaultRuntime mirror", () => {
+    const stored = {
+      defaultIsolation: { project: "ssh", workspace: "docker" },
+      defaultRuntime: "ssh",
+      projects: [
+        [
+          "/repo",
+          {
+            workspaces: [],
+            defaultIsolation: { project: "local", workspace: "none" },
+            defaultRuntime: "local",
+          },
+        ],
+      ],
+    };
+    expect(AppConfigOnDiskSchema.safeParse(stored).success).toBe(true);
+  });
+
+  it("rejects defaultIsolation values outside the known axes", () => {
+    expect(
+      AppConfigOnDiskSchema.safeParse({
+        defaultIsolation: { project: "mars", workspace: "worktree" },
+      }).success
+    ).toBe(false);
+    expect(AppConfigOnDiskSchema.safeParse({ defaultIsolation: "worktree" }).success).toBe(false);
+  });
+
   it("holds settingsBackup to the shape the backup API returns", () => {
     const stored = { repoUrl: "git@example.com:me/dotfiles.git", branch: "main", path: "mux" };
     const parsed = AppConfigOnDiskSchema.safeParse({ settingsBackup: stored });
@@ -122,6 +149,21 @@ describe("AppConfigOnDiskSchema", () => {
         expect(degraded.data.settingsBackup).toBeUndefined();
         expect(degraded.data.defaultModel).toBe("openai:gpt-4o");
       }
+    }
+  });
+
+  it("degrades out-of-range agent resource limits instead of rejecting the document", () => {
+    const kept = AppConfigOnDiskSchema.safeParse({ agentResourceLimits: { cpuCores: 2.5 } });
+    expect(kept.success && kept.data.agentResourceLimits).toEqual({ cpuCores: 2.5 });
+
+    const degraded = AppConfigOnDiskSchema.safeParse({
+      agentResourceLimits: { cpuCores: 0, memoryGiB: 8 },
+      defaultModel: "openai:gpt-4o",
+    });
+    expect(degraded.success).toBe(true);
+    if (degraded.success) {
+      expect(degraded.data.agentResourceLimits).toBeUndefined();
+      expect(degraded.data.defaultModel).toBe("openai:gpt-4o");
     }
   });
 

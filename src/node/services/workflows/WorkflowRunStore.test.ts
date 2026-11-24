@@ -2,7 +2,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { isPathSafeWorkspaceId, WorkflowRunStore } from "./WorkflowRunStore";
@@ -350,6 +351,86 @@ describe("WorkflowRunStore", () => {
     expect(run.events).toHaveLength(1);
     expect(run.steps).toHaveLength(1);
     expect(completed?.result?.structuredOutput).toEqual({ ok: true });
+  });
+
+  // zod >= 4.5 rejects minute-precision datetimes with a zone ("...T00:01Z") unless the schema
+  // allows them, and zod 4.4 accepted them. Xum writes toISOString (always with seconds), but a
+  // persisted record from a hand edit or another writer must stay readable: an unreadable
+  // run.json also makes createRunIfAbsent treat the run as half-created and delete it.
+  test("keeps minute-precision journal lines readable", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-minute-precision");
+    const store = await createStore(tmp.path);
+    const runDir = path.join(tmp.path, "workflows", "wfr_123");
+
+    await store.appendEvent("wfr_123", {
+      sequence: 1,
+      type: "phase",
+      at: new Date("2026-05-29T00:00:01Z").toISOString(),
+      name: "scope",
+    });
+    await fs.appendFile(
+      path.join(runDir, "events.jsonl"),
+      [
+        { sequence: 2, type: "log", at: "2026-05-29T00:01Z", message: "minute precision" },
+        { sequence: 3, type: "log", at: "2026-05-29T00:02+02:00", message: "offset" },
+      ]
+        .map((event) => `${JSON.stringify(event)}\n`)
+        .join("")
+    );
+    await fs.appendFile(
+      path.join(runDir, "steps.jsonl"),
+      `${JSON.stringify({
+        stepId: "minute-step",
+        inputHash: "input:2",
+        status: "started",
+        startedAt: "2026-05-29T00:01Z",
+      })}\n`
+    );
+
+    const run = await store.getRun("wfr_123");
+
+    expect(run.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(run.steps.map((step) => step.startedAt)).toEqual(["2026-05-29T00:01Z"]);
+    expect(run.updatedAt).toBe("2026-05-29T00:02+02:00");
+  });
+
+  test("keeps a run.json with minute-precision timestamps readable and in place", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-minute-precision-run");
+    const store = new WorkflowRunStore({ sessionDir: tmp.path });
+    const input = {
+      id: "wfr_child_minute",
+      workspaceId: "workspace-1",
+      workflow: definition,
+      source: source,
+      args: { topic: "nested" },
+      parentWorkflow: { runId: "wfr_parent", stepId: "child", inputHash: "hash:child", depth: 0 },
+      now: "2026-05-29T00:00:00.000Z",
+    };
+    await store.createRunIfAbsent(input);
+    await store.appendEvent("wfr_child_minute", {
+      sequence: 1,
+      type: "log",
+      at: "2026-05-29T00:00:01.000Z",
+      message: "kept",
+    });
+    const runFile = path.join(tmp.path, "workflows", "wfr_child_minute", "run.json");
+    const raw = JSON.parse(await fs.readFile(runFile, "utf-8")) as Record<string, unknown>;
+    await fs.writeFile(
+      runFile,
+      JSON.stringify({ ...raw, createdAt: "2026-05-29T00:00Z", updatedAt: "2026-05-29T00:01Z" })
+    );
+
+    await expect(store.getRun("wfr_child_minute")).resolves.toMatchObject({
+      createdAt: "2026-05-29T00:00Z",
+    });
+    await expect(store.getRunStatusSnapshot("wfr_child_minute")).resolves.toMatchObject({
+      id: "wfr_child_minute",
+    });
+    const again = await store.createRunIfAbsent(input);
+    expect(again.events.map((event) => event.type === "log" && event.message)).toEqual(["kept"]);
+    await expect(
+      fs.readFile(path.join(tmp.path, "workflows", "wfr_child_minute", "events.jsonl"), "utf-8")
+    ).resolves.toContain('"kept"');
   });
 
   test("rejects duplicate or out-of-order event sequence numbers", async () => {
@@ -1256,6 +1337,66 @@ describe("WorkflowRunStore", () => {
     await expect(store.acquireLease("wfr_123", "runner-a", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(true);
+  });
+});
+
+// Each test kills a mutant that the phase 4 mutation runs left alive (#7475).
+describe("WorkflowRunStore option and argument bounds", () => {
+  test("the constructor rejects an empty session dir and a zero lock wait", () => {
+    expect(() => new WorkflowRunStore({ sessionDir: "" })).toThrow("sessionDir is required");
+    expect(() => new WorkflowRunStore({ sessionDir: "/", mutationLockWaitTimeoutMs: 0 })).toThrow(
+      "mutationLockWaitTimeoutMs must be positive"
+    );
+    // One character and one millisecond are the smallest valid values.
+    expect(
+      () => new WorkflowRunStore({ sessionDir: "/", mutationLockWaitTimeoutMs: 1 })
+    ).not.toThrow();
+  });
+
+  test("a zero stale lease window is kept, not replaced by the default", () => {
+    const store = new WorkflowRunStore({ sessionDir: "/", staleLeaseMs: 0 });
+    expect(store.getLeaseRenewalIntervalMs()).toBe(1);
+  });
+
+  test("acquireLease rejects an empty owner id and accepts a one-character one", async () => {
+    using tmp = new DisposableTempDir("workflow-runs");
+    const store = await createStore(tmp.path);
+    await expect(store.acquireLease("wfr_123", "", 1000)).rejects.toThrow("ownerId is required");
+    await expect(store.acquireLease("wfr_123", "a", 1000)).resolves.toBe(true);
+  });
+
+  test("a lease exactly staleLeaseMs old is still active", async () => {
+    using tmp = new DisposableTempDir("workflow-runs");
+    const store = await createStore(tmp.path, 10);
+    await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
+    await expect(store.acquireLease("wfr_123", "runner-b", 1010)).resolves.toBe(false);
+    await expect(store.acquireLease("wfr_123", "runner-b", 1011)).resolves.toBe(true);
+  });
+
+  test("a waiter that passes its deadline in the queue gets a zero cross-process budget", async () => {
+    using tmp = new DisposableTempDir("workflow-runs");
+    const budgets: number[] = [];
+    const store = new WorkflowRunStore({
+      sessionDir: tmp.path,
+      mutationLockWaitTimeoutMs: 1_000,
+      locks: {
+        ...nodeSessionLocks,
+        acquireCrossProcessLock: (options) => {
+          budgets.push(options.acquireTimeoutMs);
+          return Promise.resolve(() => Promise.resolve());
+        },
+      },
+    });
+    // Every clock read is 5 s after the last, so the 1 s deadline has passed when the
+    // cross-process budget is computed.
+    let clock = 1_000_000;
+    const now = spyOn(Date, "now").mockImplementation(() => (clock += 5_000));
+    try {
+      await store.releaseLease("wfr_123", "runner-a");
+    } finally {
+      now.mockRestore();
+    }
+    expect(budgets).toEqual([0]);
   });
 });
 

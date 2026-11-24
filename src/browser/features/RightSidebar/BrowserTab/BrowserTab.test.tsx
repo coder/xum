@@ -409,7 +409,9 @@ describe("BrowserTab", () => {
         allowOtherWorkspaceSession: true,
       });
     });
-    fireEvent.click(view.getByTestId("browser-page-tab-t2"));
+    // The tab renders only after the listTabs promise resolves and React commits; waiting for the
+    // call alone raced that render on loaded CI runners (#5624).
+    fireEvent.click(await view.findByTestId("browser-page-tab-t2"));
 
     await waitFor(() => {
       expect(selectTabMock).toHaveBeenCalledWith({

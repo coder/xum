@@ -39,14 +39,15 @@ export const createBashOutputTool: ToolFactory = (config: ToolConfiguration) => 
       }
 
       // Get incremental output with blocking wait
-      // Pass workspaceId so getOutput can check for queued messages
       return await config.backgroundProcessManager.getOutput(
         process_id,
         filter ?? undefined,
         filter_exclude ?? undefined,
         timeout_secs,
         abortSignal,
-        config.workspaceId
+        config.workspaceId,
+        undefined,
+        config.hasQueuedMessages
       );
     },
   });

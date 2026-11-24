@@ -2,6 +2,9 @@
 name: Explore
 description: Read-only exploration of repository, environment, web, etc. Useful for investigation before making changes.
 base: exec
+ai:
+  # Short-lived runs rarely reread a cache after 5 minutes, and 1h cache writes cost 2x input.
+  cacheTtl: 5m
 prompt:
   append: false
 ui:

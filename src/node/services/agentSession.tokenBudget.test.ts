@@ -1,4 +1,4 @@
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import * as budgetCounting from "./contextBudgetCounting";
 import type { MCPServerManager } from "./mcpServerManager";
 import { eventSpine } from "./events/eventSpine";
@@ -9,7 +9,8 @@ import * as path from "node:path";
 
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
-import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { filterEmptyAssistantMessages } from "@/browser/utils/messages/modelMessageTransform";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -20,11 +21,9 @@ import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
-import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
-  FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
 import type { AgentSessionAIService } from "./agentSession";
 import { CompactionCancellation } from "./compactionCancellation";
@@ -38,11 +37,7 @@ import {
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
-import {
-  createContextBudgetWarning,
-  createRolloverPrefix,
-  type ContextWindowRollover,
-} from "./contextWindowRollover";
+import { createRolloverPrefix, type ContextWindowRollover } from "./contextWindowRollover";
 import * as rolloverMessages from "./contextWindowRollover";
 import * as contextLimits from "@/common/utils/compaction/contextLimit";
 import { CompactionPendingState } from "./compactionPendingState";
@@ -54,17 +49,7 @@ const model = "openai:gpt-4o";
 /** Persist the slider value (percent) for the test model, as the UI would. */
 const seedThreshold = (h: AgentSessionHarness, fraction: number) =>
   seedAutoCompactionThreshold(h.config, model, Math.round(fraction * 100));
-const options: SendMessageOptions = {
-  model,
-  agentId: "exec",
-  experiments: { tokenBudget: true },
-};
-// Dispatch and resume re-validate memory writability from the caller's options; the harness has
-// no backend experiment service, so these paths state the Memory experiment explicitly.
-const resumeOptions: SendMessageOptions = {
-  ...options,
-  experiments: { tokenBudget: true, memory: true },
-};
+const options: SendMessageOptions = { model, agentId: "exec" };
 const correlation = {
   type: "workspace-turn-task",
   taskHandleId: "wst_budget",
@@ -82,10 +67,8 @@ function trackedFilePaths(h: AgentSessionHarness): string[] {
 function budgetOf(h: AgentSessionHarness) {
   return Reflect.get(Reflect.get(h.session, "contextController") as object, "tokenBudget") as {
     contextBudgetGeneration: number;
-    contextBudgetWarningClaimed: boolean;
     contextBudgetHandoffClaimed: boolean;
-    contextBudgetFlushClaimed: boolean;
-    contextBudgetHistoryAvailable: boolean;
+    contextBudgetFinalClaimed: boolean;
   };
 }
 
@@ -100,7 +83,7 @@ function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): Sett
     toolResultChars: 0,
     imageParts: 0,
     sessionHistoryAvailable: true,
-    memoryWritable: true,
+    newContextAvailable: true,
     ...overrides,
   };
 }
@@ -123,13 +106,9 @@ function isHandoffRow(row: MuxMessage): boolean {
   return meta?.type === "context-budget-warning" && meta.handoff === true;
 }
 
-/** Per-window advisory claims; set only once a row is durable, never by pending intent. */
-function budgetClaims(h: AgentSessionHarness): { warning: boolean; handoff: boolean } {
-  const budget = budgetOf(h);
-  return {
-    warning: budget.contextBudgetWarningClaimed,
-    handoff: budget.contextBudgetHandoffClaimed,
-  };
+/** Per-window handoff claim; set only once a row is durable, never by pending intent. */
+function handoffClaimed(h: AgentSessionHarness): boolean {
+  return budgetOf(h).contextBudgetHandoffClaimed;
 }
 
 async function emitUsageDelta(h: AgentSessionHarness & { requests: unknown[] }) {
@@ -180,46 +159,68 @@ async function seedHistory(h: AgentSessionHarness, inputTokens: number, toolResu
   expect(result.success).toBe(true);
 }
 
-const LEGACY_FLUSH_TRIGGER = "Flush context notes now.";
+/** E′ − E: what the warning row adds to a counted request (the harness has no tokenizer). */
+const TURN_START_ROW_TOKENS = 300;
+
+interface TurnStartControl {
+  /**
+   * E (full estimate of the built request) for one provider attempt. Unset, E is the saved usage
+   * of the turn's last assistant row, so a scenario's seeded usage drives the stage.
+   */
+  estimate?: (attempt: number, usage: number) => number;
+  /** Runs after the stage fit, right before the session's publish (a Stop can land here). */
+  beforePublish?: () => void | Promise<void>;
+}
 
 /**
- * Rows an older build left behind after offering its final pre-rollover flush: the durable final
- * warning plus the hidden trigger it dispatched (old context precedes them). New windows never
- * write these; recovery must still finish them as one bounded step that seals the window.
+ * Provider usage as the on-send rollover check reads it: the session's last stream usage, else the
+ * saved usage of the newest assistant row in the request's messages (after a restart).
  */
-async function seedLegacyFlushTurn(
+function lastUsage(h: AgentSessionHarness, messages: readonly MuxMessage[]): number {
+  const state = (
+    Reflect.get(h.session, "getUsageState") as (
+      this: AgentSessionHarness["session"]
+    ) =>
+      | { lastContextUsage?: { input: { tokens: number }; cached: { tokens: number } } }
+      | undefined
+  ).call(h.session);
+  const live = state?.lastContextUsage;
+  if (live) return live.input.tokens + live.cached.tokens;
+  const usage = messages.findLast((row) => row.metadata?.contextUsage)?.metadata?.contextUsage;
+  return (usage?.inputTokens ?? 0) + (usage?.cachedInputTokens ?? 0);
+}
+
+/**
+ * The controlled provider replaces TurnRequestBuilder.start(), so it replays the turn-start stage
+ * step (#5286): decide from E, count E′ with the row appended, publish only if E′ fits, and
+ * dispatch that payload (the row joins `messages`, as in the builder).
+ */
+async function emulateTurnStartStage(
   h: AgentSessionHarness,
-  metadata?: Pick<MuxMetadata, "muxMetadata" | "kind" | "goalId">
-) {
-  await seedHistory(h, 110_000);
-  const result = await h.historyService.appendManyToHistory(workspaceId, [
-    createContextBudgetWarning({
-      contextTokens: 110_010,
-      maxTokens: 128_000,
-      // Older builds budgeted the slider's force band, not the usable ceiling.
-      budgetTokens: 96_000,
-      memoryWritable: true,
-      sessionHistoryAvailable: true,
-      final: true,
-    }),
-    createMuxMessage("legacy-flush-trigger", "user", LEGACY_FLUSH_TRIGGER, {
-      synthetic: true,
-      uiVisible: false,
-      retrySendOptions: { model, agentId: "exec", agentInitiated: true },
-      ...metadata,
-      muxMetadata: {
-        ...(metadata?.muxMetadata ?? { type: "normal" }),
-        contextBudgetContinuation: true,
-        contextBudgetFlush: true,
-      },
-    }),
-  ]);
-  expect(result.success).toBe(true);
+  request: Request,
+  attempt: number,
+  control: TurnStartControl
+): Promise<void> {
+  const decide = request.onTurnStartStage;
+  const limit = contextLimits.getEffectiveContextLimit(request.modelString, false);
+  if (!decide || limit == null) return;
+  const usage = lastUsage(h, request.messages);
+  const estimate = control.estimate?.(attempt, usage) ?? usage;
+  const stage = await decide({
+    estimate,
+    limit,
+    model: request.modelString,
+    messages: request.messages,
+  });
+  if (!stage?.fits(estimate + TURN_START_ROW_TOKENS)) return;
+  await control.beforePublish?.();
+  if (await stage.publish()) request.messages.push(stage.row);
 }
 
 describe("AgentSession token-budget lifecycle", () => {
   const harnesses: AgentSessionHarness[] = [];
   const storageCleanups: Array<() => Promise<void>> = [];
+  const enabledExperiments = new Set<ExperimentId>();
   afterEach(async () => {
     for (const h of harnesses.reverse()) {
       await h.session.dispose();
@@ -273,10 +274,14 @@ describe("AgentSession token-budget lifecycle", () => {
       return waiter.promise;
     };
     const completions: Array<ReturnType<typeof createTurnCompletionController>> = [];
+    const turnStart: TurnStartControl = {};
     const streamMessage = mock<AgentSessionAIService["streamMessage"]>(async (request) => {
       requests.push(request);
-      if (requests.length === 2) secondRequest.resolve(request);
-      const error = await args?.failure?.(requests.length);
+      const attempt = requests.length;
+      // A refused request (the failure hook models the turn-start check) never reaches the stage.
+      const error = await args?.failure?.(attempt);
+      if (!error) await emulateTurnStartStage(h, request, attempt, turnStart);
+      if (attempt === 2) secondRequest.resolve(request);
       if (error) return Err(error);
       h.aiEmitter.emit("stream-start", {
         type: "stream-start",
@@ -311,6 +316,12 @@ describe("AgentSession token-budget lifecycle", () => {
       },
     });
     harnesses.push(h);
+    enabledExperiments.clear();
+    enabledExperiments.add(EXPERIMENT_IDS.TOKEN_BUDGET);
+    enabledExperiments.add(EXPERIMENT_IDS.MEMORY);
+    spyOn(h.aiService, "isExperimentEnabled").mockImplementation((id) =>
+      enabledExperiments.has(id)
+    );
     spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
       Ok({
         id: workspaceId,
@@ -359,6 +370,7 @@ describe("AgentSession token-budget lifecycle", () => {
       completions,
       streamMessage,
       secondRequest,
+      turnStart,
       finishAndDispatch,
       settleStream,
       waitForRequest,
@@ -367,13 +379,10 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("manual compaction publishes a summary and clears globally enabled token-budget state", async () => {
     const h = await setup();
-    spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
-    );
     await seedHistory(h, 20_000);
     const state = budgetOf(h);
-    state.contextBudgetWarningClaimed = true;
-    state.contextBudgetFlushClaimed = true;
+    state.contextBudgetHandoffClaimed = true;
+    state.contextBudgetFinalClaimed = true;
     const generation = state.contextBudgetGeneration;
     expect(
       (
@@ -385,8 +394,8 @@ describe("AgentSession token-budget lifecycle", () => {
       ).success
     ).toBe(true);
     expect(state.contextBudgetGeneration).toBeGreaterThan(generation);
-    expect(state.contextBudgetWarningClaimed).toBe(false);
-    expect(state.contextBudgetFlushClaimed).toBe(false);
+    expect(state.contextBudgetHandoffClaimed).toBe(false);
+    expect(state.contextBudgetFinalClaimed).toBe(false);
     expect(h.requests).toHaveLength(1);
     expect(h.requests[0].onStepSettled).toBeUndefined();
     h.completions[0].settle({
@@ -851,7 +860,7 @@ describe("AgentSession token-budget lifecycle", () => {
         message = "Read @large.txt";
       } else if (kind === "skill") {
         spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT || enabledExperiments.has(id)
         );
         const skillDir = path.join(h.config.rootDir, ".xum", "skills", "large-prelude");
         await fs.mkdir(skillDir, { recursive: true });
@@ -1350,17 +1359,11 @@ describe("AgentSession token-budget lifecycle", () => {
     "valid in-memory usage takes precedence over persisted usage (%d tokens)",
     async (inputTokens) => {
       const h = await setup();
+      // A completed stream records its context usage in memory; no restart follows.
+      expect((await h.session.sendMessage("Record counters", options)).success).toBe(true);
+      h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens } });
+      await h.session.waitForIdle();
       await seedHistory(h, inputTokens === 120_000 ? 20_000 : 120_000);
-      const session = h.session as unknown as {
-        updateUsageStateFromModelUsage(
-          input: Pick<SettledStepBudget, "model" | "usage"> & { live: boolean }
-        ): void;
-      };
-      session.updateUsageStateFromModelUsage({
-        model,
-        usage: { inputTokens, outputTokens: 0, totalTokens: inputTokens },
-        live: false,
-      });
       expect((await h.session.sendMessage("Use current counters", options)).success).toBe(true);
       expect(rolloverRows(await allRows(h))).toHaveLength(inputTokens === 120_000 ? 1 : 0);
     }
@@ -1397,6 +1400,81 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toBe(true);
     // The fresh window has no outstanding request: an ordinary settled step continues.
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
+  });
+
+  test("near the ceiling the final prompt follows the handoff on a normal turn, once per window", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    // Inside the final zone the handoff request still comes first.
+    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
+    const second = await h.waitForRequest(2);
+    // The final prompt is queued like the handoff: no rollover intent and no hidden step.
+    expect((await second.onStepSettled?.(step(111_000)))?.decision).toBe("warn");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    h.settleStream(1, { contextUsage: { inputTokens: 111_000 } });
+    const third = await h.waitForRequest(3);
+    expect(third.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    let rows = await allRows(h);
+    expect(warningRows(rows).map(isFinalFlushRow)).toEqual([false, true]);
+    expect(rolloverRows(rows)).toHaveLength(0);
+    // Once claimed, the window gets no second prompt; the model's new_context seals it.
+    expect((await third.onStepSettled?.(step(112_000)))?.decision).toBe("continue");
+    expect(
+      (await third.onStepSettled?.(step(112_500, { newContextRequested: true })))?.decision
+    ).toBe("rollover");
+    h.settleStream(2);
+    await h.waitForRequest(4);
+    rows = await allRows(h);
+    const resets = rolloverRows(rows);
+    expect(resets).toHaveLength(1);
+    expect(resets[0].metadata?.muxMetadata).toMatchObject({
+      requestedBy: "model",
+      flushOpportunity: true,
+    });
+  });
+
+  test("a text-only reply in the final zone gets the final prompt on the next send", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+    h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: 92_000 } });
+    await h.session.waitForIdle();
+    expect((await h.session.sendMessage("Next real request", options)).success).toBe(true);
+    h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 111_000 } });
+    await h.session.waitForIdle();
+    expect((await h.session.sendMessage("And another", options)).success).toBe(true);
+    const rows = await allRows(h);
+    expect(warningRows(rows).map(isFinalFlushRow)).toEqual([false, true]);
+    expect(rolloverRows(rows)).toHaveLength(0);
+    // The send that delivers the prompt carries it after its own user row (#5286).
+    expect(text(rows.at(-2)!)).toBe("And another");
+    expect(isFinalFlushRow(rows.at(-1)!)).toBe(true);
+  });
+
+  test("without new_context no final prompt is offered", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect((await h.requests[0].onStepSettled?.(step(110_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
+    const second = await h.waitForRequest(2);
+    expect(
+      (await second.onStepSettled?.(step(111_000, { newContextAvailable: false })))?.decision
+    ).toBe("continue");
+    expect(h.session.hasQueuedMessages()).toBe(false);
+    // The turn start offers the final prompt only when the dispatching send has new_context.
+    h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 111_000 } });
+    await h.session.waitForIdle();
+    const noNewContext: SendMessageOptions = {
+      ...options,
+      toolPolicy: [{ regex_match: "new_context", action: "disable" }],
+    };
+    expect((await h.session.sendMessage("Without new_context", noNewContext)).success).toBe(true);
+    expect((await allRows(h)).some(isFinalFlushRow)).toBe(false);
+    h.settleStream(2, { finishReason: "stop", contextUsage: { inputTokens: 111_000 } });
+    await h.session.waitForIdle();
+    expect((await h.session.sendMessage("With new_context", options)).success).toBe(true);
+    expect(isFinalFlushRow((await allRows(h)).at(-1)!)).toBe(true);
   });
 
   test("a settled step whose next request would cross the ceiling seals the window instead of blocking", async () => {
@@ -1873,28 +1951,16 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test.each([
     {
-      label: "warning with full capabilities",
-      usage: 85_000,
-      sendOptions: resumeOptions,
-      expected: {
-        handoff: false,
-        memoryWritable: true,
-        sessionHistoryAvailable: true,
-        newContextAvailable: true,
-      },
-    },
-    {
       label: "handoff with degraded capabilities",
       usage: 90_000,
       sendOptions: {
-        ...resumeOptions,
+        ...options,
         toolPolicy: [{ regex_match: "memory|session_.*", action: "disable" }],
       } satisfies SendMessageOptions,
       expected: {
         handoff: true,
-        memoryWritable: false,
         sessionHistoryAvailable: false,
-        newContextAvailable: true,
+        newContextAvailable: false,
       },
     },
   ])(
@@ -1917,7 +1983,7 @@ describe("AgentSession token-budget lifecycle", () => {
       );
       expect(rolloverRows(rows)).toHaveLength(0);
       expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
-      expect(budgetClaims(h)).toEqual({ warning: !expected.handoff, handoff: expected.handoff });
+      expect(handoffClaimed(h)).toBe(expected.handoff);
       // A text-only reply never runs the settled-step callback; the next send repeats nothing.
       h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: usage } });
       await h.session.waitForIdle();
@@ -1950,7 +2016,7 @@ describe("AgentSession token-budget lifecycle", () => {
         budgetTokens: 119_808,
         handoffTokens: 89_600,
       });
-      for (const usage of [95_000, 105_000, 115_000]) {
+      for (const usage of [95_000, 105_000]) {
         expect((await h.requests[1].onStepSettled?.(step(usage)))?.decision).toBe("continue");
       }
       expect((await h.requests[1].onStepSettled?.(step(120_000)))?.decision).toBe("rollover");
@@ -1963,7 +2029,7 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test.each([85_000, 90_000])(
+  test.each([90_000])(
     "a settled advisory at %d tokens is durable once per window and retains delegated continuation attribution",
     async (usage) => {
       const h = await setup();
@@ -1996,8 +2062,9 @@ describe("AgentSession token-budget lifecycle", () => {
         budgetTokens: 119_808,
         handoffTokens: 89_600,
       });
-      expect(isHandoffRow(warnings[0])).toBe(usage >= 89_600);
-      const continuation = rows.at(-1)!;
+      expect(isHandoffRow(warnings[0])).toBe(true);
+      expect(rows.at(-1)).toBe(warnings[0]);
+      const continuation = rows.at(-2)!;
       expect(continuation.metadata).toMatchObject({
         synthetic: true,
         uiVisible: false,
@@ -2006,7 +2073,7 @@ describe("AgentSession token-budget lifecycle", () => {
         goalId: "goal-budget",
         muxMetadata: correlation,
       });
-      expect(warnings[0].metadata!.historySequence!).toBeLessThan(
+      expect(warnings[0].metadata!.historySequence!).toBeGreaterThan(
         continuation.metadata!.historySequence!
       );
       expect((await h.requests[1].onStepSettled?.(step(usage)))?.decision).toBe("continue");
@@ -2016,7 +2083,6 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test.each([
     ["at the hard ceiling", step(127_000), false],
-    ["with read-only memory", step(120_000, { memoryWritable: false }), false],
     ["without session_history", step(120_000, { sessionHistoryAvailable: false }), false],
   ])(
     "settled rollover %s seals without a flush and preserves continuation correlation",
@@ -2163,66 +2229,48 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test.each([
-    { label: "after an advance warning", first: 85_000, warnings: 2 },
-    { label: "on a direct jump into the handoff band", first: 90_000, warnings: 1 },
-  ])(
-    "the handoff is published once $label and suppresses later warnings",
-    async ({ first, warnings }) => {
-      const h = await setup();
-      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
-      // The external stop type stays "warn"; the published row tells the advisories apart.
-      expect((await h.requests[0].onStepSettled?.(step(first)))?.decision).toBe("warn");
-      h.settleStream(0, { contextUsage: { inputTokens: first } });
-      await h.waitForRequest(2);
-      let rows = await allRows(h);
-      expect(warningRows(rows)).toHaveLength(1);
-      expect(warningRows(rows)[0].metadata?.muxMetadata).toMatchObject({
-        budgetTokens: 119_808,
-        handoffTokens: 89_600,
-      });
-      expect(isHandoffRow(warningRows(rows)[0])).toBe(first >= 89_600);
-      expect(budgetClaims(h)).toEqual({ warning: first < 89_600, handoff: first >= 89_600 });
-      if (first < 89_600) {
-        // A delivered warning does not consume the handoff that follows it.
-        expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-        h.settleStream(1, { contextUsage: { inputTokens: 90_000 } });
-        await h.waitForRequest(3);
-        rows = await allRows(h);
-      }
-      expect(warningRows(rows)).toHaveLength(warnings);
-      expect(warningRows(rows).filter(isHandoffRow)).toHaveLength(1);
-      expect(budgetClaims(h)).toEqual({ warning: first < 89_600, handoff: true });
-      // Nothing else is advertised in this window until the usable ceiling forces a rollover;
-      // near the ceiling the advisory row itself would no longer fit.
-      const active = h.requests.at(-1)!;
-      for (const usage of [85_000, 95_000, 118_000])
-        expect((await active.onStepSettled?.(step(usage)))?.decision).toBe("continue");
-      expect(h.session.hasQueuedMessages()).toBe(false);
-      expect(rolloverRows(rows)).toHaveLength(0);
-    }
-  );
+  test("the handoff is published once and suppresses later handoff requests", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+    // The external stop type stays "warn"; the published row is the handoff request.
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(1);
+    expect(warningRows(rows)[0].metadata?.muxMetadata).toMatchObject({
+      handoff: true,
+      budgetTokens: 119_808,
+      handoffTokens: 89_600,
+    });
+    expect(handoffClaimed(h)).toBe(true);
+    // Outside the final step's band nothing else is advertised in this window until the usable
+    // ceiling forces a rollover; near the ceiling the final step itself would no longer fit.
+    const active = h.requests.at(-1)!;
+    for (const usage of [85_000, 95_000, 105_000, 118_000])
+      expect((await active.onStepSettled?.(step(usage)))?.decision).toBe("continue");
+    expect(h.session.hasQueuedMessages()).toBe(false);
+    expect(rolloverRows(rows)).toHaveLength(0);
+  });
 
-  test("a pending warning is upgraded by the queued user input that dispatches it", async () => {
+  test("a pending handoff is published after the queued user input that dispatches it", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect(h.session.queueMessage("Later question", options)).not.toBeNull();
-    expect((await h.requests[0].onStepSettled?.(step(85_000)))?.decision).toBe("warn");
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     // Real queued input owns the dispatch: no Continue is added behind it.
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    // Usage reported at stream end crossed the handoff target: the pending intent never pins
-    // the advisory to the level it was computed at.
+    // The advisory is recomputed at dispatch from the usage reported at stream end.
     h.settleStream(0, { contextUsage: { inputTokens: 92_000 } });
     await h.waitForRequest(2);
     const rows = await allRows(h);
     expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
-    expect(text(rows.at(-1)!)).toBe("Later question");
+    const later = rows.find((row) => text(row) === "Later question")!;
     expect(rows.filter((row) => text(row) === "Continue")).toHaveLength(0);
-    expect(warningRows(rows)[0].metadata!.historySequence!).toBeLessThan(
-      rows.at(-1)!.metadata!.historySequence!
-    );
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+    // [..., user, warning]: the queued input's own build carries the row (#5286).
+    expect(rows.slice(-2)).toEqual([later, warningRows(rows)[0]]);
+    expect(handoffClaimed(h)).toBe(true);
   });
 
   test.each([
@@ -2232,52 +2280,38 @@ describe("AgentSession token-budget lifecycle", () => {
       next: {
         toolPolicy: [{ regex_match: "memory|session_history|new_context", action: "disable" }],
       },
-      expected: {
-        memoryWritable: false,
-        sessionHistoryAvailable: false,
-        newContextAvailable: false,
-      },
+      expected: { sessionHistoryAvailable: false, newContextAvailable: false },
     },
     {
       label: "caller restores tools",
       previousEnabled: false,
       next: {},
-      expected: { memoryWritable: true, sessionHistoryAvailable: true, newContextAvailable: true },
+      expected: { sessionHistoryAvailable: true, newContextAvailable: true },
     },
     {
       label: "agent removes tools",
       previousEnabled: true,
       next: { agentId: "restricted" },
-      expected: {
-        memoryWritable: false,
-        sessionHistoryAvailable: false,
-        newContextAvailable: false,
-      },
+      expected: { sessionHistoryAvailable: false, newContextAvailable: false },
     },
     {
       label: "read-only agent",
       previousEnabled: true,
       next: { agentId: "observer" },
-      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
-    },
-    {
-      label: "Memory experiment disabled",
-      previousEnabled: true,
-      next: { experiments: { tokenBudget: true, memory: false } },
-      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+      expected: { sessionHistoryAvailable: true, newContextAvailable: true },
     },
     {
       label: "memory tool disabled",
       previousEnabled: true,
       next: { toolPolicy: [{ regex_match: "memory", action: "disable" }] },
-      expected: { memoryWritable: false, sessionHistoryAvailable: true, newContextAvailable: true },
+      // new_context needs the memory tool for its checkpoint.
+      expected: { sessionHistoryAvailable: true, newContextAvailable: false },
     },
   ] satisfies Array<{
     label: string;
     previousEnabled: boolean;
     next: Partial<SendMessageOptions>;
     expected: {
-      memoryWritable: boolean;
       sessionHistoryAvailable: boolean;
       newContextAvailable: boolean;
     };
@@ -2285,7 +2319,7 @@ describe("AgentSession token-budget lifecycle", () => {
     "queued advisories use dispatch permissions: $label",
     async ({ previousEnabled, next, expected }) => {
       const h = await setup();
-      const dispatchOptions: SendMessageOptions = { ...resumeOptions, ...next };
+      const dispatchOptions: SendMessageOptions = { ...options, ...next };
       if (dispatchOptions.agentId === "restricted" || dispatchOptions.agentId === "observer") {
         const agentsDir = path.join(h.config.rootDir, ".xum", "agents");
         await fs.mkdir(agentsDir, { recursive: true });
@@ -2297,7 +2331,7 @@ describe("AgentSession token-budget lifecycle", () => {
         );
       }
       const previousOptions: SendMessageOptions = {
-        ...resumeOptions,
+        ...options,
         ...(!previousEnabled
           ? {
               toolPolicy: [
@@ -2313,7 +2347,6 @@ describe("AgentSession token-budget lifecycle", () => {
         (
           await h.requests[0].onStepSettled?.(
             step(90_000, {
-              memoryWritable: previousEnabled,
               sessionHistoryAvailable: previousEnabled,
             })
           )
@@ -2326,14 +2359,15 @@ describe("AgentSession token-budget lifecycle", () => {
       const rows = await allRows(h);
       expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
-      expect(text(rows.at(-1)!)).toBe("Next request");
+      expect(handoffClaimed(h)).toBe(true);
+      expect(text(rows.at(-2)!)).toBe("Next request");
+      expect(isHandoffRow(rows.at(-1)!)).toBe(true);
     }
   );
 
   test("unresolved dispatch permissions omit the advisory without consuming its claim", async () => {
     const h = await setup();
-    expect((await h.session.sendMessage("Start work", resumeOptions)).success).toBe(true);
+    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     // Fail only the optional advisory lookup, not unrelated stream preparation or rollover admission.
     spyOn(
@@ -2343,15 +2377,18 @@ describe("AgentSession token-budget lifecycle", () => {
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
     await h.waitForRequest(2);
     expect(warningRows(await allRows(h))).toHaveLength(0);
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+    expect(handoffClaimed(h)).toBe(false);
     expect(text(h.requests[1].messages.at(-1)!)).toBe("Continue");
 
-    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-    h.settleStream(1, { contextUsage: { inputTokens: 90_000 } });
-    await h.waitForRequest(3);
+    // The Continue's own turn start declined the stage, so its settlement does not stop again.
+    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("continue");
+    h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 90_000 } });
+    await h.session.waitForIdle();
+    // Nothing was claimed: the next turn's start publishes the handoff.
+    expect((await h.session.sendMessage("Next request", options)).success).toBe(true);
     const rows = await allRows(h);
     expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+    expect(handoffClaimed(h)).toBe(true);
     expect(rolloverRows(rows)).toHaveLength(0);
   });
 
@@ -2361,17 +2398,16 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup();
       expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
       const nextOptions: SendMessageOptions =
-        change === "larger-model"
-          ? { ...options, model: "openai:gpt-4.1" }
-          : { ...options, experiments: { tokenBudget: false } };
+        change === "larger-model" ? { ...options, model: "openai:gpt-4.1" } : options;
       expect(h.session.queueMessage("Next request", nextOptions)).not.toBeNull();
       expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+      if (change === "mode-inactive") enabledExperiments.delete(EXPERIMENT_IDS.TOKEN_BUDGET);
       h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
       await h.waitForRequest(2);
       const rows = await allRows(h);
       expect(warningRows(rows)).toHaveLength(0);
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+      expect(handoffClaimed(h)).toBe(false);
       if (change === "mode-inactive") {
         // The ordinary auto-compaction path owns that send; no budget callback is installed.
         expect(h.requests[1].onStepSettled).toBeUndefined();
@@ -2382,24 +2418,37 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test("removing the queued advisory Continue does not lose the advisory itself", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-    expect(
-      h.session.removeQueuedMessagesByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY, "removed")
-    ).toBe(1);
-    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
-    await h.session.waitForIdle();
-    expect(h.requests).toHaveLength(1);
-    expect(warningRows(await allRows(h))).toHaveLength(0);
-    // The next real send derives the advisory from usage, not from the dropped intent.
-    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-    const rows = await allRows(h);
-    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
-    expect(text(rows.at(-1)!)).toBe("Follow-up");
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
-  });
+  // "queue": the user's queued send replaces the removed Continue and dispatches at stream end.
+  test.each(["send", "queue"] as const)(
+    "removing the queued advisory Continue does not lose the advisory itself (%s)",
+    async (dispatch) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+      expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+      expect(
+        h.session.removeQueuedMessagesByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY, "removed")
+      ).toBe(1);
+      if (dispatch === "queue") {
+        expect(h.session.queueMessage("Follow-up", options)).not.toBeNull();
+        h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+        await h.waitForRequest(2);
+      } else {
+        h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+        await h.session.waitForIdle();
+        expect(h.requests).toHaveLength(1);
+        expect(warningRows(await allRows(h))).toHaveLength(0);
+        // The next real send derives the advisory from usage, not from the dropped intent.
+        expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
+      }
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+      // The replacing send's own turn start carries the row, after its user row (#5286).
+      expect(text(rows.at(-2)!)).toBe("Follow-up");
+      expect(isHandoffRow(rows.at(-1)!)).toBe(true);
+      expect(rows.filter((row) => text(row) === "Continue")).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(true);
+    }
+  );
 
   test.each(["stop", "failed-publication", "restart-before", "restart-after"] as const)(
     "the handoff is published exactly once across a %s",
@@ -2409,7 +2458,7 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
       expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
       // Intent alone claims nothing; only a durable row does.
-      expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+      expect(handoffClaimed(h)).toBe(false);
       // The committed partial keeps the usage the interrupted stream reached.
       const persistUsage = () =>
         h.historyService.appendToHistory(
@@ -2443,18 +2492,27 @@ describe("AgentSession token-budget lifecycle", () => {
           break;
         }
         case "failed-publication": {
-          spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
-            (...args) => {
-              const operation = args[2];
-              expect(operation.kind === "append" && warningRows(operation.messages)).toHaveLength(
-                1
-              );
-              return Promise.resolve(Err("disk full"));
-            }
-          );
+          // The turn start publishes the row (#5286): a failed publication dispatches the
+          // Continue without it and claims nothing.
+          // The Continue row is published first; the next fenced append is the warning's.
+          const accept = spyOn(h.historyService, "acceptCompactionReplacement");
+          let rejectedCall: number | undefined;
+          const unsubscribe = h.session.onChatEvent(({ message }) => {
+            if (message.type !== "message" || rejectedCall != null) return;
+            if (message.role !== "user" || text(message) !== "Continue") return;
+            rejectedCall = accept.mock.calls.length;
+            accept.mockRejectedValueOnce(new Error("disk full"));
+          });
           h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+          const continued = await h.waitForRequest(2);
+          unsubscribe();
+          // Non-vacuous: the rejected call was the warning's publication.
+          const rejected = accept.mock.calls[rejectedCall!]?.[2];
+          expect(rejected?.kind === "append" && warningRows(rejected.messages).length).toBe(1);
+          expect(text(continued.messages.at(-1)!)).toBe("Continue");
+          expect(handoffClaimed(h)).toBe(false);
+          h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 90_000 } });
           await h.session.waitForIdle();
-          expect(h.requests).toHaveLength(1);
           break;
         }
         case "restart-before": {
@@ -2479,7 +2537,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const rows = await allRows(h);
       expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(budgetClaims(h)).toEqual({ warning: false, handoff: true });
+      expect(handoffClaimed(h)).toBe(true);
       const latest = h.requests.at(-1)!;
       for (const usage of [85_000, 95_000])
         expect((await latest.onStepSettled?.(step(usage)))?.decision).toBe("continue");
@@ -2492,9 +2550,12 @@ describe("AgentSession token-budget lifecycle", () => {
     { toolResultTokens: 18_500, advisory: false },
     { toolResultTokens: 1_000, advisory: true },
   ])(
-    "dispatch screens the pending handoff against the encoded last-step outputs (advisory=$advisory)",
+    "the pending handoff fits against the built request that carries the encoded last-step outputs (advisory=$advisory)",
     async ({ toolResultTokens, advisory }) => {
       const h = await setup();
+      // #5286: the stage fits on E, the count of the built request. That request carries the last
+      // step's outputs, which provider usage has not counted yet.
+      h.turnStart.estimate = (_attempt, projected) => (projected ?? 0) + toolResultTokens;
       const stale = "s".repeat(400_000);
       const settled = "d".repeat(4_000);
       const toolPart = (toolCallId: string, output: string): MuxMessage["parts"][number] => ({
@@ -2532,16 +2593,15 @@ describe("AgentSession token-budget lifecycle", () => {
       let rows = await allRows(h);
       expect(warningRows(rows)).toHaveLength(advisory ? 1 : 0);
       if (!advisory) {
-        // Settlement sees no persisted outputs and asks for the handoff; dispatch screens again.
-        expect((await h.requests[0].onStepSettled?.(step(100_000)))?.decision).toBe("warn");
-        h.settleStream(0, { contextUsage: { inputTokens: 100_000 } });
-        await h.waitForRequest(2);
+        // This turn's start found the handoff due without room for its row, and the request only
+        // grows within the turn: settlement does not stop for a Continue that would decline it.
+        expect((await h.requests[0].onStepSettled?.(step(100_000)))?.decision).toBe("continue");
+        expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
         rows = await allRows(h);
         expect(warningRows(rows)).toHaveLength(0);
-        expect(text(rows.at(-1)!)).toBe("Continue");
       }
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(budgetClaims(h).handoff).toBe(advisory);
+      expect(handoffClaimed(h)).toBe(advisory);
     }
   );
 
@@ -2568,7 +2628,9 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.requests).toHaveLength(3);
   });
 
-  test("an advisory that overflows at assembly takes the emergency path without a stale claim", async () => {
+  // #5286: the stage is decided only after the turn-start check admitted the request, so a send
+  // refused there publishes no warning that the emergency reset would then seal.
+  test("a handoff send refused at the turn-start check takes the emergency path without a warning or stale claim", async () => {
     const h = await setup({ failure: (attempt) => (attempt === 2 ? exceeded : undefined) });
     expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
@@ -2577,14 +2639,11 @@ describe("AgentSession token-budget lifecycle", () => {
     const rows = await allRows(h);
     const [reset] = rolloverRows(rows);
     expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
-    const handoff = warningRows(rows);
-    expect(handoff.map(isHandoffRow)).toEqual([true]);
-    expect(handoff[0].metadata!.historySequence!).toBeLessThan(reset.metadata!.historySequence!);
-    // The sealed advisory neither travels into the fresh window nor claims it.
+    expect(warningRows(rows)).toHaveLength(0);
     const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages);
-    expect(warningRows(fresh)).toHaveLength(0);
     expect(text(fresh.findLast((row) => row.role === "user")!)).toBe("Continue");
-    expect(budgetClaims(h)).toEqual({ warning: false, handoff: false });
+    // The fresh window still owes its handoff.
+    expect(handoffClaimed(h)).toBe(false);
     expect((await h.requests[2].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     expect(h.requests).toHaveLength(3);
   });
@@ -2610,8 +2669,8 @@ describe("AgentSession token-budget lifecycle", () => {
     await h.waitForRequest(2);
     expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
     const rows = await allRows(h);
-    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
-    expect(rows.at(-1)?.metadata).toMatchObject({
+    expect(isHandoffRow(rows.at(-1)!)).toBe(true);
+    expect(rows.at(-2)?.metadata).toMatchObject({
       kind: GOAL_CONTINUATION_KIND,
       goalId: "goal-budget",
     });
@@ -2625,6 +2684,28 @@ describe("AgentSession token-budget lifecycle", () => {
       "goal_continuation",
       "goal_continuation",
     ]);
+  });
+
+  // A rolled-over task turn continues as the same automatic task turn (set_goal stays gated).
+  test("a handoff continuation keeps task turn provenance", async () => {
+    const h = await setup();
+    expect(
+      (
+        await h.session.sendMessage("Report prompt", options, {
+          synthetic: true,
+          agentInitiated: true,
+          taskTurnKind: "required_report",
+        })
+      ).success
+    ).toBe(true);
+    expect(h.requests[0].taskTurnKind).toBe("required_report");
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(isHandoffRow(rows.at(-1)!)).toBe(true);
+    expect(rows.at(-2)?.metadata?.taskTurnKind).toBe("required_report");
+    expect(h.requests[1].taskTurnKind).toBe("required_report");
   });
 
   test("a handoff continuation after a fenced edit still dispatches", async () => {
@@ -2654,8 +2735,8 @@ describe("AgentSession token-budget lifecycle", () => {
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
     const continuation = await h.waitForRequest(2);
     const rows = await allRows(h);
-    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
-    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(isHandoffRow(rows.at(-1)!)).toBe(true);
+    expect(text(rows.at(-2)!)).toBe("Continue");
     expect(continuation.messages.map(text)).toContain("Edited request");
     expect(continuation.messages.map(text)).not.toContain("Original request");
   });
@@ -2684,339 +2765,17 @@ describe("AgentSession token-budget lifecycle", () => {
     });
   });
 
-  // Older builds offered a hidden notes-flush step before sealing a window. New windows never
-  // write those rows; the durable ones already on disk must still finish as one bounded step.
-  test("a resumed legacy flush stays one bounded step, then seals the window", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first, { muxMetadata: correlation });
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    const sendOptions = { ...resumeOptions, maxOutputTokens: 300, thinkingLevel: "high" as const };
-    expect((await h.session.resumeStream(sendOptions)).success).toBe(true);
-    // The sealing intent is restored up front; the flush itself runs memory-only at the lowest
-    // thinking with the bounded cap, whatever the caller configured.
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    expect(h.requests[0].thinkingLevel).toBe("off");
-    expect(h.requests[0].maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
-    expect(FLUSH_MAX_OUTPUT_TOKENS).toBeGreaterThan(300);
-    // Bounded to one step although the resumed step crosses nothing; its memory-only toolset
-    // reports session_history as unavailable, which must not queue a second flush either.
-    const outcome = await h.requests[0].onStepSettled!(
-      step(50_000, { sessionHistoryAvailable: false })
-    );
-    expect(outcome.decision).toBe("rollover");
-    expect(outcome.continuationEntryId).toBeDefined();
-    // Legacy flush recovery must still identify the paired rollover as its exact successor.
-    expect(h.session.getQueueCutReceipt(outcome.continuationEntryId!)?.successor).toBe("pending");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
-    h.settleStream(0);
-    await h.waitForRequest(2);
-    expect(h.session.getQueueCutReceipt(outcome.continuationEntryId!)?.successor).toBe("streaming");
-    const rows = await allRows(h);
-    expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
-    expect(warningRows(rows)).toHaveLength(1);
-    const [reset] = rolloverRows(rows);
-    // The reset keeps the budget the legacy row promised, not the current ceiling.
-    expect(reset.metadata?.muxMetadata).toMatchObject({
-      reason: "mid-stream",
-      flushOpportunity: true,
-      budgetTokens: 96_000,
-    });
-    expect(rows.at(-1)?.metadata).toMatchObject({
-      synthetic: true,
-      retrySendOptions: { agentInitiated: true },
-      muxMetadata: { ...correlation, contextBudgetContinuation: true },
-    });
-    expect(text(rows.at(-1)!)).toBe("Continue");
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[1].thinkingLevel).toBe("high");
-    expect(h.requests[1].maxOutputTokens).toBe(300);
-    // Neither the trigger text nor its flag reaches the fresh window, and the legacy claim does
-    // not suppress the fresh window's own advisories.
+  test("a stage Continue runs at the thinking level the user picked during the stopped turn", async () => {
+    const h = await setup();
     expect(
-      sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages).some(
-        (row) =>
-          text(row) === LEGACY_FLUSH_TRIGGER ||
-          row.metadata?.muxMetadata?.contextBudgetFlush === true
-      )
-    ).toBe(false);
-    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-  });
-
-  test("a persisted legacy flush resumed with token-budget mode disabled stays bounded to one step", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    const disabled = { ...options, experiments: { tokenBudget: false } };
-    expect((await h.session.resumeStream(disabled)).success).toBe(true);
-    // The hidden trigger keeps its memory-only ceiling and a pinned middleware chain, but nothing
-    // restores the promised reset.
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    // The settled-step callback still ends the turn after its single step.
-    expect((await h.requests[0].onStepSettled?.(step(50_000)))?.decision).toBe("rollover");
-    h.settleStream(0, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    expect(h.requests).toHaveLength(1);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-    // Re-enabling the mode later cannot seal the window with the stale legacy intent.
-    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-    expect(rolloverRows(await allRows(h))).toHaveLength(0);
-  });
-
-  test("a persisted legacy flush resumed with the mode disabled runs tool-less when no chain can be pinned", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    const unregister = eventSpine.useBefore(
-      "request.assemble",
-      (ctx) => {
-        delete ctx.tools.session_history;
-      },
-      { workspaceId }
-    );
-    try {
-      expect(
-        (await h.session.resumeStream({ ...options, experiments: { tokenBudget: false } })).success
-      ).toBe(true);
-      expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-      expect(h.requests[0].requestAssemblySnapshot).toBeUndefined();
-      expect(applyToolPolicyToNames(["memory"], h.requests[0].toolPolicy)).toEqual([]);
-    } finally {
-      unregister();
-    }
-  });
-
-  test("resuming a persisted legacy flush re-validates rollover admission first", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    const unregister = eventSpine.useBefore(
-      "request.assemble",
-      (ctx) => {
-        delete ctx.tools.session_history;
-      },
-      { workspaceId }
-    );
-    try {
-      expect(await h.session.resumeStream(options)).toMatchObject({
-        success: false,
-        error: { type: "context_budget_blocked" },
-      });
-      expect(h.requests).toHaveLength(0);
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
-    } finally {
-      unregister();
-    }
-  });
-
-  test("resuming a legacy flush without a writable memory tool degrades it to a tool-less step", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    // The Memory experiment was turned off before the restart resume.
-    expect(
-      (
-        await h.session.resumeStream({
-          ...options,
-          experiments: { tokenBudget: true, memory: false },
-        })
-      ).success
+      (await h.session.sendMessage("Work", { ...options, thinkingLevel: "low" })).success
     ).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(applyToolPolicyToNames(["memory", "bash"], h.requests[0].toolPolicy)).toEqual([]);
-    h.settleStream(0, { finishReason: "stop" });
-    await h.waitForRequest(2);
-    expect(rolloverRows(await allRows(h))).toHaveLength(1);
-  });
-
-  test("middleware registered during a resumed legacy flush cannot block the promised reset", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
-    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    const unregister = eventSpine.useBefore(
-      "request.assemble",
-      (ctx) => {
-        delete ctx.tools.session_history;
-      },
-      { workspaceId }
-    );
-    try {
-      expect((await h.requests[0].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-      h.settleStream(0);
-      await h.waitForRequest(2);
-      expect(rolloverRows(await allRows(h))).toHaveLength(1);
-      // The reset is pinned to the snapshot admitted with the resume, not the changed registry.
-      expect(h.requests[1].requestAssemblySnapshot?.preservesToolset).toBe(true);
-    } finally {
-      unregister();
-    }
-  });
-
-  test.each(["settled-step", "text-only"] as const)(
-    "disabling rollover while a resumed legacy flush runs drops the reset but keeps the Continue (%s)",
-    async (ending) => {
-      const first = await setup();
-      await seedLegacyFlushTurn(first, { muxMetadata: correlation });
-      await first.session.dispose();
-      const h = await setup({ previous: first });
-      expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-      await seedThreshold(h, 1);
-      if (ending === "settled-step")
-        expect((await h.requests[0].onStepSettled?.(step(112_000)))?.decision).toBe("rollover");
-      // The paired continuation survives as an ordinary same-turn continuation: the delegated
-      // turn's outcome is the resumed work, never the notes-only flush finish.
-      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-      h.settleStream(0, { finishReason: "stop" });
-      await h.waitForRequest(2);
-      let rows = await allRows(h);
-      expect(rolloverRows(rows)).toHaveLength(0);
-      expect(text(rows.at(-1)!)).toBe("Continue");
-      expect(rows.at(-1)?.metadata?.muxMetadata).toMatchObject(correlation);
-      expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-      h.settleStream(1, { finishReason: "stop" });
-      await h.session.waitForIdle();
-      await seedThreshold(h, 0.7);
-      expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-      rows = await allRows(h);
-      expect(rolloverRows(rows)).toHaveLength(0);
-      // The window's handoff advisory may still ride this send; no second legacy flush does.
-      expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
-    }
-  );
-
-  test("a crash after only the legacy flush placeholder keeps the notes-writing step", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    // The builder appends an empty assistant placeholder before any output exists.
-    const placeholder = createMuxMessage("flush-placeholder", "assistant", "", {
-      model,
-      partial: true,
-    });
-    expect((await first.historyService.appendToHistory(workspaceId, placeholder)).success).toBe(
-      true
-    );
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(applyToolPolicyToNames(["memory", "bash"], h.requests[0].toolPolicy)).toEqual([
-      "memory",
-      "bash",
-    ]);
-  });
-
-  test("an emergency rollover during a resumed legacy flush sanitizes the flush trigger", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    const streamError = {
-      workspaceId,
-      messageId: "assistant-1",
-      error: "context limit",
-      errorType: "context_exceeded" as const,
-      contextBudgetExceeded: {
-        type: "context_budget_exceeded" as const,
-        model,
-        estimate: 127_000,
-        hardCeiling: 119_808,
-      },
-    };
-    h.aiEmitter.emit("error", streamError);
-    h.completions[0].settle({ status: "failed", streamError });
-    expect(await h.session.waitForPendingStreamErrorRecoveryDecision("assistant-1")).toBe(
-      "retry-started"
-    );
-    await h.waitForRequest(2);
-    const rows = await allRows(h);
-    const [reset] = rolloverRows(rows);
-    expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
-    const fresh = sliceMessagesForProviderFromLatestContextBoundary(rows);
-    const trigger = fresh.findLast((row) => row.role === "user")!;
-    expect(text(trigger)).toBe("Continue");
-    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    // The sanitized retry carries neither the internal trigger text nor its flag, so the request
-    // builder applies the ordinary toolset again.
-    const leaked = (row: MuxMessage) =>
-      text(row) === LEGACY_FLUSH_TRIGGER || row.metadata?.muxMetadata?.contextBudgetFlush === true;
-    expect(fresh.some(leaked)).toBe(false);
-    expect(h.requests[1].messages.some(leaked)).toBe(false);
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-  });
-
-  test("a legacy flush whose step already completed before a crash gets no second memory call", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    // The flush step's memory call settled into the partial before the crash. StreamManager
-    // first persists an assistant placeholder to reserve its history sequence.
-    const partial = createMuxMessage("flush-partial", "assistant", "", {
-      model,
-      partial: true,
-      stepStartPartIndices: [0],
-    });
-    expect((await first.historyService.appendToHistory(workspaceId, partial)).success).toBe(true);
-    partial.parts = [
-      {
-        type: "dynamic-tool",
-        toolName: "memory",
-        toolCallId: "flush-write",
-        state: "output-available",
-        input: { command: "create", path: "/memories/workspace/context-notes.md", file_text: "x" },
-        output: { success: true },
-      },
-    ];
-    expect((await first.historyService.writePartial(workspaceId, partial)).success).toBe(true);
-    await first.session.dispose();
-    const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    // No tools at all: the resumed turn can only end, then the queued rollover seals the window.
-    expect(applyToolPolicyToNames(["memory", "session_history"], h.requests[0].toolPolicy)).toEqual(
-      []
-    );
-    h.settleStream(0, { finishReason: "stop" });
-    await h.waitForRequest(2);
-    expect(rolloverRows(await allRows(h))).toHaveLength(1);
-  });
-
-  test("a resumed legacy flush stream is exempt from goal accounting; its continuation is not", async () => {
-    const first = await setup();
-    await seedLegacyFlushTurn(first);
-    await first.session.dispose();
-    const h = await setup({ previous: first, goals: true });
-    assert(h.goalAccounting, "Expected an injected goal service");
-    const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
-    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
-    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    // Neither the live preview nor the final accounting sees the housekeeping stream's usage.
-    await emitUsageDelta(h);
-    expect(previewStreamAccounting).not.toHaveBeenCalled();
-    h.settleStream(0, { finishReason: "stop" });
-    await h.waitForRequest(2);
-    expect(recordStreamAccounting).not.toHaveBeenCalled();
-    // The paired continuation is an ordinary stream again.
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    await emitUsageDelta(h);
-    expect(previewStreamAccounting).toHaveBeenCalledTimes(1);
-    h.settleStream(1, { finishReason: "stop" });
-    await h.session.waitForIdle();
-    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
+    expect(h.requests[0].thinkingLevel).toBe("low");
+    // The pick lands before the turn's next model step, and the stage stops the turn first.
+    expect(h.session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: true });
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    expect((await h.waitForRequest(2)).thinkingLevel).toBe("high");
   });
 
   const exceeded: SendMessageError = {
@@ -3096,7 +2855,7 @@ describe("AgentSession token-budget lifecycle", () => {
           },
         };
         spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT || enabledExperiments.has(id)
         );
         if (kind === "deduped-skill") {
           expect(
@@ -3105,7 +2864,7 @@ describe("AgentSession token-budget lifecycle", () => {
           await h.session.dispose();
           h = await setup({ previous: h, failure });
           spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-            (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+            (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT || enabledExperiments.has(id)
           );
         }
       }
@@ -3380,6 +3139,27 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
+  test("prompt-hook context counts toward the fresh-window ceiling", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rOv7o): the context is metadata on the row but text in the
+    // request, so a short message with large hook context must not pass the admission.
+    const h = await setup();
+    spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(10000);
+    const unregister = eventSpine.useBefore(
+      "message.send",
+      (ctx) => {
+        ctx.additionalContext.push({ pluginId: "notes", text: "x".repeat(60_000) });
+      },
+      { workspaceId }
+    );
+    try {
+      const result = await h.session.sendMessage("Short request", options);
+      expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+      expect(h.requests).toHaveLength(0);
+    } finally {
+      unregister();
+    }
+  });
+
   test.each([false, true])(
     "provider context_exceeded only retries without prior deltas (delta=%s)",
     async (hadDelta) => {
@@ -3415,6 +3195,48 @@ describe("AgentSession token-budget lifecycle", () => {
       }
     }
   );
+
+  test("context_exceeded recovery copies the interrupted user row, not a Token Budget warning after it", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    // #5286 appends the Token Budget warning after the turn's user row. Resuming that tail and
+    // overflowing must carry the user's request into the fresh window, not the advisory.
+    expect(
+      (
+        await h.historyService.appendManyToHistory(workspaceId, [
+          createMuxMessage("interrupted-user", "user", "Finish the migration"),
+          rolloverMessages.createContextBudgetWarning({
+            contextTokens: 90_000,
+            maxTokens: 128_000,
+            budgetTokens: 119_808,
+            sessionHistoryAvailable: true,
+            handoff: true,
+            handoffTokens: 89_600,
+            newContextAvailable: true,
+          }),
+        ])
+      ).success
+    ).toBe(true);
+    expect((await h.session.resumeStream(options)).success).toBe(true);
+    await h.waitForRequest(1);
+    const streamError = {
+      workspaceId,
+      messageId: "assistant-1",
+      error: "context limit",
+      errorType: "context_exceeded" as const,
+    };
+    h.aiEmitter.emit("error", streamError);
+    h.completions[0].settle({ status: "failed", streamError });
+    expect(await h.session.waitForPendingStreamErrorRecoveryDecision(streamError.messageId)).toBe(
+      "retry-started"
+    );
+    const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages);
+    const freshUsers = fresh.filter(
+      (row) => row.role === "user" && row.metadata?.uiVisible !== false
+    );
+    expect(freshUsers.map(text)).toEqual(["Finish the migration"]);
+    expect(warningRows(fresh)).toHaveLength(0);
+  });
 
   /**
    * Records the recovery path's preparation fence and the protected calls it guards. Each
@@ -3537,9 +3359,9 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await setup();
     await seedHistory(h, 20_000);
     if (mode === "auto-off" || mode === "assembled") await seedThreshold(h, 1);
+    if (mode === "experiment-off") enabledExperiments.delete(EXPERIMENT_IDS.TOKEN_BUDGET);
     const sendOptions: SendMessageOptions = {
       ...options,
-      ...(mode === "experiment-off" ? { experiments: { tokenBudget: false } } : {}),
       ...(mode === "history-disabled"
         ? { toolPolicy: [{ regex_match: "session_.*", action: "disable" as const }] }
         : {}),
@@ -3635,34 +3457,37 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test.each([false, true])(
-    "memory tool invalidates cached notes only on successful mutation (success=%s)",
-    async (success) => {
-      const h = await setup();
-      const oldContext = { indexEntries: [], hotMemoriesBlock: "Old task notes" };
-      const newContext = { indexEntries: [], hotMemoriesBlock: "Updated task notes" };
-      const buildMemory = spyOn(h.aiService, "buildMemorySessionContext")
-        .mockResolvedValueOnce(oldContext)
-        .mockResolvedValue(newContext);
-      expect((await h.session.sendMessage("Use notes", options)).success).toBe(true);
-      const resolve = h.requests[0].resolveMemoryContext!;
-      expect(await resolve(model)).toEqual(oldContext);
-      expect(await resolve(model)).toEqual(oldContext);
-      expect(buildMemory).toHaveBeenCalledTimes(1);
-      h.aiEmitter.emit("tool-call-end", {
-        type: "tool-call-end",
-        workspaceId,
-        messageId: "assistant-1",
-        toolCallId: "notes-write",
-        toolName: "memory",
-        input: { command: "create", path: "/memories/workspace/context-notes.md" },
-        result: { success },
-        timestamp: Date.now(),
-      });
-      expect(await resolve(model)).toEqual(success ? newContext : oldContext);
-      expect(buildMemory).toHaveBeenCalledTimes(success ? 2 : 1);
-    }
-  );
+  test("memory tool writes keep the window's cached notes until the next window", async () => {
+    const h = await setup();
+    const notes = (description: string) => ({
+      indexEntries: [{ path: "/memories/workspace/context-notes.md", description }],
+    });
+    const oldContext = notes("Old task notes");
+    const newContext = notes("Updated task notes");
+    const buildMemory = spyOn(h.aiService, "buildMemorySessionContext")
+      .mockResolvedValueOnce(oldContext)
+      .mockResolvedValue(newContext);
+    expect((await h.session.sendMessage("Use notes", options)).success).toBe(true);
+    const resolve = h.requests[0].resolveMemoryContext!;
+    expect(await resolve(model)).toEqual(oldContext);
+    h.aiEmitter.emit("tool-call-end", {
+      type: "tool-call-end",
+      workspaceId,
+      messageId: "assistant-1",
+      toolCallId: "notes-write",
+      toolName: "memory",
+      input: { command: "create", path: "/memories/workspace/context-notes.md" },
+      result: { success: true },
+      timestamp: Date.now(),
+    });
+    // Frozen per context window (#5248): the write is visible to the agent through
+    // its tool result, and the checkpoint reaches the next window's context.
+    expect(await resolve(model)).toEqual(oldContext);
+    expect(buildMemory).toHaveBeenCalledTimes(1);
+    await h.session.applyContextResetSideEffects();
+    expect(await resolve(model)).toEqual(newContext);
+    expect(buildMemory).toHaveBeenCalledTimes(2);
+  });
 
   async function seedRolloverEligibilityState(
     h: AgentSessionHarness,
@@ -4200,10 +4025,13 @@ describe("AgentSession token-budget lifecycle", () => {
       const notification = h.requests[2].messages.find((row) =>
         text(row).includes("<system-file-update>")
       );
+      // A notice exists only when the copied snapshot kept its original baseline ("initial
+      // content"): a baseline that had moved to the edited content would see no change. The
+      // notice names the mentioned file and copies no content, and the unrelated read stays out.
       expect(notification).toBeDefined();
-      expect(text(notification!)).toContain("-initial content");
-      expect(text(notification!)).toContain("+changed content");
-      expect(text(notification!)).not.toContain("unrelated old context");
+      expect(text(notification!)).toContain("emergency-mentioned.txt");
+      expect(text(notification!)).not.toContain("changed content");
+      expect(text(notification!)).not.toContain("unrelated-read.txt");
     }
   );
 
@@ -4264,26 +4092,28 @@ describe("AgentSession token-budget lifecycle", () => {
     await h.session.waitForIdle();
     await fs.writeFile(mentioned, "changed content\n");
     expect((await h.session.sendMessage("Continue after edit", options)).success).toBe(true);
-    expect(
-      h.requests[1].messages.some(
-        (row) => row.metadata?.synthetic && text(row).includes("changed content")
-      )
-    ).toBe(true);
+    // The fresh window still tracks the mention, so the edit yields a notice. It names the file
+    // and copies no content (the row is user-role).
+    const notice = h.requests[1].messages.find(
+      (row) => row.metadata?.synthetic && text(row).includes("<system-file-update>")
+    );
+    expect(notice).toBeDefined();
+    expect(text(notice!)).toContain("mentioned.txt");
+    expect(text(notice!)).not.toContain("changed content");
   });
 
   test.each([
     {
       label: "degraded recovery",
-      usage: 85_000,
+      usage: 90_000,
       toolPolicy: [
         { regex_match: "memory|session_.*", action: "disable" },
       ] satisfies SendMessageOptions["toolPolicy"],
-      settled: { memoryWritable: false, sessionHistoryAvailable: false },
+      settled: { sessionHistoryAvailable: false },
       expected: {
-        handoff: false,
-        memoryWritable: false,
+        handoff: true,
         sessionHistoryAvailable: false,
-        newContextAvailable: true,
+        newContextAvailable: false,
       },
     },
     {
@@ -4295,7 +4125,6 @@ describe("AgentSession token-budget lifecycle", () => {
       settled: {},
       expected: {
         handoff: true,
-        memoryWritable: true,
         sessionHistoryAvailable: true,
         newContextAvailable: false,
       },
@@ -4305,9 +4134,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async ({ usage, toolPolicy, settled, expected }) => {
       const h = await setup();
       const warning = spyOn(rolloverMessages, "createContextBudgetWarning");
-      expect((await h.session.sendMessage("Start", { ...resumeOptions, toolPolicy })).success).toBe(
-        true
-      );
+      expect((await h.session.sendMessage("Start", { ...options, toolPolicy })).success).toBe(true);
       expect((await h.requests[0].onStepSettled?.(step(usage, settled)))?.decision).toBe("warn");
       h.settleStream(0, { contextUsage: { inputTokens: usage } });
       await h.waitForRequest(2);
@@ -4391,19 +4218,310 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
+  test("experiments on a send, as an old bundle sends them, do not override the service", async () => {
+    const h = await setup();
+    const oldBundleOptions = { ...options, experiments: { tokenBudget: false } };
+    expect((await h.session.sendMessage("Budget still on", oldBundleOptions)).success).toBe(true);
+    expect(h.requests[0].onStepSettled).toBeDefined();
+  });
+
   test.each([
-    { tokenBudget: false },
-    { tokenBudget: true, continuousCompaction: true },
-    { tokenBudget: true, rlm: true, programmaticToolCalling: true },
-  ])(
+    { off: [EXPERIMENT_IDS.TOKEN_BUDGET], on: [] },
+    { off: [], on: [EXPERIMENT_IDS.CONTINUOUS_COMPACTION] },
+    { off: [], on: [EXPERIMENT_IDS.RLM, EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING] },
+  ] satisfies Array<{ off: ExperimentId[]; on: ExperimentId[] }>)(
     "off or competing experiment %j does not install a settled budget callback",
-    async (experiments) => {
+    async ({ off, on }) => {
       const h = await setup();
-      expect(
-        (await h.session.sendMessage("No budget rollover", { ...options, experiments })).success
-      ).toBe(true);
+      for (const id of off) enabledExperiments.delete(id);
+      for (const id of on) enabledExperiments.add(id);
+      expect((await h.session.sendMessage("No budget rollover", options)).success).toBe(true);
       expect(h.requests[0].onStepSettled).toBeUndefined();
       expect(rolloverRows(await allRows(h))).toHaveLength(0);
     }
   );
+
+  describe("turn-start stages (#5286)", () => {
+    // gpt-4o: limit 128,000, slider 70%. C = 119,808, H = 89,600, F = 109,616.
+    const ceiling = 119_808;
+    const handoffReserve = 2_048;
+
+    async function stopStream(h: Awaited<ReturnType<typeof setup>>, index: number, usage: number) {
+      h.settleStream(index, { finishReason: "stop", contextUsage: { inputTokens: usage } });
+      await h.session.waitForIdle();
+    }
+
+    test.each([
+      // E′ + reserve = C − 1.
+      { estimate: ceiling - handoffReserve - TURN_START_ROW_TOKENS - 1, published: true },
+      // #5409 F1: E + reserve fits, E′ + reserve does not.
+      { estimate: ceiling - handoffReserve - TURN_START_ROW_TOKENS, published: false },
+      // Usage alone (95,000) leaves room; the built request does not.
+      { estimate: 118_000, published: false },
+    ])(
+      "a due handoff is published only when the built request has room for its row (E=$estimate)",
+      async ({ estimate, published }) => {
+        const h = await setup();
+        await seedHistory(h, 95_000);
+        h.turnStart.estimate = () => estimate;
+        expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+        expect(h.requests).toHaveLength(1);
+        const rows = await allRows(h);
+        // The on-send projection publishes no prefix: any warning follows this send's user row.
+        expect(rows.slice(-2).map((row) => (isHandoffRow(row) ? "handoff" : text(row)))).toEqual(
+          published ? ["Keep working", "handoff"] : ["Completed old work", "Keep working"]
+        );
+        expect(handoffClaimed(h)).toBe(published);
+        // Live subscribers receive the published row as a chat message, like the turn's other rows.
+        const warningIds = warningRows(rows).map((row) => row.id);
+        expect(
+          h.events.filter(
+            (event) => event.type === "message" && "id" in event && warningIds.includes(event.id)
+          )
+        ).toHaveLength(published ? 1 : 0);
+        if (published) return;
+        // The row that did not fit claimed nothing: the next send with room still gets it.
+        await stopStream(h, 0, 95_000);
+        h.turnStart.estimate = () => 100_000;
+        expect((await h.session.sendMessage("Next request", options)).success).toBe(true);
+        expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+      }
+    );
+
+    /** E below H (not due) or past it without room for the row (a fit decline). */
+    const NOT_DUE = 80_000;
+    const NO_ROOM = 118_000;
+
+    test.each([
+      // A due stage without room: the queued Continue would decline it again, so no stop.
+      { estimate: NO_ROOM, decision: "continue" },
+      // Nothing was due at turn start: a stage that comes due mid-turn still stops the turn.
+      { estimate: NOT_DUE, decision: "warn" },
+    ] as const)(
+      "settlement after a turn start that opened no stage (E=$estimate) stops with $decision",
+      async ({ estimate, decision }) => {
+        const h = await setup();
+        await seedHistory(h, 90_000);
+        h.turnStart.estimate = () => estimate;
+        expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+        expect(warningRows(await allRows(h))).toHaveLength(0);
+        expect((await h.requests[0].onStepSettled?.(step(95_000)))?.decision).toBe(decision);
+        expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(decision === "warn");
+      }
+    );
+
+    test.each(["user", "edit", "resume"] as const)(
+      "a decline holds only for its own stream: a later %s turn decides again",
+      async (kind) => {
+        const h = await setup();
+        await seedHistory(h, 90_000);
+        h.turnStart.estimate = () => NO_ROOM;
+        expect((await h.session.sendMessage("First try", options)).success).toBe(true);
+        await stopStream(h, 0, 90_000);
+        // The later turn has no room either, so a decline it inherited would show here.
+        const first = (await allRows(h)).find((row) => text(row) === "First try")!;
+        if (kind === "edit") {
+          const historyEditPrecondition = buildHistoryEditPrecondition(
+            (await allRows(h)).map((row) => MuxMessageSchema.parse(row) as MuxMessage),
+            first.id
+          );
+          expect(
+            (
+              await h.session.sendMessage("Second try", {
+                ...options,
+                editMessageId: first.id,
+                historyEditPrecondition,
+              })
+            ).success
+          ).toBe(true);
+        } else if (kind === "resume") {
+          h.turnStart.estimate = () => NOT_DUE;
+          expect((await h.session.resumeStream(options)).success).toBe(true);
+        } else {
+          h.turnStart.estimate = () => NOT_DUE;
+          expect((await h.session.sendMessage("Second try", options)).success).toBe(true);
+        }
+        const second = await h.waitForRequest(2);
+        expect(warningRows(await allRows(h))).toHaveLength(0);
+        // An edit declines on its own turn start (E=NO_ROOM); the others found nothing due.
+        expect((await second.onStepSettled?.(step(95_000)))?.decision).toBe(
+          kind === "edit" ? "continue" : "warn"
+        );
+      }
+    );
+
+    test("when both stages are due, the published handoff does not delay the final stop", async () => {
+      const h = await setup();
+      await seedHistory(h, 111_000);
+      // E is past the final point, but the unclaimed handoff takes precedence.
+      expect((await h.session.sendMessage("Work near the ceiling", options)).success).toBe(true);
+      expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+      // Growth below the reserve: the final stage was never assessed against this send.
+      expect((await h.requests[0].onStepSettled?.(step(111_100)))?.decision).toBe("warn");
+      h.settleStream(0, { contextUsage: { inputTokens: 111_100 } });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isFinalFlushRow)).toEqual([false, true]);
+      expect(text(rows.at(-2)!)).toBe("Continue");
+    });
+
+    test.each([
+      { estimate: 100_000, final: false },
+      { estimate: 111_000, final: true },
+    ])(
+      "after a restart the next send decides from its own E with claims from history (E=$estimate)",
+      async ({ estimate, final }) => {
+        const first = await setup();
+        await seedHistory(first, 90_000);
+        expect((await first.session.sendMessage("Before restart", options)).success).toBe(true);
+        expect(warningRows(await allRows(first)).map(isHandoffRow)).toEqual([true]);
+        await stopStream(first, 0, 90_000);
+        await first.session.dispose();
+        const h = await setup({ previous: first });
+        h.turnStart.estimate = () => estimate;
+        expect((await h.session.sendMessage("After restart", options)).success).toBe(true);
+        const rows = await allRows(h);
+        // The handoff claimed before the restart is never repeated; only the final stage remains.
+        expect(warningRows(rows).map(isFinalFlushRow)).toEqual(final ? [false, true] : [false]);
+        expect(text(rows.at(final ? -2 : -1)!)).toBe("After restart");
+        if (!final) return;
+        // The claimed final prompt closes the window's stages: a later send past F gets none.
+        await stopStream(h, 0, estimate);
+        expect((await h.session.sendMessage("Still working", options)).success).toBe(true);
+        expect(warningRows(await allRows(h)).map(isFinalFlushRow)).toEqual([false, true]);
+      }
+    );
+
+    // Claims come from history: a claimed final prompt closes the window's stages even when no
+    // handoff row precedes it, so a later send past H gets no handoff.
+    test("a claimed final prompt without a handoff row suppresses a due handoff", async () => {
+      const h = await setup();
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            rolloverMessages.createContextBudgetWarning({
+              contextTokens: 110_000,
+              maxTokens: 128_000,
+              budgetTokens: ceiling,
+              sessionHistoryAvailable: true,
+              final: true,
+              newContextAvailable: true,
+            }),
+          ])
+        ).success
+      ).toBe(true);
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      expect(warningRows(await allRows(h)).map(isFinalFlushRow)).toEqual([true]);
+      expect(handoffClaimed(h)).toBe(false);
+    });
+
+    // The row is published under the send's admission, like its user row: a second backend that
+    // advanced the history generation (a reset, a rollover) leaves no warning in the new state.
+    test("a turn-start warning is not published after another backend advanced the generation", async () => {
+      const h = await setup();
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      let advanced = false;
+      h.turnStart.beforePublish = async () => {
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+        advanced = true;
+      };
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      expect(advanced).toBe(true);
+      expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(false);
+      expect(text(h.requests[0].messages.at(-1)!)).toBe("Keep working");
+    });
+
+    // A row appended after the request's history read (here a sub-agent report) is not in the
+    // request. The warning's later sequence would stamp it as seen, so the warning is refused.
+    test("a turn-start warning is not published after a row the request did not read", async () => {
+      const h = await setup();
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      h.turnStart.beforePublish = async () => {
+        const late = createMuxMessage(
+          "late-report",
+          "user",
+          "<mux_subagent_report>done</mux_subagent_report>",
+          {
+            synthetic: true,
+          }
+        );
+        expect((await h.historyService.appendToHistory(workspaceId, late)).success).toBe(true);
+      };
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      const rows = await allRows(h);
+      expect(rows.map((row) => row.id)).toContain("late-report");
+      expect(warningRows(rows)).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(false);
+      expect(text(h.requests[0].messages.at(-1)!)).toBe("Keep working");
+    });
+
+    // The fence compares with the newest row the turn's history READ saw, not with the rows the
+    // provider request keeps. A crash can leave an empty partial assistant row as the newest row:
+    // the resume reads it, and the builder's provider filter drops it, yet it is no unread row.
+    test("an empty newest row the request drops does not refuse the turn-start warning", async () => {
+      let h = await setup();
+      await seedHistory(h, 90_000);
+      h.turnStart.estimate = () => NOT_DUE;
+      expect((await h.session.sendMessage("First try", options)).success).toBe(true);
+      await stopStream(h, 0, 90_000);
+      const crashLeft = createMuxMessage("crash-left", "assistant", "", { model, partial: true });
+      expect((await h.historyService.appendToHistory(workspaceId, crashLeft)).success).toBe(true);
+      // A restart, as after the crash: the new session reads history fresh.
+      await h.session.dispose();
+      h = await setup({ previous: h });
+      const accept = spyOn(h.historyService, "acceptCompactionReplacement");
+      h.turnStart.estimate = () => 100_000;
+      expect((await h.session.resumeStream(options)).success).toBe(true);
+      await h.waitForRequest(1);
+      const rows = await allRows(h);
+      const newest = rows.find((row) => row.id === crashLeft.id)?.metadata?.historySequence;
+      assert(newest != null);
+      // Non-vacuous: the provider request drops the row, and it was the newest before the warning.
+      expect(filterEmptyAssistantMessages(rows).map((row) => row.id)).not.toContain(crashLeft.id);
+      const fenced = accept.mock.calls.map(([, , , observer]) => observer.maxHistorySequence);
+      expect(fenced.filter((sequence) => sequence != null)).toEqual([newest]);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+      expect(handoffClaimed(h)).toBe(true);
+    });
+
+    // The builder drops a stage once its abort signal fires. The session's publish fence covers a
+    // Stop that is already in progress when the warning would be published.
+    test("a Stop that lands before the turn-start warning is published writes no warning", async () => {
+      const h = await setup();
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      let stop: Promise<unknown> | undefined;
+      h.turnStart.beforePublish = () => {
+        stop ??= h.session.interruptStream();
+      };
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      expect(stop).toBeDefined();
+      await stop;
+      // The controlled provider still started its stream; the Stop ends it.
+      h.aiEmitter.emit("stream-abort", {
+        type: "stream-abort",
+        workspaceId,
+        messageId: "assistant-1",
+        abortReason: "user",
+        metadata: { duration: 1 },
+      });
+      h.completions[0].settle({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: { type: "stream-abort", workspaceId, metadata: { duration: 1 } },
+      });
+      await h.session.waitForIdle();
+      expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(false);
+      // Nothing was claimed, so the next send still delivers the handoff.
+      h.turnStart.beforePublish = undefined;
+      expect((await h.session.sendMessage("Resume the work", options)).success).toBe(true);
+      expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+    });
+  });
 });

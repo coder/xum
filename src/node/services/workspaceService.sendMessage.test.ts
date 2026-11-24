@@ -1,10 +1,17 @@
 import type { TurnCompletion } from "./streamManager";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, jest } from "bun:test";
+import { NESTED_COMPACTION_FOLLOW_UP_MESSAGE } from "@/common/utils/messages/pluginSendHookFields";
 import type { WorkspaceService } from "./workspaceService";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
 import type { SendMessageInternalOptions } from "./taskWorkspaceSeam";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  createTestStreamManager,
+} from "./agentSession.testHarness";
+import { makeTestEffectRunner, TEST_CLOCK_START_MS } from "./di/testEffectRunner";
+import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { EventEmitter } from "events";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -37,6 +44,11 @@ import {
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 import { saveWorkspaces } from "./taskService.testHarness";
+import {
+  createArtifactInteractionDeps,
+  readPendingArtifactInteractions,
+  sendArtifactInteraction,
+} from "./artifactInteractions";
 
 // bun:test's jest shim implements advanceTimersByTime; its published types omit it.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
@@ -175,6 +187,47 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(remembered?.plan).toBeUndefined();
   });
 
+  test("stamps the turn's recency and authoring time on the wall clock, not on the runner's TestClock", async () => {
+    // Recency must match the user message timestamp, which AgentSession stamps on the wall
+    // clock, and the renderer compares it with lastRead (Date.now()). authoredAtMs reaches
+    // messageQueue and the goal acknowledgment gate, which compare it with Date.now() times.
+    // Both stay on the wall clock until #7282.
+    const clock = makeTestEffectRunner();
+    const wallNowMs = TEST_CLOCK_START_MS + 1_234_567;
+    const service = createWorkspaceServiceForTest({
+      config: harness.config,
+      historyService: harness.historyService,
+      aiService: harness.aiService,
+      initStateManager: harness.initStateManager,
+      extensionMetadata: harness.extensionMetadata,
+      backgroundProcessManager: harness.backgroundProcessManager,
+      effectRunner: clock.runner,
+      hostClock: clock.hostClock,
+    });
+    service.registerSession("test-workspace", fakeSession as unknown as AgentSession);
+    // beforeEach already spies on updateRecency; spyOn returns that same spy.
+    const updateRecency = spyOn(harness.extensionMetadata, "updateRecency");
+    const dateNow = spyOn(Date, "now").mockReturnValue(wallNowMs);
+    try {
+      await clock.adjust(7_000);
+      const result = await service.sendMessage("test-workspace", "hello", {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      });
+
+      expect(result.success).toBe(true);
+      expect(updateRecency).toHaveBeenCalledWith("test-workspace", wallNowMs);
+      expect(fakeSession.queueMessage).toHaveBeenCalledWith(
+        "hello",
+        expect.anything(),
+        expect.objectContaining({ authoredAtMs: wallNowMs })
+      );
+    } finally {
+      dateNow.mockRestore();
+      await clock.dispose();
+    }
+  });
+
   test("leaves budgeted-goal pricing rejections to AgentSession instead of rejecting early", async () => {
     // The session is a fake, so this only proves the forward. Input preservation is owned by
     // agentSession.budgetGate.test.ts "manual rejected send preserves the user message + emits a stream-error event".
@@ -239,6 +292,124 @@ describe("WorkspaceService sendMessage status clearing", () => {
       queueDispatchMode: queued,
     });
   });
+
+  test("generic sends cannot carry artifact interaction metadata (no spoofed pill)", async () => {
+    const result = await workspaceService.sendMessage("test-workspace", "<artifact_interaction>", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        artifactInteraction: {
+          id: "x",
+          artifactPath: "a.html",
+          title: "a",
+          version: 1,
+          action: "send",
+          text: "hi",
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+  });
+
+  test("a /compact whose follow-up is itself a compaction request is refused", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rPrJh): no Xum path builds this shape, and the nested request's
+    // own follow-up would later dispatch as an automatic send no message.send hook may block.
+    const compaction = (followUpContent: Record<string, unknown>) => ({
+      type: "compaction-request" as const,
+      rawCommand: "/compact",
+      parsed: { followUpContent },
+    });
+    const result = await workspaceService.sendMessage("test-workspace", "Summarize.", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+      muxMetadata: compaction({
+        text: "/compact",
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+        muxMetadata: compaction({ text: "deploy to prod", model: "openai:gpt-4o-mini" }),
+      }),
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: { type: "unknown", raw: NESTED_COMPACTION_FOLLOW_UP_MESSAGE },
+    });
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+    expect(fakeSession.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("an artifact interaction sent while streaming queues tool-end with its dedupe key", async () => {
+    const sessionsDir = harness.config.sessionsDir;
+    const deps = createArtifactInteractionDeps({
+      config: harness.config,
+      workspaceService,
+      historyService: harness.historyService,
+    });
+    // Busy session (the default here): the interaction must land at the next tool boundary.
+    const sent = await sendArtifactInteraction(
+      {
+        ...deps,
+        getDefaultSendOptions: () =>
+          Promise.resolve({ model: "openai:gpt-4o-mini", agentId: "exec" }),
+      },
+      { workspaceId: "test-workspace", path: "form.html", text: "Ship it" }
+    );
+    expect(sent.success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    const [, options, internal] = fakeSession.queueMessage.mock.calls[0] as [
+      string,
+      { queueDispatchMode?: string; muxMetadata?: { artifactInteraction?: { id: string } } },
+      { dedupeKey?: string },
+    ];
+    expect(options.queueDispatchMode).toBe("tool-end");
+    const id = options.muxMetadata?.artifactInteraction?.id ?? "";
+    expect(id).not.toBe("");
+    expect(internal.dedupeKey).toBe(`artifact-interaction:${id}`);
+    // Queued, not yet accepted: the pending record survives a restart.
+    const pending = await readPendingArtifactInteractions(path.join(sessionsDir, "test-workspace"));
+    expect(pending.map((record) => record.id)).toEqual([id]);
+  });
+
+  // #7342: a turn-start failure (no API key) comes back as Err after the user row is durable.
+  // Reporting it as "not sent" made the Artifacts tab offer Send, which delivered a duplicate.
+  test.each([
+    { accepted: true, expectSent: true },
+    { accepted: false, expectSent: false },
+  ])(
+    "an idle artifact interaction whose turn fails to start: accepted=$accepted -> sent=$expectSent",
+    async ({ accepted, expectSent }) => {
+      fakeSession.isBusy.mockReturnValue(false);
+      const turnError: SendMessageError = { type: "api_key_not_found", provider: "anthropic" };
+      fakeSession.sendMessage.mockImplementationOnce(
+        async (_message: string, _options: unknown, internal?: { onAccepted?: () => unknown }) => {
+          if (accepted) await internal?.onAccepted?.();
+          return Err(turnError);
+        }
+      );
+      const deps = createArtifactInteractionDeps({
+        config: harness.config,
+        workspaceService,
+        historyService: harness.historyService,
+      });
+      const sent = await sendArtifactInteraction(
+        {
+          ...deps,
+          getDefaultSendOptions: () =>
+            Promise.resolve({ model: "anthropic:claude-sonnet-4-5", agentId: "exec" }),
+        },
+        { workspaceId: "test-workspace", path: "form.html", text: "Ship it" }
+      );
+      expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+      expect(sent.success).toBe(expectSent);
+      // Either way the record is settled: an accepted row is delivered, a refused send is reported.
+      const pending = await readPendingArtifactInteractions(
+        path.join(harness.config.sessionsDir, "test-workspace")
+      );
+      expect(pending).toEqual([]);
+    }
+  );
 
   test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {
     // The session only reports busy once AgentSession.sendMessage claims PREPARING. A
@@ -548,7 +719,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
   });
 
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
-    // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): preflightSendCounts stays positive
+    // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): SendPreflight.sends stays positive
     // until the outer service call returns, so a probe reading it would let a
     // continuation's on-send compaction completion veto the continuation's
     // OWN saved follow-up. The probe must see unrelated preflights (round-37
@@ -2015,61 +2186,6 @@ describe("WorkspaceService streaming generation guard", () => {
       expect.objectContaining({ generation: 1, hasTodos: false })
     );
   });
-
-  test.each([true, false])(
-    "stream-end recency follows the hidden token-budget flush flag (flush=%s)",
-    async (flush) => {
-      const workspaceId = "ws-flush-stream-completion";
-      const stopped = createDeferred<void>();
-      const setStreaming = mock(
-        (
-          _workspaceId: string,
-          streaming: boolean,
-          update: ExtensionMetadataStreamingUpdate = {}
-        ) => {
-          if (!streaming) stopped.resolve();
-          return Promise.resolve({
-            recency: Date.now(),
-            streaming,
-            lastModel: update.model ?? null,
-            lastThinkingLevel: update.thinkingLevel ?? null,
-            hasTodos: update.hasTodos,
-            agentStatus: null,
-          });
-        }
-      );
-
-      readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
-
-      spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
-      const updateRecency = spyRecency();
-
-      emitAiEvent("stream-start", {
-        workspaceId,
-        messageId: "flush-answer",
-        model: "anthropic:claude-opus-5",
-      });
-      emitAiEvent("stream-end", {
-        workspaceId,
-        messageId: "flush-answer",
-        parts: [],
-        metadata: {
-          model: "anthropic:claude-opus-5",
-          muxMetadata: flush ? { type: "normal", contextBudgetFlush: true } : { type: "normal" },
-        },
-      });
-      await stopped.promise;
-
-      // A hidden flush is maintenance: streaming still stops, but recency (which drives
-      // unread state and background completion notifications) must not advance.
-      expect(updateRecency).toHaveBeenCalledTimes(flush ? 0 : 1);
-      expect(setStreaming).toHaveBeenCalledWith(
-        workspaceId,
-        false,
-        expect.objectContaining({ generation: 1 })
-      );
-    }
-  );
 });
 
 describe("WorkspaceService post-compaction metadata refresh", () => {
@@ -2169,6 +2285,55 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
 });
 
 describe("WorkspaceService interruptStream", () => {
+  test("Stop that disables auto-retry during a retry countdown tells the client the retry ended", async () => {
+    const workspaceId = "stop-during-retry-countdown";
+    const clock = makeTestEffectRunner();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+      backgroundProcessManager: createTestBackgroundProcessManager(),
+      streamManager: createTestStreamManager(undefined, clock.runner),
+    });
+    const service = createWorkspaceServiceForTest({
+      config: h.config,
+      historyService: h.historyService,
+      aiService: h.aiService as unknown as AIService,
+      initStateManager: h.initStateManager,
+      extensionMetadata: new ExtensionMetadataService(
+        path.join(h.config.rootDir, "extensionMetadata.json")
+      ),
+      backgroundProcessManager: h.backgroundProcessManager,
+    });
+    service.registerSession(workspaceId, h.session);
+    const stream = spyOn(h.aiService, "streamMessage");
+    const retryEvents = () => h.events.filter((event) => event.type.startsWith("auto-retry-"));
+    try {
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user", "user", "resume", {
+          retrySendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+        })
+      );
+      await h.session.runStartupRecovery();
+      expect(h.session.hasPendingAutoRetry()).toBe(true);
+      expect(retryEvents().at(-1)?.type).toBe("auto-retry-scheduled");
+
+      expect(await service.interruptStream(workspaceId, { disableAutoRetry: true })).toEqual(
+        Ok(undefined)
+      );
+
+      // The renderer keeps showing the countdown until it receives a terminal retry event.
+      expect(retryEvents().at(-1)?.type).toBe("auto-retry-abandoned");
+      expect(h.session.hasPendingAutoRetry()).toBe(false);
+      await clock.adjust(calculateBackoffDelay(1));
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+      await clock.dispose();
+    }
+  });
+
   test("soft Send Now dispatches without requiring a hard Stop receipt", async () => {
     const workspaceId = "soft-send-now-receipt";
     const h = await createAgentSessionHarness({
@@ -2178,7 +2343,7 @@ describe("WorkspaceService interruptStream", () => {
     const service = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as AIService,
+      aiService: h.aiService as unknown as AIService,
       initStateManager: h.initStateManager,
       extensionMetadata: new ExtensionMetadataService(
         path.join(h.config.rootDir, "extensionMetadata.json")
@@ -2268,7 +2433,7 @@ describe("WorkspaceService interruptStream", () => {
     const workspaceService = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as AIService,
+      aiService: h.aiService as unknown as AIService,
       initStateManager: h.initStateManager,
       extensionMetadata,
       backgroundProcessManager: h.backgroundProcessManager,

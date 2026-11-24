@@ -5,6 +5,11 @@
 // Bound model menus for large gateway catalogs; filter before applying the cap.
 export const MAX_RENDERED_MODELS = 200;
 
+/** Settings > Models: catalogue suggestions fetched per page while typing. */
+export const MODEL_CATALOG_SUGGESTION_PAGE_SIZE = 20;
+/** Settings > Models: custom model rows rendered per table page. */
+export const CUSTOM_MODELS_PAGE_SIZE = 25;
+
 /**
  * Auto-compaction threshold bounds (percentage)
  * MIN: Allow any value - user can choose aggressive compaction if desired
@@ -188,3 +193,5 @@ export const TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS = 2_000;
  * (~340 rows of heavy replies, many short steps) must still reveal fully.
  */
 export const TRANSCRIPT_REVEAL_AUTO_MAX_ROWS = 500;
+/** Mounted-row cap of the two-sided transcript slice (#4961 F20): ~118 KB heap per row. */
+export const TRANSCRIPT_MAX_MOUNTED_ROWS = 1_200;

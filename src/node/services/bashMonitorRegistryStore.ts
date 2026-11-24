@@ -12,10 +12,6 @@ import type {
   MonitorArmedPayload,
   MonitorFailedMatchPayload,
 } from "@/node/services/backgroundProcessManager";
-import {
-  boundBashMonitorWakeLines,
-  sanitizeBashMonitorWakeLine,
-} from "@/node/services/bashMonitorWakeReconciler";
 import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -198,20 +194,19 @@ export class BashMonitorRegistryStore {
       }
       const record = this.parse(raw);
       if (record?.createdAt !== createdAt) return;
-      const boundedMatch =
-        lost.failedMatch != null ? boundBashMonitorWakeLines(lost.failedMatch.lines) : undefined;
+      // Process output and runtime error text never reach disk here: a wake must not show them
+      // (they can carry contributor-controlled text), and an older build that reads this row
+      // after a downgrade would put them back into a user-role wake. `lines: []` and an absent
+      // failureMessage both satisfy the older strict schema.
       const normalized: BashMonitorLostSummary = {
         reason: "runtime-failure",
-        ...(lost.failureMessage != null
-          ? { failureMessage: sanitizeBashMonitorWakeLine(lost.failureMessage) }
-          : {}),
         ...(lost.failedOperations != null ? { failedOperations: [...lost.failedOperations] } : {}),
-        ...(lost.failedMatch != null && boundedMatch != null
+        ...(lost.failedMatch != null
           ? {
               failedMatch: {
-                lines: boundedMatch.lines,
+                lines: [],
                 totalMatches: lost.failedMatch.totalMatches,
-                droppedLines: lost.failedMatch.droppedLines + boundedMatch.droppedLines,
+                droppedLines: lost.failedMatch.droppedLines + lost.failedMatch.lines.length,
                 ...(lost.failedMatch.matchedThroughOffset != null
                   ? { matchedThroughOffset: lost.failedMatch.matchedThroughOffset }
                   : {}),

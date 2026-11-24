@@ -1,0 +1,199 @@
+/**
+ * Pure parts of the page-timing runner (T3 #5971, plan sections 2.3-2.6): per-run values, the service-worker
+ * proof, the host rule and the host qualification. scripts/perf/pageTiming.ts drives the browser.
+ */
+import assert from "node:assert/strict";
+import { isDeepStrictEqual } from "node:util";
+import {
+  minimumDetectableImprovement,
+  QUALIFY_MDI_LIMIT,
+  qualifyPage,
+  type Qualification,
+  type Signal,
+} from "./pageTimingStats";
+
+export type Page = "p1" | "p2" | "p1r";
+/** Text-matched targets. P2's code line comes from scripts/perf/fixtures/neutralSeed/chat.jsonl. */
+export const TARGET: Record<Page, { selector: string; text: string }> = {
+  p1: { selector: "p", text: "Xum is provider-agnostic" },
+  p2: { selector: ".code-line", text: "export function subtract(" },
+  p1r: {
+    selector: "p",
+    text: "To start a workspace, you'll need to configure at least one LLM provider",
+  },
+};
+
+/** Whether a run gets the neutral seed (scripts/perf/neutralSeed.ts), and the route it opens. */
+export const PAGE_SETUP: Record<Page, { seeded: boolean; route: (workspaceId: string) => string }> =
+  {
+    p1: { seeded: false, route: () => "/" },
+    p2: { seeded: true, route: (id) => `/workspace/${id}` },
+    // Gate 3's returning user (plan section 5.6, note 2): "/" on the onboarded seed with empty
+    // localStorage. It lands on the project page's provider prompt only because the seed has no
+    // provider.
+    p1r: { seeded: true, route: () => "/" },
+  };
+
+/** What the in-page probe records, in ms since navigation start. "Live" excludes a static first view. */
+export interface ProbeRecord {
+  elementTiming: Array<{ live: boolean; renderTime: number }>;
+  visible: number | null;
+  visibleLive: number | null;
+  ir: number | null;
+}
+
+/**
+ * Useful content shown (UCS) = the later of the target's Element Timing paint and the first frame in which
+ * it is visible. Never LCP: on P2 the only LCP entry is the later syntax-highlight repaint. Seconds.
+ */
+export function usefulContentShown(r: ProbeRecord): { ucs: number; ucsLive: number } {
+  const first = (live: boolean | null) => {
+    const times = r.elementTiming.filter((e) => live === null || e.live === live);
+    return times.length ? Math.min(...times.map((e) => e.renderTime)) : null;
+  };
+  const [any, live] = [first(null), first(true)];
+  assert(any !== null && live !== null, "no Element Timing entry for the target");
+  assert(r.visible !== null && r.visibleLive !== null, "the target never became visible");
+  return { ucs: Math.max(any, r.visible) / 1000, ucsLive: Math.max(live, r.visibleLive) / 1000 };
+}
+
+/** The auditor's proof that the deleted service-worker API stayed gone for the whole run. */
+export function serviceWorkerProofFailures(p: {
+  workers: number;
+  fromWorker: number;
+  apiAfterRun: boolean;
+}): string[] {
+  const failures: string[] = [];
+  if (p.workers > 0) failures.push(`${p.workers} service worker(s) started`);
+  if (p.fromWorker > 0) failures.push(`${p.fromWorker} response(s) came from a service worker`);
+  if (p.apiAfterRun) failures.push("navigator.serviceWorker exists after the run");
+  return failures;
+}
+
+/** The host state a run records (#6204 item 2): 1-minute load, and PSI `cpu some avg10` (null without PSI). */
+export function hostState(load1: number, pressureCpu: string | null) {
+  const avg10 =
+    pressureCpu === null ? null : Number(/^some avg10=([\d.]+)/m.exec(pressureCpu)?.[1]);
+  assert(avg10 === null || Number.isFinite(avg10), `bad /proc/pressure/cpu: ${pressureCpu}`);
+  return { load1, cpuSomeAvg10: avg10 };
+}
+
+/** Host rule: 1-minute load below 0.75 x CPUs, and PSI `cpu some avg10` below 10 where PSI exists. */
+export function hostIsQuiet(load: number, pressureCpu: string | null, cpus: number): boolean {
+  assert(Number.isFinite(load) && cpus > 0, `bad load ${load} or cpus ${cpus}`);
+  return load < 0.75 * cpus && (hostState(load, pressureCpu).cpuSomeAvg10 ?? 0) < 10;
+}
+
+/**
+ * After the server stops, waits up to 10 s for the run's other processes (`find`) to exit. Survivors get
+ * SIGKILL before the caller frees the lock (#6204 item 7), and the run is invalid: it throws.
+ */
+export async function reapRun(
+  find: () => number[],
+  kill: (pid: number) => void,
+  sleep: (ms: number) => Promise<unknown>
+): Promise<void> {
+  for (let i = 0; find().length > 0; i++) {
+    if (i < 100) {
+      await sleep(100);
+      continue;
+    }
+    const left = find();
+    // Until they are gone, killing what each poll finds (a fork after the first kill too): a process in
+    // uninterruptible I/O can take a while to die, and the lock waits for it.
+    for (let now = left; now.length > 0; now = find()) {
+      now.forEach(kill);
+      await sleep(100);
+    }
+    throw new Error(`processes ${left} outlived the server by 10 s and were killed`);
+  }
+}
+
+/**
+ * Runs fn under the lock on a quiet host. It waits for quiet outside the lock, so a busy host never
+ * holds it, and probes once more inside: busy releases the lock at once (at most `attempts` takes).
+ */
+export async function runOnQuietHost<T>(
+  host: { isQuiet: () => boolean; sleep: (ms: number) => Promise<unknown> },
+  withLock: <R>(fn: () => Promise<R>) => Promise<R>,
+  fn: () => Promise<T>,
+  attempts = 30
+): Promise<T> {
+  assert(attempts >= 1, `bad attempts ${attempts}`);
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    for (let check = 1; !host.isQuiet(); check++) {
+      if (check >= 60) throw new Error("the host stayed busy for 10 minutes: the block is aborted");
+      await host.sleep(10_000);
+    }
+    const ran = await withLock(async () => (host.isQuiet() ? { value: await fn() } : null));
+    if (ran) return ran.value;
+  }
+  throw new Error("the host turned busy at every lock take: the block is aborted");
+}
+
+export interface Run {
+  page: Page;
+  pair: number;
+  arm: "base" | "head";
+  values: Record<Signal | "ucsLive", number>;
+}
+
+/** d = head - base per pair, in pair order. Every pair must have both arms exactly once. */
+export function pairDiffs(runs: Run[], page: Page, signal: keyof Run["values"]): number[] {
+  const byPair = new Map<number, Partial<Record<Run["arm"], number>>>();
+  for (const run of runs.filter((r) => r.page === page)) {
+    const arms = byPair.get(run.pair) ?? {};
+    assert(arms[run.arm] === undefined, `pair ${run.pair} has two ${run.arm} runs on ${page}`);
+    byPair.set(run.pair, { ...arms, [run.arm]: run.values[signal] });
+  }
+  return [...byPair.keys()]
+    .sort((a, b) => a - b)
+    .map((pair) => {
+      const { base, head } = byPair.get(pair)!;
+      assert(base !== undefined && head !== undefined, `pair ${pair} on ${page} lacks an arm`);
+      return head - base;
+    });
+}
+
+/** One page's qualification from its A/A blocks, with the MDI per signal from every A/A pair. */
+export function qualifyHostPage(blocks: Array<Record<Signal, number[]>>): {
+  qualification: Qualification;
+  mdi: Record<Signal, number>;
+} {
+  const pooled = (signal: Signal) => blocks.flatMap((b) => b[signal]);
+  const mdi = {
+    ucs: minimumDetectableImprovement(pooled("ucs")),
+    ir: minimumDetectableImprovement(pooled("ir")),
+  };
+  // The published MDI pools every A/A pair, so it must meet the limits too (#6204): a confirmatory
+  // block that passes alone cannot qualify a page whose pooled MDI misses them.
+  const within = mdi.ucs <= QUALIFY_MDI_LIMIT.ucs && mdi.ir <= QUALIFY_MDI_LIMIT.ir;
+  const qualification = qualifyPage(blocks);
+  return {
+    qualification: qualification === "qualified" && !within ? "inconclusive" : qualification,
+    mdi,
+  };
+}
+
+/**
+ * Seed files a run rewrote (diffSeed's changed and missing). Every load adds a token stats cache (a timestamp,
+ * the chat file's inode) to session-usage.json: the app's own write, so only that key is ignored there.
+ */
+export function seedRewrites(
+  diff: { changed: string[]; missing: string[] },
+  before: Map<string, Buffer>,
+  now: (rel: string) => Buffer
+): string[] {
+  const usage = (b: Buffer): unknown => ({ ...JSON.parse(String(b)), tokenStatsCache: null });
+  const appWrite = (rel: string) => {
+    try {
+      return (
+        rel.endsWith("session-usage.json") &&
+        isDeepStrictEqual(usage(before.get(rel)!), usage(now(rel)))
+      );
+    } catch {
+      return false; // unparsable now: a rewrite
+    }
+  };
+  return [...diff.changed.filter((rel) => !appWrite(rel)), ...diff.missing];
+}

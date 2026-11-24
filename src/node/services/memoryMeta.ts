@@ -34,6 +34,7 @@ function encodeKeyComponent(value: string): string {
  * - global:<relPath>
  * - project:<projectId>:<relPath>
  * - workspace:<workspaceId>:<relPath>
+ * - session:<workspaceId>:<relPath>
  *
  * Components are escaped so embedded ':' cannot alias another memory's key
  * (the sidecar drives pins, stats, hot ranking, and rename/delete cleanup).
@@ -54,6 +55,8 @@ export function memoryLogicalKey(
       return `project:${encodeKeyComponent(ids.projectPath)}:${encodeKeyComponent(relPath)}`;
     case "workspace":
       return `workspace:${encodeKeyComponent(ids.workspaceId)}:${encodeKeyComponent(relPath)}`;
+    case "session":
+      return `session:${encodeKeyComponent(ids.workspaceId)}:${encodeKeyComponent(relPath)}`;
   }
 }
 

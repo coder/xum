@@ -1,12 +1,20 @@
 /**
  * Shared fixtures for the StreamManager test files (streamManager*.test.ts).
  */
-import { expect, afterEach, beforeEach } from "bun:test";
+import { expect, afterEach, beforeEach, mock } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import type { StreamManager, TurnExecutionOptions, WorkspaceStreamInfo } from "./streamManager";
+import { Ok } from "@/common/types/result";
+import type {
+  ModelFallbackOptions,
+  ModelFallbackPrepareOptions,
+  StreamManager,
+  TurnExecutionOptions,
+  WorkspaceStreamInfo,
+} from "./streamManager";
 import { fakeStreamText } from "./streamManager.testHarness";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
-import type { LanguageModel, ModelMessage, streamText } from "ai";
+import type { ModelMessage, streamText } from "ai";
+import type { LanguageModelV4 } from "@ai-sdk/provider";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -34,9 +42,9 @@ export function installStreamManagerTestHistory(): void {
 export function createTestLanguageModel(
   modelId = "cleanup-model",
   provider = "test"
-): LanguageModel {
+): LanguageModelV4 {
   return {
-    specificationVersion: "v3",
+    specificationVersion: "v4",
     provider,
     modelId,
     supportedUrls: {},
@@ -51,10 +59,20 @@ export const TEST_USAGE = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
 export const LOCAL_TEST_RUNTIME = createRuntime({ type: "local", srcBaseDir: "/tmp" });
 
+/**
+ * TurnExecutionOptions with `K` required and every other key optional. The
+ * required keys are Omit-ted from the Partial half: `Partial<T> & Pick<T, "model">`
+ * intersects `LanguageModel | undefined` with `LanguageModel` (a ~500-member gateway
+ * id union in ai 7.0.17x), which exceeds TypeScript's union cross-product limit (TS2590).
+ */
+export type TurnOptionsWith<K extends keyof TurnExecutionOptions> = Partial<
+  Omit<TurnExecutionOptions, K>
+> &
+  Pick<TurnExecutionOptions, K>;
+
 /** Base startStream options; scenarios override only what they assert. */
 export function testStartOptions(
-  overrides: Partial<TurnExecutionOptions> &
-    Pick<TurnExecutionOptions, "workspaceId" | "messageId" | "model">
+  overrides: TurnOptionsWith<"workspaceId" | "messageId" | "model">
 ): TurnExecutionOptions {
   return {
     messages: [{ role: "user", content: "hello" }],
@@ -86,14 +104,15 @@ export async function appendPartialAssistantForTests(
 export function createStreamResultForTests(
   fullStream: AsyncGenerator<unknown, void, unknown>,
   usage: unknown = TEST_USAGE,
-  providerMetadata: unknown = undefined
+  providerMetadata: unknown = undefined,
+  steps: unknown[] = []
 ): Record<string, unknown> {
   return {
     fullStream,
     totalUsage: Promise.resolve(usage),
     usage: Promise.resolve(usage),
     providerMetadata: Promise.resolve(providerMetadata),
-    steps: Promise.resolve([]),
+    steps: Promise.resolve(steps),
   };
 }
 
@@ -124,6 +143,8 @@ export function createStreamInfoForTests(overrides: StreamInfoFixture = {}): Str
     messageId: "test-message",
     token: "test-token" as WorkspaceStreamInfo["token"],
     startTime: now,
+    // The default runner's HostClock is the wall clock; a TestClock test overrides this.
+    durationStartMs: now,
     lastPartTimestamp: now,
     toolCompletionTimestamps: new Map<string, number>(),
     pendingWorkflowRunAttachments: new Map(),
@@ -148,9 +169,20 @@ export function createStreamInfoForTests(overrides: StreamInfoFixture = {}): Str
     receivedTerminalEvent: false,
     currentStepStartIndex: 0,
     stepStartIndices: [0],
-    stepTracker: {},
+    stepTracker: { recordSystemSections: () => undefined },
   } satisfies StreamInfoFixture;
   return { ...defaults, ...overrides };
+}
+
+/**
+ * createStreamInfoForTests typed as the engine record, for turn-engine unit tests that
+ * call an owner directly. The SDK result and request stay loose fakes: pass only the
+ * fields the owner under test reads.
+ */
+export function createWorkspaceStreamInfoForTests(
+  overrides: StreamInfoFixture = {}
+): WorkspaceStreamInfo {
+  return createStreamInfoForTests(overrides) as unknown as WorkspaceStreamInfo;
 }
 
 /** A fullStream chunk, or a callback awaited at that point of the stream (mid-turn side effects). */
@@ -162,8 +194,17 @@ export interface ScriptedAttempt {
   /** streamResult usage/totalUsage for the attempt; omitted means TEST_USAGE. */
   usage?: Record<string, number>;
   providerMetadata?: Record<string, unknown>;
+  /** streamResult steps (each step's usage and provider metadata); omitted means none. */
+  steps?: Array<{ usage: Record<string, number>; providerMetadata?: Record<string, unknown> }>;
   /** Keep the stream open after the chunks until the turn's abort signal fires. */
   holdUntilAbort?: boolean;
+}
+
+export function finishStep(
+  usage: Record<string, number>,
+  providerMetadata?: Record<string, unknown>
+): Record<string, unknown> {
+  return { type: "finish-step", usage, ...(providerMetadata ? { providerMetadata } : {}) };
 }
 
 export const STOP_FINISH = { type: "finish", finishReason: "stop" };
@@ -199,7 +240,8 @@ export function scriptedStreamText(attempts: Array<ScriptedAttempt | Error>) {
         }
       })(),
       attempt.usage,
-      attempt.providerMetadata
+      attempt.providerMetadata,
+      attempt.steps
     );
   });
 }
@@ -304,4 +346,30 @@ export async function prepareStepForTests(
     toolsContext: {},
     runtimeContext: {},
   });
+}
+
+/** The fallback model of preparedFallback's one-hop chain. */
+export const PREPARED_FALLBACK_MODEL = "openai:gpt-5.6-luna";
+
+/** A one-hop chain whose fallback prepares a plain request; `prepare` records its calls. */
+export function preparedFallback(
+  overrides: {
+    onStreamConstructed?: () => Promise<void>;
+    initialMetadataPatch?: { systemMessageTokens: number };
+  } = {}
+): ModelFallbackOptions & { prepare: ReturnType<typeof mock> } {
+  const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
+    Promise.resolve(
+      Ok({
+        model: createTestLanguageModel("fallback-model"),
+        modelString: nextModelString,
+        messages: [],
+        system: "You are a helpful assistant",
+        tools: undefined,
+        thinkingLevel: "off" as const,
+        ...overrides,
+      })
+    )
+  );
+  return { chain: [PREPARED_FALLBACK_MODEL], prepare };
 }

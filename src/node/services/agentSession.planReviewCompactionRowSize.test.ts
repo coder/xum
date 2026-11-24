@@ -123,17 +123,23 @@ describe("on-send auto-compaction request row for plan-review feedback", () => {
       const refused = await prepare(ordinaryCapBody);
       expect(!refused.success && refused.error.type).toBe("feedback_too_large");
 
-      // Largest accepted body (binary search), then the real request row for it.
+      // Largest accepted body (binary search), then the real request row for it. Keep the result
+      // the search accepted instead of preparing that size again: the measured row carries a
+      // fresh user message id whose random suffix varies in length, so a body exactly at the
+      // boundary can be accepted once and refused on the next call (#5364).
       let low = 1;
       let high = ordinaryCapBody;
+      let accepted: Awaited<ReturnType<typeof prepare>> | undefined;
       while (low < high) {
         const mid = Math.ceil((low + high) / 2);
-        if ((await prepare(mid)).success) low = mid;
-        else high = mid - 1;
+        const result = await prepare(mid);
+        if (result.success) {
+          low = mid;
+          accepted = result;
+        } else high = mid - 1;
       }
-      const accepted = await prepare(low);
-      expect(accepted.success).toBe(true);
-      if (!accepted.success) return;
+      expect(accepted?.success).toBe(true);
+      if (!accepted?.success) return;
       const followUpContent = buildAutoCompactionFollowUp({
         messageText: accepted.data.text,
         options,

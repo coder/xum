@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, mock, test } from "bun:test";
 import assert from "@/common/utils/assert";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -10,6 +11,7 @@ import { WorkflowRunStore } from "./WorkflowRunStore";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
+  WorkflowRunnerLeaseHold,
   type WorkflowAgentResult,
   type WorkflowAgentSpec,
   type WorkflowTaskAdapter,
@@ -150,6 +152,78 @@ describe("WorkflowRunner", () => {
 
     expect(lifecycle).toEqual(["agent", "ended"]);
   });
+
+  // An interrupt terminates the children before it writes "interrupted", so the aborted runner's
+  // lease is the only fence against another runner until then. It must stay held and fresh past
+  // staleLeaseMs, and go only after the hold settles.
+  test("an interrupt's lease hold keeps the aborted runner's lease renewed until it settles", async () => {
+    using tmp = new DisposableTempDir("workflow-runner-lease-hold");
+    const store = await createRunStore(tmp.path);
+    // #5508: wait on the runner's own renewals instead of reading the lease's age at a chosen
+    // moment. Under CPU load one renewal (lock + atomic write) took 0.1-1.2 s, longer than the
+    // 100 ms test lease, so the lease could read stale between two successful renewals.
+    // A renewal returns true only when this runner still owns the lease and rewrote it.
+    const renewedAtMs: number[] = [];
+    let renewed = createDeferred();
+    const renewLease = store.renewLease.bind(store);
+    store.renewLease = async (runId, ownerId, nowMs) => {
+      const ok = await renewLease(runId, ownerId, nowMs);
+      if (ok && nowMs != null) {
+        renewedAtMs.push(nowMs);
+        renewed.resolve();
+      }
+      return ok;
+    };
+    const agentStarted = createDeferred();
+    const abortController = new AbortController();
+    const leaseHold = new WorkflowRunnerLeaseHold();
+    const exiting = createDeferred();
+    let exitedAtMs = 0;
+    const close = leaseHold.close.bind(leaseHold);
+    leaseHold.close = () => {
+      exitedAtMs = Date.now();
+      exiting.resolve();
+      return close();
+    };
+    const runner = new WorkflowRunner({
+      runStore: store,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent(_spec, _lifecycle, waitOptions) {
+          agentStarted.resolve();
+          await new Promise<void>((resolve) =>
+            waitOptions?.abortSignal?.addEventListener("abort", () => resolve(), { once: true })
+          );
+          throw new Error("Task interrupted");
+        },
+      },
+      runnerId: "runner-held",
+    });
+    const run = runner.run("wfr_123", { abortSignal: abortController.signal, leaseHold });
+    const settled = run.then(
+      () => "resolved",
+      () => "rejected"
+    );
+    await agentStarted.promise;
+
+    const interrupted = createDeferred();
+    expect(leaseHold.tryHold(interrupted.promise)).toBe(true);
+    abortController.abort();
+    await exiting.promise;
+    // Renewals go on for three stale-lease periods past the exit. Without the hold the runner
+    // would stop renewing, release the lease and settle first.
+    const renewedUntilMs = exitedAtMs + 3 * WORKFLOW_RUNNER_TEST_STALE_LEASE_MS;
+    while ((renewedAtMs.at(-1) ?? 0) < renewedUntilMs) {
+      const next = await Promise.race([renewed.promise.then(() => "renewed"), settled]);
+      expect(next).toBe("renewed");
+      renewed = createDeferred();
+    }
+    expect(leaseHold.tryHold(Promise.resolve())).toBe(false);
+
+    interrupted.resolve();
+    expect(await settled).toBe("rejected");
+    expect(await store.getLeaseRetryDelayMs("wfr_123", Date.now())).toBe(0);
+  }, 30_000);
 
   test("rejects schema on built-in plan agent steps", async () => {
     using tmp = new DisposableTempDir("workflow-runner-plan-schema");
@@ -430,7 +504,8 @@ describe("WorkflowRunner", () => {
       expect.objectContaining({
         id: "verify",
         agentId: "exec",
-        modelString: "anthropic:claude-fable-5-1",
+        // Derived so the next `fable` alias move needs no test change.
+        modelString: KNOWN_MODELS.FABLE.id,
         thinkingLevel: "high",
       }),
     ]);
@@ -1807,6 +1882,156 @@ describe("WorkflowRunner", () => {
     });
     expect(waitTimeouts).toEqual([1500]);
     expect(requestFinalReport).not.toHaveBeenCalled();
+  });
+
+  describe("timeout waits after the soft deadline", () => {
+    const TIMEOUT_SOURCE = `export default function workflow({ agent }) {
+  const result = agent("Slow work", {
+    id: "slow-step",
+    schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+    timeout: { softMs: 1000, graceMs: 2000 },
+  });
+  return { reportMarkdown: result.ok ? "recovered" : "bad" };
+}
+`;
+    const timeoutSpec: WorkflowAgentSpec = {
+      id: "slow-step",
+      prompt: "Slow work",
+      outputSchema: {
+        type: "object",
+        properties: { ok: { type: "boolean" } },
+        required: ["ok"],
+      },
+      timeout: { softMs: 1000, graceMs: 2000 },
+    };
+    const timeoutInputHash = hashWorkflowStepInput(timeoutSpec.id, timeoutSpec);
+    const NOW = "2026-05-29T00:00:01.500Z";
+    const okReport = { taskId: "task_slow", reportMarkdown: "ok", structuredOutput: { ok: true } };
+
+    async function createTimeoutRun(sessionDir: string, runId: string) {
+      const store = new WorkflowRunStore({
+        sessionDir,
+        staleLeaseMs: WORKFLOW_RUNNER_TEST_STALE_LEASE_MS,
+      });
+      await store.createRun({
+        id: runId,
+        workspaceId: "workspace-1",
+        workflow: definition,
+        source: TIMEOUT_SOURCE,
+        args: {},
+        now: "2026-05-29T00:00:00.000Z",
+      });
+      return store;
+    }
+
+    function createTimeoutRunner(store: WorkflowRunStore, taskAdapter: WorkflowTaskAdapter) {
+      return new WorkflowRunner({
+        runStore: store,
+        runtimeFactory: new QuickJSRuntimeFactory(),
+        runnerId: "runner-a",
+        clock: { nowIso: () => NOW, nowMs: () => Date.parse(NOW) },
+        taskAdapter,
+      });
+    }
+
+    function timeoutPhases(run: Awaited<ReturnType<WorkflowRunStore["getRun"]>>) {
+      return run.events.flatMap((event) => (event.type === "timeout" ? [event.phase] : []));
+    }
+
+    function softWaitExpired() {
+      const error = new Error("soft wait expired");
+      error.name = "AgentReportWaitTimeoutError";
+      return error;
+    }
+
+    test.each([
+      ["prompted", 2000, ["finalization_prompt_sent", "recovered"], NOW],
+      ["queued", 1500, ["recovered"], undefined],
+      ["already_reported", 1500, [], undefined],
+    ] as const)(
+      "a resumed soft-timed-out step whose prompt was never sent requests it once (%s)",
+      async (finalizationResult, expectedWaitMs, expectedPhases, expectedPromptSentAt) => {
+        using tmp = new DisposableTempDir("workflow-runner-agent-timeout-resume-unprompted");
+        const runId = "wfr_agent_timeout_resume_unprompted";
+        const store = await createTimeoutRun(tmp.path, runId);
+        await store.recordStepStarted(runId, {
+          stepId: timeoutSpec.id,
+          inputHash: timeoutInputHash,
+          taskId: "task_slow",
+          startedAt: "2026-05-29T00:00:00.000Z",
+        });
+        // Soft-timed-out before the interruption, but the prompt was never accepted.
+        await store.recordStepTimeoutMetadata(runId, {
+          stepId: timeoutSpec.id,
+          inputHash: timeoutInputHash,
+          taskId: "task_slow",
+          startedAt: "2026-05-29T00:00:00.000Z",
+          timeout: {
+            executionStartedAt: "2026-05-29T00:00:00.000Z",
+            softDeadlineAt: "2026-05-29T00:00:01.000Z",
+            softTimedOutAt: "2026-05-29T00:00:01.000Z",
+            hardDeadlineAt: "2026-05-29T00:00:03.000Z",
+            finalizationToken: "existing-token",
+          },
+        });
+        const waitTimeouts: Array<number | undefined> = [];
+        const requestFinalReport = mock(async () => finalizationResult);
+        const runner = createTimeoutRunner(store, {
+          async runAgent() {
+            throw new Error("resume should wait on the started task");
+          },
+          readSettledAgentResult: liveOutcome,
+          async waitForAgentTask(_taskId, _spec, waitOptions) {
+            waitTimeouts.push(waitOptions?.timeoutMs);
+            return okReport;
+          },
+          requestAgentFinalReportForTimeout: requestFinalReport,
+        });
+
+        await expect(runner.run(runId)).resolves.toEqual({ reportMarkdown: "recovered" });
+        expect(requestFinalReport).toHaveBeenCalledTimes(1);
+        expect(requestFinalReport).toHaveBeenCalledWith(
+          "task_slow",
+          expect.objectContaining({ finalizationToken: "existing-token" })
+        );
+        // An accepted prompt restarts the grace period now; otherwise the persisted deadline holds.
+        expect(waitTimeouts).toEqual([expectedWaitMs]);
+        const run = await store.getRun(runId);
+        expect(timeoutPhases(run)).toEqual([...expectedPhases]);
+        const timeout = run.steps.find((step) => step.stepId === timeoutSpec.id)?.timeout;
+        expect(timeout?.finalizationPromptSentAt).toBe(expectedPromptSentAt);
+      }
+    );
+
+    test("an agent that already reported at the soft deadline is awaited for the grace period without a prompt", async () => {
+      using tmp = new DisposableTempDir("workflow-runner-agent-timeout-already-reported");
+      const runId = "wfr_agent_timeout_already_reported";
+      const store = await createTimeoutRun(tmp.path, runId);
+      const waitTimeouts: Array<number | undefined> = [];
+      const runner = createTimeoutRunner(store, {
+        async runAgent() {
+          throw new Error("timeout steps should use createAgentTasks so the runner controls waits");
+        },
+        async createAgentTasks(_specs, lifecycle) {
+          await lifecycle?.onTaskCreated?.(0, "task_slow");
+          return [{ taskId: "task_slow", status: "running" }];
+        },
+        async waitForAgentTask(_taskId, _spec, waitOptions) {
+          waitTimeouts.push(waitOptions?.timeoutMs);
+          if (waitTimeouts.length === 1) throw softWaitExpired();
+          return okReport;
+        },
+        requestAgentFinalReportForTimeout: async () => "already_reported",
+      });
+
+      await expect(runner.run(runId)).resolves.toEqual({ reportMarkdown: "recovered" });
+      expect(waitTimeouts).toEqual([1000, 2000]);
+      const run = await store.getRun(runId);
+      expect(timeoutPhases(run)).toEqual(["soft"]);
+      expect(
+        run.steps.find((step) => step.stepId === timeoutSpec.id)?.timeout?.finalizationPromptSentAt
+      ).toBeUndefined();
+    });
   });
 
   test("fails before spawning when workflow agent outputSchema is invalid", async () => {

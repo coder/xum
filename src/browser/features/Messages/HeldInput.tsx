@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { CircleSlash, Loader2, Send, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
+import type { WaitingOnYouEntry } from "@/browser/components/ChatPane/WaitingOnYou";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import {
@@ -9,7 +10,9 @@ import {
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { cn } from "@/common/lib/utils";
@@ -38,6 +41,17 @@ const HELD_INPUT_REASON_LABELS: Record<HeldInputData["reason"], string> = {
 
 function pluralize(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/** The held inputs as the "Waiting on you" card names them. */
+export function heldInputsEntry(count: number): WaitingOnYouEntry {
+  return {
+    icon: CircleSlash,
+    tab: `${count} unsent`,
+    title: pluralize(count, "unsent message"),
+    detail: "Not sent · Send or Discard",
+    urgent: true,
+  };
 }
 
 type HeldInputAction = "send" | "discard";
@@ -145,11 +159,15 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
   // above: the shortcut target listens for Discard itself, outside editable fields and never
   // under a modal (the banner is hidden behind it).
   const ownsDiscardShortcut = props.canSend === false && props.isShortcutTarget;
+  // The main chat and the /side chat tab can each have a shortcut target; only the pane owning
+  // the focused element discards, so one keystroke never discards in both chats.
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     if (!ownsDiscardShortcut) return;
     const handler = (event: KeyboardEvent) => {
       if (
         !matchesKeybind(event, KEYBINDS.DISCARD_HELD_INPUT) ||
+        !paneHandlesKeyEvent(paneScope, event.target) ||
         isEditableElement(event.target) ||
         isDialogOpen()
       ) {
@@ -170,7 +188,7 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [ownsDiscardShortcut, api, props.workspaceId, props.heldInput.id]);
+  }, [ownsDiscardShortcut, api, props.workspaceId, props.heldInput.id, paneScope]);
 
   return (
     <ChatDockSurface>
@@ -232,7 +250,7 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
                 aria-label="Send unsent message"
                 disabled={pendingAction != null}
                 onClick={() => runAction("send")}
-                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                className="text-foreground bg-muted/10 hover:bg-hover flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {pendingAction === "send" ? (
                   <Loader2 className="size-3 animate-spin" />

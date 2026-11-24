@@ -47,6 +47,17 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     this.currentWorkspacePath = options?.workspacePath;
   }
 
+  protected override agentCgroupProjectPath(): string | undefined {
+    return this.currentProjectPath;
+  }
+
+  protected override sandboxCheckoutRoot(): string | undefined {
+    if (this.currentProjectPath === undefined || this.currentWorkspaceName === undefined) {
+      return undefined;
+    }
+    return this.getWorkspacePath(this.currentProjectPath, this.currentWorkspaceName);
+  }
+
   getWorkspacePath(projectPath: string, workspaceName: string): string {
     // Honor an explicit persisted path for this runtime's own workspace so callers (cwd resolution,
     // ensureReady, agent discovery) land in the shared parent checkout instead of a name-derived
@@ -146,6 +157,22 @@ export class WorktreeRuntime extends LocalBaseRuntime {
   > {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
     return this.worktreeManager.renameWorkspace(projectPath, oldName, newName, trusted, options);
+  }
+
+  async renameWorkspaceBranch(
+    projectPath: string,
+    workspaceName: string,
+    oldBranchName: string,
+    newBranchName: string,
+    trusted?: boolean
+  ): Promise<{ success: true } | { success: false; error: string }> {
+    return this.worktreeManager.renameWorkspaceBranch(
+      projectPath,
+      workspaceName,
+      oldBranchName,
+      newBranchName,
+      trusted
+    );
   }
 
   async canDeleteWorkspaceWithoutForce(

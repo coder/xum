@@ -4,7 +4,17 @@ import {
   STARTUP_RECOVERY_READ_MAX_DELAY_MS,
 } from "@/constants/startupRecovery";
 
-export type StartupRecoveryState = "blocked" | "stopped" | "question" | "interrupted" | "idle";
+/**
+ * `follow-up`: an idle tail that can still hold a pending compaction follow-up. It is a
+ * superset of what the follow-up dispatch acts on, so `idle` proves that no follow-up is pending.
+ */
+export type StartupRecoveryState =
+  | "blocked"
+  | "stopped"
+  | "question"
+  | "interrupted"
+  | "follow-up"
+  | "idle";
 
 export type StartupRecoveryOutcome = "completed" | "deferred" | "retryable";
 

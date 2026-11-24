@@ -1,25 +1,46 @@
+import {
+  agentSandboxCoversTools,
+  fileToolSandboxContext,
+  lazyFileToolSandboxGate,
+} from "@/node/services/agentSandbox/fileToolSandbox";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { withExecutionScope } from "./tools/withExecutionScope";
+import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
+import { usesInstallationScopedPlans } from "@/common/utils/planStorage";
+import { resolvePlanFileLocation, withInstallationId } from "@/node/utils/runtime/planLocation";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
-import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
+import {
+  createTurnBudgetAnchor,
+  measureAssembledRequestBudgetForModel,
+  type TurnBudgetAnchor,
+} from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
+import type { ContextBudgetExceeded } from "@/common/utils/compaction/contextBudget";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
+import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
+import { measureCompactionInputTokens } from "./compactionInputSizing";
+import {
+  anthropicBetweenToolsRouteAvailable,
+  anthropicNativeWebFetchRouteAvailable,
+  canSwitchToAnthropic1MContext,
+  isAnthropic1MEffectivelyEnabled,
+} from "@/common/utils/ai/providerOptions";
 import * as path from "path";
+import {
+  ensureScratchDirForSpec,
+  RemoteScratchDirCache,
+  resolveScratchDirSpec,
+} from "@/node/runtime/runtimeScratchDir";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import type { MemoryScopeAccess } from "@/common/constants/memory";
 import {
-  MEMORY_INTUITION_MAX_USES_PER_TURN,
-  type MemoryScopeAccess,
-} from "@/common/constants/memory";
-import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
-import { getContextBudgetFlushMaxOutputTokens } from "@/common/utils/compaction/contextBudget";
-import {
-  resolveHeadlessAgentDefinition,
-  resolveHeadlessAgentSettings,
-} from "@/node/services/memoryConsolidationService";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+  EXPERIMENT_IDS,
+  isTokenBudgetActive,
+  type ExperimentId,
+} from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
@@ -29,52 +50,57 @@ import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 
-import {
-  ADVISOR_DEFAULT_MAX_USES_PER_TURN,
-  resolveAdvisorEnabledForAgent,
-} from "@/common/constants/advisor";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import type { GoalRecordV1 } from "@/common/types/goal";
-import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type { MuxMessage, MuxMessageMetadata, SystemSectionRecords } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, SYSTEM_SECTION_RECORD_FIELDS } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
-import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import {
   deriveToolHookConfig,
   getForcedXaiSearchToolNames,
   getToolsForModel,
-  type AdvisorStepCaptureRef,
+  supportsAnthropicToolSearch,
   type MCPPromptRuntime,
   type ToolConfiguration,
 } from "@/common/utils/tools/tools";
 import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
-import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
-import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
 import { AgentDefinitionRequestCache } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { resolveChainAgentCacheTtl } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { isRlmModeEnabled } from "@/node/services/branchSummary";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
-import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { workspaceSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultStore";
 import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
+import {
+  type AgentInterfaceStatusPageTurn,
+  isStatusPageAgentMode,
+  prepareAgentInterfaceStatusPage,
+} from "./agentInterfaceStatusPage";
+import {
+  isStatusPageAgentEnabledInSettings,
+  type StatusPageAgentService,
+} from "./statusPageAgentService";
+import { resolveArtifactsLocation } from "./artifactsOperations";
+import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
 import {
   type ModelFallbackOptions,
-  type StreamTextOnChunk,
   type TurnCompletion,
   type TurnExecutionOptions,
   type TurnStreamHandle,
@@ -83,15 +109,17 @@ import { emitTurnEnvelope } from "./turnEnvelope";
 
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { listAvailableModels } from "@/common/utils/ai/selectableModels";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
-import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
-import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import { resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import {
   effectiveAdditionalSystemContext,
@@ -100,9 +128,14 @@ import {
 } from "./additionalSystemContext";
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
+import { sideChatCapabilityGrants, withSideChatInstructions } from "./sideChat";
 import type { EvaluationService } from "./evaluation/evaluationService";
 import type { InstructionSources } from "@/common/types/instructions";
-import { extractToolInstructionsFromSources } from "./systemMessage";
+import {
+  extractToolInstructionsFromSources,
+  formatMcpContextSection,
+  removeStatusPageAgentGuidance,
+} from "./systemMessage";
 import { createAssistantMessageId } from "./utils/messageIds";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
 
@@ -119,6 +152,7 @@ import {
   buildProviderOptions,
   buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
+  resolveRequestProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -135,7 +169,8 @@ import {
 } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
-import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
+import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
+import { skillIndexSectionFor } from "@/node/services/tools/agent_skill_read";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -153,6 +188,8 @@ import {
   enforceThinkingPolicy,
   isXaiGrokFastVariantSwap,
   lookupMinThinkingLevelOverride,
+  assistantThinkingLevels,
+  resolveBetweenToolsThinkingLevel,
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
@@ -165,16 +202,15 @@ import type {
 import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isRuntimeReadFailure, isRuntimeTransportError } from "@/node/runtime/Runtime";
-import {
-  normalizeUsageModelKey,
-  resolveModelForMetadata,
-} from "@/common/utils/providers/modelEntries";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import {
   computeActiveToolNames,
+  computeLoadedToolNames,
   prepareToolSearch,
   rebuildToolSearchState,
   seedToolSearchActivationsFromMessages,
   TOOL_SEARCH_TOOL_NAME,
+  type ToolCatalogOverviewMemo,
   type ToolSearchRuntime,
 } from "@/common/utils/tools/toolCatalog";
 import {
@@ -182,13 +218,20 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  createPathSkillActivation,
+  loadedSnapshotSkillNames,
+} from "@/node/services/agentSkills/pathSkillActivation";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import type { WorkflowArchiveAdmissionGuard } from "@/node/services/workflows/workflowArchiveAdmission";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
 import {
   WorkflowService,
   type WorkflowRunStatusChangedEvent,
@@ -199,30 +242,38 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
-import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
-import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  resolveTurnAnthropicCacheTtl,
+  supportsAnthropicCache,
+  type AnthropicCacheTtl,
+} from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
 import {
   assemblePromptPayload,
   buildPlanInstructions,
+  buildContextWindowSection,
   buildStreamSystemContext,
-  formatMcpWarningPrefix,
+  formatMcpWarningSection,
+  measureWholeVolatileSystemSuffix,
   prepareProviderRequestMessages,
-  removeIntuitionGuidance,
+  removeMemoryGuidance,
+  type PromptPayload,
+  selectActiveContextMessages,
 } from "./turnContextAssembler";
+import { resolveContextWindowIds } from "./contextWindowRollover";
 export { prepareProviderRequestMessages };
 import {
   simulateContextLimitError,
   simulateToolPolicyNoop,
   type SimulationContext,
 } from "./streamSimulation";
-import {
-  applyToolPolicyAndExperiments,
-  captureMcpToolTelemetry,
-  resolveBackendGatedPtcExperiments,
-} from "./toolAssembly";
+import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAssembly";
+
+import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
+import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
 
@@ -267,15 +318,39 @@ export function resolveXumToolScope(
     projectStorageAuthority:
       runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
     ...(checkoutRoot != null ? { checkoutRoot } : {}),
+    // #6426: the project's own plugins contribute skills only once the project is trusted.
+    projectPluginsTrusted: isWorkspaceProjectTrusted(config, metadata),
   };
 }
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import { withContextBudgetFlushToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+
+/**
+ * Whether PTC actually ran for this assembly. Policy can stop it (#7028), and
+ * then the MCP tools are flat again, so tool search must treat the request as
+ * non-PTC. code_execution is only ever synthesized by the PTC branch, so its
+ * presence says PTC ran.
+ */
+function ptcRanForTools(ptcEnabled: boolean, tools: Record<string, Tool>): boolean {
+  return ptcEnabled && tools.code_execution !== undefined;
+}
+
+/**
+ * Headless callers (`xum run`, ACP) turn off ask_user_question because no user can answer it; no
+ * user can answer a sandbox approval card there either. A sub-agent has no user either: its own
+ * denial of ask_user_question is in the agent policy, not the caller's `toolPolicy`, so without
+ * this its approval card waited forever (Codex review).
+ */
+function hasNoInteractiveUser(isSubagentWorkspace: boolean, toolPolicy?: ToolPolicy): boolean {
+  return (
+    isSubagentWorkspace || applyToolPolicyToNames(["ask_user_question"], toolPolicy).length === 0
+  );
+}
 
 /** Options used to prepare and execute a turn. */
 export interface StreamMessageOptions {
@@ -318,27 +393,27 @@ export interface StreamMessageOptions {
   postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Resolver for the session-segment memory context (memory experiment):
-   * index snapshot for the memory tool description + hot-memories block.
-   * AgentSession caches the result per model/session segment because hot-memory
-   * selection is token-budgeted with the active model tokenizer. A callback
+   * index snapshot for the memory tool description.
+   * AgentSession caches the result per model/session segment. A callback
    * (not a pre-resolved value) because it must be computed after
    * runtime.ensureReady(): project-scope listing on a
    * stopped Docker/remote workspace would otherwise cache an empty/partial
    * context for the whole segment.
    */
-  resolveMemoryContext?: (
-    modelString: string,
-    options?: { includeHotMemories?: boolean; onlyContextNotes?: boolean }
-  ) => Promise<MemorySessionContext | undefined>;
-  experiments?: SendMessageOptions["experiments"];
-  allowAgentSetGoal?: boolean;
+  resolveMemoryContext?: (modelString: string) => Promise<MemorySessionContext | undefined>;
   workspaceGoalService?: WorkspaceGoalService;
-  /** Candidate admission previews tool availability only; executions keep the real goal service. */
-  prospectiveGoalStatusForToolAvailability?: GoalRecordV1["status"] | null;
+  /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
+  goalTurnKind?: GoalSyntheticMessageKind;
+  /** The goal an automatic goal turn was dispatched for (see GoalToolContext.goalId). */
+  goalTurnGoalId?: string;
+  /** Backend-owned provenance of an automatic sub-agent turn; gates set_goal too. */
+  taskTurnKind?: TaskTurnKind;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   onStepSettled?: OnStepSettled;
+  /** Token Budget stage decision on the built request (#5286); see prepareTurnStartStage. */
+  onTurnStartStage?: OnTurnStartStage;
   /**
    * Whether a token-budget rollover could actually be sealed for this request (mode active and
    * automatic rollover threshold below 100%). Gates the new_context tool so a request that
@@ -349,6 +424,17 @@ export interface StreamMessageOptions {
   requestAssemblySnapshot?: RequestAssemblySnapshot;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
+  /**
+   * Compaction requests only: the share of the compaction input budget to trim to (default 1).
+   * AgentSession passes 0.5 for the one retry after the request hit context_exceeded.
+   */
+  compactionInputBudgetScale?: number;
+  /**
+   * Compaction requests only: AgentSession still holds the one context_exceeded retry of this
+   * request (resolveCompactionRetryPlan). Without it, a model that could switch to 1M context is
+   * trimmed on this attempt too, since nothing would retry it at 1M.
+   */
+  compactionContextRetryAvailable?: boolean;
   /**
    * Model floor already resolved by AgentSession (config.json
    * minThinkingLevelByModel → resolveMinimumThinkingLevel). Passed down so
@@ -412,55 +498,17 @@ function isWorkspaceBusyIdleOnlySend(error: SendMessageError): boolean {
   return error.type === "unknown" && error.raw.includes(WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE);
 }
 
-function waitForWorkflowContinuationRetry(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, WORKFLOW_CONTINUATION_RETRY_DELAY_MS));
+function waitForWorkflowContinuationRetry(clock: HostClock): Promise<void> {
+  return new Promise((resolve) => clock.setTimer(resolve, WORKFLOW_CONTINUATION_RETRY_DELAY_MS));
 }
 
 /**
- * Pin the factory-resolved Coder instance type into a providers-config view.
- *
- * Every request builder (message prep, options, headers, overrides,
- * capability lookups, mid-turn rebuild closures) consumes ONE snapshot per
- * request instead of re-reading ProviderService. Pinning closes the residual
- * race between the factory's own config read and this capture: a concurrent
- * authoritative catalog refresh that rewrites the selected instance's type
- * would otherwise make the builders resolve a different wire than the
- * already-created SDK model. additionalProviders is the highest-precedence
- * metadata source (resolveCoderGatewayProvider consults it first), so the
- * pinned entry wins over any concurrently rewritten discovered metadata.
- * Pinning keys on the RAW selection's instance (coderSelectedInstance), not
- * on the effective route: a coder: selection that FELL BACK to a direct
- * provider still has builders resolving the raw model string (capability
- * lookups, override identity, option/header rebuilds), and a concurrent
- * retag between the factory's read and this capture would otherwise hand
- * the already-created fallback model another type's options. Non-coder
- * selections, shadowed prefixes, and unknown instances have no snapshot and
- * keep the view untouched.
- */
-function pinCoderInstanceProvidersConfig(
-  view: ProvidersConfigMap,
-  rawModelString: string,
-  instance: { name: string; type: string } | undefined
-): ProvidersConfigMap {
-  if (!instance || !rawModelString.startsWith("coder:")) {
-    return view;
-  }
-  return {
-    ...view,
-    coder: {
-      ...(view.coder ?? { apiKeySet: false, isEnabled: true, isConfigured: true }),
-      additionalProviders: [{ name: instance.name, type: instance.type }],
-    },
-  };
-}
-
-/**
- * Raw providers.jsonc counterpart of pinCoderInstanceProvidersConfig for
- * consumers that need file-shaped config (modelParameters lookups). Same
- * rationale: additionalProviders is the highest-precedence metadata source,
- * so pinning the factory-resolved instance there keeps metadata-dependent
- * decisions (mappedToModel aliases, sampling gates) on the type the SDK
- * model was created for.
+ * Pin the factory-resolved Coder instance into a fresh raw providers.jsonc
+ * read for consumers that need file-shaped config (modelParameters lookups).
+ * additionalProviders is the highest-precedence metadata source, so the
+ * pinned entry keeps metadata-dependent decisions (mappedToModel aliases,
+ * sampling gates) on the type the SDK model was created for even if a
+ * catalog refresh retyped the instance after creation.
  */
 function pinCoderInstanceRawProvidersConfig(
   view: ProvidersConfig | null,
@@ -479,7 +527,312 @@ function pinCoderInstanceRawProvidersConfig(
   };
 }
 
-/** Shared assembly path for primary, fallback, and thinking-rebuild provider attempts. */
+/**
+ * The estimated token budget a compaction request's history must fit (trimCompactionInput):
+ * SUMMARIZER_INPUT_FRACTION of the model's effective window, the share continuous compaction's
+ * summarizer uses, so the system prompt and the summary fit beside it. Per attempt, because a
+ * fallback model has its own window. Undefined, so nothing is trimmed, when the window is
+ * unknown, or when the model can still switch to 1M context and a retry is left
+ * (`contextRetryAvailable`): its context_exceeded retry does that and trims to the 1M window,
+ * which keeps more history than a trim to 200k would.
+ */
+export function resolveCompactionInputBudgetTokens(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  scale = 1,
+  contextRetryAvailable = true
+): number | undefined {
+  assert(scale > 0 && scale <= 1, "compaction input budget scale must be in (0, 1]");
+  if (retriesAt1MContext(modelString, providerOptions, providersConfig, contextRetryAvailable)) {
+    return undefined;
+  }
+  const limit = getEffectiveContextLimit(
+    modelString,
+    isAnthropic1MEffectivelyEnabled(modelString, providerOptions, providersConfig),
+    providersConfig,
+    { openaiWireFormat: providerOptions?.openai?.wireFormat }
+  );
+  return limit == null ? undefined : Math.floor(limit * SUMMARIZER_INPUT_FRACTION * scale);
+}
+
+/** The context_exceeded retry will switch this model to 1M context (see above). */
+function retriesAt1MContext(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  contextRetryAvailable: boolean
+): boolean {
+  return (
+    contextRetryAvailable &&
+    canSwitchToAnthropic1MContext(modelString, providerOptions, providersConfig)
+  );
+}
+
+/**
+ * assemblePromptPayload's compaction budget option: set for compaction requests only. A retry
+ * (scale set) on a model whose window is unknown has no window to derive a budget from; it
+ * trims to `scale` of the history's own estimate instead, so it does not resend the history
+ * that just hit context_exceeded unchanged.
+ */
+async function compactionInputBudgetOption(
+  isCompactionRequest: boolean,
+  model: {
+    modelString: string;
+    providerOptions: MuxProviderOptions | undefined;
+    providersConfig: ProvidersConfigMap | null | undefined;
+  },
+  history: MuxMessage[],
+  scale: number | undefined,
+  contextRetryAvailable: boolean
+): Promise<{ compactionInputBudgetTokens?: number }> {
+  if (!isCompactionRequest) return {};
+  const budget =
+    resolveCompactionInputBudgetTokens(
+      model.modelString,
+      model.providerOptions,
+      model.providersConfig,
+      scale,
+      contextRetryAvailable
+    ) ?? (scale == null ? undefined : await retryBudgetFromHistory(history, model, scale));
+  return budget == null ? {} : { compactionInputBudgetTokens: budget };
+}
+
+/** `scale` of the history's model-aware size: the same measure the trim then fits to it. */
+async function retryBudgetFromHistory(
+  history: MuxMessage[],
+  model: { modelString: string },
+  scale: number
+): Promise<number | undefined> {
+  const size = await measureCompactionInputTokens(history, model.modelString);
+  const budget = Math.floor(size * scale);
+  return budget > 0 ? budget : undefined;
+}
+
+interface FoldedStreamState<TMessages, TTail> {
+  thinkingLevel: ThinkingLevel;
+  providerOptions: Record<string, unknown>;
+  messages: TMessages;
+  systemRecords: TTail;
+  systemMessageTokens: number;
+  /** The count of `messages` the budget check enforced, the stage decision's E (#5286). */
+  contextBudgetEstimate?: number;
+  /** The turn anchor that count used; a rebuild at another level carries its own (#7662). */
+  contextBudgetTurnAnchor?: TurnBudgetAnchor;
+}
+
+/**
+ * Fold PREPARING-window pending thinking overrides into the ACTUAL request build, not just the
+ * envelope: message preparation is thinking-level-dependent (Anthropic signed-reasoning
+ * transforms), so recording the new level while streaming old-level messages would make wire and
+ * replay diverge — or send an invalid extended-thinking request. Consuming pending here (applied
+ * set below) is safe: createStreamAtomically seeds streamInfo.thinkingLevel from `applied`, and
+ * prepareStep simply sees no pending to re-apply. Loops until pending is quiescent:
+ * setActiveTurnThinkingLevel can write a NEW pending while the awaited message rebuild runs, and
+ * stamping the first level after the await would leave step 0 rebuilding only provider options
+ * while the messages stay at the stale level.
+ */
+async function foldPendingThinkingOverrides<TMessages, TTail>(
+  input: {
+    holder: ActiveTurnThinkingOverride | undefined;
+    computeRebuiltProviderOptions: (
+      level: ThinkingLevel,
+      currentLevel: ThinkingLevel,
+      beforeFirstStep: boolean
+    ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
+    rebuild: (level: ThinkingLevel) => Promise<{
+      messages: TMessages;
+      systemRecords: TTail;
+      systemMessageTokens: number;
+      contextBudgetEstimate?: number;
+      contextBudgetTurnAnchor?: TurnBudgetAnchor;
+    }>;
+    currentEffectiveLevelRef: { current: ThinkingLevel };
+    /** Leave pending changes for StreamManager's step 0 (after a published stage, #5286). */
+    skip?: boolean;
+  },
+  initial: FoldedStreamState<TMessages, TTail>
+): Promise<FoldedStreamState<TMessages, TTail> | { exceeded: ContextBudgetExceeded }> {
+  const { holder } = input;
+  let state = initial;
+  if (input.skip) return state;
+  while (holder?.pending != null) {
+    const pendingPreparingLevel = holder.pending;
+    holder.pending = undefined;
+    const folded = input.computeRebuiltProviderOptions(
+      pendingPreparingLevel,
+      state.thinkingLevel,
+      true
+    );
+    // No-op fold (same effective level / non-foldable variant swap):
+    // re-check pending — a change may have raced the previous rebuild.
+    if (folded == null) continue;
+    try {
+      const rebuilt = await input.rebuild(folded.effectiveLevel);
+      state = {
+        thinkingLevel: folded.effectiveLevel,
+        providerOptions: folded.providerOptions,
+        messages: rebuilt.messages,
+        systemRecords: rebuilt.systemRecords,
+        systemMessageTokens: rebuilt.systemMessageTokens,
+        contextBudgetEstimate: rebuilt.contextBudgetEstimate,
+        contextBudgetTurnAnchor: rebuilt.contextBudgetTurnAnchor,
+      };
+    } catch (error) {
+      if (error instanceof ContextBudgetExceededError) return { exceeded: error.details };
+      throw error;
+    }
+    holder.applied = folded.effectiveLevel;
+    // Keep the mid-turn rebuild baseline in sync so a later identical
+    // request is correctly treated as a no-op.
+    input.currentEffectiveLevelRef.current = folded.effectiveLevel;
+    // Loop re-checks pending: a change during the awaits above re-folds
+    // against the level just applied.
+  }
+  return state;
+}
+
+/** Called once per primary start() with E, the enforced count of the built request (#5286). */
+export type OnTurnStartStage = (budget: {
+  estimate: number;
+  limit: number;
+  model: string;
+  /** The turn's history rows: their warning rows are this window's stage claims. */
+  messages: readonly MuxMessage[];
+}) => Promise<TurnStartStage | undefined>;
+/**
+ * A due, unclaimed stage. `publish` resolves false when the send lost its admission first, or
+ * when history holds a row the turn's history read did not see (AgentSession fences that).
+ */
+export interface TurnStartStage {
+  row: MuxMessage;
+  /** Whether E′, the count of the request with `row` appended, leaves the stage its reserve. */
+  fits: (estimate: number) => boolean;
+  publish: () => Promise<boolean>;
+}
+
+/** What a primary start dispatches: the built request, or the counted candidate with a stage. */
+interface TurnStartPayload<TMessages, TTail> {
+  messages: TMessages;
+  systemRecords: TTail;
+  systemMessageTokens: number;
+  requestHistorySequence: number;
+}
+
+/**
+ * Turn-start Token Budget stage (#5286). Decided on E, the count of the built request. The request
+ * is counted again with the warning row (E′) and the row is published only if E′ leaves the stage
+ * its reserve, so every published prompt is dispatched: the payload sent is the payload counted.
+ * The candidate carries the row in `messages`, so the fallback's and step 0's rebuilds carry it.
+ */
+async function applyTurnStartStage<TMessages, TTail>(input: {
+  onTurnStartStage: OnTurnStartStage | undefined;
+  estimate: number | undefined;
+  limit: number | undefined;
+  model: string;
+  messages: MuxMessage[];
+  rebuild: () => Promise<{
+    messages: TMessages;
+    systemRecords: TTail;
+    systemMessageTokens: number;
+    contextBudgetEstimate?: number;
+  }>;
+  abortSignal: AbortSignal;
+  current: TurnStartPayload<TMessages, TTail>;
+  /** A published stage holds later thinking changes until after its counted first request. */
+  thinkingOverride: ActiveTurnThinkingOverride | undefined;
+}): Promise<TurnStartPayload<TMessages, TTail>> {
+  const { onTurnStartStage, estimate, limit, messages, current } = input;
+  if (onTurnStartStage == null || estimate == null || limit == null) return current;
+  const stage = await onTurnStartStage({ estimate, limit, model: input.model, messages });
+  if (!stage) return current;
+  messages.push(stage.row);
+  const candidate = await countAndPublishStage(stage, input.rebuild, input.abortSignal);
+  if (!candidate) {
+    messages.pop();
+    return current;
+  }
+  holdThinkingChanges(input.thinkingOverride);
+  return {
+    messages: candidate.messages,
+    systemRecords: candidate.systemRecords,
+    systemMessageTokens: candidate.systemMessageTokens,
+    requestHistorySequence: stage.row.metadata?.historySequence ?? current.requestHistorySequence,
+  };
+}
+
+/** After a published stage, StreamManager applies thinking changes only after the first request. */
+function holdThinkingChanges(holder: ActiveTurnThinkingOverride | undefined): void {
+  if (holder) holder.holdBeforeFirstRequest = true;
+}
+
+/** Counts E′ with the row and publishes it only when it fits and the turn was not stopped. */
+async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?: number }>(
+  stage: TurnStartStage,
+  rebuild: () => Promise<TCandidate>,
+  abortSignal: AbortSignal
+): Promise<TCandidate | undefined> {
+  let candidate: TCandidate;
+  try {
+    candidate = await rebuild();
+  } catch (error) {
+    // A candidate over the ceiling only means the stage does not fit.
+    if (error instanceof ContextBudgetExceededError) return undefined;
+    throw error;
+  }
+  const fits =
+    candidate.contextBudgetEstimate != null && stage.fits(candidate.contextBudgetEstimate);
+  if (!fits || abortSignal.aborted) return undefined;
+  return (await stage.publish()) ? candidate : undefined;
+}
+
+/**
+ * The turn anchor for this assembled request (#7662). A compaction request has none: its trim
+ * can drop the rows the anchored provider count holds.
+ */
+async function turnBudgetAnchorFor(
+  options: Parameters<typeof assemblePromptPayload>[0],
+  payload: PromptPayload,
+  metadataModel: string | undefined
+): Promise<TurnBudgetAnchor | undefined> {
+  if (options.compactionInputBudgetTokens != null) return undefined;
+  return createTurnBudgetAnchor(payload.providerRequestMessages, {
+    model: options.modelString,
+    metadataModel,
+    routeProvider: options.routeProvider,
+    agentId: options.effectiveAgentId,
+    thinkingLevel: options.effectiveThinkingLevel,
+    // The text the reply's systemMessageTokens counted (measureSentSystem), rows included.
+    system: payload.sentSystem.message + payload.sentSystem.rowsText,
+  });
+}
+
+/** The model's effective context limit, or undefined (logged) when it is unknown. */
+function contextBudgetLimitFor(
+  options: Parameters<typeof assemblePromptPayload>[0],
+  providerOptions: MuxProviderOptions | undefined
+): number | undefined {
+  const limit = getEffectiveContextLimit(
+    options.modelString,
+    isAnthropic1MEffectivelyEnabled(options.modelString, providerOptions, options.providersConfig),
+    options.providersConfig,
+    { openaiWireFormat: providerOptions?.openai?.wireFormat }
+  );
+  if (limit == null) {
+    log.warn("Context budget preflight unavailable: model context limit is unknown", {
+      workspaceId: options.workspaceId,
+      model: options.modelString,
+    });
+  }
+  return limit ?? undefined;
+}
+
+/**
+ * Shared assembly path for primary, fallback, and thinking-rebuild provider attempts.
+ * `contextBudgetEstimate` is the estimate the check enforced (undefined when the budget is off
+ * or the limit is unknown): the previous turn's provider count plus the messages after it when
+ * `contextBudgetTurnAnchor` applies, else the full estimate.
+ */
 export async function assembleBudgetCheckedPromptPayload(
   options: Parameters<typeof assemblePromptPayload>[0],
   budget: {
@@ -487,38 +840,91 @@ export async function assembleBudgetCheckedPromptPayload(
     providerOptions?: MuxProviderOptions;
     activeTools?: readonly string[];
   }
-): Promise<Awaited<ReturnType<typeof assemblePromptPayload>> & { contextBudgetLimit?: number }> {
+): Promise<
+  Awaited<ReturnType<typeof assemblePromptPayload>> & {
+    contextBudgetLimit?: number;
+    contextBudgetEstimate?: number;
+    contextBudgetTurnAnchor?: TurnBudgetAnchor;
+  }
+> {
   const payload = await assemblePromptPayload(options);
   let contextBudgetLimit: number | undefined;
+  let contextBudgetEstimate: number | undefined;
+  let contextBudgetTurnAnchor: TurnBudgetAnchor | undefined;
   // Check after provider transforms and system/schema assembly: history-only
   // estimates cannot prevent oversized requests from reaching the provider.
   if (budget.enabled) {
-    contextBudgetLimit =
-      getEffectiveContextLimit(
-        options.modelString,
-        isAnthropic1MEffectivelyEnabled(
-          options.modelString,
-          budget.providerOptions,
-          options.providersConfig
-        ),
-        options.providersConfig,
-        { openaiWireFormat: budget.providerOptions?.openai?.wireFormat }
-      ) ?? undefined;
-    if (contextBudgetLimit == null) {
-      log.warn("Context budget preflight unavailable: model context limit is unknown", {
-        workspaceId: options.workspaceId,
-        model: options.modelString,
-      });
+    contextBudgetLimit = contextBudgetLimitFor(options, budget.providerOptions);
+    const metadataModel = resolveModelForMetadata(
+      options.modelString,
+      options.providersConfig ?? null
+    );
+    if (contextBudgetLimit != null) {
+      contextBudgetTurnAnchor = await turnBudgetAnchorFor(options, payload, metadataModel);
     }
-    const exceeded = await checkAssembledRequestBudgetForModel(payload, {
-      model: options.modelString,
-      metadataModel: resolveModelForMetadata(options.modelString, options.providersConfig ?? null),
-      modelContextLimit: contextBudgetLimit,
-      activeTools: budget.activeTools,
-    });
-    if (exceeded) throw new ContextBudgetExceededError(exceeded);
+    const measured = await measureAssembledRequestBudgetForModel(
+      payload,
+      {
+        model: options.modelString,
+        metadataModel,
+        modelContextLimit: contextBudgetLimit,
+        activeTools: budget.activeTools,
+      },
+      contextBudgetTurnAnchor
+    );
+    contextBudgetEstimate = measured?.estimate;
+    if (measured?.exceeded) {
+      throw new ContextBudgetExceededError(measured.exceeded);
+    }
   }
-  return { ...payload, contextBudgetLimit };
+  return { ...payload, contextBudgetLimit, contextBudgetEstimate, contextBudgetTurnAnchor };
+}
+
+/**
+ * The sent system content (PromptPayload.sentSystem) with its token count. The tail rows exist
+ * only in the request, so their text counts as system: history sizing (continuous compaction,
+ * context estimates) adds this count to the rows it sizes itself.
+ */
+async function measureSentSystem(
+  sentSystem: PromptPayload["sentSystem"],
+  liveSystem: string,
+  liveTokens: number,
+  tokenizerFor: () => ReturnType<typeof getTokenizerForModel>
+): Promise<{ system: string; volatileLength: number; tokens: number }> {
+  const { message, volatileSuffixLength, rowsText } = sentSystem;
+  if (message === liveSystem && rowsText === "") {
+    return { system: message, volatileLength: volatileSuffixLength, tokens: liveTokens };
+  }
+  const tokenizer = await tokenizerFor();
+  const tokens = await tokenizer.countTokens(message + rowsText);
+  return { system: message, volatileLength: volatileSuffixLength, tokens };
+}
+
+/**
+ * The system-section records for the turn's assistant row (volatile tail, custom
+ * instructions): what this request sent, or, when a refusal fallback continues this turn's
+ * row and sends nothing new, the record the row already holds (the rows of its earlier
+ * request stay in place before it). Both keys are always present, so spreading the result
+ * over metadata replaces an older record.
+ */
+function rowSystemRecords(
+  payload: SystemSectionRecords,
+  continuation: MuxMessage | undefined
+): SystemSectionRecords {
+  const records: SystemSectionRecords = {};
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) {
+    records[field] = payload[field] ?? continuation?.metadata?.[field];
+  }
+  return records;
+}
+
+/** The assistant row's records (MuxMetadata.volatileSystemTail etc.); absent records nothing. */
+function systemRecordsMetadata(records: SystemSectionRecords): SystemSectionRecords {
+  const present: SystemSectionRecords = {};
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) {
+    if (records[field] != null) present[field] = records[field];
+  }
+  return present;
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -573,12 +979,78 @@ export interface PreparedStreamMessage extends AsyncDisposable {
 }
 
 export interface PreparedTurnRequest extends AsyncDisposable {
-  start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
+  /**
+   * `turnStartStage` is the starting send's stage callback. It is passed at start, not prepare:
+   * a request prepared before its rows were published (a rollover's first request) gets it from
+   * the send that starts it, so the new window's first request decides its stage too (#7215).
+   */
+  start(
+    thinkingOverride?: ActiveTurnThinkingOverride,
+    turnStartStage?: OnTurnStartStage
+  ): Promise<TurnRequestBuildOutcome>;
 }
 
 type PreparedTurnRequestOutcome =
   | Extract<TurnRequestBuildOutcome, { type: "finished" }>
   | { type: "prepared"; request: PreparedTurnRequest };
+
+/**
+ * Toolset facts the system prompt describes (hot memories, the status page guidance). Tool
+ * policy may strip a tool after the provisional prompt was built; a different toolset forces a
+ * rebuild so the prompt never advertises an absent tool.
+ */
+interface SystemPromptToolset {
+  memoryToolAvailable: boolean;
+  statusUpdateToolAvailable: boolean;
+}
+
+/**
+ * `activeToolPolicy` matters because the advertised union keeps a tool the active agent or the
+ * caller denies as a refusal stub (#5253): presence alone does not mean the turn may call it.
+ * Memory is never stubbed (toolAssembly canRefuseAtExecution), so its presence is enough.
+ */
+function systemPromptToolsetOf(
+  tools: Record<string, Tool>,
+  activeToolPolicy: ToolPolicy | undefined
+): SystemPromptToolset {
+  return {
+    memoryToolAvailable: tools.memory !== undefined,
+    statusUpdateToolAvailable: statusUpdateUsable(
+      tools.status_update !== undefined,
+      activeToolPolicy
+    ),
+  };
+}
+
+/** Whether a registered status_update survives the active tool policy (see above). */
+function statusUpdateUsable(
+  registered: boolean,
+  activeToolPolicy: ToolPolicy | undefined
+): boolean {
+  return registered && applyToolPolicyToNames(["status_update"], activeToolPolicy).length > 0;
+}
+
+/**
+ * A main-chat turn without status page agent mode hands the page back to the main agent, so
+ * updates still queued (or carried from a failed run) and the last failure are stale: without
+ * this they would be applied, and reported, once the mode comes back. Side chats and compaction
+ * never get the mode, so they leave the main chat's queue alone.
+ */
+function discardStatusUpdatesWithoutMode(
+  queue: TurnRequestBuilderBindings["statusPageAgent"],
+  workspaceId: string,
+  turn: { statusPageAgentActive: boolean; sideChat: boolean; compaction: boolean }
+): void {
+  if (turn.statusPageAgentActive || turn.sideChat || turn.compaction) return;
+  queue?.discard(workspaceId);
+}
+
+function sameSystemPromptToolset(a: SystemPromptToolset, b: SystemPromptToolset): boolean {
+  return (
+    a.memoryToolAvailable === b.memoryToolAvailable &&
+    a.statusUpdateToolAvailable === b.statusUpdateToolAvailable
+  );
+}
 
 export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   mcpServerManager?: MCPServerManager;
@@ -586,6 +1058,8 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   workspaceTurnManager?: ToolConfiguration["workspaceTurnManager"];
   memoryService?: MemoryService;
   timelineService?: ToolConfiguration["timelineService"];
+  /** Status page agent queue behind the status_update tool (artifacts-status-page-agent). */
+  statusPageAgent?: Pick<StatusPageAgentService, "enqueue" | "discard">;
   extraTools?: Record<string, Tool>;
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
@@ -598,6 +1072,9 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
+  computerUseService?: ComputerUseService;
+  /** Routes AI calls from bash commands through Xum so their spend is accounted. */
+  bashAiProxy?: Pick<BashAiProxyService, "envFor" | "noteBlocked">;
 }
 
 /**
@@ -615,6 +1092,20 @@ function requireWorkflowArchiveAdmission(
   return guard;
 }
 
+/**
+ * Host services that tools read through ToolConfiguration instead of importing host modules
+ * (local/no-host-imports). AILive passes the Node layers; an absent member means the tool's
+ * own Node default.
+ */
+export interface LoopHostServices {
+  desktopNotifications?: DesktopNotifications;
+  /** The host's files and paths: global instructions and the home clutter scan. */
+  hostFiles?: HostFiles;
+  hostPaths?: HostPaths;
+  /** The runtimes of AIService and the sessions. Absent: the Node layer (tests that build AIService by hand). */
+  runtimeFactory?: RuntimeFactory;
+}
+
 interface TurnRequestBuilderDependencies {
   config: Config;
   providersConfigStore: ProvidersConfigStore;
@@ -625,14 +1116,19 @@ interface TurnRequestBuilderDependencies {
   providerModelFactory: ProviderModelFactory;
   streamManager: StreamManager;
   workspaceMcpOverridesService: WorkspaceMcpOverridesService;
-  policyService?: PolicyService;
   telemetryService?: TelemetryService;
   backgroundProcessManager?: BackgroundProcessManager;
   sessionUsageService?: SessionUsageService;
   devToolsService?: DevToolsService;
-  experimentsService?: ExperimentsService;
-  lastLlmRequestByWorkspace: Map<string, DebugLlmRequestSnapshot>;
+  experimentsService?: Pick<ExperimentsService, "isExperimentEnabled">;
+  /** Only written here; AIService owns the bounded store and its reads. */
+  lastLlmRequestByWorkspace: {
+    set(workspaceId: string, snapshot: DebugLlmRequestSnapshot): unknown;
+  };
   bindings: TurnRequestBuilderBindings;
+  hostServices: LoopHostServices;
+  /** AIService's runtime builders (its hostServices.runtimeFactory, or the Node layer). */
+  runtimeFactory: RuntimeFactory;
   emit: (event: string, ...args: unknown[]) => boolean;
   createAbortedTurnHandle: (messageId: string, signal?: AbortSignal) => TurnStreamHandle;
   createSettledTurnHandle: (messageId: string, completion: TurnCompletion) => TurnStreamHandle;
@@ -648,7 +1144,6 @@ interface TurnRequestBuilderDependencies {
     SendMessageError
   >;
   isClaudeSkillsCompatEnabled: () => boolean;
-  isAgentPluginsEnabled: () => boolean;
   wrapToolsForDelegation: (
     workspaceId: string,
     tools: Record<string, Tool>,
@@ -692,15 +1187,189 @@ interface PreparedModelAttempt {
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
   currentEffectiveLevelRef: { current: ThinkingLevel };
+  /** `beforeFirstStep`: folding a pre-stream override, before any provider call ran. */
   computeRebuiltProviderOptions: (
     level: ThinkingLevel,
-    currentLevel: ThinkingLevel
+    currentLevel: ThinkingLevel,
+    beforeFirstStep?: boolean
   ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
   rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
 }
 
+/**
+ * Models per workspace that keep their own catalog overview (a primary plus a few fallbacks or
+ * switches). Past it, the least recently used model's overview is rebuilt on its next use.
+ */
+const MAX_TOOL_CATALOG_OVERVIEW_MODELS_PER_WORKSPACE = 4;
+
 export class TurnRequestBuilder {
+  /** Remote scratch dirs per workspace and runtime config (see RemoteScratchDirCache). */
+  private readonly remoteScratchDirs = new RemoteScratchDirCache();
+  /**
+   * The last deferred-tool catalog overview per workspace and model (ToolCatalogOverviewMemo).
+   * Per model because request.assemble hooks, policies and fallbacks can give each model its own
+   * catalog, and the prompt cache is per model too: one shared memo would let a model with fewer
+   * tools replace the overview another model's cache still holds. In memory only: a restart
+   * builds one fresh overview per model, which costs one cache rewrite. forgetWorkspace drops a
+   * removed or archived workspace's entry.
+   */
+  private readonly toolCatalogOverviews = new Map<string, Map<string, ToolCatalogOverviewMemo>>();
+  /**
+   * The Agent interface view's state of each root workspace's latest prepared turn, keyed by
+   * workspace, for the turn-end status page nudge (takeAgentInterfaceStatusPageTurn). One entry
+   * per workspace: the next prepare replaces or drops it.
+   */
+  private readonly agentInterfaceTurns = new Map<
+    string,
+    { messageId: string; turn: AgentInterfaceStatusPageTurn }
+  >();
+
+  /**
+   * Each workspace's latest prepared turn whose agent can call the artifact tool and is not
+   * plan-like, for the turn-end layout nudge (turnCanRepublishArtifacts). The nudge asks for a
+   * publish, and its continuation keeps the turn's agent, tool policy and request assembly: a turn
+   * without the tool could not follow it. `toolSent` is whether the tools of the turn's latest
+   * attempt still held `artifact` after assembly (followArtifactToolAfterAssembly). One entry per
+   * workspace: the next prepare replaces or drops it.
+   */
+  private readonly artifactPublishTurns = new Map<
+    string,
+    { messageId: string; toolSent: boolean }
+  >();
+
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
+
+  /** Turn timings, record timestamps and retry delays share the stream's HostClock. */
+  private get hostClock(): HostClock {
+    return this.dependencies.streamManager.hostClock;
+  }
+
+  /** Drop a removed or archived workspace's in-memory request state, so it does not grow the map. */
+  // dry-duplicate-ok: two map deletes; the browser token-state reset shares only the shape
+  forgetWorkspace(workspaceId: string): void {
+    this.toolCatalogOverviews.delete(workspaceId);
+    this.agentInterfaceTurns.delete(workspaceId);
+    this.artifactPublishTurns.delete(workspaceId);
+  }
+
+  /** Whether the turn whose assistant message is `messageId` could publish an artifact. */
+  turnCanRepublishArtifacts(workspaceId: string, messageId: string): boolean {
+    const entry = this.artifactPublishTurns.get(workspaceId);
+    return entry?.messageId === messageId && entry.toolSent;
+  }
+
+  /**
+   * The Agent interface view's state of the turn whose assistant message is `messageId`, once:
+   * undefined when the view was inactive for it, or when another turn was prepared since.
+   */
+  takeAgentInterfaceStatusPageTurn(
+    workspaceId: string,
+    messageId: string
+  ): AgentInterfaceStatusPageTurn | undefined {
+    const entry = this.agentInterfaceTurns.get(workspaceId);
+    if (entry?.messageId !== messageId) return undefined;
+    this.agentInterfaceTurns.delete(workspaceId);
+    return entry.turn;
+  }
+
+  private recordArtifactPublishTurn(
+    workspaceId: string,
+    messageId: string,
+    agent: { planLike: boolean; toolPolicy: ToolPolicy | undefined }
+  ): void {
+    // A plan-like agent (a custom one included) may edit only its plan file, as for the status
+    // page nudge (recordAgentInterfaceTurn).
+    // Not sent until an attempt's assembled tools hold the tool (followArtifactToolAfterAssembly).
+    if (!agent.planLike && applyToolPolicyToNames(["artifact"], agent.toolPolicy).length > 0) {
+      this.artifactPublishTurns.set(workspaceId, { messageId, toolSent: false });
+    } else {
+      this.artifactPublishTurns.delete(workspaceId);
+    }
+  }
+
+  /**
+   * The policy allows the tool, but request.assemble middleware, XUM_DISABLE_AGENT_TOOLS or
+   * capability grants can still remove it from the request. Each attempt (a model fallback reruns
+   * assembly) sets the record from the tools it sends. With Programmatic Tool Calling the tool is
+   * bridged into code_execution (`xum.artifact`), built from the same policy-filtered tools that
+   * request hooks never see, so code_execution carries it.
+   */
+  private followArtifactToolAfterAssembly(
+    workspaceId: string,
+    messageId: string,
+    attempt: { tools: Record<string, Tool>; ptcEnabled: boolean }
+  ): void {
+    const entry = this.artifactPublishTurns.get(workspaceId);
+    if (entry?.messageId !== messageId) return;
+    entry.toolSent =
+      attempt.tools.artifact !== undefined || ptcRanForTools(attempt.ptcEnabled, attempt.tools);
+  }
+
+  private recordAgentInterfaceTurn(
+    workspaceId: string,
+    messageId: string,
+    turn: AgentInterfaceStatusPageTurn | null,
+    agent: { subagentWorkspace: boolean; planLike: boolean; statusPageAgent: boolean }
+  ): void {
+    // Only root workspaces get the turn-end status page nudge (AgentSession.runTurnStopHooks), and
+    // no plan-like agent (a custom one included): it may edit only its plan file.
+    if (turn != null && !agent.subagentWorkspace && !agent.planLike) {
+      this.agentInterfaceTurns.set(workspaceId, {
+        messageId,
+        turn: { ...turn, statusPageAgent: agent.statusPageAgent },
+      });
+    } else {
+      this.agentInterfaceTurns.delete(workspaceId);
+    }
+  }
+
+  /**
+   * request.assemble middleware may filter status_update after the prompt was built. Then the
+   * page goes back to the main agent: the classic guidance replaces the status page agent's, and
+   * the turn-end nudge asks for a page edit, not a status_update call. Each attempt (a model
+   * fallback reruns the middleware) sets the nudge from its own prompt.
+   */
+  private followStatusUpdateAfterMiddleware(
+    workspaceId: string,
+    messageId: string,
+    systemMessage: string,
+    statusUpdate: { prompted: boolean; present: boolean }
+  ): string {
+    const entry = this.agentInterfaceTurns.get(workspaceId);
+    if (entry?.messageId === messageId) {
+      this.agentInterfaceTurns.set(workspaceId, {
+        messageId,
+        turn: { ...entry.turn, statusPageAgent: statusUpdate.prompted && statusUpdate.present },
+      });
+    }
+    return statusUpdate.present ? systemMessage : removeStatusPageAgentGuidance(systemMessage);
+  }
+
+  /**
+   * Keyed by the effective model string (the routed wire model), not the selected one: the
+   * prompt cache is per route and wire model, so two selections that reach the same wire model
+   * (an explicit gateway string and a direct string routed through that gateway) share one cache
+   * and must share one overview, or alternating between them rewrites that cache.
+   */
+  private toolCatalogOverviewMemo(
+    workspaceId: string,
+    modelString: string
+  ): ToolCatalogOverviewMemo {
+    let byModel = this.toolCatalogOverviews.get(workspaceId);
+    if (byModel === undefined) {
+      byModel = new Map();
+      this.toolCatalogOverviews.set(workspaceId, byModel);
+    }
+    const memo = byModel.get(modelString) ?? {};
+    // Least recently used goes first: re-insert on every use, evict from the front.
+    byModel.delete(modelString);
+    byModel.set(modelString, memo);
+    for (const model of byModel.keys()) {
+      if (byModel.size <= MAX_TOOL_CATALOG_OVERVIEW_MODELS_PER_WORKSPACE) break;
+      byModel.delete(model);
+    }
+    return memo;
+  }
 
   private resolveOverridesIdentity(
     rawModelString: string,
@@ -739,8 +1408,68 @@ export class TurnRequestBuilder {
     };
   }
 
+  /**
+   * Start this workspace's MCP servers exactly as a send's request build does (same inputs to
+   * MCPServerManager.getToolsForWorkspace), so the same servers start and no others. Codex plugin
+   * hooks on UserPromptSubmit run before request building and need their plugin's server, which
+   * after a restart is not running yet. Returns false when the workspace is not ready for MCP
+   * (init failed, unsanitized checkout, runtime not ready, no MCP manager) or is a side chat.
+   */
+  async startWorkspaceMcpServers(workspaceId: string, signal: AbortSignal): Promise<boolean> {
+    const mcpServerManager = this.dependencies.bindings.mcpServerManager;
+    if (mcpServerManager === undefined) return false;
+    const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
+    if (!metadataResult.success) return false;
+    const metadata = metadataResult.data;
+    // Like request building: a side chat never starts MCP servers (its local-read-only ceiling),
+    // so its prompt hooks fail open instead of reaching a possibly mutating MCP tool.
+    if (sideChatCapabilityGrants(metadata) != null) return false;
+    const runtimeContext = this.dependencies.createWorkspaceRuntimeContext(workspaceId, metadata);
+    if (!runtimeContext.success) return false;
+    const { runtime, workspacePath, hostCheckoutRoot } = runtimeContext.data;
+    await this.dependencies.initStateManager.waitForInit(workspaceId, signal);
+    if (this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId)) return false;
+    const ready = await runtime.ensureReady({ signal });
+    if (!ready.ready || signal.aborted) return false;
+    // Wall clock: MCPServerManager subtracts Date.now() from the deadline (#7282).
+    const readStartedAt = nodeClock.nowMs();
+    const read = await this.dependencies.workspaceMcpOverridesService
+      .getOverridesForWorkspace(workspaceId, {
+        timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+        signal,
+        clock: this.hostClock,
+      })
+      .catch(() => ({ overrides: undefined, authoritative: false }));
+    const projectSecrets = workspaceSecrets(
+      metadata,
+      this.dependencies.secretsStore,
+      this.dependencies.config
+    );
+    await mcpServerManager.getToolsForWorkspace(
+      {
+        workspaceId,
+        projectPath: metadata.projectPath,
+        runtime,
+        workspacePath,
+        trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        runtimeConfig: metadata.runtimeConfig,
+        overrides: read.overrides,
+        overridesAuthoritative: read.authoritative,
+        ...(read.authoritative
+          ? {}
+          : { overridesReadDeadlineAt: readStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS }),
+        projectSecrets: await secretsToRecord(projectSecrets),
+        agentPlugins: hostCheckoutRoot
+          ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+          : null,
+      },
+      { signal }
+    );
+    return true;
+  }
+
   prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
-    const buildProviderOptionsStartedAt = Date.now();
+    const buildProviderOptionsStartedAt = this.hostClock.nowMs();
     const providerOptions = buildProviderOptions(
       options.optionsModelString,
       options.effectiveThinkingLevel,
@@ -755,7 +1484,7 @@ export class TurnRequestBuilder {
       options.reasoningMode
     ) as Record<string, unknown>;
     options.recordStartupPhaseTiming?.("buildProviderOptionsMs", buildProviderOptionsStartedAt);
-    const buildRequestConfigStartedAt = Date.now();
+    const buildRequestConfigStartedAt = this.hostClock.nowMs();
     const requestHeaders = buildRequestHeaders(
       options.optionsModelString,
       options.muxProviderOptions,
@@ -779,8 +1508,10 @@ export class TurnRequestBuilder {
       overridesIdentity.modelString,
       options.effectiveModelString
     );
-    const namespaceKey = resolveProviderOptionsNamespaceKey(
+    const namespaceKey = resolveRequestProviderOptionsNamespaceKey(
       options.wireProviderName,
+      options.optionsModelString,
+      options.providersConfigSnapshot,
       options.routeProvider
     );
     const extrasWireCompatible =
@@ -800,7 +1531,8 @@ export class TurnRequestBuilder {
     const currentEffectiveLevelRef = { current: options.effectiveThinkingLevel };
     const computeRebuiltProviderOptions = (
       level: ThinkingLevel,
-      currentLevel: ThinkingLevel
+      currentLevel: ThinkingLevel,
+      beforeFirstStep = false
     ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
       const clamped = enforceThinkingPolicy(
         options.rawModelString,
@@ -808,10 +1540,23 @@ export class TurnRequestBuilder {
         options.minThinkingLevel,
         options.providersConfigSnapshot
       );
-      const effective = resolveEffectiveThinkingLevel(
-        options.rawModelString,
-        clamped,
-        options.providersConfigSnapshot
+      // Sonnet 5.5 effort pin (#5086). Before the first provider call only the history
+      // counts, as at turn start; once a step ran, a switch to "off" changes the effort
+      // within the conversation, so it runs as "low" adaptive.
+      const effective = resolveBetweenToolsThinkingLevel(
+        resolveModelForMetadata(options.rawModelString, options.providersConfigSnapshot ?? null),
+        resolveEffectiveThinkingLevel(
+          options.rawModelString,
+          clamped,
+          options.providersConfigSnapshot
+        ),
+        beforeFirstStep &&
+          anthropicBetweenToolsRouteAvailable(
+            options.optionsModelString,
+            options.routeProvider,
+            options.providersConfigSnapshot
+          ),
+        assistantThinkingLevels(options.providerRequestMessages)
       );
       if (
         effective === currentLevel ||
@@ -835,9 +1580,14 @@ export class TurnRequestBuilder {
       return { effectiveLevel: effective, providerOptions: mergeExtras(rebuilt) };
     };
     const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
-      level
+      level,
+      beforeFirstStep = false
     ) => {
-      const result = computeRebuiltProviderOptions(level, currentEffectiveLevelRef.current);
+      const result = computeRebuiltProviderOptions(
+        level,
+        currentEffectiveLevelRef.current,
+        beforeFirstStep
+      );
       if (result != null) {
         currentEffectiveLevelRef.current = result.effectiveLevel;
       }
@@ -861,7 +1611,7 @@ export class TurnRequestBuilder {
     const prepared = await this.prepare(opts, context);
     if (prepared.type === "finished") return prepared;
     await using request = prepared.request;
-    return await request.start(opts.activeTurnThinkingOverride);
+    return await request.start(opts.activeTurnThinkingOverride, opts.onTurnStartStage);
   }
 
   async prepare(
@@ -935,6 +1685,60 @@ export class TurnRequestBuilder {
     return { type: "finished", result: Err({ type: errorType, message: errorMessage }) };
   }
 
+  /**
+   * AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
+   * the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
+   * provider that project secrets configure: secrets override xumEnv in the bash tool, and a
+   * proxy URL must never pair with a real key.
+   * Best effort: a proxy problem leaves bash without the pair and never fails the turn.
+   * Untrusted projects and the project-automation kill switch blank provider keys in bash
+   * (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
+   * Add nothing rather than a proxy URL whose key the bash tool then blanks.
+   */
+  private async bashAiProxyEnv(
+    workspaceId: string,
+    runtimeType: ReturnType<typeof getRuntimeType>,
+    secretKeys: readonly string[],
+    sharedExecutionTrusted: boolean
+  ): Promise<Record<string, string> | undefined> {
+    const bashAiProxy = this.dependencies.bindings.bashAiProxy;
+    if (!bashAiProxy) return undefined;
+    if (!sharedExecutionTrusted) {
+      // Say why bash gets no proxy variables, so a user who turned the switch on can find out.
+      bashAiProxy.noteBlocked(
+        workspaceId,
+        projectAutomationDisabled() ? "kill_switch" : "untrusted"
+      );
+      return undefined;
+    }
+    try {
+      return await bashAiProxy.envFor(workspaceId, runtimeType, secretKeys);
+    } catch (error) {
+      log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Cumulative session cost for the MUX_COSTS_USD env var. A ledger read error (EIO, EMFILE)
+   * leaves the variable unset: the cost is informational and must not fail the user's send.
+   */
+  private async loadSessionCostsUsd(workspaceId: string): Promise<number | undefined> {
+    const sessionUsageService = this.dependencies.sessionUsageService;
+    if (!sessionUsageService) return undefined;
+    try {
+      const sessionUsage = await sessionUsageService.getSessionUsage(workspaceId);
+      if (!sessionUsage) return undefined;
+      return getTotalCost(sumUsageHistory(Object.values(sessionUsage.byModel)));
+    } catch (error) {
+      log.warn("Failed to read session usage; MUX_COSTS_USD stays unset", { workspaceId, error });
+      return undefined;
+    }
+  }
+
   private async prepareOrThrow(
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
@@ -977,9 +1781,10 @@ export class TurnRequestBuilder {
       recordProposedPlan,
       postCompactionAttachments,
       resolveMemoryContext,
-      experiments: experimentsFromOptions,
-      allowAgentSetGoal,
       workspaceGoalService,
+      goalTurnKind,
+      goalTurnGoalId,
+      taskTurnKind,
       disableWorkspaceAgents,
       hasQueuedMessages,
       getQueuedInputStopCause,
@@ -987,6 +1792,8 @@ export class TurnRequestBuilder {
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
+      compactionInputBudgetScale,
+      compactionContextRetryAvailable,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
@@ -995,19 +1802,20 @@ export class TurnRequestBuilder {
     let modelString = opts.modelString;
     let autoModelRouting = opts.autoModelRouting;
     let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
-    // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
-    // writing the workspace context notes, on a transcript that may carry injected tool output.
-    // It must not gain synthesized code execution (PTC) or run repository tool hooks, and its
-    // memory writes are pinned to the notes file below.
-    const contextBudgetFlushTurn = muxMetadata?.contextBudgetFlush === true;
-    const gatedExperiments = resolveBackendGatedPtcExperiments(
-      experimentsFromOptions,
-      (experimentId) =>
-        this.dependencies.experimentsService?.isExperimentEnabled(experimentId) === true
+    // One read per flag for the whole turn: a toggle while the turn is prepared must not
+    // split dependent flags, such as token budget and the memory it requires.
+    const enabledExperiments = new Set(
+      Object.values(EXPERIMENT_IDS).filter(
+        (id) => this.dependencies.experimentsService?.isExperimentEnabled(id) === true
+      )
     );
-    const experiments: StreamMessageOptions["experiments"] = contextBudgetFlushTurn
-      ? { ...gatedExperiments, programmaticToolCalling: false }
-      : gatedExperiments;
+    const isExperimentEnabled = (id: ExperimentId) => enabledExperiments.has(id);
+    const experiments = {
+      programmaticToolCalling: isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+      rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),
+      tokenBudget: isTokenBudgetActive(isExperimentEnabled),
+      continuousCompaction: isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
+    };
     const combinedAbortSignal = context.abortSignal;
     const syntheticMessageId = context.syntheticMessageId;
     const startTime = context.startTime;
@@ -1032,6 +1840,9 @@ export class TurnRequestBuilder {
     // Mode (plan|exec|compact) is derived from the selected agent definition.
     const effectiveMuxProviderOptions: MuxProviderOptions = muxProviderOptions ?? {};
     const userOpenAIWireFormat = effectiveMuxProviderOptions.openai?.wireFormat;
+    // A non-OpenAI attempt strips unsupported options from this mutable object.
+    // Preserve the chat's choice so an OpenAI fallback cannot re-inherit a global tier.
+    const userServiceTier = effectiveMuxProviderOptions.openai?.serviceTier;
 
     const resolveToolsIdentity = (
       raw: string,
@@ -1072,14 +1883,16 @@ export class TurnRequestBuilder {
         }
         return { modelString: raw };
       }
-      if (!raw.startsWith("coder:")) {
+      // A canonical selection that canonicalRoutes sends through Coder speaks
+      // the selected instance's wire, like the explicit coder: string.
+      if (!raw.startsWith("coder:") && !effective.startsWith("coder:")) {
         return { modelString: raw };
       }
       if (!effective.startsWith("coder:")) {
-        // Fallback away from Coder. A PASSTHROUGH gateway fallback
-        // (mux-gateway:anthropic/x) must normalize to the canonical wire
-        // identity: getToolsForModel only runs Anthropic/OpenAI-specific
-        // assembly (native web tools, MCP schema sanitization) for direct
+        // Fallback away from Coder. A PASSTHROUGH gateway fallback must
+        // normalize to the canonical wire identity: getToolsForModel only runs
+        // Anthropic/OpenAI-specific assembly (native web tools, MCP schema
+        // sanitization) for direct
         // provider prefixes, and passthrough gateways forward origin-shaped
         // payloads. Transforming gateways (openrouter) keep their own
         // identity, same as a direct selection of that gateway.
@@ -1116,12 +1929,23 @@ export class TurnRequestBuilder {
             : {}),
       };
     };
+    // One scope per built turn: every model this turn creates (fallback hops included) shares it,
+    // so the prefix detector can tell a turn-boundary break from a mid-turn one.
+    const promptCacheScope = this.dependencies.providerModelFactory.createPromptCacheTurnScope(
+      workspaceId,
+      this.dependencies.bindings.timelineService ?? NOOP_TIMELINE_RECORDER
+    );
+    // The running agent's prompt-cache TTL. Models are created before the agent resolves, so
+    // their Anthropic wires read it through a getter at request time (set after resolution).
+    const agentCacheTtl: { value?: AnthropicCacheTtl } = {};
     const prepareModelSeed = async (options: {
       rawModelString: string;
       requestedThinkingLevel: ThinkingLevel | undefined;
       minimumThinkingLevelOverride: ThinkingLevel | undefined;
       enforceMinimum: boolean;
       recordTiming?: boolean;
+      /** A refusal-fallback hop: the refused model's Anthropic Fast pick does not carry over. */
+      refusalFallback?: boolean;
     }) => {
       if (
         options.enforceMinimum &&
@@ -1134,31 +1958,44 @@ export class TurnRequestBuilder {
       }
 
       const requestedThinkingLevel = options.requestedThinkingLevel ?? THINKING_LEVEL_OFF;
-      const preliminaryProvidersConfig = this.dependencies.providerService.getConfig();
+      // Routing, model creation, and the request view share ONE read: a
+      // re-read after creation could see a concurrent provider refresh and
+      // build tools and options for another wire than the created model.
+      const providersConfigSnapshot =
+        this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
+      const providersConfig = this.dependencies.providerService.getConfig(providersConfigSnapshot);
       const preliminaryMinThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,
-        preliminaryProvidersConfig
+        providersConfig
       );
       const preliminaryThinkingLevel = options.enforceMinimum
         ? enforceThinkingPolicy(
             options.rawModelString,
             requestedThinkingLevel,
             preliminaryMinThinkingLevel,
-            preliminaryProvidersConfig
+            providersConfig
           )
         : resolveEffectiveThinkingLevel(
             options.rawModelString,
             requestedThinkingLevel,
-            preliminaryProvidersConfig
+            providersConfig
           );
 
-      const resolveAndCreateModelStartedAt = Date.now();
+      const resolveAndCreateModelStartedAt = this.hostClock.nowMs();
       const resolved = await this.dependencies.providerModelFactory.resolveAndCreateModel(
         options.rawModelString,
         preliminaryThinkingLevel,
         effectiveMuxProviderOptions,
-        { agentInitiated, workspaceId }
+        {
+          agentInitiated,
+          workspaceId,
+          providersConfig: providersConfigSnapshot,
+          getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          withoutAnthropicFastMode: options.refusalFallback === true,
+          getAnthropicCacheTtlOverride: () => agentCacheTtl.value,
+          promptCacheScope,
+        }
       );
       if (options.recordTiming) {
         recordStartupPhaseTiming("resolveAndCreateModelMs", resolveAndCreateModelStartedAt);
@@ -1167,17 +2004,12 @@ export class TurnRequestBuilder {
         return resolved;
       }
 
-      const providersConfig = pinCoderInstanceProvidersConfig(
-        this.dependencies.providerService.getConfig(),
-        options.rawModelString,
-        resolved.data.coderSelectedInstance
-      );
       const minThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,
         providersConfig
       );
-      const effectiveThinkingLevel = options.enforceMinimum
+      const policyThinkingLevel = options.enforceMinimum
         ? enforceThinkingPolicy(
             options.rawModelString,
             requestedThinkingLevel,
@@ -1208,18 +2040,35 @@ export class TurnRequestBuilder {
         };
       }
 
+      const capabilityModelString = resolveModelForMetadata(
+        options.rawModelString.startsWith("coder:")
+          ? options.rawModelString
+          : resolved.data.canonicalModelString,
+        providersConfig
+      );
+      // Sonnet 5.5 "off" is `between_tools`, pinned to effort low for the conversation
+      // (#5086). Decide here, not in buildProviderOptions, so the recorded level, message
+      // preparation and provider options all agree when it falls back to "low".
+      const effectiveThinkingLevel = resolveBetweenToolsThinkingLevel(
+        capabilityModelString,
+        policyThinkingLevel,
+        anthropicBetweenToolsRouteAvailable(
+          optionsModelString,
+          resolved.data.routeProvider,
+          providersConfig
+        ),
+        // The rows message preparation can send, not only the boundary slice: a
+        // model-hidden row or an excluded keep-recent tail never reaches the provider.
+        assistantThinkingLevels(selectActiveContextMessages(messages))
+      );
+
       return Ok({
         ...resolved.data,
         rawModelString: options.rawModelString,
         providersConfig,
         minThinkingLevel,
         effectiveThinkingLevel,
-        capabilityModelString: resolveModelForMetadata(
-          options.rawModelString.startsWith("coder:")
-            ? options.rawModelString
-            : resolved.data.canonicalModelString,
-          providersConfig
-        ),
+        capabilityModelString,
         toolsModelString: toolsIdentity.modelString,
         optionsModelString,
       });
@@ -1234,8 +2083,8 @@ export class TurnRequestBuilder {
     });
     // Auto routing promises the composer's model whenever the tier model cannot run. The
     // factory owns every reason it cannot be built (missing credentials, disabled or removed
-    // provider, policy on the route-resolved identity, catalog), so the fallback keys on its
-    // verdict here instead of pre-checking copies of those rules at classification time.
+    // provider, catalog), so the fallback keys on its verdict here instead of pre-checking
+    // copies of those rules at classification time.
     // Only the model reverts: the tier's thinking level (when Auto set it) is re-clamped for
     // the fallback model here and recorded with the assembled request, like a refusal hop.
     if (
@@ -1282,7 +2131,6 @@ export class TurnRequestBuilder {
       canonicalModelString,
       canonicalProviderName,
       wireProviderName,
-      routedThroughGateway,
       routeProvider,
       providersConfig: requestProvidersConfig,
       effectiveThinkingLevel,
@@ -1318,7 +2166,7 @@ export class TurnRequestBuilder {
     if (wireProviderName === "openai") {
       log.debug("Keeping reasoning parts for OpenAI (managed via explicit history)");
     }
-    const getWorkspaceMetadataStartedAt = Date.now();
+    const getWorkspaceMetadataStartedAt = this.hostClock.nowMs();
     const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
     recordStartupPhaseTiming("getWorkspaceMetadataMs", getWorkspaceMetadataStartedAt);
     if (!metadataResult.success) {
@@ -1326,21 +2174,13 @@ export class TurnRequestBuilder {
     }
 
     const metadata = metadataResult.data;
-
-    if (this.dependencies.policyService?.isEnforced()) {
-      if (!this.dependencies.policyService.isRuntimeAllowed(metadata.runtimeConfig)) {
-        return {
-          type: "finished",
-          result: Err({
-            type: "policy_denied",
-            message: "Workspace runtime is not allowed by policy",
-          }),
-        };
-      }
-    }
+    // Side chats share the main checkout: metadata, never a caller opt-in, imposes the
+    // local-read ceiling so agent/caller configuration cannot grant mutating capabilities.
+    const capabilityGrants = sideChatCapabilityGrants(metadata);
+    const isSideChat = capabilityGrants != null;
     const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
     const logSlowStreamStartup = (details: Record<string, unknown>): void => {
-      const totalMs = Date.now() - startTime;
+      const totalMs = this.hostClock.nowMs() - startTime;
       if (totalMs < STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS) {
         return;
       }
@@ -1400,7 +2240,7 @@ export class TurnRequestBuilder {
         startupStage,
         phase: breadcrumb.phase,
         detail: breadcrumb.detail,
-        elapsedMs: Date.now() - startTime,
+        elapsedMs: this.hostClock.nowMs() - startTime,
       });
       if (!context.admissionOnly)
         this.dependencies.emit("runtime-status", {
@@ -1426,7 +2266,7 @@ export class TurnRequestBuilder {
     // Wait for init to complete before any runtime I/O operations
     // (SSH/devcontainer may not be ready until init finishes pulling the container)
     emitStartupBreadcrumb("waiting_for_init");
-    const waitForInitStartedAt = Date.now();
+    const waitForInitStartedAt = this.hostClock.nowMs();
     await this.dependencies.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
     recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
     // Metadata was read before the wait: a checkout whose launch sanitize failed meanwhile
@@ -1452,7 +2292,7 @@ export class TurnRequestBuilder {
     // For Coder workspaces, this may start a stopped workspace and wait for it.
     // If init failed during container creation, ensureReady() will return an error.
     emitStartupBreadcrumb("checking_runtime");
-    const ensureReadyStartedAt = Date.now();
+    const ensureReadyStartedAt = this.hostClock.nowMs();
     const readyResult = await runtime.ensureReady({
       signal: combinedAbortSignal,
       statusSink: (status) => {
@@ -1489,98 +2329,50 @@ export class TurnRequestBuilder {
     // project-scope listing sees a running runtime (a stopped Docker/remote
     // workspace would yield an empty/partial context, and AgentSession caches
     // the result per model/session segment).
-    // Flush turns only ever see the context notes (index and preload): other memories must
-    // not be disclosed to, or laundered through, the hidden prompt-influenced turn.
     const memoryContext = resolveMemoryContext
-      ? await resolveMemoryContext(modelString, {
-          includeHotMemories: false,
-          onlyContextNotes: contextBudgetFlushTurn,
-        })
+      ? await resolveMemoryContext(modelString)
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
-    const advisorExperimentEnabled =
-      experiments?.advisorTool ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL) ===
-        true;
-    const dynamicWorkflowsExperimentEnabled =
-      experiments?.dynamicWorkflows ??
-      this.dependencies.experimentsService?.isExperimentEnabled(
-        EXPERIMENT_IDS.DYNAMIC_WORKFLOWS
-      ) === true;
-    const memoryExperimentEnabled =
-      experiments?.memory ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
-    const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
-      this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
-    const sessionHistoryEnabled =
-      experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET);
-    const timelineExperimentEnabled =
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
-    const workspaceHeartbeatsExperimentEnabled =
-      experiments?.workspaceHeartbeats ??
-      this.dependencies.experimentsService?.isExperimentEnabled(
-        EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
-      ) === true;
-    const toolSearchExperimentEnabled =
-      experiments?.toolSearch ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) ===
-        true;
-    const memoryIntuitionExperimentEnabled =
-      experiments?.memoryIntuition ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
-        true;
-    const memoryHotSetExperimentEnabled =
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) ===
-      true;
-    // claude-skills-compat is host-evaluated (like memory-hot-set): sub-agents share the
-    // host ExperimentsService, so it is not inherited through SendMessageOptions.experiments.
+    const memoryExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.MEMORY);
+    const sessionHistoryEnabled = experiments.tokenBudget;
+    // Tool search is a host-level user setting (default on); sub-agents and CLI
+    // runs follow the same config.
+    const toolSearchEnabled = cfg.toolSearchEnabled !== false;
+    const artifactsExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS);
     const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
-    const agentPluginsExperimentEnabled = this.dependencies.isAgentPluginsEnabled();
-    // Once final tool policy keeps the memory tool, upgrade the index-only
-    // memory context (resolved pre-policy with includeHotMemories: false) to
-    // the token-budgeted hot block for the model that will actually stream.
-    // Returns the unchanged pre-policy `memoryContext` reference when hot
-    // preloading is off or the memory tool was stripped, so callers can use
-    // identity comparison to decide whether the system prompt must be rebuilt.
-    const upgradeMemoryContextForModel = async (
-      memoryToolAvailableForModel: boolean,
-      modelStringForContext: string
-    ): Promise<MemorySessionContext | undefined> =>
-      memoryToolAvailableForModel &&
-      memoryHotSetExperimentEnabled &&
-      resolveMemoryContext !== undefined
-        ? await resolveMemoryContext(modelStringForContext, {
-            includeHotMemories: true,
-            onlyContextNotes: contextBudgetFlushTurn,
-          })
-        : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
     const agentDefinitionCache = new AgentDefinitionRequestCache();
-    const resolveAgentForStreamStartedAt = Date.now();
+    const projectSecrets = workspaceSecrets(
+      metadata,
+      this.dependencies.secretsStore,
+      this.dependencies.config
+    );
+    // Bash and the file tools get these too, so the agent definition and instruction reads
+    // follow the same sandbox.
+    const projectSecretsRecord = await secretsToRecord(projectSecrets);
+    const resolveAgentForStreamStartedAt = this.hostClock.nowMs();
     const agentResult = await resolveAgentForStream({
       workspaceId,
       metadata,
       runtime,
       workspacePath,
+      runtimeFactory: this.dependencies.runtimeFactory,
       requestedAgentId: agentId,
       strictAgentResolution,
+      // Goal kind survives retries, restart resumes and compaction follow-ups (#5402).
+      automaticGoalTurn: goalTurnKind != null,
       disableWorkspaceAgents: disableWorkspaceAgents ?? false,
-      // Flush turns get the memory-only ceiling here, independent of caller options, so a
-      // resumed or retried stream cannot widen the hidden turn's toolset.
-      callerToolPolicy: contextBudgetFlushTurn
-        ? withContextBudgetFlushToolPolicy(toolPolicy)
-        : toolPolicy,
+      callerToolPolicy: toolPolicy,
       cfg,
       emitError: (event) => {
         if (!context.admissionOnly) this.dependencies.emit("error", event);
         onPreStartError?.(event);
       },
-      isAdvisorExperimentEnabled: advisorExperimentEnabled,
-      includeAgentPlugins: agentPluginsExperimentEnabled,
       agentDefinitionCache,
+      sandboxEnv: projectSecretsRecord,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
     if (!agentResult.success) {
@@ -1593,13 +2385,31 @@ export class TurnRequestBuilder {
       agentDiscoveryPath,
       isSubagentWorkspace,
       agentInheritanceChain,
+      agentAiSettingsChain,
       agentIsPlanLike,
       effectiveMode,
       taskSettings,
       taskDepth,
       shouldDisableTaskToolsForDepth,
-      effectiveToolPolicy,
+      effectiveToolPolicy: agentToolPolicy,
+      switchableAgents: resolvedSwitchableAgents,
     } = agentResult.data;
+    agentCacheTtl.value = resolveChainAgentCacheTtl(
+      effectiveAgentId,
+      cfg.agentAiDefaults,
+      agentAiSettingsChain
+    );
+    // Side conversations must not inherit completion requirements for work in the main chat.
+    // Grants cap the tools; keep normal enable/disable policy but never require recovery calls.
+    const effectiveToolPolicy = isSideChat
+      ? agentToolPolicy?.filter((rule) => rule.action !== "require")
+      : agentToolPolicy;
+    const switchableAgents = isSideChat
+      ? resolvedSwitchableAgents?.map((agent) => ({
+          ...agent,
+          toolPolicy: agent.toolPolicy.filter((rule) => rule.action !== "require"),
+        }))
+      : resolvedSwitchableAgents;
     // Explicit summaries remain recovery operations, not token-budget turns.
     // Inspect this request's last effective user row, never an older compact command.
     const latestUserMessage = providerRequestMessages.findLast(
@@ -1609,57 +2419,43 @@ export class TurnRequestBuilder {
       effectiveAgentId === "compact" ||
       muxMetadata?.type === "compaction-request" ||
       latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
+    // Before any request is sent: compaction prompts never extend the chat's prefix, and
+    // the baseline must clear even when the compaction model is not on an Anthropic route.
+    if (isCompactionRequest) promptCacheScope.markCompaction();
+    // The context the request is built from: a cleared or replaced history starts a new baseline.
+    promptCacheScope.setContextEpoch(providerRequestMessages[0]?.id);
     const tokenBudgetEnabled =
       !isCompactionRequest &&
       sessionHistoryEnabled &&
-      !(
-        experiments?.continuousCompaction ??
-        isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)
-      ) &&
-      !isRlmModeEnabled(experiments, isExperimentEnabled);
+      !experiments.continuousCompaction &&
+      !isRlmModeEnabled(isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
-    const agentMemoryAccess = resolveMemoryAccessPolicy({
+    const memoryAccess: MemoryScopeAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,
       editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
     });
-    // Flush turns: keep global/project stores read-only and pin mutations to the notes file
-    // (memoryWritePath below) so injected transcript content cannot reach other memory.
-    const memoryAccess: MemoryScopeAccess = contextBudgetFlushTurn
-      ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace }
-      : agentMemoryAccess;
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping
     // config trust for sub-agent delegation.
     const sharedExecutionTrusted =
       isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) && !projectAutomationDisabled();
-    const agentAdvisorEnabled = resolveAdvisorEnabledForAgent(
-      effectiveAgentId,
-      cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
-    );
-    const advisorModelString = cfg.advisorModelString?.trim() ?? "";
-    const advisorToolEligible =
-      advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
-
-    // Goals graduated to GA: tools are gated solely on the workspace's
-    // current goal status + agent capability, not on an experiment flag.
-    let currentGoalForTools: GoalRecordV1 | null = null;
-    if (workspaceGoalService) {
-      currentGoalForTools = await workspaceGoalService.getGoal(workspaceId);
-    }
     const effectiveGoalDefaults = mergeGoalDefaults(
       normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
       metadata.goalDefaults ?? null
     );
-    const goalToolAvailability = getGoalToolAvailability({
-      goalStatus:
-        opts.prospectiveGoalStatusForToolAvailability !== undefined
-          ? opts.prospectiveGoalStatusForToolAvailability
-          : (currentGoalForTools?.status ?? null),
+    // Goal tools are registered whenever a goal service exists and gate at
+    // execution time on these per-turn inputs plus the live goal status, so the
+    // tool block does not change when the goal does (prompt caching, #5247).
+    const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
-      allowAgentSetGoal,
-      agentInheritanceChain,
-    });
+      goalTurnKind,
+      ...(goalTurnKind != null && goalTurnGoalId != null ? { goalId: goalTurnGoalId } : {}),
+      agentId: effectiveAgentId,
+      agentIsPlanLike,
+      agentDiscoveryOverridden: disableWorkspaceAgents === true,
+      taskTurnKind,
+    };
 
     // Fetch workspace MCP overrides (for filtering servers and tools)
     // NOTE: Stored in <workspace>/.xum/mcp.local.jsonc (not ~/.xum/config.json).
@@ -1670,7 +2466,9 @@ export class TurnRequestBuilder {
     // overrides" would re-enable a globally enabled server that only the
     // unreadable document disables.
     let mcpOverridesAuthoritative = false;
-    const loadWorkspaceMcpOverridesStartedAt = Date.now();
+    const loadWorkspaceMcpOverridesStartedAt = this.hostClock.nowMs();
+    // Wall clock: MCPServerManager subtracts Date.now() from this deadline (#7282).
+    const mcpOverridesReadDeadlineAt = nodeClock.nowMs() + MCP_OVERRIDES_READ_TIMEOUT_MS;
     try {
       // Bounded and cancellable: an inheriting child's resolution probes and
       // reads every ancestor's document on that ancestor's runtime (SSH/Docker
@@ -1679,7 +2477,11 @@ export class TurnRequestBuilder {
       // read (see above), never authoritative empty overrides.
       const read = await this.dependencies.workspaceMcpOverridesService.getOverridesForWorkspace(
         workspaceId,
-        { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal: combinedAbortSignal }
+        {
+          timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+          signal: combinedAbortSignal,
+          clock: this.hostClock,
+        }
       );
       mcpOverrides = read.overrides;
       mcpOverridesAuthoritative = read.authoritative;
@@ -1708,21 +2510,23 @@ export class TurnRequestBuilder {
       ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
       : null;
 
-    // Tier-1 plugin hooks (agent-plugins experiment): reconcile discovered
-    // hooks.js modules with the event spine BEFORE request assembly so both
-    // request.assemble and tool.execute middleware are in place for this
-    // turn. Failure posture: a broken plugin never blocks a send.
+    // Tier-1 plugin hooks: reconcile discovered hooks.js modules with the
+    // event spine BEFORE request assembly so both request.assemble and
+    // tool.execute middleware are in place for this turn. Failure posture: a
+    // broken plugin never blocks a send.
     if (!requestAssemblySnapshot) {
       await prepareWorkspaceRequestHooks({
         config: this.dependencies.config,
         metadata,
         hostCheckoutRoot,
         journal: this.dependencies.durableEventJournalFor(workspaceId),
-        enabled: this.dependencies.isAgentPluginsEnabled(),
+        mcpServerManager: this.dependencies.bindings.mcpServerManager,
+        hostFiles: this.dependencies.hostServices.hostFiles,
+        hostPaths: this.dependencies.hostServices.hostPaths,
       });
     }
 
-    const listMcpServersStartedAt = Date.now();
+    const listMcpServersStartedAt = this.hostClock.nowMs();
     // The system prompt's MCP inventory. When the override read was not
     // authoritative, a listing built from the fallback overrides could
     // advertise servers the manager's serve excludes (it re-reads disk and
@@ -1730,7 +2534,7 @@ export class TurnRequestBuilder {
     // case the inventory is rebuilt below from the overrides the validated
     // serve actually used, or omitted entirely when the serve failed closed.
     let mcpServers =
-      this.dependencies.bindings.mcpServerManager && mcpOverridesAuthoritative
+      !isSideChat && this.dependencies.bindings.mcpServerManager && mcpOverridesAuthoritative
         ? await this.dependencies.bindings.mcpServerManager.listServers(
             metadata.projectPath,
             mcpOverrides,
@@ -1740,7 +2544,7 @@ export class TurnRequestBuilder {
         : undefined;
     recordStartupPhaseTiming("listMcpServersMs", listMcpServersStartedAt);
 
-    const loadAdditionalSystemContextStartedAt = Date.now();
+    const loadAdditionalSystemContextStartedAt = this.hostClock.nowMs();
     let workspaceAdditionalSystemContext = additionalSystemContext;
     if (workspaceAdditionalSystemContext == null) {
       try {
@@ -1748,7 +2552,11 @@ export class TurnRequestBuilder {
         // `effectiveAdditionalSystemContext` honors the `enabled` toggle: when
         // the user has disabled the scratchpad, the persisted content is
         // intentionally not injected.
-        const record = await readAdditionalSystemContext(this.dependencies.config, workspaceId);
+        const record = await readAdditionalSystemContext(
+          this.dependencies.config,
+          workspaceId,
+          this.dependencies.historyService.files
+        );
         workspaceAdditionalSystemContext = effectiveAdditionalSystemContext(record);
       } catch (error) {
         // The scratchpad is user-editable state, so a transient read failure should not block a send.
@@ -1759,20 +2567,42 @@ export class TurnRequestBuilder {
         workspaceAdditionalSystemContext = "";
       }
     }
-    const scratchpadAdditionalSystemInstructions = mergeAdditionalSystemInstructions(
-      workspaceAdditionalSystemContext,
-      additionalSystemInstructions
+    // Side chats get their guardrails on every turn (including retries and resumes), so they do
+    // not depend on the renderer remembering to send them.
+    const scratchpadAdditionalSystemInstructions = withSideChatInstructions(
+      metadata,
+      mergeAdditionalSystemInstructions(
+        workspaceAdditionalSystemContext,
+        additionalSystemInstructions
+      )
     );
     recordStartupPhaseTiming("loadAdditionalSystemContextMs", loadAdditionalSystemContextStartedAt);
 
     // Build plan-aware instructions and determine plan→exec transition content.
     // IMPORTANT: Derive this from the same boundary-sliced message payload that is sent to
     // the model so plan hints/handoffs cannot be suppressed by pre-boundary history.
-    const buildPlanInstructionsStartedAt = Date.now();
+    const buildPlanInstructionsStartedAt = this.hostClock.nowMs();
+    // Where the plan lives (planLocation.ts). On SSH it needs this installation's identity
+    // (#5174); an unusable identity file fails the turn with its repair instructions. Loaded once
+    // for the turn, so this plan path and the ancestor paths listed below use one identity even if
+    // the identity file is replaced meanwhile.
+    const installationId = usesInstallationScopedPlans(metadata.runtimeConfig)
+      ? await this.dependencies.config.getInstallationId()
+      : undefined;
+    const planLocation = await resolvePlanFileLocation(
+      installationId === undefined
+        ? this.dependencies.config
+        : withInstallationId(this.dependencies.config, installationId),
+      runtime,
+      { ...metadata, id: workspaceId },
+      this.dependencies.historyService.locks
+    );
     const { effectiveAdditionalInstructions, planFilePath, planContentForTransition } =
       await buildPlanInstructions({
         runtime,
+        runtimeFactory: this.dependencies.runtimeFactory,
         metadata,
+        planLocation,
         workspaceId,
         workspacePath,
         effectiveMode,
@@ -1786,6 +2616,8 @@ export class TurnRequestBuilder {
         taskSettings,
         requestPayloadMessages: providerRequestMessages,
         agentDefinitionCache,
+        // #6426: from this turn's loaded config (no extra read).
+        projectPluginsTrusted: isWorkspaceProjectTrustedIn(cfg.projects, metadata),
       });
     recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
@@ -1800,7 +2632,7 @@ export class TurnRequestBuilder {
       runtime,
       workspacePath,
       xumScope,
-      includeAgentPlugins: this.dependencies.isAgentPluginsEnabled(),
+      runtimeFactory: this.dependencies.runtimeFactory,
     });
 
     const desktopSessionManager = this.dependencies.bindings.desktopSessionManager;
@@ -1822,46 +2654,87 @@ export class TurnRequestBuilder {
     // below so the prompt never advertises an absent tool.
     const memoryToolEligible =
       memoryExperimentEnabled && this.dependencies.bindings.memoryService !== undefined;
-    // Gate and execute the same global-only definition snapshot: edits during
-    // turn assembly must not swap the body after its enablement was checked.
-    const intuitionDefinition =
-      memoryToolEligible && memoryIntuitionExperimentEnabled && !isSubagentWorkspace
-        ? await resolveHeadlessAgentDefinition(this.dependencies.config.rootDir, "intuition")
-        : null;
-    const intuitionToolEligible =
-      intuitionDefinition !== null &&
-      !isAgentEffectivelyDisabled({
-        cfg,
-        agentId: "intuition",
-        resolvedFrontmatter: intuitionDefinition.frontmatter,
+    const runtimeType = getRuntimeType(metadata.runtimeConfig);
+    // The scratch dir lives where commands run: the host session dir for local/worktree, the
+    // remote host or container otherwise (runtimeScratchDir.ts). Undefined leaves
+    // XUM_SCRATCH_DIR unset, e.g. a devcontainer whose daemon cannot see host paths. Remote
+    // scratch dirs need the Artifacts experiment: resolving one is a remote exec, cached per
+    // workspace and runtime config so it is not repeated every turn.
+    const scratchOnHost = runtimeType === "local" || runtimeType === "worktree";
+    let scratchDir: string | undefined;
+    if (scratchOnHost || artifactsExperimentEnabled) {
+      const scratchSpec = await resolveScratchDirSpec({
+        runtimeConfig: metadata.runtimeConfig,
+        workspaceId,
+        sessionsDir: this.dependencies.config.sessionsDir,
+        runtime,
+        multiProject: isMultiProject(metadata),
       });
-    const evaluationService = this.dependencies.bindings.evaluationService;
-    const builtInIntuitionBody = getBuiltInAgentDefinitions().find(
-      (definition) => definition.id === "intuition"
-    )?.body;
-    const intuitionSettings = intuitionToolEligible
-      ? resolveHeadlessAgentSettings(
-          this.dependencies.config,
+      scratchDir =
+        scratchSpec.kind === "host"
+          ? await ensureScratchDirForSpec(
+              runtime,
+              scratchSpec,
+              combinedAbortSignal,
+              this.dependencies.historyService.files
+            )
+          : await this.remoteScratchDirs.ensure({
+              workspaceId,
+              runtimeConfig: metadata.runtimeConfig,
+              runtime,
+              spec: scratchSpec,
+              abortSignal: combinedAbortSignal,
+              files: this.dependencies.historyService.files,
+            });
+    }
+    // Agent interface view: seed the status page the main pane shows before the model runs; the
+    // prompt tells the agent about the page under the same condition.
+    const agentInterfaceTurn = await prepareAgentInterfaceStatusPage({
+      scratchDirSet: scratchDir !== undefined,
+      artifactsEnabled: artifactsExperimentEnabled,
+      agentInterfaceEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+      sideChat: isSideChat,
+      compactionRequest: isCompactionRequest,
+      // Takes its signal per call: the turn-end nudge reads the page after this turn's signal.
+      resolveLocation: (abortSignal) =>
+        resolveArtifactsLocation(
+          this.dependencies.config.sessionsDir,
           workspaceId,
-          "intuition",
-          modelString,
-          intuitionDefinition.frontmatter.ai
-        )
-      : undefined;
+          { ...metadata, namedWorkspacePath: workspacePath },
+          { createRuntime: () => runtime, abortSignal }
+        ),
+      abortSignal: combinedAbortSignal,
+    });
+    const agentInterfaceViewActive = agentInterfaceTurn != null;
+    // Status page agent mode: the main agent sends status_update calls and a host-run agent
+    // edits the page. Eligibility mirrors status_update registration; tool policy may still
+    // strip the tool, which forces a rebuild below so the prompt keeps the classic guidance.
+    const statusPageAgentActive = isStatusPageAgentMode({
+      agentInterfaceView: agentInterfaceViewActive,
+      statusPageAgentEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT),
+      enabledInSettings: isStatusPageAgentEnabledInSettings(cfg),
+      queueAvailable: this.dependencies.bindings.statusPageAgent !== undefined,
+    });
+    discardStatusUpdatesWithoutMode(this.dependencies.bindings.statusPageAgent, workspaceId, {
+      statusPageAgentActive,
+      sideChat: isSideChat,
+      compaction: isCompactionRequest,
+    });
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
     const buildStreamSystemContextForToolset = (
-      toolset: {
-        advisorToolAvailable: boolean;
-        memoryToolAvailable: boolean;
-        intuitionToolAvailable: boolean;
-      },
-      modelStringForSystem: string = modelString,
-      contextForModel: MemorySessionContext | undefined = memoryContext
+      toolset: SystemPromptToolset,
+      modelStringForSystem: string = modelString
     ) =>
       buildStreamSystemContext({
         runtime,
+        runtimeFactory: this.dependencies.runtimeFactory,
+        instructionHost: {
+          files: this.dependencies.hostServices.hostFiles,
+          paths: this.dependencies.hostServices.hostPaths,
+          sandboxEnv: projectSecretsRecord,
+        },
         metadata,
         workspacePath,
         workspaceId,
@@ -1872,36 +2745,31 @@ export class TurnRequestBuilder {
         isSubagentWorkspace,
         effectiveAdditionalInstructions,
         planFilePath,
+        installationId,
         modelString: modelStringForSystem,
         cfg,
         providersConfig: this.dependencies.providerService.getConfig(),
-        mcpServers,
         xumScope,
         loadDesktopCapability,
-        advisorToolAvailable: toolset.advisorToolAvailable,
         memoryToolAvailable: toolset.memoryToolAvailable,
         tokenBudgetEnabled,
         workspaceMemoryWritable: memoryAccess.workspace === "readwrite",
-        intuitionToolAvailable: toolset.intuitionToolAvailable,
-        hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
-        agentPluginsEnabled: agentPluginsExperimentEnabled,
         instructionSources: turnInstructionSources.current,
         agentDefinitionCache,
+        scratchDirSet: scratchDir !== undefined,
+        agentInterfaceView: agentInterfaceViewActive,
+        statusPageAgent: toolset.statusUpdateToolAvailable,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
-    // The final system prompt is rebuilt after policy application so advisor guidance cannot
-    // survive when the resolved toolset strips the advisor tool.
-    const buildStreamSystemContextStartedAt = Date.now();
-    const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
-      advisorToolAvailable: advisorToolEligible,
+    // Rebuild after policy application so guidance only describes available tools.
+    const buildStreamSystemContextStartedAt = this.hostClock.nowMs();
+    const prePolicyToolset: SystemPromptToolset = {
       memoryToolAvailable: memoryToolEligible,
-      intuitionToolAvailable: intuitionToolEligible,
-    });
-    // The MCP inventory the pre-policy context was built with; a later
-    // rebuild from the validated serve makes that context stale.
-    const mcpServersAtPrePolicy = mcpServers;
+      statusUpdateToolAvailable: statusPageAgentActive,
+    };
+    const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset(prePolicyToolset);
     recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
     const {
       agentSystemPromptSections,
@@ -1911,12 +2779,10 @@ export class TurnRequestBuilder {
       instructionSources,
     } = prePolicyStreamSystemContext;
     turnInstructionSources.current = instructionSources;
+    // The agent_skill_read index the tools are built with, found again by the assembler.
+    const skillIndexSection = skillIndexSectionFor(availableSkills);
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
-
-    const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
 
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 
@@ -1926,11 +2792,10 @@ export class TurnRequestBuilder {
     let mcpPromptRuntime: MCPPromptRuntime | undefined;
     let mcpSetupDurationMs = 0;
 
-    // SECURITY: the memory-only flush turn filters every MCP tool out anyway, so never start
-    // repository-configured servers (with project secrets) for this hidden automatic turn.
-    if (this.dependencies.bindings.mcpServerManager && !contextBudgetFlushTurn) {
+    // Do not start external servers for a conversation that can never call their tools.
+    if (!isSideChat && this.dependencies.bindings.mcpServerManager) {
       const mcpServerManager = this.dependencies.bindings.mcpServerManager;
-      const mcpToolSetupStartedAt = Date.now();
+      const mcpToolSetupStartedAt = this.hostClock.nowMs();
       try {
         const result = await mcpServerManager.getToolsForWorkspace(
           {
@@ -1939,6 +2804,7 @@ export class TurnRequestBuilder {
             runtime,
             workspacePath,
             trusted: projectTrusted,
+            runtimeConfig: metadata.runtimeConfig,
             overrides: mcpOverrides,
             overridesAuthoritative: mcpOverridesAuthoritative,
             // A non-authoritative read that exhausted its budget (unreachable
@@ -1947,8 +2813,7 @@ export class TurnRequestBuilder {
             ...(mcpOverridesAuthoritative
               ? {}
               : {
-                  overridesReadDeadlineAt:
-                    loadWorkspaceMcpOverridesStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS,
+                  overridesReadDeadlineAt: mcpOverridesReadDeadlineAt,
                 }),
             projectSecrets: await secretsToRecord(projectSecrets),
             agentPlugins: agentPluginsMcpContext,
@@ -2006,20 +2871,20 @@ export class TurnRequestBuilder {
         mcpServers = undefined;
         workspaceLog.error("Failed to start MCP servers", { error });
       } finally {
-        mcpSetupDurationMs = Date.now() - mcpToolSetupStartedAt;
+        mcpSetupDurationMs = this.hostClock.nowMs() - mcpToolSetupStartedAt;
         startupPhaseTimingsMs.mcpToolSetupMs = mcpSetupDurationMs;
       }
     }
 
-    // Tool search (tool-search experiment): assembly-time gate. The runtime
+    // Tool search (user setting, default on): assembly-time gate. The runtime
     // holder makes getToolsForModel create the tool_catalog_search tool; its `state`
     // is assigned only after policy filtering builds the deferred catalog
     // (see prepareToolSearch below). Without MCP tools there is nothing to
     // defer, so the feature stays fully inactive.
     const toolSearchRuntime: ToolSearchRuntime | undefined =
-      toolSearchExperimentEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
+      !isSideChat && toolSearchEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
 
-    const createTempDirForStreamStartedAt = Date.now();
+    const createTempDirForStreamStartedAt = this.hostClock.nowMs();
     const runtimeTempDir = await this.dependencies.streamManager.createTempDirForStream(
       streamToken,
       runtime
@@ -2031,6 +2896,8 @@ export class TurnRequestBuilder {
         {
           cwd: path.dirname(runtimeTempDir),
           timeout: 10,
+          // Xum code, not agent code: removes Xum's own folder under ~/.xum-tmp.
+          sandbox: "internal",
         }
       );
       if (removed.exitCode !== 0)
@@ -2041,7 +2908,7 @@ export class TurnRequestBuilder {
     };
     recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
 
-    const readToolInstructionsStartedAt = Date.now();
+    const readToolInstructionsStartedAt = this.hostClock.nowMs();
     // Same snapshot as the system message: no second AGENTS.md scan, and the
     // prompt and tool descriptions cannot disagree about file contents.
     const toolInstructions = extractToolInstructionsFromSources(
@@ -2052,127 +2919,34 @@ export class TurnRequestBuilder {
     );
     recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
 
-    // Calculate cumulative session costs for MUX_COSTS_USD env var
-    let sessionCostsUsd: number | undefined;
-    const loadSessionUsageStartedAt = Date.now();
-    if (this.dependencies.sessionUsageService) {
-      const sessionUsage = await this.dependencies.sessionUsageService.getSessionUsage(workspaceId);
-      if (sessionUsage) {
-        const allUsage = sumUsageHistory(Object.values(sessionUsage.byModel));
-        sessionCostsUsd = getTotalCost(allUsage);
-      }
-    }
+    const loadSessionUsageStartedAt = this.hostClock.nowMs();
+    const sessionCostsUsd = await this.loadSessionCostsUsd(workspaceId);
     recordStartupPhaseTiming("loadSessionUsageMs", loadSessionUsageStartedAt);
 
     emitStartupBreadcrumb("loading_tools");
     assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
-    if (advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length === 0) {
-      workspaceLog.warn("Advisor tool enabled for agent without advisorModelString; suppressing", {
-        effectiveAgentId,
-      });
-    }
-    if (advisorToolEligible) {
-      assert(
-        advisorModelString.length > 0,
-        "advisorModelString must be non-empty when advisor is eligible"
-      );
-    }
-    // Mutable ref updated by StreamManager.prepareStep so the advisor tool reads the live
-    // transcript lazily at execute time instead of capturing a stale snapshot here.
-    const advisorTranscriptRef: { messages?: ModelMessage[] } = {};
-    const advisorStepCaptureRef: AdvisorStepCaptureRef = {
-      currentStepText: "",
-      currentStepReasoning: "",
-      frozenSnapshotsByToolCallId: new Map(),
-    };
-    const onAdvisorChunk: StreamTextOnChunk = ({ chunk }) => {
-      switch (chunk.type) {
-        case "text-delta": {
-          // Providers/SDKs can stream advisor text deltas under different field names.
-          const chunkText = extractChunkDeltaText(chunk as Record<string, unknown>, [
-            "textDelta",
-            "delta",
-            "text",
-          ]);
-          if (chunkText.length > 0) {
-            advisorStepCaptureRef.currentStepText += chunkText;
-          }
-          return;
-        }
-        case "reasoning-delta": {
-          // Anthropic signature updates can arrive as reasoning deltas without text.
-          const chunkText = extractChunkDeltaText(chunk as Record<string, unknown>, [
-            "text",
-            "textDelta",
-            "delta",
-          ]);
-          if (chunkText.length > 0) {
-            advisorStepCaptureRef.currentStepReasoning += chunkText;
-          }
-          return;
-        }
-        case "tool-call": {
-          if (chunk.toolName !== "advisor") {
-            return;
-          }
-          const toolCallId = chunk.toolCallId?.trim?.() ?? "";
-          // Skip malformed tool calls defensively — the normal tool-error
-          // path will handle bad input; crashing the stream callback would
-          // be worse than missing the snapshot.
-          if (
-            toolCallId.length === 0 ||
-            !isPlainObject(chunk.input) ||
-            advisorStepCaptureRef.frozenSnapshotsByToolCallId.has(toolCallId)
-          ) {
-            return;
-          }
-          advisorStepCaptureRef.frozenSnapshotsByToolCallId.set(toolCallId, {
-            toolCallId,
-            toolName: "advisor",
-            input: { ...chunk.input },
-            stepText: advisorStepCaptureRef.currentStepText,
-            stepReasoning: advisorStepCaptureRef.currentStepReasoning,
-          });
-          return;
-        }
-        default:
-          return;
-      }
-    };
-    // Normalize: undefined -> default, null -> unlimited, positive int -> exact cap.
-    const advisorMaxUses =
-      cfg.advisorMaxUsesPerTurn === null
-        ? null
-        : (cfg.advisorMaxUsesPerTurn ?? ADVISOR_DEFAULT_MAX_USES_PER_TURN);
-    assert(
-      cfg.advisorMaxOutputTokens == null ||
-        (Number.isInteger(cfg.advisorMaxOutputTokens) && cfg.advisorMaxOutputTokens > 0),
-      "advisorMaxOutputTokens must be null, undefined, or a positive integer"
-    );
-    const advisorMaxOutputTokens =
-      cfg.advisorMaxOutputTokens != null && cfg.advisorMaxOutputTokens > 0
-        ? cfg.advisorMaxOutputTokens
-        : undefined;
-    // Clamp the persisted advisor thinking level so the tool metadata matches the
-    // providerOptions actually sent to generateText().
-    const advisorReasoningLevel = enforceThinkingPolicy(
-      advisorModelString,
-      cfg.advisorThinkingLevel ?? THINKING_LEVEL_OFF,
-      undefined,
-      this.dependencies.providerService.getConfig()
-    );
-    const runtimeType = getRuntimeType(metadata.runtimeConfig);
     const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
       workspaceId,
       modelString,
       thinkingLevel: thinkingLevel ?? "off",
       costsUsd: sessionCostsUsd,
+      scratchDir,
     });
+    Object.assign(
+      xumEnv,
+      await this.bashAiProxyEnv(
+        workspaceId,
+        runtimeType,
+        Object.keys(projectSecretsRecord),
+        sharedExecutionTrusted
+      )
+    );
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
+    const workflowProjectSearchRoot = projectCheckoutRoot ?? workspacePath;
     const workflowService =
-      dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
+      this.dependencies.bindings.taskService != null
         ? new WorkflowService({
             archiveAdmission: requireWorkflowArchiveAdmission(this.dependencies.bindings),
             runStore: new WorkflowRunStore({
@@ -2205,6 +2979,7 @@ export class TurnRequestBuilder {
                 : undefined,
             taskAdapterFactory: (runId, workflowName) =>
               createProductionWorkflowTaskAdapter({
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                 taskService: this.dependencies.bindings.taskService!,
                 parentWorkspaceId: workspaceId,
                 workflowRunId: runId,
@@ -2217,23 +2992,33 @@ export class TurnRequestBuilder {
                   runtimeTempDir,
                   workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
                   trusted: getWorkflowProjectTrusted(),
+                  sessionLocks: this.dependencies.historyService.locks,
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
-                experiments: {
-                  ...experiments,
-                  dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-                  workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-                },
               }),
+            // A nested workflow's path comes from the script, which an agent can write.
             resolveWorkflowScript: (scriptPath) =>
               resolveWorkflowScript({
                 scriptPath,
                 runtime,
                 workspacePath,
-                projectSearchRoot: projectCheckoutRoot ?? workspacePath,
+                projectSearchRoot: workflowProjectSearchRoot,
                 projectTrusted: getWorkflowProjectTrusted(),
-                includeAgentPlugins: this.dependencies.isAgentPluginsEnabled(),
                 skillStorageContext: workflowSkillStorageContext,
+                runtimeFactory: this.dependencies.runtimeFactory,
+                sandboxGate: lazyFileToolSandboxGate(runtime, workspacePath, {
+                  env: projectSecretsRecord,
+                }),
+              }),
+            assertStoredPluginWorkflowReviewed: (stored) =>
+              assertStoredPluginWorkflowReviewed({
+                ...stored,
+                runtime,
+                workspacePath,
+                projectSearchRoot: workflowProjectSearchRoot,
+                projectTrusted: getWorkflowProjectTrusted(),
+                skillStorageContext: workflowSkillStorageContext,
+                runtimeFactory: this.dependencies.runtimeFactory,
               }),
             // Background workflow tools outlive the model turn that started them. Feed the
             // terminal result back as a hidden user turn so the parent agent continues
@@ -2278,7 +3063,7 @@ export class TurnRequestBuilder {
                 );
                 if (!invocationCurrent) {
                   if (this.dependencies.isStreaming(workspaceId)) {
-                    await waitForWorkflowContinuationRetry();
+                    await waitForWorkflowContinuationRetry(this.hostClock);
                     continue;
                   }
                   log.debug("Skipping superseded workflow continuation", { workspaceId, runId });
@@ -2295,15 +3080,13 @@ export class TurnRequestBuilder {
                     // continuation does not silently drop back to standard.
                     reasoningMode,
                     agentId: effectiveAgentId,
-                    toolPolicy: effectiveToolPolicy,
+                    // The caller's policy, not the composed one: the continuation
+                    // re-resolves the agent, and agent rules sent as caller rules
+                    // would refuse with the caller's text.
+                    toolPolicy,
                     additionalSystemInstructions: scratchpadAdditionalSystemInstructions,
                     maxOutputTokens,
                     providerOptions: effectiveMuxProviderOptions,
-                    experiments: {
-                      ...experiments,
-                      dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-                      workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-                    },
                     skipAiSettingsPersistence: true,
                     muxMetadata: {
                       type: WORKFLOW_RESULT_METADATA_TYPE,
@@ -2333,7 +3116,7 @@ export class TurnRequestBuilder {
                   });
                   return;
                 }
-                await waitForWorkflowContinuationRetry();
+                await waitForWorkflowContinuationRetry(this.hostClock);
               }
             },
             getCurrentProjectTrusted: () =>
@@ -2342,106 +3125,57 @@ export class TurnRequestBuilder {
           })
         : undefined;
 
-    // Create assistant message ID early so tool-side usage reporting and nested tool events
-    // stay scoped to this specific assistant turn. The placeholder is appended to history below
+    // Create assistant message ID early so nested tool events stay scoped to this specific
+    // assistant turn. The placeholder is appended to history below
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
+    this.recordAgentInterfaceTurn(workspaceId, assistantMessageId, agentInterfaceTurn, {
+      subagentWorkspace: isSubagentWorkspace,
+      planLike: agentIsPlanLike,
+      // The same rule the prompt follows, so the nudge asks for what the prompt told the agent.
+      statusPageAgent: statusUpdateUsable(statusPageAgentActive, effectiveToolPolicy),
+    });
+    this.recordArtifactPublishTurn(workspaceId, assistantMessageId, {
+      planLike: agentIsPlanLike,
+      toolPolicy: effectiveToolPolicy,
+    });
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
-    // Share creation-time provider/pricing snapshots for both headless tools.
-    const createToolModel = async (ms: string, toolThinkingLevel?: ThinkingLevel) => {
-      const toolModelString = ms.trim();
-      assert(
-        toolModelString.length > 0,
-        "tool model string must be non-empty when creating a tool model"
-      );
-      const created = await this.dependencies.providerModelFactory.createModelWithPinnedOptions(
-        toolModelString,
-        { thinkingLevel: toolThinkingLevel, workspaceId, agentInitiated: true }
-      );
-      if (!created.success) {
-        throw new Error(`Failed to create tool model: ${getErrorMessage(created.error)}`);
-      }
-      return created.data;
-    };
+    // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
+    // One object for every attempt: each attempt sets the model it streams with, so a refusal
+    // fallback's tool calls, and the host-side hook config built once below (kernel file loads),
+    // report the fallback model (Codex PRRT_kwDOPxxmWM6sXvVm).
+    const hookTurn = { turnId: assistantMessageId, model: modelString };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
       cwd: workspacePath,
+      clock: this.hostClock,
+      hookTurn,
       runtime,
       projects: getProjects(metadata),
-      secrets: await secretsToRecord(projectSecrets),
+      secrets: projectSecretsRecord,
       xumEnv,
       runtimeTempDir,
-      ...(advisorToolEligible
-        ? {
-            advisorRuntime: {
-              advisorModelString,
-              reasoningLevel: advisorReasoningLevel,
-              reasoningMode: cfg.advisorReasoningMode,
-              maxUsesPerTurn: advisorMaxUses,
-              maxOutputTokens: advisorMaxOutputTokens,
-              getTranscriptSnapshot: () => {
-                const messages = advisorTranscriptRef.messages;
-                assert(
-                  messages != null,
-                  "advisor transcript ref must be populated before advisor execution"
-                );
-                return messages;
-              },
-              takeToolCallSnapshot: (toolCallId) => {
-                const normalizedToolCallId = toolCallId.trim();
-                assert(normalizedToolCallId.length > 0, "advisor toolCallId must be non-empty");
-                const snapshot =
-                  advisorStepCaptureRef.frozenSnapshotsByToolCallId.get(normalizedToolCallId);
-                if (snapshot == null) {
-                  return undefined;
-                }
-                const didDelete =
-                  advisorStepCaptureRef.frozenSnapshotsByToolCallId.delete(normalizedToolCallId);
-                assert(didDelete, "advisor tool-call snapshot must be deleted when consumed");
-                assert(snapshot.toolName === "advisor", "advisor snapshot must belong to advisor");
-                return snapshot;
-              },
-              createModel: createToolModel,
-              abortSignal: combinedAbortSignal,
-            },
-          }
-        : {}),
-      ...(intuitionSettings
-        ? {
-            intuitionRuntime: {
-              modelString: intuitionSettings.model,
-              thinkingLevel: intuitionSettings.thinkingLevel,
-              maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
-              usesThisTurn: 0,
-              createModel: (ms) => createToolModel(ms, intuitionSettings.thinkingLevel),
-              resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
-              // Evaluation recall replaces only the built-in body's tool loop: a custom
-              // body was written for that loop, and evaluation ignores prompt bodies.
-              ...(evaluationService && intuitionDefinition?.body === builtInIntuitionBody
-                ? {
-                    createEvaluationModel: (ms: string) =>
-                      this.dependencies.providerModelFactory.createEvaluationModel(ms),
-                    evaluationService,
-                  }
-                : {}),
-              abortSignal: combinedAbortSignal,
-            },
-          }
-        : {}),
       ...(toolSearchRuntime ? { toolSearchRuntime } : {}),
       capabilityModelString,
       openaiWireFormat: effectiveMuxProviderOptions?.openai?.wireFormat,
       xaiNativeToolsEnabled: routeProvider === "xai",
+      anthropicNativeWebFetchEnabled: anthropicNativeWebFetchRouteAvailable(
+        modelResult.data.rawModelString,
+        routeProvider,
+        requestProvidersConfig
+      ),
       xaiSearchParameters: effectiveMuxProviderOptions.xai?.searchParameters,
       backgroundProcessManager: this.dependencies.backgroundProcessManager,
+      hasQueuedMessages,
       // Plan agent configuration for plan file access.
       // - read: plan file is readable in all agents (useful context)
       // - write: allowed in all agents; plan agents still lock other edits to the exact plan path
       planFileOnly: agentIsPlanLike,
+      noInteractiveUser: hasNoInteractiveUser(isSubagentWorkspace, toolPolicy),
       emitChatEvent: (event) => {
         // Defensive: tools should only emit events for the workspace they belong to.
         if ("workspaceId" in event && event.workspaceId !== workspaceId) {
@@ -2457,180 +3191,101 @@ export class TurnRequestBuilder {
       workspaceProjectPath: metadata.projectPath,
       workspaceExecutionRootPath: metadata.subProjectPath ?? metadata.projectPath,
       workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+      artifactShelfRoot: getArtifactShelfRoot(this.dependencies.config.rootDir),
       planFilePath,
       ancestorPlanFilePaths,
       workspaceId,
       agentId: effectiveAgentId,
       strictAgentResolution,
       xumScope,
-      timelineService: timelineExperimentEnabled
-        ? this.dependencies.bindings.timelineService
-        : undefined,
-      workspaceHeartbeatService: this.dependencies.bindings.workspaceHeartbeatService,
+      timelineService: this.dependencies.bindings.timelineService,
+      statusPageAgent: this.dependencies.bindings.statusPageAgent,
+      statusPageAgentActive,
+      desktopNotifications: this.dependencies.hostServices.desktopNotifications,
+      sessionLocks: this.dependencies.historyService.locks,
+      sessionFiles: this.dependencies.historyService.files,
+      runtimeFactory: this.dependencies.runtimeFactory,
+      hostFiles: this.dependencies.hostServices.hostFiles,
+      hostPaths: this.dependencies.hostServices.hostPaths,
+      // Agent-scheduled heartbeats start paid turns unattended, so they are user opt-in.
+      workspaceHeartbeatService:
+        this.dependencies.config.loadConfigOrDefault().agentHeartbeatsEnabled === true
+          ? this.dependencies.bindings.workspaceHeartbeatService
+          : undefined,
       workflowService,
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
       goalKickoffModel: modelString,
-      enableGoalTools: goalToolAvailability,
+      statusUpdateFallbackModel: modelString,
+      goalToolContext,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
-      // RLM family messaging: gate on the flags persisted on the task record at
-      // spawn — NOT the live send-options experiments — so a child spawned under RLM
-      // keeps task_message_parent/task_message_sibling across app restarts and
-      // frontend experiment toggles. Uses the full RLM predicate (rlm AND a PTC
-      // parent) rather than the bare rlm bit: the hidden sub-flag can stay true
-      // after its parent is disabled, and such children run outside RLM. Workflow-
-      // owned workers are excluded: they hand results to WorkflowRunner through the
+      scratchWorkspace: metadata.kind === "scratch",
+      // Workflow-owned workers are excluded: they hand results to WorkflowRunner through the
       // journal path.
       enableFamilyMessaging:
         Boolean(metadata.parentWorkspaceId) &&
         metadata.workflowTask == null &&
-        isRlmModeEnabled(
-          findWorkspaceEntry(cfg, workspaceId)?.workspace.taskExperiments,
-          undefined
-        ),
+        isRlmModeEnabled(isExperimentEnabled),
       workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
       allowLegacyInvalidWorkflowAgentOutputSchema,
       recordFileState,
       recordProposedPlan,
-      reportModelUsage: (event) => {
-        try {
-          const eventModel = event.model.trim();
-          assert(eventModel.length > 0, "tool model usage event model must be non-empty");
-          // Persist tool-side model usage under its own model bucket so session costs keep
-          // advisor/system-side pricing separate from the parent chat model.
-          const providerMetadata = event.providerMetadata;
-          // Prefer the creation-time identity captured when the tool model
-          // was created; models not created through the tool runtime fall
-          // back to live resolution (their identity is not coder-scoped).
-          const pinnedMetadataModel = event.metadataModel;
-          const metadataModel =
-            pinnedMetadataModel ??
-            resolveModelForMetadata(eventModel, this.dependencies.providerService.getConfig());
-          this.dependencies.streamManager.recordToolModelUsage(workspaceId, assistantMessageId, {
-            toolName: event.toolName,
-            toolCallId: event.toolCallId,
-            timestamp: event.timestamp,
-            model: eventModel,
-            metadataModel,
-            usage: event.usage,
-            ...(providerMetadata != null ? { providerMetadata } : {}),
-          });
-          void (async () => {
-            try {
-              if (!this.dependencies.sessionUsageService) {
-                return;
-              }
-              const displayUsage = createDisplayUsage(
-                event.usage,
-                eventModel,
-                providerMetadata,
-                metadataModel
-              );
-              if (!displayUsage) {
-                return;
-              }
-              // Ledger keys resolve Coder identities to their record-time
-              // metadata identity — the CREATION-TIME pin when available,
-              // mirroring StreamManager.recordSessionUsage. Non-coder
-              // models keep the canonical key (their metadata identity can
-              // be a mappedToModel pricing alias, not the ledger bucket).
-              const canonicalModel =
-                eventModel.startsWith("coder:") && pinnedMetadataModel
-                  ? pinnedMetadataModel
-                  : normalizeUsageModelKey(
-                      eventModel,
-                      this.dependencies.providerService.getConfig()
-                    );
-              await this.dependencies.sessionUsageService.recordUsage(
-                workspaceId,
-                canonicalModel,
-                displayUsage
-              );
-              this.dependencies.emit("session-usage-delta", {
-                type: "session-usage-delta" as const,
-                workspaceId,
-                sourceWorkspaceId: workspaceId,
-                byModelDelta: { [canonicalModel]: displayUsage },
-                timestamp: Date.now(),
-              });
-            } catch (error) {
-              log.warn("Failed to record tool model usage", {
-                error,
-                workspaceId,
-                toolName: event.toolName,
-                model: event.model,
-              });
-            }
-          })();
-        } catch (error) {
-          log.warn("Failed to record tool model usage", {
-            error,
-            workspaceId,
-            toolName: event.toolName,
-            model: event.model,
-          });
-        }
-      },
       onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
       taskService: this.dependencies.bindings.taskService,
       workspaceTurnManager: this.dependencies.bindings.workspaceTurnManager,
-      // models_list: same pipeline as the composer picker, read from live backend
-      // state on every call (the tool object outlives config edits). Models are
+      // Read live backend state on every call (the tool object outlives config edits). Models are
       // resolved on the Xum host, so this is the source even for SSH workspaces.
       listAvailableModels: () => {
         const appConfig = this.dependencies.config.loadConfigOrDefault();
-        const policy = this.dependencies.policyService;
-        const enforced = policy?.isEnforced() === true;
-        const effectivePolicy = enforced ? (policy?.getEffectivePolicy() ?? null) : null;
-        // Enforcement without an effective policy is the "blocked" state, where
-        // PolicyService denies every model. Shared filtering reads a null policy as
-        // "unenforced", so advertise nothing rather than every configured model.
-        if (enforced && effectivePolicy == null) {
-          return [];
-        }
         return listAvailableModels(
           {
             providersConfig: this.dependencies.providerService.getConfig(),
-            hiddenModels: appConfig.hiddenModels ?? [...DEFAULT_HIDDEN_MODELS],
             routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
             routeOverrides: appConfig.routeOverrides ?? {},
-            effectivePolicy,
           },
           (raw, reason) => log.debug(`[models_list] skipped ${raw}: ${reason}`)
         );
       },
       analyticsService: this.dependencies.bindings.analyticsService,
       desktopSessionManager: this.dependencies.bindings.desktopSessionManager,
+      computerUseService: this.dependencies.bindings.computerUseService,
       // Agent memory (memory experiment): per-scope write policy derived from
       // the agent class (exec-like / plan-like / read-only). Project memory is
       // host-local under xumHome, keyed by the stable project identity.
       historyService: this.dependencies.historyService,
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
-      ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
+      memoryScopes: resolveMemoryScopes(tokenBudgetEnabled),
       contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
         ...experiments,
-        dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
         memory: memoryExperimentEnabled,
-        timeline: timelineExperimentEnabled,
-        workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-        toolSearch: toolSearchExperimentEnabled,
+        artifacts: artifactsExperimentEnabled,
         claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
-        agentPlugins: agentPluginsExperimentEnabled,
       },
       // Dynamic context for tool descriptions (moved from system prompt for better model attention)
       availableSubagents: agentDefinitions,
       availableSkills,
+      // Built once per turn (refusal-fallback rebuilds reuse this config) from the
+      // context window, so path-scoped skills surface once per window.
+      pathSkillActivation: createPathSkillActivation({
+        skills: availableSkills,
+        messages: activeContextMessages,
+        // The first request after compaction re-injects loaded skills from this
+        // attachment, outside history: those skills need no pointer either.
+        loadedSkillNames: loadedSnapshotSkillNames(postCompactionAttachments),
+        cwd: workspacePath,
+        runtime,
+      }),
       mcpPromptRuntime,
       // Session-segment memory index advertised in the memory tool
       // description (same disclosure mechanic as skills).
       memoryIndexEntries: memoryContext?.indexEntries,
-      // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
-      // Flush turns never run repository tool hooks around their pinned memory write.
-      trusted: sharedExecutionTrusted && !contextBudgetFlushTurn,
+      // Even a permitted read tool must not run mutating repo tool_pre/tool_post scripts.
+      // Ordinary chats retain the existing shared-runtime trust gate.
+      trusted: !isSideChat && sharedExecutionTrusted,
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
@@ -2641,15 +3296,65 @@ export class TurnRequestBuilder {
       cwd: toolsForModelConfig.cwd,
       runtime: toolsForModelConfig.runtime,
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
+      sandbox: fileToolSandboxContext(toolsForModelConfig),
     });
-    const ptcEnabled = experiments?.programmaticToolCalling === true;
-    const mcpWarningPrefix = mcpStats
-      ? formatMcpWarningPrefix(mcpStats.failedServerCount, mcpStats.failedServerNames)
+    const ptcEnabled = !isSideChat && experiments.programmaticToolCalling;
+    const mcpWarningSection = mcpStats
+      ? formatMcpWarningSection(mcpStats.failedServerCount, mcpStats.failedServerNames)
       : undefined;
-    if (mcpWarningPrefix != null) {
+    // The MCP server list is volatile too (the final inventory, after validation): its
+    // change goes through the volatile-tail rows instead of rewriting the cached prompt.
+    const mcpContextSection = formatMcpContextSection(mcpServers);
+    // join() reads an absent section as "".
+    const mcpSections = [mcpContextSection, mcpWarningSection].join("");
+    if (mcpWarningSection != null) {
       workspaceLog.warn("MCP servers failed to start", {
         failedNames: mcpStats?.failedServerNames.join(", "),
       });
+    }
+    // SECURITY AUDIT: MCP Apps model context (ui/update-model-context) is view output, i.e.
+    // untrusted text from an MCP server, sent to the model. It is a request-only user-role row
+    // placed right before the newest user row (assemblePromptPayload). At the provider,
+    // mergeConsecutiveUserMessages joins the two, so the newest user message starts with the
+    // labeled <mcp-app-context> block and the user's text follows it. Never the system prompt:
+    // unlike plugin request.assemble text, no user reviewed it, so it must not outrank tool
+    // results, and a view update must not change the cached system prefix. It is never written
+    // to chat.jsonl. It goes in only (1) for servers this turn actually enabled (the validated
+    // inventory above; none when the serve failed closed), (2) attributed to the server and view
+    // named by the view's result record, inside the block, whose text cannot close a <view> or
+    // the block, so nothing after the host's own closing tag can pose as the user's text, and
+    // (3) after a durable hook-context row, so "model-visible => logged" holds.
+    // Each view's latest update replaces its previous one in the store, so only the last update
+    // before this request is sent. It is kept for later turns too, not cleared on use: the spec
+    // says "This context will be used in future turns" (MCP Apps 2026-01-26).
+    let mcpAppContextMessage: MuxMessage | undefined;
+    if (!isSideChat && mcpServers !== undefined && this.dependencies.bindings.mcpServerManager) {
+      const enabledServers = new Set(
+        Object.entries(mcpServers)
+          .filter(([, info]) => !info.disabled)
+          .map(([name]) => name)
+      );
+      try {
+        const section = formatMcpAppModelContextSection(
+          await this.dependencies.bindings.mcpServerManager.getMcpAppModelContexts(workspaceId),
+          enabledServers
+        );
+        if (section !== undefined) {
+          await this.dependencies
+            .durableEventJournalFor(workspaceId)
+            .publishWithBlob(section, (blobHash) => ({
+              workspaceId,
+              kind: "hook-context",
+              data: { hookId: "mcp-apps:model-context", placement: "user-context", blobHash },
+            }));
+          mcpAppContextMessage = createMuxMessage("mcp-app-context", "user", section, {
+            synthetic: true,
+          });
+        }
+      } catch (error) {
+        // Self-healing: an unreadable store or journal drops the context, never the turn.
+        workspaceLog.warn("Dropping MCP Apps model context from the request", { error });
+      }
     }
 
     type ModelSeed = typeof modelResult.data;
@@ -2665,6 +3370,7 @@ export class TurnRequestBuilder {
       cleanupModelOnError?: boolean;
     }) => {
       const { seed } = options;
+      hookTurn.model = seed.rawModelString;
       try {
         const attemptProviderRequestMessages =
           options.providerRequestMessages ??
@@ -2674,17 +3380,24 @@ export class TurnRequestBuilder {
             seed.effectiveThinkingLevel
           ).providerRequestMessages;
 
-        const getToolsStartedAt = Date.now();
+        const getToolsStartedAt = this.hostClock.nowMs();
         const allTools = await getToolsForModel(
           seed.toolsModelString,
           {
             ...toolsForModelConfig,
+            hookTurn: { ...hookTurn },
             capabilityModelString: seed.capabilityModelString,
             // Per attempt: a fallback model that calls set_goal must price and
             // kick off the goal on itself, not on the primary it replaced.
             goalKickoffModel: seed.rawModelString,
+            statusUpdateFallbackModel: seed.rawModelString,
             openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
             xaiNativeToolsEnabled: seed.routeProvider === "xai",
+            anthropicNativeWebFetchEnabled: anthropicNativeWebFetchRouteAvailable(
+              seed.rawModelString,
+              seed.routeProvider,
+              seed.providersConfig
+            ),
           },
           workspaceId,
           this.dependencies.initStateManager,
@@ -2695,38 +3408,73 @@ export class TurnRequestBuilder {
           recordStartupPhaseTiming("getToolsForModelMs", getToolsStartedAt);
         }
 
-        const applyPolicyStartedAt = Date.now();
+        const applyPolicyStartedAt = this.hostClock.nowMs();
         let attemptTools = await applyToolPolicyAndExperiments({
+          capabilityGrants,
           allTools: this.dependencies.wrapToolsForDelegation(
             workspaceId,
             withExecutionScope(allTools, executionScope),
             delegatedToolNames
           ),
-          extraTools: this.dependencies.bindings.extraTools,
+          // Runtime extras may shadow a granted built-in name with arbitrary execution.
+          extraTools: isSideChat ? undefined : this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
-          experiments,
+          switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
+          callerToolPolicy: toolPolicy,
+          activeAgentId: effectiveAgentId,
+          // Side chats expose granted reads directly, not an executable PTC/RLM bridge.
+          experiments: isSideChat
+            ? { ...experiments, programmaticToolCalling: false, rlm: false }
+            : experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
             workspaceId,
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
+            locks: this.dependencies.historyService.locks,
+            blocksGlobalWrites: () => agentSandboxCoversTools(toolsForModelConfig),
           },
         });
         if (options.recordTimings) {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
         }
+        // XUM_DISABLE_AGENT_TOOLS: drop every tool here, so tool search, the system prompt and the
+        // context budgets all see the toolless request that StreamManager sends.
+        if (isAgentToolsDisabled()) attemptTools = {};
+        const ptcActive = ptcRanForTools(ptcEnabled, attemptTools);
 
-        // Intuition's internal memory_read must not bypass a policy denying memory.
-        if (attemptTools.memory === undefined) delete attemptTools.intuition;
-
+        // Same predicate and model as the tools cache breakpoint
+        // (applyCacheControlToTools), so "caches the tools block" and "keeps the
+        // tool list stable" cannot disagree (#5250): these attempts use native
+        // Anthropic deferred loading instead of activeTools scoping (#5262).
+        // A request-level beta opt-out also makes the provider strip cache
+        // markers, and must keep defer_loading/tool_reference off the wire too.
+        // Claude models before 4.5 reject both, so they keep scoped search, as do
+        // transforming gateways, which ignore the anthropic providerOptions namespace.
+        // #5253: classify by every switchable agent's require rules, like PTC
+        // promotion, so a tool required in one mode is not deferred in another.
+        const toolSearchPolicy =
+          switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? effectiveToolPolicy;
+        const toolSearchPromptCacheActive =
+          supportsAnthropicCache(seed.rawModelString, seed.providersConfig) &&
+          effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true &&
+          supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "") &&
+          resolveProviderOptionsNamespaceKey(seed.wireProviderName, seed.routeProvider) ===
+            "anthropic";
+        const toolCatalogOverviewMemo = this.toolCatalogOverviewMemo(
+          workspaceId,
+          seed.effectiveModelString
+        );
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
-              ptcEnabled,
+              toolPolicy: toolSearchPolicy,
+              ptcEnabled: ptcActive,
+              promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             });
             attemptTools = preparedSearch.tools;
             if (preparedSearch.state) {
@@ -2737,8 +3485,10 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
-              ptcEnabled,
+              toolPolicy: toolSearchPolicy,
+              ptcEnabled: ptcActive,
+              promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
             const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
@@ -2746,35 +3496,23 @@ export class TurnRequestBuilder {
           }
         }
 
-        const intuitionToolAvailable = attemptTools.intuition !== undefined;
-        const advisorToolAvailable = attemptTools.advisor !== undefined;
-        const memoryToolAvailable = attemptTools.memory !== undefined;
-        const memoryContextForModel = await upgradeMemoryContextForModel(
-          memoryToolAvailable,
-          seed.rawModelString
-        );
+        const attemptToolset = systemPromptToolsetOf(attemptTools, effectiveToolPolicy);
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
-          mcpServers === mcpServersAtPrePolicy &&
-          advisorToolAvailable === advisorToolEligible &&
-          memoryToolAvailable === memoryToolEligible &&
-          intuitionToolAvailable === intuitionToolEligible &&
-          memoryContextForModel === memoryContext;
-        const rebuildSystemStartedAt = Date.now();
+          sameSystemPromptToolset(attemptToolset, prePolicyToolset);
+        const rebuildSystemStartedAt = this.hostClock.nowMs();
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
-          : await buildStreamSystemContextForToolset(
-              { advisorToolAvailable, memoryToolAvailable, intuitionToolAvailable },
-              seed.rawModelString,
-              memoryContextForModel
-            );
+          : await buildStreamSystemContextForToolset(attemptToolset, seed.rawModelString);
         if (options.recordTimings && !canReuseSystemContext) {
           recordStartupPhaseTiming("rebuildStreamSystemContextMs", rebuildSystemStartedAt);
         }
         let attemptSystem = systemContext.systemMessage;
         let attemptSystemTokens = systemContext.systemMessageTokens;
-        if (mcpWarningPrefix != null) {
-          attemptSystem = mcpWarningPrefix + attemptSystem;
+        // Volatile sections (the MCP list and warning, the context-window ids) go last so
+        // the stable prefix stays cacheable (#5251).
+        if (mcpSections !== "") {
+          attemptSystem = attemptSystem + mcpSections;
           const tokenizer = await getTokenizerForModel(
             seed.rawModelString,
             seed.capabilityModelString
@@ -2798,22 +3536,27 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
-              ptcEnabled,
+              toolPolicy: toolSearchPolicy,
+              ptcEnabled: ptcActive,
+              promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           }
-          // Middleware may filter tools too, but must not restore policy-denied
-          // recall or leave its private memory reader available without memory.
-          if (!intuitionToolAvailable || attemptTools.memory === undefined) {
-            delete attemptTools.intuition;
-          }
-          if (attemptTools.intuition === undefined) {
-            assembleCtx.systemMessage = removeIntuitionGuidance(
-              assembleCtx.systemMessage,
-              attemptTools.memory !== undefined,
-              memoryContextForModel?.hotMemoriesBlock
-            );
-          }
+          // Middleware may filter tools too: drop the memory guidance it left
+          // describing a removed memory tool.
+          assembleCtx.systemMessage = removeMemoryGuidance(
+            assembleCtx.systemMessage,
+            attemptTools.memory !== undefined
+          );
+          assembleCtx.systemMessage = this.followStatusUpdateAfterMiddleware(
+            workspaceId,
+            assistantMessageId,
+            assembleCtx.systemMessage,
+            {
+              prompted: attemptToolset.statusUpdateToolAvailable,
+              present: attemptTools.status_update !== undefined,
+            }
+          );
           if (assembleCtx.systemMessage !== attemptSystem) {
             attemptSystem = assembleCtx.systemMessage;
             const tokenizer = await getTokenizerForModel(
@@ -2824,7 +3567,53 @@ export class TurnRequestBuilder {
           }
         }
 
-        if (options.initializeToolSearch && toolSearchRuntime?.state) {
+        // Assembly hooks (live or replayed) can replace the tool map. Reapply the metadata
+        // ceiling after every attempt's hooks, including fallbacks; never trust an injected
+        // code_execution, provider-native tool or mutator just because policy allowed it.
+        if (capabilityGrants) {
+          attemptTools = isAgentToolsDisabled()
+            ? {}
+            : applyCapabilityGrants(attemptTools, capabilityGrants);
+        }
+        this.followArtifactToolAfterAssembly(workspaceId, assistantMessageId, {
+          tools: attemptTools,
+          ptcEnabled,
+        });
+
+        // The window section goes last, resolved from the rows being sent, so start() can
+        // re-render it without rerunning assembly middleware or tool construction.
+        const baseSystem = attemptSystem;
+        const baseSystemTokens = attemptSystemTokens;
+        let attemptVolatileSystemSuffixLength = 0;
+        const renderContextWindowSection = async () => {
+          const ids = tokenBudgetEnabled
+            ? resolveContextWindowIds(options.sourceMessages)
+            : undefined;
+          attemptSystem = baseSystem;
+          attemptSystemTokens = baseSystemTokens;
+          const section = ids == null ? undefined : `\n\n${buildContextWindowSection(ids)}`;
+          if (section != null) {
+            attemptSystem += section;
+            const tokenizer = await getTokenizerForModel(
+              seed.rawModelString,
+              seed.capabilityModelString
+            );
+            attemptSystemTokens += await tokenizer.countTokens(section);
+          }
+          // Re-measured on every render: the window section can change length. A tail that
+          // middleware edited is not split at all (no rows either, see planSystemPrompt).
+          attemptVolatileSystemSuffixLength = measureWholeVolatileSystemSuffix(attemptSystem, [
+            mcpContextSection,
+            mcpWarningSection,
+            section,
+          ]);
+        };
+        await renderContextWindowSection();
+
+        // Also on fallbacks: the rebuild drops activations the fallback cannot
+        // defer, so a fallback that defers them again must reseed prior-turn
+        // activations. Seeding only adds names, so repeating it is harmless.
+        if (toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
             attemptProviderRequestMessages
@@ -2833,6 +3622,10 @@ export class TurnRequestBuilder {
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
+        // Native mode sends deferred tools unloaded, so an agent transition must
+        // not list them as callable before a search loads them.
+        const loadedToolNames =
+          computeLoadedToolNames(toolSearchRuntime?.state)?.sort() ?? toolNamesForSentinel;
         const preparedAttempt = this.prepareModelAttempt({
           rawModelString: seed.rawModelString,
           canonicalModelString: seed.canonicalModelString,
@@ -2853,12 +3646,13 @@ export class TurnRequestBuilder {
           reasoningMode,
           ...(options.recordTimings ? { recordStartupPhaseTiming } : {}),
         });
-        // Manual cache markers must honor a TTL set through per-model
-        // providerOptions extras when the dedicated mux-level setting is
-        // unset, matching the pre-assembler request-config behavior.
-        const effectiveAnthropicCacheTtl =
-          effectiveMuxProviderOptions.anthropic?.cacheTtl ??
-          getAnthropicCacheTtl(preparedAttempt.providerOptions);
+        const effectiveAnthropicCacheTtl = resolveTurnAnthropicCacheTtl({
+          agentCacheTtl: agentCacheTtl.value,
+          modelString: seed.rawModelString,
+          providersConfig: seed.providersConfig,
+          muxProviderOptions: effectiveMuxProviderOptions,
+          providerOptions: preparedAttempt.providerOptions,
+        });
         const forcedFirstStepToolNames =
           seed.routeProvider === "xai"
             ? getForcedXaiSearchToolNames(
@@ -2869,35 +3663,72 @@ export class TurnRequestBuilder {
         const firstStepToolNames = new Set(
           forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
         );
+        // Recorded in the DevTools run so the replay verifier trims the same way.
+        const compactionInputBudget = await compactionInputBudgetOption(
+          isCompactionRequest,
+          {
+            modelString: seed.rawModelString,
+            providerOptions: effectiveMuxProviderOptions,
+            providersConfig: seed.providersConfig,
+          },
+          attemptProviderRequestMessages,
+          compactionInputBudgetScale,
+          compactionContextRetryAvailable === true
+        );
+        // What the latest assembly sent as system content (prompt-cache mechanism 10: a frozen
+        // tail plus tail rows). The envelope, debug views and stored token count describe it.
+        let sent = {
+          system: attemptSystem,
+          volatileLength: attemptVolatileSystemSuffixLength,
+          tokens: attemptSystemTokens,
+        };
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn.
-        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
-          assembleBudgetCheckedPromptPayload(
+        const assemblePayloadForThinkingLevel = async (level: ThinkingLevel) => {
+          const payload = await assembleBudgetCheckedPromptPayload(
             {
               history: options.sourceMessages,
               systemMessage: attemptSystem,
+              volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
+              instructionsSection: systemContext.instructionsSection,
               tools: attemptTools,
+              skillIndexSection,
+              toolInstructions,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,
               openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
               providerForMessages: seed.wireProviderName,
               effectiveThinkingLevel: level,
               effectiveAgentId,
-              toolNamesForSentinel,
+              toolNamesForSentinel: loadedToolNames,
               planContentForTransition,
               planFilePath,
               postCompactionAttachments,
               providersConfig: seed.providersConfig,
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
+              tagHistoryItemIds: tokenBudgetEnabled,
+              ...compactionInputBudget,
+              requestContextMessage: mcpAppContextMessage,
             },
             {
               enabled: tokenBudgetEnabled,
               providerOptions: effectiveMuxProviderOptions,
-              activeTools: [...firstStepToolNames],
+              // Native tool search sends deferred tools without loading them into context.
+              activeTools: forcedFirstStepToolNames?.length
+                ? forcedFirstStepToolNames
+                : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
             }
           );
-        const prepareMessagesForProviderStartedAt = Date.now();
+          sent = await measureSentSystem(
+            payload.sentSystem,
+            attemptSystem,
+            attemptSystemTokens,
+            () => getTokenizerForModel(seed.rawModelString, seed.capabilityModelString)
+          );
+          return payload;
+        };
+        const prepareMessagesForProviderStartedAt = this.hostClock.nowMs();
         const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
         if (options.recordTimings) {
           recordStartupPhaseTiming(
@@ -2913,7 +3744,8 @@ export class TurnRequestBuilder {
           await emitTurnEnvelope({
             journal: this.dependencies.durableEventJournalFor(workspaceId),
             workspaceId,
-            systemMessage: attemptSystem,
+            systemMessage: sent.system,
+            systemVolatileSuffixLength: sent.volatileLength,
             tools: Object.fromEntries(
               Object.entries(attemptTools).filter(([name]) => firstStepToolNames.has(name))
             ),
@@ -2921,43 +3753,55 @@ export class TurnRequestBuilder {
             thinkingLevel: level,
             providerOptions: providerOptionsForEnvelope,
             requestHistorySequence: options.requestHistorySequence(),
-            sentinelToolNames: toolNamesForSentinel,
+            sentinelToolNames: loadedToolNames,
             wireProviderName: seed.wireProviderName,
             anthropicCacheTtl: effectiveAnthropicCacheTtl,
             planContentForTransition,
             planFilePath,
             postCompactionAttachments,
             partialContinuationMessage: options.partialContinuationMessage,
+            mcpAppModelContextMessage: mcpAppContextMessage,
           });
         };
+        // The level decides which reasoning-only rows are sent, and with them the tail rows:
+        // a rebuild returns its own tail record for the turn's row.
         const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
           const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
-          return rebuiltPayload.messages;
+          return {
+            messages: rebuiltPayload.messages,
+            contextBudgetEstimate: rebuiltPayload.contextBudgetEstimate,
+            contextBudgetTurnAnchor: rebuiltPayload.contextBudgetTurnAnchor,
+            systemMessageTokens: sent.tokens,
+            systemRecords: rowSystemRecords(rebuiltPayload, options.partialContinuationMessage),
+          };
         };
         const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
           level,
           providerOptionsForEnvelope
         ) => {
-          const rebuiltMessages = await rebuildMessagesForThinkingLevel(level);
+          const rebuilt = await rebuildMessagesForThinkingLevel(level);
           await emitEnvelopeWith(level, providerOptionsForEnvelope);
-          return rebuiltMessages;
+          return rebuilt;
         };
 
         return {
           ...seed,
           providerRequestMessages: attemptProviderRequestMessages,
           messages: finalMessages,
-          system: attemptSystem,
+          system: sent.system,
           engineSystem: attemptPayload.system,
+          systemRecords: rowSystemRecords(attemptPayload, options.partialContinuationMessage),
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
-          systemMessageTokens: attemptSystemTokens,
+          contextBudgetTurnAnchor: attemptPayload.contextBudgetTurnAnchor,
+          contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
+          ...compactionInputBudget,
+          systemMessageTokens: sent.tokens,
           tools: attemptTools,
-          contextBudgetMemoryWritable:
-            memoryAccess.workspace === "readwrite" && attemptTools.memory !== undefined,
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
           providerOptions: preparedAttempt.providerOptions,
+          anthropicCacheTtl: effectiveAnthropicCacheTtl,
           headers: preparedAttempt.requestHeaders,
           resolvedOverrides: preparedAttempt.resolvedOverrides,
           currentEffectiveLevelRef: preparedAttempt.currentEffectiveLevelRef,
@@ -2969,6 +3813,20 @@ export class TurnRequestBuilder {
           onStreamConstructed: () =>
             emitEnvelopeWith(seed.effectiveThinkingLevel, preparedAttempt.providerOptions),
           rebuildFirstStepForThinkingLevel,
+          rebuildAfterSequencing: async () => {
+            await renderContextWindowSection();
+            const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+            return {
+              system: sent.system,
+              systemMessageTokens: sent.tokens,
+              engineSystem: payload.system,
+              systemRecords: rowSystemRecords(payload, options.partialContinuationMessage),
+              messages: payload.messages,
+              contextBudgetLimit: payload.contextBudgetLimit,
+              contextBudgetTurnAnchor: payload.contextBudgetTurnAnchor,
+              contextBudgetEstimate: payload.contextBudgetEstimate,
+            };
+          },
         };
       } catch (error) {
         if (options.cleanupModelOnError) {
@@ -3004,15 +3862,6 @@ export class TurnRequestBuilder {
     const tools = primaryRequest.tools;
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
-    const finalMessages = primaryRequest.messages;
-    // Debug sinks pair systemMessage with the message list, so when the
-    // assembler embedded the system prompt as a leading cached row
-    // (engineSystem undefined), drop that row to keep the system prompt
-    // single-sourced in captures.
-    const debugViewMessages =
-      primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
-        ? finalMessages.slice(1)
-        : finalMessages;
 
     captureMcpToolTelemetry({
       telemetryService: this.dependencies.telemetryService,
@@ -3038,16 +3887,99 @@ export class TurnRequestBuilder {
 
     let started = false;
     const start = async (
-      thinkingOverride?: ActiveTurnThinkingOverride
+      thinkingOverride?: ActiveTurnThinkingOverride,
+      turnStartStage?: OnTurnStartStage
     ): Promise<TurnRequestBuildOutcome> => {
       assert(!started && !transferred, "Prepared request must be started once before disposal");
       started = true;
       activeTurnThinkingOverride = thinkingOverride;
-      if (context.admissionOnly)
+      if (context.admissionOnly) {
         requestHistorySequence = messages.reduce(
           (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
           -1
         );
+        // Rollover admission prepared before append sequenced these same rows, so the prompt
+        // lacked the window IDs and [id] markers. The re-assembly budget-checks them too.
+        try {
+          primaryRequest = {
+            ...primaryRequest,
+            ...(await primaryRequest.rebuildAfterSequencing()),
+          };
+        } catch (error) {
+          if (error instanceof ContextBudgetExceededError) {
+            runLanguageModelCleanup(modelResult.data.model);
+            return { type: "finished", result: Err(error.details) };
+          }
+          throw error;
+        }
+        systemMessage = primaryRequest.system;
+        systemMessageTokens = primaryRequest.systemMessageTokens;
+      }
+      const finalMessages = primaryRequest.messages;
+      const mergedProviderOptions = primaryRequest.providerOptions;
+      const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
+      const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
+      // Fold PREPARING-window pending thinking overrides into the ACTUAL
+      // request build, not just the envelope (see foldPendingThinkingOverrides).
+      // The fold runs before the assistant placeholder is appended, so a refusal leaves no row
+      // to delete, and a Token Budget stage is decided on the folded request (#5286). Only a
+      // change written during the append counts the request again (the refold below). A turn
+      // already stopped skips the rebuild.
+      if (combinedAbortSignal.aborted)
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      const foldInput = {
+        holder: activeTurnThinkingOverride,
+        computeRebuiltProviderOptions,
+        rebuild: primaryRequest.rebuildMessagesForThinkingLevel,
+        currentEffectiveLevelRef,
+      };
+      let streamState = await foldPendingThinkingOverrides(foldInput, {
+        thinkingLevel: effectiveThinkingLevel,
+        providerOptions: mergedProviderOptions,
+        messages: finalMessages,
+        systemRecords: primaryRequest.systemRecords,
+        systemMessageTokens,
+        contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
+        contextBudgetTurnAnchor: primaryRequest.contextBudgetTurnAnchor,
+      });
+      if ("exceeded" in streamState) {
+        runLanguageModelCleanup(modelResult.data.model);
+        return { type: "finished", result: Err(streamState.exceeded) };
+      }
+      // Token Budget stage (#5286), decided on E, the count the turn-start check (or the fold)
+      // just took; see applyTurnStartStage.
+      const foldedLevel = streamState.thinkingLevel;
+      const unstaged = {
+        messages: streamState.messages,
+        systemRecords: streamState.systemRecords,
+        systemMessageTokens: streamState.systemMessageTokens,
+        requestHistorySequence,
+      };
+      const staged = await applyTurnStartStage({
+        onTurnStartStage: turnStartStage,
+        estimate: streamState.contextBudgetEstimate,
+        limit: primaryRequest.contextBudgetLimit,
+        model: modelString,
+        messages,
+        rebuild: () => primaryRequest.rebuildMessagesForThinkingLevel(foldedLevel),
+        abortSignal: combinedAbortSignal,
+        current: unstaged,
+        thinkingOverride: activeTurnThinkingOverride,
+      });
+      const stagePublished = staged !== unstaged;
+      ({ requestHistorySequence } = staged);
+      streamState = {
+        ...streamState,
+        messages: staged.messages,
+        systemRecords: staged.systemRecords,
+        systemMessageTokens: staged.systemMessageTokens,
+      };
+      ({ systemMessageTokens } = streamState);
       if (combinedAbortSignal.aborted)
         return {
           type: "finished",
@@ -3057,9 +3989,9 @@ export class TurnRequestBuilder {
         };
       const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-        timestamp: Date.now(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        timestamp: nodeClock.nowMs(),
         model: canonicalModelString,
-        routedThroughGateway,
         systemMessageTokens,
         agentId: effectiveAgentId,
       });
@@ -3071,6 +4003,52 @@ export class TurnRequestBuilder {
       if (!appendResult.success) {
         return { type: "finished", result: Err({ type: "unknown", raw: appendResult.error }) };
       }
+      // A stop that arrived during the append wins over the refold below: a refused rebuild
+      // must not turn a stopped turn into a budget error.
+      if (combinedAbortSignal.aborted) {
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      }
+      // A change written while the append's file I/O ran still reaches the messages, as when
+      // the fold ran after the append. A published stage skips this refold: its counted payload
+      // is dispatched, and StreamManager holds the change until after that first request
+      // (holdBeforeFirstRequest), so a refusal cannot leave the warning unanswered (#5286).
+      streamState = await foldPendingThinkingOverrides(
+        { ...foldInput, skip: stagePublished },
+        streamState
+      );
+      if ("exceeded" in streamState) {
+        runLanguageModelCleanup(modelResult.data.model);
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return { type: "finished", result: Err(streamState.exceeded) };
+      }
+      const {
+        thinkingLevel: streamThinkingLevel,
+        providerOptions: streamProviderOptions,
+        messages: streamFinalMessages,
+        systemRecords: streamSystemRecords,
+        contextBudgetTurnAnchor: streamTurnAnchor,
+      } = streamState;
+      ({ systemMessageTokens } = streamState);
+      // Debug sinks pair systemMessage with the message list, so when the
+      // assembler embedded the system prompt as leading rows (engineSystem
+      // undefined; a cached stable row plus an optional volatile row), drop
+      // them to keep the system prompt single-sourced in captures. Taken from the dispatched
+      // messages, so a stage warning shows.
+      const leadingSystemRows = streamFinalMessages.findIndex(
+        (message) => message.role !== "system"
+      );
+      const debugViewMessages =
+        primaryRequest.engineSystem == null
+          ? streamFinalMessages.slice(
+              leadingSystemRows === -1 ? streamFinalMessages.length : leadingSystemRows
+            )
+          : streamFinalMessages;
 
       const historySequence = assistantMessage.metadata?.historySequence ?? 0;
 
@@ -3088,14 +4066,13 @@ export class TurnRequestBuilder {
           workspaceId,
           assistantMessageId,
           canonicalModelString,
-          routedThroughGateway,
           ...(routeProvider != null ? { routeProvider } : {}),
           historySequence,
           systemMessageTokens,
           effectiveAgentId,
           effectiveMode,
           metadataMode: legacyModeForMetadata,
-          effectiveThinkingLevel,
+          effectiveThinkingLevel: streamThinkingLevel,
           emit: (event, data) => this.dependencies.emit(event, data),
         };
 
@@ -3133,10 +4110,7 @@ export class TurnRequestBuilder {
       }
 
       let requestHeaders = primaryRequest.headers;
-      const mergedProviderOptions = primaryRequest.providerOptions;
       const resolvedOverrides = primaryRequest.resolvedOverrides;
-      const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
-      const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
       const rebuildProviderOptionsForThinkingLevel =
         primaryRequest.rebuildProviderOptionsForThinkingLevel;
       // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
@@ -3188,7 +4162,8 @@ export class TurnRequestBuilder {
       }
 
       const snapshot: DebugLlmRequestSnapshot = {
-        capturedAt: Date.now(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        capturedAt: nodeClock.nowMs(),
         workspaceId,
         messageId: assistantMessageId,
         model: modelString,
@@ -3210,6 +4185,11 @@ export class TurnRequestBuilder {
       const toolsForStream = primaryRequest.engineTools;
 
       const devToolsService = this.dependencies.devToolsService;
+      // Queues this turn's run metadata with a request's compaction budget: the primary's
+      // below, each refusal fallback's own one (another window) in modelFallback.prepare, so
+      // replay rebuilds the request each run sent.
+      let queueRunMetadata: (compactionInputBudgetTokens: number | undefined) => void = () =>
+        undefined;
       const canQueueDevToolsRunMetadata =
         devToolsService?.enabled === true &&
         typeof modelResult.data.model !== "string" &&
@@ -3221,7 +4201,8 @@ export class TurnRequestBuilder {
         // when middleware is guaranteed to run (LanguageModelV3).
         pendingRunMetadataId = String(streamToken);
         context.startupState.pendingRunMetadataId = pendingRunMetadataId;
-        devToolsService.setPendingRunMetadata(workspaceId, pendingRunMetadataId, {
+        const metadataId = pendingRunMetadataId;
+        const runMetadata = {
           toolPolicy:
             effectiveToolPolicy != null && effectiveToolPolicy.length > 0
               ? effectiveToolPolicy
@@ -3229,7 +4210,18 @@ export class TurnRequestBuilder {
           // Join key for the replay verifier: re-anchors this recorded run to
           // its turn-envelope row and assistant message (see DevToolsRun).
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-        });
+          // Same epoch as the runtime prefix monitor: the replay audit resets its baseline on change.
+          ...(promptCacheScope.contextEpoch != null
+            ? { contextEpoch: promptCacheScope.contextEpoch }
+            : {}),
+        };
+        queueRunMetadata = (compactionInputBudgetTokens) =>
+          devToolsService.setPendingRunMetadata(workspaceId, metadataId, {
+            ...runMetadata,
+            // Undefined unless this is a budgeted compaction request (JSON drops the key).
+            compactionInputBudgetTokens,
+          });
+        queueRunMetadata(primaryRequest.compactionInputBudgetTokens);
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,
           workspaceId,
@@ -3270,27 +4262,26 @@ export class TurnRequestBuilder {
                       prepareOptions.continuation.assistantMessage
                     )
                   : messages;
-                // The flush is housekeeping: it runs at the fallback model's own inherent
-                // minimum (no user floor, no mid-turn override), mirroring the primary flush
-                // request, and gets a cap sized for THAT level below.
-                const requestedThinkingLevel = contextBudgetFlushTurn
-                  ? THINKING_LEVEL_OFF
-                  : (prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel);
                 const nextSeedResult = await prepareModelSeed({
                   rawModelString: nextModelString,
-                  requestedThinkingLevel,
-                  minimumThinkingLevelOverride: contextBudgetFlushTurn
-                    ? undefined
-                    : lookupMinThinkingLevelOverride(
-                        this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
-                        nextModelString
-                      ),
+                  requestedThinkingLevel:
+                    prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel,
+                  minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
+                    this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+                    nextModelString
+                  ),
                   enforceMinimum: true,
+                  refusalFallback: true,
                 });
                 if (!nextSeedResult.success) {
                   return Err(formatSendMessageError(nextSeedResult.error).message);
                 }
 
+                // No Token Budget stage is decided here (#5286, maintainer's choice): the
+                // turn's placeholder row already exists, so a warning row cannot precede it,
+                // and handing the turn over to a Continue would need a new mechanism. The
+                // fallback request is sent as built. A stage it reaches comes at the next turn
+                // start that reaches it (applyTurnStartStage), one turn late.
                 let nextRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
                 try {
                   nextRequest = await prepareModelRequest({
@@ -3308,6 +4299,8 @@ export class TurnRequestBuilder {
                 }
                 let nextHeaders = nextRequest.headers;
                 if (pendingRunMetadataId != null) {
+                  // The fallback's run is created after this, under the same metadata ID.
+                  queueRunMetadata(nextRequest.compactionInputBudgetTokens);
                   nextHeaders = {
                     ...nextHeaders,
                     [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
@@ -3322,32 +4315,24 @@ export class TurnRequestBuilder {
                   messages: nextRequest.messages,
                   system: nextRequest.engineSystem,
                   tools: nextRequest.engineTools,
-                  contextBudgetMemoryWritable: nextRequest.contextBudgetMemoryWritable,
                   contextBudgetLimit: nextRequest.contextBudgetLimit,
+                  contextBudgetTurnAnchor: nextRequest.contextBudgetTurnAnchor,
                   providerOptions: nextRequest.providerOptions,
+                  anthropicCacheTtl: nextRequest.anthropicCacheTtl,
                   headers: nextHeaders,
                   callSettingsOverrides: nextRequest.resolvedOverrides.standard,
                   thinkingLevel: nextRequest.effectiveThinkingLevel,
-                  // A fallback with a higher thinking minimum than the primary would be
-                  // rejected under the primary's flush cap (thinking budget must stay below
-                  // max_tokens), losing the only notes-preserving step.
-                  ...(contextBudgetFlushTurn
-                    ? {
-                        maxOutputTokens: getContextBudgetFlushMaxOutputTokens(
-                          nextRequest.effectiveThinkingLevel
-                        ),
-                      }
-                    : {}),
                   forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
                   rebuildProviderOptionsForThinkingLevel:
                     nextRequest.rebuildProviderOptionsForThinkingLevel,
                   providersConfig: nextRequest.providersConfig,
                   initialMetadataPatch: {
-                    routedThroughGateway: nextRequest.routedThroughGateway,
                     ...(nextRequest.routeProvider != null
                       ? { routeProvider: nextRequest.routeProvider }
                       : {}),
                     systemMessageTokens: nextRequest.systemMessageTokens,
+                    // Exact: the fallback's request decides what the row recorded.
+                    ...nextRequest.systemRecords,
                   },
                 });
               },
@@ -3355,52 +4340,6 @@ export class TurnRequestBuilder {
           : undefined;
 
       const forcedFirstStepToolNames = primaryRequest.forcedFirstStepToolNames;
-
-      // Fold PREPARING-window pending thinking overrides into the ACTUAL
-      // request build, not just the envelope: message preparation is
-      // thinking-level-dependent (Anthropic signed-reasoning transforms), so
-      // recording the new level while streaming old-level messages would make
-      // wire and replay diverge — or send an invalid extended-thinking
-      // request. Consuming pending here (applied set below) is safe:
-      // createStreamAtomically seeds streamInfo.thinkingLevel from `applied`,
-      // and prepareStep simply sees no pending to re-apply.
-      // Loop until pending is quiescent: setActiveTurnThinkingLevel can write
-      // a NEW pending while the awaited message rebuild runs, and stamping the
-      // first level after the await would leave step 0 rebuilding only
-      // provider options while the messages stay at the stale level.
-      let streamThinkingLevel = effectiveThinkingLevel;
-      let streamProviderOptions = mergedProviderOptions;
-      let streamFinalMessages = finalMessages;
-      while (activeTurnThinkingOverride?.pending != null) {
-        const pendingPreparingLevel = activeTurnThinkingOverride.pending;
-        activeTurnThinkingOverride.pending = undefined;
-        const folded = computeRebuiltProviderOptions(pendingPreparingLevel, streamThinkingLevel);
-        if (folded == null) {
-          // No-op fold (same effective level / non-foldable variant swap):
-          // re-check pending — a change may have raced the previous rebuild.
-          continue;
-        }
-        try {
-          streamFinalMessages = await primaryRequest.rebuildMessagesForThinkingLevel(
-            folded.effectiveLevel
-          );
-        } catch (error) {
-          if (error instanceof ContextBudgetExceededError) {
-            runLanguageModelCleanup(modelResult.data.model);
-            await deleteAbortedPlaceholder(assistantMessageId);
-            return { type: "finished", result: Err(error.details) };
-          }
-          throw error;
-        }
-        streamProviderOptions = folded.providerOptions;
-        streamThinkingLevel = folded.effectiveLevel;
-        activeTurnThinkingOverride.applied = folded.effectiveLevel;
-        // Keep the mid-turn rebuild baseline in sync so a later identical
-        // request is correctly treated as a no-op.
-        currentEffectiveLevelRef.current = folded.effectiveLevel;
-        // Loop re-checks pending: a change during the awaits above re-folds
-        // against the level just applied.
-      }
 
       const emitPrimaryEnvelope = (): Promise<void> =>
         primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
@@ -3416,15 +4355,17 @@ export class TurnRequestBuilder {
         messageId: assistantMessageId,
         abortSignal: combinedAbortSignal,
         tools: toolsForStream,
-        contextBudgetMemoryWritable: primaryRequest.contextBudgetMemoryWritable,
         contextBudgetLimit: primaryRequest.contextBudgetLimit,
+        contextBudgetTurnAnchor: streamTurnAnchor,
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
           systemMessageTokens,
-          timestamp: Date.now(),
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          timestamp: nodeClock.nowMs(),
           agentId: effectiveAgentId,
+          // Where this request sent the volatile system tail, so the next rebuild repeats it.
+          ...systemRecordsMetadata(streamSystemRecords),
           ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
-          routedThroughGateway,
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),
@@ -3439,6 +4380,7 @@ export class TurnRequestBuilder {
           }),
         },
         providerOptions: streamProviderOptions,
+        anthropicCacheTtl: primaryRequest.anthropicCacheTtl,
         maxOutputTokens,
         toolPolicy: effectiveToolPolicy,
         providedStreamToken: streamToken,
@@ -3450,15 +4392,6 @@ export class TurnRequestBuilder {
         thinkingLevel: streamThinkingLevel,
         headers: requestHeaders,
         callSettingsOverrides: resolvedOverrides.standard,
-        onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
-        onStepMessages: advisorToolEligible
-          ? (stepMessages) => {
-              advisorTranscriptRef.messages = stepMessages;
-              advisorStepCaptureRef.currentStepText = "";
-              advisorStepCaptureRef.currentStepReasoning = "";
-              advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
-            }
-          : undefined,
         providedRuntimeTempDir: runtimeTempDir,
         modelFallback,
         toolSearchState: toolSearchRuntime?.state,

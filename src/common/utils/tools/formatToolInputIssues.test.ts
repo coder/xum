@@ -63,6 +63,33 @@ describe("formatToolInputIssues", () => {
     expect(formatToolInputIssues(issues, { question: 42 })).toBe("question: Too big");
     expect(formatToolInputIssues(issues, null)).toBe("question: Too big");
   });
+
+  test("lists the received keys once when required fields are missing, never their values", () => {
+    const schema = z.object({ script: z.string(), display_name: z.string() });
+    const input = { agent_report: "<parameter=secret", ["k".repeat(100)]: 1 };
+
+    const message = formatToolInputIssues(issuesFor(schema, input), input);
+
+    // Two missing-field issues, then one listing of the keys that arrived.
+    expect(message.split("; ")).toHaveLength(3);
+    expect(message.split("agent_report")).toHaveLength(2);
+    expect(message).toContain("k".repeat(40));
+    expect(message).not.toContain("k".repeat(41));
+    expect(message).not.toContain("secret");
+    // An empty object still gets the note, so the model learns it sent nothing.
+    expect(formatToolInputIssues(issuesFor(schema, {}), {}).split("; ")).toHaveLength(3);
+  });
+
+  test("does not list keys for a present field of the wrong type or another issue", () => {
+    const schema = z.object({ script: z.string(), count: z.number().max(1) });
+
+    for (const { input, unlistedKey } of [
+      { input: { script: 5, count: 0 }, unlistedKey: "count" },
+      { input: { script: "ls", count: 2 }, unlistedKey: "script" },
+    ]) {
+      expect(formatToolInputIssues(issuesFor(schema, input), input)).not.toContain(unlistedKey);
+    }
+  });
 });
 
 describe("isToolInputIssueArray", () => {

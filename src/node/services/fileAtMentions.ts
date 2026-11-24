@@ -173,7 +173,7 @@ export interface MaterializedFileMention {
  * that expands @file mentions — there is no request-time injection, so the provider
  * request stays a pure function of chat.jsonl. Persisting the snapshot also means:
  * 1. Future sends don't re-read the same files (prompt-cache stability)
- * 2. File changes are detected via recordFileState and surfaced as <system-file-update> diffs
+ * 2. File changes are detected via recordFileState and surfaced as <system-file-update> notices
  *
  * Old histories that predate send-time materialization keep their @mentions as plain
  * text; they still build valid requests, just without injected file content.

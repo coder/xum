@@ -1,5 +1,6 @@
 import type { MuxMessage } from "@/common/types/message";
 import type { SettledStepBudget } from "../streamManager";
+import type { OnTurnStartStage } from "../turnRequestBuilder";
 import type { ContextSendFailure, ContextFailureRecovery } from "./types";
 import type { PreparationReceipt } from "./types";
 import { TokenBudgetStrategy } from "./strategies/tokenBudget";
@@ -113,15 +114,8 @@ export class SessionContextController {
     );
   }
 
-  normalizeSend(
-    userMessage: MuxMessage,
-    options: SendMessageOptions,
-    active: boolean
-  ): SendMessageOptions {
-    return this.tokenBudget.normalizeSend(userMessage, options, active);
-  }
-  preparePublication(input: Parameters<TokenBudgetStrategy["preparePublication"]>[0]) {
-    return this.tokenBudget.preparePublication(input);
+  dropPendingRollover(): void {
+    this.tokenBudget.dropPendingRollover();
   }
   onSendAccepted(userMessage: MuxMessage, prefixRows: readonly MuxMessage[]): void {
     this.tokenBudget.onSendAccepted(userMessage, prefixRows);
@@ -178,15 +172,22 @@ export class SessionContextController {
       | { kind: "prepared" }
       | {
           kind: "starting";
-          stream: Pick<StreamContextSnapshot, "options" | "contextBudgetFlushTurn">;
+          stream: Pick<StreamContextSnapshot, "options">;
         }
   ) {
     // An already prepared rollover request owns this callback even if selection changes.
-    // The ordinary start path retains its separate active-mode/flush obligation predicate.
-    return input.kind === "prepared" ||
-      this.isTokenBudgetActive(input.stream.options) ||
-      input.stream.contextBudgetFlushTurn
+    return input.kind === "prepared" || this.isTokenBudgetActive(input.stream.options)
       ? (step: SettledStepBudget) => this.tokenBudget.onContextBudgetStepSettled(step)
+      : undefined;
+  }
+
+  /** Turn-start stage decision (#5286); the session supplies how the warning row is published. */
+  turnStartStage(
+    options: SendMessageOptions | undefined,
+    publish: (row: MuxMessage) => Promise<boolean>
+  ): OnTurnStartStage | undefined {
+    return options && this.isTokenBudgetActive(options)
+      ? (budget) => this.tokenBudget.prepareTurnStartStage(budget, options, publish)
       : undefined;
   }
 
@@ -249,7 +250,6 @@ export class SessionContextController {
 
   isTokenBudgetActive(options?: SendMessageOptions): boolean {
     const selection = resolveContextStrategy({
-      experiments: options?.experiments,
       isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
       isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
     });
@@ -511,9 +511,12 @@ export class SessionContextController {
         agentInitiated: input.agentInitiated,
         goalKind: input.goalKind,
         goalId: input.goalId,
+        taskTurnKind: input.taskTurnKind,
         muxMetadata: input.muxMetadata,
         workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
         autoModelRouting: input.autoModelRouting,
+        pluginSendHooksApplied: input.pluginSendHooksApplied,
+        pluginHookContext: input.pluginHookContext,
       });
 
       // Waterfall hook point: lets registered middleware (e.g. refinement
@@ -532,9 +535,7 @@ export class SessionContextController {
       // RLM keep-recent floor: stamp on-send auto-compaction requests with
       // the durable tail-start sequence. No-op when RLM is off.
       if (autoCompactionRequest.metadata.type === "compaction-request") {
-        const enabled = isRlmModeEnabled(optionsForStream.experiments, (id) =>
-          this.deps.aiService.isExperimentEnabled(id)
-        );
+        const enabled = isRlmModeEnabled((id) => this.deps.aiService.isExperimentEnabled(id));
         const stamp = await computeKeepRecentTailStamp(
           this.deps.historyService,
           this.host.workspaceId,

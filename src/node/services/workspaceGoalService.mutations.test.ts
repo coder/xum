@@ -164,7 +164,9 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
-  test("rejects child workspaces", async () => {
+  // Sub-agents own their goal (TaskService drives its turns); the goal board stays parent-only,
+  // and only the user may resume a child's paused goal, and only while its task attempt is live.
+  test("child workspaces own a goal; board ops stay parent-only; resume is user-only and live", async () => {
     const childWorkspaceId = "goal-child";
     await config.addWorkspace(PROJECT_PATH, {
       id: childWorkspaceId,
@@ -175,17 +177,64 @@ describe("WorkspaceGoalService", () => {
       parentWorkspaceId: workspaceId,
     });
 
-    // setGoal now catches WorkspaceGoalChildWorkspaceError and
-    // returns it as a typed Result error so the oRPC handler doesn't leak
-    // it as an unhandled 500.
-    const result = await service.setGoal({
+    // The child's own model creates its goal; a user-direct creation is refused.
+    const userCreated = await service.setGoal({
       workspaceId: childWorkspaceId,
       objective: "child goal",
     });
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error.type).toBe("child_workspace");
+    expect(userCreated.success ? null : userCreated.error.type).toBe("invalid_transition");
+    const created = await service.setGoal({
+      workspaceId: childWorkspaceId,
+      objective: "child goal",
+      initiator: "model",
+    });
+    expect(created.success).toBe(true);
+    let thrown: unknown;
+    try {
+      await service.addUpcomingGoal({ workspaceId: childWorkspaceId, objective: "queued" });
+    } catch (error) {
+      thrown = error;
     }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(
+      (await service.setGoal({ workspaceId: childWorkspaceId, status: "paused" })).success
+    ).toBe(true);
+
+    // No TaskService hooks registered: no live attempt can be proven, so the resume is refused.
+    const unproven = await service.setGoal({ workspaceId: childWorkspaceId, status: "active" });
+    expect(unproven.success ? null : unproven.error.type).toBe("invalid_transition");
+
+    let live = false;
+    const resumed: string[] = [];
+    service.setChildGoalResumeHooks({
+      getResumeRefusal: () => (live ? null : "Reactivate the task first."),
+      captureActivationAttempt: () => (live ? "att_live" : null),
+      isActivationAllowed: (_id, attemptId) => live && attemptId === "att_live",
+      getTurnModel: () => null,
+      onGoalResumed: (id) => {
+        resumed.push(id);
+        return Promise.resolve();
+      },
+    });
+    const byModel = await service.setGoal({
+      workspaceId: childWorkspaceId,
+      status: "active",
+      initiator: "model",
+    });
+    expect(byModel.success ? null : byModel.error.type).toBe("invalid_transition");
+    const terminated = await service.setGoal({ workspaceId: childWorkspaceId, status: "active" });
+    expect(
+      !terminated.success && terminated.error.type === "invalid_transition"
+        ? terminated.error.message
+        : null
+    ).toContain("Reactivate the task");
+    expect((await service.getGoal(childWorkspaceId))?.status).toBe("paused");
+
+    live = true;
+    const byUser = await service.setGoal({ workspaceId: childWorkspaceId, status: "active" });
+    expect(byUser.success).toBe(true);
+    expect((await service.getGoal(childWorkspaceId))?.status).toBe("active");
+    expect(resumed).toEqual([childWorkspaceId]);
   });
 
   for (const sourceStatus of [

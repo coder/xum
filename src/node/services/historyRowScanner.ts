@@ -141,8 +141,10 @@ function createRow(
         keyHash?.update(Buffer.from(token.value, "utf16le"));
         break;
       case "endKey": {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const key = keyHash!.digest("hex");
         keyHash = undefined;
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const keys = objects.at(-1)!;
         if (keys.has(key)) hasDuplicateKeys = true;
         keys.add(key);

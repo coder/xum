@@ -76,7 +76,7 @@ export type PTCExecutionResult = CodeExecutionResult;
  *   retaining them matches what classic-mode records already expose.
  * - Media-bearing results: any bridged MCP tool may return a content
  *   container carrying base64 media. Request-time extraction
- *   (extractToolMediaAsUserMessages) turns nested media into model-visible
+ *   (extractToolMediaAsUserMessagesFromModelMessages) turns nested media into model-visible
  *   multimodal attachments — impossible if capture bounding or compaction
  *   already dropped the payload, which would leave RLM users unable to see
  *   bridged screenshots/images at all. Media size is host-tool-produced (the
@@ -121,7 +121,8 @@ export function retainExemptKernelRecordResult(toolName: string, result: unknown
  *   diffs truncated at a HUNK boundary (see boundRetainedEditDiff) — the
  *   ui_only diff variant is flattened onto `diff`, which the extractor reads
  *   as its fallback.
- * - agent_skill_read: { success, skill } / { success, error } passes through
+ * - agent_skill_read: { success, skill } / { success, error }, plus the
+ *   bounded skillDir/pluginRoot/skillDirUnavailable, passes through
  *   when its serialized size fits MAX_FILE_CONTENT_SIZE; oversized packages
  *   keep a schema-valid skill with a truncated body (see
  *   boundOversizedSkillPackage) instead of being discarded.
@@ -136,12 +137,7 @@ function boundPersistenceCriticalResult(toolName: string, result: unknown): unkn
       : {};
 
   if (toolName === "agent_skill_read") {
-    const skill = (result as { skill?: unknown }).skill;
-    const reduced = { ...success, ...error, ...(skill !== undefined ? { skill } : {}) };
-    const reducedLength = serializedJsonLength(reduced);
-    if (reducedLength === undefined) return undefined;
-    if (reducedLength <= MAX_FILE_CONTENT_SIZE) return reduced;
-    return boundOversizedSkillPackage(skill, reducedLength, success, error);
+    return boundSkillReadResult(result, { ...success, ...error });
   }
 
   const rawDiff = (result as { diff?: unknown }).diff;
@@ -152,6 +148,48 @@ function boundPersistenceCriticalResult(toolName: string, result: unknown): unkn
     ...error,
     ...(typeof diff === "string" ? boundRetainedEditDiff(diff) : {}),
   };
+}
+
+/**
+ * The retained agent_skill_read record. The re-injected snapshot names the
+ * skill directory from the location fields (#6704); without them kernel-mode
+ * reads lose it after compaction. They are optional: when they leave no body
+ * budget, keep the skill instructions without them rather than lose the whole
+ * package. skillDir alone is tried first: it is the line the snapshot needs
+ * most (#6854). Not when skillDirUnavailable is set too (corrupted input): the
+ * snapshot then trusts the reason over the path, so the path alone must not
+ * survive.
+ */
+function boundSkillReadResult(
+  result: { skill?: unknown } & Partial<Record<(typeof SKILL_LOCATION_FIELDS)[number], unknown>>,
+  fields: Record<string, unknown>
+): unknown {
+  const skill = result.skill;
+  const location = retainSkillLocationFields(result);
+  // The raw marker, not the retained one: an oversized reason is dropped from
+  // `location` but still marks the record as corrupted, so the path goes in
+  // every attempt below.
+  if (typeof result.skillDirUnavailable === "string") delete location.skillDir;
+  const withLocation = boundSkillReadPackage(skill, { ...fields, ...location });
+  if (withLocation !== undefined) return withLocation;
+  if (location.skillDir !== undefined) {
+    const withSkillDir = boundSkillReadPackage(skill, { ...fields, skillDir: location.skillDir });
+    if (withSkillDir !== undefined) return withSkillDir;
+  }
+  return boundSkillReadPackage(skill, fields);
+}
+
+/**
+ * The retained agent_skill_read record: `fields` plus the skill package, whole
+ * when it fits MAX_FILE_CONTENT_SIZE, else with a truncated body. Undefined
+ * when even the truncated package does not fit.
+ */
+function boundSkillReadPackage(skill: unknown, fields: Record<string, unknown>): unknown {
+  const reduced = { ...fields, ...(skill !== undefined ? { skill } : {}) };
+  const reducedLength = serializedJsonLength(reduced);
+  if (reducedLength === undefined) return undefined;
+  if (reducedLength <= MAX_FILE_CONTENT_SIZE) return reduced;
+  return boundOversizedSkillPackage(skill, reducedLength, fields);
 }
 
 /**
@@ -183,8 +221,8 @@ const SKILL_BODY_CAPTURE_TRUNCATION_NOTE =
 function boundOversizedSkillPackage(
   skill: unknown,
   reducedLength: number,
-  success: { success?: boolean },
-  error: { error?: string }
+  /** The bounded top-level fields kept next to `skill` (success, error, location). */
+  fields: Record<string, unknown>
 ): unknown {
   if (typeof skill !== "object" || skill === null) return undefined;
   const body = (skill as { body?: unknown }).body;
@@ -239,10 +277,32 @@ function boundOversizedSkillPackage(
   // post-compaction context.
   const cut = boundaries[low];
   return {
-    ...success,
-    ...error,
+    ...fields,
     skill: { ...skill, body: `${body.slice(0, cut)}${SKILL_BODY_CAPTURE_TRUNCATION_NOTE}` },
   };
+}
+
+const SKILL_LOCATION_FIELDS = ["skillDir", "pluginRoot", "skillDirUnavailable"] as const;
+
+/**
+ * agent_skill_read's location fields, each kept only as a string within the
+ * retained path limit (serialized bytes, like other retained paths). A cut
+ * path would name the wrong directory, so an oversized value is dropped (the
+ * snapshot then shows no line), never truncated.
+ */
+function retainSkillLocationFields(
+  result: Partial<Record<(typeof SKILL_LOCATION_FIELDS)[number], unknown>>
+): Record<string, string> {
+  const retained: Record<string, string> = {};
+  for (const field of SKILL_LOCATION_FIELDS) {
+    const value = result[field];
+    if (typeof value !== "string") continue;
+    const bytes = serializedJsonByteLength(value);
+    if (bytes !== undefined && bytes <= KERNEL_RETAINED_PATH_MAX_BYTES) {
+      retained[field] = value;
+    }
+  }
+  return retained;
 }
 
 /**

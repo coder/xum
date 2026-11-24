@@ -7,7 +7,10 @@ export {
   normalizeOpenAICompatibleBaseURL,
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
+import { createHash, createPrivateKey } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
 import { Effect } from "effect";
+import type { createOpenAI as CreateOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
   LanguageModelV4,
@@ -21,8 +24,9 @@ import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
 import {
   anthropicRejectsDisabledThinking,
-  isGpt6SolOrLunaModel,
+  isGpt6LunaModel,
   isGrokFrontierModel,
+  openaiGptTier,
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { Ok, Err } from "@/common/types/result";
@@ -40,6 +44,8 @@ import {
 } from "@/common/utils/ai/evaluationModels";
 import { computeConfigFingerprint } from "@/node/services/evaluation/evaluationDigest";
 import {
+  evaluationModelFromLanguageModel,
+  withTypeSafeScoreLevelLabels,
   installInnerBillingCapture,
   type EvaluationModelInstance,
 } from "@/node/services/evaluation/evaluationService";
@@ -47,15 +53,26 @@ import {
   CODEX_ENDPOINT,
   CODEX_OAUTH_ROUTED_HEADER,
   isCodexOauthAllowedModel,
-  isCodexOauthRequiredModel,
 } from "@/common/constants/codexOAuth";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
-import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import {
+  ServiceTierSchema,
+  type ServiceTier,
+  type XAIServiceTier,
+} from "@/common/config/schemas/providersConfig";
+import {
+  OpenAICyberAccessProgramSchema,
+  type OpenAICyberAccessProgram,
+} from "@/common/types/openaiAccessPrograms";
+import {
+  openaiModelSupportsServiceTier,
+  openaiServiceTierAvailable,
+} from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import { anthropicFastModeAvailable } from "@/common/utils/ai/anthropicFastMode";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
@@ -63,7 +80,8 @@ import {
   isBuiltInProvider,
   isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
-import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   maybeGetProviderModelEntryId,
   resolveModelForMetadata,
@@ -74,11 +92,11 @@ import {
   toCopilotModelId,
 } from "@/common/utils/copilot/modelRouting";
 import { CopilotResponsesLanguageModel } from "@/node/services/copilot/copilotResponsesLanguageModel";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import {
+  CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
   coderAibridgeBaseUrl,
   coderGatewayWireProtocol,
   parseCoderGatewayProviders,
@@ -88,17 +106,35 @@ import {
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import {
+  mapEventStreamLines,
+  wrapFetchWithGeminiThoughts,
+} from "@/node/services/geminiThoughtsFetch";
+import {
   captureAndStripDevToolsHeader,
+  recordPromptCacheWire,
   resolveDevToolsCaptureBody,
 } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
 import { createToolInputDepthGuardMiddleware } from "@/node/services/toolInputDepthGuardMiddleware";
+import { mapToolSubschemas } from "@/common/utils/tools/schemaSanitizer";
+import { createToolSchemaCompactionMiddleware } from "@/node/services/toolSchemaCompactionMiddleware";
 import {
   attachLanguageModelCleanup,
   moveLanguageModelCleanup,
 } from "@/node/services/languageModelCleanup";
 import { createOpenAIWebSocketTransportFetch } from "@/node/services/openAIWebSocketTransportFetch";
 import { log } from "@/node/services/log";
+import type { TimelineRecorder } from "@/node/services/timelineRecorder";
+import {
+  PromptCachePrefixMonitor,
+  type PromptCacheRouteIdentity,
+  type PromptCacheTurnScope,
+} from "@/node/services/promptCachePrefixMonitor";
+import {
+  isSessionTapeReplayMode,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+} from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { isMockAiMode, MOCK_AI_MODEL_REFUSED_MESSAGE } from "@/node/services/mock/mockAiMode";
 import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { resolveRoute, type RouteContext } from "@/common/routing";
 import {
@@ -106,22 +142,19 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
+  MAX_CREDENTIAL_FILE_BYTES,
   resolveCustomProviderCredentials,
   resolveProviderCredentials,
   resolveTypeSafeCredentials,
-  type ProviderConfigRaw,
   type ProviderRequirementError,
 } from "@/node/utils/providerRequirements";
-import {
-  normalizeGatewayStreamUsage,
-  normalizeGatewayGenerateResult,
-} from "@/node/utils/gatewayStreamNormalization";
-import { wrapFetchWithGatewayFilePartNormalization } from "@/node/utils/gatewayFilePartNormalization";
 import { EnvHttpProxyAgent, type Dispatcher } from "undici";
+import { guardAgainstBrotliResponses } from "@/node/utils/network/brotliResponseGuard";
 import packageJson from "../../../package.json";
 
 // ---------------------------------------------------------------------------
@@ -131,10 +164,12 @@ import packageJson from "../../../package.json";
 // and NO_PROXY environment variables for debugging/corporate network support.
 // ---------------------------------------------------------------------------
 
-const unlimitedTimeoutAgent = new EnvHttpProxyAgent({
-  bodyTimeout: 0, // No timeout - prevents BodyTimeoutError on long reasoning pauses
-  headersTimeout: 0, // No timeout for headers
-});
+const unlimitedTimeoutAgent = guardAgainstBrotliResponses(
+  new EnvHttpProxyAgent({
+    bodyTimeout: 0, // No timeout - prevents BodyTimeoutError on long reasoning pauses
+    headersTimeout: 0, // No timeout for headers
+  })
+);
 
 // Extend RequestInit with undici-specific dispatcher property (Node.js only)
 type RequestInitWithDispatcher = RequestInit & { dispatcher?: Dispatcher };
@@ -284,7 +319,8 @@ function injectProviderOptionsDefaults(
     doGenerate: (options: never) => unknown;
   },
   namespace: string,
-  defaults: Record<string, unknown>
+  defaults: Record<string, unknown>,
+  liveOverrides?: () => Record<string, unknown>
 ): void {
   interface CallOptions {
     providerOptions?: Record<string, unknown>;
@@ -297,6 +333,8 @@ function injectProviderOptionsDefaults(
       [namespace]: {
         ...defaults,
         ...(options.providerOptions?.[namespace] as Record<string, unknown> | undefined),
+        // A chat-local speed change supersedes its already-prepared request options.
+        ...liveOverrides?.(),
       },
     },
   });
@@ -320,9 +358,88 @@ function injectProviderOptionsDefaults(
  */
 export function wrapFetchWithXAIServiceTier(
   baseFetch: typeof fetch,
-  serviceTier?: XAIServiceTier
+  serviceTier?: XAIServiceTier,
+  // A chat's mid-turn speed change applies to its next request, like the OpenAI tier.
+  getLiveServiceTier?: () => XAIServiceTier | undefined
 ): typeof fetch {
-  return wrapFetchWithServiceTier(baseFetch, serviceTier);
+  if (getLiveServiceTier == null) return wrapFetchWithServiceTier(baseFetch, serviceTier);
+  return wrapFetchWithJsonBodyPatch(baseFetch, (body) => {
+    const tier = getLiveServiceTier() ?? serviceTier;
+    return tier == null ? body : { ...body, service_tier: tier };
+  });
+}
+
+/** xAI has only Standard and Priority; any other chat tier pick means Standard there. */
+function toXAIServiceTier(tier: ServiceTier | undefined): XAIServiceTier | undefined {
+  if (tier == null) return undefined;
+  return tier === "priority" ? "priority" : "default";
+}
+
+type GetServiceTierOverride = () => ServiceTier | undefined;
+
+/**
+ * Speed belongs to the chat, like its reasoning level, so its pick drives every Fast-mode
+ * provider; a chat without a pick inherits each provider's preference. The pick travels as
+ * the OpenAI tier, and a live mid-turn pick wins over the one the request was built with.
+ */
+function readChatServiceTier(
+  muxProviderOptions: MuxProviderOptions | undefined,
+  getServiceTierOverride: GetServiceTierOverride | undefined
+): ServiceTier | undefined {
+  return ServiceTierSchema.safeParse(
+    getServiceTierOverride?.() ?? muxProviderOptions?.openai?.serviceTier
+  ).data;
+}
+
+/**
+ * Anthropic `speed` for a model that supports Fast mode: pinned from the chat's pick (else the
+ * provider preference), and like the OpenAI tier, a mid-turn pick applies to the next call.
+ * None when the caller opts out (refusal-fallback hops): see CreateModelOptions.
+ */
+function resolveAnthropicFastMode(
+  chatServiceTier: ServiceTier | undefined,
+  providerSpeed: unknown,
+  opts: Pick<CreateModelOptions, "getServiceTierOverride" | "withoutAnthropicFastMode"> | undefined
+): { defaults: { speed?: "fast" }; liveOverrides?: () => { speed?: "fast" } } | undefined {
+  if (opts?.withoutAnthropicFastMode === true) return undefined;
+  const getServiceTierOverride = opts?.getServiceTierOverride;
+  const pinned =
+    chatServiceTier != null ? chatServiceTier === "priority" : providerSpeed === "fast";
+  if (getServiceTierOverride == null) return pinned ? { defaults: { speed: "fast" } } : undefined;
+  return {
+    defaults: pinned ? { speed: "fast" } : {},
+    liveOverrides: () => {
+      const tier = getServiceTierOverride();
+      if (tier == null) return {};
+      return { speed: tier === "priority" ? "fast" : undefined };
+    },
+  };
+}
+
+/**
+ * xAI `service_tier` for one model: an explicit request tier, then (frontier Grok only, the
+ * models with Fast mode) the chat's pick, then the provider preference.
+ */
+function resolveXAIServiceTier(input: {
+  requestTier: XAIServiceTier | null | undefined;
+  configuredTier: unknown;
+  chatServiceTier: ServiceTier | undefined;
+  followsChat: boolean;
+  getServiceTierOverride: GetServiceTierOverride | undefined;
+}): { serviceTier?: XAIServiceTier; getLiveServiceTier?: () => XAIServiceTier | undefined } {
+  const configuredTier =
+    input.configuredTier === "default" || input.configuredTier === "priority"
+      ? input.configuredTier
+      : undefined;
+  // An explicit request tier wins, also over a live mid-turn chat change.
+  if (input.requestTier != null) return { serviceTier: input.requestTier };
+  if (!input.followsChat) return { serviceTier: configuredTier };
+  const getServiceTierOverride = input.getServiceTierOverride;
+  return {
+    serviceTier: toXAIServiceTier(input.chatServiceTier) ?? configuredTier,
+    getLiveServiceTier:
+      getServiceTierOverride && (() => toXAIServiceTier(getServiceTierOverride())),
+  };
 }
 
 function wrapFetchWithServiceTier(baseFetch: typeof fetch, serviceTier?: string): typeof fetch {
@@ -362,6 +479,142 @@ function wrapFetchWithJsonBodyPatch(
   return Object.assign(patchedFetch, baseFetch) as typeof fetch;
 }
 
+/**
+ * Gemini's OpenAI-compatible endpoint streams each tool call whole in its own
+ * chunk, with an id but no `index`. @ai-sdk/openai's chat chunk schema
+ * requires the index, so every Gemini tool-call turn through a Coder gateway
+ * failed with "Type validation failed". Fill it in from the call id (an id-less
+ * continuation delta keeps the previous index) before the SDK parses the stream.
+ */
+function wrapFetchWithChatToolCallIndexes(baseFetch: typeof fetch): typeof fetch {
+  const indexedFetch = async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1]
+  ): Promise<Response> => {
+    const response = await baseFetch(input, init);
+    if (
+      response.body == null ||
+      response.headers.get("content-type")?.includes("text/event-stream") !== true
+    ) {
+      return response;
+    }
+
+    const indexesById = new Map<string, number>();
+    let previousIndex: number | undefined;
+    const indexToolCalls = (line: string): string => {
+      if (!line.startsWith("data:") || !line.includes('"tool_calls"')) {
+        return line;
+      }
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(line.slice("data:".length));
+      } catch {
+        return line;
+      }
+      if (!isPlainObject(chunk) || !Array.isArray(chunk.choices)) {
+        return line;
+      }
+      let changed = false;
+      for (const choice of chunk.choices) {
+        const toolCalls =
+          isPlainObject(choice) && isPlainObject(choice.delta) ? choice.delta.tool_calls : null;
+        if (!Array.isArray(toolCalls)) {
+          continue;
+        }
+        for (const toolCall of toolCalls) {
+          if (!isPlainObject(toolCall) || typeof toolCall.index === "number") {
+            continue;
+          }
+          const id = typeof toolCall.id === "string" && toolCall.id ? toolCall.id : null;
+          let index = id == null ? previousIndex : indexesById.get(id);
+          if (index == null) {
+            index = indexesById.size;
+            if (id != null) {
+              indexesById.set(id, index);
+            }
+          }
+          toolCall.index = index;
+          previousIndex = index;
+          changed = true;
+        }
+      }
+      return changed ? `data: ${JSON.stringify(chunk)}` : line;
+    };
+
+    return mapEventStreamLines(response, response.body, indexToolCalls);
+  };
+
+  return Object.assign(indexedFetch, baseFetch) as typeof fetch;
+}
+
+/**
+ * Model for a Coder instance on an OpenAI wire other than google-typed ones.
+ * The gateway intercepts both /responses and /chat/completions: real OpenAI
+ * upstreams use Responses, compatible upstreams use Chat.
+ */
+function createCoderOpenAIWireModel(
+  createOpenAI: typeof CreateOpenAI,
+  options: {
+    wire: "openai-responses" | "openai-chat";
+    baseURL: string;
+    modelId: string;
+    fetch: typeof fetch;
+    serviceTierAvailable: boolean;
+    capabilityModel: string;
+  }
+): LanguageModelV4 {
+  const createCoderModel = (fetch: typeof globalThis.fetch) => {
+    const provider = createOpenAI({
+      apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+      baseURL: options.baseURL,
+      fetch,
+    });
+    return options.wire === "openai-responses"
+      ? provider.responses(options.modelId)
+      : provider.chat(options.modelId);
+  };
+  if (options.wire === "openai-responses") {
+    return createOpenAIModelWithPreservedOptions(createCoderModel, options.fetch, {
+      serviceTierAvailable: options.serviceTierAvailable,
+      wireModelId: options.modelId,
+    });
+  }
+  // Chat upstreams include Gemini's OpenAI compatibility layer behind
+  // openai-compat instances.
+  const coderModel = createOpenAIModelWithPreservedOptions(
+    createCoderModel,
+    wrapFetchWithChatToolCallIndexes(options.fetch),
+    { serviceTierAvailable: options.serviceTierAvailable, wireModelId: options.modelId }
+  );
+  return clampGpt6ChatCompletionsToolReasoning(
+    reportChatCompletionsServiceTier(coderModel),
+    options.capabilityModel
+  );
+}
+
+/**
+ * Request body for google-typed Coder instances. @ai-sdk/openai-compatible
+ * replays reasoning as reasoning_content on assistant messages; drop it, as
+ * @ai-sdk/openai (this route's previous client) did, because Gemini's
+ * compatibility layer takes thoughts back only as tool-call thought signatures,
+ * which stay.
+ */
+function toGeminiOpenAICompatBody(body: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(body.messages)) {
+    return body;
+  }
+  return {
+    ...body,
+    messages: body.messages.map((message: unknown) => {
+      if (!isPlainObject(message) || message.role !== "assistant") {
+        return message;
+      }
+      const { reasoning_content: _reasoning, ...rest } = message;
+      return rest;
+    }),
+  };
+}
+
 /** Set reasoning effort "none" on either OpenAI wire format's request body. */
 function withOpenAINoneReasoningEffort(body: Record<string, unknown>): Record<string, unknown> {
   if ("messages" in body) {
@@ -372,25 +625,115 @@ function withOpenAINoneReasoningEffort(body: Record<string, unknown>): Record<st
   return { ...body, reasoning: { ...reasoning, effort: "none" } };
 }
 
+/** Select a Daybreak access program on Responses bodies; Chat Completions has no such field. */
+function withOpenAICyberAccessProgram(
+  body: Record<string, unknown>,
+  cyber: OpenAICyberAccessProgram
+): Record<string, unknown> {
+  if ("messages" in body) return body;
+  const accessPrograms =
+    typeof body.access_programs === "object" && body.access_programs !== null
+      ? body.access_programs
+      : {};
+  return { ...body, access_programs: { ...accessPrograms, cyber } };
+}
+
 /**
- * Preserve OpenAI request options that @ai-sdk/openai drops by model-name capability
- * checks, without rewriting the raw model/endpoint routing identity.
+ * Names of the function tools a call leaves without a strict mode. Since 4.0.77
+ * (2abd503), @ai-sdk/openai sends `strict: false` for them on Responses; before, it
+ * omitted the key, and OpenAI then applies strict mode, which schemaSanitizer's
+ * nullable widening of optional properties is built for. Chat Completions still
+ * omits an unset `strict`, and its tools carry no top-level `name`.
  */
-function createOpenAIModelWithPreservedOptions(
+function unsetStrictFunctionToolNames(
+  tools: LanguageModelV4CallOptions["tools"]
+): ReadonlySet<string> {
+  return new Set(
+    (tools ?? []).flatMap((tool) =>
+      tool.type === "function" && tool.strict === undefined ? [tool.name] : []
+    )
+  );
+}
+
+/** Drop the SDK's defaulted `strict: false` from those Responses function tools. */
+function withoutDefaultedToolStrict(
+  body: Record<string, unknown>,
+  names: ReadonlySet<string>
+): Record<string, unknown> {
+  if (!Array.isArray(body.tools)) return body;
+  return {
+    ...body,
+    tools: body.tools.map((tool: unknown) => {
+      if (!isPlainObject(tool) || tool.strict !== false || tool.type !== "function") return tool;
+      if (typeof tool.name !== "string" || !names.has(tool.name)) return tool;
+      const { strict: _defaulted, ...rest } = tool;
+      return rest;
+    }),
+  };
+}
+
+/**
+ * A model whose Responses requests omit `strict` on the function tools a call left
+ * unset (see unsetStrictFunctionToolNames). A model on another wire is returned as
+ * built. Per-call models keep concurrent calls' tool sets independent.
+ */
+function withUnsetToolStrictOmitted(
   createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
-  baseFetch: typeof fetch,
-  options: { serviceTierAvailable: boolean; wireModelId: string }
+  baseFetch: typeof fetch
 ): LanguageModelV4 {
   const model = createModel(baseFetch);
+  // `${providerName}.responses` is the SDK's provider id for its Responses model.
+  if (!model.provider.endsWith(".responses")) return model;
+  const modelForCall = (params: LanguageModelV4CallOptions): LanguageModelV4 => {
+    const names = unsetStrictFunctionToolNames(params.tools);
+    if (names.size === 0) return model;
+    return createModel(
+      wrapFetchWithJsonBodyPatch(baseFetch, (body) => withoutDefaultedToolStrict(body, names))
+    );
+  };
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      wrapGenerate: ({ params }) => modelForCall(params).doGenerate(params),
+      wrapStream: ({ params }) => modelForCall(params).doStream(params),
+    },
+  });
+}
+
+/**
+ * Preserve OpenAI request options that @ai-sdk/openai drops or defaults by model-name
+ * capability checks, without rewriting the raw model/endpoint routing identity.
+ */
+function createOpenAIModelWithPreservedOptions(
+  createSdkModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
+  baseFetch: typeof fetch,
+  options: {
+    serviceTierAvailable: boolean;
+    wireModelId: string;
+    /** Only the direct OpenAI API accepts access_programs. */
+    cyberAccessProgramAvailable?: boolean;
+  }
+): LanguageModelV4 {
+  // Every model built here, per-call ones included, omits an unset tool `strict`.
+  const createModel = (fetch: typeof globalThis.fetch) =>
+    withUnsetToolStrictOmitted(createSdkModel, fetch);
+  const model = createModel(baseFetch);
   // @ai-sdk/openai (through at least 4.0.72) allowlists GPT-6 reasoning efforts
-  // without "none" and silently strips it, but Sol/Luna accept "none" and OpenAI
-  // requires it for Chat Completions function calling (Astra genuinely rejects it,
-  // and Xum never requests it there). Without this, Chat agent turns fail and
-  // Responses "off" silently runs at the API default effort. This lives in Xum
+  // without "none" and silently strips it, but Luna accepts "none" and OpenAI
+  // requires it for Chat Completions function calling (the other GPT-6 tiers
+  // genuinely reject it, and Xum never requests it there). Without this, Chat
+  // agent turns fail and Responses "off" silently runs at the API default effort. This lives in Xum
   // runtime code rather than a bun patch because npm installs of the published
   // package would not apply a bun patch.
-  const preserveNoneEffort = isGpt6SolOrLunaModel(options.wireModelId);
-  if (!options.serviceTierAvailable && !preserveNoneEffort) return model;
+  const preserveNoneEffort = isGpt6LunaModel(options.wireModelId);
+  if (
+    !options.serviceTierAvailable &&
+    !preserveNoneEffort &&
+    !options.cyberAccessProgramAvailable
+  ) {
+    return model;
+  }
 
   const createPreservingCall = (params: LanguageModelV4CallOptions) => {
     const openaiOptions = params.providerOptions?.openai;
@@ -398,13 +741,23 @@ function createOpenAIModelWithPreservedOptions(
       ? ServiceTierSchema.optional().parse(openaiOptions?.serviceTier)
       : undefined;
     const noneEffort = preserveNoneEffort && openaiOptions?.reasoningEffort === "none";
-    if (tier == null && !noneEffort) return undefined;
+    // buildProviderOptions' private Cyber key. @ai-sdk/openai through 4.0.83 has
+    // no access_programs option and its schema drops unknown keys, so serialize it here.
+    const cyber = options.cyberAccessProgramAvailable
+      ? OpenAICyberAccessProgramSchema.optional().parse(openaiOptions?.cyberAccessProgram)
+      : undefined;
+    if (tier == null && !noneEffort && cyber == null) return undefined;
     // The SDK drops tiers for opaque gateway aliases and "none" for GPT-6 IDs.
     // Serialize them after SDK capability checks instead. Per-call adapters keep
     // concurrent requests' overrides independent.
     let callFetch = wrapFetchWithServiceTier(baseFetch, tier);
     if (noneEffort) {
       callFetch = wrapFetchWithJsonBodyPatch(callFetch, withOpenAINoneReasoningEffort);
+    }
+    if (cyber != null) {
+      callFetch = wrapFetchWithJsonBodyPatch(callFetch, (body) =>
+        withOpenAICyberAccessProgram(body, cyber)
+      );
     }
     return {
       model: createModel(callFetch),
@@ -438,8 +791,53 @@ function createOpenAIModelWithPreservedOptions(
   });
 }
 
+// Ollama servers before v0.6.6 (ollama/ollama#9434) parse a tool schema `type` only as a string,
+// on /api/chat and on the OpenAI-compatible /v1 (both decode the same Go structs), so one `type`
+// array fails the whole request. zod >= 4.5 emits nullable fields as `type: [X, "null"]` (MCP
+// schemas can too), so these routes send the equivalent `anyOf`.
+function typeArrayToAnyOf(out: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(out.type)) return out;
+  const { type: types, ...rest } = out as { type: unknown[]; allOf?: unknown };
+  if (types.length === 1) return { ...rest, type: types[0] };
+  const union = types.map((type) => ({ type }));
+  if (!("anyOf" in rest)) return { ...rest, anyOf: union };
+  // An existing anyOf is a separate constraint: the type union joins it via allOf.
+  return {
+    ...rest,
+    allOf: [...(Array.isArray(rest.allOf) ? (rest.allOf as unknown[]) : []), { anyOf: union }],
+  };
+}
+
 /**
- * GPT-6 Sol/Luna Chat Completions accepts function calling only with
+ * The wrapped model reports specificationVersion "v4" (ollama-ai-provider-v2 4.x does too, #5372),
+ * so DevTools records these requests when it is on, as on the Copilot route. That is intended
+ * (#6083): recording does not change the request.
+ */
+function withToolTypeArraysAsAnyOf(model: Parameters<typeof wrapLanguageModel>[0]["model"]) {
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      transformParams: ({ params }) => {
+        const tools = params.tools?.map((tool) =>
+          tool.type === "function"
+            ? {
+                ...tool,
+                inputSchema: mapToolSubschemas(
+                  tool.inputSchema,
+                  typeArrayToAnyOf
+                ) as typeof tool.inputSchema,
+              }
+            : tool
+        );
+        return Promise.resolve({ ...params, tools });
+      },
+    },
+  });
+}
+
+/**
+ * GPT-6 Luna Chat Completions accepts function calling only with
  * reasoning_effort "none". buildProviderOptions clamps the options agent turns
  * record and send, but headless tool loops (Dream consolidation, memory
  * harvest, refine, sidebar status) call streamText with tools and no provider
@@ -450,11 +848,11 @@ function createOpenAIModelWithPreservedOptions(
  * createOpenAIModelWithPreservedOptions: the injected "none" must be visible
  * to that wrapper's body patch, or the SDK strips it.
  */
-export function clampGpt6ChatCompletionsToolReasoning(
+function clampGpt6ChatCompletionsToolReasoning(
   model: LanguageModelV4,
   capabilityModel: string
 ): LanguageModelV4 {
-  if (!isGpt6SolOrLunaModel(capabilityModel)) return model;
+  if (!isGpt6LunaModel(capabilityModel)) return model;
   return wrapLanguageModel({
     model,
     middleware: {
@@ -583,31 +981,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** Anthropic wire form (`defer_loading`) or AI SDK prompt form (providerOptions). */
+function isWireDeferLoadingTool(tool: Record<string, unknown>): boolean {
+  return tool.defer_loading === true || isDeferLoadingTool(tool);
+}
+
 /**
- * Remove every cache marker the request pipeline may have serialized:
- * `cache_control` on system/message/tool entries and nested content parts,
- * plus gateway-style providerOptions.anthropic.cacheControl. ZDR enforcement
- * happens HERE, at the wire, because upstream eligibility checks read a
- * policy-filtered providers view that can hide the global anthropic
- * disableBetaFeatures flag.
+ * Visits every entry of the request body that can hold a cache marker: system/message/tool
+ * entries and their nested content parts (tool_result content included), with the entry's
+ * prompt-form providerOptions.anthropic record when it has one.
  */
-function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void {
-  const stripEntry = (entry: unknown): void => {
-    if (entry == null || typeof entry !== "object" || Array.isArray(entry)) {
+function forEachAnthropicCacheMarkerHolder(
+  json: Record<string, unknown>,
+  visit: (record: Record<string, unknown>, anthropicOptions?: Record<string, unknown>) => void
+): void {
+  const visitEntry = (entry: unknown): void => {
+    if (!isRecord(entry) || Array.isArray(entry)) {
       return;
     }
-    const record = entry as Record<string, unknown>;
-    delete record.cache_control;
-    const providerOptions = record.providerOptions;
-    if (providerOptions != null && typeof providerOptions === "object") {
-      const anthropicOptions = (providerOptions as Record<string, unknown>).anthropic;
-      if (anthropicOptions != null && typeof anthropicOptions === "object") {
-        delete (anthropicOptions as Record<string, unknown>).cacheControl;
-      }
-    }
-    if (Array.isArray(record.content)) {
-      for (const part of record.content) {
-        stripEntry(part);
+    const providerOptions = entry.providerOptions;
+    const anthropicOptions = isRecord(providerOptions) ? providerOptions.anthropic : undefined;
+    visit(entry, isRecord(anthropicOptions) ? anthropicOptions : undefined);
+    if (Array.isArray(entry.content)) {
+      for (const part of entry.content) {
+        visitEntry(part);
       }
     }
   };
@@ -616,10 +1013,136 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
     const value = json[key];
     if (Array.isArray(value)) {
       for (const entry of value) {
-        stripEntry(entry);
+        visitEntry(entry);
       }
     }
   }
+}
+
+/**
+ * Remove every cache marker the request pipeline may have serialized:
+ * `cache_control` on system/message/tool entries and nested content parts,
+ * plus prompt-form providerOptions.anthropic.cacheControl. ZDR enforcement
+ * happens HERE, at the wire, so no upstream eligibility check is load-bearing
+ * for the global anthropic disableBetaFeatures flag.
+ */
+function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void {
+  forEachAnthropicCacheMarkerHolder(json, (record, anthropicOptions) => {
+    delete record.cache_control;
+    if (anthropicOptions) delete anthropicOptions.cacheControl;
+  });
+}
+
+/**
+ * Puts one TTL on every existing cache marker. Anthropic rejects a request whose ttl=1h marker
+ * follows a ttl=5m one (order: tools, system, messages), so a marker serialized upstream with
+ * another TTL (a per-model extra, a continuous-compaction prefix) must not keep it. An identical
+ * prefix still reads its cache entry across a TTL change, so this costs no cache hit.
+ */
+function setAnthropicCacheMarkerTtl(json: Record<string, unknown>, cacheTtl: AnthropicCacheTtl) {
+  const retag = (holder: Record<string, unknown>, key: string) => {
+    if (isRecord(holder[key])) holder[key] = mergeAnthropicCacheControl(holder[key], cacheTtl);
+  };
+  retag(json, "cache_control");
+  forEachAnthropicCacheMarkerHolder(json, (record, anthropicOptions) => {
+    retag(record, "cache_control");
+    if (anthropicOptions) retag(anthropicOptions, "cacheControl");
+  });
+}
+
+type AnthropicCacheTtlSource =
+  | AnthropicCacheTtl
+  | null
+  | undefined
+  | (() => AnthropicCacheTtl | null | undefined);
+
+/** The last wire-shaping step: strip every marker (ZDR), or put the TTL on every marker. */
+function finalizeAnthropicCacheMarkers(
+  json: Record<string, unknown>,
+  injectCacheControl: boolean,
+  cacheTtlSource: AnthropicCacheTtlSource
+): void {
+  if (!injectCacheControl) {
+    stripAnthropicCacheControlMarkers(json);
+    return;
+  }
+  const cacheTtl = typeof cacheTtlSource === "function" ? cacheTtlSource() : cacheTtlSource;
+  if (cacheTtl) setAnthropicCacheMarkerTtl(json, cacheTtl);
+}
+
+/** The running agent's TTL wins over the configured one, read per request (see CreateModelOptions). */
+function wireAnthropicCacheTtl(
+  configured: AnthropicCacheTtl | undefined,
+  opts: CreateModelOptions | undefined
+): AnthropicCacheTtlSource {
+  const getOverride = opts?.getAnthropicCacheTtlOverride;
+  return getOverride ? () => getOverride() ?? configured : configured;
+}
+
+/**
+ * One fetch attempt of the Anthropic cache wrapper, recording its outcome on the request's
+ * DevTools step when the wrapper knows its route (see recordPromptCacheWire).
+ */
+/**
+ * Whether the runtime monitor observes this response. Only a request Anthropic accepted with
+ * cache markers: one that rejected before reaching it (auth refresh, connection error) or that
+ * it refused (overloaded, rate limited) neither creates nor breaks a cache entry, so it must
+ * not move the baseline or record a break. Nor does a response that arrived after the
+ * request's abort fired (a fetch that ignored the cancellation): the turn already finalized
+ * that DevTools step as aborted without a wire record, so the replay audit cannot count it,
+ * and the monitor must not either.
+ */
+function isObservableResponse(
+  response: Response,
+  cacheMarkersInjected: boolean,
+  signal: AbortSignal | null | undefined
+): boolean {
+  return cacheMarkersInjected && response.ok && signal?.aborted !== true;
+}
+
+/** Orders observations within one process (see DevToolsPromptCacheWire.observedSeq). */
+let promptCacheObservationSeq = 0;
+
+async function fetchRecordingPromptCacheWire(
+  baseFetch: typeof fetch,
+  input: Parameters<typeof fetch>[0],
+  init: RequestInit,
+  wire: {
+    /** The caller's headers: they still carry the synthetic DevTools step id. */
+    stepHeaders: HeadersInit | undefined;
+    options: { routeIdentity?: Omit<PromptCacheRouteIdentity, "endpoint"> } | undefined;
+    cacheMarkersInjected: boolean;
+  }
+): Promise<Response> {
+  const routeIdentity = wire.options?.routeIdentity;
+  if (routeIdentity == null) return baseFetch(input, init);
+  const record = (outcome: { dispatched: boolean; observedAt?: string; observedSeq?: number }) =>
+    recordPromptCacheWire(wire.stepHeaders, {
+      ...routeIdentity,
+      // The monitor keys by the request's endpoint too (another base URL, another cache).
+      endpoint: requestEndpoint(requestUrlOf(input)),
+      cacheMarkersInjected: wire.cacheMarkersInjected,
+      ...outcome,
+    });
+  let response: Response;
+  try {
+    response = await baseFetch(input, init);
+  } catch (error) {
+    record({ dispatched: false });
+    throw error;
+  }
+  // Taken when the monitor observes (right after this returns), so the audit measures the
+  // cache TTL from the same time.
+  record(
+    response.ok
+      ? {
+          dispatched: true,
+          observedAt: new Date().toISOString(),
+          observedSeq: ++promptCacheObservationSeq,
+        }
+      : { dispatched: true }
+  );
+  return response;
 }
 
 /**
@@ -629,7 +1152,7 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
  * and lets a higher-level cacheTtl override win at the last wire-shaping step.
  *
  * Injects cache_control on:
- * 1. Last tool (caches all tool definitions)
+ * 1. Last non-deferred tool (caches all tool definitions)
  * 2. Last message's last content part (caches entire conversation)
  *
  * When injectCacheControl is false (beta features disabled), existing markers
@@ -637,8 +1160,23 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
  */
 export function wrapFetchWithAnthropicCacheControl(
   baseFetch: typeof fetch,
-  cacheTtl?: AnthropicCacheTtl | null,
-  options?: { injectCacheControl?: boolean }
+  /** A getter is sampled at each request, so a per-agent TTL can change between turns. */
+  cacheTtl?: AnthropicCacheTtlSource,
+  options?: {
+    injectCacheControl?: boolean;
+    /**
+     * Sees the final JSON body and its request URL once the request was
+     * dispatched (prompt-cache prefix detection). Not called when cache
+     * markers are stripped: with prompt caching off there is no cache to break.
+     */
+    observeFinalBody?: (body: Record<string, unknown>, requestUrl: string) => void;
+    /**
+     * The route identity the prompt-cache monitor keys this wire by. When set, each attempt
+     * of a DevTools-tracked request records it with the dispatch outcome on the step, so the
+     * replay audit can apply the monitor's rules (see recordPromptCacheWire).
+     */
+    routeIdentity?: Omit<PromptCacheRouteIdentity, "endpoint">;
+  }
 ): typeof fetch {
   const injectCacheControl = options?.injectCacheControl ?? true;
   const cachingFetch = async (
@@ -650,26 +1188,31 @@ export function wrapFetchWithAnthropicCacheControl(
       return baseFetch(input, init);
     }
 
+    let json: Record<string, unknown>;
+    let newBody: string;
     try {
-      const json = JSON.parse(init.body) as Record<string, unknown>;
+      json = JSON.parse(init.body) as Record<string, unknown>;
 
-      if (!injectCacheControl) {
-        stripAnthropicCacheControlMarkers(json);
-      }
-
-      // Inject cache_control on the last tool if tools array exists.
-      // If the SDK already populated cache_control, preserve it but override ttl
-      // when a higher-level cacheTtl is configured.
+      // Inject cache_control on the last non-deferred tool if tools array exists.
+      // If the SDK already populated cache_control, preserve it (the final pass
+      // sets a configured TTL on every marker). Anthropic rejects
+      // cache_control on a defer_loading tool (#5262), so none may keep one.
       if (injectCacheControl && Array.isArray(json.tools) && json.tools.length > 0) {
-        const lastTool = json.tools[json.tools.length - 1] as Record<string, unknown>;
-        lastTool.cache_control = mergeAnthropicCacheControl(lastTool.cache_control, cacheTtl);
+        const tools = json.tools.filter(isRecord);
+        for (const tool of tools) {
+          if (isWireDeferLoadingTool(tool)) delete tool.cache_control;
+        }
+        const lastTool = tools.findLast((tool) => !isWireDeferLoadingTool(tool));
+        if (lastTool) {
+          lastTool.cache_control = mergeAnthropicCacheControl(lastTool.cache_control);
+        }
       }
 
       // Inject cache_control on last message's last content part
       // This caches the entire conversation
       // Handle both formats:
       // - Direct Anthropic provider: json.messages (Anthropic API format)
-      // - Gateway provider: json.prompt (AI SDK internal format)
+      // - AI SDK prompt form: json.prompt
       const messages =
         injectCacheControl && Array.isArray(json.messages)
           ? json.messages
@@ -680,15 +1223,12 @@ export function wrapFetchWithAnthropicCacheControl(
       if (messages && messages.length >= 1) {
         const lastMsg = messages[messages.length - 1] as Record<string, unknown>;
 
-        // For gateway: add providerOptions.anthropic.cacheControl at message level
-        // (gateway validates schema strictly, doesn't allow raw cache_control on messages)
+        // For the prompt form: add providerOptions.anthropic.cacheControl at message level
+        // (that schema is validated strictly and has no raw cache_control on messages)
         if (Array.isArray(json.prompt)) {
           const providerOpts = (lastMsg.providerOptions ?? {}) as Record<string, unknown>;
           const anthropicOpts = (providerOpts.anthropic ?? {}) as Record<string, unknown>;
-          anthropicOpts.cacheControl = mergeAnthropicCacheControl(
-            anthropicOpts.cacheControl,
-            cacheTtl
-          );
+          anthropicOpts.cacheControl = mergeAnthropicCacheControl(anthropicOpts.cacheControl);
           providerOpts.anthropic = anthropicOpts;
           lastMsg.providerOptions = providerOpts;
         }
@@ -697,53 +1237,38 @@ export function wrapFetchWithAnthropicCacheControl(
         const content = lastMsg.content;
         if (Array.isArray(content) && content.length > 0) {
           const lastPart = content[content.length - 1] as Record<string, unknown>;
-          lastPart.cache_control = mergeAnthropicCacheControl(lastPart.cache_control, cacheTtl);
+          lastPart.cache_control = mergeAnthropicCacheControl(lastPart.cache_control);
         }
       }
 
+      finalizeAnthropicCacheMarkers(json, injectCacheControl, cacheTtl);
+
       // Update body with modified JSON
-      const newBody = JSON.stringify(json);
-      const outHeaders = new Headers(init.headers);
-      outHeaders.delete("content-length"); // Body size changed
-      return baseFetch(input, { ...init, headers: outHeaders, body: newBody });
+      newBody = JSON.stringify(json);
     } catch {
       // If JSON parsing fails we can't touch the body; forward unchanged.
       return baseFetch(input, init);
     }
-  };
-
-  return Object.assign(cachingFetch, baseFetch) as typeof fetch;
-}
-
-/**
- * Wrap fetch so any mux-gateway 401 response clears local credentials (best-effort).
- *
- * This ensures the UI immediately reflects that the user has been logged out
- * when the gateway session expires.
- */
-function wrapFetchWithMuxGatewayAutoLogout(
-  baseFetch: typeof fetch,
-  providerService: ProviderService
-): typeof fetch {
-  const wrappedFetch = async (
-    input: Parameters<typeof fetch>[0],
-    init?: Parameters<typeof fetch>[1]
-  ): Promise<Response> => {
-    const response = await baseFetch(input, init);
-
-    if (response.status === 401) {
+    const outHeaders = new Headers(init.headers);
+    outHeaders.delete("content-length"); // Body size changed
+    // Outside the try above: a rejected dispatch must not be re-sent unchanged.
+    const response = await fetchRecordingPromptCacheWire(
+      baseFetch,
+      input,
+      { ...init, headers: outHeaders, body: newBody },
+      { stepHeaders: init.headers, options, cacheMarkersInjected: injectCacheControl }
+    );
+    if (isObservableResponse(response, injectCacheControl, init.signal)) {
       try {
-        await providerService.setConfig("mux-gateway", ["couponCode"], "");
-        await providerService.setConfig("mux-gateway", ["voucher"], "");
+        options?.observeFinalBody?.(json, requestUrlOf(input));
       } catch {
-        // Ignore failures clearing local credentials
+        // Observation is diagnostic only and must never affect the request.
       }
     }
-
     return response;
   };
 
-  return Object.assign(wrappedFetch, baseFetch) as typeof fetch;
+  return Object.assign(cachingFetch, baseFetch) as typeof fetch;
 }
 
 /**
@@ -776,6 +1301,122 @@ function wrapFetchStrippingEmptyAuthHeaders(baseFetch: typeof fetch): typeof fet
     return baseFetch(input, { ...init, headers });
   };
   return Object.assign(wrappedFetch, baseFetch) as typeof fetch;
+}
+
+function requestUrlOf(input: Parameters<typeof fetch>[0]): string {
+  return input instanceof Request ? input.url : String(input);
+}
+
+/** First 16 hex chars of sha256: tells values apart without revealing them. */
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+/** `?sha256:<hash>` for a non-empty query string, else "". */
+function hashedQuery(search: string): string {
+  return search.length > 0 ? `?sha256:${shortHash(search)}` : "";
+}
+
+/**
+ * The cache endpoint of a request URL: origin and path, plus a short hash of the query.
+ * normalizeAnthropicBaseURL keeps base-URL query parameters, and a proxy can pick an account
+ * or cache by them (`?token=...`), so another query is another cache. The query can hold
+ * credentials, so only its hash reaches baseline keys, logs and DevTools records.
+ */
+export function requestEndpoint(requestUrl: string): string {
+  try {
+    const url = new URL(requestUrl);
+    return `${url.origin}${url.pathname}${hashedQuery(url.search)}`;
+  } catch {
+    return `unparsed:sha256:${shortHash(requestUrl)}`;
+  }
+}
+
+/** Google Vertex AI: ADC by default, express mode when an API key resolves. */
+function createGoogleVertexModelEffect(
+  providerConfig: ProviderConfig,
+  modelId: string
+): Effect.Effect<Result<LanguageModel, SendMessageError>> {
+  return Effect.gen(function* () {
+    const creds = resolveProviderCredentials("google-vertex", providerConfig);
+    if (!creds.isConfigured) {
+      return Err({ type: "api_key_not_found", provider: "google-vertex" });
+    }
+    // google-auth-library parses the key file only at request time, where a
+    // missing file, a directory or invalid JSON surfaced as a retried request
+    // error whose text echoed the path or the file's first characters. Fail
+    // here instead, with a non-retryable configuration error.
+    const { keyFilename } = creds;
+    if (keyFilename != null && !(yield* Effect.promise(() => isUsableKeyFile(keyFilename)))) {
+      return Err({ type: "api_key_not_found", provider: "google-vertex" });
+    }
+    const { createVertex } = yield* Effect.promise(async () =>
+      PROVIDER_REGISTRY["google-vertex"]()
+    );
+    // Pass only explicit SDK settings: Xum resolved config and env already,
+    // so the SDK must not reread env. An empty apiKey keeps ADC selected
+    // (the SDK falls back to GOOGLE_VERTEX_API_KEY only when undefined).
+    const provider = createVertex({
+      apiKey: creds.apiKey ?? "",
+      project: creds.project,
+      location: creds.location,
+      // google-auth-library reads the env key file itself: its ADC lookup also
+      // applies GOOGLE_CLOUD_QUOTA_PROJECT, which an explicit keyFilename skips.
+      ...(creds.keyFilenameSource === "config" && { googleAuthOptions: { keyFilename } }),
+      ...(creds.baseUrl != null && { baseURL: creds.baseUrl }),
+      headers: providerConfig.headers,
+      fetch: getProviderFetch(providerConfig),
+    });
+    try {
+      return Ok(provider(modelId));
+    } catch (error) {
+      // The SDK rejects some model IDs synchronously (e.g. tuned endpoints/...
+      // models with an express mode API key). That is deterministic for this
+      // model string, so report it as a non-retryable model error.
+      return Err({ type: "invalid_model_string", message: getErrorMessage(error) });
+    }
+  });
+}
+
+async function isUsableKeyFile(filePath: string): Promise<boolean> {
+  let reason: string;
+  try {
+    // Check the type and size before reading: reading a FIFO blocks until a
+    // writer appears, reading a device such as /dev/zero never ends, and a
+    // huge file would be read whole.
+    const fileStat = await stat(filePath);
+    if (!fileStat.isFile()) {
+      reason = "not a regular file";
+    } else if (fileStat.size > MAX_CREDENTIAL_FILE_BYTES) {
+      reason = "too large";
+    } else {
+      const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
+      if (!isPlainObject(parsed)) {
+        reason = "not a JSON object";
+      } else if (typeof parsed.private_key === "string" && !isPrivateKey(parsed.private_key)) {
+        // google-auth-library decodes the key only when it signs a token request, and
+        // that decoder error ("DECODER routines::unsupported") read as a retryable API error.
+        reason = "invalid private key";
+      } else {
+        return true;
+      }
+    }
+  } catch (error) {
+    // Only the failure kind: fs messages carry the path, JSON errors quote the file.
+    reason = error instanceof SyntaxError ? "invalid JSON" : "unreadable";
+  }
+  log.warn("Google Vertex AI service account key file is unusable", { reason });
+  return false;
+}
+
+function isPrivateKey(pem: string): boolean {
+  try {
+    createPrivateKey(pem);
+    return true;
+  } catch {
+    // Not logged: the caller logs only the failure kind.
+    return false;
+  }
 }
 
 /**
@@ -835,8 +1476,8 @@ export function withAnthropicEvaluationEffort(
     provider: model.provider,
     modelId: model.modelId,
     supportedQuestionTypes: model.supportedQuestionTypes,
-    doEvaluate: (options) =>
-      model.doEvaluate({
+    doDecide: (options) =>
+      model.doDecide({
         ...options,
         providerOptions: {
           ...options.providerOptions,
@@ -988,6 +1629,7 @@ const CODEX_ALLOWED_PARAMS = new Set([
   "store",
   "prompt_cache_key",
   "reasoning",
+  "service_tier",
   "temperature",
   "top_p",
   "include",
@@ -1047,13 +1689,10 @@ function extractTextContent(content: unknown): string {
   return "";
 }
 
-export function normalizeCodexResponsesBody(body: string): string {
-  const json = JSON.parse(body) as Record<string, unknown>;
-
-  // ChatGPT's Codex endpoint is stricter than the public OpenAI Responses API
-  // and currently rejects the `truncation` field entirely.
-  delete json.truncation;
-
+function normalizeCodexOptions(
+  json: Record<string, unknown>,
+  modelTier: ReturnType<typeof openaiGptTier>
+): void {
   // Strip the native pro-mode field before forwarding to the stricter ChatGPT
   // backend. Unknown nested reasoning fields risk a hard 4xx, and falling back
   // to standard mode is safer. Preserve effort/summary.
@@ -1063,6 +1702,27 @@ export function normalizeCodexResponsesBody(body: string): string {
       delete json.reasoning;
     }
   }
+
+  // Forward only paid speed tiers that Codex accepts. Standard omits the field.
+  if (
+    json.service_tier !== "priority" &&
+    !(json.service_tier === "ultrafast" && modelTier?.ultrafast === true)
+  ) {
+    delete json.service_tier;
+  }
+}
+
+export function normalizeCodexResponsesBody(
+  body: string,
+  modelTier?: ReturnType<typeof openaiGptTier>
+): string {
+  const json = JSON.parse(body) as Record<string, unknown>;
+
+  // ChatGPT's Codex endpoint is stricter than the public OpenAI Responses API
+  // and currently rejects the `truncation` field entirely.
+  delete json.truncation;
+
+  normalizeCodexOptions(json, modelTier);
 
   // Codex-compatible Responses requests must disable storage and strip unsupported params.
   json.store = false;
@@ -1127,40 +1787,6 @@ function getConfiguredProviderModelIds(providerConfig: ProviderConfig | undefine
     const modelId = maybeGetProviderModelEntryId(entry);
     return modelId == null ? [] : [modelId];
   });
-}
-
-function createGatewayModelAccessibilityChecker(
-  providersConfig: ProvidersConfig,
-  policyService?: PolicyService | null
-) {
-  // discoveredModels/removedModels are Coder-specific keys (other gateways
-  // have no server-discovered catalog marker), and ProvidersConfig's
-  // loosely-typed Record variant widens them to unknown — validate the shape
-  // once here.
-  const rawDiscovered = providersConfig.coder?.discoveredModels;
-  const coderDiscoveredModels = Array.isArray(rawDiscovered)
-    ? rawDiscovered.filter((id): id is string => typeof id === "string")
-    : undefined;
-  const rawRemoved = providersConfig.coder?.removedModels;
-  const coderRemovedModels = Array.isArray(rawRemoved)
-    ? rawRemoved.filter((id): id is string => typeof id === "string")
-    : undefined;
-  return (gateway: string, gatewayModelId: string): boolean => {
-    // The persisted catalog is deliberately policy-unfiltered (a temporarily
-    // restrictive policy must not survive in durable state); the CURRENT
-    // policy is applied here at routing time, so disallowed gateway models
-    // fall back to other routes instead of dying at model creation.
-    if (policyService?.isEnforced() && !policyService.isModelAllowed(gateway, gatewayModelId)) {
-      return false;
-    }
-    return isGatewayModelAccessibleFromAuthoritativeCatalog(
-      gateway,
-      gatewayModelId,
-      providersConfig[gateway]?.models,
-      gateway === "coder" ? coderDiscoveredModels : undefined,
-      gateway === "coder" ? coderRemovedModels : undefined
-    );
-  };
 }
 
 function formatCustomProviderRequirementError(
@@ -1247,8 +1873,6 @@ export interface ResolveAndCreateModelResult {
    * retagged instance type diverging from the created fallback model.
    */
   coderSelectedInstance?: { name: string; type: string };
-  /** Whether the request is being routed through the Xum gateway. */
-  routedThroughGateway: boolean;
   /** Route provider chosen by backend routing (direct provider or gateway). */
   routeProvider?: ProviderName;
 }
@@ -1296,6 +1920,21 @@ interface CreateModelOptions {
   agentInitiated?: boolean;
   workspaceId?: string;
   routeContext?: RouteContext;
+  /** Chat-local override, sampled at the next model call without changing other chats or routing. */
+  getServiceTierOverride?: () => ServiceTier | undefined;
+  /**
+   * Never send Anthropic `speed: "fast"` (neither the chat's pick nor the provider preference).
+   * Refusal-fallback hops set it: the pick was made for the refused model, Fast mode is limited
+   * to some Anthropic models (Opus 5 needs a waitlist) and the API rejects it elsewhere.
+   */
+  withoutAnthropicFastMode?: boolean;
+  /**
+   * The running agent's Anthropic prompt-cache TTL, sampled at each request on Anthropic wires.
+   * It wins over the global and request-level TTLs; undefined keeps them.
+   */
+  getAnthropicCacheTtlOverride?: () => AnthropicCacheTtl | undefined;
+  /** Chat turns only: enables prompt-cache prefix-break detection on Anthropic wires. */
+  promptCacheScope?: PromptCacheTurnScope;
   /**
    * Providers-config snapshot to create the model from. Passed by
    * resolveAndCreateModel so routing, the returned coderWire snapshot,
@@ -1333,8 +1972,8 @@ interface CreateModelOptions {
  *   via `resolveProviderCredentials`): they compose no async work, so an
  *   Effect conversion would add fiber overhead without composition benefit.
  * - Per-request fetch wrappers and doStream/doGenerate wrappers (Codex/Coder
- *   OAuth token refresh via `getValidAuth()`, mux-gateway auto-logout,
- *   Copilot billing classification, gateway usage normalization): these are
+ *   OAuth token refresh via `getValidAuth()`, Copilot billing
+ *   classification): these are
  *   AI SDK-owned async callbacks executed on every network request after
  *   model creation, not service pipelines — converting them would embed a
  *   `runPromise` boundary per request with no error-typing win.
@@ -1342,51 +1981,59 @@ interface CreateModelOptions {
 export class ProviderModelFactory {
   private readonly config: Config;
   private readonly providerService: ProviderService;
-  private readonly policyService?: PolicyService;
   private readonly devToolsService?: DevToolsService;
   private readonly oauthServices?: OauthServiceBindings;
   private readonly providersConfigStore: ProvidersConfigStore;
+  private readonly promptCachePrefixMonitor = new PromptCachePrefixMonitor();
 
   constructor(
     config: Config,
     providerService: ProviderService,
-    policyService?: PolicyService,
     oauthServices?: OauthServiceBindings,
     devToolsService?: DevToolsService,
     providersConfigStore?: ProvidersConfigStore
   ) {
     this.config = config;
     this.providerService = providerService;
-    this.policyService = policyService;
     this.oauthServices = oauthServices;
     this.devToolsService = devToolsService;
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
   }
 
+  /** A chat turn's prompt-cache scope (see PromptCachePrefixMonitor.createTurnScope). */
+  createPromptCacheTurnScope(
+    workspaceId: string,
+    recorder: TimelineRecorder
+  ): PromptCacheTurnScope {
+    return this.promptCachePrefixMonitor.createTurnScope(workspaceId, recorder);
+  }
+
   /**
-   * Apply an enforced policy forcedBaseUrl to the coder provider's
-   * user-editable deploymentUrl. Coder credentials are issuer-bound, so they
-   * must be resolved against the effective (policy-locked) deployment —
-   * validating against the still-editable config field would wrongly reject
-   * policy-bound credentials after a user edit.
+   * Final-body observer for an Anthropic wire, or undefined for requests outside a chat turn.
+   * The request's endpoint joins the route identity: a changed base URL reaches another cache
+   * (another proxy or account), so its first request must not compare with the old baseline.
    */
-  private coderEffectiveProviderConfig(providerConfig: ProviderConfigRaw): ProviderConfigRaw {
-    const forced = this.policyService?.isEnforced()
-      ? this.policyService.getForcedBaseUrl("coder")
-      : undefined;
-    return forced ? { ...providerConfig, deploymentUrl: forced } : providerConfig;
+  private promptCacheObserver(
+    opts: CreateModelOptions | undefined,
+    identity: Omit<PromptCacheRouteIdentity, "endpoint">
+  ): ((body: Record<string, unknown>, requestUrl: string) => void) | undefined {
+    const scope = opts?.promptCacheScope;
+    if (scope == null) {
+      return undefined;
+    }
+    return (body, requestUrl) =>
+      this.promptCachePrefixMonitor.observe(
+        scope,
+        { ...identity, endpoint: requestEndpoint(requestUrl) },
+        body
+      );
   }
 
   private isProviderAvailableForRouting(
     provider: ProviderName,
-    providersConfig: ProvidersConfig,
-    config: ReturnType<Config["loadConfigOrDefault"]>
+    providersConfig: ProvidersConfig
   ): boolean {
-    const rawProviderConfig = providersConfig[provider] ?? {};
-    const providerConfig =
-      provider === "coder"
-        ? this.coderEffectiveProviderConfig(rawProviderConfig)
-        : rawProviderConfig;
+    const providerConfig = providersConfig[provider] ?? {};
     const credentials = resolveProviderCredentials(provider, providerConfig);
 
     // OpenAI Codex OAuth is a valid credential path even without an API key;
@@ -1399,17 +2046,8 @@ export class ProviderModelFactory {
       return false;
     }
 
-    // Route resolution must honor the shared provider-level enabled=false switch
-    // before considering legacy gateway-specific config gates.
-    if (isProviderDisabledInConfig(providerConfig as { enabled?: unknown })) {
-      return false;
-    }
-
-    if (provider === "mux-gateway") {
-      return config.muxGatewayEnabled !== false;
-    }
-
-    return true;
+    // Route resolution must honor the shared provider-level enabled=false switch.
+    return !isProviderDisabledInConfig(providerConfig as { enabled?: unknown });
   }
 
   /**
@@ -1439,6 +2077,20 @@ export class ProviderModelFactory {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
+      // Perf harness replay mode (XUM_REPLAY_TAPES): no provider call, by construction. Every
+      // chat, status, title, compaction, refine and memory model is created
+      // through here, so no per-service gate is needed.
+      if (isSessionTapeReplayMode()) {
+        return Err<SendMessageError>({
+          type: "session_tape_replay",
+          message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+        });
+      }
+      // Mock AI mode (XUM_MOCK_AI, #5604): the same choke point keeps background features
+      // from reaching a real provider while chat turns are mocked.
+      if (isMockAiMode()) {
+        return Err<SendMessageError>({ type: "unknown", raw: MOCK_AI_MODEL_REFUSED_MESSAGE });
+      }
       const result = yield* self.createModelCoreEffect(modelString, muxProviderOptions, opts);
       if (!result.success) {
         return result;
@@ -1458,7 +2110,7 @@ export class ProviderModelFactory {
       // outside so it records what the SDK actually saw.
       let model: LanguageModel = wrapLanguageModel({
         model: coreModel,
-        middleware: createToolInputDepthGuardMiddleware(),
+        middleware: [createToolSchemaCompactionMiddleware(), createToolInputDepthGuardMiddleware()],
       });
       moveLanguageModelCleanup(coreModel, model);
 
@@ -1488,15 +2140,19 @@ export class ProviderModelFactory {
   private createModelCoreEffect(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: {
-      agentInitiated?: boolean;
-      routeContext?: RouteContext;
-      providersConfig?: ProvidersConfig;
-    }
+    opts?: CreateModelOptions
   ): Effect.Effect<Result<LanguageModel, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    let serviceTierDefault: { namespace: string; option: string; value: string } | undefined;
+    let serviceTierDefault:
+      | {
+          namespace: string;
+          option: string;
+          value?: ServiceTier;
+          liveOverrides?: () => Record<string, ServiceTier | undefined>;
+        }
+      | undefined;
+    let anthropicFastMode: ReturnType<typeof resolveAnthropicFastMode>;
     // The explicit annotation restores the contextual typing the old async
     // signature provided, so the wire-error literals below stay narrowed.
     const pipeline: Effect.Effect<Result<LanguageModel, SendMessageError>> = Effect.gen(
@@ -1548,26 +2204,10 @@ export class ProviderModelFactory {
           });
         }
 
-        if (self.policyService?.isEnforced()) {
-          if (!self.policyService.isProviderAllowed(providerName)) {
-            return Err({
-              type: "policy_denied",
-              message: `Provider ${providerName} is not allowed by policy`,
-            });
-          }
-
-          if (!self.policyService.isModelAllowed(providerName, modelId)) {
-            return Err({
-              type: "policy_denied",
-              message: `Model ${providerName}:${modelId} is not allowed by policy`,
-            });
-          }
-        }
-
         // Backend config is authoritative for Anthropic prompt cache TTL on any
-        // Anthropic-routed model (direct Anthropic, mux-gateway:anthropic/*,
-        // openrouter:anthropic/*). We still allow request-level values when config
-        // is unset for backward compatibility with older clients.
+        // Anthropic-routed model (direct Anthropic, openrouter:anthropic/*). We
+        // still allow request-level values when config is unset for backward
+        // compatibility with older clients.
         const configAnthropicCacheTtl = parseAnthropicCacheTtl(providersConfig.anthropic?.cacheTtl);
         // Coder gateway instances classify by their resolved WIRE type, not the
         // route name: a custom-named Anthropic instance (coder:prod-anthropic/x)
@@ -1606,8 +2246,16 @@ export class ProviderModelFactory {
             cacheTtl: configAnthropicCacheTtl,
           };
         }
-        const effectiveAnthropicCacheTtl =
-          muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl;
+        const effectiveAnthropicCacheTtl = wireAnthropicCacheTtl(
+          muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl,
+          opts
+        );
+
+        // Capture the chat's speed before non-OpenAI routes strip the OpenAI tier below.
+        const chatServiceTier = readChatServiceTier(
+          muxProviderOptions,
+          opts?.getServiceTierOverride
+        );
 
         // Fast is one OpenAI preference across direct and forwarding gateways.
         // Resolve it after routing, from the model's config snapshot, so pinned
@@ -1615,11 +2263,22 @@ export class ProviderModelFactory {
         const serviceTier = ServiceTierSchema.safeParse(
           muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
         );
-        const serviceTierAvailable = openaiServiceTierAvailable(modelString, {
-          providersConfig: self.providerService.getConfig(providersConfig),
+        const serviceTierProvidersConfig = self.providerService.getConfig(providersConfig);
+        const serviceTierRouteOptions = {
+          providersConfig: serviceTierProvidersConfig,
           openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
-        });
-        if (serviceTier.success && serviceTierAvailable) {
+        };
+        const serviceTierAvailable = openaiServiceTierAvailable(
+          modelString,
+          serviceTierRouteOptions
+        );
+        if (
+          serviceTier.success &&
+          serviceTierAvailable &&
+          // Ultrafast (and Flex on GPT-6.2) is model-gated: drop it rather than send a
+          // tier the model rejects.
+          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierRouteOptions)
+        ) {
           serviceTierDefault = {
             namespace: "openai",
             option: "serviceTier",
@@ -1633,6 +2292,41 @@ export class ProviderModelFactory {
         } else if (muxProviderOptions?.openai) {
           delete muxProviderOptions.openai.serviceTier;
         }
+
+        if (serviceTierAvailable && opts?.getServiceTierOverride) {
+          // The API can change tier between calls, not inside an in-flight response.
+          // Read only this turn's override; global preference edits must not affect
+          // another ongoing chat. Keep capabilities pinned to this model's route.
+          serviceTierDefault ??= { namespace: "openai", option: "serviceTier" };
+          const tierOptions = serviceTierDefault;
+          tierOptions.liveOverrides = () => {
+            const tier = opts.getServiceTierOverride?.();
+            if (tier == null) return {};
+            return {
+              [tierOptions.option]: openaiModelSupportsServiceTier(
+                modelString,
+                tier,
+                serviceTierRouteOptions
+              )
+                ? tier
+                : undefined,
+            };
+          };
+        }
+
+        // Anthropic Fast mode is a first-party-API-only beta. Pin it at creation
+        // like the OpenAI tier so fallbacks and headless callers cannot drift, and
+        // never send `speed` where it is unsupported (the API rejects it).
+        const anthropicFastModeSupported =
+          providerName === "anthropic" &&
+          !providerIsCustom &&
+          muxProviderOptions?.anthropic?.disableBetaFeatures !== true &&
+          anthropicFastModeAvailable(modelString, {
+            providersConfig: self.providerService.getConfig(providersConfig),
+          });
+        anthropicFastMode = anthropicFastModeSupported
+          ? resolveAnthropicFastMode(chatServiceTier, providersConfig.anthropic?.speed, opts)
+          : undefined;
 
         // OpenAI-specific: merge global store setting into muxProviderOptions.
         // Coder instances classify by the instance's exact TYPE ("openai" =
@@ -1656,10 +2350,7 @@ export class ProviderModelFactory {
         let providerConfig = providersConfig[providerName] ?? {};
 
         // Providers can be disabled in providers.jsonc without deleting credentials.
-        if (
-          providerName !== "mux-gateway" &&
-          isProviderDisabledInConfig(providerConfig as { enabled?: unknown })
-        ) {
+        if (isProviderDisabledInConfig(providerConfig as { enabled?: unknown })) {
           return Err({ type: "provider_disabled", provider: providerName });
         }
 
@@ -1668,14 +2359,6 @@ export class ProviderModelFactory {
         providerConfig = baseUrl
           ? { ...configWithoutBaseUrl, baseURL: baseUrl }
           : configWithoutBaseUrl;
-
-        // Policy: force provider base URL (if configured).
-        const forcedBaseUrl = self.policyService?.isEnforced()
-          ? self.policyService.getForcedBaseUrl(providerName)
-          : undefined;
-        if (forcedBaseUrl) {
-          providerConfig = { ...providerConfig, baseURL: forcedBaseUrl };
-        }
 
         // Inject app attribution headers (used by OpenRouter and other compatible platforms).
         // We never overwrite user-provided values (case-insensitive header matching).
@@ -1710,7 +2393,8 @@ export class ProviderModelFactory {
                 headers: { ...muxAttributionHeaders },
                 fetch: providerFetch,
               });
-              return Ok(provider(modelId));
+              // These endpoints include old Ollama's /v1 (see withToolTypeArraysAsAnyOf).
+              return Ok(withToolTypeArraysAsAnyOf(provider(modelId)));
             }
             case "openai-responses": {
               const { createOpenAI } = yield* Effect.promise(async () =>
@@ -1739,6 +2423,7 @@ export class ProviderModelFactory {
               // Honor beta disablement like the built-in Anthropic path: strict
               // ZDR proxies reject cache_control when beta features are off.
               const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+              const customRoute = { route: `custom:${providerName}`, modelString };
               const provider = createAnthropic({
                 baseURL: normalizeAnthropicBaseURL(credentials.baseURL),
                 apiKey: isolatedApiKey,
@@ -1746,7 +2431,11 @@ export class ProviderModelFactory {
                 fetch: wrapFetchWithAnthropicCacheControl(
                   customAdapterFetch,
                   effectiveAnthropicCacheTtl,
-                  { injectCacheControl: !disableBeta }
+                  {
+                    injectCacheControl: !disableBeta,
+                    observeFinalBody: self.promptCacheObserver(opts, customRoute),
+                    routeIdentity: customRoute,
+                  }
                 ),
               });
               return Ok(provider(modelId));
@@ -1787,11 +2476,16 @@ export class ProviderModelFactory {
           // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
           const baseFetch = getProviderFetch(providerConfig);
           const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+          const anthropicRoute = { route: "anthropic", modelString };
           // Wrap for cache_control normalization; skip injection when beta features are off.
           const fetchWithCacheControl = wrapFetchWithAnthropicCacheControl(
             baseFetch,
             effectiveAnthropicCacheTtl,
-            { injectCacheControl: !disableBeta }
+            {
+              injectCacheControl: !disableBeta,
+              observeFinalBody: self.promptCacheObserver(opts, anthropicRoute),
+              routeIdentity: anthropicRoute,
+            }
           );
           const providerFetch = fetchWithCacheControl;
           const provider = createAnthropic({
@@ -1808,8 +2502,6 @@ export class ProviderModelFactory {
           const fullModelId = `${providerName}:${modelId}`;
 
           const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
-          const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
-
           const storedCodexOauth = parseCodexOauthAuth(
             (providerConfig as { codexOauth?: unknown }).codexOauth
           );
@@ -1817,13 +2509,6 @@ export class ProviderModelFactory {
           // Resolve credentials from config + env so we can decide whether to
           // route through Codex OAuth or fall back to API key auth.
           const creds = resolveProviderCredentials("openai", providerConfig);
-
-          // When a model requires Codex OAuth but the user hasn't connected it,
-          // fall back to their API key instead of blocking entirely.  If the model
-          // truly only works through OAuth, OpenAI's API will return a clear error.
-          if (codexOauthRequired && !storedCodexOauth && !creds.isConfigured) {
-            return Err({ type: "oauth_not_connected", provider: providerName });
-          }
 
           const codexOauthDefaultAuthRaw = (providerConfig as { codexOauthDefaultAuth?: unknown })
             .codexOauthDefaultAuth;
@@ -1838,7 +2523,6 @@ export class ProviderModelFactory {
 
           // Codex OAuth routing:
           // - Chat Completions never routes through OAuth when an API key exists.
-          // - Required models route through ChatGPT OAuth when connected.
           // - If OAuth is not connected, fall back to API key (if available).
           // - Allowed models route through OAuth only when:
           //   - no API key is configured, OR
@@ -1850,10 +2534,6 @@ export class ProviderModelFactory {
 
             if (earlyWireFormat === "chatCompletions" && creds.isConfigured) {
               return false;
-            }
-
-            if (codexOauthRequired) {
-              return true;
             }
 
             if (!creds.isConfigured) {
@@ -1909,6 +2589,8 @@ export class ProviderModelFactory {
           // Includes request-level overrides from muxProviderOptions, not just config.
           const effectiveWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
 
+          const capabilityModel = resolveModelForMetadata(fullModelId, providersConfig);
+          const modelTier = openaiGptTier(capabilityModel);
           const baseFetch = getProviderFetch(providerConfig);
           const codexOauthService = self.oauthServices?.codexOauthService;
           const webSocketTransportEnabled =
@@ -1965,7 +2647,7 @@ export class ProviderModelFactory {
                     nextInit = {
                       ...init,
                       headers,
-                      body: normalizeCodexResponsesBody(body),
+                      body: normalizeCodexResponsesBody(body, modelTier),
                     };
                   } catch {
                     // If body isn't JSON, fall through to normal fetch (but still allow Codex routing).
@@ -2038,21 +2720,20 @@ export class ProviderModelFactory {
               ? provider.chat(modelId)
               : provider.responses(modelId);
           };
-          // Reuse the same transport across per-call adapters. Inject tiers before
-          // its HTTP/WebSocket dispatch, and keep OAuth's normalization unchanged.
-          // Mappings are metadata, not authority over the raw/proxy model's tier support.
+          // Inject tiers before dispatch. Use the Codex backend's tier rules, not the SDK's
+          // API model rules, for OAuth. Mapped IDs also need to bypass the SDK's model rules.
           // Explicit mappings forward the requested tier for upstream validation;
           // only unmapped native IDs retain the SDK's name-based restrictions.
-          const capabilityModel = resolveModelForMetadata(fullModelId, providersConfig);
           const isMappedAlias = capabilityModel !== fullModelId;
           const preservedModel = createOpenAIModelWithPreservedOptions(
             createNativeModel,
             webSocketTransport.fetch,
             {
-              // Codex OAuth keeps its existing tier behavior; only effort is preserved.
               serviceTierAvailable:
-                !shouldRouteThroughCodexOauth && serviceTierAvailable && isMappedAlias,
+                shouldRouteThroughCodexOauth || (serviceTierAvailable && isMappedAlias),
               wireModelId: modelId,
+              // Codex OAuth needs no gate: normalizeCodexResponsesBody's allowlist drops access_programs.
+              cyberAccessProgramAvailable: true,
             }
           );
           const model =
@@ -2135,13 +2816,27 @@ export class ProviderModelFactory {
             };
           }
 
-          const configuredServiceTier =
-            serviceTier === "default" || serviceTier === "priority" ? serviceTier : undefined;
-          const effectiveServiceTier =
-            muxProviderOptions?.xai?.serviceTier ?? configuredServiceTier;
+          // Frontier Grok uses the Responses API so @ai-sdk/xai surfaces exact billed
+          // cost metadata (including Priority Processing). Mapped provider aliases inherit
+          // that capability; older custom model strings stay on Chat Completions for
+          // legacy search_parameters compatibility.
+          const capabilityModel = resolveModelForMetadata(`xai:${modelId}`, providersConfig);
+          const isFrontierGrok = isGrokFrontierModel(capabilityModel);
+
+          const xaiTier = resolveXAIServiceTier({
+            requestTier: muxProviderOptions?.xai?.serviceTier,
+            configuredTier: serviceTier,
+            chatServiceTier,
+            followsChat: isFrontierGrok,
+            getServiceTierOverride: opts?.getServiceTierOverride,
+          });
 
           const { createXai } = yield* Effect.promise(async () => PROVIDER_REGISTRY.xai());
-          const providerFetch = wrapFetchWithXAIServiceTier(baseFetch, effectiveServiceTier);
+          const providerFetch = wrapFetchWithXAIServiceTier(
+            baseFetch,
+            xaiTier.serviceTier,
+            xaiTier.getLiveServiceTier
+          );
           const provider = createXai({
             apiKey: resolvedApiKey,
             baseURL: creds.baseUrl ?? baseURL,
@@ -2149,14 +2844,7 @@ export class ProviderModelFactory {
             ...restOptions,
             fetch: providerFetch,
           });
-          // Frontier Grok uses the Responses API so @ai-sdk/xai surfaces exact billed
-          // cost metadata (including Priority Processing). Mapped provider aliases inherit
-          // that capability; older custom model strings stay on Chat Completions for
-          // legacy search_parameters compatibility.
-          const capabilityModel = resolveModelForMetadata(`xai:${modelId}`, providersConfig);
-          const model = isGrokFrontierModel(capabilityModel)
-            ? provider.responses(modelId)
-            : provider.chat(modelId);
+          const model = isFrontierGrok ? provider.responses(modelId) : provider.chat(modelId);
 
           // Frontier Grok Responses: force store=false by default so ZDR and non-ZDR share
           // one path. buildProviderOptions already defaults this; inject here too so
@@ -2182,7 +2870,7 @@ export class ProviderModelFactory {
             // Use strict mode for better compatibility with Ollama API
             compatibility: "strict",
           });
-          return Ok(provider(modelId));
+          return Ok(withToolTypeArraysAsAnyOf(provider(modelId)));
         }
 
         // Handle OpenRouter provider
@@ -2335,120 +3023,8 @@ export class ProviderModelFactory {
           return Ok(provider(modelId));
         }
 
-        // Handle Xum Gateway provider
-        if (providerName === "mux-gateway") {
-          // Resolve couponCode from config (single source of truth)
-          const creds = resolveProviderCredentials("mux-gateway", providerConfig);
-          if (!creds.isConfigured || !creds.couponCode) {
-            return Err({ type: "api_key_not_found", provider: providerName });
-          }
-          const { couponCode } = creds;
-
-          const { createGateway } = yield* Effect.promise(async () =>
-            PROVIDER_REGISTRY["mux-gateway"]()
-          );
-          // For Anthropic models via gateway, normalize cache_control on the final payload.
-          // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
-          // The gateway server still expects spec-v3 string-encoded file parts;
-          // rewrite the v4 `{ type: "data" | "url" }` objects the 4.x SDK emits
-          // so image attachments are not rejected as "invalid request".
-          const baseFetch = wrapFetchWithGatewayFilePartNormalization(
-            getProviderFetch(providerConfig)
-          );
-          const isAnthropicModel = modelId.startsWith("anthropic/");
-          const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
-          // For Anthropic models via gateway, wrap for cache_control normalization;
-          // skip injection when beta features are off.
-          const fetchWithCacheControl = isAnthropicModel
-            ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
-                injectCacheControl: !disableBeta,
-              })
-            : baseFetch;
-          const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
-            fetchWithCacheControl,
-            self.providerService
-          );
-          const providerFetch = fetchWithAutoLogout;
-          // Use configured baseURL or fall back to default gateway URL
-          const gatewayBaseURL =
-            providerConfig.baseURL ?? "https://gateway.mux.coder.com/api/v1/ai-gateway/v1/ai";
-
-          // 1M context beta header is injected per-request via buildRequestHeaders() →
-          // streamText({ headers }), not at provider creation time.
-          const gateway = createGateway({
-            apiKey: couponCode,
-            baseURL: gatewayBaseURL,
-            fetch: providerFetch,
-          });
-          const model = gateway(modelId);
-
-          // Normalize usage format from the gateway server.
-          // The gateway SDK declares specificationVersion "v3", so the AI SDK core
-          // expects nested v3 usage: { inputTokens: { total, ... }, outputTokens: { total, ... } }.
-          // However the gateway server may return flat v2-style usage
-          // (e.g. { inputTokens: 123, outputTokens: 456 }), causing
-          // asLanguageModelUsage to produce undefined → 0 for all token counts.
-          // These wrappers detect flat usage and convert to v3 nested format.
-          // Google forwards candidatesTokenCount as flat outputTokens, which excludes
-          // thoughts; other providers report output inclusive of reasoning.
-          const usageOptions = { outputExcludesReasoning: modelId.startsWith("google/") };
-          const originalDoStream = model.doStream.bind(model);
-          model.doStream = async (options) => {
-            const result = await originalDoStream(options);
-            return {
-              ...result,
-              // Type assertion safe: the transform only modifies the shape of usage/finishReason
-              // fields within existing chunks, it doesn't change the stream part types.
-              stream: result.stream.pipeThrough(
-                normalizeGatewayStreamUsage(usageOptions)
-              ) as typeof result.stream,
-            };
-          };
-
-          const originalDoGenerate = model.doGenerate.bind(model);
-          model.doGenerate = async (options) => {
-            const result = await originalDoGenerate(options);
-            return normalizeGatewayGenerateResult(result, usageOptions);
-          };
-
-          const configuredOpenAIStore = muxProviderOptions?.openai?.store;
-          if (modelId.startsWith("openai/") && typeof configuredOpenAIStore === "boolean") {
-            // Inject configured OpenAI store as a request-level default for
-            // gateway-routed OpenAI models when callers omit providerOptions.
-            const injectStoreFlag = (
-              options: Parameters<typeof model.doStream>[0]
-            ): Parameters<typeof model.doStream>[0] => {
-              const openaiOpts =
-                (options.providerOptions?.openai as Record<string, unknown> | undefined) ?? {};
-              return {
-                ...options,
-                providerOptions: {
-                  ...options.providerOptions,
-                  openai: {
-                    store: configuredOpenAIStore,
-                    ...openaiOpts,
-                  },
-                },
-              };
-            };
-
-            const originalDoStream = model.doStream.bind(model);
-            const originalDoGenerate = model.doGenerate.bind(model);
-            model.doStream = (options) => originalDoStream(injectStoreFlag(options));
-            model.doGenerate = (options) => originalDoGenerate(injectStoreFlag(options));
-          }
-
-          // Gateway-routed frontier Grok must get the same store=false default as direct xAI.
-          // Route form is mux-gateway:xai/<model>; capability lookup uses canonical xai:id.
-          if (modelId.startsWith("xai/")) {
-            const gatewayGrokModel = `xai:${modelId.slice("xai/".length)}`;
-            const capabilityModel = resolveModelForMetadata(gatewayGrokModel, providersConfig);
-            if (isGrokFrontierModel(capabilityModel)) {
-              injectGrokStoreDefault(model, muxProviderOptions?.xai?.store);
-            }
-          }
-
-          return Ok(model);
+        if (providerName === "google-vertex") {
+          return yield* createGoogleVertexModelEffect(providerConfig, modelId);
         }
 
         // GitHub Copilot chooses a stock OpenAI chat model or a custom Responses model per route.
@@ -2537,6 +3113,10 @@ export class ProviderModelFactory {
           }
 
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
+          // Apply the live pick after translating Copilot's public options; otherwise
+          // their stale tier would overwrite the new OpenAI-wire value.
+          const liveTierOverrides = serviceTierDefault?.liveOverrides;
+          if (serviceTierDefault) serviceTierDefault.liveOverrides = undefined;
           const providerOptionsNamespace = resolveProviderOptionsNamespaceKey(
             "openai",
             "github-copilot"
@@ -2563,6 +3143,7 @@ export class ProviderModelFactory {
                       openai: {
                         ...params.providerOptions?.openai,
                         ...params.providerOptions?.[providerOptionsNamespace],
+                        ...liveTierOverrides?.(),
                       },
                     },
                   }),
@@ -2574,18 +3155,7 @@ export class ProviderModelFactory {
         // Coder AI Bridge: per-origin endpoints under <deployment>/api/v2/aibridge,
         // authenticated with Coder OAuth access tokens (refreshed per request).
         if (providerName === "coder") {
-          // Policy: an enforced forcedBaseUrl must win over the user-editable
-          // deploymentUrl, otherwise Coder traffic would bypass the policy-locked
-          // endpoint. Apply the forced URL BEFORE credential resolution (see
-          // coderEffectiveProviderConfig): credentials are issuer-bound, and
-          // tokens minted by any other deployment fail closed as "not
-          // configured". The login flow itself targets the forced URL
-          // (CoderOauthService is policy-aware), so re-login produces matching
-          // credentials.
-          const creds = resolveProviderCredentials(
-            "coder",
-            self.coderEffectiveProviderConfig(providerConfig)
-          );
+          const creds = resolveProviderCredentials("coder", providerConfig);
           if (!creds.isConfigured || !creds.deploymentUrl) {
             return Err({ type: "api_key_not_found", provider: providerName });
           }
@@ -2599,7 +3169,7 @@ export class ProviderModelFactory {
             });
           }
 
-          // Model IDs are <providerName>/<modelId> (mux-gateway style) because
+          // Model IDs are <providerName>/<modelId> because
           // the gateway has no cross-provider routing: each configured provider
           // instance is mounted at /<name>/... and only serves its own wire
           // format. The FIRST slash separates the instance name (names cannot
@@ -2639,29 +3209,10 @@ export class ProviderModelFactory {
           // Per-request auth wrapper: getValidAuth() transparently refreshes and
           // persists rotated tokens, so long sessions never send stale tokens.
           const baseFetch = getProviderFetch(providerConfig);
-          const policyService = self.policyService;
-          // Policy recheck per REQUEST, not just at model creation: an
-          // enforced policy can refresh mid-stream (or during the awaited
-          // setup between resolveAndCreateModel and the first fetch) to deny
-          // Coder or this model. getValidAuth() only validates the
-          // credential/issuer, so without this gate the wrapper would keep
-          // attaching the OAuth token and bypass the newly effective
-          // restriction for the remainder of a long multi-step stream.
-          const assertCoderModelAllowedByPolicy = () => {
-            if (
-              policyService?.isEnforced() &&
-              (!policyService.isProviderAllowed("coder") ||
-                !policyService.isModelAllowed("coder", modelId))
-            ) {
-              throw new Error(`Model coder:${modelId} is not allowed by policy`);
-            }
-          };
           const coderFetchFn = async (
             input: Parameters<typeof fetch>[0],
             init?: Parameters<typeof fetch>[1]
           ) => {
-            // Fail fast before the (possibly slow) token round-trip below.
-            assertCoderModelAllowedByPolicy();
             const authResult = await coderOauthService.getValidAuth();
             if (!authResult.success) {
               throw new Error(authResult.error);
@@ -2677,11 +3228,6 @@ export class ProviderModelFactory {
                 "Coder deployment changed since this model was created. Retry the request."
               );
             }
-            // Recheck AFTER the await: getValidAuth() can spend tens of seconds
-            // refreshing an expired token and waiting for cross-process file
-            // locks. A policy refresh landing during that window must not be
-            // bypassed by a check that passed before the await.
-            assertCoderModelAllowedByPolicy();
 
             const headers = new Headers(input instanceof Request ? input.headers : undefined);
             if (init?.headers) {
@@ -2700,12 +3246,17 @@ export class ProviderModelFactory {
           const gatewayBaseUrl = coderAibridgeBaseUrl(deploymentUrl, gatewayProvider.name);
           if (wire === "anthropic") {
             const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
-            // Same cache_control normalization as direct Anthropic / mux-gateway:
+            const coderRoute = { route: `coder:${gatewayProvider.name}`, modelString };
+            // Same cache_control normalization as direct Anthropic:
             // the bridge forwards origin-shaped payloads to the real Anthropic API.
             const providerFetch = wrapFetchWithAnthropicCacheControl(
               coderFetch,
               effectiveAnthropicCacheTtl,
-              { injectCacheControl: !disableBeta }
+              {
+                injectCacheControl: !disableBeta,
+                observeFinalBody: self.promptCacheObserver(opts, coderRoute),
+                routeIdentity: coderRoute,
+              }
             );
             const { createAnthropic } = yield* Effect.promise(async () =>
               PROVIDER_REGISTRY.anthropic()
@@ -2718,40 +3269,44 @@ export class ProviderModelFactory {
             return Ok(provider(originModelId));
           }
 
-          const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          const createCoderModel = (fetch: typeof coderFetch) => {
-            const provider = createOpenAI({
-              apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+          if (gatewayProvider.type === "google") {
+            // Gemini's OpenAI compatibility layer emits thoughts only for an
+            // extra_body thinking_config (see buildProviderOptions), inline in
+            // content. @ai-sdk/openai drops both the passthrough and reasoning;
+            // the compatible SDK forwards one and parses reasoning_content,
+            // which wrapFetchWithGeminiThoughts produces from the inline thoughts.
+            const provider = createOpenAICompatible({
+              name: CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
               baseURL: gatewayBaseUrl,
-              fetch,
+              fetch: wrapFetchWithGeminiThoughts(wrapFetchWithChatToolCallIndexes(coderFetch)),
+              // Match @ai-sdk/openai's chat requests: streamed usage and json_schema outputs.
+              includeUsage: true,
+              supportsStructuredOutputs: true,
+              transformRequestBody: toGeminiOpenAICompatBody,
             });
-            // The gateway intercepts both /responses and /chat/completions. Real
-            // OpenAI upstreams use Responses; compatible upstreams use Chat.
-            return wire === "openai-responses"
-              ? provider.responses(originModelId)
-              : provider.chat(originModelId);
-          };
-          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, coderFetch, {
-            serviceTierAvailable,
-            wireModelId: originModelId,
-          });
-          // A Coder-scoped "Treat as" mapping (coder:compat/team-luna → openai:gpt-6-luna)
-          // is the only capability identity an openai-compat instance has; the raw
-          // originModelId would miss the clamp. Same resolution as buildProviderOptions.
+            return Ok(provider(originModelId));
+          }
+
+          const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
           return Ok(
-            wire === "openai-responses"
-              ? coderModel
-              : clampGpt6ChatCompletionsToolReasoning(
-                  reportChatCompletionsServiceTier(coderModel),
-                  resolveModelForMetadata(`coder:${modelId}`, providersConfig)
-                )
+            createCoderOpenAIWireModel(createOpenAI, {
+              wire,
+              baseURL: gatewayBaseUrl,
+              modelId: originModelId,
+              fetch: coderFetch,
+              serviceTierAvailable,
+              // A Coder-scoped "Treat as" mapping (coder:compat/team-luna → openai:gpt-6-luna)
+              // is the only capability identity an openai-compat instance has; the raw
+              // originModelId would miss the clamp. Same resolution as buildProviderOptions.
+              capabilityModel: resolveModelForMetadata(`coder:${modelId}`, providersConfig),
+            })
           );
         }
 
         // Generic handler for simple providers (standard API key + factory pattern)
         // (mirrored for Google by createEvaluationModelEffect — keep credential
         // merging in sync)
-        // Providers with custom logic (anthropic, openai, xai, ollama, openrouter, bedrock, mux-gateway,
+        // Providers with custom logic (anthropic, openai, xai, ollama, openrouter, bedrock,
         // github-copilot) are handled explicitly above. New providers using the standard pattern need
         // only be added to PROVIDER_DEFINITIONS - no code changes required here.
         const providerDef = PROVIDER_DEFINITIONS[providerName as ProviderName];
@@ -2764,12 +3319,11 @@ export class ProviderModelFactory {
           const resolvedApiKey = creds.apiKey;
 
           // Lazy-load and create provider using factoryName from definition
-          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           const providerModule = (yield* Effect.promise(async () =>
             providerDef.import()
-          )) as unknown as Record<
+          )) as Record<
             string,
-            (config: Record<string, unknown>) => (modelId: string) => LanguageModel
+            (config: Record<string, unknown>) => (modelId: string) => LanguageModelV4
           >;
           const factory = providerModule[providerDef.factoryName];
           if (!factory) {
@@ -2787,11 +3341,14 @@ export class ProviderModelFactory {
           };
 
           const providerFetch = getProviderFetch(providerConfig);
-          const provider = factory({
-            ...configWithCreds,
-            fetch: providerFetch,
-          });
-          return Ok(provider(modelId));
+          // Meta serves the OpenAI Responses wire through @ai-sdk/openai; other generic
+          // providers' models come back as built.
+          return Ok(
+            withUnsetToolStrictOmitted(
+              (fetch) => factory({ ...configWithCreds, fetch })(modelId),
+              providerFetch
+            )
+          );
         }
 
         return Err({
@@ -2805,9 +3362,21 @@ export class ProviderModelFactory {
         if (result.success && serviceTierDefault && typeof result.data !== "string") {
           // Headless callers may never rebuild providerOptions. Pin the validated
           // creation-time tier on both model methods, without rereading config.
-          injectProviderOptionsDefaults(result.data, serviceTierDefault.namespace, {
-            [serviceTierDefault.option]: serviceTierDefault.value,
-          });
+          injectProviderOptionsDefaults(
+            result.data,
+            serviceTierDefault.namespace,
+            { [serviceTierDefault.option]: serviceTierDefault.value },
+            serviceTierDefault.liveOverrides
+          );
+        }
+        if (result.success && anthropicFastMode && typeof result.data !== "string") {
+          // @ai-sdk/anthropic adds the fast-mode beta header for this option.
+          injectProviderOptionsDefaults(
+            result.data,
+            "anthropic",
+            anthropicFastMode.defaults,
+            anthropicFastMode.liveOverrides
+          );
         }
         return result;
       }),
@@ -2828,25 +3397,23 @@ export class ProviderModelFactory {
   /** Create a model and its complete request options from one config/route decision. */
   async createModelWithPinnedOptions(
     modelString: string,
-    opts?: {
+    opts: {
       thinkingLevel?: ThinkingLevel;
       providerOptions?: MuxProviderOptions;
-      agentInitiated?: boolean;
-      workspaceId?: string;
-    }
+    } & Pick<
+      CreateModelOptions,
+      "agentInitiated" | "workspaceId" | "getAnthropicCacheTtlOverride"
+    > = {}
   ): Promise<Result<PinnedModelOptions, SendMessageError>> {
+    const { thinkingLevel, providerOptions, ...createOptions } = opts;
     const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const optionsProvidersConfig = this.providerService.getConfig(providersConfig);
-    const optionsMuxProviderOptions = structuredClone(opts?.providerOptions ?? {});
+    const optionsMuxProviderOptions = structuredClone(providerOptions ?? {});
     const result = await this.resolveAndCreateModel(
       modelString,
-      opts?.thinkingLevel,
+      thinkingLevel,
       optionsMuxProviderOptions,
-      {
-        agentInitiated: opts?.agentInitiated,
-        workspaceId: opts?.workspaceId,
-        providersConfig,
-      }
+      { ...createOptions, providersConfig }
     );
     if (!result.success) return result;
 
@@ -2888,7 +3455,7 @@ export class ProviderModelFactory {
    *
    * A narrow sibling of createModelCoreEffect, NOT a refactor of it: only direct
    * API-key routes of EVALUATION_PROVIDERS are supported; Codex OAuth, every
-   * gateway (Coder, Copilot, Xum Gateway, OpenRouter, Bedrock), custom providers
+   * gateway (Coder, Copilot, OpenRouter, Bedrock), custom providers
    * and providers without an evaluation factory are intentional typed
    * rejections (EvaluationResolveError) so the caller can name the fix instead
    * of silently re-routing a billable call. Each provider branch mirrors ~20
@@ -2912,6 +3479,16 @@ export class ProviderModelFactory {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
+      // Perf harness replay mode (XUM_REPLAY_TAPES): see createModelEffect. The typed error has
+      // no free text, so the reason is logged.
+      if (isSessionTapeReplayMode()) {
+        log.warn("Evaluation model refused", { error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+        return Err<EvaluationResolveError>({ reason: "unsupported-route" });
+      }
+      if (isMockAiMode()) {
+        log.debug("Evaluation model refused", { error: MOCK_AI_MODEL_REFUSED_MESSAGE });
+        return Err<EvaluationResolveError>({ reason: "unsupported-route" });
+      }
       // ONE providers.jsonc read for the shadow check, routing, credentials and
       // construction (same single-snapshot rule as resolveAndCreateModelEffect).
       const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
@@ -2951,15 +3528,6 @@ export class ProviderModelFactory {
         });
       }
 
-      // Enterprise policy applies to headless evaluation exactly as to chat.
-      if (
-        self.policyService?.isEnforced() &&
-        (!self.policyService.isProviderAllowed(providerName) ||
-          !self.policyService.isModelAllowed(providerName, modelId))
-      ) {
-        return Err<EvaluationResolveError>({ reason: "unauthorized", providerName });
-      }
-
       // routePriority/routeOverrides may prefer a configured gateway for this
       // origin; evaluation only runs on the origin's own direct route.
       const routeContext = self.resolveModelRoute(canonicalModelString, providersConfig);
@@ -2987,18 +3555,12 @@ export class ProviderModelFactory {
         return Err<EvaluationResolveError>({ reason: "unauthorized", providerName });
       }
 
-      // baseUrl → baseURL, policy-forced base URL and attribution headers,
+      // baseUrl → baseURL and attribution headers,
       // exactly as createModelCoreEffect prepares the provider config.
       const { baseUrl, ...configWithoutBaseUrl } = providerConfig;
       providerConfig = baseUrl
         ? { ...configWithoutBaseUrl, baseURL: baseUrl }
         : configWithoutBaseUrl;
-      const forcedBaseUrl = self.policyService?.isEnforced()
-        ? self.policyService.getForcedBaseUrl(providerName)
-        : undefined;
-      if (forcedBaseUrl) {
-        providerConfig = { ...providerConfig, baseURL: forcedBaseUrl };
-      }
       providerConfig = {
         ...providerConfig,
         headers: buildAppAttributionHeaders(providerConfig.headers),
@@ -3033,7 +3595,6 @@ export class ProviderModelFactory {
         // switched to the API key.
         const fullModelId = `${providerName}:${modelId}`;
         const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
-        const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
         const storedCodexOauth = parseCodexOauthAuth(providerConfig.codexOauth);
         const codexOauthDefaultAuth =
           providerConfig.codexOauthDefaultAuth === "apiKey" ? "apiKey" : "oauth";
@@ -3044,9 +3605,6 @@ export class ProviderModelFactory {
           }
           if (configWireFormat === "chatCompletions" && creds.isConfigured) {
             return false;
-          }
-          if (codexOauthRequired) {
-            return true;
           }
           if (!creds.isConfigured) {
             return true;
@@ -3084,7 +3642,7 @@ export class ProviderModelFactory {
             PROVIDER_REGISTRY.anthropic()
           );
           model = withAnthropicEvaluationEffort(
-            createAnthropic({ ...normalizedConfig, fetch: providerFetch }).evaluationModel(modelId),
+            createAnthropic({ ...normalizedConfig, fetch: providerFetch }).decisionModel(modelId),
             modelId
           );
           break;
@@ -3102,8 +3660,9 @@ export class ProviderModelFactory {
             ...(creds.organization && { organization: creds.organization }),
           };
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          model = createOpenAI({ ...configWithCreds, fetch: providerFetch }).evaluationModel(
-            modelId
+          model = evaluationModelFromLanguageModel(
+            createOpenAI({ ...configWithCreds, fetch: providerFetch }).responses(modelId),
+            "openai"
           );
           break;
         }
@@ -3121,26 +3680,28 @@ export class ProviderModelFactory {
           const { createGoogleGenerativeAI } = yield* Effect.promise(async () =>
             PROVIDER_REGISTRY.google()
           );
-          model = createGoogleGenerativeAI({
-            ...configWithCreds,
-            fetch: providerFetch,
-          }).evaluationModel(modelId);
+          model = evaluationModelFromLanguageModel(
+            createGoogleGenerativeAI({ ...configWithCreds, fetch: providerFetch }).chat(modelId),
+            "google"
+          );
           break;
         }
         case TYPESAFE_PROVIDER_KEY: {
           // Evaluation-only provider with no chat sibling to mirror: the SDK
           // reads exactly apiKey/baseURL/headers/fetch, so pass those fields
           // rather than spreading the raw providers.jsonc entry. The credential
-          // resolver already read the (policy-forced or configured) base URL
+          // resolver already read the configured base URL
           // and trimmed it; the raw `configuredBaseURL` would embed a stray
           // space before the SDK's `/systemone` suffix.
           effectiveBaseURL = creds.baseUrl;
-          model = createTypeSafeAi({
-            apiKey: creds.apiKey,
-            ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
-            headers: providerConfig.headers,
-            fetch: providerFetch,
-          }).evaluationModel(modelId);
+          model = withTypeSafeScoreLevelLabels(
+            createTypeSafeAi({
+              apiKey: creds.apiKey,
+              ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
+              headers: providerConfig.headers,
+              fetch: providerFetch,
+            }).decisionModel(modelId)
+          );
           break;
         }
       }
@@ -3175,7 +3736,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
+    opts?: Omit<CreateModelOptions, "routeContext">
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
       this.resolveAndCreateModelEffect(modelString, thinkingLevel, muxProviderOptions, opts)
@@ -3186,7 +3747,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
+    opts?: Omit<CreateModelOptions, "routeContext">
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -3284,15 +3845,10 @@ export class ProviderModelFactory {
         providersConfigForShadowCheck
       );
       if (rawCoderGatewayModelId != null) {
-        const appConfig = self.config.loadConfigOrDefault();
-        const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
-          providersConfigForShadowCheck,
-          self.policyService
-        );
+        const { isGatewayModelAccessible } = createGatewayRouting(providersConfigForShadowCheck);
         const coderProviderRoutable = self.isProviderAvailableForRouting(
           "coder",
-          providersConfigForShadowCheck,
-          appConfig
+          providersConfigForShadowCheck
         );
         const coderModelAccessible = isGatewayModelAccessible("coder", rawCoderGatewayModelId);
         if (coderProviderRoutable && coderModelAccessible) {
@@ -3303,7 +3859,7 @@ export class ProviderModelFactory {
           // vercel IDs are unmappable), so falling away from the gateway is
           // never valid for this selection.
           if (coderProviderRoutable) {
-            // The authoritative catalog / removedModels tombstone / policy
+            // The authoritative catalog / removedModels tombstone
             // conclusively rejected this gateway model. Feeding the rejected
             // coder: identity back into route resolution would land on the
             // last-resort direct Coder route and send the request through the
@@ -3349,12 +3905,6 @@ export class ProviderModelFactory {
       const canonicalCustomEntry = providersConfigForShadowCheck[canonicalProviderName];
       const canonicalIsCustomProvider = isCustomProviderConfig(canonicalCustomEntry);
 
-      // Stream result normalization currently only understands Xum gateway responses,
-      // so keep this flag mux-gateway-specific until the downstream normalization path
-      // is generalized too. A custom provider shadowing the mux-gateway id is
-      // direct: gateway attribution/quota handling must not engage for it.
-      const routedThroughGateway =
-        !canonicalIsCustomProvider && effectiveModelString.startsWith("mux-gateway:");
       const [effectiveRouteProvider] = parseModelString(effectiveModelString);
       const routeProvider = Object.hasOwn(PROVIDER_REGISTRY, effectiveRouteProvider)
         ? (effectiveRouteProvider as ProviderName)
@@ -3472,7 +4022,6 @@ export class ProviderModelFactory {
         wireProviderName,
         coderWire,
         coderSelectedInstance,
-        routedThroughGateway,
         // Custom adapters are direct routes: the raw custom id is not a
         // ProviderName, and leaking it as routeProvider makes downstream
         // namespace/format selection treat the request as a transforming
@@ -3492,10 +4041,8 @@ export class ProviderModelFactory {
     // providers.jsonc state (see createModel's providersConfig option).
     const providersConfig =
       providersConfigSnapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
-      providersConfig,
-      this.policyService
-    );
+    const { isGatewayModelAccessible, resolveGatewayModelId } =
+      createGatewayRouting(providersConfig);
     return resolveRoute(
       canonicalModel,
       config.routePriority ?? ["direct"],
@@ -3505,13 +4052,10 @@ export class ProviderModelFactory {
           return false;
         }
 
-        return this.isProviderAvailableForRouting(
-          provider as ProviderName,
-          providersConfig,
-          config
-        );
+        return this.isProviderAvailableForRouting(provider as ProviderName, providersConfig);
       },
-      isGatewayModelAccessible
+      isGatewayModelAccessible,
+      resolveGatewayModelId
     );
   }
 
@@ -3540,17 +4084,9 @@ export class ProviderModelFactory {
   resolveGatewayModelString(
     modelString: string,
     modelKeyOrRouteContext?: string | RouteContext,
-    explicitGatewayOrLegacyFlag?: ProviderName | boolean,
+    explicitGateway?: ProviderName,
     providersConfigSnapshot?: ProvidersConfig
   ): string {
-    // Legacy callers may still pass boolean true to mean an explicit mux-gateway request.
-    const explicitGateway: ProviderName | undefined =
-      explicitGatewayOrLegacyFlag === true
-        ? "mux-gateway"
-        : typeof explicitGatewayOrLegacyFlag === "string"
-          ? explicitGatewayOrLegacyFlag
-          : undefined;
-
     // Same single-snapshot rule as resolveModelRoute: callers holding one
     // providers.jsonc read pass it so routing cannot diverge from it.
     const providersConfig =
@@ -3575,10 +4111,6 @@ export class ProviderModelFactory {
       return canonicalModelString;
     }
 
-    if (originProviderName === "mux-gateway") {
-      return canonicalModelString;
-    }
-
     if (isCustomProviderConfig(providersConfig[originProviderName])) {
       // Manual providers.jsonc edits can shadow a built-in provider id. Custom providers
       // are direct-only, so keep the user's model pointed at the custom endpoint.
@@ -3591,10 +4123,8 @@ export class ProviderModelFactory {
 
     const originProvider = originProviderName as ProviderName;
     const config = this.config.loadConfigOrDefault();
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
-      providersConfig,
-      this.policyService
-    );
+    const { isGatewayModelAccessible, resolveGatewayModelId } =
+      createGatewayRouting(providersConfig);
     const routeContext =
       typeof modelKeyOrRouteContext === "object" && modelKeyOrRouteContext != null
         ? modelKeyOrRouteContext
@@ -3609,23 +4139,18 @@ export class ProviderModelFactory {
                 return false;
               }
 
-              return this.isProviderAvailableForRouting(
-                provider as ProviderName,
-                providersConfig,
-                config
-              );
+              return this.isProviderAvailableForRouting(provider as ProviderName, providersConfig);
             },
-            isGatewayModelAccessible
+            isGatewayModelAccessible,
+            resolveGatewayModelId
           );
-
-    let resolvedRouteProvider = routeContext.routeProvider;
 
     // Preserve an explicit gateway prefix from the raw model string when that
     // gateway can still route the canonical origin. This keeps deliberate
     // gateway selections from being silently rewritten after canonicalization.
     if (
       explicitGateway != null &&
-      this.isProviderAvailableForRouting(explicitGateway, providersConfig, config)
+      this.isProviderAvailableForRouting(explicitGateway, providersConfig)
     ) {
       const explicitGatewayDefinition = PROVIDER_DEFINITIONS[explicitGateway];
       if (explicitGatewayDefinition.kind === "gateway") {
@@ -3635,6 +4160,9 @@ export class ProviderModelFactory {
         // coder:<origin>/<model> absent from the discovered catalog would be
         // sent to AI Bridge (and fail there) instead of using the fallback
         // route already resolved above.
+        // The static rebuild is the literal explicit ID: only default-named
+        // coder instances canonicalize (coder:anthropic/x), so it can never
+        // land on a canonicalRoutes-mapped instance.
         const explicitGatewayModelId =
           explicitGatewayDefinition.toGatewayModelId?.(originProvider, originModelId) ??
           originModelId;
@@ -3642,30 +4170,28 @@ export class ProviderModelFactory {
           explicitGatewayRoutes.includes(originProvider) &&
           isGatewayModelAccessible(explicitGateway, explicitGatewayModelId)
         ) {
-          resolvedRouteProvider = explicitGateway;
+          return `${explicitGateway}:${explicitGatewayModelId}`;
         }
       }
     }
 
-    if (resolvedRouteProvider === originProvider) {
+    const resolvedRouteProvider = routeContext.routeProvider;
+    if (
+      resolvedRouteProvider === originProvider ||
+      PROVIDER_DEFINITIONS[resolvedRouteProvider].kind !== "gateway"
+    ) {
       return canonicalModelString;
     }
 
-    const routeDefinition = PROVIDER_DEFINITIONS[resolvedRouteProvider];
-
-    if (routeDefinition.kind !== "gateway") {
-      return canonicalModelString;
-    }
-
-    const gatewayRoutes: readonly ProviderName[] = routeDefinition.routes;
-    if (!gatewayRoutes.includes(originProvider)) {
-      return canonicalModelString;
-    }
-
-    if (!("toGatewayModelId" in routeDefinition) || !routeDefinition.toGatewayModelId) {
-      return canonicalModelString;
-    }
-
-    return `${resolvedRouteProvider}:${routeDefinition.toGatewayModelId(originProvider, originModelId)}`;
+    // Same resolver resolveRoute used, so a Coder canonicalRoutes mapping
+    // lands on its instance (anthropic:x -> coder:<mapped-instance>/x).
+    const gatewayModelId = resolveGatewayModelId(
+      resolvedRouteProvider,
+      originProvider,
+      originModelId
+    );
+    return gatewayModelId == null
+      ? canonicalModelString
+      : `${resolvedRouteProvider}:${gatewayModelId}`;
   }
 }

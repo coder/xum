@@ -29,7 +29,10 @@ import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { WorkspaceTurnHost } from "./taskWorkspaceSeam";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import { BackgroundProcessManager } from "./backgroundProcessManager";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import assert from "@/common/utils/assert";
+import * as os from "os";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -45,6 +48,9 @@ import {
   createMockAIService,
   createWorkspaceServiceForTest,
 } from "./workspaceService.testHarness";
+import { createTaskServiceHarness } from "./taskService.shared.testHarness";
+import { findWorkspaceInConfig } from "./taskService.testHarness";
+import type { WorkspaceHost } from "./taskWorkspaceSeam";
 
 describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   function registryRecord(ownerWorkspaceId: string, createdAt: string): BashMonitorRegistryRecord {
@@ -67,19 +73,21 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     return path.join(h.config.sessionsDir, h.workspaceId, "auto-retry-preference.json");
   }
 
-  async function createWakeWiringService() {
+  async function createWakeWiringService(realManager?: BackgroundProcessManager) {
     const { config, historyService, cleanup } = await createTestHistoryService();
-    const events = new EventEmitter();
-    const backgroundProcessManager = Object.assign(events, {
-      cleanup: mock(() => Promise.resolve()),
-      notifyMonitorWakeStateChanged: mock(() => undefined),
-      getActiveMonitorCount: mock(() => 0),
-      pullMonitorWakeSignals: mock(() => []),
-      getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
-      acknowledgeMonitorWake: mock(() => undefined),
-      dropRetiredMonitor: mock(() => undefined),
-      setMessageQueued: mock(() => undefined),
-    }) as unknown as BackgroundProcessManager;
+    const events = realManager ?? new EventEmitter();
+    const backgroundProcessManager =
+      realManager ??
+      (Object.assign(events, {
+        cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: mock(() => undefined),
+        getActiveMonitorCount: mock(() => 0),
+        pullMonitorWakeSignals: mock(() => []),
+        getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
+        acknowledgeMonitorWake: mock(() => undefined),
+        dropRetiredMonitor: mock(() => undefined),
+        getForegroundToolCallIds: mock(() => []),
+      }) as unknown as BackgroundProcessManager);
     const aiService = createMockAIService({ isStreaming: mock(() => false) });
     const extensionMetadata = new ExtensionMetadataService(
       path.join(config.rootDir, "wake-wiring-extension-metadata.json")
@@ -105,8 +113,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
   async function createActiveWakeHarness(options?: {
     workspaceGoalService?: WorkspaceGoalService | "real";
+    /** A real manager: its own snapshots and read cursor drive the wake, nothing is stubbed. */
+    realManager?: BackgroundProcessManager;
   }) {
-    const fixture = await createWakeWiringService();
+    const fixture = await createWakeWiringService(options?.realManager);
     const { config, service, historyService, backgroundProcessManager } = fixture;
     // "real": the session gets a real goal service over this fixture's stores.
     const workspaceGoalService =
@@ -176,12 +186,19 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       Promise.resolve({ model, agentId: "exec" });
     const signals: BashMonitorProcessSnapshot[] = [];
     let shown = 0;
-    spyOn(backgroundProcessManager, "pullMonitorWakeSignals").mockImplementation(() => [
-      ...signals,
-    ]);
-    spyOn(backgroundProcessManager, "getMonitorWakeDeliveryState").mockImplementation(() =>
-      Promise.resolve({ status: "settled", shownThroughOffset: shown, terminalStatusShown: false })
-    );
+    if (options?.realManager == null) {
+      spyOn(backgroundProcessManager, "pullMonitorWakeSignals").mockImplementation(() => [
+        ...signals,
+      ]);
+      spyOn(backgroundProcessManager, "getMonitorWakeDeliveryState").mockImplementation(() =>
+        Promise.resolve({
+          status: "settled",
+          shownThroughOffset: shown,
+          terminalStatusShown: false,
+          readCursorOffset: shown,
+        })
+      );
+    }
     const reconciler = internal.bashMonitorWakeReconciler;
     const dispatch = spyOn(internal, "dispatchBashMonitorWake");
     const complete = async (finishReason = "stop") => {
@@ -245,7 +262,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
             script: "watch",
             createdAt: "2026-01-01T00:00:00.000Z",
             retired: false,
-            match: { throughOffset: offset, lines: ["READY " + offset], totalMatches: 1 },
+            match: { throughOffset: offset },
           }))
         );
         fixture.events.emit("monitor:match", workspaceId, {});
@@ -263,6 +280,64 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       },
     };
   }
+
+  test("a real monitored process wakes its owner with no process output in any user-role message", async () => {
+    const root = await fsPromises.mkdtemp(path.join(os.tmpdir(), "wake-real-stack-"));
+    const manager = new BackgroundProcessManager(root);
+    const h = await createActiveWakeHarness({ realManager: manager });
+    const matched = "RESULT MARKER_MATCHED_LINE";
+    const tail = "MARKER_FINAL_LINE";
+    try {
+      const spawned = await manager.spawn(
+        new LocalRuntime(process.cwd()),
+        h.workspaceId,
+        `printf '${matched}\\n${tail}\\n'; exit 3`,
+        {
+          cwd: process.cwd(),
+          displayName: "real-stack-watcher",
+          monitor: { filter: "^RESULT ", pattern: /^RESULT /, exclude: false, cooldownMs: 0 },
+        }
+      );
+      assert(spawned.success, "spawn failed");
+      await waitForCondition(() => h.requests.length > 0, { timeoutMs: 10_000 });
+
+      const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+      assert(history.success, "history read failed");
+      const userText = history.data
+        .filter((message) => message.role === "user")
+        .map((message) => JSON.stringify(message.parts));
+      expect(userText.length).toBeGreaterThan(0);
+      for (const text of userText) {
+        expect(text).not.toContain("MARKER_");
+      }
+      const wakeMetadata = history.data.find(
+        (message) => message.metadata?.muxMetadata?.type === "bash-monitor-wake"
+      )?.metadata?.muxMetadata;
+      assert(wakeMetadata?.type === "bash-monitor-wake", "the wake row is in history");
+      expect(wakeMetadata.records[0]).toMatchObject({
+        processId: spawned.processId,
+        terminal: { status: "exited", exitCode: 3 },
+      });
+
+      // The output stays readable through the call task_await makes, as a tool result.
+      const read = await manager.getOutput(
+        spawned.processId,
+        undefined,
+        false,
+        0,
+        undefined,
+        h.workspaceId,
+        "task_await"
+      );
+      assert(read.success, "read failed");
+      expect(read.output).toContain(matched);
+      expect(read.output).toContain(tail);
+    } finally {
+      await manager.cleanup(h.workspaceId);
+      await h.finish();
+      await fsPromises.rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("a wake row already in history is consumed without a dispatch, even behind a compaction boundary", async () => {
     const h = await createActiveWakeHarness();
@@ -647,28 +722,39 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("a wake the task integration declines, fails, or throws before sending dispatches plainly", async () => {
+  test("a reactivation refused during a Stop is retried, never sent plainly; others dispatch plainly", async () => {
     const h = await createActiveWakeHarness();
-    const integrations = [
-      mock(() => Promise.resolve(null)),
-      mock(() => Promise.resolve(Err("maxParallelAgentTasks exceeded"))),
-      mock(() => Promise.reject(new Error("config unreadable"))),
+    let latched = true;
+    const outcomes: Array<() => Promise<Result<void, string> | null>> = [
+      () => Promise.resolve(Err("A stop is in progress")),
+      () => Promise.reject(new Error("config unreadable")),
+      () => {
+        // The Stop settled; a refusal now (e.g. at capacity) keeps today's plain fallback.
+        latched = false;
+        return Promise.resolve(Err("maxParallelAgentTasks exceeded"));
+      },
     ];
+    const reactivate = mock(
+      (): Promise<Result<void, string> | null> =>
+        (outcomes.shift() ?? (() => Promise.resolve(null)))()
+    );
+    h.service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        reactivateInactiveAgentTaskFromBashMonitorWake: reactivate,
+        isWorkspaceStopInProgress: () => latched,
+      })
+    );
     try {
-      for (const [index, reactivate] of integrations.entries()) {
-        h.service.setAgentTaskIntegration(
-          makeAgentTaskIntegrationFake({
-            reactivateInactiveAgentTaskFromBashMonitorWake: reactivate,
-          })
-        );
-        const started = new Promise<void>((resolve) => h.launched.once("start", resolve));
-        if (index > 0) await h.complete();
-        await h.addAttention(10 * (index + 1));
-        await started;
-        expect(reactivate).toHaveBeenCalledTimes(1);
-        expect(h.requests).toHaveLength(index + 1);
-        expect(h.requests[index].muxMetadata).toBeUndefined();
-      }
+      const started = new Promise<void>((resolve) => h.launched.once("start", resolve));
+      await h.addAttention(10).catch(() => undefined);
+      // Pre-fix: the plain send's manual-resume rescue restarts the sub-agent being stopped.
+      expect(reactivate).toHaveBeenCalledTimes(1);
+      expect(h.requests).toHaveLength(0);
+      // The retry backoff offers the owed wake again until the Stop settled.
+      await started;
+      expect(reactivate).toHaveBeenCalledTimes(3);
+      expect(h.requests).toHaveLength(1);
+      expect(h.requests[0].muxMetadata).toBeUndefined();
     } finally {
       await h.finish();
     }
@@ -970,7 +1056,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await settled;
       expect(sessionResult).toMatchObject({ success: false, error: "cancellation write failed" });
       expect(partialDeleted).toHaveBeenCalledWith(h.workspaceId);
-      expect(descendants).toHaveBeenCalledWith(h.workspaceId);
+      expect(descendants).toHaveBeenCalledWith(h.workspaceId, {
+        retireBashMonitorAttention: expect.any(Function) as unknown,
+      });
       expect(queueRestored).toHaveBeenCalledTimes(1);
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
       expect(h.session.isBusy()).toBe(false);
@@ -1700,7 +1788,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         recordTerminal(): Promise<void>;
         recordLost: typeof recordLost;
       };
-      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+      bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
     };
     try {
       await internal.bashMonitorRecoveryPromise;
@@ -1721,9 +1809,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       };
       events.emit("monitor:armed", "owner", armed);
       let armedDrained = false;
-      const armedDrain = internal.drainBashMonitorPersistence("owner").then(() => {
-        armedDrained = true;
-      });
+      const armedDrain = internal.bashMonitorPersistence
+        .drainBashMonitorPersistence("owner")
+        .then(() => {
+          armedDrained = true;
+        });
       await Promise.resolve();
       expect(armedDrained).toBe(false);
       releaseArmed?.();
@@ -1740,9 +1830,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
       let failureDrained = false;
-      const failureDrain = internal.drainBashMonitorPersistence("owner").then(() => {
-        failureDrained = true;
-      });
+      const failureDrain = internal.bashMonitorPersistence
+        .drainBashMonitorPersistence("owner")
+        .then(() => {
+          failureDrained = true;
+        });
       await Promise.resolve();
       expect(failureDrained).toBe(false);
       releaseLost?.();
@@ -1758,11 +1850,14 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       ownerWorkspaceIds: [],
       scanFailed: false,
     });
-    const { config, events, cleanup } = await createWakeWiringService();
+    const { service, config, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = spyOn(
       BashMonitorWakeReconciler.prototype,
       "scheduleReconcile"
     ).mockImplementation(() => undefined);
+    const internal = service as unknown as {
+      bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
+    };
     // Read the evidence back through a fresh store: it must be durable, not only in memory.
     const registry = new BashMonitorRegistryStore(config);
     try {
@@ -1790,21 +1885,21 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         },
       });
 
-      let rows = await registry.listAll("owner");
-      for (let attempt = 0; attempt < 20 && rows.length === 0; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        rows = await registry.listAll("owner");
-      }
+      // Wait for the whole failure persist (upsert, then recordLost, then the wake), not for the
+      // first row to appear: polling for the row could observe the upserted row before recordLost
+      // added its evidence, which failed under host load (#5401).
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence("owner");
+      const rows = await registry.listAll("owner");
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
         processId: "failed-proc",
         lost: {
           reason: "runtime-failure",
-          failureMessage: "transport unavailable",
           failedOperations: ["readOutput"],
-          failedMatch: { lines: ["READY before failure"] },
+          failedMatch: { lines: [], totalMatches: 1, matchedThroughOffset: 12 },
         },
       });
+      expect(rows[0].lost).not.toHaveProperty("failureMessage");
       expect(scheduleReconcile).toHaveBeenCalledWith("owner");
     } finally {
       mock.restore();
@@ -1911,8 +2006,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // The invalidated chain must also release its tracking entry so the
       // per-process failure-persist map stays bounded by in-flight chains.
       const tracking = (
-        service as unknown as { activeBashMonitorFailurePersists: Map<string, unknown> }
-      ).activeBashMonitorFailurePersists;
+        service as unknown as {
+          bashMonitorPersistence: { activeBashMonitorFailurePersists: Map<string, unknown> };
+        }
+      ).bashMonitorPersistence.activeBashMonitorFailurePersists;
       expect(tracking.size).toBe(0);
     } finally {
       mock.restore();
@@ -2299,6 +2396,255 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(session.hasQueuedMessages()).toBe(false);
     } finally {
       await cleanup();
+    }
+  });
+});
+
+// #5377: a user's tree Stop retires the owed monitor attention of every descendant it stops, the
+// way the directly stopped workspace's is retired, and a wake never manually resumes a stopped
+// descendant. Monitor input that arrives after the Stop stays automatic.
+describe("tree Stop and descendant bash monitor attention", () => {
+  const ROOT = "monitor-tree-root";
+  const CHILD = "monitor-tree-child";
+  const model = "anthropic:claude-sonnet-4-5";
+
+  // A real TaskService behind the real WorkspaceService. CHILD is a running sub-agent of ROOT that
+  // streams until the Stop cascade stops it, so its monitor attention is owed (deferred) meanwhile.
+  async function createTreeHarness(childStatus: "running" | "reported" = "running") {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    for (const id of [ROOT, CHILD]) {
+      await config.addWorkspace("/tmp/monitor-tree-project", {
+        id,
+        name: id,
+        projectName: "monitor-tree-project",
+        projectPath: "/tmp/monitor-tree-project",
+        runtimeConfig: { type: "local" },
+      });
+    }
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const child = project.workspaces.find((w) => w.id === CHILD);
+        if (child == null) continue;
+        child.parentWorkspaceId = ROOT;
+        child.taskStatus = childStatus;
+      }
+      return cfg;
+    });
+    const signals: BashMonitorProcessSnapshot[] = [];
+    const shown = 0;
+    const events = new EventEmitter();
+    const backgroundProcessManager = Object.assign(events, {
+      cleanup: mock(() => Promise.resolve()),
+      notifyMonitorWakeStateChanged: mock(() => undefined),
+      getActiveMonitorCount: mock(() => 0),
+      hasRunningBackgroundProcesses: mock(() => false),
+      hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
+      pullMonitorWakeSignals: mock((owner: string) => (owner === CHILD ? [...signals] : [])),
+      getMonitorWakeDeliveryState: mock(() =>
+        Promise.resolve({
+          status: "settled",
+          shownThroughOffset: shown,
+          terminalStatusShown: false,
+        })
+      ),
+      acknowledgeMonitorWake: mock(() => undefined),
+      dropRetiredMonitor: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
+    }) as unknown as BackgroundProcessManager;
+    let childStreaming = true;
+    // When set, the cascade's stream stop of the child waits for it (holding the child's latch).
+    let childStopHold: { entered: () => void; release: Promise<void> } | undefined;
+    const aiService = createMockAIService({
+      isStreaming: mock((workspaceId: string) => workspaceId === CHILD && childStreaming),
+      stopStream: mock(async (workspaceId: string) => {
+        if (workspaceId === CHILD) {
+          // The stream is gone; the stop's cleanup (and so the latch) waits for the hold.
+          childStreaming = false;
+          childStopHold?.entered();
+          await childStopHold?.release;
+        }
+        return Ok(undefined);
+      }) as unknown as AIService["stopStream"],
+    });
+    const service = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService,
+      backgroundProcessManager,
+      extensionMetadata: new ExtensionMetadataService(
+        path.join(config.rootDir, "monitor-tree-extension-metadata.json")
+      ),
+    });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: service as unknown as WorkspaceHost,
+      aiService,
+      historyService,
+    });
+    service.setAgentTaskIntegration(taskService);
+    const internal = service as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorWakeReconciler: BashMonitorWakeReconciler;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<SendMessageOptions>;
+      dispatchBashMonitorWake(dispatch: BashMonitorWakeDispatch): Promise<"in-flight" | "deferred">;
+    };
+    await internal.bashMonitorRecoveryPromise;
+    internal.getDelegatedTurnContinuationSendOptions = () =>
+      Promise.resolve({ model, agentId: "exec" });
+    const reconciler = internal.bashMonitorWakeReconciler;
+    return {
+      config,
+      service,
+      taskService,
+      internal,
+      reconciler,
+      holdChildStop: () => {
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        childStopHold = { entered: () => entered.resolve(), release: release.promise };
+        return { entered: entered.promise, release: () => release.resolve() };
+      },
+      childStatus: () => findWorkspaceInConfig(config, CHILD)?.taskStatus,
+      addChildAttention: async (offset: number) => {
+        signals.splice(
+          0,
+          signals.length,
+          ...["first", "second"].map((processId) => ({
+            processId,
+            taskId: "bash:" + processId,
+            ownerWorkspaceId: CHILD,
+            filter: "READY",
+            filterExclude: false,
+            script: "watch",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            retired: false,
+            match: { throughOffset: offset },
+          }))
+        );
+        events.emit("monitor:match", CHILD, {});
+        await reconciler.reconcile(CHILD);
+      },
+      pendingChildWakes: async () => (await reconciler.snapshot(CHILD)).pendingWakeKinds.size,
+      finish: async () => {
+        await reconciler.dispose(CHILD);
+        await reconciler.dispose(ROOT);
+        await cleanup();
+      },
+    };
+  }
+
+  // A reported child streaming under a continuation keeps its completed status through the Stop.
+  test.each([
+    ["running", "interrupted"],
+    ["reported", "reported"],
+  ] as const)(
+    "a tree Stop retires a stopped %s descendant's owed attention; later input still wakes it",
+    async (childStatus, stoppedStatus) => {
+      const h = await createTreeHarness(childStatus);
+      try {
+        await h.addChildAttention(10);
+        // Owed while the child streams.
+        expect(await h.pendingChildWakes()).toBe(2);
+        const dispatch = spyOn(h.internal, "dispatchBashMonitorWake").mockResolvedValue("deferred");
+        expect(await h.service.interruptStream(ROOT, { retireBashMonitorAttention: true })).toEqual(
+          Ok(undefined)
+        );
+        expect(h.childStatus()).toBe(stoppedStatus);
+        await h.reconciler.reconcile(CHILD);
+        // Pre-fix: both wakes stay owed and dispatch (reactivating the stopped child).
+        expect(await h.pendingChildWakes()).toBe(0);
+        expect(dispatch).not.toHaveBeenCalled();
+        await h.addChildAttention(20);
+        expect(dispatch).toHaveBeenCalled();
+      } finally {
+        await h.finish();
+      }
+    }
+  );
+
+  test("a tree Stop whose descendant retirement failed reports it and retires before any wake", async () => {
+    const h = await createTreeHarness();
+    const listAll = Object.getOwnPropertyDescriptor(BashMonitorRegistryStore.prototype, "listAll")
+      ?.value as (
+      this: BashMonitorRegistryStore,
+      ownerWorkspaceId: string
+    ) => ReturnType<BashMonitorRegistryStore["listAll"]>;
+    // Armed once the attention is owed: the Stop's retirement read is the next registry read.
+    let failed = true;
+    const registry = spyOn(BashMonitorRegistryStore.prototype, "listAll").mockImplementation(
+      function (this: BashMonitorRegistryStore, ownerWorkspaceId: string) {
+        if (ownerWorkspaceId === CHILD && !failed) {
+          failed = true;
+          return Promise.reject(new Error("transient registry read"));
+        }
+        return listAll.call(this, ownerWorkspaceId);
+      }
+    );
+    try {
+      await h.addChildAttention(10);
+      failed = false;
+      const dispatch = spyOn(h.internal, "dispatchBashMonitorWake").mockResolvedValue("deferred");
+      // The child stopped, but its dismissal is only in memory, so the Stop reports it.
+      expect(await h.service.interruptStream(ROOT, { retireBashMonitorAttention: true })).toEqual(
+        Err(STOP_UNRECORDED_MESSAGE)
+      );
+      expect(failed).toBe(true);
+      expect(h.childStatus()).toBe("interrupted");
+      // The next reconcile retries the retirement instead of dispatching the dismissed output.
+      await h.reconciler.reconcile(CHILD);
+      expect(await h.pendingChildWakes()).toBe(0);
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally {
+      registry.mockRestore();
+      await h.finish();
+    }
+  });
+
+  test("an internal interrupt of the root keeps a descendant's owed attention", async () => {
+    const h = await createTreeHarness();
+    try {
+      await h.addChildAttention(10);
+      spyOn(h.internal, "dispatchBashMonitorWake").mockResolvedValue("deferred");
+      expect(await h.service.interruptStream(ROOT)).toEqual(Ok(undefined));
+      expect(h.childStatus()).toBe("interrupted");
+      expect(await h.pendingChildWakes()).toBe(2);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("input during a tree Stop neither resumes the descendant nor is lost", async () => {
+    const h = await createTreeHarness();
+    try {
+      const hold = h.holdChildStop();
+      // The reactivation refuses under the latch, as reactivateInactiveAgentTask does.
+      const latchedAtReactivation: boolean[] = [];
+      const reactivate = spyOn(
+        h.taskService,
+        "reactivateInactiveAgentTaskFromBashMonitorWake"
+      ).mockImplementation((workspaceId) => {
+        const latched = h.taskService.isWorkspaceStopInProgress(workspaceId);
+        latchedAtReactivation.push(latched);
+        return Promise.resolve(latched ? Err("A stop is in progress") : null);
+      });
+      const rescue = spyOn(h.taskService, "reawakenInterruptedTask");
+      const send = spyOn(h.service, "sendMessage").mockResolvedValue(Ok(undefined));
+      const stopping = h.service.interruptStream(ROOT, { retireBashMonitorAttention: true });
+      await hold.entered;
+      await h.addChildAttention(20).catch(() => undefined);
+      expect(latchedAtReactivation[0]).toBe(true);
+      // Pre-fix: the plain fallback send takes the manual-resume rescue and starts the child.
+      expect(send).not.toHaveBeenCalled();
+      expect(rescue).not.toHaveBeenCalled();
+      expect(await h.pendingChildWakes()).toBe(2);
+      hold.release();
+      expect(await stopping).toEqual(Ok(undefined));
+      expect(h.childStatus()).toBe("interrupted");
+      // Retried once the Stop settled: the wake is offered to the reactivation again.
+      await waitForCondition(() => latchedAtReactivation.includes(false), { timeoutMs: 3_000 });
+      expect(reactivate.mock.calls.length).toBeGreaterThan(1);
+      expect(rescue).not.toHaveBeenCalled();
+    } finally {
+      await h.finish();
     }
   });
 });

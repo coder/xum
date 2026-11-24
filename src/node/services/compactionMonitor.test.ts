@@ -122,7 +122,7 @@ describe("CompactionMonitor", () => {
 
   test("checkMidStream applies the request wire format to the Codex OAuth cap", () => {
     // API key + OAuth preferred: Responses requests route OAuth (272K cap), while a
-    // request-level Chat Completions selection falls back to the API key (1.05M).
+    // request-level Chat Completions selection falls back to the API key (922K).
     const providersConfig: ProvidersConfigMap = {
       openai: {
         apiKeySet: true,
@@ -137,7 +137,7 @@ describe("CompactionMonitor", () => {
     const { monitor: oauthMonitor } = createMonitor();
     expect(
       oauthMonitor.checkMidStream({
-        model: "openai:gpt-5.5",
+        model: "openai:gpt-6.1-sol",
         threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage,
         use1MContext: false,
@@ -148,7 +148,7 @@ describe("CompactionMonitor", () => {
     const { monitor: apiKeyMonitor } = createMonitor();
     expect(
       apiKeyMonitor.checkMidStream({
-        model: "openai:gpt-5.5",
+        model: "openai:gpt-6.1-sol",
         threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
         usage,
         use1MContext: false,

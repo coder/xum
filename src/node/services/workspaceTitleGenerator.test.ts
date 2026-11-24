@@ -12,6 +12,7 @@ import type { AIService } from "./aiService";
 import type { SendMessageError } from "@/common/types/errors";
 import { NAME_GEN_MAX_OUTPUT_TOKENS } from "@/common/constants/nameGeneration";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 
 afterEach(() => {
@@ -85,7 +86,9 @@ function createTitleModel(modelId = "title-model"): LanguageModel {
 function pinnedOptionsFor(
   modelString: string,
   model: LanguageModel,
-  _opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean }
+  _opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean },
+  muxProviderOptions: MuxProviderOptions = {},
+  optionsRouteProvider?: "bedrock" | "openrouter"
 ) {
   return Ok({
     model,
@@ -94,7 +97,8 @@ function pinnedOptionsFor(
     metadataModel: modelString,
     optionsModelString: modelString,
     optionsProvidersConfig: {},
-    optionsMuxProviderOptions: {},
+    optionsMuxProviderOptions: muxProviderOptions,
+    ...(optionsRouteProvider && { optionsRouteProvider }),
   });
 }
 
@@ -103,7 +107,7 @@ type PinnedCreate = (
   opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean }
 ) => Promise<ReturnType<typeof pinnedOptionsFor> | ReturnType<typeof Err<SendMessageError>>>;
 
-/** AIService surface the generator uses: pinned creation + the policy-filtered providers view. */
+/** AIService surface the generator uses: pinned creation + the providers view. */
 function titleAIService(createModelWithPinnedOptions: PinnedCreate): AIService {
   return { createModelWithPinnedOptions, getProvidersConfig: () => null } as unknown as AIService;
 }
@@ -159,6 +163,23 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     });
   });
 
+  test("the request carries the caller's abort signal", async () => {
+    // Creation naming stops a timed-out or orphaned request through this signal.
+    const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+    const controller = new AbortController();
+
+    await generateWorkspaceIdentity(
+      "Add setting",
+      [{ model: "anthropic:claude-haiku-4-5" }],
+      createTitleAIService(createTitleModel()),
+      undefined,
+      undefined,
+      controller.signal
+    );
+
+    expect(streamTextSpy.mock.calls[0]?.[0].abortSignal).toBe(controller.signal);
+  });
+
   test("clamps the configured thinking level to the model's policy", async () => {
     const aiService = createTitleAIService(createTitleModel());
     const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
@@ -196,14 +217,14 @@ describe("generateWorkspaceIdentity candidate settings", () => {
       "Add setting",
       [
         { model: "google:gemini-3.8-flash", thinkingLevel: "medium" },
-        { model: "openai:gpt-5.6-luna" },
+        { model: "openai:gpt-6-luna" },
       ],
       aiService
     );
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.modelUsed).toBe("openai:gpt-5.6-luna");
+      expect(result.data.modelUsed).toBe("openai:gpt-6-luna");
     }
     expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
     // Fallbacks carry no configured thinking: they are CREATED with an explicit
@@ -374,6 +395,112 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     }
   );
 
+  const forcedProposeName = { type: "tool", toolName: "propose_name" } as const;
+  test.each([
+    // Fallback default "off" serializes no Anthropic thinking block.
+    { name: "Haiku default", model: "anthropic:claude-haiku-4-5", forced: true },
+    {
+      name: "Haiku off",
+      model: "anthropic:claude-haiku-4-5",
+      thinkingLevel: "off" as const,
+      forced: true,
+    },
+    // Adaptive-thinking models serialize "off" as an explicit disabled block.
+    {
+      name: "Sonnet 4.6 off",
+      model: "anthropic:claude-sonnet-4-6",
+      thinkingLevel: "off" as const,
+      forced: true,
+    },
+    // Luna "off" serializes reasoningEffort "none".
+    { name: "Luna default", model: "openai:gpt-6-luna", forced: true },
+    // Chat Completions pins Luna to effort "none" at any level.
+    {
+      name: "Luna high on Chat Completions",
+      model: "openai:gpt-6-luna",
+      thinkingLevel: "high" as const,
+      chat: true,
+      forced: true,
+    },
+    {
+      name: "Haiku medium",
+      model: "anthropic:claude-haiku-4-5",
+      thinkingLevel: "medium" as const,
+      forced: false,
+    },
+    // The per-model floor turns thinking on.
+    {
+      name: "Haiku off with low floor",
+      model: "anthropic:claude-haiku-4-5",
+      thinkingLevel: "off" as const,
+      minThinkingLevel: "low" as const,
+      forced: false,
+    },
+    // Policy keeps "off", but this route serializes adaptive thinking.
+    {
+      name: "Sonnet 5.5 off",
+      model: "anthropic:claude-sonnet-5-5",
+      thinkingLevel: "off" as const,
+      forced: false,
+    },
+    {
+      name: "Luna off with high floor",
+      model: "openai:gpt-6-luna",
+      thinkingLevel: "off" as const,
+      minThinkingLevel: "high" as const,
+      forced: false,
+    },
+  ])(
+    "forces propose_name only when the request serializes thinking off ($name)",
+    async ({ model, thinkingLevel, minThinkingLevel, chat, forced }) => {
+      const aiService = titleAIService((modelString) =>
+        Promise.resolve(
+          pinnedOptionsFor(
+            modelString,
+            createTitleModel(modelString),
+            undefined,
+            chat ? { openai: { wireFormat: "chatCompletions" } } : {}
+          )
+        )
+      );
+      const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        [{ model, thinkingLevel, minThinkingLevel }],
+        aiService
+      );
+
+      expect(result.success).toBe(true);
+      expect(streamTextSpy.mock.calls[0]?.[0].toolChoice).toEqual(
+        forced ? forcedProposeName : undefined
+      );
+    }
+  );
+
+  // #5954: Bedrock and OpenRouter spell "thinking off" in their own namespaces.
+  test.each([{ route: "bedrock" as const }, { route: "openrouter" as const }])(
+    "forces propose_name when the $route route serializes thinking off",
+    async ({ route }) => {
+      const model = "anthropic:claude-haiku-5-5";
+      const aiService = titleAIService((modelString) =>
+        Promise.resolve(
+          pinnedOptionsFor(modelString, createTitleModel(modelString), undefined, {}, route)
+        )
+      );
+      const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        [{ model, thinkingLevel: "off" }],
+        aiService
+      );
+
+      expect(result.success).toBe(true);
+      expect(streamTextSpy.mock.calls[0]?.[0].toolChoice).toEqual(forcedProposeName);
+    }
+  );
+
   test("skips a candidate whose model cannot be created and reports the last failure", async () => {
     const createModelWithPinnedOptions = mock((modelString: string) =>
       Promise.resolve(
@@ -402,6 +529,43 @@ describe("generateWorkspaceIdentity candidate settings", () => {
         type: "unknown",
         raw: "Model did not call propose_name tool",
       });
+    }
+    expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
+  });
+
+  test.each([
+    {
+      label: "a failed request over a later candidate skipped for missing credentials",
+      skippedProviders: ["openai"],
+      expected: { type: "service_unavailable", raw: "naming model unavailable" },
+    },
+    {
+      label: "the last skip when every candidate is skipped for missing credentials",
+      skippedProviders: ["anthropic", "openai"],
+      expected: { type: "authentication", authKind: "api_key_missing", provider: "openai" },
+    },
+  ])("reports $label", async (c) => {
+    const createModelWithPinnedOptions = mock((modelString: string) => {
+      const provider = modelString.split(":")[0] ?? modelString;
+      return Promise.resolve(
+        c.skippedProviders.some((skipped) => skipped === provider)
+          ? Err({ type: "api_key_not_found" as const, provider })
+          : pinnedOptionsFor(modelString, createTitleModel(modelString))
+      );
+    });
+    spyOn(aiSdk, "streamText").mockImplementation((() => {
+      throw createApiCallError(500, "naming model unavailable");
+    }) as unknown as typeof aiSdk.streamText);
+
+    const result = await generateWorkspaceIdentity(
+      "Add setting",
+      [{ model: "anthropic:claude-haiku-4-5" }, { model: "openai:gpt-5.6-luna" }],
+      titleAIService(createModelWithPinnedOptions)
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toEqual(c.expected);
     }
     expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
   });
@@ -668,18 +832,6 @@ describe("workspaceTitleGenerator error mappers", () => {
       expect(providerNotSupported).toEqual({
         type: "configuration",
         raw: "Provider not supported",
-      });
-    });
-
-    test("derives provider from model string for policy_denied errors", () => {
-      const mapped = mapModelCreationError(
-        { type: "policy_denied", message: "Provider blocked" },
-        "openai:gpt-4.1-mini"
-      );
-      expect(mapped).toEqual({
-        type: "policy",
-        provider: "openai",
-        raw: "Provider blocked",
       });
     });
 

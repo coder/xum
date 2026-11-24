@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
-import { resolveAutoRoutingForAgent, resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { getAgentBases, setAgentBases } from "./aiSelectionIntent";
+import {
+  resolveConfiguredAiDefaults,
+  resolveInheritedLayerModel,
+  resolveWorkspaceAiSettingsForAgent,
+} from "./workspaceModeAi";
 
 describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses global agent defaults when configured", () => {
@@ -409,93 +415,19 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
   });
 });
 
-describe("resolveAutoRoutingForAgent", () => {
-  const autoExec = { exec: { autoModelRouting: true, autoThinkingLevel: true } } as const;
-  const base = { agentId: "exec", experimentEnabled: true } as const;
-
-  test("explicit switch: the workspace pick outranks the configured default", () => {
-    expect(
-      resolveAutoRoutingForAgent({
-        ...base,
-        agentAiDefaults: autoExec,
-        explicitSwitch: true,
-        routingChoices: { exec: { model: false } },
-      })
-    ).toEqual({ model: false, thinkingLevel: true });
-
-    expect(
-      resolveAutoRoutingForAgent({
-        ...base,
-        agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
-        explicitSwitch: true,
-        routingChoices: { exec: { model: true } },
-      })
-    ).toEqual({ model: true, thinkingLevel: false });
-  });
-
-  test("explicit switch without pick or configured Auto leaves Auto", () => {
-    expect(
-      resolveAutoRoutingForAgent({ ...base, agentAiDefaults: {}, explicitSwitch: true })
-    ).toEqual({ model: false, thinkingLevel: false });
-  });
-
-  test("sync only turns configured Auto on for dimensions without a pick or bucket value", () => {
-    expect(
-      resolveAutoRoutingForAgent({ ...base, agentAiDefaults: autoExec, explicitSwitch: false })
-    ).toEqual({ model: true, thinkingLevel: true });
-
-    expect(
-      resolveAutoRoutingForAgent({
-        ...base,
-        agentAiDefaults: autoExec,
-        explicitSwitch: false,
-        routingChoices: { exec: { thinkingLevel: true } },
-        workspaceByAgent: { exec: { model: "openai:gpt-5.2", thinkingLevel: "low" } },
-      })
-    ).toEqual({ model: undefined, thinkingLevel: undefined });
-
-    // Sync never turns Auto off, even when the default is concrete.
-    expect(
-      resolveAutoRoutingForAgent({
-        ...base,
-        agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
-        explicitSwitch: false,
-      })
-    ).toEqual({ model: undefined, thinkingLevel: undefined });
-  });
-
-  test("experiment off ignores picks and configured Auto", () => {
-    const args = {
-      agentId: "exec",
-      agentAiDefaults: autoExec,
-      experimentEnabled: false,
-      routingChoices: { exec: { model: true } },
-    };
-    expect(resolveAutoRoutingForAgent({ ...args, explicitSwitch: true })).toEqual({
-      model: false,
-      thinkingLevel: false,
-    });
-    expect(resolveAutoRoutingForAgent({ ...args, explicitSwitch: false })).toEqual({
-      model: undefined,
-      thinkingLevel: undefined,
-    });
-  });
-
+describe("resolveConfiguredAiDefaults Auto flags", () => {
   test("the nearest declared layer setting a dimension decides Auto", () => {
     const agentBaseById = new Map([
       ["reviewer", "writer"],
       ["writer", "exec"],
     ]);
-    const resolve = (
-      agentAiDefaults: Parameters<typeof resolveAutoRoutingForAgent>[0]["agentAiDefaults"]
-    ) =>
-      resolveAutoRoutingForAgent({
-        ...base,
-        agentId: "reviewer",
-        agentAiDefaults,
-        agentBaseById,
-        explicitSwitch: true,
-      });
+    const resolve = (agentAiDefaults: AgentAiDefaults) => {
+      const configured = resolveConfiguredAiDefaults("reviewer", agentAiDefaults, agentBaseById);
+      return {
+        model: configured.autoModelRouting === true,
+        thinkingLevel: configured.autoThinkingLevel === true,
+      };
+    };
 
     // A child's concrete value blocks ancestor Auto for that dimension only.
     expect(
@@ -515,13 +447,55 @@ describe("resolveAutoRoutingForAgent", () => {
   });
 
   test("the implicit exec fallback contributes no Auto to undeclared agents", () => {
+    const configured = resolveConfiguredAiDefaults("custom", {
+      exec: { autoModelRouting: true, autoThinkingLevel: true },
+    });
+    expect(configured.autoModelRouting).toBeUndefined();
+    expect(configured.autoThinkingLevel).toBeUndefined();
+  });
+});
+
+describe("resolveConfiguredAiDefaults with a settings base (Cursor model: fast)", () => {
+  test("an agent's applied settings base replaces its base in the loaded agent bases", () => {
+    setAgentBases("settings-base-scope", [
+      { id: "ci-watcher", base: "exec", aiSettingsBase: "explore" },
+    ]);
+    const configured = resolveConfiguredAiDefaults(
+      "ci-watcher",
+      { explore: { modelString: "custom:m-explore" }, exec: { modelString: "custom:m-exec" } },
+      getAgentBases("settings-base-scope")
+    );
+    expect(configured.modelString).toBe("custom:m-explore");
+  });
+});
+
+describe("resolveInheritedLayerModel", () => {
+  // ci-watcher's resolved layers when a project exec.md pins a model: Explore, then Exec.
+  const layers = {
+    ancestors: [
+      { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" as const } },
+      { agentId: "exec", definitionAiDefaults: { model: "custom:exec-pin" } },
+    ],
+  };
+
+  test("ranks a layer's Settings model above a later layer's pinned model", () => {
     expect(
-      resolveAutoRoutingForAgent({
-        ...base,
-        agentId: "custom",
-        agentAiDefaults: autoExec,
-        explicitSwitch: true,
+      resolveInheritedLayerModel("ci-watcher", layers, {
+        explore: { modelString: "custom:m-explore" },
       })
-    ).toEqual({ model: false, thinkingLevel: false });
+    ).toBe("custom:m-explore");
+    expect(resolveInheritedLayerModel("ci-watcher", layers, {})).toBe("custom:exec-pin");
+  });
+
+  test("leaves the agent's own Settings model out", () => {
+    expect(
+      resolveInheritedLayerModel(
+        "ci-watcher",
+        { ancestors: [] },
+        {
+          "ci-watcher": { modelString: "custom:own" },
+        }
+      )
+    ).toBeUndefined();
   });
 });

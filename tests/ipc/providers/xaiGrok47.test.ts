@@ -11,10 +11,11 @@ import {
 } from "../helpers";
 import { setupWorkspace, shouldRunIntegrationTests, validateApiKeys } from "../setup";
 import {
-  PROVIDER_CAPACITY_BACKOFF_MS,
   ProviderCapacityError,
   isProviderCapacityError,
+  isProviderStall,
   retryOnProviderCapacity,
+  withProviderCapacityRetryBudget,
 } from "./liveProviderCapacity";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -50,6 +51,12 @@ async function waitForTerminal(
     collector.waitForEvent("stream-error", timeoutMs),
   ]);
   if (!terminalEvent) {
+    const eventTypes = collector.getEvents().map((event) => ("type" in event ? event.type : ""));
+    if (isProviderStall(eventTypes)) {
+      throw new ProviderCapacityError(
+        `xAI sent no output within ${timeoutMs / 1000} s after the stream started`
+      );
+    }
     throw new Error("Expected terminal stream event from Grok 4.7");
   }
   if (terminalEvent.type === "stream-error") {
@@ -64,14 +71,6 @@ async function waitForTerminal(
   return terminalEvent;
 }
 
-/** Every capacity attempt can use the whole per-attempt budget, plus the waits between. */
-function withCapacityRetryBudget(attemptMs: number): number {
-  return (
-    attemptMs * (PROVIDER_CAPACITY_BACKOFF_MS.length + 1) +
-    PROVIDER_CAPACITY_BACKOFF_MS.reduce((total, ms) => total + ms, 0)
-  );
-}
-
 describeIntegration("xAI Grok 4.7 integration", () => {
   configureTestRetries(3);
 
@@ -84,6 +83,8 @@ describeIntegration("xAI Grok 4.7 integration", () => {
         collector.start();
 
         try {
+          // Subscribe before sending so a stall check sees this turn's stream-start.
+          await collector.waitForSubscription();
           const result = await sendMessageWithModel(
             env,
             workspaceId,
@@ -121,7 +122,7 @@ describeIntegration("xAI Grok 4.7 integration", () => {
         }
       });
     },
-    withCapacityRetryBudget(90_000)
+    withProviderCapacityRetryBudget(90_000)
   );
 
   test(
@@ -213,6 +214,6 @@ describeIntegration("xAI Grok 4.7 integration", () => {
         }
       });
     },
-    withCapacityRetryBudget(180_000)
+    withProviderCapacityRetryBudget(180_000)
   );
 });

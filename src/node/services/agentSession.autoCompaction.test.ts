@@ -9,6 +9,7 @@ import type {
   WorkspaceChatMessage,
 } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -22,6 +23,10 @@ import {
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
+import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
+import { computeSendDigest } from "./sendIds";
+import assert from "@/common/utils/assert";
+import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 
 type CompactionDecisions = Partial<Pick<CompactionMonitor, "checkBeforeSend" | "checkMidStream">>;
 
@@ -237,13 +242,17 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
             )
           ).success
         ).toBe(true);
+        const flags: ExperimentId[] =
+          strategy === "tokenBudget"
+            ? [EXPERIMENT_IDS.TOKEN_BUDGET, EXPERIMENT_IDS.MEMORY]
+            : [EXPERIMENT_IDS.CONTINUOUS_COMPACTION];
+        spyOn(h.aiService, "isExperimentEnabled").mockImplementation((id) => flags.includes(id));
         const stream = spyOn(h.aiService, "streamMessage");
         expect(
           (
             await h.session.sendMessage("Summarize the idle workspace", {
               model,
               agentId: "compact",
-              experiments: { [strategy]: true },
               muxMetadata: {
                 type: "compaction-request",
                 rawCommand: "/compact",
@@ -355,14 +364,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   });
 
   test("stamps on-send auto-compaction requests with the RLM keep-recent tail only when RLM is on", async () => {
-    const runCase = async (args: {
-      workspaceId: string;
-      experiments?: SendMessageOptions["experiments"];
-    }) => {
+    const runCase = async (args: { workspaceId: string; enabled?: ExperimentId[] }) => {
       stubOverThreshold({ usagePercentage: 99, thresholdPercentage: 85 });
-      const { session, historyService } = await createSessionHarness({
+      const { session, historyService, aiService } = await createSessionHarness({
         workspaceId: args.workspaceId,
       });
+      spyOn(aiService, "isExperimentEnabled").mockImplementation(
+        (id) => args.enabled?.includes(id) === true
+      );
 
       // Seed a prior turn so the keep-recent selector has a safe user boundary
       // (u1 @ seq 2) with a provider-eligible head (u0, a0) before it.
@@ -379,7 +388,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       const result = await session.sendMessage("next question", {
         model: "openai:gpt-4o",
         agentId: "exec",
-        ...(args.experiments ? { experiments: args.experiments } : {}),
       });
       expect(result.success).toBe(true);
 
@@ -398,7 +406,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // RLM on (sub-experiment of PTC): stamped with u1's historySequence.
     const stamped = await runCase({
       workspaceId: "ws-auto-compaction-rlm-stamp-on",
-      experiments: { programmaticToolCalling: true, rlm: true },
+      enabled: [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, EXPERIMENT_IDS.RLM],
     });
     expect(stamped).toEqual({ startHistorySequence: 2 });
     await historyCleanup?.();
@@ -406,7 +414,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // RLM flag without a PTC parent flag stays inert.
     const inert = await runCase({
       workspaceId: "ws-auto-compaction-rlm-stamp-inert",
-      experiments: { rlm: true },
+      enabled: [EXPERIMENT_IDS.RLM],
     });
     expect(inert).toBeUndefined();
     await historyCleanup?.();
@@ -430,6 +438,65 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cIv2E): the re-dispatched follow-up row must
     // stay goal-scoped instead of degrading to a legacy unscoped row.
     expect(followUp.goalId).toBe("goal-compaction-scope");
+  });
+
+  test("preserves task turn provenance on auto-compaction follow-up requests", () => {
+    // The follow-up replays the compacted task turn, so it must stay classified as one.
+    const followUp = buildAutoCompactionFollowUp({
+      messageText: "Report your result",
+      options: { model: "openai:gpt-4o", agentId: "exec" },
+      modelForStream: "openai:gpt-4o",
+      taskTurnKind: "recovery",
+    });
+
+    expect(followUp.taskTurnKind).toBe("recovery");
+    expect(
+      buildAutoCompactionFollowUp({
+        messageText: "Plain",
+        options: { model: "openai:gpt-4o", agentId: "exec" },
+        modelForStream: "openai:gpt-4o",
+      })
+    ).not.toHaveProperty("taskTurnKind");
+  });
+
+  // Task launch briefs: a launch skips on-send compaction, so its brief
+  // is published as its own row carrying the brief's id, never folded into a compaction follow-up
+  // that is dispatched later without it.
+  test("an automatic send that skips on-send compaction publishes its own row with its send ids", async () => {
+    const workspaceId = "ws-auto-compaction-automatic-send-ids";
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
+    );
+    stubOverThreshold({ usagePercentage: 95, thresholdPercentage: 70 });
+    const harness = await createSessionHarness({ workspaceId, streamMessage });
+    const sendId = `${MINTED_SEND_ID_PREFIX}brief`;
+
+    const result = await harness.session.sendMessage(
+      "the brief",
+      { model: "openai:gpt-4o", agentId: "exec" },
+      {
+        acceptanceOrigin: "automatic",
+        agentInitiated: true,
+        skipOnSendCompaction: true,
+        sendIdentities: [
+          { id: sendId, digest: computeSendDigest({ message: "the brief" }), unpublished: true },
+        ],
+      }
+    );
+
+    expect(result.success).toBe(true);
+    const history = await harness.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(String(history.error));
+    expect(
+      history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
+    ).toBe(false);
+    const briefRow = history.data.find(
+      (message) =>
+        message.role === "user" &&
+        message.parts.some((part) => part.type === "text" && part.text === "the brief")
+    );
+    expect(briefRow?.metadata?.sendIds).toEqual([sendId]);
+    await harness.session.dispose();
   });
 
   test("triggers on-send compaction at threshold even before force buffer", async () => {
@@ -870,9 +937,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     await session.dispose();
   });
 
-  test("surfaces nested dispatch failures after mid-stream compaction interrupt", async () => {
-    const workspaceId = "ws-auto-compaction-mid-stream-dispatch-failure";
-
+  /**
+   * Sends a turn whose stream crosses the mid-stream compaction threshold once. The nested
+   * compaction dispatch runs `dispatch` instead of a send; returns once its failure surfaced.
+   */
+  async function runMidStreamCompactionDispatch(
+    workspaceId: string,
+    dispatch: (session: AgentSession) => ReturnType<AgentSession["sendMessage"]>
+  ) {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
@@ -945,7 +1017,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         return originalSendMessage(...args);
       }
 
-      return Err({ type: "unknown", raw: "mid-stream compaction dispatch failed" });
+      return dispatch(session);
     }) as AgentSession["sendMessage"];
 
     const events: WorkspaceChatMessage[] = [];
@@ -965,6 +1037,15 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
 
+    return { session, events, stopStream };
+  }
+
+  test("surfaces nested dispatch failures after mid-stream compaction interrupt", async () => {
+    const { session, events, stopStream } = await runMidStreamCompactionDispatch(
+      "ws-auto-compaction-mid-stream-dispatch-failure",
+      () => Promise.resolve(Err({ type: "unknown", raw: "mid-stream compaction dispatch failed" }))
+    );
+
     const streamError = events.find(
       (event): event is Extract<WorkspaceChatMessage, { type: "stream-error" }> =>
         event.type === "stream-error"
@@ -972,6 +1053,32 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(streamError).toBeDefined();
     expect(streamError?.error).toContain("mid-stream compaction dispatch failed");
     expect(stopStream).toHaveBeenCalledTimes(1);
+
+    await session.dispose();
+  });
+
+  test("a Stop during the mid-stream compaction dispatch arms no retry", async () => {
+    const { session, events } = await runMidStreamCompactionDispatch(
+      "ws-auto-compaction-mid-stream-dispatch-stopped",
+      (stopped) => {
+        // What a workspace-turn interrupt or a hard timeout does while the compaction request is
+        // in preflight: it ends the retry loop, and its stop latch refuses the send with a
+        // retryable error. Neither runs cancelCompaction, so the continuation stays admitted.
+        stopped.abandonAutoRetry("task_stopped");
+        return Promise.resolve(
+          Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE })
+        );
+      }
+    );
+    assert(
+      events.some((event) => event.type === "stream-error"),
+      "the refused dispatch surfaces after its retry decision"
+    );
+
+    expect({
+      pending: session.hasPendingAutoRetry(),
+      armed: events.filter((event) => event.type === "auto-retry-scheduled").length,
+    }).toEqual({ pending: false, armed: 0 });
 
     await session.dispose();
   });

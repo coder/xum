@@ -119,6 +119,23 @@ describe("QueuedMessage banner", () => {
     expect(onEdit).toHaveBeenCalledTimes(1);
   });
 
+  // #5934: while another message is being edited, Edit would replace that edit.
+  test("a blocked Edit does nothing and says why", async () => {
+    const onEdit = mock(() => undefined);
+    const view = render(
+      <QueuedMessage message={createQueuedMessage()} onEdit={onEdit} editBlocked />
+    );
+
+    const edit = view.getByRole("button", { name: "Edit" });
+    expect(edit.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(edit);
+    expect(onEdit).not.toHaveBeenCalled();
+    fireEvent.focus(edit);
+    await waitFor(() =>
+      expect(view.getAllByText("Finish or cancel the open edit first").length).toBeGreaterThan(0)
+    );
+  });
+
   test("selecting a deferred mode calls onChangeDispatchMode", async () => {
     const onChangeDispatchMode = mock((_mode: "tool-end" | "turn-end") => Promise.resolve());
     const view = render(
@@ -189,7 +206,7 @@ describe("QueuedMessage banner", () => {
     fireEvent.click(view.getByRole("menuitem", { name: "Send now" }));
     await waitFor(() => {
       expect(onSendImmediately).toHaveBeenCalledTimes(2);
-      expect(view.queryByRole("alert")).toBeNull();
+      expect(view.queryByRole("alert") === null).toBe(true);
     });
   });
 
@@ -406,5 +423,26 @@ describe("QueuedMessage banner", () => {
     expect(view.getByAltText("Attachment 2")).toBeTruthy();
     expect(view.queryByText(/\d+ file/)).toBeNull();
     expect(view.queryByText(/\d+ image/)).toBeNull();
+  });
+
+  test("an artifact send shows its label and confirmed text, and offers no Edit", () => {
+    const view = render(
+      <QueuedMessage
+        message={createQueuedMessage({
+          content: "Ship it",
+          artifactInteraction: {
+            id: "i-1",
+            artifactPath: "form.html",
+            title: "Form",
+            action: "send",
+            text: "Ship it",
+          },
+        })}
+        onEdit={mock(() => undefined)}
+      />
+    );
+    expect(view.getByText("from artifact")).toBeTruthy();
+    expect(view.getByText("Ship it")).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 });

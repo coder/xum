@@ -1,13 +1,20 @@
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
-import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createTerminalTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
+import { openChatActivityPanel } from "@/browser/stories/storyPlayHelpers";
 
 const meta = {
   ...appMeta,
   title: "App/Chat/Components/BackgroundProcesses",
+};
+
+// The bashes chip starts closed; the pending-wake stories snapshot its open list.
+const openBashesPanel: AppStory["play"] = async ({ canvasElement }) => {
+  await openChatActivityPanel(canvasElement, "BackgroundProcessesBanner");
 };
 
 export default meta;
@@ -102,6 +109,8 @@ export const MonitorWakePendingAfterExit: AppStory = {
     <AppWithMocks
       setup={() =>
         setupSimpleChatStory({
+          // Own workspace: see OutputDialogHeading.
+          workspaceId: "ws-monitor-wake-pending",
           messages: [
             createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
               historySequence: 1,
@@ -161,6 +170,7 @@ export const MonitorWakePendingAfterExit: AppStory = {
       },
     },
   },
+  play: openBashesPanel,
 };
 
 export const MonitorLostWakePendingAfterRestart: AppStory = {
@@ -168,6 +178,8 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
     <AppWithMocks
       setup={() =>
         setupSimpleChatStory({
+          // Own workspace: see OutputDialogHeading.
+          workspaceId: "ws-monitor-lost-wake",
           messages: [
             createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
               historySequence: 1,
@@ -217,5 +229,81 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
           "An app restart terminated an armed watcher; its durable monitor-lost wake is still pending delivery. The synthesized row shows 'monitor lost' wording with no pid, duration, output, or terminate affordances.",
       },
     },
+  },
+  play: openBashesPanel,
+};
+
+const NAMED_PROCESS = "Background calls, one every 5 s";
+
+/**
+ * The output dialog of a process whose ID equals its display name (the usual case: the backend
+ * uses the bash call's display_name as the ID). The heading shows the name once (#5771).
+ */
+export const OutputDialogHeading: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          // Its own workspace. The test runner renders this file's stories one after another in
+          // one page, and the app keeps the state of a workspace it already loaded. With the
+          // shared default "ws-chat", this story showed the first story's transcript and no banner.
+          workspaceId: "ws-output-dialog-heading",
+          messages: [
+            createUserMessage("msg-1", "Poll the API in the background", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+          ],
+          backgroundProcesses: [
+            {
+              id: NAMED_PROCESS,
+              pid: 32345,
+              script: "while true; do curl -sS localhost:8080/health; sleep 5; done",
+              displayName: NAMED_PROCESS,
+              startTime: Date.now() - 30000,
+              status: "running",
+            },
+            {
+              // A duplicate name gets a suffixed ID; the dialog still shows that ID.
+              id: `${NAMED_PROCESS} (2)`,
+              pid: 32346,
+              script: "sleep 600",
+              displayName: NAMED_PROCESS,
+              startTime: Date.now() - 20000,
+              status: "running",
+            },
+          ],
+        })
+      }
+    />
+  ),
+  // No Pixel capture: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is full.
+  // The play asserts the heading text instead.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The bashes chip in the composer's live line opens the list.
+    await userEvent.click(await canvas.findByRole("button", { name: /background bashes/ }));
+    const body = within(canvasElement.ownerDocument.body);
+
+    const viewButtons = await canvas.findAllByRole("button", { name: "View output" });
+    await userEvent.click(viewButtons[0]);
+    const dialog = await body.findByRole("dialog");
+    await waitFor(() => {
+      const heading = within(dialog).getByRole("heading");
+      void expect(heading.textContent).toBe(NAMED_PROCESS);
+    });
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(body.queryByRole("dialog")).toBeNull());
+    // The dialog has no trigger of its own: focus goes back to the button that opened it, not
+    // the page body, so the next Escape reaches the panel.
+    await waitFor(() => expect(viewButtons[0]).toHaveFocus());
+
+    await userEvent.click(viewButtons[1]);
+    const second = await body.findByRole("dialog");
+    await waitFor(() => {
+      const heading = within(second).getByRole("heading");
+      void expect(heading.textContent).toBe(`${NAMED_PROCESS}${NAMED_PROCESS} (2)`);
+    });
   },
 };

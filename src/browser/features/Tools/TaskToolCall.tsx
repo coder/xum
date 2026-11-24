@@ -67,8 +67,8 @@ import {
 import { resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
-import { ModelDisplay } from "../Messages/ModelDisplay";
-import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
+import { ModelDisplay, ThinkingLevelLabel } from "../Messages/ModelDisplay";
+import type { ThinkingLevel } from "@/common/types/thinking";
 
 /**
  * Clean SVG icon for task tools - represents spawning/branching work
@@ -110,7 +110,7 @@ const TaskStatusBadge: React.FC<{
       case "retitled":
       case "completed":
       case "reported":
-        return "bg-success/20 text-success";
+        return "bg-success/20 text-success-text";
       case "running":
       case "backgrounded":
         return "bg-pending/20 text-pending";
@@ -529,6 +529,8 @@ interface TaskToolCallProps {
 
 interface TaskToolDisplayEntry {
   taskId: string;
+  /** The child's best-of slot: a partial group result skips the slots that failed to spawn. */
+  candidateIndex?: number;
   status: string;
   title?: string;
   reportMarkdown?: string;
@@ -563,7 +565,8 @@ const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string 
       )}
       {props.thinkingLevel != null && (
         <span className="rounded bg-[var(--color-bg-tertiary)] px-1 py-0.5 font-mono leading-none">
-          thinking: {getThinkingOptionLabel(props.thinkingLevel, props.modelString)}
+          thinking:{" "}
+          <ThinkingLevelLabel level={props.thinkingLevel} modelString={props.modelString} />
         </span>
       )}
     </span>
@@ -573,6 +576,25 @@ const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string 
 interface TaskToolOwnReport {
   reportMarkdown: string;
   title?: string;
+  /** The result holds only the first page of a longer report (it carries nextCharOffset). */
+  isFirstPage?: boolean;
+}
+
+/**
+ * The report a task card shows: its own result's report, unless that is only the first page of
+ * a longer report. Then the report joined from the task_await pages (which starts from that
+ * first page) wins, so the pages the agent read stay on the card.
+ */
+function pickTaskReportMarkdown(
+  ownReport: TaskToolOwnReport | undefined,
+  linkedReport: { reportMarkdown: string } | undefined
+): string | undefined {
+  if (ownReport?.isFirstPage === true && hasNonEmptyText(linkedReport?.reportMarkdown)) {
+    return linkedReport.reportMarkdown;
+  }
+  return hasNonEmptyText(ownReport?.reportMarkdown)
+    ? ownReport.reportMarkdown
+    : linkedReport?.reportMarkdown;
 }
 
 function hasNonEmptyText(value: unknown): value is string {
@@ -633,6 +655,12 @@ function getTaskToolWorkspaceTitle(
   metadata: FrontendWorkspaceMetadata | null | undefined
 ): string | undefined {
   return normalizeTaskTitle(metadata?.title) ?? normalizeTaskTitle(metadata?.name) ?? undefined;
+}
+
+function getTaskToolWorkspaceCandidateIndex(
+  metadata: FrontendWorkspaceMetadata | null | undefined
+): number | undefined {
+  return metadata?.bestOf?.index;
 }
 
 function mergeTaskIdsInDisplayOrder(taskIdLists: ReadonlyArray<readonly string[]>): string[] {
@@ -757,6 +785,14 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
   );
 }
 
+/**
+ * The entries of a persisted list that are objects. A partly corrupted chat.jsonl can hold a
+ * null entry, and skipping it keeps the card rendering (self-healing).
+ */
+function objectEntries<T>(entries: readonly T[]): T[] {
+  return entries.filter((entry) => typeof entry === "object" && entry !== null);
+}
+
 function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null): {
   taskIds: string[];
   statusByTaskId: Map<string, string>;
@@ -816,6 +852,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
     ownReportsByTaskId.set(singleTaskId, {
       reportMarkdown: result.reportMarkdown,
       title: result.title,
+      isFirstPage: result.nextCharOffset != null,
     });
   }
 
@@ -837,12 +874,13 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
   }
 
   if ("reports" in result && Array.isArray(result.reports)) {
-    for (const report of result.reports) {
+    for (const report of objectEntries(result.reports)) {
       const taskId = rememberTaskId(report.taskId);
       if (taskId) {
         ownReportsByTaskId.set(taskId, {
           reportMarkdown: report.reportMarkdown,
           title: report.title,
+          isFirstPage: report.nextCharOffset != null,
         });
         rememberWorkspace(taskId, report.workspaceId);
         rememberAiSettings(taskId, report);
@@ -905,7 +943,7 @@ const TaskToolCandidateCard: React.FC<{
 }> = ({ entry, index, total, onOpenTranscript }) => {
   const canViewTranscript = entry.status === "completed";
   const hasReport = hasNonEmptyText(entry.reportMarkdown);
-  const memberLabel = formatTaskGroupMemberLabel(index);
+  const memberLabel = formatTaskGroupMemberLabel(entry.candidateIndex ?? index);
 
   return (
     <div className="bg-code-bg rounded-sm p-2">
@@ -1010,9 +1048,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     const linkedReport = taskReportLinking?.reportByTaskId.get(taskId);
     const openWorkspaceId = workspaceIdByTaskId.get(taskId);
     const metadata = findWorkspaceForTaskTarget(workspaceMetadata, taskId, openWorkspaceId);
-    const reportMarkdown = hasNonEmptyText(ownReport?.reportMarkdown)
-      ? ownReport.reportMarkdown
-      : linkedReport?.reportMarkdown;
+    const reportMarkdown = pickTaskReportMarkdown(ownReport, linkedReport);
     const reportTitle = ownReport?.title ?? linkedReport?.title;
     const derivedStatus =
       (ownReport ?? linkedReport)
@@ -1023,6 +1059,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
 
     return {
       taskId,
+      candidateIndex: getTaskToolWorkspaceCandidateIndex(metadata),
       status:
         derivedStatus ?? (status === "executing" ? "running" : (successResult?.status ?? "queued")),
       title: reportTitle ?? getTaskToolWorkspaceTitle(metadata) ?? title,
@@ -1424,7 +1461,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
             "[&_svg]:size-3.5",
             summaryTone === "active" && "text-task-mode",
             summaryTone === "danger" && "text-danger",
-            summaryTone === "success" && "text-success",
+            summaryTone === "success" && "text-success-text",
             summaryTone === "interrupted" && "text-interrupted",
             summaryTone === "waiting" && "text-muted"
           )}
@@ -1435,7 +1472,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
             "size-3 shrink-0",
             summaryTone === "active" && "text-task-mode animate-spin",
             summaryTone === "danger" && "text-danger",
-            summaryTone === "success" && "text-success",
+            summaryTone === "success" && "text-success-text",
             summaryTone === "interrupted" && "text-interrupted",
             summaryTone === "waiting" && "text-muted"
           )}
@@ -1921,6 +1958,35 @@ export const TaskStopToolCall: React.FC<TaskStopToolCallProps> = (props) => {
   );
 };
 
+interface TaskRemoveResultRowProps {
+  result: {
+    taskId: string;
+    status?: string;
+    error?: string;
+    paths?: string[];
+    /** What a forced removal deleted. */
+    deletedWork?: string;
+  };
+}
+
+const TaskRemoveResultRow: React.FC<TaskRemoveResultRowProps> = (props) => (
+  <div className="bg-code-bg rounded-sm p-2">
+    <TaskId id={props.result.taskId} />
+    {props.result.status != null && <TaskStatusBadge status={props.result.status} />}
+    {props.result.error != null && (
+      <div className="text-danger mt-1 text-[11px]">{props.result.error}</div>
+    )}
+    {props.result.deletedWork != null && (
+      <div className="text-secondary mt-1 text-[11px] break-words">{props.result.deletedWork}</div>
+    )}
+    {props.result.paths?.map((filePath) => (
+      <div key={filePath} className="text-secondary font-mono text-[11px] break-all">
+        {filePath}
+      </div>
+    ))}
+  </div>
+);
+
 interface TaskRemoveToolCallProps {
   args: TaskRemoveToolArgs;
   result?: TaskRemoveToolSuccessResult;
@@ -1930,12 +1996,8 @@ interface TaskRemoveToolCallProps {
 export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => {
   const { expanded, toggleExpanded } = useToolExpansion(false);
   const results = props.result?.results ?? [];
-  const displayResults: Array<{
-    taskId: string;
-    status?: string;
-    error?: string;
-    paths?: string[];
-  }> = results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
+  const displayResults: Array<TaskRemoveResultRowProps["result"]> =
+    results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
   const removed = results.filter((result) => result.status === "removed").length;
   return (
     <ToolContainer expanded={expanded}>
@@ -1954,18 +2016,7 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
         <ToolDetails>
           <div className="task-surface mt-1 space-y-2 rounded-md p-3">
             {displayResults.map((result, index) => (
-              <div key={result.taskId ?? index} className="bg-code-bg rounded-sm p-2">
-                <TaskId id={result.taskId} />
-                {result.status != null && <TaskStatusBadge status={result.status} />}
-                {result.error != null && (
-                  <div className="text-danger mt-1 text-[11px]">{result.error}</div>
-                )}
-                {result.paths?.map((filePath) => (
-                  <div key={filePath} className="text-secondary font-mono text-[11px] break-all">
-                    {filePath}
-                  </div>
-                ))}
-              </div>
+              <TaskRemoveResultRow key={result.taskId ?? index} result={result} />
             ))}
           </div>
         </ToolDetails>

@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 
 import { APIContext, useAPI, type APIClient } from "@/browser/contexts/API";
 import { isAbortError } from "@/browser/utils/isAbortError";
@@ -24,6 +24,29 @@ function recency(run: WorkflowRunRecord): number {
 }
 
 /**
+ * The state update for one feed event: a snapshot replaces the shown runs, a delta upserts one
+ * run. Called as the event arrives, so an unknown event throws into the feed's error handling.
+ */
+function workflowRunsUpdate(
+  event: WorkflowRunStreamEvent
+): (previous: Map<string, WorkflowRunRecord>) => Map<string, WorkflowRunRecord> {
+  switch (event.type) {
+    case "snapshot": {
+      const snapshot = new Map(event.runs.map((run) => [run.id, run]));
+      return () => snapshot;
+    }
+    case "run-changed":
+      return (previous) => {
+        const next = new Map(previous);
+        next.set(event.run.id, event.run);
+        return next;
+      };
+    default:
+      return assertNever(event);
+  }
+}
+
+/**
  * Live workflow-run feed for one workspace. Subscribes to `workflows.subscribe`
  * (snapshot + per-write deltas) and keeps a local id→record map in sync, so the
  * tab reflects step/status progress in real time without polling. Mirrors
@@ -34,16 +57,24 @@ export function useWorkflowRuns(workspaceId: string): UseWorkflowRunsResult {
   const [runsById, setRunsById] = useState<Map<string, WorkflowRunRecord>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // The workspace whose runs are shown. Only another workspace clears them: a re-run for the same
+  // one (no client during a reconnect, then a new client) keeps them, and the empty state, until
+  // the new snapshot replaces them.
+  const shownWorkspaceIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!api) {
+    if (shownWorkspaceIdRef.current !== workspaceId) {
+      shownWorkspaceIdRef.current = workspaceId;
       setRunsById(new Map());
-      setLoading(false);
+      setLoading(true);
+    }
+
+    // Without a client nothing is loaded yet, so `loading` stays as it is: still true before the
+    // first snapshot of this workspace (the tab must not show its empty state, then flip to runs).
+    if (!api) {
       return;
     }
 
-    setRunsById(new Map());
-    setLoading(true);
     setError(null);
 
     const controller = new AbortController();
@@ -62,20 +93,9 @@ export function useWorkflowRuns(workspaceId: string): UseWorkflowRunsResult {
         if (signal.aborted) {
           break;
         }
-        switch (event.type) {
-          case "snapshot":
-            setRunsById(new Map(event.runs.map((run) => [run.id, run])));
-            setLoading(false);
-            break;
-          case "run-changed":
-            setRunsById((previous) => {
-              const next = new Map(previous);
-              next.set(event.run.id, event.run);
-              return next;
-            });
-            break;
-          default:
-            assertNever(event);
+        setRunsById(workflowRunsUpdate(event));
+        if (event.type === "snapshot") {
+          setLoading(false);
         }
       }
     };

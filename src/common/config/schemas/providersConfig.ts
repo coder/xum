@@ -6,10 +6,21 @@ import { ModelParametersByModelSchema } from "./modelParameters";
 import { ProviderModelEntrySchema } from "./providerModelEntry";
 
 export const CacheTtlSchema = z.enum(["5m", "1h"]);
-export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority"]);
+/** Anthropic request speed; "fast" opts into Fast mode (see anthropicFastMode.ts). */
+export const AnthropicSpeedSchema = z.enum(["standard", "fast"]);
+// "ultrafast" is OpenAI's model-gated premium tier (DevDay 2026-09-29); requests for
+// models without it drop the tier, as GPT-6.2 requests do for "flex" (see
+// openaiModelSupportsServiceTier).
+export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority", "ultrafast"]);
 export type ServiceTier = z.infer<typeof ServiceTierSchema>;
-export const FastModePreviousServiceTierSchema = z.enum(["auto", "default", "flex", "unset"]);
-export type FastModePreviousServiceTier = z.infer<typeof FastModePreviousServiceTierSchema>;
+// Fast mode remembers the tier it replaced, so toggling Fast off from Ultrafast restores it.
+export const FastModePreviousServiceTierSchema = z.enum([
+  "auto",
+  "default",
+  "flex",
+  "ultrafast",
+  "unset",
+]);
 export const XAIServiceTierSchema = z.enum(["default", "priority"]);
 export type XAIServiceTier = z.infer<typeof XAIServiceTierSchema>;
 export const XAIFastModePreviousServiceTierSchema = z.enum(["default", "unset"]);
@@ -22,6 +33,8 @@ export const BaseProviderConfigSchema = z
     baseUrl: z.string().optional(),
     baseURL: z.string().optional(),
     headers: z.record(z.string(), z.string()).optional(),
+    /** Header name that carries the workspace id on chat requests (see sessionHeader.ts). */
+    sessionHeader: z.string().optional(),
     enabled: z.boolean().optional(),
     providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
     displayName: z.string().min(1).optional(),
@@ -32,6 +45,7 @@ export const BaseProviderConfigSchema = z
 
 export const AnthropicProviderConfigSchema = BaseProviderConfigSchema.extend({
   cacheTtl: CacheTtlSchema.optional(),
+  speed: AnthropicSpeedSchema.optional(),
 });
 
 export const OpenAIProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -43,6 +57,8 @@ export const OpenAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   defaultModel: z.string().optional(),
   apiVersion: z.string().optional(),
   webSocketTransportEnabled: z.boolean().optional(),
+  /** Offer Cyber (OpenAI Daybreak access program) in the thinking menu. Absent = off. */
+  cyberModelEnabled: z.boolean().optional(),
 });
 
 export const BedrockProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -51,6 +67,13 @@ export const BedrockProviderConfigSchema = BaseProviderConfigSchema.extend({
   bearerToken: z.string().optional(),
   accessKeyId: z.string().optional(),
   secretAccessKey: z.string().optional(),
+});
+
+export const GoogleVertexProviderConfigSchema = BaseProviderConfigSchema.extend({
+  project: z.string().optional(),
+  location: z.string().optional(),
+  /** Service-account JSON key file; unset uses Google Application Default Credentials. */
+  keyFilename: z.string().optional(),
 });
 
 export const OpenRouterProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -68,11 +91,6 @@ export const XAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   searchParameters: z.record(z.string(), z.unknown()).optional(),
   serviceTier: XAIServiceTierSchema.optional(),
   fastModePreviousServiceTier: XAIFastModePreviousServiceTierSchema.optional(),
-});
-
-export const MuxGatewayProviderConfigSchema = BaseProviderConfigSchema.extend({
-  couponCode: z.string().optional(),
-  voucher: z.string().optional(),
 });
 
 export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -129,6 +147,13 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
    */
   additionalProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
   /**
+   * User preference mapping a canonical provider (anthropic/openai/google) to
+   * the same-type gateway instance that serves its native models when routing
+   * picks Coder (see resolveCoderCanonicalRouteInstance). Login, refresh, and
+   * disconnect never touch it.
+   */
+  canonicalRoutes: z.record(z.string(), z.string()).optional(),
+  /**
    * Cross-process disconnect generation (monotonic counter, incremented by
    * coderOauthService.disconnect). Each login flow snapshots the persisted
    * value at start; a flow whose snapshot no longer matches at commit time —
@@ -155,6 +180,7 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
 export const GoogleProviderConfigSchema = BaseProviderConfigSchema;
 export const DeepSeekProviderConfigSchema = BaseProviderConfigSchema;
 export const MoonshotAIProviderConfigSchema = BaseProviderConfigSchema;
+export const MetaProviderConfigSchema = BaseProviderConfigSchema;
 export const ZaiProviderConfigSchema = BaseProviderConfigSchema;
 export const OllamaProviderConfigSchema = BaseProviderConfigSchema;
 export const GitHubCopilotProviderConfigSchema = BaseProviderConfigSchema;
@@ -166,8 +192,9 @@ export const ProvidersConfigSchema = z
     bedrock: BedrockProviderConfigSchema.optional(),
     openrouter: OpenRouterProviderConfigSchema.optional(),
     xai: XAIProviderConfigSchema.optional(),
-    "mux-gateway": MuxGatewayProviderConfigSchema.optional(),
+    meta: MetaProviderConfigSchema.optional(),
     google: GoogleProviderConfigSchema.optional(),
+    "google-vertex": GoogleVertexProviderConfigSchema.optional(),
     deepseek: DeepSeekProviderConfigSchema.optional(),
     moonshotai: MoonshotAIProviderConfigSchema.optional(),
     zai: ZaiProviderConfigSchema.optional(),
@@ -180,7 +207,7 @@ export const ProvidersConfigSchema = z
 export type BaseProviderConfig = z.infer<typeof BaseProviderConfigSchema>;
 export type OpenAIProviderConfig = z.infer<typeof OpenAIProviderConfigSchema>;
 export type BedrockProviderConfig = z.infer<typeof BedrockProviderConfigSchema>;
-export type MuxGatewayProviderConfig = z.infer<typeof MuxGatewayProviderConfigSchema>;
+export type GoogleVertexProviderConfig = z.infer<typeof GoogleVertexProviderConfigSchema>;
 export type CoderProviderConfig = z.infer<typeof CoderProviderConfigSchema>;
 
 export type ProvidersConfig = z.infer<typeof ProvidersConfigSchema>;

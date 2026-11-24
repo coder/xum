@@ -1,0 +1,608 @@
+{
+  "recordedAt": "2026-09-29",
+  "source": "Anthropic /v1/messages/count_tokens via the Coder AI gateway, 2026-09-29. Request text is frozen repo docs/source; smallToolsProviderTokens / oneToolProviderTokens = count with all 30 / only the first small tool minus count without tools (#5219).",
+  "providerInputTokens": {
+    "claude-opus-5-5": 7289,
+    "claude-sonnet-4-6": 5739
+  },
+  "request": {
+    "system": "---\ntitle: AGENTS.md\ndescription: Agent instructions for AI assistants working on the Xum codebase\n---\n\n**Prime directive:** keep edits minimal and token-efficient\u2014say only what conveys actionable signal.\n\n## Project Snapshot\n\n- `xum`: Electron + React desktop app for parallel agent workflows; UX must be fast, responsive, predictable.\n- Minor breaking changes are expected, but critical flows must allow upgrade\u2194downgrade without friction; skip migrations when breakage is tightly scoped.\n- **Before creating or updating any PR, commit, or public issue**, you **MUST** read the `pull-requests` skill (`agent_skill_read` in Xum; `.xum/skills/pull-requests/SKILL.md` elsewhere) for attribution footer requirements and workflow conventions. Do not skip this step.\n\n## External Submissions\n\n- **Do not submit updates to the Terminal-Bench leaderboard repo directly.** Only provide the user with commands they can run themselves.\n\n## Repo Reference\n\n- Core files: `src/desktop/main.ts`, `src/desktop/preload.ts`, `src/browser/App.tsx`, `src/node/config/index.ts`.\n- Up-to-date model names: see `src/common/constants/knownModels.ts` for current provider model IDs.\n- Persistent data: `~/.xum/config.json`, `~/.xum/src/<project>/<branch>` (worktrees), `~/.xum/sessions/<workspace>/chat.jsonl`.\n- Rename compatibility is centralized in `src/common/compat/legacyMux.ts` and `src/node/compat/xumTransition.ts`; do not add scattered `mux` fallbacks. Project-local `.xum/` is canonical, `.mux/` is a read fallback, and stable external IDs remain compatibility contracts.\n\n## Documentation Rules\n\n- No free-floating Markdown. User docs live in `docs/` (read `docs/README.md`, add pages to `docs.json` navigation, use standard Markdown + mermaid). Developer notes belong inline as comments.\n  - Exception: the `rfc` folder contains human-written RFCs for implementation planning.\n- For planning artifacts, use the `propose_plan` tool or inline comments instead of ad-hoc docs.\n- Do not add new root-level docs without explicit request; during feature work rely on code + tests + inline comments.\n- Vercel AI SDK docs live in `/tmp/ai-sdk-docs/**.mdx` once `./scripts/update_vercel_docs.sh` has fetched them; never browse `https://sdk.vercel.ai/docs/ai-sdk-core` directly.\n\n### Code Comments\n\n- When delivering a user's request, leave their rationale in the code as comments.\n- Generally, prefer code comments that explain the \"why\" behind a change.\n- Still explain the \"what\" if the code is opaque, surprising, confusing, etc.\n\n## Key Features & Performance\n\n- Core UX: projects sidebar (left panel), workspace management (local git worktrees or SSH clones), config stored in `~/.xum/config.json`.\n- Fetch bulk data in one IPC call\u2014no O(n) frontend\u2192backend loops.\n- **React Compiler enabled** \u2014 auto-memoization handles components/hooks; do not add manual `React.memo()`, `useMemo`, or `useCallback` for memoization purposes. Focus instead on fixing unstable object references that the compiler cannot optimize (e.g., `new Set()` in state setters, inline object literals as props).\n- **useEffect** \u2014 Before adding effects, consult the `react-effects` skill (`.xum/skills/react-effects/SKILL.md`). Most effects for derived state, prop resets, or event-triggered logic are anti-patterns.\n\n## Tooling & Commands\n\n- Package manager: bun only. Use `bun install`, `bun add`, `bun run` (which proxies to Make when relevant). Run `bun install` if modules/types go missing.\n- Makefile is source of truth (new commands land there, not `package.json`).\n- Primary targets: `make dev|start|build|lint|lint-fix|fmt|fmt-check|typecheck|test|test-integration|clean|help`.\n- CI runs `make static-check-full`, which adds the targets in its Makefile prerequisites (including docs link checking via `mintlify broken-links`) to `static-check`.\n- Xum sources `.xum/tool_env` before every `bash` tool call; in other harnesses, `source .xum/tool_env` first. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.\n- Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.\n- `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.\n- `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.\n- `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.\n\n## Browser Automation\n\nUse `agent-browser` for web automation. Run `agent-browser --help` for all commands.\n\nCore workflow:\n\n1. `agent-browser open <url>` - Navigate to page\n2. `agent-browser snapshot -i` - Get interactive elements with refs (@e1, @e2)\n3. `agent-browser click @e1` / `fill @e2 \"text\"` - Interact using refs\n4. Re-snapshot after page changes\n\n## PR Workflow\n\n- When checking PR readiness, audit **all** PR reviews, review comments, and issue comments from every reviewer/bot (including `coder-agents-review`), not just Codex; address or explicitly resolve them before declaring readiness.\n- If a PR has `coder-agents-review` feedback, address it and reply before resolving: either reply inline on each finding or leave a PR comment that explicitly lists each finding and your response. Do not silently resolve those threads.\n- If a PR has Codex review comments, address + resolve them, then re-request review by commenting `@codex review` on the PR.\n- Prefer `gh` CLI for GitHub interactions over manual web/curl flows. Use `./scripts/wait_pr_ready.sh` for readiness: `gh pr checks` deduplicates names across check suites and can hide failures.\n- User preference: use `gh stack` to manage GitHub-native stacked PRs; keep every PR linked in the native stack, not just chained by base branches.\n\n- User preference: when work is already on an open PR, push branch updates at the end of each completed change set so the PR stays current.\n- **PR creation gate:** Do **n",
+    "tools": [
+      {
+        "name": "read_file",
+        "description": "Tool read_file: # Xum Documentation\n\nThis directory contains the source for Xum documentation hosted on [Mintlify](https://mintlify.com/).\n\n**Live docs:** https://mux.coder.com\n\n## Local Development\n\n```bash\n# Serve ",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or workspace-relative path"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["a", "b", "c"]
+            }
+          },
+          "required": ["path"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "write_file",
+        "description": "Tool write_file: docs locally with hot reload\nmake docs-server\n```\n\n## Features\n\n- \u2705 **Mermaid diagrams** - Add diagrams with ` ```mermaid ` code blocks\n- \u2705 **Link checking** - CI validates all internal links via `min",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or workspace-relative path"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["a", "b", "c"]
+            }
+          },
+          "required": ["path"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "bash",
+        "description": "Tool bash: tlify broken-links`\n- \u2705 **Auto-deploy** - Mintlify automatically deploys on push to main\n\n## Structure\n\n```\ndocs/\n\u251c\u2500\u2500 docs.json        # Mintlify configuration (navigation, theme, etc.)\n\u251c\u2500\u2500 custom.css",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or workspace-relative path"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["a", "b", "c"]
+            }
+          },
+          "required": ["path"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "search",
+        "description": "Tool search:        # Custom styling\n\u251c\u2500\u2500 img/             # Images and logos\n\u2514\u2500\u2500 *.md             # Documentation pages\n```\n\n## Adding Content\n\n1. Create a new `.md` file in `docs/`\n2. Add frontmatter with title a",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or workspace-relative path"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["a", "b", "c"]
+            }
+          },
+          "required": ["path"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "list_dir",
+        "description": "Tool list_dir: nd description\n3. Add the page to `docs.json` navigation\n4. Use standard markdown + mermaid diagrams\n\nExample frontmatter:\n\n```markdown\n---\ntitle: Page Title\ndescription: Brief description for SEO\n---",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or workspace-relative path"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["a", "b", "c"]
+            }
+          },
+          "required": ["path"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "web_fetch",
+        "description": "Tool web_fetch: \n```\n\n## Writing Guidelines\n\nSee [STYLE.md](./STYLE.md) for documentation writing guidelines.\n\n## CI/CD\n\n- **Link checking**: CI runs `mintlify broken-links` on every PR\n- **Deployment**: Mintlify Git",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or workspace-relative path"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["a", "b", "c"]
+            }
+          },
+          "required": ["path"],
+          "additionalProperties": false
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Please review the worker pool and the config.\n# Xum Documentation\n\nThis directory contains the source for Xum documentation hosted on [Mintlify](https://mintlify.com/).\n\n**Live docs:** https://mux.coder.com\n\n## Local Development\n\n```bash\n# Serve docs locally with hot reload\nmake docs-server\n```\n\n## Features\n\n- \u2705 **Mermaid diagrams** - Add diagrams with ` ```mermaid ` code blocks\n- \u2705 **Link checking** - CI validates all internal links via `mintlify broken-links`\n- \u2705 **Auto-deploy** - Mintlify automatically deploys on push to main\n\n## Structure\n\n```\ndocs/\n\u251c\u2500\u2500 docs.json        # Mintlify configuration (navigation, theme, etc.)\n\u251c\u2500\u2500 custom.css       # Custom styling\n\u251c\u2500\u2500 img/             # Images and logos\n\u2514\u2500\u2500 *.md             # Documentation pages\n```\n\n## Adding Content\n\n1. Create a new `.md` file in `docs/`\n2. Add frontmatter with title and description\n3. Add the page to `docs.json` navigation\n4. Use standard markdown + mermaid diagrams\n\nExample frontmatter:\n\n```markdown\n---\ntitle: Page Title\ndescription: Brief description for SEO\n---\n```\n\n## Writing Guidelines\n\nSee [STYLE.md](./STYLE.md) for documentation writing guidelines.\n\n## CI/CD\n\n- **Link checking**: CI runs `mintlify broken-links` on every PR\n- **Deployment**: Mintlify GitHub app auto-deploys on push to main\n"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Reading the files."
+          },
+          {
+            "type": "tool-call",
+            "toolCallId": "call_1",
+            "toolName": "read_file",
+            "input": {
+              "path": "src/node/utils/main/workerPool.ts"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": [
+          {
+            "type": "tool-result",
+            "toolCallId": "call_1",
+            "toolName": "read_file",
+            "output": {
+              "type": "text",
+              "value": "import assert from \"node:assert\";\nimport { Worker } from \"node:worker_threads\";\nimport { join, dirname, sep, extname } from \"node:path\";\nimport { log } from \"@/node/services/log\";\nimport type { EncodingName, TokenizerWorkerData } from \"./tokenizer.worker\";\n\ninterface WorkerRequest {\n  messageId: number;\n  taskName: string;\n  data: unknown;\n}\n\ninterface WorkerSuccessResponse {\n  messageId: number;\n  result: unknown;\n}\n\ninterface WorkerErrorResponse {\n  messageId: number;\n  error: {\n    message: string;\n    stack?: string;\n  };\n}\n\ntype WorkerResponse = WorkerSuccessResponse | WorkerErrorResponse;\n\ninterface PendingRequest {\n  resolve: (value: unknown) => void;\n  reject: (error: Error) => void;\n}\n\ninterface EncodingWorker {\n  worker: Worker;\n  pending: Map<number, PendingRequest>;\n  // Set once the worker dies (e.g., failed to load); later calls reject immediately.\n  error: Error | null;\n}\n\nlet messageIdCounter = 0;\n\n// Resolve worker path\n// In production: both workerPool.js and tokenizer.worker.js are in dist/utils/main/\n// During tests: workerPool.ts is in src/utils/main/ but worker is in dist/utils/main/\nconst currentDir = dirname(__filename);\nconst pathParts = currentDir.split(sep);\nconst hasDist = pathParts.includes(\"dist\");\nconst srcIndex = pathParts.lastIndexOf(\"src\");\n\nlet workerDir: string;\nlet workerFile = \"tokenizer.worker.js\";\n\n// Check if we're running under Bun (not Node with ts-jest)\n// ts-jest transpiles .ts files but runs them via Node, which can't load .ts workers\n// eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern\nconst isBun = !!(process as unknown as { isBun?: boolean }).isBun;\n\nif (isBun && extname(__filename) === \".ts\") {\n  // Running from source via Bun - use .ts worker directly\n  workerDir = currentDir;\n  workerFile = \"tokenizer.worker.ts\";\n} else if (srcIndex !== -1 && !hasDist) {\n  // Replace 'src' with 'dist' in the path (only if not already in dist)\n  pathParts[srcIndex] = \"dist\";\n  workerDir = pathParts.join(sep);\n} else {\n  workerDir = currentDir;\n}\n\nconst workerPath = join(workerDir, workerFile);\n\n// One worker per encoding, spawned on first use: loading an encoding is seconds of synchronous CPU\n// (o200k_base ~10 s), so a shared worker would block every other encoding's counts behind it (#4816).\nconst encodingWorkers = new Map<EncodingName, EncodingWorker>();\n\nfunction spawnWorker(encoding: EncodingName): EncodingWorker {\n  assert(!encodingWorkers.has(encoding), `Tokenizer worker for '${encoding}' already exists`);\n  const workerData: TokenizerWorkerData = { encoding };\n  const entry: EncodingWorker = {\n    worker: new Worker(workerPath, { workerData }),\n    pending: new Map(),\n    error: null,\n  };\n  encodingWorkers.set(encoding, entry);\n\n  const failAll = (error: Error) => {\n    entry.error = error;\n    for (const pending of entry.pending.values()) {\n      pending.reject(error);\n    }\n    entry.pending.clear();\n  };\n\n  // Handle messages from worker\n  entry.worker.on(\"message\", (response: WorkerResponse) => {\n    const pending = entry.pending.get(response.messageId);\n    if (!pending) {\n      log.error(`No pending promise for messageId ${response.messageId}`);\n      return;\n    }\n\n    entry.pending.delete(response.messageId);\n\n    if (\"error\" in response) {\n      const error = new Error(response.error.message);\n      error.stack = response.error.stack;\n      pending.reject(error);\n    } else {\n      pending.resolve(response.result);\n    }\n  });\n\n  // Handle worker errors\n  entry.worker.on(\"error\", (error: Error) => {\n    log.error(`Tokenizer worker (${encoding}) error:`, error);\n    failAll(error);\n  });\n\n  // Handle worker exit\n  entry.worker.on(\"exit\", (code) => {\n    if (code !== 0) {\n      log.error(`Tokenizer worker (${encoding}) stopped with exit code ${code}`);\n      failAll(new Error(`Worker stopped with exit code ${code}`));\n    }\n  });\n\n  // Don't block process exit\n  entry.worker.unref();\n  return entry;\n}\n\n/**\n * Run a task on the worker thread that serves `encoding`, spawning it on first use.\n * Spawning is synchronous here, so concurrent calls can never create two workers for one encoding.\n * @param encoding The encoding whose worker should run the task\n * @param taskName The name of the task to run (e.g., \"countTokensBatch\", \"ready\")\n * @param data The data to pass to the task\n * @returns A promise that resolves with the task result\n */\nexport function run<T>(encoding: EncodingName, taskName: string, data: unknown): Promise<T> {\n  const entry = encodingWorkers.get(encoding) ?? spawnWorker(encoding);\n\n  // If worker already died (e.g., failed to load), reject immediately\n  // This prevents hanging promises when the worker is not available\n  if (entry.error) {\n    return Promise.reject(entry.error);\n  }\n\n  const messageId = messageIdCounter++;\n  const request: WorkerRequest = { messageId, taskName, data };\n\n  return new Promise<T>((resolve, reject) => {\n    entry.pending.set(messageId, {\n      resolve: resolve as (value: unknown) => void,\n      reject,\n    });\n    entry.worker.postMessage(request);\n  });\n}\n"
+            }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool-call",
+            "toolCallId": "call_2",
+            "toolName": "read_file",
+            "input": {
+              "path": "tsconfig.json"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": [
+          {
+            "type": "tool-result",
+            "toolCallId": "call_2",
+            "toolName": "read_file",
+            "output": {
+              "type": "text",
+              "value": "{\n  \"compilerOptions\": {\n    \"target\": \"ES2020\",\n    \"lib\": [\n      \"ES2023\",\n      \"DOM\",\n      \"DOM.Iterable\",\n      \"ES2022.Intl\"\n    ],\n    \"module\": \"ESNext\",\n    \"moduleResolution\": \"bundler\",\n    \"jsx\": \"react-jsx\",\n    \"strict\": true,\n    \"noUnusedLocals\": true,\n    \"noUnusedParameters\": true,\n    \"esModuleInterop\": true,\n    \"skipLibCheck\": true,\n    \"forceConsistentCasingInFileNames\": true,\n    \"resolveJsonModule\": true,\n    \"allowSyntheticDefaultImports\": true,\n    \"allowJs\": true,\n    \"sourceMap\": true,\n    \"inlineSources\": true,\n    \"paths\": {\n      \"@/*\": [\n        \"./src/*\"\n      ],\n      \"@shared/*\": [\n        \"./src/*\"\n      ]\n    }\n  },\n  \"watchOptions\": {\n    \"excludeDirectories\": [\n      \"**/node_modules\",\n      \"**/dist\",\n      \"**/build\",\n      \"**/.git\"\n    ],\n    \"excludeFiles\": [\n      \"**/*.d.ts.map\"\n    ]\n  },\n  \"include\": [\n    \"src/**/*.tsx\",\n    \"src/**/*.ts\",\n    \"tests/**/*.ts\",\n    \"tests/**/*.tsx\",\n    \".storybook/**/*.ts\",\n    \".storybook/**/*.tsx\"\n  ],\n  \"exclude\": [\n    \"node_modules\",\n    \"dist\"\n  ]\n}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Both files look consistent; the pool starts one worker per encoding."
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Thanks. Summarize the risks in three bullets."
+          }
+        ]
+      }
+    ]
+  },
+  "smallTools": [
+    {
+      "name": "tool_0",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_1",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_2",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_3",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_4",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_5",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_6",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_7",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_8",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_9",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_10",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_11",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_12",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_13",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_14",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_15",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_16",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_17",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_18",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_19",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_20",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_21",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_22",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_23",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_24",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_25",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_26",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_27",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_28",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool_29",
+      "description": "Do one thing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "smallToolsProviderTokens": {
+    "claude-opus-5-5": 2086,
+    "claude-sonnet-4-6": 1847
+  },
+  "oneToolProviderTokens": {
+    "claude-opus-5-5": 346,
+    "claude-sonnet-4-6": 542
+  }
+}

@@ -1,7 +1,9 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
+import { useThinking } from "@/browser/contexts/ThinkingContext";
 import React, { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Route, Zap } from "lucide-react";
+import { UltrafastIcon } from "@/browser/components/icons/UltrafastIcon/UltrafastIcon";
 
-import { useAPI } from "@/browser/contexts/API";
 import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
@@ -9,8 +11,11 @@ import { useRouting } from "@/browser/hooks/useRouting";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
-  applyFastModeServiceTierChange,
   getFastModeProvider,
+  resolveChatServiceTier,
+  toggleServiceTier,
+  type PremiumServiceTier,
+  ultrafastModeAvailable as getUltrafastModeAvailable,
 } from "@/browser/utils/fastModeServiceTier";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
@@ -21,6 +26,7 @@ import {
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
+import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy, getAvailableThinkingLevels } from "@/common/utils/thinking/policy";
@@ -60,14 +66,14 @@ interface ThinkingSelectorControlProps {
   modelCapabilitiesDeferred?: boolean;
   /** Independent of effort/model inheritance; false denotes an explicit mode override. */
   reasoningModeInherited?: boolean;
-  /** Nested tools enforce model capabilities without the chat-specific effort floor. */
-  applyMinimumThinkingLevel?: boolean;
   thinkingLevel: ThinkingLevel;
   onThinkingLevelChange: (level: ThinkingLevel) => void;
   reasoningMode: OpenAIReasoningMode;
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
-  /** Some embedded clients cannot resolve route-aware provider options safely. */
-  allowProMode?: boolean;
+  serviceTier?: ServiceTier;
+  onServiceTierChange?: (tier: ServiceTier) => void;
+  /** Some embedded clients cannot resolve route-aware provider options safely. Gates Pro and Cyber. */
+  allowReasoningModes?: boolean;
   /** Some embedded clients do not expose provider configuration mutations. */
   allowFastMode?: boolean;
   /** "composer": compact chat-input trigger, menu opens upward (default).
@@ -85,17 +91,15 @@ interface ThinkingSelectorControlProps {
 
 /**
  * Controlled reasoning picker shared by the chat composer and settings pages.
- * Owns thinking-level policy resolution plus route-aware Pro/Fast mode
+ * Owns thinking-level policy resolution plus route-aware Pro/Cyber/Fast mode
  * availability so every surface exposes the same feature set; callers only
  * supply the current values and persistence callbacks.
  */
 export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (props) => {
-  const { api } = useAPI();
   const { getMinimum } = useMinThinkingLevels();
-  const { config: providersConfig, refresh, updateOptimistically } = useProvidersConfig();
+  const { config: providersConfig } = useProvidersConfig();
   const routing = useRouting();
   const [isOpen, setIsOpen] = useState(false);
-  const [fastModeSaving, setFastModeSaving] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const variant = props.variant ?? "composer";
@@ -104,57 +108,88 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
 
   const modelCapabilitiesDeferred = props.modelCapabilitiesDeferred ?? false;
   const reasoningModeInherited = props.reasoningModeInherited === true;
-  const { allowed, effectiveThinkingLevel, capabilityModel, proModeAvailable, fastModeProvider } =
-    (() => {
-      // The calling chat's model is unknown in Settings. Store preferences without
-      // borrowing global Exec capabilities; the launch path enforces the real model's policy.
-      if (modelCapabilitiesDeferred) {
-        return {
-          allowed: THINKING_LEVELS,
-          effectiveThinkingLevel: props.thinkingLevel,
-          capabilityModel: undefined,
-          proModeAvailable: props.allowProMode !== false,
-          fastModeProvider: null,
-        };
-      }
-
-      assert(props.modelString, "A model is required unless capabilities are deferred");
-      const minimum =
-        props.applyMinimumThinkingLevel === false ? undefined : getMinimum(props.modelString);
-      const resolvedRoute = routing.resolveRoute(normalizeToCanonical(props.modelString)).route;
+  const {
+    allowed,
+    effectiveThinkingLevel,
+    capabilityModel,
+    proModeAvailable,
+    fastModeProvider,
+    ultrafastModeAvailable,
+  } = (() => {
+    // The calling chat's model is unknown in Settings. Store preferences without
+    // borrowing global Exec capabilities; the launch path enforces the real model's policy.
+    if (modelCapabilitiesDeferred) {
       return {
-        allowed: getAvailableThinkingLevels(props.modelString, minimum, providersConfig),
-        effectiveThinkingLevel: enforceThinkingPolicy(
-          props.modelString,
-          props.thinkingLevel,
-          minimum,
-          providersConfig
-        ),
-        // Mapped aliases use the target model's ladder and provider-aware labels.
-        capabilityModel: resolveModelForMetadata(props.modelString, providersConfig ?? null),
-        proModeAvailable:
-          props.allowProMode !== false &&
-          openaiProModeAvailable(props.modelString, {
-            providersConfig,
-            effectiveRouteProvider: routing.resolveEffectiveRoute(props.modelString),
-          }),
-        fastModeProvider:
-          props.allowFastMode !== false && providersConfig != null
-            ? getFastModeProvider(props.modelString, {
-                providersConfig,
-                resolvedRouteProvider: resolvedRoute,
-              })
-            : null,
+        allowed: THINKING_LEVELS,
+        effectiveThinkingLevel: props.thinkingLevel,
+        capabilityModel: undefined,
+        proModeAvailable: props.allowReasoningModes !== false,
+        fastModeProvider: null,
+        ultrafastModeAvailable: false,
       };
-    })();
+    }
+
+    assert(props.modelString, "A model is required unless capabilities are deferred");
+    const minimum = getMinimum(props.modelString);
+    const resolvedRoute = routing.resolveRoute(normalizeToCanonical(props.modelString)).route;
+    return {
+      allowed: getAvailableThinkingLevels(props.modelString, minimum, providersConfig),
+      effectiveThinkingLevel: enforceThinkingPolicy(
+        props.modelString,
+        props.thinkingLevel,
+        minimum,
+        providersConfig
+      ),
+      // Mapped aliases use the target model's ladder and provider-aware labels.
+      capabilityModel: resolveModelForMetadata(props.modelString, providersConfig ?? null),
+      proModeAvailable:
+        props.allowReasoningModes !== false &&
+        openaiProModeAvailable(props.modelString, {
+          providersConfig,
+          effectiveRouteProvider: routing.resolveEffectiveRoute(props.modelString),
+        }),
+      fastModeProvider:
+        props.allowFastMode !== false && providersConfig != null
+          ? getFastModeProvider(props.modelString, {
+              providersConfig,
+              resolvedRouteProvider: resolvedRoute,
+            })
+          : null,
+      // Ultrafast sits next to Fast mode and is hidden wherever Fast mode is.
+      ultrafastModeAvailable:
+        props.allowFastMode !== false &&
+        providersConfig != null &&
+        getUltrafastModeAvailable(props.modelString, {
+          providersConfig,
+          resolvedRouteProvider: resolvedRoute,
+        }),
+    };
+  })();
   const fastModeAvailable = fastModeProvider != null;
+  // Deferred capabilities cannot prove Cyber's exact model and direct route, unlike Pro.
+  const cyberModeAvailable =
+    !modelCapabilitiesDeferred &&
+    props.modelString != null &&
+    props.allowReasoningModes !== false &&
+    openaiCyberModeAvailable(props.modelString, {
+      providersConfig,
+      effectiveRouteProvider: routing.resolveEffectiveRoute(props.modelString),
+    });
   const proModeActive =
     !reasoningModeInherited && proModeAvailable && props.reasoningMode === "pro";
-  const fastModeActive =
-    fastModeProvider != null && providersConfig?.[fastModeProvider]?.serviceTier === "priority";
+  const cyberModeActive =
+    !reasoningModeInherited && cyberModeAvailable && props.reasoningMode === "cyber";
+  // Like the thinking level, speed is the chat's choice for every provider.
+  const chatServiceTier =
+    fastModeProvider != null
+      ? resolveChatServiceTier(fastModeProvider, props.serviceTier, providersConfig)
+      : undefined;
+  const fastModeActive = chatServiceTier === "priority";
+  const ultrafastModeActive = ultrafastModeAvailable && chatServiceTier === "ultrafast";
   const hasMenu =
     allowed.length > 1 ||
     proModeAvailable ||
+    cyberModeAvailable ||
     fastModeAvailable ||
     props.inheritOption != null ||
     props.autoRouting != null;
@@ -174,31 +209,9 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [isOpen]);
 
-  const handleFastModeToggle = async () => {
-    if (!api || fastModeSaving || providersConfig == null || fastModeProvider == null) return;
-
-    setFastModeSaving(true);
-    try {
-      const providerConfig = providersConfig[fastModeProvider];
-      const change = await applyFastModeServiceTierChange(
-        api.providers,
-        fastModeProvider,
-        providerConfig?.serviceTier,
-        providerConfig?.fastModePreviousServiceTier
-      );
-      if (change) {
-        updateOptimistically(fastModeProvider, {
-          serviceTier: change.serviceTier,
-          fastModePreviousServiceTier: change.previousServiceTier,
-        });
-      } else {
-        await refresh();
-      }
-    } catch {
-      await refresh();
-    } finally {
-      setFastModeSaving(false);
-    }
+  const handleFastModeToggle = (targetServiceTier: PremiumServiceTier = "priority") => {
+    if (providersConfig == null || fastModeProvider == null) return;
+    props.onServiceTierChange?.(toggleServiceTier(chatServiceTier, targetServiceTier));
   };
 
   if (!hasMenu) {
@@ -226,10 +239,10 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
       <button
         type="button"
         data-thinking-selector-trigger
-        className="text-foreground hover:bg-hover focus-visible:bg-hover focus-visible:text-accent flex shrink-0 cursor-pointer items-center gap-0.5 rounded-sm bg-transparent py-0 pr-0.5 text-[11px] font-medium transition-colors focus-visible:outline-none"
+        className="text-foreground hover:bg-hover focus-visible:bg-hover focus-visible:text-accent-text flex shrink-0 cursor-pointer items-center gap-0.5 rounded-sm bg-transparent py-0 pr-0.5 text-[11px] font-medium transition-colors focus-visible:outline-none"
         aria-expanded={isOpen}
         aria-haspopup="listbox"
-        aria-label={`Thinking: ${autoActive ? "Auto" : effectiveThinkingLevel}${proModeActive ? ", pro mode" : ""}${fastModeActive ? ", fast mode" : ""}`}
+        aria-label={`Thinking: ${autoActive ? "Auto" : effectiveThinkingLevel}${proModeActive ? ", pro mode" : ""}${cyberModeActive ? ", cyber mode" : ""}${fastModeActive ? ", fast mode" : ""}${ultrafastModeActive ? ", ultrafast mode" : ""}`}
         onClick={() => setIsOpen((previous) => !previous)}
       >
         {autoActive && <Route aria-hidden className="h-3 w-3 shrink-0 opacity-70" />}
@@ -251,12 +264,31 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
             PRO
           </span>
         )}
+        {cyberModeActive && (
+          <span
+            data-thinking-cyber-status
+            className={cn(
+              "border-border-medium text-muted ml-0.5 rounded-[3px] border bg-transparent px-1 text-[9px] leading-[14px] font-semibold tracking-wide",
+              COMPOSER_PRO_HIDE_CLASS
+            )}
+          >
+            CYBER
+          </span>
+        )}
         {fastModeActive && (
           <Zap
             data-fast-mode-indicator
             className="text-thinking-mode h-3 w-3 shrink-0"
             fill="currentColor"
             aria-label="Fast mode enabled"
+          />
+        )}
+        {ultrafastModeActive && (
+          <UltrafastIcon
+            data-ultrafast-mode-indicator
+            // The trails start at the icon's left edge; a hairline gap keeps them off the label.
+            className="text-thinking-mode ml-px shrink-0"
+            aria-label="Ultrafast mode enabled"
           />
         )}
         <ChevronDown
@@ -284,12 +316,12 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
               ? props.inheritOption.label
               : getThinkingMenuLabel(effectiveThinkingLevel, capabilityModel)}
         </span>
-        {(proModeActive || props.reasoningModeInherited === false) && (
+        {(proModeActive || cyberModeActive || props.reasoningModeInherited === false) && (
           <span
             data-thinking-pro-status
             className="border-border-medium text-muted rounded-[3px] border bg-transparent px-1 text-[9px] leading-[14px] font-semibold tracking-wide"
           >
-            {props.reasoningMode === "pro" ? "PRO" : "STANDARD"}
+            {cyberModeActive ? "CYBER" : props.reasoningMode === "pro" ? "PRO" : "STANDARD"}
           </span>
         )}
         {fastModeActive && (
@@ -298,6 +330,14 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
             className="text-thinking-mode h-3 w-3 shrink-0"
             fill="currentColor"
             aria-label="Fast mode enabled"
+          />
+        )}
+        {ultrafastModeActive && (
+          <UltrafastIcon
+            data-ultrafast-mode-indicator
+            // The trails start at the icon's left edge; a hairline gap keeps them off the label.
+            className="text-thinking-mode ml-px shrink-0"
+            aria-label="Ultrafast mode enabled"
           />
         )}
         <ChevronDown
@@ -377,11 +417,11 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
               >
                 <Route
                   aria-hidden
-                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent-text" : "text-muted")}
                 />
                 <span className="text-foreground min-w-0 flex-1">Auto</span>
                 <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
-                {autoActive && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                {autoActive && <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />}
               </button>
             )}
             {props.inheritOption && (
@@ -397,7 +437,9 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                 onClick={props.inheritOption.onSelect}
               >
                 <span className="text-foreground min-w-0 flex-1">{props.inheritOption.label}</span>
-                {inheritSelected && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                {inheritSelected && (
+                  <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
+                )}
               </button>
             )}
             {allowed.map((level) => {
@@ -417,13 +459,16 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                   onClick={() => props.onThinkingLevelChange(level)}
                 >
                   <span className="text-foreground min-w-0 flex-1">{label}</span>
-                  {selected && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                  {selected && <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />}
                 </button>
               );
             })}
           </div>
 
-          {(proModeAvailable || fastModeAvailable) && (
+          {(proModeAvailable ||
+            cyberModeAvailable ||
+            fastModeAvailable ||
+            ultrafastModeAvailable) && (
             <div className="border-border-light border-t py-1">
               {proModeAvailable && (
                 <button
@@ -445,16 +490,35 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                 </button>
               )}
 
+              {cyberModeAvailable && (
+                <button
+                  type="button"
+                  data-component="CyberModeToggle"
+                  aria-pressed={reasoningModeInherited ? "mixed" : cyberModeActive}
+                  className="hover:bg-hover flex w-full items-center gap-2.5 px-2.5 py-1.5 text-left transition-colors"
+                  onClick={() =>
+                    props.onReasoningModeChange(cyberModeActive ? "standard" : "cyber")
+                  }
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="text-foreground block text-[11px] font-medium">Cyber</span>
+                    <span className="text-muted block text-[10px] font-normal">
+                      {reasoningModeInherited
+                        ? "Use calling chat’s Exec"
+                        : "OpenAI Daybreak access program"}
+                    </span>
+                  </span>
+                  {cyberModeActive && <Check className="text-thinking-mode h-3 w-3" aria-hidden />}
+                </button>
+              )}
+
               {fastModeAvailable && (
                 <button
                   type="button"
                   data-component="FastModeToggle"
                   aria-pressed={fastModeActive}
-                  disabled={fastModeSaving}
                   className="hover:bg-hover disabled:text-muted flex w-full items-center gap-2.5 px-2.5 py-1.5 text-left transition-colors disabled:cursor-default"
-                  onClick={() => {
-                    handleFastModeToggle().catch(() => undefined);
-                  }}
+                  onClick={() => handleFastModeToggle()}
                 >
                   <span className="min-w-0 flex-1">
                     <span className="text-foreground block text-[11px] font-medium">Fast mode</span>
@@ -462,7 +526,31 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                       Faster responses at higher cost
                     </span>
                   </span>
-                  {fastModeActive && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                  {fastModeActive && (
+                    <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
+                  )}
+                </button>
+              )}
+
+              {ultrafastModeAvailable && (
+                <button
+                  type="button"
+                  data-component="UltrafastModeToggle"
+                  aria-pressed={ultrafastModeActive}
+                  className="hover:bg-hover disabled:text-muted flex w-full items-center gap-2.5 px-2.5 py-1.5 text-left transition-colors disabled:cursor-default"
+                  onClick={() => handleFastModeToggle("ultrafast")}
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="text-foreground block text-[11px] font-medium">
+                      Ultrafast mode
+                    </span>
+                    <span className="text-muted block text-[10px] font-normal">
+                      Fastest responses, highest cost
+                    </span>
+                  </span>
+                  {ultrafastModeActive && (
+                    <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
+                  )}
                 </button>
               )}
             </div>
@@ -475,8 +563,8 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
 
 interface ThinkingSelectorProps {
   modelString: string;
-  /** Some embedded clients cannot resolve route-aware provider options safely. */
-  allowProMode?: boolean;
+  /** Some embedded clients cannot resolve route-aware provider options safely. Gates Pro and Cyber. */
+  allowReasoningModes?: boolean;
   /** Some embedded clients do not expose provider configuration mutations. */
   allowFastMode?: boolean;
   /**
@@ -490,6 +578,7 @@ interface ThinkingSelectorProps {
 export const ThinkingSelector: React.FC<ThinkingSelectorProps> = (props) => {
   const [thinkingLevel, setThinkingLevel] = useThinkingLevel();
   const [reasoningMode, setReasoningMode] = useReasoningMode();
+  const { serviceTier, setServiceTier } = useThinking();
 
   return (
     <ThinkingSelectorControl
@@ -498,7 +587,9 @@ export const ThinkingSelector: React.FC<ThinkingSelectorProps> = (props) => {
       onThinkingLevelChange={setThinkingLevel}
       reasoningMode={reasoningMode}
       onReasoningModeChange={setReasoningMode}
-      allowProMode={props.allowProMode}
+      serviceTier={serviceTier}
+      onServiceTierChange={setServiceTier}
+      allowReasoningModes={props.allowReasoningModes}
       allowFastMode={props.allowFastMode}
       autoRouting={props.autoRouting}
     />

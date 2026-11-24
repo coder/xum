@@ -270,6 +270,19 @@ export async function readReactProfileSnapshot(
   });
 }
 
+export interface TapeReplayPerfSummary {
+  /** Events on the replayed tape. */
+  eventCount: number;
+  /** The tape's recorded duration (trailer offset). */
+  durationMs: number;
+  /** From the workspace click until the first history row rendered. */
+  firstRowMs: number;
+  /** From the workspace click until the streamed turn's final text rendered. */
+  lastRowMs: number;
+  /** Probe image requests the renderer egress block cancelled. */
+  blockedRequests: number;
+}
+
 async function writeJsonFile(filePath: string, payload: unknown): Promise<void> {
   await fsPromises.writeFile(filePath, JSON.stringify(payload, null, 2), "utf-8");
 }
@@ -284,6 +297,8 @@ export async function writePerfArtifacts(args: {
   milestones?: PageMilestones;
   /** Per-switch chat-switch timings and medians (perf.chatSwitch.spec.ts, #4504). */
   chatSwitch?: ChatSwitchPerfSummary;
+  /** Session tape replay timings (perf.tapeReplay.spec.ts). */
+  tapeReplay?: TapeReplayPerfSummary;
 }): Promise<string> {
   const timestamp = new Date().toISOString().replace(/[.:]/g, "-");
   const runDirName = `${sanitizeForPath(args.runLabel)}-${timestamp}`;
@@ -318,6 +333,7 @@ export async function writePerfArtifacts(args: {
     // Additive field: schemaVersion stays 1 because existing readers ignore unknown keys.
     ...(args.milestones ? { milestones: args.milestones } : {}),
     ...(args.chatSwitch ? { chatSwitch: args.chatSwitch } : {}),
+    ...(args.tapeReplay ? { tapeReplay: args.tapeReplay } : {}),
     chromeProfile: {
       label: args.chromeProfile.label,
       startedAt: args.chromeProfile.startedAt,

@@ -15,6 +15,7 @@ import {
 } from "@/common/orpc/types";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 
 interface ReplayHarnessStreamInfo {
   messageId: string;
@@ -374,7 +375,9 @@ describe("AgentSession pre-stream errors", () => {
   it("honors persisted auto-retry opt-out for synthetic startup-time failures", async () => {
     const workspaceId = "ws-runtime-start-failed-persisted-opt-out";
 
-    const { historyService, config, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService({
+      files: SessionFilesMemory,
+    });
     historyCleanup = cleanup;
 
     const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {

@@ -1,0 +1,1936 @@
+[
+  {
+    "step": "a. append user and assistant rows",
+    "rows": [
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "appendFile", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.sync", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "appendFile", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.sync", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" }
+    ]
+  },
+  {
+    "step": "b. write and commit a partial",
+    "rows": [
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "appendFile", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.sync", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "realpath", "file": "partial.json" },
+      { "api": "stat", "file": "partial.json" },
+      { "api": "open", "file": "partial.json.<12 hex>", "flags": "w" },
+      { "api": "write", "file": "partial.json.<12 hex>" },
+      { "api": "fsync", "file": "partial.json.<12 hex>" },
+      { "api": "fstat", "file": "partial.json.<12 hex>" },
+      { "api": "close", "file": "partial.json.<12 hex>" },
+      { "api": "rename", "file": "partial.json.<12 hex>", "to": "partial.json" },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "partial.json.<12 hex>" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "readFile", "file": "partial.json" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "readFile", "file": "partial.json" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat-archive.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "readFile", "file": "chat.jsonl" },
+      { "api": "realpath", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl.<12 hex>", "flags": "w", "mode": "0o100644" },
+      { "api": "write", "file": "chat.jsonl.<12 hex>" },
+      { "api": "fsync", "file": "chat.jsonl.<12 hex>" },
+      { "api": "fstat", "file": "chat.jsonl.<12 hex>" },
+      { "api": "close", "file": "chat.jsonl.<12 hex>" },
+      { "api": "chown", "file": "chat.jsonl.<12 hex>" },
+      { "api": "chmod", "file": "chat.jsonl.<12 hex>", "mode": "0o100644" },
+      { "api": "rename", "file": "chat.jsonl.<12 hex>", "to": "chat.jsonl" },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "chat.jsonl.<12 hex>" },
+      { "api": "unlink", "file": "partial.json" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" }
+    ]
+  },
+  {
+    "step": "c. edit an assistant row",
+    "rows": [
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "readFile", "file": "chat.jsonl" },
+      { "api": "realpath", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl.<12 hex>", "flags": "w", "mode": "0o100644" },
+      { "api": "write", "file": "chat.jsonl.<12 hex>" },
+      { "api": "fsync", "file": "chat.jsonl.<12 hex>" },
+      { "api": "fstat", "file": "chat.jsonl.<12 hex>" },
+      { "api": "close", "file": "chat.jsonl.<12 hex>" },
+      { "api": "chown", "file": "chat.jsonl.<12 hex>" },
+      { "api": "chmod", "file": "chat.jsonl.<12 hex>", "mode": "0o100644" },
+      { "api": "rename", "file": "chat.jsonl.<12 hex>", "to": "chat.jsonl" },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "chat.jsonl.<12 hex>" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" }
+    ]
+  },
+  {
+    "step": "d. append a compaction boundary (rotates rows into chat-archive.jsonl)",
+    "rows": [
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "appendFile", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.sync", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "readFile", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "open", "file": "chat-archive.jsonl", "flags": "a+" },
+      { "api": "handle.stat", "file": "chat-archive.jsonl" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "handle.writeFile", "file": "chat-archive.jsonl" },
+      { "api": "handle.sync", "file": "chat-archive.jsonl" },
+      { "api": "handle.close", "file": "chat-archive.jsonl" },
+      { "api": "realpath", "file": "chat.jsonl.continuous-<uuid>" },
+      { "api": "stat", "file": "chat.jsonl.continuous-<uuid>" },
+      {
+        "api": "open",
+        "file": "chat.jsonl.continuous-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "chat.jsonl.continuous-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "chat.jsonl.continuous-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "chat.jsonl.continuous-<uuid>.<12 hex>" },
+      { "api": "close", "file": "chat.jsonl.continuous-<uuid>.<12 hex>" },
+      { "api": "chmod", "file": "chat.jsonl.continuous-<uuid>.<12 hex>", "mode": "0o600" },
+      {
+        "api": "rename",
+        "file": "chat.jsonl.continuous-<uuid>.<12 hex>",
+        "to": "chat.jsonl.continuous-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "chat.jsonl.continuous-<uuid>.<12 hex>" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "renameSync", "file": "chat.jsonl.continuous-<uuid>", "to": "chat.jsonl" },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "rm", "file": "chat.jsonl.continuous-<uuid>", "options": { "force": true } },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" }
+    ]
+  },
+  {
+    "step": "e. write the journal, the pending state and the cancellation record",
+    "rows": [
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "realpath", "file": "continuous-compaction-generation.continuous-<uuid>" },
+      { "api": "stat", "file": "continuous-compaction-generation.continuous-<uuid>" },
+      {
+        "api": "open",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "close", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "chmod",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "mode": "0o600"
+      },
+      {
+        "api": "rename",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "to": "continuous-compaction-generation.continuous-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "renameSync",
+        "file": "continuous-compaction-generation.continuous-<uuid>",
+        "to": "continuous-compaction-generation"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      {
+        "api": "rm",
+        "file": "continuous-compaction-generation.continuous-<uuid>",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "readFile", "file": "continuous-compaction.json" },
+      { "api": "realpath", "file": "continuous-compaction.json.continuous-<uuid>" },
+      { "api": "stat", "file": "continuous-compaction.json.continuous-<uuid>" },
+      {
+        "api": "open",
+        "file": "continuous-compaction.json.continuous-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "continuous-compaction.json.continuous-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "continuous-compaction.json.continuous-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "continuous-compaction.json.continuous-<uuid>.<12 hex>" },
+      { "api": "close", "file": "continuous-compaction.json.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "chmod",
+        "file": "continuous-compaction.json.continuous-<uuid>.<12 hex>",
+        "mode": "0o600"
+      },
+      {
+        "api": "rename",
+        "file": "continuous-compaction.json.continuous-<uuid>.<12 hex>",
+        "to": "continuous-compaction.json.continuous-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "continuous-compaction.json.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "renameSync",
+        "file": "continuous-compaction.json.continuous-<uuid>",
+        "to": "continuous-compaction.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      {
+        "api": "rm",
+        "file": "continuous-compaction.json.continuous-<uuid>",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat-archive.jsonl", "flags": "r" },
+      { "api": "handle.stat", "file": "chat-archive.jsonl" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat-archive.jsonl" },
+      { "api": "readFile", "file": "chat.jsonl" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "readFile", "file": "continuous-compaction.json" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true } },
+      { "api": "readFile", "file": "post-compaction.json" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "realpath", "file": "post-compaction.json.continuous-<uuid>" },
+      { "api": "stat", "file": "post-compaction.json.continuous-<uuid>" },
+      {
+        "api": "open",
+        "file": "post-compaction.json.continuous-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "post-compaction.json.continuous-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "post-compaction.json.continuous-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "post-compaction.json.continuous-<uuid>.<12 hex>" },
+      { "api": "close", "file": "post-compaction.json.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "chmod",
+        "file": "post-compaction.json.continuous-<uuid>.<12 hex>",
+        "mode": "0o600"
+      },
+      {
+        "api": "rename",
+        "file": "post-compaction.json.continuous-<uuid>.<12 hex>",
+        "to": "post-compaction.json.continuous-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "post-compaction.json.continuous-<uuid>.<12 hex>" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "renameSync",
+        "file": "post-compaction.json.continuous-<uuid>",
+        "to": "post-compaction.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      {
+        "api": "rm",
+        "file": "post-compaction.json.continuous-<uuid>",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "open", "file": "compaction-cancellation.json", "flags": "r" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "realpath", "file": "continuous-compaction-generation.continuous-<uuid>" },
+      { "api": "stat", "file": "continuous-compaction-generation.continuous-<uuid>" },
+      {
+        "api": "open",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "close", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "chmod",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "mode": "0o600"
+      },
+      {
+        "api": "rename",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "to": "continuous-compaction-generation.continuous-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "renameSync",
+        "file": "continuous-compaction-generation.continuous-<uuid>",
+        "to": "continuous-compaction-generation"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      {
+        "api": "rm",
+        "file": "continuous-compaction-generation.continuous-<uuid>",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "readFile", "file": "partial.json" },
+      { "api": "readFile", "file": "chat-archive.jsonl" },
+      { "api": "readFile", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "realpath", "file": "compaction-cancellation.json.continuous-<uuid>" },
+      { "api": "stat", "file": "compaction-cancellation.json.continuous-<uuid>" },
+      {
+        "api": "open",
+        "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      { "api": "close", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "chmod",
+        "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>",
+        "mode": "0o600"
+      },
+      {
+        "api": "rename",
+        "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>",
+        "to": "compaction-cancellation.json.continuous-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "renameSync",
+        "file": "compaction-cancellation.json.continuous-<uuid>",
+        "to": "compaction-cancellation.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      {
+        "api": "rm",
+        "file": "compaction-cancellation.json.continuous-<uuid>",
+        "options": { "force": true }
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "open", "file": "compaction-cancellation.json", "flags": "r" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.close", "file": "compaction-cancellation.json" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "readFile", "file": "partial.json" },
+      { "api": "readFile", "file": "chat-archive.jsonl" },
+      { "api": "readFile", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "realpath", "file": "compaction-cancellation.json.continuous-<uuid>" },
+      { "api": "stat", "file": "compaction-cancellation.json.continuous-<uuid>" },
+      {
+        "api": "open",
+        "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      { "api": "close", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "chmod",
+        "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>",
+        "mode": "0o600"
+      },
+      {
+        "api": "rename",
+        "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>",
+        "to": "compaction-cancellation.json.continuous-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "compaction-cancellation.json.continuous-<uuid>.<12 hex>" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "renameSync",
+        "file": "compaction-cancellation.json.continuous-<uuid>",
+        "to": "compaction-cancellation.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      {
+        "api": "rm",
+        "file": "compaction-cancellation.json.continuous-<uuid>",
+        "options": { "force": true }
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" }
+    ]
+  },
+  {
+    "step": "f. truncate after an archived message",
+    "rows": [
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "readFile", "file": "chat.jsonl" },
+      { "api": "readFile", "file": "chat-archive.jsonl" },
+      { "api": "realpath", "file": "continuous-compaction-generation.continuous-<uuid>" },
+      { "api": "stat", "file": "continuous-compaction-generation.continuous-<uuid>" },
+      {
+        "api": "open",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      { "api": "close", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "chmod",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "mode": "0o600"
+      },
+      {
+        "api": "rename",
+        "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>",
+        "to": "continuous-compaction-generation.continuous-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "continuous-compaction-generation.continuous-<uuid>.<12 hex>" },
+      {
+        "api": "renameSync",
+        "file": "continuous-compaction-generation.continuous-<uuid>",
+        "to": "continuous-compaction-generation"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      {
+        "api": "rm",
+        "file": "continuous-compaction-generation.continuous-<uuid>",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "realpath", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "open", "file": "chat-archive.jsonl.truncate.json.<12 hex>", "flags": "w" },
+      { "api": "write", "file": "chat-archive.jsonl.truncate.json.<12 hex>" },
+      { "api": "fsync", "file": "chat-archive.jsonl.truncate.json.<12 hex>" },
+      { "api": "fstat", "file": "chat-archive.jsonl.truncate.json.<12 hex>" },
+      { "api": "close", "file": "chat-archive.jsonl.truncate.json.<12 hex>" },
+      {
+        "api": "rename",
+        "file": "chat-archive.jsonl.truncate.json.<12 hex>",
+        "to": "chat-archive.jsonl.truncate.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "chat-archive.jsonl.truncate.json.<12 hex>" },
+      { "api": "rename", "file": "chat-archive.jsonl", "to": "chat-archive.jsonl.truncate" },
+      { "api": "realpath", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl.<12 hex>", "flags": "w", "mode": "0o100600" },
+      { "api": "write", "file": "chat.jsonl.<12 hex>" },
+      { "api": "fsync", "file": "chat.jsonl.<12 hex>" },
+      { "api": "fstat", "file": "chat.jsonl.<12 hex>" },
+      { "api": "close", "file": "chat.jsonl.<12 hex>" },
+      { "api": "chown", "file": "chat.jsonl.<12 hex>" },
+      { "api": "chmod", "file": "chat.jsonl.<12 hex>", "mode": "0o100600" },
+      { "api": "rename", "file": "chat.jsonl.<12 hex>", "to": "chat.jsonl" },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "chat.jsonl.<12 hex>" },
+      { "api": "rm", "file": "chat-archive.jsonl.truncate" },
+      { "api": "rm", "file": "chat-archive.jsonl.truncate.json", "options": { "force": true } },
+      { "api": "readFile", "file": "partial.json" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" }
+    ]
+  },
+  {
+    "step": "g. write a partial that stays on disk",
+    "rows": [
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "realpath", "file": "partial.json" },
+      { "api": "stat", "file": "partial.json" },
+      { "api": "open", "file": "partial.json.<12 hex>", "flags": "w" },
+      { "api": "write", "file": "partial.json.<12 hex>" },
+      { "api": "fsync", "file": "partial.json.<12 hex>" },
+      { "api": "fstat", "file": "partial.json.<12 hex>" },
+      { "api": "close", "file": "partial.json.<12 hex>" },
+      { "api": "rename", "file": "partial.json.<12 hex>", "to": "partial.json" },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "partial.json.<12 hex>" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" }
+    ]
+  },
+  {
+    "step": "h. accept one row (guarded append), then two rows (staged publication)",
+    "rows": [
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "open", "file": "compaction-cancellation.json", "flags": "r" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.close", "file": "compaction-cancellation.json" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "open", "file": "compaction-cancellation.json", "flags": "r" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.close", "file": "compaction-cancellation.json" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "a", "mode": "0o600" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "writeSync", "file": "chat.jsonl" },
+      { "api": "fsyncSync", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.sync", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "open", "file": "compaction-cancellation.json", "flags": "r" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.close", "file": "compaction-cancellation.json" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "mkdir", "file": "<root>/locks", "options": { "recursive": true } },
+      {
+        "api": "writeFile",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "link",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>",
+        "to": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock"
+      },
+      {
+        "api": "unlink",
+        "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock.tmp-<pid>-<hex>"
+      },
+      {
+        "api": "access",
+        "file": "<root>/locks/workspace-removed-91a225936e660b7a8bc1ea7324939dc9.json"
+      },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json",
+        "flags": "O_RDONLY|O_NOFOLLOW|O_NONBLOCK"
+      },
+      { "api": "handle.stat", "file": "history-append-provenance.json" },
+      { "api": "handle.read", "file": "history-append-provenance.json" },
+      { "api": "handle.close", "file": "history-append-provenance.json" },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "stat", "file": "chat-archive.jsonl.truncate" },
+      { "api": "readFile", "file": "chat-archive.jsonl.truncate.json" },
+      { "api": "open", "file": "compaction-cancellation.json", "flags": "r" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.read", "file": "compaction-cancellation.json" },
+      { "api": "handle.close", "file": "compaction-cancellation.json" },
+      { "api": "readFile", "file": "continuous-compaction-generation" },
+      { "api": "stat", "file": "chat.jsonl" },
+      { "api": "open", "file": "chat.jsonl", "flags": "r" },
+      { "api": "handle.read", "file": "chat.jsonl" },
+      { "api": "handle.close", "file": "chat.jsonl" },
+      { "api": "stat", "file": "chat-archive.jsonl" },
+      { "api": "mkdir", "file": ".", "options": { "recursive": true }, "mode": "0o700" },
+      { "api": "chmod", "file": ".", "mode": "0o700" },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "readFile", "file": "chat.jsonl" },
+      { "api": "realpath", "file": "chat.jsonl.publication-<uuid>" },
+      { "api": "stat", "file": "chat.jsonl.publication-<uuid>" },
+      {
+        "api": "open",
+        "file": "chat.jsonl.publication-<uuid>.<12 hex>",
+        "flags": "w",
+        "mode": "0o600"
+      },
+      { "api": "write", "file": "chat.jsonl.publication-<uuid>.<12 hex>" },
+      { "api": "fsync", "file": "chat.jsonl.publication-<uuid>.<12 hex>" },
+      { "api": "fstat", "file": "chat.jsonl.publication-<uuid>.<12 hex>" },
+      { "api": "close", "file": "chat.jsonl.publication-<uuid>.<12 hex>" },
+      { "api": "chmod", "file": "chat.jsonl.publication-<uuid>.<12 hex>", "mode": "0o600" },
+      {
+        "api": "rename",
+        "file": "chat.jsonl.publication-<uuid>.<12 hex>",
+        "to": "chat.jsonl.publication-<uuid>"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "fsync", "file": "." },
+      { "api": "close", "file": "." },
+      { "api": "unlink", "file": "chat.jsonl.publication-<uuid>.<12 hex>" },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "renameSync", "file": "chat.jsonl.publication-<uuid>", "to": "chat.jsonl" },
+      { "api": "fsyncSync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      { "api": "rm", "file": "chat.jsonl.publication-<uuid>", "options": { "force": true } },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat.jsonl", "options": { "bigint": true } },
+      { "api": "stat", "file": "chat-archive.jsonl", "options": { "bigint": true } },
+      {
+        "api": "open",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "flags": "wx",
+        "mode": "0o600"
+      },
+      { "api": "handle.writeFile", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.sync", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "handle.close", "file": "history-append-provenance.json.<uuid>.tmp" },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      {
+        "api": "rename",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "to": "history-append-provenance.json"
+      },
+      { "api": "open", "file": ".", "flags": "r" },
+      { "api": "handle.sync", "file": "." },
+      { "api": "handle.close", "file": "." },
+      {
+        "api": "rm",
+        "file": "history-append-provenance.json.<uuid>.tmp",
+        "options": { "force": true }
+      },
+      { "api": "readFile", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" },
+      { "api": "unlink", "file": "<root>/locks/history-91a225936e660b7a8bc1ea7324939dc9.lock" }
+    ]
+  }
+]

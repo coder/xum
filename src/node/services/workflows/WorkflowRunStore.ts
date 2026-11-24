@@ -31,9 +31,12 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isErrnoException, isErrnoWithCode } from "@/node/utils/fs";
 import {
-  acquireCrossProcessLock,
-  CrossProcessLockTimeoutError,
-} from "@/node/utils/main/crossProcessLock";
+  parseProcessIdentity,
+  type ProcessIdentity,
+} from "@/node/utils/concurrency/processLiveness";
+import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
 import { KeyedFifoLock } from "@/node/services/workflows/keyedFifoLock";
 
@@ -110,6 +113,8 @@ export interface WorkflowRunStoreOptions {
   staleLeaseMs?: number;
   /** Test seam: how long a journal/lease mutation waits for its locks before timing out. */
   mutationLockWaitTimeoutMs?: number;
+  /** The session locks (phase 4); every caller today keeps the Node layer. */
+  locks?: SessionLocks;
 }
 
 export interface CreateWorkflowRunInput {
@@ -124,7 +129,19 @@ export interface CreateWorkflowRunInput {
   parentWorkflow?: WorkflowRunParent;
   /** Background runs persist "notify_on_terminal"; foreground/default omit (defaults to blocking). */
   attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /** Process creating a top-level run; written before run.json (see WorkflowRunStarterRecord). */
+  starter?: WorkflowRunStarterRecord;
   now: string;
+}
+
+/**
+ * The process that called createRun. A run stays `pending` until its starter writes the first
+ * `running` status; crash recovery adopts a pending run only once this process is provably gone
+ * (judgeHolder), so it never races a live starter into a second runner.
+ */
+export interface WorkflowRunStarterRecord {
+  pid: number;
+  identity: ProcessIdentity;
 }
 
 export interface AppendWorkflowRunEventOptions {
@@ -203,6 +220,7 @@ export class WorkflowRunStore {
   private readonly sessionDir: string;
   private readonly staleLeaseMs: number;
   private readonly mutationLockWaitTimeoutMs: number | undefined;
+  private readonly locks: SessionLocks;
   /** Live draining-owner capabilities by run id; see WorkflowCancellationSettlement. */
   private readonly cancellationSettlements = new Map<string, WorkflowCancellationSettlement>();
 
@@ -215,6 +233,8 @@ export class WorkflowRunStore {
       "WorkflowRunStore: mutationLockWaitTimeoutMs must be positive"
     );
     this.mutationLockWaitTimeoutMs = options.mutationLockWaitTimeoutMs;
+    // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+    this.locks = options.locks ?? nodeSessionLocks;
   }
 
   async createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunRecord> {
@@ -246,8 +266,47 @@ export class WorkflowRunStore {
       steps: [],
     });
 
+    if (input.starter != null) {
+      assert(
+        Number.isInteger(input.starter.pid) && input.starter.pid > 0,
+        "WorkflowRunStore.createRun: starter pid must be a positive integer"
+      );
+      // Before run.json: a listed pending run then always has its starter evidence.
+      await writeJsonAtomic(this.starterFile(input.id), input.starter);
+    }
     await this.writeRunFile(input.id, run);
     return run;
+  }
+
+  /**
+   * The run's starter evidence; null for legacy runs, nested runs, or a malformed record. Any
+   * other read error (EIO, EACCES) is thrown: the record may exist, so the caller retries
+   * instead of treating the run as one without starter evidence (#5385).
+   */
+  async readRunStarter(runId: string): Promise<WorkflowRunStarterRecord | null> {
+    assertValidWorkflowRunId(runId);
+    let text: string;
+    try {
+      text = await fs.readFile(this.starterFile(runId), "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      throw error;
+    }
+    try {
+      const raw = JSON.parse(text) as unknown;
+      if (
+        isRecord(raw) &&
+        typeof raw.pid === "number" &&
+        Number.isInteger(raw.pid) &&
+        raw.pid > 0 &&
+        isRecord(raw.identity)
+      ) {
+        return { pid: raw.pid, identity: parseProcessIdentity(raw.identity) };
+      }
+    } catch {
+      return null;
+    }
+    return null;
   }
 
   async createRunIfAbsent(input: CreateWorkflowRunInput): Promise<WorkflowRunRecord> {
@@ -531,6 +590,39 @@ export class WorkflowRunStore {
           runId,
           options.expectedLeaseOwnerId,
           async () => await this.appendNextEventUnlocked(runId, event, options)
+        )
+    );
+  }
+
+  /**
+   * Appends `interrupted` only while the run is still `pending` and nobody holds its lease, both
+   * checked under the lease lock that acquireLease takes. A runner that took the lease first (an
+   * explicit resume of the pending run) therefore keeps its run; returns null when declined.
+   */
+  async interruptUnleasedPendingRun(runId: string, at: string): Promise<WorkflowRunRecord | null> {
+    return await this.withWorkflowMutationLock(
+      runId,
+      async () =>
+        await withWorkflowFileLock(
+          this.leaseLockFile(runId),
+          this.workflowLockOptions(),
+          async () => {
+            if ((await readLease(this.leaseFile(runId))) != null) {
+              return null;
+            }
+            // The journal, not run.json: a status event lands in events.jsonl first.
+            const status =
+              getRunStatusFromEvents(await this.readEvents(runId)) ??
+              (await this.getRunFileSnapshot(runId)).status;
+            if (status !== "pending") {
+              return null;
+            }
+            return await this.appendNextEventUnlocked(runId, {
+              type: "status",
+              at,
+              status: "interrupted",
+            });
+          }
         )
     );
   }
@@ -1019,6 +1111,7 @@ export class WorkflowRunStore {
     const leaseFile = this.leaseFile(runId);
     // Single attempt, as before: a busy lease lock reads as "another runner is active".
     const attempt = await tryWithWorkflowFileLock(
+      this.locks,
       this.leaseLockFile(runId),
       this.leaseMutationLockStaleMs(),
       async () => {
@@ -1056,10 +1149,11 @@ export class WorkflowRunStore {
     return this.mutationLockWaitTimeoutMs ?? Math.max(30_000, this.leaseMutationLockStaleMs() * 4);
   }
 
-  private workflowLockOptions(): { staleMs: number; acquireTimeoutMs: number } {
+  private workflowLockOptions(): WorkflowLockOptions {
     return {
       staleMs: this.leaseMutationLockStaleMs(),
       acquireTimeoutMs: this.leaseMutationWaitTimeoutMs(),
+      locks: this.locks,
     };
   }
 
@@ -1411,6 +1505,10 @@ export class WorkflowRunStore {
     return path.join(this.runDir(runId), "lease.json");
   }
 
+  private starterFile(runId: string): string {
+    return path.join(this.runDir(runId), "starter.json");
+  }
+
   private eventsLockFile(runId: string): string {
     return `${this.eventsFile(runId)}${WORKFLOW_LOCK_FILE_SUFFIX}`;
   }
@@ -1632,18 +1730,25 @@ const workflowLockQueue = new KeyedFifoLock();
  * acquire itself fail leaves no window between an existence check and the publication.
  */
 async function acquireWorkflowCrossProcessLock(
+  locks: SessionLocks,
   lockPath: string,
   acquireTimeoutMs: number,
   staleMs: number,
   timeoutMessage: string
 ): Promise<() => Promise<void>> {
-  return await acquireCrossProcessLock({
+  return await locks.acquireCrossProcessLock({
     lockPath,
     acquireTimeoutMs,
     staleMs,
     timeoutMessage,
     createParentDirectory: false,
   });
+}
+
+interface WorkflowLockOptions {
+  staleMs: number;
+  acquireTimeoutMs: number;
+  locks: SessionLocks;
 }
 
 /**
@@ -1654,7 +1759,7 @@ async function acquireWorkflowCrossProcessLock(
  */
 async function withWorkflowFileLock<T>(
   lockPath: string,
-  options: { staleMs: number; acquireTimeoutMs: number },
+  options: WorkflowLockOptions,
   operation: () => Promise<T>
 ): Promise<T> {
   // One budget covers the in-process queue and the cross-process acquire. A waiter behind a hung
@@ -1668,6 +1773,7 @@ async function withWorkflowFileLock<T>(
   }
   try {
     const release = await acquireWorkflowCrossProcessLock(
+      options.locks,
       lockPath,
       Math.max(0, deadline - Date.now()),
       options.staleMs,
@@ -1685,6 +1791,7 @@ async function withWorkflowFileLock<T>(
 
 /** One attempt, in-process and cross-process; `{ acquired: false }` while anyone holds the lock. */
 async function tryWithWorkflowFileLock<T>(
+  locks: SessionLocks,
   lockPath: string,
   staleMs: number,
   operation: () => Promise<T>
@@ -1697,6 +1804,7 @@ async function tryWithWorkflowFileLock<T>(
     let release: () => Promise<void>;
     try {
       release = await acquireWorkflowCrossProcessLock(
+        locks,
         lockPath,
         0,
         staleMs,

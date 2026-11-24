@@ -1,13 +1,12 @@
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
-  TERMINAL_BADGE_CONFIG_KEY,
-  type TerminalBadgeConfig,
+  DEFAULT_TERMINAL_FONT_CONFIG,
 } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { within } from "@storybook/test";
+import { expect, within } from "storybook/test";
 import { GeneralSection } from "./GeneralSection.js";
+import { TerminalEditorSection } from "./TerminalEditorSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
 const meta: Meta = {
@@ -29,26 +28,54 @@ export const General: Story = {
     const canvas = within(canvasElement);
 
     await canvas.findByText(/^Theme$/i);
-    await canvas.findByText(/^Terminal Font$/i);
-    await canvas.findByText(/^Terminal Font Size$/i);
+    await canvas.findByText(/^Transcript density$/i);
+  },
+};
+
+// The terminal settings moved to Terminal & editor; their stories stay in this file so their
+// story ids (and Pixel baselines) carry over and the story-file budget does not grow.
+/**
+ * Phone-width contract for the Terminal Font row (#5814): the row wraps, so the fixed-width
+ * input moves below its label instead of running past the screen edge (#5813). A play only, no
+ * Pixel snapshot. The fixed 375px frame makes the check hold in the CI test-runner too, which
+ * ignores viewport globals (AGENTS.md).
+ */
+export const TerminalFontPhoneWidth: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <SettingsSectionStory setup={() => setupSettingsStory({})}>
+      <div data-testid="phone-frame" style={{ width: 375, maxWidth: "100%" }}>
+        <TerminalEditorSection />
+      </div>
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = canvas.getByTestId("phone-frame").getBoundingClientRect();
+    const input = await canvas.findByPlaceholderText(DEFAULT_TERMINAL_FONT_CONFIG.fontFamily);
+    await expect(input.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
   },
 };
 
 export const TerminalBadgeEnabledPhone: Story = {
   render: () => (
     <SettingsSectionStory
-      setup={() => {
-        const client = setupSettingsStory({});
-        // Seed after the story reset so the enabled-only badge rows render;
-        // the phone Pixel snapshot guards their narrow-width wrapping.
-        updatePersistedState<TerminalBadgeConfig>(TERMINAL_BADGE_CONFIG_KEY, {
-          ...DEFAULT_TERMINAL_BADGE_CONFIG,
-          enabled: true,
-        });
-        return client;
-      }}
+      // Enabled so the enabled-only badge rows render; the phone Pixel snapshot guards their
+      // narrow-width wrapping.
+      setup={() =>
+        setupSettingsStory({
+          userPreferences: {
+            appearance: {
+              terminalBadgeConfig: { ...DEFAULT_TERMINAL_BADGE_CONFIG, enabled: true },
+            },
+          },
+        })
+      }
     >
-      <GeneralSection />
+      <TerminalEditorSection />
     </SettingsSectionStory>
   ),
   globals: {

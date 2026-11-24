@@ -7,6 +7,11 @@
 
 import { z } from "zod";
 
+/** Match the versioned Wonder family without treating similarly named custom models as Wonder. */
+export function isMuseWonderModel(modelString: string): boolean {
+  return /^muse-wonder-\d+(?:\.\d+)*$/.test(stripModelProviderPrefixes(modelString));
+}
+
 export const THINKING_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export const ThinkingLevelSchema = z.enum(THINKING_LEVELS);
@@ -24,33 +29,44 @@ export const THINKING_DISPLAY_LABELS: Record<ThinkingLevel, string> = {
   max: "MAX",
 };
 
+/** OpenAI ids: `openai:` or a gateway's `openai/` model. */
+function isOpenAIModelString(modelString: string): boolean {
+  const normalized = modelString.trim().toLowerCase();
+  return (
+    normalized.startsWith("openai:") ||
+    normalized.replace(/^[a-z0-9_-]+:\s*/, "").startsWith("openai/")
+  );
+}
+
 /**
  * Display label for thinking levels, with provider-aware xhigh labeling.
  *
  * Models with a native "xhigh" effort level (OpenAI, Anthropic Opus 4.7+,
- * Anthropic Sonnet 5+) show "XHIGH" for the xhigh ThinkingLevel; on those
- * providers xhigh and max are distinct. On Opus/Sonnet 4.6 (where xhigh maps
- * to max effort), it shows "MAX".
+ * Anthropic Sonnet 5+) show "XHIGH" for the xhigh ThinkingLevel. OpenAI models
+ * without native max send max as xhigh too, so both read "XHIGH". On
+ * Opus/Sonnet 4.6 (where xhigh maps to max effort), it shows "MAX".
  * Medium always displays as "MED".
  */
 export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: string): string {
   if ((level === "xhigh" || level === "max") && modelString) {
-    const normalized = modelString.trim().toLowerCase();
-    const withoutPrefix = normalized.replace(/^[a-z0-9_-]+:\s*/, "");
+    // Native-max models (the GPT-6 tiers and the GPT-5.6 family) have "max" as a
+    // distinct effort above xhigh. Match them by name like the thinking policy does,
+    // whatever the prefix (bare mappedToModel targets, azure:, github-copilot:).
+    if (openaiSupportsNativeMaxEffort(modelString)) return level === "max" ? "MAX" : "XHIGH";
+    // Other OpenAI models send both xhigh and max as the "xhigh" effort.
+    if (isOpenAIModelString(modelString)) return "XHIGH";
 
-    // OpenAI: both xhigh and max resolve to "xhigh" reasoning effort — except
-    // native-max models (GPT-5.6 family, GPT-6 Astra), where "max" is a distinct
-    // native effort above xhigh.
-    if (normalized.startsWith("openai:") || withoutPrefix.startsWith("openai/")) {
-      if (level === "max" && openaiSupportsNativeMaxEffort(modelString)) return "MAX";
+    // These models expose native xhigh, distinct from max where max is supported.
+    if (
+      level === "xhigh" &&
+      [
+        anthropicSupportsNativeXhigh,
+        grokSupportsNativeXhigh,
+        isMuseWonderModel,
+        geminiSupportsXhigh,
+      ].some((supportsNativeXhigh) => supportsNativeXhigh(modelString))
+    )
       return "XHIGH";
-    }
-
-    // Anthropic Opus 4.7+: xhigh is a distinct effort level from max
-    if (level === "xhigh" && anthropicSupportsNativeXhigh(modelString)) return "XHIGH";
-
-    // Grok 4.6/4.7: xhigh is a distinct native reasoning effort (their policies have no max).
-    if (level === "xhigh" && grokSupportsNativeXhigh(modelString)) return "XHIGH";
   }
   return THINKING_DISPLAY_LABELS[level];
 }
@@ -115,7 +131,7 @@ export function parseThinkingInput(value: string): ParsedThinkingInput | undefin
   if (named) return named;
 
   // Numeric index — resolved later against the model's thinking policy
-  // (e.g., 0 = lowest allowed level, which is "medium" for gpt-5.5-pro)
+  // (e.g., 0 = lowest allowed level, which is "low" for gpt-6-astra)
   const num = parseInt(normalized, 10);
   if (!Number.isNaN(num) && String(num) === normalized && num >= 0 && num <= MAX_THINKING_INDEX) {
     return num;
@@ -181,7 +197,7 @@ export type AnthropicEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
  * The effort parameter controls how much computational work the model applies.
  * - Opus 4.5 supports: low, medium, high (policy clamps xhigh → high)
  * - Opus 4.6 supports: low, medium, high, max (xhigh maps to "max" effort)
- * - Opus 4.7+ and Sonnet 5+ support: low, medium, high, xhigh, max (native xhigh)
+ * - Opus 4.7+, Sonnet 5+ and Haiku 5+ support: low, medium, high, xhigh, max (native xhigh)
  *
  * The table keeps `xhigh: "max"` as the non-native fallback; `getAnthropicEffort`
  * upgrades it to the native "xhigh" wire value on models that support it.
@@ -242,6 +258,8 @@ export function stripModelProviderPrefixes(modelString: string): string {
  * - `claude-sonnet-5` and any future Sonnet 5+ (Sonnet 5 introduced native xhigh effort for
  *   the Sonnet tier; Sonnet 4.6 and earlier did not).
  * - Mythos-class models (`claude-fable-*`, `claude-mythos-*`), the tier above Opus.
+ * - `claude-haiku-5-5` and any future Haiku 5+ (Haiku 5.5 supports all five effort levels
+ *   with adaptive thinking only; Haiku 4.5 uses `budget_tokens` and has no effort).
  */
 export function anthropicSupportsNativeXhigh(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
@@ -250,79 +268,124 @@ export function anthropicSupportsNativeXhigh(modelString: string): boolean {
   return (
     /claude-opus-(?:4-(?:[7-9]|\d{2,})|[5-9]|\d{2,})/.test(withoutPrefix) ||
     /claude-sonnet-(?:[5-9]|\d{2,})/.test(withoutPrefix) ||
+    /claude-haiku-(?:[5-9]|\d{2,})/.test(withoutPrefix) ||
     /claude-(?:fable|mythos)-/.test(withoutPrefix)
   );
 }
 
+/** What OpenAI documents for one supported GPT model id. */
+interface OpenAIGptTier {
+  /**
+   * The API returns HTTP 400 for `reasoning.effort: "none"` and lists no
+   * `minimal`, so reasoning cannot be turned off (see openaiRejectsDisabledReasoning).
+   */
+  readonly rejectsNoneEffort: boolean;
+  /** OpenAI serves `service_tier: "ultrafast"` (https://developers.openai.com/api/docs/guides/ultrafast-mode). */
+  readonly ultrafast: boolean;
+  /** The Flex table of https://developers.openai.com/api/docs/pricing lists the model. */
+  readonly flex: boolean;
+}
+
 /**
- * GPT-5.6 family matcher: the bare `gpt-5.6` alias (OpenAI routes it to Sol)
- * plus the Sol/Terra/Luna tiers. The `\b` + lookaheads tolerate version-date
- * suffixes (e.g. gpt-5.6-sol-2026-07-09) while rejecting hypothetical named
- * variants (e.g. gpt-5.6-sol-mini) and other ids (e.g. gpt-5.61).
+ * The supported OpenAI GPT tiers, keyed by API id. Older GPT models are not built
+ * in. Every tier has the native "max" reasoning effort, Pro reasoning mode on the
+ * same model id, and explicit prompt-cache breakpoints (GPT-5.6 and later). GPT-6
+ * Astra and GPT-6.1 Sol keep their rows after the aliases moved to GPT-6.2: they
+ * stay usable as custom model strings.
  */
-export function isGpt56FamilyModel(modelString: string): boolean {
-  const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^gpt-5\.6(?:-(?:sol|terra|luna))?\b(?!\.)(?!-[a-z])/.test(withoutPrefix);
-}
+const OPENAI_GPT_TIERS: Readonly<Record<string, OpenAIGptTier>> = {
+  // GPT-6 Astra (September 3, 2026). https://developers.openai.com/api/docs/models/gpt-6-astra
+  "gpt-6-astra": { rejectsNoneEffort: true, ultrafast: true, flex: true },
+  // GPT-6 Luna (September 22, 2026) takes `none` through `max`; Chat Completions
+  // function calls require `none` (see isGpt6LunaModel).
+  "gpt-6-luna": { rejectsNoneEffort: false, ultrafast: false, flex: true },
+  // GPT-6.1 Sol (September 29, 2026; Ultrafast since 2026-10-08). Unlike GPT-6 Sol
+  // (no longer supported) it shares Astra's reasoning surface.
+  "gpt-6.1-sol": { rejectsNoneEffort: true, ultrafast: true, flex: true },
+  // GPT-6.2 Astra and Sol (November 17, 2026). Both reject `none`. Neither is in the
+  // pricing page's Flex table (the model pages list Standard, Batch, Fast and
+  // Ultrafast), so Xum drops a Flex tier for them instead of sending it.
+  // https://developers.openai.com/api/docs/models/gpt-6.2-astra
+  // https://developers.openai.com/api/docs/models/gpt-6.2-sol
+  "gpt-6.2-astra": { rejectsNoneEffort: true, ultrafast: true, flex: false },
+  "gpt-6.2-sol": { rejectsNoneEffort: true, ultrafast: true, flex: false },
+};
 
 /**
- * GPT-6 Astra matcher (released September 3, 2026 under the API id
- * `gpt-6-astra`; there is no bare `gpt-6` alias). Accepts only the bare id or a
- * dated snapshot (`-YYYY-MM-DD` / `-YYYYMMDD`, e.g. gpt-6-astra-2026-09-30) and
- * is anchored so any other qualifier, named (`gpt-6-astra-mini`) or numeric
- * (`gpt-6-astra-2-mini`, `gpt-6-astra-2026-preview`), stays outside it. A false
- * match would apply Astra's reasoning surface (native `max`, no `none`) to a
- * model that may reject it.
+ * The OpenAI GPT tier a model string names, or undefined. Accepts provider and
+ * gateway prefixes and a dated snapshot suffix (`-YYYY-MM-DD` / `-YYYYMMDD`,
+ * e.g. gpt-6-astra-2026-09-30). Any other qualifier, named (`gpt-6-astra-mini`)
+ * or numeric (`gpt-6-astra-2-mini`, `gpt-6-astra-2026-preview`), stays outside
+ * it: a false match would apply a reasoning surface (native `max`, no `none`)
+ * to a model that may reject it.
  */
-export function isGpt6AstraModel(modelString: string): boolean {
-  const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^gpt-6-astra(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
-}
-
-/** Released tiers with optional reasoning; do not match unannounced variants. */
-export function isGpt6SolOrLunaModel(modelString: string): boolean {
-  const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^gpt-6-(?:sol|luna)(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+export function openaiGptTier(modelString: string): OpenAIGptTier | undefined {
+  const modelId = stripModelProviderPrefixes(modelString).replace(
+    /-(?:\d{4}-\d{2}-\d{2}|\d{8})$/,
+    ""
+  );
+  return Object.hasOwn(OPENAI_GPT_TIERS, modelId) ? OPENAI_GPT_TIERS[modelId] : undefined;
 }
 
 /**
- * Whether the given OpenAI model supports the native "max" reasoning effort.
- *
- * The GPT-5.6 GA launch (July 9, 2026) added a top reasoning effort above
- * xhigh for the whole family — Sol, Terra, Luna, and the bare `gpt-5.6` alias
- * (see the OpenAI changelog: "GPT-5.6 adds ... max reasoning effort, and Pro
- * mode"). Earlier preview coverage described it as Sol-only, which is stale.
- *
- * GPT-6 Astra keeps the native max effort (its model page lists
- * low/medium/high/xhigh/max) but, unlike the GPT-5.6 family, rejects `none`; see
- * openaiRejectsDisabledReasoning. Sol/Luna support none through max.
- * Pro mode is independent of that effort ladder.
+ * GPT-6 Luna matcher (released September 22, 2026). Unlike the other GPT tiers it
+ * supports `none` through `max`; Chat Completions function calls require `none`.
+ */
+export function isGpt6LunaModel(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /^gpt-6-luna(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+}
+
+/** Whether the model is one of the supported OpenAI GPT tiers (see OPENAI_GPT_TIERS). */
+export function isGpt6FamilyModel(modelString: string): boolean {
+  return openaiGptTier(modelString) !== undefined;
+}
+
+/**
+ * GPT-5.6 family matcher (`gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+ * `gpt-5.6-luna`, plus dated snapshots). GPT-5.6 is no longer a built-in model
+ * (#5258), but the Settings → Models catalogue still offers it, and OpenAI serves
+ * `none` through native `max` and Pro mode on the whole family. Anchored like
+ * openaiGptTier so `gpt-5.6-cyber` (a separate Daybreak model with an unknown
+ * reasoning surface) and unannounced variants (`gpt-5.6-sol-mini`, `gpt-5.61`)
+ * stay outside it.
+ */
+function isGpt56FamilyModel(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /^gpt-5\.6(?:-(?:sol|terra|luna))?(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+}
+
+/**
+ * Whether the given OpenAI model supports the native "max" reasoning effort
+ * (every GPT-6 tier and the GPT-5.6 family). Every GPT-6 tier but Luna rejects
+ * `none` (see openaiRejectsDisabledReasoning); Luna and GPT-5.6 support none
+ * through max. Pro mode is independent of that effort ladder.
  */
 export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
-  return (
-    isGpt56FamilyModel(modelString) ||
-    isGpt6AstraModel(modelString) ||
-    isGpt6SolOrLunaModel(modelString)
-  );
+  return isGpt6FamilyModel(modelString) || isGpt56FamilyModel(modelString);
 }
 
 /**
  * Whether the given OpenAI model rejects `reasoning.effort: "none"`.
  *
  * GPT-6 Astra returns HTTP 400 for `none` and lists no `minimal`; reasoning
- * cannot be turned off. OpenAI's migration guidance for callers of either value
- * is to send `low`, so the thinking policy drops "off" and clamps it to "low".
+ * cannot be turned off. The GPT-6.1 Sol and GPT-6.2 model pages likewise reject
+ * `none` (see OPENAI_GPT_TIERS). OpenAI's migration guidance for callers of
+ * either value is to send `low`, so the thinking policy drops "off" and clamps
+ * it to "low".
  */
 export function openaiRejectsDisabledReasoning(modelString: string): boolean {
-  return isGpt6AstraModel(modelString);
+  return openaiGptTier(modelString)?.rejectsNoneEffort === true;
 }
 
 /**
  * OpenAI Responses API reasoning mode (orthogonal to reasoning effort).
  * Absent/"standard" is the API default; "pro" enables the slower, more
- * thorough pro-mode serving introduced with the GPT-5.6 family.
+ * thorough pro-mode serving (see openaiSupportsProMode). "cyber" instead sends
+ * the model's documented Daybreak access program (see openaiCyberAccessProgram);
+ * one mode value keeps Pro and Cyber mutually exclusive.
  */
-export const OPENAI_REASONING_MODES = ["standard", "pro"] as const;
+export const OPENAI_REASONING_MODES = ["standard", "pro", "cyber"] as const;
 export type OpenAIReasoningMode = (typeof OPENAI_REASONING_MODES)[number];
 export const OpenAIReasoningModeSchema = z.enum(OPENAI_REASONING_MODES);
 
@@ -335,23 +398,13 @@ export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode |
 
 /**
  * Whether the given OpenAI model supports `reasoning.mode: "pro"` on the
- * Responses API.
- *
- * "GPT-5.6 Sol Pro" is not a separate model id: the same GPT-5.6 ids are
- * served with `reasoning.mode: "pro"`. Per the Responses API reasoning guide,
- * pro mode is available on every GPT-5.6 model (Sol, Terra, Luna, and the bare
- * `gpt-5.6` alias) — the Sol/Terra-only restriction came from stale preview
- * coverage.
- *
- * GPT-6 Astra, Sol, and Luna also support Pro on the same model id; keep it independent of
- * effort so choosing native max does not silently opt users into Pro serving.
+ * Responses API. Pro is not a separate model id: every GPT-6 tier and the GPT-5.6
+ * family are served with `reasoning.mode: "pro"` (this superseded ids like
+ * gpt-5.5-pro). Keep it independent of effort so choosing native max does not
+ * silently opt users into Pro serving.
  */
 export function openaiSupportsProMode(modelString: string): boolean {
-  return (
-    isGpt56FamilyModel(modelString) ||
-    isGpt6AstraModel(modelString) ||
-    isGpt6SolOrLunaModel(modelString)
-  );
+  return isGpt6FamilyModel(modelString) || isGpt56FamilyModel(modelString);
 }
 
 /**
@@ -373,10 +426,28 @@ export function grokSupportsNativeXhigh(modelString: string): boolean {
   return /^grok-4\.[67](?:$|-)/.test(withoutPrefix);
 }
 
-/** GLM 5.3 and GLM 5.3 Flash always reason with low, high, or max effort. */
+/**
+ * Gemini models with a native XHIGH thinking level (Google's Gemini 4 Neon developer
+ * guide lists LOW/MEDIUM/HIGH/XHIGH). @ai-sdk/google's option schema accepts an explicit
+ * "xhigh" from 4.0.119; older versions reject it before the request is sent.
+ */
+export function geminiSupportsXhigh(modelString: string): boolean {
+  return /^gemini-4-neon(?:$|-)/.test(stripModelProviderPrefixes(modelString));
+}
+
+/**
+ * GLM 5.3 and GLM 5.3 Flash always reason with low, high, or max effort.
+ *
+ * Self-hosted deployments append quantization and format tags to the id
+ * (`GLM-5.3-Flash-oQ4e-mtp`, `glm-5.3-flash:q4_k_m`, `GLM-5.3-Flash-MLX-4bit`).
+ * Those tags carry a digit or name a packaging format, while Z.ai's named
+ * variants (FlashX, Air, Turbo) are plain words, so the variants stay unmatched.
+ */
 export function isGlm53Model(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^glm-5\.3(?:-flash)?(?:$|-(?:latest|\d))/.test(withoutPrefix);
+  return /^glm-5\.3(?:-flash)?(?:$|[-:](?:latest|gguf|mlx|awq|gptq|mtp|[a-z]*\d))/.test(
+    withoutPrefix
+  );
 }
 
 /**
@@ -406,11 +477,8 @@ export function isKimiK3Model(modelString: string): boolean {
  * `claude-opus-5` keeps its "off" level.
  *
  * Claude Sonnet 5.5 rejects `disabled` too (breaking change from Sonnet 5). Its
- * lowest setting is the new `thinking: { type: "between_tools" }`, but that
- * setting only accepts low..high effort, takes no `display`/`block_binding`, and
- * returns 400 when effort changes mid-conversation, which Xum allows per message.
- * So "off" clamps to "low" adaptive here, as for Opus 5.5, rather than mapping to
- * `between_tools`.
+ * lowest setting is `thinking: { type: "between_tools" }` instead, so it keeps
+ * its "off" level; see {@link anthropicSupportsBetweenToolsThinking}.
  * See https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5
  */
 export function anthropicRejectsDisabledThinking(modelString: string): boolean {
@@ -422,16 +490,55 @@ export function anthropicRejectsDisabledThinking(modelString: string): boolean {
 }
 
 /**
+ * Whether the given Anthropic model thinks (adaptively) when the request omits
+ * `thinking`, while still accepting `{ type: "disabled" }`. Callers that want a
+ * thinking-free request must send `disabled` explicitly for these models.
+ *
+ * Claude Haiku 5.5 (and any future Haiku 5+) does this; Haiku 4.5 does not think
+ * unless asked. See https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide
+ */
+export function anthropicThinksUnlessDisabled(modelString: string): boolean {
+  return /(?:^|\.)claude-haiku-(?:[5-9]|\d{2,})/.test(stripModelProviderPrefixes(modelString));
+}
+
+/**
+ * Whether the given Anthropic model accepts `thinking: { type: "between_tools" }`,
+ * which turns off up-front thinking; the model still writes short progress notes
+ * between tool calls. Xum maps the "off" level to it (#5086). Only Claude Sonnet
+ * 5.5 supports it so far, and it still rejects `disabled`.
+ *
+ * The API accepts it only at low..high effort, with no `display`,
+ * `budget_tokens` or `block_binding` field, and without a mid-conversation
+ * effort change. See `resolveBetweenToolsThinkingLevel` for how Xum keeps to that.
+ * https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5#turn-off-up-front-thinking
+ */
+export function anthropicSupportsBetweenToolsThinking(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /claude-sonnet-5-5(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(withoutPrefix);
+}
+
+/**
  * Whether the given Anthropic model binds each replayed thinking block to the
  * conversation prefix (system prompt, tools, and earlier messages) that produced it.
  *
- * On enforced accounts, Claude Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1
- * (Mythos 5.1 is the same model) reject a request that replays a block whose prefix
- * has since changed.
+ * On enforced accounts, Claude Opus 5.5, Claude Sonnet 5.5, Claude Haiku 5.5, and
+ * Claude Fable 5.1 reject a request that replays a block whose prefix has since changed.
+ * On the Claude API, Claude Fable 5.2, Claude Mythos 5.2 and Claude Mythos 5.1 reject such
+ * a request on every account, whatever its age. The preserved-thinking docs (fetched
+ * 2026-11-10) list a 400 for Mythos 5.1 on accounts created both before and after August 31,
+ * 2026, replacing the older "Mythos 5.1 ... don't run the prefix check" line that #5957
+ * relied on. The Fable 5.2 migration guide says Mythos 5.1 on Bedrock still accepts such a
+ * request. `block_binding` goes out only on the direct Claude API and anthropic-typed Coder
+ * instances, and a model that skips the check accepts it. The "off" history strip keys on the
+ * anthropic wire instead, which Bedrock routes use too (direct or through a Bedrock-typed Coder
+ * instance). The thinking policy raises Mythos 5.1's "off" to "low", so that strip only runs
+ * for a caller that skips the policy, and it then costs reasoning context Bedrock would have
+ * accepted, never a failed request.
+ * See https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */
 export function anthropicBindsThinkingToPrefix(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /claude-(?:opus-5-5|sonnet-5-5|fable-5-1|mythos-5-1)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
+  return /claude-(?:opus-5-5|sonnet-5-5|haiku-5-5|fable-5-1|fable-5-2|mythos-5-1|mythos-5-2)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
     withoutPrefix
   );
 }
@@ -468,17 +575,19 @@ export const OPENAI_REASONING_EFFORT: Record<ThinkingLevel, string | undefined> 
  * Model-aware OpenAI reasoning effort resolution.
  *
  * Most OpenAI models top out at "xhigh", so the ThinkingLevel "max" downgrades to
- * "xhigh" (see OPENAI_REASONING_EFFORT). The GPT-5.6 family ships a distinct native
- * effort above xhigh with the wire value "max" on the Responses API (live-verified:
- * the response echoes `effort: max`; not yet in the SDK's typed union).
+ * "xhigh" (see OPENAI_REASONING_EFFORT). The GPT-6 tiers and the GPT-5.6 family
+ * ship a distinct native effort above xhigh with the wire value "max" on the
+ * Responses API (live-verified on GPT-5.6: the response echoes `effort: max`;
+ * not yet in the SDK's typed union).
  *
- * GPT-5.6 "off" maps to the explicit "none" effort: omitting the field defaults
- * the request to medium (live-verified 2026-07-10 — an effort-less request echoed
- * `effort: medium`), which would silently ignore the user's off selection.
+ * GPT-6 Luna and GPT-5.6 "off" map to the explicit "none" effort: omitting the
+ * field defaults the request to medium (live-verified 2026-07-10 — an
+ * effort-less request echoed `effort: medium`), which would silently ignore the
+ * user's off selection.
  *
- * GPT-6 Astra shares the native "max" but rejects "none" with a 400 (see
+ * Every GPT-6 tier but Luna rejects "none" with a 400 (see
  * openaiRejectsDisabledReasoning). The thinking policy already excludes "off" for
- * it; a stray "off" clamps to "low" here so a caller bypassing policy cannot
+ * them; a stray "off" clamps to "low" here so a caller bypassing policy cannot
  * trigger the error.
  */
 export function getOpenAIReasoningEffort(
@@ -510,6 +619,21 @@ export const GEMINI_THINKING_BUDGETS: Record<ThinkingLevel, number> = {
   xhigh: 16384, // Same as high - Gemini doesn't support xhigh
   max: 16384,
 } as const;
+
+/**
+ * Gemini 3+ thinkingLevel per Xum level. xhigh/max map to high; models with native XHIGH
+ * (geminiSupportsXhigh) get "xhigh" in the provider-options adapter instead.
+ */
+export const GEMINI_THINKING_LEVELS: Record<
+  Exclude<ThinkingLevel, "off">,
+  "low" | "medium" | "high"
+> = {
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "high",
+  max: "high",
+};
 export const OPENROUTER_REASONING_EFFORT: Record<
   ThinkingLevel,
   "low" | "medium" | "high" | undefined

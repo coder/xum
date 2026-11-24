@@ -17,7 +17,7 @@ interface SectionConfig {
 }
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipIfPresent } from "../Tooltip/Tooltip";
 import { resolveSectionColor, SECTION_COLOR_PALETTE } from "@/common/constants/ui";
-import { HexColorPicker } from "react-colorful";
+import { LazyHexColorPicker } from "@/browser/components/LazyHexColorPicker/LazyHexColorPicker";
 import { useContextMenuPosition } from "../../hooks/useContextMenuPosition";
 import { PositionedMenu, PositionedMenuItem } from "../PositionedMenu/PositionedMenu";
 
@@ -280,7 +280,7 @@ export const SectionHeader: React.FC<SectionHeaderProps> = ({
                 ))}
               </div>
               <div className="section-color-picker">
-                <HexColorPicker
+                <LazyHexColorPicker
                   color={sectionColor}
                   onChange={(newColor) => {
                     setHexInputValue(newColor);

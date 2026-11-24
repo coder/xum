@@ -1,0 +1,35 @@
+# Weekly canary for flake consumers who make nixpkgs follow their own: build
+# xum against the latest nixos-unstable (newer bun, glibc and Electron) instead
+# of the version pinned in flake.lock.
+
+name: Nix Unstable
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Weekly, Mondays 7 AM UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-unstable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix-build:
+    name: Nix Build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - run: nix build .#xum --no-link -L --override-input nixpkgs github:NixOS/nixpkgs/nixos-unstable

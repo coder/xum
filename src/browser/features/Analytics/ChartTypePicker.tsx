@@ -29,7 +29,8 @@ interface ChartTypePickerProps {
 
 export function ChartTypePicker(props: ChartTypePickerProps) {
   return (
-    <div className="flex items-center gap-1">
+    // Wraps: six buttons are wider than a phone screen, and a fixed row scrolled the whole page.
+    <div className="flex flex-wrap items-center gap-1">
       {CHART_TYPE_OPTIONS.map((option) => (
         <button
           key={option.value}

@@ -26,6 +26,11 @@ interface OrchestrateForkParams {
   projectPath: string;
   sourceWorkspaceName: string;
   newWorkspaceName: string;
+  /**
+   * Id of the workspace being created. Target runtimes need it: a devcontainer only gets the
+   * workspace's scratch dir mount when its id is known at `devcontainer up`.
+   */
+  newWorkspaceId: string;
   initLogger: InitLogger;
 
   /** For applying runtime config updates */
@@ -218,6 +223,7 @@ export async function orchestrateFork(
     projectPath,
     sourceWorkspaceName,
     newWorkspaceName,
+    newWorkspaceId,
     initLogger,
     config,
     sourceWorkspaceId,
@@ -488,6 +494,7 @@ export async function orchestrateFork(
       runtime: createRuntime(normalizedForkedRuntimeConfig, {
         projectPath: project.projectPath,
         workspaceName: newWorkspaceName,
+        workspaceId: newWorkspaceId,
       }),
       createdBranch: branchCreators.has(project.projectPath),
     }));
@@ -590,6 +597,7 @@ export async function orchestrateFork(
     projectPath,
     workspaceName: newWorkspaceName,
     workspacePath,
+    workspaceId: newWorkspaceId,
   });
 
   return Ok({

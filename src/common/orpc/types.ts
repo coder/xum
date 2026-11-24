@@ -15,10 +15,8 @@ import type {
   ToolCallExecutionStartEvent,
   ToolCallDeltaEvent,
   ToolCallEndEvent,
-  AdvisorOutputEvent,
-  AdvisorReasoningOutputEvent,
-  AdvisorPhaseEvent,
   BashOutputEvent,
+  BashSandboxApprovalEvent,
   TaskCreatedEvent,
   WorkflowRunAttachedEvent,
   ReasoningDeltaEvent,
@@ -33,22 +31,27 @@ export type SendMessageOptions = z.infer<typeof schemas.SendMessageOptionsSchema
 export type HistoryEditPrecondition = z.infer<typeof schemas.HistoryEditPreconditionSchema>;
 
 // Provider types (single source of truth - derived from schemas)
-export type AWSCredentialStatus = z.infer<typeof schemas.AWSCredentialStatusSchema>;
 export type ProviderModelEntry = z.infer<typeof schemas.ProviderModelEntrySchema>;
 export type ProviderModelDiscoveryResult = z.infer<
   typeof schemas.ProviderModelDiscoveryResultSchema
 >;
+export type ModelCatalogEntry = z.infer<typeof schemas.ModelCatalogEntrySchema>;
+export type ModelCatalogSearchInput = z.infer<typeof schemas.ModelCatalogSearchInputSchema>;
+export type ModelCatalogSearchResult = z.infer<typeof schemas.ModelCatalogSearchResultSchema>;
 export type ProviderConfigInfo = z.infer<typeof schemas.ProviderConfigInfoSchema>;
 export type ProvidersConfigMap = z.infer<typeof schemas.ProvidersConfigMapSchema>;
 export type CustomProviderMutationError = z.infer<typeof schemas.CustomProviderMutationErrorSchema>;
 export type AddCustomProviderInput = z.infer<typeof schemas.providers.addCustomProvider.input>;
 export type FilePart = z.infer<typeof schemas.FilePartSchema>;
 export type WorkspaceChatMessage = z.infer<typeof schemas.WorkspaceChatMessageSchema>;
+/** An onChat event: a WorkspaceChatMessage or an onChat-only `message-batch` (#5102). */
+export type OnChatEvent = z.infer<typeof schemas.OnChatEventSchema>;
 /** One held input's display data (see HeldInputsChangedEventSchema). */
 export type HeldInput = Extract<
   WorkspaceChatMessage,
   { type: "held-inputs-changed" }
 >["heldInputs"][number];
+export type AcpPromptCorrelation = z.infer<typeof schemas.AcpPromptCorrelationSchema>;
 export type CaughtUpMessage = z.infer<typeof schemas.CaughtUpMessageSchema>;
 export type OnChatCursor = z.infer<typeof OnChatCursorSchema>;
 export type OnChatHistoryCursor = z.infer<typeof OnChatHistoryCursorSchema>;
@@ -57,6 +60,7 @@ export type OnChatDowngradeReason = z.infer<typeof schemas.OnChatDowngradeReason
 export type StreamErrorMessage = z.infer<typeof schemas.StreamErrorMessageSchema>;
 export type DeleteMessage = z.infer<typeof schemas.DeleteMessageSchema>;
 export type GoalBudgetLimitedEvent = z.infer<typeof schemas.GoalBudgetLimitedEventSchema>;
+export type PluginHookNoticeEvent = z.infer<typeof schemas.PluginHookNoticeEventSchema>;
 export type WorkspaceInitEvent = z.infer<typeof schemas.WorkspaceInitEventSchema>;
 export type UpdateStatus = z.infer<typeof schemas.UpdateStatusSchema>;
 export type RestartBlocker = z.infer<typeof schemas.RestartBlockerSchema>;
@@ -72,13 +76,6 @@ export type FrontendWorkspaceMetadataSchemaType = z.infer<
 export type ApiServerStatus = z.infer<typeof schemas.ApiServerStatusSchema>;
 export type ServerAuthSession = z.infer<typeof schemas.ServerAuthSessionSchema>;
 // Experiment types (single source of truth - derived from schemas)
-
-// Policy types (single source of truth - derived from schemas)
-export type PolicyGetResponse = z.infer<typeof schemas.PolicyGetResponseSchema>;
-export type PolicyStatus = z.infer<typeof schemas.PolicyStatusSchema>;
-export type PolicySource = z.infer<typeof schemas.PolicySourceSchema>;
-export type EffectivePolicy = z.infer<typeof schemas.EffectivePolicySchema>;
-export type PolicyRuntimeId = z.infer<typeof schemas.PolicyRuntimeIdSchema>;
 // Type guards for common chat message variants
 export function isCaughtUpMessage(msg: WorkspaceChatMessage): msg is CaughtUpMessage {
   return (msg as { type?: string }).type === "caught-up";
@@ -126,14 +123,11 @@ export function isBashOutputEvent(msg: WorkspaceChatMessage): msg is BashOutputE
   return (msg as { type?: string }).type === "bash-output";
 }
 
-export function isAdvisorOutputEvent(msg: WorkspaceChatMessage): msg is AdvisorOutputEvent {
-  return (msg as { type?: string }).type === "advisor-output";
-}
-
-export function isAdvisorReasoningOutputEvent(
+// dry-duplicate-ok: one type guard per chat event type, the pattern of this file
+export function isBashSandboxApprovalEvent(
   msg: WorkspaceChatMessage
-): msg is AdvisorReasoningOutputEvent {
-  return (msg as { type?: string }).type === "advisor-reasoning-output";
+): msg is BashSandboxApprovalEvent {
+  return (msg as { type?: string }).type === "bash-sandbox-approval";
 }
 
 export function isTaskCreatedEvent(msg: WorkspaceChatMessage): msg is TaskCreatedEvent {
@@ -146,9 +140,6 @@ export function isWorkflowRunAttachedEvent(
   return (msg as { type?: string }).type === "workflow-run-attached";
 }
 
-export function isAdvisorPhaseEvent(msg: WorkspaceChatMessage): msg is AdvisorPhaseEvent {
-  return (msg as { type?: string }).type === "advisor-phase";
-}
 export function isToolCallEnd(msg: WorkspaceChatMessage): msg is ToolCallEndEvent {
   return (msg as { type?: string }).type === "tool-call-end";
 }
@@ -195,6 +186,10 @@ export function isInitEnd(
 
 export function isGoalBudgetLimitedEvent(msg: WorkspaceChatMessage): msg is GoalBudgetLimitedEvent {
   return (msg as { type?: string }).type === "goal-budget-limited";
+}
+
+export function isPluginHookNoticeEvent(msg: WorkspaceChatMessage): msg is PluginHookNoticeEvent {
+  return (msg as { type?: string }).type === "plugin-hook-notice";
 }
 
 export function isQueuedMessageChanged(

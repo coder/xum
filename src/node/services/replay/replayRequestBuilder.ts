@@ -20,7 +20,7 @@
  * a divergence — surfacing them is the point of the auditor.
  */
 
-import { streamText, type ModelMessage, type SystemModelMessage, type Tool } from "ai";
+import { streamText, type Instructions, type ModelMessage, type Tool } from "ai";
 import type {
   LanguageModelV4,
   LanguageModelV4CallOptions,
@@ -28,11 +28,16 @@ import type {
 } from "@ai-sdk/provider";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
-import { filterOrphanedMcpPromptSnapshots, type MuxMessage } from "@/common/types/message";
+import {
+  filterOrphanedMcpPromptSnapshots,
+  type MuxMessage,
+  type VolatileSystemTailRecord,
+} from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
+import { dedupeNativeToolReferences } from "@/common/utils/tools/toolCatalog";
 import { replaceOrAppendMessageById } from "@/node/services/aiService";
 import { assemblePromptPayload } from "@/node/services/turnContextAssembler";
 import { parseModelString } from "@/node/services/providerModelFactory";
@@ -61,6 +66,17 @@ export interface ReplayRequestInputs {
   routeProvider?: string;
   providersConfig?: ProvidersConfigMap | null;
   anthropicCacheTtl?: AnthropicCacheTtl | null;
+  /** Volatile system tail length from the turn-envelope row (absent = one block). */
+  systemPromptVolatileSuffixLength?: number;
+  /**
+   * The turn's MuxMetadata.volatileSystemTail. The envelope records the system tail the
+   * request sent (frozen inside a segment), so the rebuild derives the live tail from this.
+   */
+  volatileSystemTail?: VolatileSystemTailRecord;
+  /** The turn's MuxMetadata.customInstructions, skillIndex and toolInstructions, likewise. */
+  customInstructions?: VolatileSystemTailRecord;
+  skillIndex?: VolatileSystemTailRecord;
+  toolInstructions?: VolatileSystemTailRecord;
   /**
    * Resolved wire provider name from the turn-envelope row. Falls back to
    * name-canonicalization of the model string when absent (legacy envelopes) —
@@ -79,13 +95,29 @@ export interface ReplayRequestInputs {
    * fallback request via replaceOrAppendMessageById.
    */
   partialContinuation?: MuxMessage | null;
+  /**
+   * MCP Apps model context message from the turn-envelope blob. Request-only
+   * (never in chat.jsonl); assemblePromptPayload inserts it where production does.
+   */
+  mcpAppModelContext?: MuxMessage | null;
+  /**
+   * Native tool search: deferred tool names, whose replayed tool_catalog_search results
+   * production rewrites into tool_reference blocks. Derived from the recorded wire tools.
+   */
+  deferLoadingToolNames?: ReadonlySet<string>;
+  /**
+   * The budget production trimmed a compaction request's history to, from the recorded
+   * DevTools run (DevToolsRun.compactionInputBudgetTokens). It depends on the 1M setting and
+   * the retry scale, which no durable log row carries.
+   */
+  compactionInputBudgetTokens?: number;
   workspaceId: string;
 }
 
 /** The rebuilt request at both comparison levels. */
 export interface ReplayBuiltRequest {
   /** streamText `system` argument after production cache wrapping. */
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   /** Provider-ready ModelMessages (post prepareMessagesForProvider + cache system prepend). */
   messages: ModelMessage[];
   /**
@@ -115,7 +147,7 @@ export function deriveWireProviderName(modelString: string): string {
  * whose bytes depended on a live download is not log-reconstructible anyway).
  */
 export async function captureLanguageModelPrompt(params: {
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   messages: ModelMessage[];
   modelId: string;
   /** Optional: capture the wire tool definitions too (fixture generation). */
@@ -174,8 +206,9 @@ export async function captureLanguageModelPrompt(params: {
       // prepareStep — they run on step 0 too, so the recorded prompt
       // includes them.
       const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
-      const rewritten =
-        await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
+      const rewritten = dedupeNativeToolReferences(
+        await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords)
+      );
       return rewritten === stepMessages ? undefined : { messages: rewritten };
     },
   });
@@ -204,6 +237,13 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
   const payload = await assemblePromptPayload({
     history: requestMessages,
     systemMessage: inputs.systemPrompt,
+    volatileSystemSuffixLength: inputs.systemPromptVolatileSuffixLength,
+    replayedTurn: {
+      record: inputs.volatileSystemTail,
+      customInstructions: inputs.customInstructions,
+      skillIndex: inputs.skillIndex,
+      toolInstructions: inputs.toolInstructions,
+    },
     modelString: inputs.modelString,
     routeProvider: inputs.routeProvider,
     providerForMessages: wireProviderName,
@@ -216,6 +256,9 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     providersConfig: inputs.providersConfig,
     anthropicCacheTtl: inputs.anthropicCacheTtl,
     workspaceId: inputs.workspaceId,
+    deferLoadingToolNames: inputs.deferLoadingToolNames,
+    compactionInputBudgetTokens: inputs.compactionInputBudgetTokens,
+    requestContextMessage: inputs.mcpAppModelContext ?? undefined,
   });
 
   const { prompt } = await captureLanguageModelPrompt({

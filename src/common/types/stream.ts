@@ -6,9 +6,6 @@ import type { PrefixSwapInvalidatedEventSchema } from "@/common/orpc/schemas/str
 import type { z } from "zod";
 import type { MuxReasoningPart, MuxTextPart, MuxToolPart } from "./message";
 import type {
-  AutoRetryAbandonedEventSchema,
-  AutoRetryScheduledEventSchema,
-  AutoRetryStartingEventSchema,
   ErrorEventSchema,
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
@@ -24,11 +21,9 @@ import type {
   ToolCallExecutionStartEventSchema,
   ToolCallStartEventSchema,
   BashOutputEventSchema,
-  AdvisorOutputEventSchema,
-  AdvisorReasoningOutputEventSchema,
+  BashSandboxApprovalEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
-  AdvisorPhaseEventSchema,
   UsageDeltaEventSchema,
   RuntimeStatusEventSchema,
 } from "../orpc/schemas";
@@ -65,11 +60,9 @@ export type StreamAbortEvent = z.infer<typeof StreamAbortEventSchema>;
 export type ErrorEvent = z.infer<typeof ErrorEventSchema>;
 
 export type BashOutputEvent = z.infer<typeof BashOutputEventSchema>;
-export type AdvisorOutputEvent = z.infer<typeof AdvisorOutputEventSchema>;
-export type AdvisorReasoningOutputEvent = z.infer<typeof AdvisorReasoningOutputEventSchema>;
+export type BashSandboxApprovalEvent = z.infer<typeof BashSandboxApprovalEventSchema>;
 export type TaskCreatedEvent = z.infer<typeof TaskCreatedEventSchema>;
 export type WorkflowRunAttachedEvent = z.infer<typeof WorkflowRunAttachedEventSchema>;
-export type AdvisorPhaseEvent = z.infer<typeof AdvisorPhaseEventSchema>;
 export type ToolCallStartEvent = z.infer<typeof ToolCallStartEventSchema>;
 export type ToolCallExecutionStartEvent = z.infer<typeof ToolCallExecutionStartEventSchema>;
 export type ToolCallDeltaEvent = z.infer<typeof ToolCallDeltaEventSchema>;
@@ -83,10 +76,6 @@ export type ReasoningEndEvent = z.infer<typeof ReasoningEndEventSchema>;
  * Allows UI to update token display as steps complete (after each tool call or at stream end).
  */
 export type UsageDeltaEvent = z.infer<typeof UsageDeltaEventSchema>;
-
-export type AutoRetryScheduledEvent = z.infer<typeof AutoRetryScheduledEventSchema>;
-export type AutoRetryStartingEvent = z.infer<typeof AutoRetryStartingEventSchema>;
-export type AutoRetryAbandonedEvent = z.infer<typeof AutoRetryAbandonedEventSchema>;
 
 /**
  * Progress event for pre-stream startup work.

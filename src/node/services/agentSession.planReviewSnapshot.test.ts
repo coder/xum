@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { createTestPlanStorage } from "@/node/utils/runtime/planLocation.testHarness";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -18,6 +19,7 @@ import type { StreamMessageOptions } from "./turnRequestBuilder";
 import { createProposePlanTool } from "./tools/propose_plan";
 import { TestTempDir, createTestToolConfig } from "./tools/testHelpers";
 import { createTestHistoryService } from "./testHistoryService";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 const model = "openai:gpt-4o";
 const sendOptions = { model, agentId: "exec" };
@@ -474,8 +476,10 @@ describe("AgentSession plan-review snapshot capture", () => {
           emitChatEvent: (_workspaceId, message) => emitted.push(message.id),
         },
         {
+          runtimeFactory: nodeRuntimeFactory,
           workspaceId,
           metadata: metadataFor(workspaceId),
+          planStorage: createTestPlanStorage(),
           proposalToolCallId: "call-plan",
           signal: controller.signal,
         }
@@ -667,7 +671,12 @@ describe("AgentSession plan-review snapshot: an admitted append outlives Stop/fa
               emitChatEvent: (_id, message) =>
                 h.session.emitChatEvent({ ...message, type: "message" }),
             },
-            { workspaceId, metadata: metadataFor(workspaceId) }
+            {
+              runtimeFactory: nodeRuntimeFactory,
+              workspaceId,
+              metadata: metadataFor(workspaceId),
+              planStorage: createTestPlanStorage(),
+            }
           );
           successorProgress = successorCall;
         } else {

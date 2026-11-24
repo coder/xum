@@ -60,7 +60,10 @@ interface Entry {
   pending: ReviewStateDelta[];
   /** Updaters issued before hydration; replayed onto the hydrated view. */
   queued: QueuedUpdater[];
-  /** UI unblocked (see ReviewStateView.isReady); `ready` resolves at the same moment. */
+  /**
+   * UI unblocked (see ReviewStateView.isReady). Stays true after the last subscriber leaves so
+   * switching back does not flash a loading state.
+   */
   isReady: boolean;
   /**
    * A real server snapshot was applied. Distinct from isReady: a failed first subscription
@@ -69,10 +72,20 @@ interface Entry {
    */
   hydrated: boolean;
   /**
+   * Resolved with true when a snapshot hydrates the entry, false when a subscription attempt
+   * fails or the workspace is removed (see waitForHydration).
+   */
+  hydrationWaiters: Set<(hydrated: boolean) => void>;
+  /**
    * Backend revision of `base` (see ReviewStateRevisionSchema). Reset by each subscription's
    * first snapshot, so a restarted backend is never ignored.
    */
   baseRevision: number;
+  /**
+   * Resolves at the first result of the current retention period: a snapshot or a failed
+   * subscription. Replaced when the last subscriber leaves, so a later whenReady/flush waits
+   * for the next subscription instead of trusting an old snapshot.
+   */
   ready: Promise<void>;
   resolveReady: () => void;
   refCount: number;
@@ -89,6 +102,8 @@ interface Entry {
 const FLUSH_DEBOUNCE_MS = 300;
 const RETRY_BASE_MS = 250;
 const RETRY_MAX_MS = 5_000;
+/** How long a send waits for a retried subscription before it goes out without notes. */
+const SEND_HYDRATION_TIMEOUT_MS = 3_000;
 const EMPTY_SECTIONS: ReviewStateSections = {};
 const LOADING_VIEW: ReviewStateView = { sections: EMPTY_SECTIONS, isReady: false };
 /** Workspace-less callers (e.g. a plan tool call without a workspace) are ready and empty. */
@@ -177,7 +192,7 @@ export class ReviewStateStore {
       this.stopSubscription(entry);
       if (!client) continue;
       if (entry.refCount > 0) this.ensureSubscribed(workspaceId);
-      if (entry.pending.length > 0) this.flushInBackground(workspaceId);
+      if (entry.pending.length > 0 || entry.queued.length > 0) this.flushInBackground(workspaceId);
     }
   }
 
@@ -199,7 +214,14 @@ export class ReviewStateStore {
     // Keep base/view in memory so switching back does not flash empty; the next
     // subscription refreshes it.
     this.stopSubscription(entry);
-    this.flushInBackground(workspaceId);
+    if (entry.hydrated && entry.pending.length > 0) {
+      // Failures schedule a retry inside drain(); flushInBackground rehydrates first.
+      this.drain(workspaceId, entry).catch(() => undefined);
+    }
+    // #5011: without a subscription, base can go stale (another renderer may change it), so a
+    // later mutate must queue and replay onto a fresh snapshot, not run against this cache.
+    entry.hydrated = false;
+    this.resetReady(entry);
   }
 
   /** Hold the workspace subscription open (hydrating it if needed) while `run` settles. */
@@ -235,6 +257,27 @@ export class ReviewStateStore {
     return this.withRetained(workspaceId, (entry) => entry.ready);
   }
 
+  isHydrated(workspaceId: string): boolean {
+    return this.entries.get(workspaceId)?.hydrated === true;
+  }
+
+  /**
+   * The attached notes for a send (#5011). Waits up to `timeoutMs` in total for real data,
+   * retrying a failed subscription at once instead of after the backoff. Returns null when
+   * there is still none, so the caller can tell the user the notes were not attached (they
+   * stay attached on the backend).
+   */
+  async readAttachedReviewsForSend(
+    workspaceId: string,
+    timeoutMs = SEND_HYDRATION_TIMEOUT_MS
+  ): Promise<Review[] | null> {
+    if (workspaceId.length === 0) return [];
+    const hydrated = await this.withRetained(workspaceId, (entry) =>
+      this.waitForHydration(workspaceId, entry, timeoutMs)
+    );
+    return hydrated ? this.getAttachedReviews(workspaceId) : null;
+  }
+
   getAttachedReviews(workspaceId: string): Review[] {
     return Object.values(this.getView(workspaceId).sections.reviews ?? {})
       .filter((review) => review.status === "attached")
@@ -259,12 +302,8 @@ export class ReviewStateStore {
     if (!entry.hydrated) {
       entry.queued.push(queued);
       // A mutate-only caller (no mounted selector) would otherwise never hydrate, so the
-      // change would never be sent. flush retains the workspace, hydrates, then drains.
-      if (entry.refCount === 0) {
-        this.flush(workspaceId).catch((error: unknown) => {
-          console.warn("Failed to persist review state; it stays queued:", error);
-        });
-      }
+      // change would never be sent. flushInBackground retains, hydrates, then drains.
+      this.flushInBackground(workspaceId);
       return;
     }
     const delta = queued(entry.view.sections);
@@ -310,24 +349,24 @@ export class ReviewStateStore {
     entry.pending = [];
     entry.queued = [];
     this.entries.delete(workspaceId);
+    // #5011: settle waiters so none hangs; flush then rejects as not hydrated.
+    entry.resolveReady();
+    this.settleHydrationWaiters(entry, false);
   }
 
   private getOrCreateEntry(workspaceId: string): Entry {
     const existing = this.entries.get(workspaceId);
     if (existing) return existing;
-    let resolveReady: () => void = () => undefined;
-    const ready = new Promise<void>((resolve) => {
-      resolveReady = resolve;
-    });
     const entry: Entry = {
       base: EMPTY_SECTIONS,
       pending: [],
       queued: [],
       isReady: false,
       hydrated: false,
+      hydrationWaiters: new Set(),
       baseRevision: Number.NEGATIVE_INFINITY,
-      ready,
-      resolveReady,
+      ready: Promise.resolve(),
+      resolveReady: () => undefined,
       refCount: 0,
       view: LOADING_VIEW,
       listeners: new Set(),
@@ -338,8 +377,51 @@ export class ReviewStateStore {
       flushAttempt: 0,
       inFlight: null,
     };
+    this.resetReady(entry);
     this.entries.set(workspaceId, entry);
     return entry;
+  }
+
+  private resetReady(entry: Entry): void {
+    entry.ready = new Promise<void>((resolve) => {
+      entry.resolveReady = resolve;
+    });
+  }
+
+  private settleHydrationWaiters(entry: Entry, hydrated: boolean): void {
+    for (const settle of [...entry.hydrationWaiters]) settle(hydrated);
+  }
+
+  /**
+   * Wait up to timeoutMs (the whole wait, including a stalled first snapshot) for data. A
+   * failed attempt is retried once right away instead of after the backoff: the attempt this
+   * call starts, or else the retry after the attempt already in flight.
+   */
+  private waitForHydration(workspaceId: string, entry: Entry, timeoutMs: number): Promise<boolean> {
+    if (entry.hydrated) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      let retried = false;
+      const finish = (hydrated: boolean) => {
+        clearTimeout(timer);
+        entry.hydrationWaiters.delete(settle);
+        resolve(hydrated);
+      };
+      const settle = (hydrated: boolean) => {
+        if (!hydrated && !retried && this.entries.get(workspaceId) === entry) {
+          retried = true;
+          // The failed attempt already cleared its subscription (see ensureSubscribed).
+          this.ensureSubscribed(workspaceId);
+          return;
+        }
+        finish(hydrated);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      entry.hydrationWaiters.add(settle);
+      if (!entry.subscription) {
+        retried = true;
+        this.ensureSubscribed(workspaceId);
+      }
+    });
   }
 
   /** Recompose the view only when base or pending changed, keeping snapshots stable. */
@@ -369,10 +451,11 @@ export class ReviewStateStore {
 
   /** Unblock the UI (and `ready`) without replaying queued updaters. */
   private markReady(entry: Entry): void {
+    // `ready` may be a fresh promise of a later retention period while isReady stays true.
+    entry.resolveReady();
     if (entry.isReady) return;
     entry.isReady = true;
     this.recompute(entry);
-    entry.resolveReady();
   }
 
   /** A real snapshot arrived: replay the queued updaters onto it, then unblock. */
@@ -386,13 +469,25 @@ export class ReviewStateStore {
     entry.queued = [];
     this.recompute(entry);
     this.markReady(entry);
+    this.settleHydrationWaiters(entry, true);
     if (entry.pending.length > 0) this.scheduleFlush(workspaceId, entry);
   }
 
   private ensureSubscribed(workspaceId: string): void {
     const entry = this.entries.get(workspaceId);
     const client = this.client;
-    if (!entry || !client || entry.subscription) return;
+    if (!entry) return;
+    if (!client) {
+      // No client can hydrate. A workspace that was ready before (released since) settles its
+      // waiters now, as before per-retention readiness, so flush rejects instead of hanging.
+      // A never-ready one keeps waiting: setClient subscribes it once the client arrives.
+      if (entry.isReady) {
+        entry.resolveReady();
+        this.settleHydrationWaiters(entry, false);
+      }
+      return;
+    }
+    if (entry.subscription) return;
     if (entry.resubscribeTimer) {
       clearTimeout(entry.resubscribeTimer);
       entry.resubscribeTimer = null;
@@ -403,6 +498,7 @@ export class ReviewStateStore {
 
     const run = async () => {
       let iterator: AsyncIterator<unknown> | null = null;
+      let failed = false;
       try {
         const events = await client.workspace.reviewState.subscribe({ workspaceId }, { signal });
         iterator = events;
@@ -415,6 +511,8 @@ export class ReviewStateStore {
             entry.baseRevision = event.revision;
             this.setBase(entry, event.snapshot.sections);
             await this.importLegacy(workspaceId, entry, client);
+            // Released during the import: stay unhydrated (#5011); the next subscription replays.
+            if (signal.aborted) break;
             this.markHydrated(workspaceId, entry);
           } else if (event.revision >= entry.baseRevision) {
             // Older pushes can trail a write reply that already moved base forward.
@@ -428,6 +526,7 @@ export class ReviewStateStore {
           // Self-heal: never hold the review pane (or a send) on a broken subscription. Queued
           // updaters stay queued until a resubscription delivers real data.
           this.markReady(entry);
+          failed = true;
         }
       } finally {
         if (entry.subscription === controller) entry.subscription = null;
@@ -443,6 +542,8 @@ export class ReviewStateStore {
             this.ensureSubscribed(workspaceId);
           }, delay);
         }
+        // After the subscription is cleared, so a waiter can retry it right away.
+        if (failed) this.settleHydrationWaiters(entry, false);
         try {
           // Close the iterator so the backend drops its listener.
           await iterator?.return?.();
@@ -525,9 +626,32 @@ export class ReviewStateStore {
 
   private flushInBackground(workspaceId: string): void {
     const entry = this.entries.get(workspaceId);
-    if (!entry?.hydrated || entry.pending.length === 0) return;
+    if (!entry || (entry.pending.length === 0 && entry.queued.length === 0)) return;
+    if (!entry.hydrated) {
+      // A released workspace (e.g. a write that failed after its last subscriber left, or a
+      // mutate with no mounted selector): flush retains it, rehydrates and sends, and a failed
+      // attempt is retried with backoff. A mounted one sends once markHydrated runs.
+      if (entry.refCount === 0) {
+        this.flush(workspaceId).catch((error: unknown) => {
+          console.warn("Failed to persist review state; retrying:", error);
+          if (this.entries.get(workspaceId) === entry && !entry.flushTimer) {
+            this.scheduleRetry(workspaceId, entry);
+          }
+        });
+      }
+      return;
+    }
     // Failures already scheduled a retry inside drain(); nothing else to do here.
     this.drain(workspaceId, entry).catch(() => undefined);
+  }
+
+  private scheduleRetry(workspaceId: string, entry: Entry): void {
+    const delay = retryDelayMs(entry.flushAttempt++);
+    if (entry.flushTimer) clearTimeout(entry.flushTimer);
+    entry.flushTimer = setTimeout(() => {
+      entry.flushTimer = null;
+      this.flushInBackground(workspaceId);
+    }, delay);
   }
 
   /** Send pending deltas, at most one request in flight per workspace. */
@@ -556,12 +680,7 @@ export class ReviewStateStore {
         this.applyWriteReply(entry, reply.sections, reply.revision);
       } catch (error) {
         // Keep pending (never silently drop a change) and retry with backoff.
-        const delay = retryDelayMs(entry.flushAttempt++);
-        if (entry.flushTimer) clearTimeout(entry.flushTimer);
-        entry.flushTimer = setTimeout(() => {
-          entry.flushTimer = null;
-          this.flushInBackground(workspaceId);
-        }, delay);
+        this.scheduleRetry(workspaceId, entry);
         throw error;
       } finally {
         entry.inFlight = null;

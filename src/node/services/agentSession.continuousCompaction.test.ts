@@ -8,7 +8,7 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 import type { SessionUsageService } from "./sessionUsageService";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import {
   createMuxMessage,
@@ -21,8 +21,11 @@ import type { AgentSession, AgentSessionStreamManager } from "./agentSession";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
+  createStreamLifecycleMocks,
+  createTestStreamManager,
   seedAutoCompactionThreshold,
   type AgentSessionHarness,
+  type StreamLifecycle,
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
 import type { CompactionToken, TurnCoordinator } from "./turnCoordinator";
@@ -35,11 +38,7 @@ import { waitForCondition } from "./testDispatchHelpers";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
-const sendOptions: SendMessageOptions = {
-  model,
-  agentId: "exec",
-  experiments: { continuousCompaction: true },
-};
+const sendOptions: SendMessageOptions = { model, agentId: "exec" };
 
 interface ContinuousStrategyInternals {
   continuousCompactor: ContinuousCompactor;
@@ -115,8 +114,22 @@ describe("AgentSession continuous compaction wiring", () => {
     mock.restore();
   });
 
-  async function setup(usagePercent = 0, streamManager?: AgentSessionStreamManager) {
-    harness = await createAgentSessionHarness({ workspaceId, captureEvents: true, streamManager });
+  const enabledExperiments = new Set<ExperimentId>();
+  async function setup(
+    usagePercent = 0,
+    streamManager?: Omit<AgentSessionStreamManager, "effectRunner" | "hostClock">
+  ) {
+    harness = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+      // The default runner and its clock, as a real StreamManager without injection has.
+      streamManager: streamManager && { ...createTestStreamManager(), ...streamManager },
+    });
+    enabledExperiments.clear();
+    enabledExperiments.add(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+    spyOn(harness.aiService, "isExperimentEnabled").mockImplementation((id) =>
+      enabledExperiments.has(id)
+    );
     if (usagePercent > 0) {
       await harness.historyService.appendToHistory(
         workspaceId,
@@ -427,10 +440,11 @@ describe("AgentSession continuous compaction wiring", () => {
     if (mode === "disabled-usage-terminal") {
       // Kept private: a real send here would be queued behind the live source stream, so the
       // disabled usage observation needs the turn context seeded directly (cleared below).
+      enabledExperiments.delete(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
       internals(h.session).activeStreamContext = {
         modelString: model,
         providersConfig: null,
-        options: { ...sendOptions, experiments: { continuousCompaction: false } },
+        options: sendOptions,
       };
       const observed = deferred<void>();
       const observe = compactor.observe.bind(compactor);
@@ -448,6 +462,7 @@ describe("AgentSession continuous compaction wiring", () => {
       await observed.promise;
       expect(await store.read()).not.toBeNull();
       internals(h.session).activeStreamContext = undefined;
+      enabledExperiments.add(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
     }
     source.parts.push({ type: "text", text: "post-swap crash growth" });
     await h.historyService.writePartial(workspaceId, source);
@@ -523,7 +538,8 @@ describe("AgentSession continuous compaction wiring", () => {
     }
     if (mode !== "startup") {
       const strategy = continuous(h.session);
-      const options = { ...sendOptions, experiments: { continuousCompaction: false } };
+      enabledExperiments.delete(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+      const options = sendOptions;
       if (mode === "terminal-error") {
         spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(() =>
           Promise.reject(new Error("temporary terminal history failure"))
@@ -593,14 +609,14 @@ describe("AgentSession continuous compaction wiring", () => {
         });
         expect(compacting.success).toBe(true);
       }
+      enabledExperiments.delete(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+      enabledExperiments.add(EXPERIMENT_IDS.MEMORY);
+      if (guard === "token-budget") enabledExperiments.add(EXPERIMENT_IDS.TOKEN_BUDGET);
       const state = internals(h.session);
       state.activeStreamContext = {
         modelString: model,
         providersConfig: null,
-        options: {
-          ...sendOptions,
-          experiments: { continuousCompaction: false, tokenBudget: guard === "token-budget" },
-        },
+        options: sendOptions,
       };
       const strategy = continuous(h.session);
       spyOn(strategy.continuousCompactor, "hasConsumedSwap").mockReturnValue(true);
@@ -696,6 +712,16 @@ describe("AgentSession continuous compaction wiring", () => {
     });
     expect(compacting.success).toBe(true);
     const summaryId = "test-assistant-message";
+    // The compaction's stream identity, as the provider stream start supplies it: only the
+    // operation that streamed a message may register a wait for its decision (#5326).
+    h.aiEmitter.emit("stream-start", {
+      type: "stream-start",
+      workspaceId,
+      messageId: summaryId,
+      model,
+      historySequence: 1,
+      startTime: Date.now(),
+    });
     const completion = h.session.waitForPendingCompactionCompletionDecision(summaryId);
     void runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",
@@ -758,11 +784,12 @@ describe("AgentSession continuous compaction wiring", () => {
           return "applied";
         }
       );
+      if (tokenBudget) {
+        enabledExperiments.add(EXPERIMENT_IDS.TOKEN_BUDGET);
+        enabledExperiments.add(EXPERIMENT_IDS.MEMORY);
+      }
       const stream = spyOn(h.aiService, "streamMessage");
-      const result = await h.session.sendMessage("Keep going with the next task", {
-        ...sendOptions,
-        experiments: { continuousCompaction: true, tokenBudget },
-      });
+      const result = await h.session.sendMessage("Keep going with the next task", sendOptions);
       expect(result.success).toBe(true);
       expect(stream).toHaveBeenCalledTimes(1);
       // Continuous must actually apply, not merely suppress the competing budget callback.
@@ -798,26 +825,6 @@ describe("AgentSession continuous compaction wiring", () => {
       }
     }
   );
-
-  test("explicit experiment disable wins over backend enable and keeps legacy on-send policy", async () => {
-    const h = await setup(72);
-    spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.CONTINUOUS_COMPACTION
-    );
-    const observe = spyOn(continuous(h.session).continuousCompactor, "observe");
-    expect(
-      (
-        await h.session.sendMessage("New work", {
-          ...sendOptions,
-          experiments: { continuousCompaction: false },
-        })
-      ).success
-    ).toBe(true);
-    expect(observe).not.toHaveBeenCalled();
-    expect(
-      (await rows(h)).some((row) => row.metadata?.muxMetadata?.type === "compaction-request")
-    ).toBe(true);
-  });
 
   test("threshold 100 disables both automatic strategies even above the context limit", async () => {
     const h = await setup(110);
@@ -922,7 +929,22 @@ describe("AgentSession continuous compaction wiring", () => {
   });
 
   test("invalidation contains an initial wait rejection and safely stops the blocked stream", async () => {
-    const h = await setup();
+    // The session's stream manager answers the lifecycle from the AI fake (spied below) and
+    // reports the swap invalidated once the live turn runs.
+    // The session reads the lifecycle while it is constructed, before the fake exists.
+    let invalidated = false;
+    let ai: StreamLifecycle = createStreamLifecycleMocks();
+    const fromAi: StreamLifecycle = {
+      stopStream: (id, options) => ai.stopStream(id, options),
+      isStreaming: (id) => ai.isStreaming(id),
+      getStreamInfo: (id, includeFinalizing) => ai.getStreamInfo(id, includeFinalizing),
+      replayStream: (id, options) => ai.replayStream(id, options),
+    };
+    const h = await setup(0, {
+      ...createTestStreamManager(fromAi),
+      getPrefixSwapState: () => (invalidated ? "invalidated" : "none"),
+    });
+    ai = h.aiService;
     const compactor = continuous(h.session).continuousCompactor;
     const unhandled: unknown[] = [];
     const onUnhandled = (error: unknown) => {
@@ -937,8 +959,7 @@ describe("AgentSession continuous compaction wiring", () => {
       parts: [],
       toolCompletionTimestamps: new Map(),
     });
-    // The harness injects aiService as the session's stream manager; give it the swap probe.
-    Object.assign(h.aiService, { getPrefixSwapState: () => "invalidated" as const });
+    invalidated = true;
     spyOn(compactor, "waitForIdle").mockImplementationOnce(() =>
       Promise.reject(new Error("apply wait failed"))
     );
@@ -1593,6 +1614,8 @@ describe("AgentSession continuous compaction wiring", () => {
         head: [
           createMuxMessage("head", "user", "Preserve the root cause and the failed approaches"),
         ],
+        // No receipt anywhere in these fixtures unless a test passes its own segment rows.
+        receiptRows: [],
         signal: new AbortController().signal,
         context: { enabled: true, model, contextWindowTokens: 128_000, thresholdPercent: 70 },
         baseOptions: sendOptions,
@@ -1633,6 +1656,23 @@ describe("AgentSession continuous compaction wiring", () => {
       },
     ];
   }
+
+  test("headless summaries run at the chat's speed", async () => {
+    const { h, args } = await summarySetup();
+    const sdkModel = new MockLanguageModelV3({
+      doStream: () =>
+        Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) }),
+    });
+    const create = spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok(pinnedSummaryModel(sdkModel, "openai:gpt-4.1"))
+    );
+    await summarizeContinuousCompaction({
+      ...args,
+      compactOptions: { ...args.compactOptions, serviceTier: "priority" },
+    });
+    // The factory maps this tier to Anthropic speed and the xAI tier too.
+    expect(create.mock.calls[0]?.[1]?.providerOptions?.openai?.serviceTier).toBe("priority");
+  });
 
   test("headless summaries use the compact model and account usage with its pinned identity", async () => {
     const { h, args } = await summarySetup();
@@ -1699,7 +1739,7 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test.each([
     { route: "coder", alias: true, wire: "responses", pro: true },
-    { route: "mux-gateway", alias: false, wire: "responses", pro: false },
+    { route: "openrouter", alias: false, wire: "responses", pro: false },
     { route: "openai", alias: false, wire: "responses", pro: true },
     { route: "openai", alias: false, wire: "chatCompletions", pro: false },
   ] as const)(
@@ -1752,6 +1792,206 @@ describe("AgentSession continuous compaction wiring", () => {
       expect(requests[0].providerOptions?.anthropic).toBeUndefined();
     }
   );
+
+  test("a summary on a google-typed Coder instance replays only that route's thought signatures", async () => {
+    const { h, args } = await summarySetup();
+    const requests: LanguageModelV3CallOptions[] = [];
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+      },
+    });
+    const coderConfig = {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      discoveredProviders: [{ name: "agents-google", type: "google" as const }],
+      canonicalRoutes: { google: "agents-google" },
+    };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({ coder: coderConfig });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        ...pinnedSummaryModel(sdkModel, "google:gemini-4-carbon"),
+        optionsRouteProvider: "coder" as const,
+        optionsProvidersConfig: { coder: coderConfig },
+      })
+    );
+    const toolCall: MuxMessage = {
+      id: "assistant-tool",
+      role: "assistant",
+      metadata: {},
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "ls" },
+          output: "README.md",
+          providerOptions: {
+            coderGoogle: { thoughtSignature: "sig-coder" },
+            google: { thoughtSignature: "sig-native" },
+          },
+        },
+      ],
+    };
+    await summarizeContinuousCompaction({
+      ...args,
+      head: [...args.head, toolCall],
+      compactOptions: { ...args.compactOptions, model: "google:gemini-4-carbon" },
+    });
+    const sentOptions = requests[0].prompt
+      .flatMap((message) => (message.role === "assistant" ? message.content : []))
+      .filter((part) => part.type === "tool-call")
+      .map((part) => part.providerOptions);
+    expect(sentOptions).toEqual([{ coderGoogle: { thoughtSignature: "sig-coder" } }]);
+  });
+
+  test("a Sonnet 5.5 'off' summary after a higher-effort turn prepares messages at low too", async () => {
+    // #5086: the effort pin turns "off" into low adaptive here; the summary must then
+    // prepare messages at "low" (keeping signed reasoning), not strip them as for
+    // between_tools while the options ask for adaptive thinking.
+    const { h, args } = await summarySetup();
+    const sonnet55 = "anthropic:claude-sonnet-5-5";
+    const requests: LanguageModelV3CallOptions[] = [];
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+      },
+    });
+    const anthropicConfig = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({ anthropic: anthropicConfig });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        ...pinnedSummaryModel(sdkModel, sonnet55),
+        wireProviderName: "anthropic",
+        optionsRouteProvider: "anthropic" as const,
+        optionsProvidersConfig: { anthropic: anthropicConfig },
+      })
+    );
+    const earlierHigh: MuxMessage = {
+      id: "assistant-high",
+      role: "assistant",
+      metadata: { thinkingLevel: "high" },
+      parts: [
+        {
+          type: "reasoning",
+          text: "earlier thinking",
+          providerOptions: { anthropic: { signature: "sig" } },
+        },
+        { type: "text", text: "earlier answer" },
+      ],
+    };
+    await summarizeContinuousCompaction({
+      ...args,
+      head: [...args.head, earlierHigh, createMuxMessage("next", "user", "next step")],
+      compactOptions: { ...args.compactOptions, model: sonnet55, thinkingLevel: "off" },
+    });
+
+    expect(requests[0].providerOptions?.anthropic).toMatchObject({
+      thinking: { type: "adaptive" },
+      effort: "low",
+    });
+    expect(JSON.stringify(requests[0].prompt)).toContain("earlier thinking");
+  });
+
+  test("a receipt in the retained tail keeps the head's Anthropic thinking out of the summary (#5996)", async () => {
+    const { h, args } = await summarySetup();
+    const opus = "anthropic:claude-opus-5-5";
+    const requests: LanguageModelV3CallOptions[] = [];
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+      },
+    });
+    const anthropicConfig = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({ anthropic: anthropicConfig });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        ...pinnedSummaryModel(sdkModel, opus),
+        wireProviderName: "anthropic",
+        optionsRouteProvider: "anthropic" as const,
+        optionsProvidersConfig: { anthropic: anthropicConfig },
+      })
+    );
+    const signedHead: MuxMessage = {
+      id: "assistant-signed",
+      role: "assistant",
+      metadata: { thinkingLevel: "high" },
+      parts: [
+        {
+          type: "reasoning",
+          text: "removed thinking",
+          providerOptions: { anthropic: { signature: "sig-removed" } },
+        },
+        { type: "text", text: "earlier answer" },
+      ],
+    };
+    const head = [...args.head, signedHead, createMuxMessage("next", "user", "next step")];
+    const tailReceipt = createMuxMessage("tail-answer", "assistant", "repaired answer", {
+      anthropicThinkingReplay: "off",
+    });
+    const summarize = (receiptRows: MuxMessage[]) =>
+      summarizeContinuousCompaction({
+        ...args,
+        head,
+        receiptRows,
+        compactOptions: { ...args.compactOptions, model: opus, thinkingLevel: "high" },
+      });
+
+    // Control: the head alone holds no receipt, so its thinking is sent.
+    await summarize(head);
+    expect(JSON.stringify(requests[0].prompt)).toContain("removed thinking");
+
+    await summarize([...head, tailReceipt]);
+    const prompt = JSON.stringify(requests[1].prompt);
+    expect(prompt).not.toContain("removed thinking");
+    expect(prompt).toContain("earlier answer");
+  });
+
+  test("a Sonnet 5.5 'off' summary ignores a higher-effort turn before the context boundary", async () => {
+    // #5086: the effort pin reads provider-visible history only; a reset seals
+    // everything before it, so this summary still sends between_tools.
+    const { h, args } = await summarySetup();
+    const sonnet55 = "anthropic:claude-sonnet-5-5";
+    const requests: LanguageModelV3CallOptions[] = [];
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+      },
+    });
+    const anthropicConfig = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({ anthropic: anthropicConfig });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        ...pinnedSummaryModel(sdkModel, sonnet55),
+        wireProviderName: "anthropic",
+        optionsRouteProvider: "anthropic" as const,
+        optionsProvidersConfig: { anthropic: anthropicConfig },
+      })
+    );
+    await summarizeContinuousCompaction({
+      ...args,
+      head: [
+        createMuxMessage("assistant-high", "assistant", "earlier answer", {
+          thinkingLevel: "high",
+        }),
+        createMuxMessage("reset", "assistant", "", { contextBoundaryKind: "reset" }),
+        ...args.head,
+        createMuxMessage("next", "user", "next step"),
+      ],
+      compactOptions: { ...args.compactOptions, model: sonnet55, thinkingLevel: "off" },
+    });
+
+    expect(requests[0].providerOptions?.anthropic).toMatchObject({
+      thinking: { type: "between_tools" },
+      effort: "low",
+    });
+  });
 
   test("a compact model too small for the head falls back to the configured parent route without truncating", async () => {
     const { h, args } = await summarySetup();

@@ -1,4 +1,3 @@
-import { WARNING_ADVANCE_PERCENT } from "./autoCompactionCheck";
 import type { SendMessageError } from "@/common/types/errors";
 import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
@@ -9,45 +8,13 @@ import {
   MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO,
   OUTPUT_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
-  WARNING_ADVANCE_MIN_TOKENS,
   WARNING_RESERVE_TOKENS,
+  FINAL_HANDOFF_RESERVE_TOKENS,
   FLUSH_RESERVE_TOKENS,
-  FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { ANTHROPIC_THINKING_BUDGETS, type ThinkingLevel } from "@/common/types/thinking";
-import { enforceThinkingPolicy, resolveMinimumThinkingLevel } from "@/common/utils/thinking/policy";
 
 export type ContextBudgetExceeded = Extract<SendMessageError, { type: "context_budget_exceeded" }>;
-
-/**
- * Output cap for the hidden flush step at a given thinking level: the notes-sized cap plus that
- * level's Anthropic thinking budget (the API rejects a budget that is not strictly below
- * max_tokens). Every model that may run the flush — the primary and each refusal fallback —
- * must derive its cap from its OWN resolved level, not inherit the primary's.
- */
-export function getContextBudgetFlushMaxOutputTokens(level: ThinkingLevel): number {
-  return FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS[level];
-}
-
-/**
- * Thinking and output cap for the hidden flush step on one model. It is housekeeping, so the
- * user's configured thinking floor does not apply — only the model's inherent minimum. Shared by
- * admission (headroom) and the stream request so both agree.
- */
-export function resolveContextBudgetFlushThinking(
-  modelString: string,
-  providersConfig: ProvidersConfigMap | null
-): { level: ThinkingLevel; maxOutputTokens: number } {
-  const level = enforceThinkingPolicy(
-    modelString,
-    "off",
-    resolveMinimumThinkingLevel(modelString, undefined, providersConfig),
-    providersConfig
-  );
-  return { level, maxOutputTokens: getContextBudgetFlushMaxOutputTokens(level) };
-}
 
 /** Keep output headroom without making supported small context windows unusable. */
 export function getContextBudgetHardCeiling(modelContextLimit: number): number {
@@ -64,14 +31,29 @@ export function getContextBudgetHardCeiling(modelContextLimit: number): number {
   );
 }
 
-/** The slider is an agent handoff target, not a second forced-rollover ceiling. */
+/**
+ * Where the final handoff prompt zone opens. A window smaller than a few final reserves would
+ * reach the zone at once, so it never opens in the first half of the usable window.
+ */
+export function getContextBudgetFinalPoint(modelContextLimit: number): number {
+  const hardCeiling = getContextBudgetHardCeiling(modelContextLimit);
+  return Math.max(hardCeiling - FINAL_HANDOFF_RESERVE_TOKENS, Math.ceil(hardCeiling / 2));
+}
+
+/**
+ * The slider is an agent handoff target, not a second forced-rollover ceiling. A high slider is
+ * clamped to the final zone so the handoff request always comes before the final prompt.
+ */
 export function getContextBudgetHandoffPoint(modelContextLimit: number, threshold: number): number {
   assert(
     Number.isFinite(modelContextLimit) && modelContextLimit > 0,
     "Handoff requires a finite positive model context limit"
   );
   assert(threshold > 0 && threshold < 1, "Handoff point requires an enabled fractional threshold");
-  return Math.floor(modelContextLimit * threshold);
+  return Math.min(
+    Math.floor(modelContextLimit * threshold),
+    getContextBudgetFinalPoint(modelContextLimit)
+  );
 }
 
 export interface StepBudgetInput {
@@ -83,18 +65,18 @@ export interface StepBudgetInput {
   toolResultTokens?: number;
   /**
    * Assembled estimate of the next provider request (the measure the per-step preflight
-   * enforces), when known. Floors only the hard stop, never the advisory stages.
+   * enforces), when known. Floors the measure both the hard stop and the advisory stages open on.
    */
   nextRequestTokens?: number;
   modelContextLimit: number | null | undefined;
   threshold: number;
-  warningEmitted: boolean;
   handoffRequested: boolean;
+  /** The caller can still publish this window's single final prompt. */
+  finalHandoffAvailable: boolean;
 }
 
 export interface StepBudgetEvaluation {
-  decision: "continue" | "warn" | "handoff" | "rollover" | "block";
-  flushOpportunity: boolean;
+  decision: "continue" | "handoff" | "final" | "rollover" | "block";
   projected: number;
   /** Undefined means unknown, not unlimited. The caller should log that limitation. */
   hardCeiling: number | undefined;
@@ -132,12 +114,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     limit != null && Number.isFinite(limit) && limit > 0
       ? getContextBudgetHardCeiling(limit)
       : undefined;
-  const result: StepBudgetEvaluation = {
-    decision: "continue",
-    flushOpportunity: false,
-    projected,
-    hardCeiling,
-  };
+  const result: StepBudgetEvaluation = { decision: "continue", projected, hardCeiling };
   // The auto-compaction Off setting disables proactive rollover, not request preflight.
   if (hardCeiling === undefined || limit == null) return result;
   if (hardProjected >= hardCeiling) {
@@ -148,24 +125,25 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     };
   }
   if (input.threshold >= 1) return result;
-  const safeFlush = hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling;
-  // Advisories are best-effort. Skip stages without headroom rather than forcing an early
-  // rollover; the final assembled-payload preflight remains authoritative before dispatch.
-  if (input.handoffRequested || hardProjected + WARNING_RESERVE_TOKENS >= hardCeiling)
-    return result;
-  const handoffAt = getContextBudgetHandoffPoint(limit, input.threshold);
-  if (projected >= handoffAt) {
-    return { ...result, decision: "handoff", flushOpportunity: safeFlush };
+  // Stages are best-effort. Skip a stage without headroom rather than forcing an early rollover;
+  // the final assembled-payload preflight remains authoritative before dispatch. Both stages
+  // open on `hardProjected`, the measure their headroom check and the hard stop use, and the
+  // next turn start decides them on its own estimate too. Opening on provider usage instead let
+  // an estimate above that usage close a stage's band before it opened (#5223).
+  if (
+    !input.handoffRequested &&
+    hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
+    hardProjected >= getContextBudgetHandoffPoint(limit, input.threshold)
+  ) {
+    return { ...result, decision: "handoff" };
   }
-  const warnAt = Math.max(
-    handoffAt / 2,
-    Math.min(
-      limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100),
-      handoffAt - WARNING_ADVANCE_MIN_TOKENS
-    )
-  );
-  if (!input.warningEmitted && projected >= warnAt) {
-    return { ...result, decision: "warn", flushOpportunity: safeFlush };
+  // Last chance before the forced rollover: a prompt to save the checkpoint and call new_context.
+  if (
+    input.finalHandoffAvailable &&
+    hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling &&
+    hardProjected >= getContextBudgetFinalPoint(limit)
+  ) {
+    return { ...result, decision: "final" };
   }
   return result;
 }
@@ -178,6 +156,26 @@ export function estimateToolResultSize(result: unknown): {
   return measureBudgetContent(result);
 }
 
+type BudgetContentKind =
+  | "json"
+  | "messages"
+  | "message"
+  | "parts"
+  | "part"
+  | "assistant-parts"
+  | "assistant-part"
+  | "output"
+  | "output-parts"
+  | "output-part"
+  | "request-options";
+
+const BUDGET_ITEM_KIND: Partial<Record<BudgetContentKind, BudgetContentKind>> = {
+  messages: "message",
+  parts: "part",
+  "assistant-parts": "assistant-part",
+  "output-parts": "output-part",
+};
+
 function measureBudgetContent(
   result: unknown,
   textParts?: string[],
@@ -189,22 +187,11 @@ function measureBudgetContent(
   let toolResultChars = 0;
   let imageParts = 0;
   const ancestors = new Set<object>();
-  const stack: Array<{
-    value: unknown;
-    leave?: boolean;
-    kind?:
-      | "json"
-      | "messages"
-      | "message"
-      | "parts"
-      | "part"
-      | "assistant-parts"
-      | "assistant-part"
-      | "reasoning-options"
-      | "openai-reasoning-options"
-      | "output";
-  }> = [{ value: result, kind }];
+  const stack: Array<{ value: unknown; leave?: boolean; kind?: BudgetContentKind }> = [
+    { value: result, kind },
+  ];
   while (stack.length > 0) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const entry = stack.pop()!;
     const value = entry.value;
     if (value == null) {
@@ -239,18 +226,8 @@ function measureBudgetContent(
     stack.push({ value, leave: true });
     toolResultChars += 2;
     if (Array.isArray(value)) {
-      for (const child of value)
-        stack.push({
-          value: child,
-          kind:
-            entry.kind === "messages"
-              ? "message"
-              : entry.kind === "assistant-parts"
-                ? "assistant-part"
-                : entry.kind === "parts"
-                  ? "part"
-                  : "json",
-        });
+      const itemKind = (entry.kind && BUDGET_ITEM_KIND[entry.kind]) ?? "json";
+      for (const child of value) stack.push({ value: child, kind: itemKind });
       toolResultChars += value.length;
       continue;
     }
@@ -260,7 +237,8 @@ function measureBudgetContent(
     // Tool JSON can impersonate SDK part shapes. Only direct model-message/fresh
     // attachment parts get SDK media semantics; canonical tool wrappers are also
     // safe because the shared attachment sanitizer removes their data recursively.
-    const isPart = entry.kind === "part" || entry.kind === "assistant-part";
+    const messagePart = entry.kind === "part" || entry.kind === "assistant-part";
+    const isPart = messagePart || entry.kind === "output-part";
     const image = isPart && record.type === "image" && "image" in record;
     const inlineText =
       typeof record.data === "object" &&
@@ -281,14 +259,12 @@ function measureBudgetContent(
         (urlMedia && key === "url")
       )
         continue;
-      // Ciphertext length does not measure reasoning tokens. Provider usage tracks the underlying reasoning.
-      // Exclude only the SDK replay field; identical keys in user/tool JSON must still count.
-      if (
-        entry.kind === "openai-reasoning-options" &&
-        key === "reasoningEncryptedContent" &&
-        typeof child === "string"
-      )
-        continue;
+      // On model output, providerOptions replays provider metadata (reasoning signatures and
+      // ciphertext, item IDs, cache hints), which providers do not bill as input text.
+      if (key === "providerOptions" && entry.kind === "assistant-part") continue;
+      // Options on user and tool content can reach the model as text (an Anthropic
+      // document's context and title), but adapters never send Xum's own namespace.
+      if (entry.kind === "request-options" && key === "mux") continue;
       toolResultChars += JSON.stringify(key).length + 2;
       textParts?.push(key);
       let childKind: typeof entry.kind = "json";
@@ -298,15 +274,9 @@ function measureBudgetContent(
       } else if (isPart && record.type === "tool-result" && key === "output") {
         childKind = "output";
       } else if (entry.kind === "output" && record.type === "content" && key === "value") {
-        childKind = "parts";
-      } else if (
-        entry.kind === "assistant-part" &&
-        record.type === "reasoning" &&
-        key === "providerOptions"
-      ) {
-        childKind = "reasoning-options";
-      } else if (entry.kind === "reasoning-options" && key === "openai") {
-        childKind = "openai-reasoning-options";
+        childKind = "output-parts";
+      } else if (key === "providerOptions" && (messagePart || entry.kind === "message")) {
+        childKind = "request-options";
       }
       stack.push({ value: child, kind: childKind });
     }

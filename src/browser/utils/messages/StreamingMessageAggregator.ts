@@ -10,6 +10,7 @@ import {
   createMuxMessage,
   getMcpPromptReferenceKey,
   isCompactionSummaryMetadata,
+  isContextBudgetWarningMessage,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
@@ -45,8 +46,9 @@ import {
   isCompletedSubagentReportEnvelope,
   parseSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
-import { completeInProgressTodoItems } from "@/common/utils/todoList";
-import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
+import { findOpenAskUserQuestions } from "@/browser/utils/messages/openAskUserQuestions";
+import { completeInProgressTodoItems, isTodoListFinished } from "@/common/utils/todoList";
+import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/agentSkillReadToolResult";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
 import type {
@@ -55,6 +57,7 @@ import type {
   DeleteMessage,
   OnChatCursor,
   OnChatHistoryCursor,
+  CaughtUpMessage,
 } from "@/common/orpc/types";
 import {
   isInitStart,
@@ -73,12 +76,11 @@ import {
   getTextPartContent,
   hasSuccessResult,
   mergeAdjacentParts,
-  normalizeMessageRouteProvider,
-  resolveRouteProvider,
 } from "./displayedMessageBuilder";
 import { showBrowserNotification } from "@/browser/utils/ui/showBrowserNotification";
 import type { DynamicToolPart, DynamicToolPartPending } from "@/common/types/toolParts";
 import type { AgentSkillDescriptor, AgentSkillScope } from "@/common/types/agentSkill";
+import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import { z } from "zod";
@@ -92,7 +94,13 @@ import {
   type PendingInitialUserMessage,
 } from "./pendingInitialUserMessage";
 import { assert } from "@/common/utils/assert";
-import { getStatusStateKey } from "@/common/constants/storage";
+import {
+  STATUS_STATE_EMOJI_MAX_CHARS,
+  STATUS_STATE_MESSAGE_MAX_CHARS,
+  STATUS_STATE_URL_MAX_CHARS,
+  getStatusStateKey,
+} from "@/common/constants/storage";
+import { truncateStringToChars } from "@/browser/utils/boundedPersistedValue";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   CONTEXT_BOUNDARY_KINDS,
@@ -108,6 +116,34 @@ function isTranscriptVisibleUserRow(message: MuxMessage): boolean {
   return message.metadata?.synthetic !== true || message.metadata.uiVisible === true;
 }
 
+/**
+ * Hidden notices AgentSession.streamWithHistory persists INSIDE a turn that already started: the
+ * `<system-file-update>` row (createFileChangeNotificationMessage, `file-change-` id) and the
+ * `[CONTINUE]` sentinel for a trailing completed assistant. The backend publishes them so the
+ * client holds the same rows as history (an edit fences its range with them), but they arrive
+ * after the turn's real user row and must not restart that turn's pending state. Matched by the
+ * exact markers the backend writes, not by `synthetic` alone: hidden synthetic rows such as
+ * context-budget continuations do start turns.
+ */
+function isInTurnHiddenNoticeRow(message: MuxMessage): boolean {
+  const metadata = message.metadata;
+  if (
+    message.role !== "user" ||
+    metadata?.synthetic !== true ||
+    metadata.uiVisible === true ||
+    metadata.muxMetadata !== undefined ||
+    message.parts.length !== 1
+  ) {
+    return false;
+  }
+  const part = message.parts[0];
+  if (part.type !== "text") return false;
+  return (
+    part.text === "[CONTINUE]" ||
+    (message.id.startsWith("file-change-") && part.text.startsWith("<system-file-update>"))
+  );
+}
+
 function isDisplayOnlyCompletedSubagentReport(message: MuxMessage): boolean {
   if (
     message.role !== "user" ||
@@ -118,6 +154,19 @@ function isDisplayOnlyCompletedSubagentReport(message: MuxMessage): boolean {
   }
 
   return isCompletedSubagentReportEnvelope(getTextPartContent(message.parts));
+}
+
+/**
+ * A user row that starts a turn. Plan-review records, in-turn notices, Token Budget warnings and
+ * display-only sub-agent report cards are user rows that start none (see handleMuxMessage).
+ */
+function startsUserTurn(message: MuxMessage): boolean {
+  return (
+    !isPlanReviewRecordMessage(message) &&
+    !isInTurnHiddenNoticeRow(message) &&
+    !isContextBudgetWarningMessage(message) &&
+    !isDisplayOnlyCompletedSubagentReport(message)
+  );
 }
 
 // Maximum number of messages to display in the DOM for performance
@@ -246,6 +295,35 @@ const ALWAYS_KEEP_MESSAGE_TYPES = new Set<DisplayedMessage["type"]>([
   "workspace-init",
 ]);
 
+/**
+ * Rows truncation keeps beyond the always-kept types: the reveal target, and every question the
+ * chat docks above the input (the dock reads this list, so those rows must stay reachable). It is
+ * the dock's own selector, so truncation never keeps a row the dock would not show.
+ */
+function buildAlwaysKeepMessage(
+  workspaceId: string | undefined,
+  messages: readonly DisplayedMessage[],
+  revealTarget: TranscriptRevealTarget | null
+): (message: DisplayedMessage) => boolean {
+  const openQuestionRowIds = new Set(
+    findOpenAskUserQuestions(workspaceId, messages).map((question) => question.id)
+  );
+  return (message) => {
+    if (openQuestionRowIds.has(message.id)) return true;
+    if (revealTarget == null) return false;
+    const matchesToolCall =
+      revealTarget.toolCallId != null &&
+      message.type === "tool" &&
+      message.toolCallId === revealTarget.toolCallId;
+    return (
+      matchesToolCall ||
+      (revealTarget.messageId != null &&
+        "historyId" in message &&
+        message.historyId === revealTarget.messageId)
+    );
+  };
+}
+
 interface StreamingContext {
   /** Backend timestamp when stream started (Date.now()) */
   serverStartTime: number;
@@ -273,7 +351,6 @@ interface StreamingContext {
    * stream is active.
    */
   metadataModel?: string;
-  routedThroughGateway?: boolean;
   routeProvider?: string;
 
   /** Timestamp of first content token (text or reasoning delta) - backend Date.now() */
@@ -563,6 +640,18 @@ function foldAgentPeerTriggers(messages: DisplayedMessage[]): DisplayedMessage[]
   );
 }
 
+/** Throttle window for init-output cache invalidation (see initOutputThrottleTimer). */
+const INIT_OUTPUT_THROTTLE_MS = 100;
+
+/** Tools whose replayed outputs feed aggregator derived state (see processToolResult). */
+const DERIVED_STATE_TOOL_NAMES = new Set([
+  "todo_write",
+  "propose_plan",
+  "status_set",
+  "agent_skill_read",
+  "review_pane_update",
+]);
+
 export class StreamingMessageAggregator {
   private messages = new Map<string, MuxMessage>();
   private activeStreams = new Map<string, StreamingContext>();
@@ -617,6 +706,13 @@ export class StreamingMessageAggregator {
    *  reconnect to a full replay. */
   private lastServerHistoryCursor: OnChatHistoryCursor | null = null;
 
+  /** Windowed replay (#4961): todos and review pins written before the window floor, from the
+   *  last full caught-up (null when its window reached the epoch start). Replayed rows at or
+   *  above the floor override it. */
+  private windowSeed: NonNullable<CaughtUpMessage["windowSeed"]> | null = null;
+  /** The loaded rows miss the start of the active epoch, so the init card cannot be placed. */
+  private windowMissesEpochStart = false;
+
   // Delta history for token counting and TPS calculation
   private deltaHistory = new Map<string, DeltaRecordStorage>();
 
@@ -633,9 +729,12 @@ export class StreamingMessageAggregator {
   >();
 
   // Current TODO list (updated when todo_write succeeds)
-  // Incomplete lists persist across streams and reloads; fully completed lists clear
-  // once the final stream finishes so stale plans do not linger in the UI.
+  // Incomplete lists persist across streams and reloads; a finished list stays until the next
+  // user turn starts, so its chip reads 5/5 after its turn.
   private currentTodos: TodoItem[] = [];
+  // The list came from the window seed and no row or tool result has written one since. The seed
+  // is the session's list now, so during a turn it may be an earlier turn's finished plan.
+  private todosFromWindowSeed = false;
 
   // Current agent status (updated when status_set is called)
   // Unlike todos, this persists after stream completion to show last activity
@@ -700,7 +799,6 @@ export class StreamingMessageAggregator {
 
   // Throttle init-output cache invalidation to avoid re-render per line during fast streaming
   private initOutputThrottleTimer: ReturnType<typeof setTimeout> | null = null;
-  private static readonly INIT_OUTPUT_THROTTLE_MS = 100;
 
   // Track when we're waiting for stream-start after user message
   // Prevents retry barrier flash during normal send flow
@@ -833,7 +931,16 @@ export class StreamingMessageAggregator {
     if (!this.workspaceId) return;
     const parsed = AgentStatusSchema.safeParse(status);
     if (!parsed.success) return;
-    updatePersistedState(getStatusStateKey(this.workspaceId), parsed.data);
+    // Persist a copy that fits the key budget; a cut URL would be a broken link, so it is dropped.
+    const { emoji, message, url } = parsed.data;
+    updatePersistedState(getStatusStateKey(this.workspaceId), {
+      emoji: truncateStringToChars(emoji, STATUS_STATE_EMOJI_MAX_CHARS),
+      message: truncateStringToChars(message, STATUS_STATE_MESSAGE_MAX_CHARS),
+      url:
+        url !== undefined && JSON.stringify(url).length <= STATUS_STATE_URL_MAX_CHARS
+          ? url
+          : undefined,
+    });
   }
 
   private clearPersistedAgentStatus(): void {
@@ -956,6 +1063,10 @@ export class StreamingMessageAggregator {
     return this.currentTodos;
   }
 
+  private clearFinishedTodos(): void {
+    if (isTodoListFinished(this.currentTodos)) this.currentTodos = [];
+  }
+
   /**
    * Get the current set of agent-flagged Assisted Review hunks.
    * Updated whenever `review_pane_update` succeeds.
@@ -1021,7 +1132,7 @@ export class StreamingMessageAggregator {
    * - Transient agentStatus (from displayStatus) - restored to persisted value
    *
    * Preserves:
-   * - currentTodos (incomplete lists stay visible; handleStreamEnd may clear fully completed lists)
+   * - currentTodos (a finished plan stays too, until the next user turn starts)
    */
   private cleanupStreamState(messageId: string): void {
     // Clear optimistic interrupt flag if this stream was being interrupted.
@@ -1061,27 +1172,24 @@ export class StreamingMessageAggregator {
   }
 
   addMessage(message: MuxMessage): void {
-    const normalizedMessage = normalizeMessageRouteProvider(message);
     // A backend row for an overlaid id is the persisted version the fence must see, whether or
     // not the richer displayed projection below keeps its place.
-    if (this.overlaidPersistedRows.has(normalizedMessage.id)) {
-      this.overlaidPersistedRows.set(normalizedMessage.id, normalizedMessage);
+    if (this.overlaidPersistedRows.has(message.id)) {
+      this.overlaidPersistedRows.set(message.id, message);
     }
-    this.upsertMessage(normalizedMessage);
+    this.upsertMessage(message);
   }
 
-  private upsertMessage(normalizedMessage: MuxMessage): void {
-    const existing = this.messages.get(normalizedMessage.id);
+  private upsertMessage(message: MuxMessage): void {
+    const existing = this.messages.get(message.id);
     if (existing) {
       const existingParts = Array.isArray(existing.parts) ? existing.parts.length : 0;
-      const incomingParts = Array.isArray(normalizedMessage.parts)
-        ? normalizedMessage.parts.length
-        : 0;
+      const incomingParts = Array.isArray(message.parts) ? message.parts.length : 0;
 
       // Rejection capsules are authoritative despite having no parts; stale payloads cannot revive them.
       // Otherwise prefer richer content (e.g., placeholder vs completed message).
       if (
-        !normalizedMessage.metadata?.contextBudgetRejected &&
+        !message.metadata?.contextBudgetRejected &&
         (existing.metadata?.contextBudgetRejected || incomingParts < existingParts)
       ) {
         return;
@@ -1089,8 +1197,8 @@ export class StreamingMessageAggregator {
     }
 
     // Just store the message - backend assigns historySequence
-    this.messages.set(normalizedMessage.id, normalizedMessage);
-    this.markMessageDirty(normalizedMessage.id);
+    this.messages.set(message.id, message);
+    this.markMessageDirty(message.id);
   }
 
   /**
@@ -1099,19 +1207,18 @@ export class StreamingMessageAggregator {
    * can be asked about (see `getHistoryEvidenceMessages`).
    */
   addEphemeralMessage(message: MuxMessage): void {
-    const normalizedMessage = normalizeMessageRouteProvider(message);
-    const existing = this.messages.get(normalizedMessage.id);
+    const existing = this.messages.get(message.id);
     const overlaysPersistedRow =
       existing !== undefined &&
       !this.locallyFabricatedRows.has(existing) &&
-      !this.overlaidPersistedRows.has(normalizedMessage.id);
+      !this.overlaidPersistedRows.has(message.id);
     if (overlaysPersistedRow) {
       // A projection over a persisted row (same id): keep the persisted version as evidence.
-      this.overlaidPersistedRows.set(normalizedMessage.id, existing);
+      this.overlaidPersistedRows.set(message.id, existing);
     }
-    this.upsertMessage(normalizedMessage);
-    const stored = this.messages.get(normalizedMessage.id);
-    if (stored !== undefined && !this.overlaidPersistedRows.has(normalizedMessage.id)) {
+    this.upsertMessage(message);
+    const stored = this.messages.get(message.id);
+    if (stored !== undefined && !this.overlaidPersistedRows.has(message.id)) {
       this.locallyFabricatedRows.add(stored);
     }
   }
@@ -1167,6 +1274,7 @@ export class StreamingMessageAggregator {
         }
       }
       this.establishedOldestHistorySequence = minSeq;
+      this.applyWindowSeed();
     }
 
     const overwrittenMessageIds: string[] = [];
@@ -1174,33 +1282,30 @@ export class StreamingMessageAggregator {
 
     // Add/overwrite messages in the map
     for (const message of messages) {
-      const normalizedMessage = normalizeMessageRouteProvider(message);
-      if (this.overlaidPersistedRows.has(normalizedMessage.id)) {
-        this.overlaidPersistedRows.set(normalizedMessage.id, normalizedMessage);
+      if (this.overlaidPersistedRows.has(message.id)) {
+        this.overlaidPersistedRows.set(message.id, message);
       }
-      const existing = mode === "append" ? this.messages.get(normalizedMessage.id) : undefined;
+      const existing = mode === "append" ? this.messages.get(message.id) : undefined;
 
       if (existing) {
         const existingParts = Array.isArray(existing.parts) ? existing.parts.length : 0;
-        const incomingParts = Array.isArray(normalizedMessage.parts)
-          ? normalizedMessage.parts.length
-          : 0;
+        const incomingParts = Array.isArray(message.parts) ? message.parts.length : 0;
 
         // Since-replay can include a stale boundary row for an active stream message while
         // richer in-memory parts already exist. Keep the richer message to avoid dropping
         // in-flight tool/text parts that filtered replay deltas may not resend.
         if (
-          !normalizedMessage.metadata?.contextBudgetRejected &&
+          !message.metadata?.contextBudgetRejected &&
           (existing.metadata?.contextBudgetRejected || incomingParts < existingParts)
         ) {
           continue;
         }
 
-        overwrittenMessageIds.push(normalizedMessage.id);
+        overwrittenMessageIds.push(message.id);
       }
 
-      this.messages.set(normalizedMessage.id, normalizedMessage);
-      appliedMessages.push(normalizedMessage);
+      this.messages.set(message.id, message);
+      appliedMessages.push(message);
     }
 
     if (mode === "append") {
@@ -1234,7 +1339,11 @@ export class StreamingMessageAggregator {
     hasActiveStream: boolean,
     opts?: { skipDerivedState?: boolean }
   ): void {
-    let shouldClearCompletedTodosOnIdleReplay = false;
+    // A finished plan clears when a later user turn starts, as it does live. Rows replayed here
+    // set the list in order; a list from before them (the window seed, or a live stream's) may
+    // also clear when idle, since then every replayed turn came after it. With a stream active,
+    // the seed may hold that stream's own writes, which no replayed row precedes.
+    let todosFromReplay = false;
     if (!opts?.skipDerivedState) {
       // Replay historical messages in order to reconstruct derived state
       for (const message of chronologicalMessages) {
@@ -1242,18 +1351,23 @@ export class StreamingMessageAggregator {
 
         if (message.role === "user") {
           // Plan-review record rows are hidden UI state, not user turns (see handleMuxMessage).
-          if (isPlanReviewRecordMessage(message)) continue;
+          if (isPlanReviewRecordMessage(message) || isInTurnHiddenNoticeRow(message)) continue;
           // Mirror live behavior for status: clear transient status on new user turn
           // but keep persisted status for fallback on reload.
           this.agentStatus = undefined;
           if (isTranscriptVisibleUserRow(message)) {
             this.clearPendingInitialUserMessage();
           }
+          if (
+            startsUserTurn(message) &&
+            (todosFromReplay || (!hasActiveStream && this.activeStreams.size === 0))
+          ) {
+            this.clearFinishedTodos();
+          }
           continue;
         }
 
         if (message.role === "assistant") {
-          let assistantUpdatedTodos = false;
           for (const part of message.parts) {
             if (isDynamicToolPart(part) && part.state === "output-available") {
               // Replay deliberately omits the live context so historical
@@ -1266,13 +1380,9 @@ export class StreamingMessageAggregator {
                 hasSuccessResult(part.output) &&
                 parseTodoWriteInput(part.input)
               ) {
-                assistantUpdatedTodos = true;
+                todosFromReplay = true;
               }
             }
-          }
-
-          if (!hasActiveStream && assistantUpdatedTodos) {
-            shouldClearCompletedTodosOnIdleReplay = message.metadata?.partial !== true;
           }
         }
       }
@@ -1285,19 +1395,6 @@ export class StreamingMessageAggregator {
         this.agentStatus = persistedStatus;
         this.lastStatusUrl = persistedStatus.url;
       }
-    }
-
-    // Mirror live stream-end cleanup for idle reloads: a completed plan should not reappear
-    // just because we reconstructed it from historical tool output after a successful final stream.
-    if (
-      !opts?.skipDerivedState &&
-      !hasActiveStream &&
-      this.activeStreams.size === 0 &&
-      shouldClearCompletedTodosOnIdleReplay &&
-      this.currentTodos.length > 0 &&
-      this.currentTodos.every((todo) => todo.status === "completed")
-    ) {
-      this.currentTodos = [];
     }
 
     this.invalidateCache();
@@ -1320,15 +1417,6 @@ export class StreamingMessageAggregator {
     }
   }
 
-  /** Tools whose replayed outputs feed aggregator derived state (see processToolResult). */
-  private static readonly DERIVED_STATE_TOOL_NAMES = new Set([
-    "todo_write",
-    "propose_plan",
-    "status_set",
-    "agent_skill_read",
-    "review_pane_update",
-  ]);
-
   private messageContributesDerivedState(message: MuxMessage): boolean {
     if (message.metadata?.agentSkillSnapshot != null) {
       return true;
@@ -1337,7 +1425,7 @@ export class StreamingMessageAggregator {
       (part) =>
         isDynamicToolPart(part) &&
         part.state === "output-available" &&
-        StreamingMessageAggregator.DERIVED_STATE_TOOL_NAMES.has(part.toolName)
+        DERIVED_STATE_TOOL_NAMES.has(part.toolName)
     );
   }
 
@@ -1372,7 +1460,7 @@ export class StreamingMessageAggregator {
       `reconcileSinceReplay requires a non-negative anchor, got ${requestedAnchorSequence}`
     );
 
-    const replayed = args.messages.map(normalizeMessageRouteProvider);
+    const replayed = args.messages;
     const replayedIds = new Set(replayed.map((message) => message.id));
 
     // Incremental derived-state replay cannot "unapply" a discarded todo_write /
@@ -1473,8 +1561,7 @@ export class StreamingMessageAggregator {
     this.loadedSkillsCache = [];
     this.skillLoadErrors.clear();
     this.skillLoadErrorsCache = [];
-    this.currentTodos = [];
-    this.assistedReviewHunks = [];
+    this.applyWindowSeed();
     this.agentStatus = undefined;
     this.lastStatusUrl = undefined;
 
@@ -1484,6 +1571,28 @@ export class StreamingMessageAggregator {
       return historySequence !== undefined && historySequence >= windowFloor;
     });
     this.replayDerivedState(windowRows, hasActiveStream);
+  }
+
+  /** Set on every full caught-up, before its rows replace the transcript. */
+  setWindowSeed(seed: CaughtUpMessage["windowSeed"] | null): void {
+    this.windowSeed = seed ?? null;
+    this.windowMissesEpochStart = this.windowSeed !== null;
+  }
+
+  /** A loaded older page reached the start of the active epoch. */
+  markEpochStartLoaded(): void {
+    if (!this.windowMissesEpochStart) return;
+    this.windowMissesEpochStart = false;
+    this.invalidateCache();
+  }
+
+  /** Reset todos and review pins to the window seed; replayed rows then override them. */
+  private applyWindowSeed(): void {
+    // A finished seed list stays until a replayed user turn clears it (replayDerivedState).
+    const next = this.windowSeed?.todos ?? [];
+    if (!this.todosEqual(this.currentTodos, next)) this.currentTodos = next;
+    this.todosFromWindowSeed = next.length > 0;
+    this.assistedReviewHunks = [...(this.windowSeed?.assistedReview ?? [])];
   }
 
   setEstablishedOldestHistorySequence(sequence: number | null): void {
@@ -1512,6 +1621,8 @@ export class StreamingMessageAggregator {
       }
     }
     if (removed > 0) {
+      // Rows below a seeded window's floor are gone again, so the epoch start is unloaded (#4961).
+      if (this.windowSeed !== null) this.windowMissesEpochStart = true;
       // Match handleDeleteMessage: removed rows invalidate async last-user-prompt fallbacks.
       this.historyEpoch++;
       this.invalidateCache();
@@ -1710,7 +1821,7 @@ export class StreamingMessageAggregator {
       if (message.role !== "user") continue;
       // Hidden plan-review records (snapshot/resolve/reopen) appended after the request are
       // state, not user turns; they must not hide the request on reconnect recovery.
-      if (isPlanReviewRecordMessage(message)) continue;
+      if (isPlanReviewRecordMessage(message) || isInTurnHiddenNoticeRow(message)) continue;
       const muxMetadata = message.metadata?.muxMetadata;
       if (muxMetadata?.type === "compaction-request") {
         return sawCompletedCompaction
@@ -2118,12 +2229,8 @@ export class StreamingMessageAggregator {
       activeStream.hasQueuedFollowUp = false;
     }
     this.backgroundHandoffCompletion = undefined;
-    const routeProvider = resolveRouteProvider(data.routeProvider, data.routedThroughGateway);
 
-    // A hidden token-budget flush turn is maintenance, not a reply: never notify with
-    // output the transcript intentionally hides (e.g. a resumed flush with no continuation).
     const suppressNotification =
-      data.muxMetadata?.contextBudgetFlush === true ||
       this.isDefaultPostCompactionContinueTurn() ||
       this.getLatestUnresolvedCompactionRequest()?.parsed.followUpContent?.dispatchOptions
         ?.source === "internal-resume";
@@ -2139,8 +2246,7 @@ export class StreamingMessageAggregator {
       isReplay: data.replay === true,
       model: data.model,
       metadataModel: data.metadataModel,
-      routedThroughGateway: data.routedThroughGateway,
-      routeProvider,
+      routeProvider: data.routeProvider,
       serverFirstTokenTime: null,
       toolExecutionMs: 0,
       pendingToolStarts: new Map(),
@@ -2175,8 +2281,7 @@ export class StreamingMessageAggregator {
       this.activeStreams.set(data.messageId, context);
       if (existingMessage.metadata) {
         existingMessage.metadata.model = data.model;
-        existingMessage.metadata.routedThroughGateway = data.routedThroughGateway;
-        existingMessage.metadata.routeProvider = routeProvider;
+        existingMessage.metadata.routeProvider = data.routeProvider;
         existingMessage.metadata.autoModelRouting = data.autoModelRouting;
         if (data.agentId != null) {
           existingMessage.metadata.agentId = data.agentId;
@@ -2200,14 +2305,13 @@ export class StreamingMessageAggregator {
       historySequence: data.historySequence,
       timestamp: Date.now(),
       model: data.model,
-      routedThroughGateway: data.routedThroughGateway,
-      routeProvider,
+      routeProvider: data.routeProvider,
       autoModelRouting: data.autoModelRouting,
       agentId: data.agentId,
       mode: data.mode,
       thinkingLevel: data.thinkingLevel,
-      // Turn classification must be known before the first delta so a hidden maintenance
-      // turn (token-budget flush) never paints; stream-end re-merges the same metadata.
+      // Turn classification must be known before the first delta; stream-end re-merges the
+      // same metadata.
       ...(data.muxMetadata != null ? { muxMetadata: data.muxMetadata } : {}),
     });
 
@@ -2293,11 +2397,6 @@ export class StreamingMessageAggregator {
           ...message.metadata,
           ...data.metadata,
         };
-        updatedMetadata.routeProvider = resolveRouteProvider(
-          updatedMetadata.routeProvider,
-          updatedMetadata.routedThroughGateway
-        );
-
         const durationMs = data.metadata.duration;
         if (typeof durationMs === "number" && Number.isFinite(durationMs)) {
           this.updateStreamClock(activeStream, activeStream.serverStartTime + durationMs);
@@ -2344,10 +2443,8 @@ export class StreamingMessageAggregator {
       const completedAt = isFinal ? Date.now() : null;
 
       // Recency policy: only non-compaction final streams inflate lastResponseCompletedAt.
-      // Compaction recency comes from the compacted summary's own timestamp. A hidden
-      // token-budget flush adds no visible row, so it must not mark the workspace unread.
-      const isHiddenFlushTurn = message?.metadata?.muxMetadata?.contextBudgetFlush === true;
-      if (completedAt !== null && !activeStream.isCompacting && !isHiddenFlushTurn) {
+      // Compaction recency comes from the compacted summary's own timestamp.
+      if (completedAt !== null && !activeStream.isCompacting) {
         this.lastResponseCompletedAt = completedAt;
       }
 
@@ -2369,16 +2466,11 @@ export class StreamingMessageAggregator {
       // Backend MUST provide historySequence in metadata
 
       // Create the complete message
-      const routeProvider = resolveRouteProvider(
-        data.metadata.routeProvider,
-        data.metadata.routedThroughGateway
-      );
       const message: MuxMessage = {
         id: data.messageId,
         role: "assistant",
         metadata: {
           ...data.metadata,
-          routeProvider,
           timestamp: data.metadata.timestamp ?? Date.now(),
         },
         parts: data.parts,
@@ -2389,16 +2481,9 @@ export class StreamingMessageAggregator {
       // Clean up stream-scoped state for this stream.
       this.cleanupStreamState(data.messageId);
     }
-    // Keep incomplete plans available across stream boundaries, but clear a fully completed
-    // plan once the workspace has no active streams so finished work does not linger.
-    if (
-      this.activeStreams.size === 0 &&
-      this.currentTodos.length > 0 &&
-      this.currentTodos.every((todo) => todo.status === "completed")
-    ) {
-      this.currentTodos = [];
-    }
-
+    // A finished list only the seed knows may be the turn before this one's: unlike one this turn
+    // wrote, it does not outlast this turn (a replayed user row cannot clear it mid-stream).
+    if (this.todosFromWindowSeed && this.activeStreams.size === 0) this.clearFinishedTodos();
     // Assistant message is now stable (completed or reconnected) - invalidate all caches.
     this.markMessageDirty(data.messageId);
   }
@@ -2733,7 +2818,7 @@ export class StreamingMessageAggregator {
     if (result.success) {
       const skill = result.skill;
       this.trackLoadedSkill({
-        name: skill.frontmatter.name,
+        name: resolveSkillReadIdentity(input, skill.frontmatter.name),
         description: skill.frontmatter.description,
         scope: skill.scope,
       });
@@ -2745,6 +2830,15 @@ export class StreamingMessageAggregator {
     if (skillName) {
       this.trackSkillLoadError(skillName, result.error);
     }
+  }
+
+  private applyTodoWrite(input: unknown): void {
+    const args = parseTodoWriteInput(input);
+    // Guard against malformed historical data.
+    if (!args) return;
+    this.todosFromWindowSeed = false;
+    // Update only on real changes to prevent flicker from equivalent-but-new todo array references.
+    if (!this.todosEqual(this.currentTodos, args.todos)) this.currentTodos = args.todos;
   }
 
   /**
@@ -2772,16 +2866,9 @@ export class StreamingMessageAggregator {
     liveContext?: { timestamp: number }
   ): void {
     // Update TODO state if this was a successful todo_write.
-    // We still reconstruct from history so interrupted/incomplete plans survive reloads;
-    // final completed plans are cleared later when the last active stream ends.
-    if (toolName === "todo_write" && hasSuccessResult(output)) {
-      const args = parseTodoWriteInput(input);
-      if (args && !this.todosEqual(this.currentTodos, args.todos)) {
-        // Guard against malformed historical data and update only on real changes
-        // to prevent flicker from equivalent-but-new todo array references.
-        this.currentTodos = args.todos;
-      }
-    }
+    // We still reconstruct from history so plans survive reloads; a finished plan clears when
+    // the next user turn starts.
+    if (toolName === "todo_write" && hasSuccessResult(output)) this.applyTodoWrite(input);
 
     // Update Assisted Review state when review_pane_update succeeds.
     // The tool returns the resulting list directly (already merged + deduped
@@ -3163,7 +3250,7 @@ export class StreamingMessageAggregator {
       // Throttle cache invalidation during fast streaming to avoid re-render per line.
       this.initOutputThrottleTimer ??= setTimeout(
         () => this.flushPendingInitOutput(),
-        StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS
+        INIT_OUTPUT_THROTTLE_MS
       );
       return true;
     }
@@ -3173,7 +3260,7 @@ export class StreamingMessageAggregator {
         this.initState.progress = { label: data.label, percent: data.percent };
         this.initOutputThrottleTimer ??= setTimeout(
           () => this.flushPendingInitOutput(),
-          StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS
+          INIT_OUTPUT_THROTTLE_MS
         );
       }
       return true;
@@ -3209,9 +3296,7 @@ export class StreamingMessageAggregator {
     return false;
   }
 
-  private handleMuxMessage(data: MuxMessage): void {
-    const incomingMessage = normalizeMessageRouteProvider(data);
-
+  private handleMuxMessage(incomingMessage: MuxMessage): void {
     // Smart replacement logic for edits: if history was truncated, remove the
     // existing message at the incoming sequence and all subsequent messages.
     const incomingSequence = incomingMessage.metadata?.historySequence;
@@ -3255,11 +3340,27 @@ export class StreamingMessageAggregator {
       return;
     }
 
+    if (isInTurnHiddenNoticeRow(incomingMessage)) {
+      // Kept above as edit evidence; the turn it belongs to is already pending.
+      return;
+    }
+
+    if (isContextBudgetWarningMessage(incomingMessage)) {
+      // A Token Budget warning is a notice, not a request: keep the turn state of its user row.
+      return;
+    }
+
     if (isDisplayOnlyCompletedSubagentReport(incomingMessage)) {
       // A terminal report card is appended for visibility after the parent already answered the
       // progress update. It intentionally starts no new parent turn, so preserve the idle lifecycle
       // instead of briefly presenting the card as an interrupted user request.
       return;
+    }
+
+    // A finished plan's chip reads 5/5 after its turn and clears once the next turn starts. A
+    // message sent mid-turn leaves it: that turn has not ended yet.
+    if (this.activeStreams.size === 0) {
+      this.clearFinishedTodos();
     }
 
     // Reset terminal lifecycle snapshots from the previous turn immediately so
@@ -3798,20 +3899,12 @@ export class StreamingMessageAggregator {
       const showSyntheticMessages =
         typeof window !== "undefined" && window.api?.debugLlmRequest === true;
 
-      // The token-budget flush turn is machine maintenance (one memory write before the
-      // window is sealed), not a reply to the user. Its trigger row is already a hidden
-      // synthetic user row; the assistant output it produces carries the same turn flag on
-      // the live stream, the recovered partial, and the settled history row, so hide the
-      // whole turn by that flag rather than by the text it happens to emit. A failed flush
-      // stays visible: its error row and retry controls are the only explanation the user gets.
       // Plan-review record rows stay hidden even in debug-LLM mode: that mode shows what the
       // model sees, and these rows are never sent (isModelHiddenMessage).
       const shouldHideMessageFromTranscript = (message: MuxMessage): boolean =>
         isPlanReviewRecordMessage(message) ||
         (!showSyntheticMessages &&
           ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
-            (message.metadata?.muxMetadata?.contextBudgetFlush === true &&
-              message.metadata.error == null) ||
             isWorkflowResultMessage(message)));
 
       // Retain hidden snapshots so referenced user messages can display their resolved content.
@@ -3957,15 +4050,11 @@ export class StreamingMessageAggregator {
           displayedMessages,
           maxDisplayedMessages: MAX_DISPLAYED_MESSAGES,
           alwaysKeepMessageTypes: ALWAYS_KEEP_MESSAGE_TYPES,
-          shouldAlwaysKeepMessage: revealTarget
-            ? (message) =>
-                (revealTarget.toolCallId != null &&
-                  message.type === "tool" &&
-                  message.toolCallId === revealTarget.toolCallId) ||
-                (revealTarget.messageId != null &&
-                  "historyId" in message &&
-                  message.historyId === revealTarget.messageId)
-            : undefined,
+          shouldAlwaysKeepMessage: buildAlwaysKeepMessage(
+            this.workspaceId,
+            displayedMessages,
+            revealTarget
+          ),
         });
 
         resultMessages =
@@ -4012,9 +4101,11 @@ export class StreamingMessageAggregator {
           ? createPendingCreationInitMessage(this.pendingCreationInit)
           : null;
       // Creation belongs to the first user turn, even though init starts before it is persisted.
-      const insertionIndex = initMessage
-        ? findInitMessageInsertionIndex(resultMessages, initMessage.timestamp)
-        : null;
+      // A window that misses the epoch start cannot place it; a running init stays visible.
+      const insertionIndex =
+        initMessage && (!this.windowMissesEpochStart || initMessage.status === "running")
+          ? findInitMessageInsertionIndex(resultMessages, initMessage.timestamp)
+          : null;
       if (initMessage && insertionIndex !== null) {
         resultMessages = resultMessages.slice();
         resultMessages.splice(insertionIndex, 0, initMessage);

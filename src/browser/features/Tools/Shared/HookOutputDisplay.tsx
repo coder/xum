@@ -45,7 +45,8 @@ export const HookOutputDisplay: React.FC<HookOutputDisplayProps> = ({
         <pre
           className={cn(
             "mt-1 ml-3 px-2 py-1.5 rounded text-[10px] leading-relaxed",
-            "bg-muted/30 text-muted-foreground",
+            // Foreground text: muted text on this muted tint was below 4.5:1 in three themes (#6544).
+            "bg-muted/30 text-foreground",
             "whitespace-pre-wrap break-words max-h-[150px] overflow-y-auto",
             "border-l-2 border-muted-foreground/20"
           )}

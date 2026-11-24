@@ -21,6 +21,7 @@ import { createSSHTransport } from "@/node/runtime/transports";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 import { ssh2ConnectionPool } from "@/node/runtime/SSH2ConnectionPool";
+import { MISSING_CWD_COMMANDS } from "@/node/runtime/testRemoteRuntime";
 
 function shouldRunIntegrationTests(): boolean {
   return process.env.TEST_INTEGRATION === "1" || process.env.TEST_INTEGRATION === "true";
@@ -82,6 +83,24 @@ describeIntegration("SSH2 Transport integration tests", () => {
       });
 
       expect(result.exitCode).toBe(42);
+    });
+
+    test("a multi-line command with a missing cwd fails without running later lines", async () => {
+      const runtime = createSSH2Runtime(sshConfig!);
+      await using workspace = await TestWorkspace.create(runtime, "ssh");
+
+      for (const command of MISSING_CWD_COMMANDS) {
+        const result = await execBuffered(runtime, command, {
+          cwd: `${workspace.path}/missing`,
+          env: { XUM_TEST_VAR: "set" },
+          timeout: 30,
+        });
+        expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+          command,
+          failed: true,
+          stdout: "",
+        });
+      }
     });
 
     test("captures stderr separately", async () => {

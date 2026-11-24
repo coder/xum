@@ -2,11 +2,16 @@
 import {
   ProviderCapacityError,
   isProviderCapacityError,
+  isProviderStall,
   retryOnProviderCapacity,
 } from "./liveProviderCapacity";
 
 const XAI_CAPACITY =
   "The model is currently at capacity due to high demand. Please try again in a few minutes, or use a higher service tier for priority processing";
+
+// The stream-error text in merge-queue runs 36502073443 and 36502113315 (#5128), where the
+// live OpenAI web_search test hit it on every attempt.
+const OPENAI_OVERLOADED = "Our servers are currently overloaded. Please try again later.";
 
 describe("isProviderCapacityError", () => {
   test.each([
@@ -26,8 +31,45 @@ describe("isProviderCapacityError", () => {
     { error: "Service Unavailable", errorType: "api", capacity: false },
     { error: "terminated", errorType: "network", capacity: false },
     { error: "Invalid reasoning replay", errorType: "reasoning_rejected", capacity: false },
+    // OpenAI's overload sentence, as the backend classifies it before any output (a 503/500
+    // APICallError -> server_error) and mid-stream (an unclassified provider error -> unknown).
+    { error: OPENAI_OVERLOADED, errorType: "server_error", capacity: true },
+    { error: OPENAI_OVERLOADED, errorType: "unknown", capacity: true },
+    // Near misses must still fail: other 5xx text, a 4xx class, and "overloaded" that is not
+    // the provider's whole message (for example quoted inside other output).
+    {
+      error: "The server had an error while processing your request.",
+      errorType: "server_error",
+      capacity: false,
+    },
+    { error: OPENAI_OVERLOADED, errorType: "api", capacity: false },
+    { error: OPENAI_OVERLOADED, errorType: "authentication", capacity: false },
+    {
+      error: "The model said the network is overloaded today.",
+      errorType: "unknown",
+      capacity: false,
+    },
+    { error: `Tool output: "${OPENAI_OVERLOADED}"`, errorType: "unknown", capacity: false },
   ])("$errorType: $error -> $capacity", ({ error, errorType, capacity }) => {
     expect(isProviderCapacityError({ error, errorType })).toBe(capacity);
+  });
+});
+
+describe("isProviderStall", () => {
+  test.each([
+    // The request left Mux and the provider never answered: a stall.
+    { eventTypes: ["caught-up", "stream-start"], stall: true },
+    // Nothing was sent: a Mux hang before the request, not the provider.
+    { eventTypes: ["caught-up"], stall: false },
+    { eventTypes: [], stall: false },
+    // Output arrived, so a missing terminal event is Mux failing to finish the stream.
+    { eventTypes: ["stream-start", "stream-delta"], stall: false },
+    { eventTypes: ["stream-start", "reasoning-delta"], stall: false },
+    { eventTypes: ["stream-start", "reasoning-end"], stall: false },
+    { eventTypes: ["stream-start", "tool-call-start"], stall: false },
+    { eventTypes: ["stream-start", "usage-delta"], stall: false },
+  ])("$eventTypes -> $stall", ({ eventTypes, stall }) => {
+    expect(isProviderStall(eventTypes)).toBe(stall);
   });
 });
 

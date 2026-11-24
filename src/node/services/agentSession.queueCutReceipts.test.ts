@@ -1,4 +1,5 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -32,7 +33,7 @@ function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): Sett
     toolResultChars: 0,
     imageParts: 0,
     sessionHistoryAvailable: true,
-    memoryWritable: true,
+    newContextAvailable: true,
     ...overrides,
   };
 }
@@ -80,6 +81,9 @@ async function setup(args?: { failure?: boolean }) {
     aiServiceOverrides: {
       streamMessage,
       buildMemorySessionContext: mock(() => Promise.resolve(null)),
+      isExperimentEnabled: mock(
+        (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+      ),
     },
   });
   spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
@@ -98,7 +102,6 @@ async function setup(args?: { failure?: boolean }) {
     const sent = await h.session.sendMessage("Work through the task", {
       model: BUDGET_MODEL,
       agentId: "exec",
-      experiments: { tokenBudget: true },
     });
     expect(sent.success).toBe(true);
     return firstRequest.promise;
@@ -183,7 +186,6 @@ describe("AgentSession queue-cut receipts", () => {
   });
 
   test.each([
-    { usage: 85_000, decision: "warn", dedupeKey: CONTEXT_WARNING_DEDUPE_KEY },
     { usage: 90_000, decision: "warn", dedupeKey: CONTEXT_WARNING_DEDUPE_KEY },
     { usage: 120_000, decision: "rollover", dedupeKey: CONTEXT_CONTINUE_DEDUPE_KEY },
   ])("a budget stop at $usage designates only its single continuation", async (fixture) => {
@@ -195,7 +197,6 @@ describe("AgentSession queue-cut receipts", () => {
       expect(entryId).toBeDefined();
       expect(outcome).toEqual({ decision: fixture.decision, continuationEntryId: entryId });
       expect(h.session.getQueueCutReceipt(entryId!)?.successor).toBe("pending");
-      // New windows never create a flush pair; the unused key must not invent a successor.
       const unusedKey =
         fixture.dedupeKey === CONTEXT_WARNING_DEDUPE_KEY
           ? CONTEXT_CONTINUE_DEDUPE_KEY
@@ -205,7 +206,6 @@ describe("AgentSession queue-cut receipts", () => {
       h.settleStream(0);
       await h.secondRequest;
       expect(h.session.getQueueCutReceipt(entryId!)?.successor).toBe("streaming");
-      expect(h.requests[1].muxMetadata?.contextBudgetFlush).not.toBe(true);
       expect(await h.requests[1].onStepSettled!(step(5_000))).toEqual({ decision: "continue" });
     } finally {
       await teardown(h);
@@ -216,7 +216,7 @@ describe("AgentSession queue-cut receipts", () => {
     const h = await setup();
     try {
       await h.startBudgetTurn();
-      const outcome = await h.requests[0].onStepSettled!(step(85_000));
+      const outcome = await h.requests[0].onStepSettled!(step(90_000));
       const continueEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_WARNING_DEDUPE_KEY);
       expect(outcome).toEqual({ decision: "warn", continuationEntryId: continueEntryId });
 
@@ -243,7 +243,7 @@ describe("AgentSession queue-cut receipts", () => {
       await h.startBudgetTurn();
       h.session.queueMessage("Unrelated follow-up", { model: TEST_MODEL, agentId: "exec" });
       const unrelatedEntryId = queueOf(h).getNextQueueCutCandidate()!.entryId;
-      const outcome = await h.requests[0].onStepSettled!(step(85_000));
+      const outcome = await h.requests[0].onStepSettled!(step(90_000));
       expect(outcome).toEqual({ decision: "warn" });
       expect(h.session.getQueueCutReceipt(unrelatedEntryId)).toBeUndefined();
     } finally {

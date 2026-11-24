@@ -1,40 +1,19 @@
 /** Shared limits for opt-in, lossless context-window rollover and history retrieval. */
-export const CONTEXT_NOTES_MEMORY_PATH = "/memories/workspace/context-notes.md";
-export const CONTEXT_NOTES_RESERVED_BYTES = 8 * 1024;
-export const CONTEXT_NOTES_RESERVED_TOKENS = 2_000;
+// Room reserved below the hard ceiling for the agent's final checkpoint write.
+export const CONTEXT_CHECKPOINT_MAX_TOKENS = 2_000;
 export const CONTEXT_CONTINUE_DEDUPE_KEY = "context-budget-continue";
 export const CONTEXT_WARNING_DEDUPE_KEY = "context-budget-warning";
-/**
- * Appended to the inherited tool policy for the hidden final-flush turn: only `memory` (the
- * write it exists for) stays enabled. The turn is bounded to one provider step, so a read-only
- * `session_history` call would consume the whole preservation opportunity without a write; the
- * transcript is still in context anyway, and history retrieval belongs to the next window.
- * Rollover admission checks `session_history` against the inherited policy separately.
- */
-export const CONTEXT_FLUSH_TOOL_POLICY_RULE = {
-  regex_match: "(?!memory$).*",
-  action: "disable",
-} as const;
 export const OUTPUT_RESERVE_TOKENS = 8_192;
 export const MAX_OUTPUT_RESERVE_CONTEXT_RATIO = 0.25;
 export const MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO = 0.5;
 export const WARNING_RESERVE_TOKENS = 2_048;
-// Headroom one final notes-writing step needs below the hard ceiling: the warning row plus the
-// pinned-tool prompt, and the context-notes preload the flush-only memory context may add even
-// when the ordinary session context had not selected the notes yet.
-export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_NOTES_RESERVED_TOKENS;
-// Output cap for the hidden flush step, replacing the caller's: large enough for a full notes
-// file (its preload token cap, doubled for tool-call framing/escaping) yet bounded, so injected
-// transcript text cannot make the automatic, cost-exempt step emit a model-sized reply. Stays
-// within OUTPUT_RESERVE_TOKENS, which the hard ceiling already reserves for the step's output.
-export const FLUSH_MAX_OUTPUT_TOKENS = Math.min(
-  OUTPUT_RESERVE_TOKENS,
-  2 * CONTEXT_NOTES_RESERVED_TOKENS
-);
-// Absolute floor on how far ahead of the rollover point the advance warning fires. The
-// percent-based advance (WARNING_ADVANCE_PERCENT of the limit) shrinks with the window, so
-// reserve three WARNING_RESERVE_TOKENS: one notes flush plus roughly two working steps.
-export const WARNING_ADVANCE_MIN_TOKENS = 3 * WARNING_RESERVE_TOKENS;
+// Headroom the final prompt needs below the hard ceiling: the prompt row plus a
+// checkpoint-sized margin.
+export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_CHECKPOINT_MAX_TOKENS;
+// The final prompt zone opens once the next request gets this close to the hard ceiling: the
+// prompt's own headroom plus roughly three working steps to save the checkpoint and call
+// new_context, so a normal step rarely jumps straight past it into a forced rollover.
+export const FINAL_HANDOFF_RESERVE_TOKENS = FLUSH_RESERVE_TOKENS + 3 * WARNING_RESERVE_TOKENS;
 export const IMAGE_TOKEN_ESTIMATE = 1_024;
 export const SYSTEM_FLOOR_TOKENS_ESTIMATE = 8_192;
 export const SESSION_HISTORY_MAX_RESULT_BYTES = 16 * 1024;
@@ -84,8 +63,17 @@ export const SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;
 // Compact JSON marker; the bounded scanner ignores JSON whitespace around it.
 export const SESSION_HISTORY_RESET_NEEDLE = '"contextBoundaryKind":"reset"';
-// Each marker character can occupy six raw characters as a JSON Unicode escape.
-export const SESSION_HISTORY_RESET_PROBE_CHARS = SESSION_HISTORY_RESET_NEEDLE.length * 6;
+// One unit of a reset token (a character or an escape) spans at most this many canonical
+// characters in the probes' retained overlap: a \u00XX escape (6) with a \x00 escaped-separator
+// run (4) in each of its 5 gaps (separators are removed before decoding), plus a run before the
+// next unit (#5320).
+export const SESSION_HISTORY_RESET_UNIT_MAX_CHARS = 6 + 5 * 4 + 4;
+// The token probe keeps SESSION_HISTORY_RESET_PROBE_CHARS - 1 canonical characters of overlap
+// between segments (row, 64 KiB read and page edges). It must hold the longest token of the needle
+// at its widest spelling, or a token split at an edge is missed (#5324); one unit of margin.
+export const SESSION_HISTORY_RESET_PROBE_CHARS =
+  SESSION_HISTORY_RESET_UNIT_MAX_CHARS *
+  (Math.max(...SESSION_HISTORY_RESET_NEEDLE.split(":").map((token) => token.length)) + 1);
 
 // Allow for provider message/tool envelopes beyond encoded visible text.
 export const REQUEST_FRAMING_TOKENS = 8;

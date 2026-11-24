@@ -7,10 +7,15 @@ import { chmodSync, mkdirSync } from "fs";
  * but explicit mode makes the security intent clear at each callsite.
  * Also tightens permissions on pre-existing directories from older installs.
  */
-export async function ensurePrivateDir(dirPath: string): Promise<void> {
-  await fs.mkdir(dirPath, { recursive: true, mode: 0o700 });
+export async function ensurePrivateDir(
+  dirPath: string,
+  // Another file system (the in-memory session files) passes its own; the default is read on
+  // each call.
+  fsp: Pick<typeof fs, "mkdir" | "chmod"> = fs
+): Promise<void> {
+  await fsp.mkdir(dirPath, { recursive: true, mode: 0o700 });
   // chmod is needed because mkdir does not change permissions on existing dirs
-  await fs.chmod(dirPath, 0o700);
+  await fsp.chmod(dirPath, 0o700);
 }
 
 export function ensurePrivateDirSync(dirPath: string): void {

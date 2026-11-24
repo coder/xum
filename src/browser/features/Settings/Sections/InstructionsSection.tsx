@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import type { ProjectConfig } from "@/common/types/project";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
@@ -93,13 +94,13 @@ export const InstructionsSection: React.FC = () => {
       <div>
         <p className="text-muted text-xs">
           Custom instructions are appended to the system prompt of every workspace in the selected
-          project. They are stored in <code className="text-accent">~/.mux/config.json</code> (kept
-          out of source control).
+          project. They are stored in <code className="text-accent-text">~/.xum/config.json</code>{" "}
+          (kept out of source control).
         </p>
         <p className="text-muted mt-1 text-xs">
           For instructions shared with all agents and contributors, use the project&apos;s{" "}
-          <code className="text-accent">AGENTS.md</code>; for global personal instructions, use{" "}
-          <code className="text-accent">~/.xum/AGENTS.md</code>.
+          <code className="text-accent-text">AGENTS.md</code>; for global personal instructions, use{" "}
+          <code className="text-accent-text">~/.xum/AGENTS.md</code>.
         </p>
       </div>
 
@@ -129,6 +130,7 @@ export const InstructionsSection: React.FC = () => {
         <p className="text-muted text-xs">Add a project to configure its instructions.</p>
       ) : (
         <div>
+          <SettingsMark id="custom-instructions" />
           <label htmlFor="project-custom-instructions" className="block">
             <div className="text-foreground text-sm font-medium">Custom instructions</div>
           </label>

@@ -10,8 +10,10 @@ import type { ReactElement, ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import * as RealExperimentsModule from "@/browser/hooks/useExperiments";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import { formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -218,7 +220,12 @@ function ApiWrapper(props: { children: ReactNode }) {
   if (!fake) {
     throw new Error("Test bug: assign `fake` before rendering MemoryTab");
   }
-  return <APIProvider client={createTestApiClient(fake.api)}>{props.children}</APIProvider>;
+  // Rendered Markdown code blocks read the theme.
+  return (
+    <ThemeProvider forcedTheme="dark">
+      <APIProvider client={createTestApiClient(fake.api)}>{props.children}</APIProvider>
+    </ThemeProvider>
+  );
 }
 
 function renderWithApi(ui: ReactElement) {
@@ -343,6 +350,194 @@ describe("MemoryTab", () => {
     expect(statusBlock!.getAttribute("title")).toBeNull();
   });
 
+  test("labels an analyzer harvest by the memory edits it made and the ones rejected", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 3,
+          skippedCandidates: 1,
+          nextChunk: 2,
+          ops: [],
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText("Harvest: completed: 3 edits / 1 rejected");
+  });
+
+  test("says on the harvest line when a completed run read only part of its epoch", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 8,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          note: "edit budget spent: chunks 2-3 of 3 were not read",
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(
+      "Harvest: completed: 8 edits / 0 rejected · edit budget spent: chunks 2-3 of 3 were not read"
+    );
+  });
+
+  test("wraps the harvest line instead of truncating it", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 8,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          note: "edit budget spent: chunks 2-3 of 3 were not read",
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    const harvestLine = await findByText(/^Harvest: completed/);
+
+    // happy-dom does no layout, so the class list is the only signal that a line wraps: a
+    // truncated one hides the end of the note on a phone, where no tooltip opens. The story
+    // `HarvestNoteAtPhoneWidth` measures the wrap in a browser.
+    expect(harvestLine.classList.contains("break-words")).toBe(true);
+    expect(harvestLine.classList.contains("truncate")).toBe(false);
+  });
+
+  test("shows what each run cost and the note of a run the cost ceiling stopped", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: {
+          ...DEFAULT_CONSOLIDATION_RECORD,
+          ops: [{ command: "create", path: "/memories/workspace/notes.md", applied: true }],
+          spentUsd: 1.004,
+          note: "stopped at the cost ceiling after $1.00",
+        },
+        // A record written before the cost was measured has none to show.
+        globalRecord: { ...DEFAULT_CONSOLIDATION_RECORD, lastRunAt: Date.now() - 60_000 },
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 2,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 1,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          spentUsd: 1.5,
+          note: "stopped at the cost ceiling after $1.50",
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    const workspaceLine = await findByText(
+      /^Workspace: .*1 change · \$1\.00 · stopped at the cost ceiling after \$1\.00$/
+    );
+    await findByText(
+      "Harvest: completed: 1 edit / 0 rejected · $1.50 · stopped at the cost ceiling after $1.50"
+    );
+    expect((await findByText(/^Global: /)).textContent).not.toContain("$");
+    // A touch screen cannot open the tooltip, so the note must wrap instead of truncating.
+    expect(workspaceLine.classList.contains("break-words")).toBe(true);
+    expect(workspaceLine.classList.contains("truncate")).toBe(false);
+  });
+
+  test("one run under three scopes counts each scope's changes and shows its cost once", async () => {
+    // One organizer pass writes this same record to every scope it covers.
+    const run: MemoryConsolidationRecordPayload = {
+      ...DEFAULT_CONSOLIDATION_RECORD,
+      spentUsd: 0.9,
+      note: "stopped at the cost ceiling after $0.90",
+    };
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: run,
+        projectRecord: run,
+        globalRecord: run,
+      },
+    });
+    const { findByText, getByText, getAllByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: .* · manual · 0 changes$/);
+    expect(getByText(/^Project: /).textContent).toMatch(/ · 0 changes$/);
+    expect(getByText(/^Global: /).textContent).toMatch(/ · 1 change$/);
+    expect(getAllByText(/\$0\.90$/).map((line) => line.textContent)).toEqual([
+      "Run cost (workspace, project, global): $0.90 · stopped at the cost ceiling after $0.90",
+    ]);
+  });
+
+  test("records from different runs keep their own costs", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: { ...DEFAULT_CONSOLIDATION_RECORD, spentUsd: 0.5 },
+        projectRecord: { ...DEFAULT_CONSOLIDATION_RECORD, trigger: "archive", spentUsd: 0.25 },
+        globalRecord: {
+          ...DEFAULT_CONSOLIDATION_RECORD,
+          lastRunAt: DEFAULT_CONSOLIDATION_RECORD.lastRunAt - 60_000,
+          spentUsd: 0.75,
+        },
+      },
+    });
+    const { findByText, getByText, queryByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: .* · manual · 0 changes · \$0\.50$/);
+    expect(getByText(/^Project: /).textContent).toMatch(/ · archive · 0 changes · \$0\.25$/);
+    expect(getByText(/^Global: /).textContent).toMatch(/ · manual · 1 change · \$0\.75$/);
+    expect(queryByText(/^Run cost/)).toBeNull();
+  });
+
+  test("keeps the candidate wording for a harvest record written before the analyzer", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 2,
+          skippedCandidates: 1,
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText("Harvest: completed: 2 accepted / 1 skipped");
+  });
+
   test("renders failed harvest errors inline for keyboard and screen reader access", async () => {
     fake = createFakeMemoryApi([], {
       consolidationStatus: {
@@ -402,9 +597,12 @@ describe("MemoryTab", () => {
   test("opens a file, edits it, and saves with the loaded sha", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
-    const { findByText, findByLabelText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, findByLabelText, findByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
 
     fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
     const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
     expect(editor.value).toBe("likes tea");
 
@@ -425,9 +623,12 @@ describe("MemoryTab", () => {
   test("shows a conflict banner when a save is rejected and reloads on request", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
-    const { findByText, findByLabelText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, findByLabelText, findByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
 
     fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
     const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
     fireEvent.input(editor, { target: { value: "draft edit" } });
 
@@ -441,6 +642,192 @@ describe("MemoryTab", () => {
     await waitFor(() => {
       expect(editor.value).toBe("agent version");
     });
+  });
+
+  test("a Markdown file opens in a rendered preview of its content", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent(
+      "/memories/global/prefs.md",
+      "---\ndescription: likes tea\n---\n# Heading\n\nbody text",
+      "sha-original"
+    );
+    const { findByText, findByRole, queryByRole, container } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("prefs.md"));
+    expect((await findByRole("heading", { name: "Heading" })).tagName).toBe("H1");
+    // Frontmatter is code, not a thematic break plus a setext heading.
+    await waitFor(() => {
+      expect(container.querySelector('[data-code-language="yaml"]')?.textContent).toContain(
+        "description: likes tea"
+      );
+    });
+    expect(container.querySelector("h2")).toBeNull();
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    // The shortcut tooltip describes the toggle's wrapper, so the focusable buttons carry it.
+    for (const name of ["Preview", "Edit"]) {
+      expect(queryByRole("button", { name })?.getAttribute("aria-keyshortcuts")).toBe(
+        formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+      );
+    }
+  });
+
+  test("preview renders the unsaved draft and Save sends it from preview", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
+    const { findByText, findByLabelText, findByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
+    const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
+    expect(editor.value).toBe("likes tea");
+    fireEvent.input(editor, { target: { value: "## Draft heading" } });
+
+    fireEvent.click(await findByRole("button", { name: "Preview" }));
+    await findByRole("heading", { name: "Draft heading" });
+    fireEvent.click(await findByLabelText("Save memory file"));
+
+    await waitFor(() => {
+      expect(fake!.state.saveCalls).toEqual([
+        {
+          path: "/memories/global/prefs.md",
+          content: "## Draft heading",
+          expectedSha256: "sha-original",
+        },
+      ]);
+    });
+  });
+
+  test("the save shortcut works from preview, outside the textarea", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fireEvent.keyDown(document.activeElement!, { key: "Enter", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(fake!.state.saveCalls).toEqual([
+        { path: "/memories/global/prefs.md", content: "# Heading", expectedSha256: "sha-original" },
+      ]);
+    });
+  });
+
+  test("the toggle shortcut switches between preview and edit, repeatedly from the editor", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    // Opening focuses the editor, so the shortcut works without clicking into it first.
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    const editor = await findByRole("textbox", { name: "Memory file content" });
+    expect(document.activeElement).toBe(editor);
+
+    fireEvent.keyDown(editor, { key: "e", ctrlKey: true });
+    await findByRole("heading", { name: "Heading" });
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    // happy-dom keeps focus on the hidden textarea where a browser drops it to
+    // <body>, so check that focus moved to the editor root explicitly.
+    expect(document.activeElement).toBe(await findByRole("group", { name: /prefs\.md/ }));
+
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    expect(document.activeElement).toBe(
+      await findByRole("textbox", { name: "Memory file content" })
+    );
+  });
+
+  test("a held toggle shortcut switches once, not on every key repeat", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    const editor = await findByRole("textbox", { name: "Memory file content" });
+
+    // A repeat is still swallowed, so the browser's own handling of the chord does not run either.
+    expect(fireEvent.keyDown(editor, { key: "e", ctrlKey: true, repeat: true })).toBe(false);
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBe(editor);
+  });
+
+  test("a Markdown file that fails to load shows no preview toggle", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    const { findByText, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByText("No memory file at /memories/global/prefs.md");
+    expect(queryByRole("button", { name: "Preview" })).toBeNull();
+  });
+
+  test("a preview round trip keeps the same textarea with its value and selection", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
+    const editor = (await findByRole("textbox", {
+      name: "Memory file content",
+    })) as HTMLTextAreaElement;
+    fireEvent.input(editor, { target: { value: "likes green tea" } });
+    editor.setSelectionRange(6, 11);
+
+    fireEvent.click(await findByRole("button", { name: "Preview" }));
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
+
+    expect(await findByRole("textbox", { name: "Memory file content" })).toBe(editor);
+    expect(editor.value).toBe("likes green tea");
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([6, 11]);
+    expect(document.activeElement).toBe(editor);
+  });
+
+  test("focus returns to the editor after Reload removes its banner, so shortcuts keep working", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole, findByLabelText, queryByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fake.state.nextSaveConflict = true;
+    fireEvent.click(await findByLabelText("Save memory file"));
+    const reload = await findByLabelText("Reload memory file");
+    reload.focus();
+    fireEvent.click(reload);
+    await waitFor(() => expect(queryByRole("alert") === null).toBe(true));
+
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    expect(document.activeElement).toBe(
+      await findByRole("textbox", { name: "Memory file content" })
+    );
+  });
+
+  test("a non-Markdown file opens in the editor with no preview toggle", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/notes.txt" })]);
+    fake.setContent("/memories/global/notes.txt", "# not a heading", "sha-original");
+    const { findByText, findByLabelText, queryByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("notes.txt"));
+    const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
+    await waitFor(() => expect(editor.value).toBe("# not a heading"));
+    expect(queryByRole("button", { name: "Preview" })).toBeNull();
+
+    // happy-dom skips React's bubbling keydown handlers when the target lacks focus.
+    editor.focus();
+    fireEvent.keyDown(editor, { key: "e", ctrlKey: true });
+    // The textarea stays mounted in Preview, hidden, so a visible textbox means no mode switch.
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBe(editor);
   });
 
   test("deletes a file from the list after confirming the modal", async () => {
@@ -470,7 +857,7 @@ describe("MemoryTab", () => {
     fireEvent.click(await findByRole("button", { name: "Cancel" }));
 
     await waitFor(() => {
-      expect(queryByRole("button", { name: "Cancel" })).toBeNull();
+      expect(queryByRole("button", { name: "Cancel" }) === null).toBe(true);
     });
     expect(fake.state.deleteCalls).toEqual([]);
     await findByText("prefs.md");
@@ -580,7 +967,7 @@ describe("MemoryTab", () => {
     // Opening the file acknowledges the badge.
     fireEvent.click(await findByText("prefs.md"));
     await waitFor(() => {
-      expect(queryByText("agent edited")).toBeNull();
+      expect(queryByText("agent edited") === null).toBe(true);
     });
   });
 
@@ -597,7 +984,7 @@ describe("MemoryTab", () => {
       projectPath: "/project/one",
     });
     await waitFor(() => {
-      expect(queryByText("agent edited")).toBeNull();
+      expect(queryByText("agent edited") === null).toBe(true);
     });
   });
 });

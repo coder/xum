@@ -144,4 +144,4 @@ In a workflow, the verifier becomes `agent(prompt, { id, schema, onRefusal: "fai
 
 ## Prerequisites
 
-- **Max Task Nesting Depth must be ≥ 1** (Settings → Agents → Task Settings). Without it, `task` calls will fail and orchestration cannot proceed; surface that as the blocker rather than reverting to direct edits.
+- **Max Task Nesting Depth must be ≥ 1** (Settings → Behavior → Tasks). Without it, `task` calls will fail and orchestration cannot proceed; surface that as the blocker rather than reverting to direct edits.

@@ -8,6 +8,7 @@ import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelM
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { extractEditedFileDiffs } from "@/common/utils/messages/extractEditedFiles";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
+import { nodeClock } from "@/node/utils/hostClock";
 import {
   extractLoadedSkillSnapshotsFromMessages,
   mergeLoadedSkillSnapshots,
@@ -93,7 +94,7 @@ export class ContinuousStrategy {
         const attachments = await this.buildContinuousCompactionAttachments(head);
         return { ...prepared, attachments };
       },
-      summarize: (head, signal, context: SessionCompactionContext) => {
+      summarize: (head, signal, context: SessionCompactionContext, receiptRows) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
         const request = this.host.buildAutoCompactionRequest({
           baseOptions,
@@ -106,6 +107,7 @@ export class ContinuousStrategy {
           aiService: this.deps.aiService,
           sessionUsageService: this.deps.sessionUsageService,
           head,
+          receiptRows,
           signal,
           context,
           baseOptions,
@@ -130,7 +132,9 @@ export class ContinuousStrategy {
         ...(pending?.readFiles ?? []),
         ...extractReadFilePaths(head),
       ]),
-      reportsCompletedBeforeMs: Date.now(),
+      // Wall clock on purpose: TaskService and WorkflowService stamp report
+      // completion with Date.now() (#7282).
+      reportsCompletedBeforeMs: nodeClock.nowMs(),
     });
   }
 
@@ -148,7 +152,6 @@ export class ContinuousStrategy {
     this.lastThreshold = { model, threshold };
     const providersConfig = this.host.state.providersConfig;
     const selection = resolveContextStrategy({
-      experiments: options?.experiments,
       isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
       isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
     });
@@ -334,6 +337,7 @@ export class ContinuousStrategy {
       agentInitiated: context.agentInitiated,
       goalKind: context.goalKind,
       goalId: context.goalId,
+      taskTurnKind: context.taskTurnKind,
       muxMetadata: context.workspaceTurnMetadata,
       autoModelRouting: context.autoModelRouting,
     });
@@ -410,6 +414,7 @@ export class ContinuousStrategy {
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
           goalKind: fallback ? undefined : context.goalKind,
           goalId: fallback ? undefined : context.goalId,
+          taskTurnKind: fallback ? undefined : context.taskTurnKind,
         },
         {
           stream: context,

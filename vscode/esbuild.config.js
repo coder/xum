@@ -287,6 +287,11 @@ const webviewBuild = {
   splitting: true,
   chunkNames: "chunks/[name]-[hash]",
   ...sharedConfig,
+  alias: {
+    ...sharedConfig.alias,
+    // Node-only SDK; see the stub for why browser bundles never load it.
+    "@ai-sdk/google-vertex": path.resolve(__dirname, "../src/common/mocks/googleVertexStub.ts"),
+  },
   plugins: [
     ...sharedConfig.plugins,
     svgReactPlugin,

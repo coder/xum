@@ -33,8 +33,7 @@ import { getWorkspaceLastReadKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 
-import { installDom } from "../dom";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, setupTestDom, setupWorkspaceView } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 
 function getWorkspaceRow(container: HTMLElement, workspaceId: string): HTMLElement | null {
@@ -141,7 +140,8 @@ async function createSubagentSidebarHarness(): Promise<SubagentSidebarHarness> {
         return result.metadata;
       },
       async render(metadata, beforeRender) {
-        cleanupDom = installDom();
+        // setupTestDom turns tutorials off: their bubble would take focus and end the rename.
+        cleanupDom = setupTestDom();
         beforeRender?.();
         view = renderApp({ apiClient: env.orpc, metadata });
         await setupWorkspaceView(view, metadata, metadata.id);
@@ -258,6 +258,40 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
       );
       expect(menuLabels.some((label) => label.includes("Show sub-agents"))).toBe(false);
       expect(menuLabels.some((label) => label.includes("Hide sub-agents"))).toBe(false);
+    } finally {
+      await harness.cleanup();
+    }
+  }, 90_000);
+
+  test("offers heartbeat configuration on parent rows but not on sub-agent rows", async () => {
+    const harness = await createSubagentSidebarHarness();
+    const { env, repoPath } = harness;
+
+    try {
+      const parentWorkspace = await harness.createWorkspace("Heartbeat Parent", "heartbeat-parent");
+      const childWorkspace = await harness.createWorkspace("Heartbeat Child", "heartbeat-child");
+      await env.config.addWorkspace(repoPath, {
+        ...childWorkspace,
+        parentWorkspaceId: parentWorkspace.id,
+        taskStatus: "running",
+      });
+
+      const renderedView = await harness.render(parentWorkspace);
+      const openMenuLabels = async (title: string) => {
+        fireEvent.click(
+          await findWorkspaceActionsButton({ container: renderedView.container, title })
+        );
+        await findMenuItem("Generate new title");
+        return Array.from(document.querySelectorAll("button")).map(
+          (button) => button.textContent ?? ""
+        );
+      };
+
+      const childLabels = await openMenuLabels(childWorkspace.title ?? childWorkspace.name);
+      expect(childLabels.some((label) => label.includes("Configure heartbeat"))).toBe(false);
+
+      const parentLabels = await openMenuLabels(parentWorkspace.title ?? parentWorkspace.name);
+      expect(parentLabels.some((label) => label.includes("Configure heartbeat"))).toBe(true);
     } finally {
       await harness.cleanup();
     }

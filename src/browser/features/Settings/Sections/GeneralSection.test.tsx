@@ -7,18 +7,30 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { APIProvider } from "@/browser/contexts/API";
-import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
-import { ExperimentsProvider, useExperiment } from "@/browser/contexts/ExperimentsContext";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
+import {
+  createTestApiClient,
+  createTestConfig,
+  resetTestExperiments,
+  type TestClientConfig,
+} from "@/browser/testUtils";
+import { flushUserPreferences, getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
+import { useExperiment } from "@/browser/hooks/useExperiments";
 import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
 import { GeneralSection } from "./GeneralSection";
-import {
-  EXPERIMENT_IDS,
-  getExperimentKey,
-  type ExperimentId,
-} from "@/common/constants/experiments";
+import { TerminalEditorSection } from "./TerminalEditorSection";
+import { CompactionStrategySetting } from "./CompactionStrategySetting";
+import { KeepScreenAwakeSetting } from "./KeepScreenAwakeSetting";
+import { ArchiveBehaviorSettings } from "./ArchiveBehaviorSettings";
+import { DefaultProjectDirSetting } from "./DefaultProjectDirSetting";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
+import {
+  DEFAULT_TERMINAL_BADGE_CONFIG,
+  DEFAULT_TERMINAL_FONT_CONFIG,
+} from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
   type CoderWorkspaceArchiveBehavior,
@@ -30,12 +42,28 @@ import {
 
 type MockConfig = TestClientConfig;
 
+/**
+ * Everything General used to render. The settings split moved these into the sections they
+ * belong to (Terminal & editor, Agents, Runtimes); these behavior tests still cover all of them.
+ */
+function FormerGeneralSettings() {
+  return (
+    <>
+      <GeneralSection />
+      <TerminalEditorSection />
+      <CompactionStrategySetting />
+      <KeepScreenAwakeSetting />
+      <ArchiveBehaviorSettings />
+      <DefaultProjectDirSetting />
+    </>
+  );
+}
+
 type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
 
 interface MockAPIClient {
   experiments: {
-    getOverrides: () => Promise<ExperimentOverrides>;
-    setOverride: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
+    set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
   };
   config: {
     getConfig: () => Promise<MockConfig>;
@@ -46,6 +74,7 @@ interface MockAPIClient {
     updateChatTranscriptFullWidth: (input: { enabled: boolean }) => Promise<void>;
     updateLlmDebugLogs: (input: { enabled: boolean }) => Promise<void>;
     updateKeepScreenAwake: (input: { enabled: boolean }) => Promise<void>;
+    updateUserPreferences: (input: { patches: unknown[] }) => Promise<void>;
     onConfigChanged: (
       input?: unknown,
       options?: { signal?: AbortSignal }
@@ -191,9 +220,7 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
 function TestProviders(props: { children: React.ReactNode }) {
   return (
     <APIProvider client={createTestApiClient(mockApi)}>
-      <ExperimentsProvider>
-        <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
-      </ExperimentsProvider>
+      <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
     </APIProvider>
   );
 }
@@ -205,7 +232,6 @@ interface RenderGeneralSectionOptions {
   keepScreenAwake?: boolean;
   /** Render as the Electron app (window.api set by the preload) instead of browser mode. */
   desktop?: boolean;
-  localOverrides?: ExperimentOverrides;
   backendOverrides?: ExperimentOverrides;
   children?: React.ReactNode;
 }
@@ -213,8 +239,7 @@ interface RenderGeneralSectionOptions {
 interface MockAPISetup {
   api: MockAPIClient;
   backendOverrides: ExperimentOverrides;
-  setOverrideMock: ReturnType<typeof mock<MockAPIClient["experiments"]["setOverride"]>>;
-  getOverridesMock: ReturnType<typeof mock<MockAPIClient["experiments"]["getOverrides"]>>;
+  setMock: ReturnType<typeof mock<MockAPIClient["experiments"]["set"]>>;
   getConfigMock: ReturnType<typeof mock<() => Promise<MockConfig>>>;
   updateCoderPrefsMock: ReturnType<
     typeof mock<
@@ -243,8 +268,7 @@ function createMockAPI(
   experimentOverrides: ExperimentOverrides = {}
 ): MockAPISetup {
   const backendOverrides = { ...experimentOverrides };
-  const getOverridesMock = mock(() => Promise.resolve({ ...backendOverrides }));
-  const setOverrideMock = mock(
+  const setMock = mock(
     ({ experimentId, enabled }: { experimentId: ExperimentId; enabled?: boolean | null }) => {
       // Like the backend, a null/omitted value clears the override.
       if (enabled == null) {
@@ -252,12 +276,15 @@ function createMockAPI(
       } else {
         backendOverrides[experimentId] = enabled;
       }
+      emitConfigChanged();
       return Promise.resolve();
     }
   );
   const config: MockConfig = createTestConfig(configOverrides);
 
-  const getConfigMock = mock(() => Promise.resolve({ ...config }));
+  const getConfigMock = mock(() =>
+    Promise.resolve({ ...config, experiments: { ...backendOverrides } })
+  );
   const updateCoderPrefsMock = mock(
     (input: {
       coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior;
@@ -326,7 +353,7 @@ function createMockAPI(
 
   return {
     api: {
-      experiments: { getOverrides: getOverridesMock, setOverride: setOverrideMock },
+      experiments: { set: setMock },
       config: {
         getConfig: getConfigMock,
         updateCoderPrefs: updateCoderPrefsMock,
@@ -337,6 +364,15 @@ function createMockAPI(
           return Promise.resolve();
         }),
         updateKeepScreenAwake: updateKeepScreenAwakeMock,
+        updateUserPreferences: ({ patches }: { patches: unknown[] }) => {
+          for (const patch of patches) {
+            config.userPreferences = applyMergePatch(
+              config.userPreferences,
+              patch
+            ) as MockConfig["userPreferences"];
+          }
+          return Promise.resolve();
+        },
         onConfigChanged,
       },
       server: {
@@ -349,8 +385,7 @@ function createMockAPI(
       },
     },
     backendOverrides,
-    setOverrideMock,
-    getOverridesMock,
+    setMock,
     getConfigMock,
     updateCoderPrefsMock,
     updateChatTranscriptFullWidthMock,
@@ -371,6 +406,8 @@ describe("GeneralSection", () => {
   });
 
   afterEach(() => {
+    getAppConfigStore().setClient(null);
+    resetTestExperiments();
     cleanup();
     mock.restore();
     cleanupDom?.();
@@ -378,9 +415,6 @@ describe("GeneralSection", () => {
   });
 
   function renderGeneralSection(options: RenderGeneralSectionOptions = {}) {
-    for (const [id, enabled] of Object.entries(options.localOverrides ?? {})) {
-      window.localStorage.setItem(getExperimentKey(id as ExperimentId), JSON.stringify(enabled));
-    }
     const setup = createMockAPI(
       {
         chatTranscriptFullWidth: options.chatTranscriptFullWidth,
@@ -391,11 +425,12 @@ describe("GeneralSection", () => {
       options.backendOverrides
     );
     mockApi = setup.api;
+    getAppConfigStore().setClient(createTestApiClient(mockApi));
     if (options.desktop) window.api = { platform: "linux", versions: {} };
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <FormerGeneralSettings />
         {options.children}
       </TestProviders>
     );
@@ -418,11 +453,11 @@ describe("GeneralSection", () => {
     return trigger;
   }
 
-  async function chooseSelectOption(
+  async function clickSelectOption(
     view: ReturnType<typeof render>,
     label: string,
     optionText: string
-  ): Promise<void> {
+  ): Promise<HTMLElement> {
     const trigger = getSelectTrigger(view, label);
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     const portalRoot = view.baseElement.ownerDocument.body;
@@ -438,6 +473,15 @@ describe("GeneralSection", () => {
       return button;
     });
     fireEvent.click(option);
+    return trigger;
+  }
+
+  async function chooseSelectOption(
+    view: ReturnType<typeof render>,
+    label: string,
+    optionText: string
+  ): Promise<void> {
+    const trigger = await clickSelectOption(view, label, optionText);
     await waitFor(() => {
       expect(trigger.textContent).toContain(optionText);
     });
@@ -464,88 +508,44 @@ describe("GeneralSection", () => {
     });
   }
 
-  async function hydrateExperiments(setup: MockAPISetup) {
+  async function hydrateExperiments() {
     await act(async () => {
-      await waitFor(() => expect(setup.getOverridesMock).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(getAppConfigStore().getSnapshot()?.experiments).toBeDefined());
     });
   }
 
-  for (const source of ["localOverrides", "backendOverrides"] as const) {
-    test.each(legacyStrategies)(
-      `displays ${source} continuous=$continuous budget=$budget without normalizing on mount`,
-      async ({ continuous, budget, label }) => {
-        const overrides = {
-          [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
-          [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
-        };
-        const setup = renderGeneralSection({ [source]: overrides });
-        await hydrateExperiments(setup);
-        expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
-          label
-        );
-        expect(setup.backendOverrides).toEqual(overrides);
-        expect(experimentOverriddenMock).not.toHaveBeenCalled();
-        // The provider uploads explicit local values; mounting the dropdown must add no writes.
-        if (source === "localOverrides") {
-          for (const [experimentId, enabled] of Object.entries(overrides)) {
-            expect(setup.setOverrideMock).toHaveBeenCalledWith({ experimentId, enabled });
-          }
-        }
-        expect(setup.setOverrideMock).toHaveBeenCalledTimes(source === "localOverrides" ? 2 : 0);
-        for (const [id, enabled] of Object.entries(overrides)) {
-          expect(window.localStorage.getItem(getExperimentKey(id as ExperimentId))).toBe(
-            source === "localOverrides" ? JSON.stringify(enabled) : null
-          );
-        }
-      }
-    );
-  }
-
-  test("defaults to Summarize without persisting an implicit choice", async () => {
-    const setup = renderGeneralSection();
-    await hydrateExperiments(setup);
-    expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
-      "Summarize"
-    );
-    expect(setup.setOverrideMock).not.toHaveBeenCalled();
-    expect(setup.backendOverrides).toEqual({});
-    expect(
-      window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
-    ).toBeNull();
-    expect(window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET))).toBeNull();
-  });
-
-  test.each([
-    {
-      local: { [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: false },
-      backend: {
-        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true,
-        [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
-      },
-      label: "Token Budget",
-    },
-    {
-      local: { [EXPERIMENT_IDS.TOKEN_BUDGET]: false },
-      backend: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
-      label: "Summarize",
-    },
-    {
-      local: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
-      backend: { [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true },
-      label: "Continuous",
-    },
-  ])(
-    "resolves local overrides before backend values and defaults ($label)",
-    async ({ local, backend, label }) => {
-      const setup = renderGeneralSection({ localOverrides: local, backendOverrides: backend });
-      await hydrateExperiments(setup);
+  test.each(legacyStrategies)(
+    "displays continuous=$continuous budget=$budget without normalizing on mount",
+    async ({ continuous, budget, label }) => {
+      const overrides = {
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
+        [EXPERIMENT_IDS.MEMORY]: true,
+      };
+      const setup = renderGeneralSection({ backendOverrides: overrides });
+      await hydrateExperiments();
       expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
         label
       );
-      expect(setup.backendOverrides).toEqual({ ...backend, ...local });
-      expect(setup.setOverrideMock).toHaveBeenCalledTimes(Object.keys(local).length);
+      expect(setup.backendOverrides).toEqual(overrides);
+      expect(experimentOverriddenMock).not.toHaveBeenCalled();
+      expect(setup.setMock).not.toHaveBeenCalled();
+      // Hydration must not recreate client-held copies.
+      expect(
+        Object.keys(window.localStorage).filter((key) => key.startsWith("experiment:"))
+      ).toEqual([]);
     }
   );
+
+  test("defaults to Summarize without persisting an implicit choice", async () => {
+    const setup = renderGeneralSection();
+    await hydrateExperiments();
+    expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
+      "Summarize"
+    );
+    expect(setup.setMock).not.toHaveBeenCalled();
+    expect(setup.backendOverrides).toEqual({});
+  });
 
   for (const initial of legacyStrategies) {
     test.each(legacyStrategies.slice(0, 3).filter((next) => next.label !== initial.label))(
@@ -563,7 +563,7 @@ describe("GeneralSection", () => {
             [EXPERIMENT_IDS.TOKEN_BUDGET]: initial.budget,
           },
         });
-        await hydrateExperiments(setup);
+        await hydrateExperiments();
         await chooseSelectOption(setup.view, "Compaction strategy", label);
         await waitFor(() =>
           expect(setup.backendOverrides).toEqual({
@@ -572,23 +572,41 @@ describe("GeneralSection", () => {
             [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
           })
         );
-        expect(setup.setOverrideMock).toHaveBeenCalledTimes(2);
+        expect(setup.setMock).toHaveBeenCalledTimes(2);
         expect(experimentOverriddenMock).toHaveBeenCalledTimes(2);
         expect(experimentOverriddenMock).toHaveBeenCalledWith(
           EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
           continuous
         );
         expect(experimentOverriddenMock).toHaveBeenCalledWith(EXPERIMENT_IDS.TOKEN_BUDGET, budget);
-        expect(
-          window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
-        ).toBe(JSON.stringify(continuous));
-        expect(window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET))).toBe(
-          JSON.stringify(budget)
-        );
         expect(Boolean(setup.view.queryByRole("status"))).toBe(label === "Token Budget");
       }
     );
   }
+
+  test("rapid strategy choices on a slow backend persist the last choice", async () => {
+    const setup = renderGeneralSection({ backendOverrides: { [EXPERIMENT_IDS.MEMORY]: true } });
+    await hydrateExperiments();
+    const pending: Array<() => void> = [];
+    setup.setMock.mockImplementation(({ experimentId, enabled }) => {
+      setup.backendOverrides[experimentId] = enabled === true;
+      setup.emitConfigChanged();
+      return new Promise<void>((resolve) => pending.push(resolve));
+    });
+
+    await clickSelectOption(setup.view, "Compaction strategy", "Continuous");
+    await clickSelectOption(setup.view, "Compaction strategy", "Token Budget");
+    while (setup.setMock.mock.calls.length < 4 || pending.length > 0) {
+      await waitFor(() => expect(pending.length).toBeGreaterThan(0));
+      act(() => pending.shift()?.());
+    }
+
+    expect(setup.backendOverrides).toEqual({
+      [EXPERIMENT_IDS.MEMORY]: true,
+      [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: false,
+      [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
+    });
+  });
 
   test("keeps Token Budget selectable and tracks live PTC/RLM conflicts without changing the strategy", async () => {
     function ConflictToggles() {
@@ -596,27 +614,46 @@ describe("GeneralSection", () => {
       const [rlm, setRlm] = useExperiment(EXPERIMENT_IDS.RLM);
       return (
         <>
-          <button onClick={() => setPtc(!ptc)}>Toggle PTC fixture</button>
-          <button onClick={() => setRlm(!rlm)}>Toggle RLM fixture</button>
+          <button
+            onClick={() => {
+              setPtc(!ptc).catch(() => undefined);
+            }}
+          >
+            Toggle PTC fixture
+          </button>
+          <button
+            onClick={() => {
+              setRlm(!rlm).catch(() => undefined);
+            }}
+          >
+            Toggle RLM fixture
+          </button>
         </>
       );
     }
-    const setup = renderGeneralSection({ children: <ConflictToggles /> });
-    await hydrateExperiments(setup);
+    const setup = renderGeneralSection({
+      children: <ConflictToggles />,
+      backendOverrides: { [EXPERIMENT_IDS.MEMORY]: true },
+    });
+    await hydrateExperiments();
     await chooseSelectOption(setup.view, "Compaction strategy", "Token Budget");
     const trigger = setup.view.getByRole("combobox", { name: "Compaction strategy" });
     expect(setup.view.queryByRole("status")).toBeNull();
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
-    expect(setup.view.queryByRole("status")).toBeNull();
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle PTC fixture" }));
-    const warning = setup.view.getByRole("status");
-    expect(trigger.getAttribute("aria-describedby")).toBe(warning.id);
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
-    expect(setup.view.queryByRole("status")).toBeNull();
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
-    expect(setup.view.getByRole("status")).toBeTruthy();
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle PTC fixture" }));
-    expect(setup.view.queryByRole("status")).toBeNull();
+    // Toggles show the backend value from the next config snapshot, so each step waits for it.
+    const toggle = async (id: ExperimentId, enabled: boolean, warns: boolean) => {
+      const name = id === EXPERIMENT_IDS.RLM ? "Toggle RLM fixture" : "Toggle PTC fixture";
+      fireEvent.click(setup.view.getByRole("button", { name }));
+      await waitFor(() => {
+        expect(getAppConfigStore().getSnapshot()?.experiments?.[id]).toBe(enabled);
+        expect(Boolean(setup.view.queryByRole("status"))).toBe(warns);
+      });
+    };
+    await toggle(EXPERIMENT_IDS.RLM, true, false);
+    await toggle(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, true, true);
+    expect(trigger.getAttribute("aria-describedby")).toBe(setup.view.getByRole("status").id);
+    await toggle(EXPERIMENT_IDS.RLM, false, false);
+    await toggle(EXPERIMENT_IDS.RLM, true, true);
+    await toggle(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, false, false);
     expect(trigger.textContent).toBe("Token Budget");
     await waitFor(() =>
       expect(setup.backendOverrides).toEqual({
@@ -624,24 +661,44 @@ describe("GeneralSection", () => {
         [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
         [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: false,
         [EXPERIMENT_IDS.RLM]: true,
+        [EXPERIMENT_IDS.MEMORY]: true,
       })
     );
   });
 
-  test("persists flat chat list mode from the Sidebar group", () => {
-    const { view } = renderGeneralSection();
-    const sidebarHeading = view.getByRole("heading", { name: "Sidebar" });
-    const sidebarGroup = sidebarHeading.parentElement;
+  test("hides Token Budget without Agent Memory and keeps the saved preference", async () => {
+    const setup = renderGeneralSection({
+      backendOverrides: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
+    });
+    await hydrateExperiments();
+    const trigger = setup.view.getByRole("combobox", { name: "Compaction strategy" });
+    expect(trigger.textContent).toBe("Summarize");
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    const portalRoot = setup.view.baseElement.ownerDocument.body;
+    await waitFor(() =>
+      expect(within(portalRoot).getAllByText("Continuous").length).toBeGreaterThan(0)
+    );
+    expect(within(portalRoot).queryAllByText("Token Budget")).toHaveLength(0);
+    expect(setup.backendOverrides).toEqual({ [EXPERIMENT_IDS.TOKEN_BUDGET]: true });
+    expect(setup.setMock).not.toHaveBeenCalled();
+  });
+
+  test("persists flat chat list mode from the Sidebar group", async () => {
+    const setup = renderGeneralSection();
+    const sidebarHeading = setup.view.getByRole("heading", { name: "Sidebar" });
+    const sidebarGroup = sidebarHeading.closest("section");
     expect(sidebarGroup).not.toBeNull();
     const toggle = within(sidebarGroup!).getByLabelText("Toggle flat chat list");
 
     fireEvent.click(toggle);
 
-    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+    await act(() => flushUserPreferences());
+    expect(setup.config.userPreferences?.ui?.sidebarFlatMode).toBe(true);
   });
 
   test("persists the collapsed bash summaries display mode", async () => {
-    const { view } = renderGeneralSection();
+    const setup = renderGeneralSection();
+    const view = setup.view;
 
     await waitFor(() => {
       expect(getSelectTrigger(view, "Collapsed bash summaries").textContent).toContain(
@@ -651,9 +708,66 @@ describe("GeneralSection", () => {
 
     await chooseSelectOption(view, "Collapsed bash summaries", "Intent");
 
-    expect(window.localStorage.getItem(BASH_COLLAPSED_SUMMARY_MODE_KEY)).toBe(
-      JSON.stringify("intent")
-    );
+    await flushUserPreferences();
+    expect(setup.config.userPreferences?.appearance?.bashCollapsedSummaryMode).toBe("intent");
+  });
+
+  test("clearing the terminal font family keeps the field empty and the font size", async () => {
+    const setup = renderGeneralSection();
+    setup.config.userPreferences = {
+      appearance: { terminalFontConfig: { fontFamily: "Menlo", fontSize: 16 } },
+    };
+    await act(() => getAppConfigStore().refresh());
+    const input = setup.view.getByPlaceholderText(DEFAULT_TERMINAL_FONT_CONFIG.fontFamily);
+    expect((input as HTMLInputElement).value).toBe("Menlo");
+
+    await userEvent
+      .setup({ document: input.ownerDocument })
+      .type(input, "{Backspace}".repeat("Menlo".length));
+    await act(() => flushUserPreferences());
+
+    expect(setup.config.userPreferences?.appearance?.terminalFontConfig).toEqual({ fontSize: 16 });
+    expect((input as HTMLInputElement).value).toBe("");
+  });
+
+  // A number field fires on every keystroke: only a positive, in-range value may be saved, so
+  // an empty, zero or out-of-range intermediate value keeps the stored one.
+  test("terminal number fields save only positive in-range values", async () => {
+    const setup = renderGeneralSection();
+    await settleMountLoads(setup);
+    setup.config.userPreferences = {
+      appearance: {
+        terminalFontConfig: { fontFamily: "Menlo", fontSize: 16 },
+        terminalBadgeConfig: { ...DEFAULT_TERMINAL_BADGE_CONFIG, enabled: true, opacity: 0.5 },
+      },
+    };
+    await act(() => getAppConfigStore().refresh());
+    // happy-dom's change event does not reach React's handler for these number fields: call the
+    // field's own onChange, as TasksSection.ui.test does for its limit inputs.
+    const change = async (label: string, value: string) => {
+      const input = setup.view.getByLabelText(label);
+      const propsKey = Object.keys(input).find((key) => key.startsWith("__reactProps"));
+      const props = (propsKey ? (input as unknown as Record<string, unknown>)[propsKey] : null) as {
+        onChange?: (event: { target: { value: string } }) => void;
+      } | null;
+      if (!props?.onChange) throw new Error(`${label} exposes no onChange handler`);
+      const onChange = props.onChange;
+      act(() => onChange({ target: { value } }));
+      await act(() => flushUserPreferences());
+    };
+    const appearance = () => setup.config.userPreferences?.appearance;
+
+    await change("Terminal Font Size", "0");
+    await change("Terminal Font Size", "");
+    expect(appearance()?.terminalFontConfig?.fontSize).toBe(16);
+    await change("Terminal Font Size", "18");
+    expect(appearance()?.terminalFontConfig?.fontSize).toBe(18);
+
+    // Opacity is a percentage: above 100 is rejected, 80 saves as 0.8.
+    await change("Terminal Badge Opacity", "150");
+    expect(appearance()?.terminalBadgeConfig?.opacity).toBe(0.5);
+    await change("Terminal Badge Opacity", "80");
+    expect(appearance()?.terminalBadgeConfig?.opacity).toBe(0.8);
   });
 
   test("loads the SSH host setting in browser mode", async () => {
@@ -701,6 +815,32 @@ describe("GeneralSection", () => {
       expect(toggle.getAttribute("aria-checked")).toBe("false");
       expect(updateChatTranscriptFullWidthMock).toHaveBeenCalledWith({ enabled: false });
     });
+  });
+
+  test("a failed full-width save shows the saved value again", async () => {
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const toggle = setup.view.getByRole("switch", { name: "Toggle full-width chat transcript" });
+    await settleMountLoads(setup);
+    setup.updateChatTranscriptFullWidthMock.mockRejectedValueOnce(new Error("config write failed"));
+
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(setup.updateChatTranscriptFullWidthMock).toHaveBeenCalledWith({ enabled: false })
+    );
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+  });
+
+  test("the full-width toggle shows the shared config store value", async () => {
+    // The transcript reads the store, so the switch must not show a value from its own read.
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const toggle = setup.view.getByRole("switch", { name: "Toggle full-width chat transcript" });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    act(() => getAppConfigStore().updateOptimistically({ chatTranscriptFullWidth: false }));
+
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
   });
 
   test("shows the keep screen awake toggle only in the desktop app", async () => {
@@ -869,6 +1009,75 @@ describe("GeneralSection", () => {
     await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
   });
 
+  // A reconnect reloads the config through the new client. The archive controls keep their
+  // loaded values, but stay disabled until the reload answers: they are written together, so a
+  // change before it would send a stale value for the other one.
+  describe.each([...GAP_MODES])("across a reconnect (%s)", (mode) => {
+    test("keeps the archive values and locks the controls while the reload is pending", async () => {
+      const setup = createMockAPI({ worktreeArchiveBehavior: "delete" });
+      mockApi = setup.api;
+      getAppConfigStore().setClient(createTestApiClient(mockApi));
+      const harness = createConnectionHarness(mode, () => mockApi);
+      const view = render(
+        <harness.Wrapper>
+          <ThemeProvider forcedTheme="dark">
+            <FormerGeneralSettings />
+          </ThemeProvider>
+        </harness.Wrapper>
+      );
+      await waitFor(() => {
+        const trigger = getSelectTrigger(view, "Worktree archive behavior");
+        expect(trigger.textContent).toContain("Delete checkout");
+        expect(trigger.hasAttribute("disabled")).toBe(false);
+      });
+
+      mockApi = {
+        ...setup.api,
+        config: { ...setup.api.config, getConfig: () => new Promise(() => undefined) },
+      };
+      await harness.drop();
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      const trigger = getSelectTrigger(view, "Worktree archive behavior");
+      expect(trigger.textContent).toContain("Delete checkout");
+      expect(trigger.hasAttribute("disabled")).toBe(true);
+    });
+
+    // Offline the loaded values stay, but a control that writes to the server must not look
+    // usable: its write could not reach the server.
+    test("disables the server-backed controls while offline", async () => {
+      const setup = createMockAPI({ worktreeArchiveBehavior: "delete" });
+      mockApi = setup.api;
+      getAppConfigStore().setClient(createTestApiClient(mockApi));
+      const harness = createConnectionHarness(mode, () => mockApi);
+      const view = render(
+        <harness.Wrapper>
+          <ThemeProvider forcedTheme="dark">
+            <FormerGeneralSettings />
+          </ThemeProvider>
+        </harness.Wrapper>
+      );
+      const debugLogs = view.getByRole("switch", { name: "Toggle API Debug Logs" });
+      await waitFor(() => {
+        const trigger = getSelectTrigger(view, "Worktree archive behavior");
+        expect(trigger.hasAttribute("disabled")).toBe(false);
+      });
+      expect(debugLogs.hasAttribute("disabled")).toBe(false);
+
+      await harness.drop();
+      const trigger = getSelectTrigger(view, "Worktree archive behavior");
+      expect(trigger.textContent).toContain("Delete checkout");
+      expect(trigger.hasAttribute("disabled")).toBe(true);
+      expect(debugLogs.hasAttribute("disabled")).toBe(true);
+
+      harness.reconnect();
+      await waitFor(() => expect(debugLogs.hasAttribute("disabled")).toBe(false));
+    });
+  });
+
   test("renders the worktree archive behavior copy and loads the saved value", async () => {
     const { view } = renderGeneralSection({
       coderWorkspaceArchiveBehavior: "delete",
@@ -933,7 +1142,7 @@ describe("GeneralSection", () => {
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <FormerGeneralSettings />
       </TestProviders>
     );
 
@@ -973,29 +1182,30 @@ describe("GeneralSection", () => {
     const { api, updateCoderPrefsMock } = createMockAPI({
       worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     });
-    let rejectGetConfig: ((error?: unknown) => void) | undefined;
+    // The shared AppConfigStore fetches too, so settle every pending call.
+    const rejectGetConfig: Array<(error?: unknown) => void> = [];
     api.config.getConfig = mock(
       () =>
         new Promise<MockConfig>((_resolve, reject) => {
-          rejectGetConfig = reject;
+          rejectGetConfig.push(reject);
         })
     );
     mockApi = api;
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <FormerGeneralSettings />
       </TestProviders>
     );
 
     await waitFor(() => {
-      expect(rejectGetConfig).toBeDefined();
+      expect(rejectGetConfig.length).toBeGreaterThan(0);
     });
 
     const trigger = getSelectTrigger(view, "Worktree archive behavior");
     expect(trigger.hasAttribute("disabled")).toBe(true);
 
-    rejectGetConfig?.(new Error("config read failed"));
+    for (const reject of rejectGetConfig) reject(new Error("config read failed"));
 
     await waitFor(() => {
       expect(trigger.hasAttribute("disabled")).toBe(false);
@@ -1016,23 +1226,23 @@ describe("GeneralSection", () => {
       worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     });
     const loadedConfig = await getConfigMock();
-    let resolveGetConfig: ((value: MockConfig) => void) | undefined;
+    const resolveGetConfig: Array<(value: MockConfig) => void> = [];
     api.config.getConfig = mock(
       () =>
         new Promise<MockConfig>((resolve) => {
-          resolveGetConfig = resolve;
+          resolveGetConfig.push(resolve);
         })
     );
     mockApi = api;
 
     const view = render(
       <TestProviders>
-        <GeneralSection />
+        <FormerGeneralSettings />
       </TestProviders>
     );
 
     await waitFor(() => {
-      expect(resolveGetConfig).toBeDefined();
+      expect(resolveGetConfig.length).toBeGreaterThan(0);
     });
 
     const trigger = getSelectTrigger(view, "Worktree archive behavior");
@@ -1041,11 +1251,13 @@ describe("GeneralSection", () => {
     fireEvent.mouseDown(trigger);
     expect(updateCoderPrefsMock).not.toHaveBeenCalled();
 
-    resolveGetConfig?.({
-      ...loadedConfig,
-      coderWorkspaceArchiveBehavior: "delete",
-      worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
-    });
+    for (const resolve of resolveGetConfig) {
+      resolve({
+        ...loadedConfig,
+        coderWorkspaceArchiveBehavior: "delete",
+        worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
+      });
+    }
 
     await waitFor(() => {
       expect(updateCoderPrefsMock).not.toHaveBeenCalled();

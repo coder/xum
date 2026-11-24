@@ -18,6 +18,11 @@ export function generateGitStatusScript(baseRef?: string): string {
   const shellSafePreferredBranch = `'${preferredBranch.replace(/'/g, `'\\''`)}'`;
 
   return `
+# Read-only poll: never take the optional index lock. "git status" otherwise rewrites the index's
+# stat cache under .git/index.lock, and a commit that runs at that moment (an agent's, a user's)
+# fails with "index.lock: File exists" (#7626).
+export GIT_OPTIONAL_LOCKS=0
+
 # Determine primary branch to compare against
 PRIMARY_BRANCH=""
 PRIMARY_REF=""
@@ -87,10 +92,12 @@ DIRTY_COUNT=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
 # We emit *only* totals to keep output tiny (avoid output truncation in large repos).
 MERGE_BASE=$(git merge-base HEAD "$PRIMARY_REF" 2>/dev/null || echo "")
 
-# Outgoing: local changes vs merge-base (working tree vs base, includes uncommitted changes)
+# Outgoing: local changes vs merge-base (working tree vs base, includes uncommitted changes).
+# Plumbing diff-index, not "git diff": the porcelain refreshes and rewrites the index under its lock
+# even with GIT_OPTIONAL_LOCKS=0 (#7626). -M keeps the porcelain's default rename detection.
 OUTGOING_STATS="0 0"
 if [ -n "$MERGE_BASE" ]; then
-  OUTGOING_STATS=$(git diff --numstat "$MERGE_BASE" 2>/dev/null | awk '{ if ($1 == "-" || $2 == "-") next; add += $1; del += $2 } END { printf "%d %d", add+0, del+0 }')
+  OUTGOING_STATS=$(git diff-index -M --numstat "$MERGE_BASE" 2>/dev/null | awk '{ if ($1 == "-" || $2 == "-") next; add += $1; del += $2 } END { printf "%d %d", add+0, del+0 }')
   if [ -z "$OUTGOING_STATS" ]; then
     OUTGOING_STATS="0 0"
   fi

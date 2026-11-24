@@ -10,15 +10,20 @@
  * Simple providers (requiresApiKey + standard factory pattern) need NO aiService.ts changes.
  */
 
+import type { OpenAIProviderSettings } from "@ai-sdk/openai";
+import { META_API_BASE_URL } from "@/constants/modelDiscovery";
+import { normalizeOpenAICompatibleBaseURL } from "@/common/utils/providers/baseUrl";
+
 /**
  * Union type of all supported provider names
  */
 export type ProviderName =
-  | "mux-gateway"
   | "anthropic"
   | "openai"
   | "google"
+  | "google-vertex"
   | "xai"
+  | "meta"
   | "deepseek"
   | "moonshotai"
   | "zai"
@@ -47,8 +52,6 @@ interface ProviderDefinition {
   fromGatewayModelId?: (gatewayModelId: string) => { origin: string; modelId: string } | null;
   /** True when gateway is a transparent proxy and preserves canonical identity */
   passthrough?: boolean;
-  /** Whether this provider uses stroke-based icon styling instead of fill */
-  strokeBasedIcon?: boolean;
 }
 
 const toSlashSeparatedGatewayModelId = (origin: string, modelId: string): string =>
@@ -109,18 +112,6 @@ const fromDotSeparatedGatewayModelId = (
 
 // Order determines display order in UI (Settings, model selectors, etc.)
 export const PROVIDER_DEFINITIONS = {
-  "mux-gateway": {
-    displayName: "Xum Gateway",
-    import: () => import("ai"),
-    factoryName: "createGateway",
-    requiresApiKey: true, // Uses couponCode
-    kind: "gateway",
-    routes: ["anthropic", "openai", "google", "xai"],
-    passthrough: true,
-    toGatewayModelId: toSlashSeparatedGatewayModelId,
-    fromGatewayModelId: fromSlashSeparatedGatewayModelId,
-    strokeBasedIcon: true,
-  },
   anthropic: {
     displayName: "Anthropic",
     import: () => import("@ai-sdk/anthropic"),
@@ -142,10 +133,34 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: true,
     kind: "direct",
   },
+  "google-vertex": {
+    displayName: "Google Vertex AI",
+    // Node-only; browser bundles alias it to src/common/mocks/googleVertexStub.ts.
+    import: () => import("@ai-sdk/google-vertex"),
+    factoryName: "createVertex",
+    requiresApiKey: false, // Google ADC by default; an API key selects express mode
+    kind: "direct",
+  },
   xai: {
     displayName: "xAI",
     import: () => import("@ai-sdk/xai"),
     factoryName: "createXai",
+    requiresApiKey: true,
+    kind: "direct",
+  },
+  meta: {
+    displayName: "Meta",
+    // Adapt the endpoint, not the SDK namespace: encrypted reasoning uses the
+    // existing openai persistence/replay path without inheriting OpenAI settings.
+    import: () =>
+      import("@ai-sdk/openai").then(({ createOpenAI }) => ({
+        createMeta: (config: OpenAIProviderSettings) =>
+          createOpenAI({
+            ...config,
+            baseURL: normalizeOpenAICompatibleBaseURL(config.baseURL ?? META_API_BASE_URL),
+          }),
+      })),
+    factoryName: "createMeta",
     requiresApiKey: true,
     kind: "direct",
   },
@@ -231,6 +246,9 @@ export const PROVIDER_DEFINITIONS = {
     kind: "local",
   },
 } as const satisfies Record<ProviderName, ProviderDefinition>;
+
+/** Vertex serves Gemini 3.x from the global endpoint, so it is the default location. */
+export const GOOGLE_VERTEX_DEFAULT_LOCATION = "global";
 
 export const GATEWAY_PROVIDERS = Object.entries(PROVIDER_DEFINITIONS)
   .filter(([, def]) => def.kind === "gateway")

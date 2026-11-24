@@ -123,6 +123,8 @@ export class CoderSSHRuntime extends SSHRuntime {
       bgOutputDir: config.bgOutputDir,
       identityFile: config.identityFile,
       port: config.port,
+      workspaceIsolation: config.workspaceIsolation,
+      projectDir: config.projectDir,
     };
 
     super(baseConfig, transport, options);
@@ -200,6 +202,16 @@ export class CoderSSHRuntime extends SSHRuntime {
     }
 
     return status;
+  }
+
+  /** Keep cleanup hooks from starting stopped Coder workspaces through SSH. */
+  async isRunningWithoutStart(abortSignal: AbortSignal): Promise<boolean> {
+    const workspaceName = this.coderConfig.workspaceName;
+    if (!workspaceName) return false;
+    const status = await this.coderService.getWorkspaceStatus(workspaceName, {
+      signal: abortSignal,
+    });
+    return status.kind === "ok" && status.status === "running";
   }
 
   /** In-flight ensureReady promise to avoid duplicate start/wait sequences */
@@ -782,6 +794,15 @@ export class CoderSSHRuntime extends SSHRuntime {
       forkedRuntimeConfig: sharedRuntimeConfig,
       sourceRuntimeConfig: sharedRuntimeConfig,
     };
+  }
+
+  /** A new-mode creation's provisioning session is consumed only by postCreateSetup (#5113). */
+  async releaseCreationSetup(): Promise<void> {
+    const coderWorkspaceName = this.coderConfig.workspaceName;
+    if (this.coderConfig.existingWorkspace || !coderWorkspaceName) {
+      return;
+    }
+    await this.coderService.disposeProvisioningSession(coderWorkspaceName).catch(() => undefined);
   }
 
   /**

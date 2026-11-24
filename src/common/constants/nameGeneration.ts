@@ -6,9 +6,8 @@ import { getKnownModel } from "@/common/constants/knownModels";
  * WorkspaceService.getWorkspaceNamingCandidates); these only cover the unset case
  * or a failing configured model.
  *
- * Luna is the catalog's newer small OpenAI model (previously gpt-5.1-codex-mini) and
- * is also included in the Codex OAuth allowlist (CODEX_OAUTH_ALLOWED_MODELS), unlike
- * gpt-5.4-nano.
+ * Luna is the catalog's small OpenAI model and is also included in the Codex OAuth
+ * allowlist (CODEX_OAUTH_ALLOWED_MODELS).
  */
 export const NAME_GEN_PREFERRED_MODELS = [
   getKnownModel("HAIKU").id,

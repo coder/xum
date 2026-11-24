@@ -1,4 +1,3 @@
-import * as fs from "fs/promises";
 import * as path from "path";
 import {
   INSTRUCTION_SCOPE,
@@ -8,6 +7,13 @@ import {
 } from "@/common/types/instructions";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
+import {
+  AgentSandboxPathError,
+  lazyFileToolSandboxGate,
+} from "@/node/services/agentSandbox/fileToolSandbox";
+import { log } from "@/node/services/log";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { readFileString } from "@/node/utils/runtime/helpers";
 
 export const CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY = ".claude";
@@ -47,21 +53,55 @@ interface FileReader {
 }
 
 /**
- * Create a FileReader for local filesystem access.
+ * Create a FileReader for host filesystem access.
  */
-function createLocalFileReader(): FileReader {
+function createLocalFileReader(files: HostFiles): FileReader {
   return {
-    readFile: (filePath: string) => fs.readFile(filePath, "utf-8"),
+    readFile: (filePath: string) => files.promises.readFile(filePath, "utf-8"),
   };
 }
 
 /**
- * Create a FileReader for Runtime-based access (supports SSH).
+ * `reader`, reading only what a sandboxed command of `runtime` in `directory` could. A sandboxed
+ * agent can replace an instruction file with a link to a file its sandbox hides, such as
+ * ~/.ssh/id_rsa, and the read puts the file in its prompt. Such a file reads as empty: it still
+ * exists, so CLAUDE.md does not take AGENTS.md's place.
  */
-function createRuntimeFileReader(runtime: Runtime): FileReader {
+function withSandboxGate(
+  reader: FileReader,
+  runtime: Runtime,
+  directory: string,
+  sandboxEnv: NodeJS.ProcessEnv | undefined
+): FileReader {
+  const gate = lazyFileToolSandboxGate(runtime, directory, { env: sandboxEnv });
   return {
-    readFile: (filePath: string) => readFileString(runtime, filePath),
+    readFile: async (filePath: string) => {
+      try {
+        await gate(filePath, "read");
+      } catch (error) {
+        if (!(error instanceof AgentSandboxPathError)) throw error;
+        log.warn(`Skipping instruction file ${filePath}: the agent sandbox hides it`);
+        return "";
+      }
+      return reader.readFile(filePath);
+    },
   };
+}
+
+/**
+ * Create a FileReader for Runtime-based access (supports SSH), behind the runtime's sandbox.
+ */
+function createRuntimeFileReader(
+  runtime: Runtime,
+  directory: string,
+  sandboxEnv: NodeJS.ProcessEnv | undefined
+): FileReader {
+  return withSandboxGate(
+    { readFile: (filePath: string) => readFileString(runtime, filePath) },
+    runtime,
+    directory,
+    sandboxEnv
+  );
 }
 
 type ReadInstructionFileResult = { exists: false } | { exists: true; file: InstructionFile | null };
@@ -251,12 +291,22 @@ async function readInstructionSetWith(
 export async function readInstructionSet(
   directory: string | null | undefined,
   scope: InstructionScope,
-  projectName?: string
+  projectName?: string,
+  /** The host files of the read (phase 5: the agent loop passes its own). Absent: the Node layer. */
+  files: HostFiles = nodeHostFiles,
+  /** The workspace runtime whose agent sandbox the read follows, where its agent can write. */
+  sandboxRuntime?: Runtime,
+  /** The project's secrets, for that sandbox (AgentSandboxPolicyInput.env). */
+  sandboxEnv?: NodeJS.ProcessEnv
 ): Promise<InstructionSet | null> {
   if (!directory) return null;
+  const resolvedDirectory = path.resolve(directory);
+  const reader = createLocalFileReader(files);
   return readInstructionSetWith(
-    createLocalFileReader(),
-    path.resolve(directory),
+    sandboxRuntime
+      ? withSandboxGate(reader, sandboxRuntime, resolvedDirectory, sandboxEnv)
+      : reader,
+    resolvedDirectory,
     scope,
     projectName
   );
@@ -268,11 +318,13 @@ export async function readInstructionSet(
  * Xum candidate and local-file semantics never leak into ~/.claude.
  */
 export async function readClaudeCompatGlobalInstructionSet(
-  directory: string
+  directory: string,
+  /** As in readInstructionSet. */
+  files: HostFiles = nodeHostFiles
 ): Promise<InstructionSet | null> {
   const resolvedDirectory = path.resolve(directory);
   const result = await readSingleFile(
-    createLocalFileReader(),
+    createLocalFileReader(files),
     resolvedDirectory,
     CLAUDE_COMPAT_GLOBAL_INSTRUCTION_FILENAME,
     INSTRUCTION_SCOPE.GLOBAL,
@@ -304,7 +356,14 @@ export async function readInstructionSetFromRuntime(
   runtime: Runtime,
   directory: string,
   scope: InstructionScope,
-  projectName?: string
+  projectName?: string,
+  /** The project's secrets, for the runtime's agent sandbox (AgentSandboxPolicyInput.env). */
+  sandboxEnv?: NodeJS.ProcessEnv
 ): Promise<InstructionSet | null> {
-  return readInstructionSetWith(createRuntimeFileReader(runtime), directory, scope, projectName);
+  return readInstructionSetWith(
+    createRuntimeFileReader(runtime, directory, sandboxEnv),
+    directory,
+    scope,
+    projectName
+  );
 }

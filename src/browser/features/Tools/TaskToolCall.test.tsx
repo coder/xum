@@ -9,15 +9,21 @@ import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displ
 import { NestedToolsContainer } from "./Shared/NestedToolsContainer";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
+import { pageToolText, type ToolTextPage } from "@/common/utils/tools/pageToolText";
 import * as RealWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as RealSubagentTranscriptDialogModule from "@/browser/features/Tools/SubagentTranscriptDialog";
 import * as RealElapsedTimeDisplayModule from "@/browser/features/Tools/Shared/ElapsedTimeDisplay";
+import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { createMappedAliasProvidersConfig, MAPPED_ALIAS_MODEL } from "@/browser/testUtils";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 let workspaceContextMock: {
   workspaceMetadata: Map<string, FrontendWorkspaceMetadata>;
   setSelectedWorkspace?: (selection: unknown) => void;
 } | null = null;
+let providersConfigMock: ProvidersConfigMap | null = null;
+const realProvidersConfigModule = { ...RealProvidersConfigModule };
 
 // Restore the real modules after this suite so the partial stubs cannot leak into later
 // suites that render the real components (e.g. AgentContext.test uses the real provider).
@@ -25,6 +31,7 @@ restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...RealWorkspaceContextModule }],
   ["@/browser/features/Tools/SubagentTranscriptDialog", { ...RealSubagentTranscriptDialogModule }],
   ["@/browser/features/Tools/Shared/ElapsedTimeDisplay", { ...RealElapsedTimeDisplayModule }],
+  ["@/browser/hooks/useProvidersConfig", realProvidersConfigModule],
 ]);
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   useOptionalWorkspaceContext: () => workspaceContextMock,
@@ -33,6 +40,14 @@ void mock.module("@/browser/contexts/WorkspaceContext", () => ({
 
 void mock.module("@/browser/features/Tools/SubagentTranscriptDialog", () => ({
   SubagentTranscriptDialog: () => null,
+}));
+
+void mock.module("@/browser/hooks/useProvidersConfig", () => ({
+  ...realProvidersConfigModule,
+  useProvidersConfig: () => ({
+    ...realProvidersConfigModule.useProvidersConfig(),
+    config: providersConfigMock,
+  }),
 }));
 
 void mock.module("@/browser/features/Tools/Shared/ElapsedTimeDisplay", () => ({
@@ -129,6 +144,7 @@ describe("TaskToolCall", () => {
 
   afterEach(() => {
     workspaceContextMock = null;
+    providersConfigMock = null;
     cleanup();
     mock.restore();
     globalThis.window = originalWindow;
@@ -229,6 +245,53 @@ describe("TaskToolCall", () => {
     expect(settings?.textContent).not.toContain("thinking: low");
   });
 
+  test("labels best-of candidates by their group index when a middle candidate failed to spawn", () => {
+    // The partial result lists only the spawned candidates, so candidate 2's slot is missing.
+    const groupId = "task-group:parent:call-1";
+    const spawned = [0, 2].map((index) =>
+      createWorkspaceMetadata({
+        id: `task-child-${index + 1}`,
+        bestOf: { groupId, index, total: 3 },
+      })
+    );
+    workspaceContextMock = {
+      workspaceMetadata: new Map(spawned.map((workspace) => [workspace.id, workspace])),
+    };
+
+    const bestOfArgs = {
+      subagent_type: "explore",
+      prompt: "Compare three approaches.",
+      title: "Best of 3",
+      run_in_background: true,
+      n: 3,
+    };
+    const AgentTaskToolCall = getToolComponent("task", bestOfArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={bestOfArgs}
+          result={{
+            status: "running",
+            taskIds: ["task-child-1", "task-child-3"],
+            tasks: [
+              { taskId: "task-child-1", status: "running" },
+              { taskId: "task-child-3", status: "running" },
+            ],
+            note: "Grouped task creation spawned 2 of 3 task(s); 1 failed: workspace creation failed.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const text = view.container.textContent ?? "";
+    expect(text).toContain("candidate 1");
+    expect(text).toContain("candidate 3");
+    expect(text).not.toContain("candidate 2");
+  });
+
   test("prefers linked report settings over the spawn snapshot after cleanup", () => {
     // Workspace already cleaned up; the task_await-linked report carries the exec
     // settings while the spawn result kept the stale plan-phase ones.
@@ -280,6 +343,381 @@ describe("TaskToolCall", () => {
     expect(settings?.textContent).not.toContain("thinking: low");
   });
 
+  test("shows every page of a paged report on the spawn card", () => {
+    workspaceContextMock = { workspaceMetadata: new Map() };
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: true,
+    };
+    const spawnResult = { status: "running", taskId: "task-paged", note: "Started." };
+    const awaitPage = (offset: number | undefined, reportMarkdown: string, next?: number) =>
+      createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-paged"], ...(offset != null ? { offset_chars: offset } : {}) },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "task-paged",
+              reportMarkdown,
+              ...(next != null ? { nextCharOffset: next } : {}),
+            },
+          ],
+        },
+      });
+    const firstPage = "First page of the report. ";
+    const linking = computeTaskReportLinking([
+      createToolMessage({ toolName: "task", args: agentTaskArgs, result: spawnResult }),
+      awaitPage(undefined, firstPage, firstPage.length),
+      awaitPage(firstPage.length, "Second page of the report."),
+    ]);
+    expect(linking.suppressReportInAwaitTaskIds.has("task-paged")).toBe(true);
+
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={spawnResult}
+          taskReportLinking={linking}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    fireEvent.click(view.getByText("task"));
+
+    expect(view.container.textContent).toContain(
+      "First page of the report. Second page of the report."
+    );
+  });
+
+  test("keeps the later pages when the agent rereads an earlier page", () => {
+    workspaceContextMock = { workspaceMetadata: new Map() };
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: true,
+    };
+    const spawnResult = { status: "running", taskId: "task-reread", note: "Started." };
+    const report = "Page zero. Page one. Page two.";
+    const awaitPage = (offset: number) => {
+      const page = pageToolText(report, offset, 10);
+      return createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-reread"], ...(offset > 0 ? { offset_chars: offset } : {}) },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "task-reread",
+              reportMarkdown: page.text,
+              ...(page.startCharOffset != null ? { startCharOffset: page.startCharOffset } : {}),
+              ...(page.nextCharOffset != null ? { nextCharOffset: page.nextCharOffset } : {}),
+            },
+          ],
+        },
+      });
+    };
+    const linking = computeTaskReportLinking([
+      createToolMessage({ toolName: "task", args: agentTaskArgs, result: spawnResult }),
+      awaitPage(0),
+      awaitPage(10),
+      awaitPage(20),
+      // The agent reads the first page again after the last one.
+      awaitPage(0),
+    ]);
+    expect(linking.reportByTaskId.get("task-reread")?.reportMarkdown).toBe(report);
+    expect(linking.suppressReportInAwaitTaskIds.has("task-reread")).toBe(true);
+
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={spawnResult}
+          taskReportLinking={linking}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    fireEvent.click(view.getByText("task"));
+    expect(view.container.textContent).toContain(report);
+  });
+
+  describe("paged foreground reports", () => {
+    const report = "Page zero. Page one. Page two.";
+    const foregroundArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: false,
+    };
+    const firstPage = pageToolText(report, 0, 10);
+    const awaitPage = (taskId: string, offset: number, text = report) => {
+      const page = pageToolText(text, offset, 10);
+      return createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: [taskId], ...(offset > 0 ? { offset_chars: offset } : {}) },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId,
+              reportMarkdown: page.text,
+              ...(page.startCharOffset != null ? { startCharOffset: page.startCharOffset } : {}),
+              ...(page.nextCharOffset != null ? { nextCharOffset: page.nextCharOffset } : {}),
+            },
+          ],
+        },
+      });
+    };
+    const renderCard = (result: unknown, laterMessages: DisplayedMessage[]) => {
+      workspaceContextMock = { workspaceMetadata: new Map() };
+      const linking = computeTaskReportLinking([
+        createToolMessage({ toolName: "task", args: foregroundArgs, result }),
+        ...laterMessages,
+      ]);
+      const AgentTaskToolCall = getToolComponent("task", foregroundArgs, undefined);
+      const view = render(
+        <TooltipProvider>
+          <AgentTaskToolCall
+            args={foregroundArgs}
+            result={result}
+            taskReportLinking={linking}
+            status="completed"
+          />
+        </TooltipProvider>
+      );
+      fireEvent.click(view.getByText("task"));
+      return { linking, text: view.container.textContent ?? "" };
+    };
+    const singleResult = (taskId: string) => ({
+      status: "completed",
+      taskId,
+      reportMarkdown: firstPage.text,
+      nextCharOffset: firstPage.nextCharOffset,
+    });
+
+    test("shows the whole report after the agent rereads every page from 0", () => {
+      const card = renderCard(singleResult("fg-reread"), [
+        awaitPage("fg-reread", 0),
+        awaitPage("fg-reread", 10),
+        awaitPage("fg-reread", 20),
+      ]);
+      expect(card.linking.suppressReportInAwaitTaskIds.has("fg-reread")).toBe(true);
+      expect(card.text).toContain(report);
+    });
+
+    test("joins continuation pages onto a best-of candidate's first page", () => {
+      const card = renderCard(
+        {
+          status: "completed",
+          taskIds: ["fg-a", "fg-b"],
+          reports: [
+            {
+              taskId: "fg-a",
+              reportMarkdown: firstPage.text,
+              nextCharOffset: firstPage.nextCharOffset,
+            },
+            { taskId: "fg-b", reportMarkdown: "Short report." },
+          ],
+        },
+        [awaitPage("fg-a", 10), awaitPage("fg-a", 20)]
+      );
+      expect(card.linking.suppressReportInAwaitTaskIds.has("fg-a")).toBe(true);
+      expect(card.text).toContain(report);
+      expect(card.text).toContain("Short report.");
+    });
+
+    test("joins continuation pages onto a completed candidate of a pending best-of group", () => {
+      // One candidate finished with a report longer than one page; the other was backgrounded,
+      // so the foreground result has a pending status (buildPendingTaskResult).
+      const continuation = pageToolText(report, 10, 100);
+      const pendingResult = {
+        status: "running",
+        taskIds: ["fg-done", "fg-bg"],
+        tasks: [
+          { taskId: "fg-done", status: "completed" },
+          { taskId: "fg-bg", status: "interrupted" },
+        ],
+        note: "Tasks were sent to background because a new message was queued.",
+        reports: [
+          {
+            taskId: "fg-done",
+            reportMarkdown: firstPage.text,
+            nextCharOffset: firstPage.nextCharOffset,
+          },
+        ],
+      };
+      const continuationRead = createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["fg-done"], offset_chars: firstPage.nextCharOffset },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "fg-done",
+              reportMarkdown: continuation.text,
+              startCharOffset: continuation.startCharOffset,
+            },
+          ],
+        },
+      });
+      const linking = computeTaskReportLinking([
+        createToolMessage({ toolName: "task", args: foregroundArgs, result: pendingResult }),
+        continuationRead,
+      ]);
+      expect(linking.reportByTaskId.get("fg-done")?.reportMarkdown).toBe(report);
+      expect(linking.suppressReportInAwaitTaskIds.has("fg-done")).toBe(true);
+      expect(renderCard(pendingResult, [continuationRead]).text).toContain(report);
+    });
+
+    test("skips malformed foreground report entries instead of throwing", () => {
+      // A partly corrupted chat.jsonl can hold null or non-object `reports` entries; the
+      // transcript must still render (self-healing), and the valid entry still joins.
+      const corruptResult = {
+        status: "completed",
+        taskIds: ["fg-ok"],
+        reports: [
+          null,
+          "not a report",
+          7,
+          {
+            taskId: "fg-ok",
+            reportMarkdown: firstPage.text,
+            nextCharOffset: firstPage.nextCharOffset,
+          },
+        ],
+      };
+      const linking = computeTaskReportLinking([
+        createToolMessage({ toolName: "task", args: foregroundArgs, result: corruptResult }),
+      ]);
+      expect(linking.reportByTaskId.get("fg-ok")?.reportMarkdown).toBe(firstPage.text);
+      expect(renderCard(corruptResult, []).text).toContain(firstPage.text);
+    });
+
+    test("ignores tool rows named after Object.prototype members", () => {
+      // A persisted toolName is untrusted: "__proto__" or "constructor" must not resolve to a
+      // prototype member and throw while the transcript renders.
+      const linking = computeTaskReportLinking([
+        createToolMessage({ toolName: "__proto__", args: {}, result: {} }),
+        createToolMessage({ toolName: "constructor", args: {}, result: {} }),
+        createToolMessage({
+          toolName: "task",
+          args: foregroundArgs,
+          result: singleResult("fg-ok"),
+        }),
+        awaitPage("fg-ok", 10),
+        awaitPage("fg-ok", 20),
+      ]);
+      expect(linking.reportByTaskId.get("fg-ok")?.reportMarkdown).toBe(report);
+    });
+
+    test("starts a new join when a woken task reports again", () => {
+      // The second attempt's first page matches the first attempt's text.
+      const secondReport = "Page zero. Fresh end.";
+      const card = renderCard(singleResult("fg-again"), [
+        awaitPage("fg-again", 10),
+        awaitPage("fg-again", 20),
+        createToolMessage({
+          toolName: "task_send_message",
+          args: { task_id: "fg-again", message: "Once more." },
+          result: { status: "reactivated", taskId: "fg-again" },
+        }),
+        awaitPage("fg-again", 0, secondReport),
+      ]);
+      expect(card.linking.reportByTaskId.get("fg-again")?.reportMarkdown).toBe("Page zero.");
+      expect(card.text).not.toContain("Page one.");
+    });
+  });
+
+  test("joins a report page at the start the pager rounded to", () => {
+    // offset_chars 10 points inside the emoji's surrogate pair: the pager starts at 9.
+    const report = `${"a".repeat(9)}😀tail`;
+    const first = pageToolText(report, 0, 9);
+    const second = pageToolText(report, 10);
+    expect(second.startCharOffset).toBe(9);
+    const awaitPage = (args: Record<string, unknown>, page: ToolTextPage) =>
+      createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-pair"], ...args },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "task-pair",
+              reportMarkdown: page.text,
+              ...(page.startCharOffset != null ? { startCharOffset: page.startCharOffset } : {}),
+            },
+          ],
+        },
+      });
+    const linking = computeTaskReportLinking([
+      createToolMessage({
+        toolName: "task",
+        args: { subagent_type: "explore", prompt: "p", title: "t", run_in_background: true },
+        result: { status: "running", taskId: "task-pair" },
+      }),
+      awaitPage({}, first),
+      awaitPage({ offset_chars: 10 }, second),
+    ]);
+    expect(linking.reportByTaskId.get("task-pair")?.reportMarkdown).toBe(report);
+  });
+
+  test("keeps await rows visible when report pages leave a gap", () => {
+    const linking = computeTaskReportLinking([
+      createToolMessage({
+        toolName: "task",
+        args: { subagent_type: "explore", prompt: "p", title: "t", run_in_background: true },
+        result: { status: "running", taskId: "task-gap" },
+      }),
+      // Only a later page is in the transcript (the first was read in an earlier context).
+      createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-gap"], offset_chars: 50_000 },
+        result: {
+          results: [{ status: "completed", taskId: "task-gap", reportMarkdown: "Late page." }],
+        },
+      }),
+    ]);
+    expect(linking.suppressReportInAwaitTaskIds.has("task-gap")).toBe(false);
+  });
+
+  test("keeps a later page's await row visible when the first page is read after it", () => {
+    const report = "Page zero. Page one.";
+    const awaitPage = (offset: number) => {
+      const page = pageToolText(report, offset, 10);
+      return createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-late-first"], offset_chars: offset },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "task-late-first",
+              reportMarkdown: page.text,
+              ...(page.nextCharOffset != null ? { nextCharOffset: page.nextCharOffset } : {}),
+            },
+          ],
+        },
+      });
+    };
+    const linking = computeTaskReportLinking([
+      createToolMessage({
+        toolName: "task",
+        args: { subagent_type: "explore", prompt: "p", title: "t", run_in_background: true },
+        result: { status: "running", taskId: "task-late-first" },
+      }),
+      awaitPage(10),
+      awaitPage(0),
+    ]);
+    expect(linking.reportByTaskId.get("task-late-first")?.reportMarkdown).toBe("Page zero.");
+    expect(linking.suppressReportInAwaitTaskIds.has("task-late-first")).toBe(false);
+  });
+
   test("falls back to result-carried settings after workspace cleanup", () => {
     workspaceContextMock = { workspaceMetadata: new Map() };
 
@@ -310,6 +748,39 @@ describe("TaskToolCall", () => {
 
     const settings = view.container.querySelector("[data-task-ai-settings]");
     expect(settings?.textContent).toContain("thinking: low");
+  });
+
+  test("labels a mapped alias's thinking from its target model", () => {
+    workspaceContextMock = { workspaceMetadata: new Map() };
+    providersConfigMock = createMappedAliasProvidersConfig();
+
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: true,
+    };
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={{
+            status: "running",
+            taskId: "task-child-3",
+            modelString: MAPPED_ALIAS_MODEL,
+            thinkingLevel: "max",
+            note: "Task started in background.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const settings = view.container.querySelector("[data-task-ai-settings]");
+    expect(settings?.textContent).toContain("thinking: max");
   });
 });
 
@@ -923,7 +1394,7 @@ describe("TaskSendMessageToolCall", () => {
     );
     const status = view.getByRole("status");
     const sent = result.status === "accepted" || result.status === "reactivated";
-    expect(status.className.includes("text-success")).toBe(sent);
+    expect(status.className.includes("text-success-text")).toBe(sent);
     expect(status.className.includes("text-danger")).toBe(!sent && result.status !== "queued");
     if (result.error != null) expect(view.getByRole("alert").textContent).toBe(result.error);
     if (result.reason != null) expect(view.getByRole("alert").textContent).toBe(result.reason);
@@ -990,7 +1461,7 @@ describe("TaskSendMessageToolCall", () => {
         <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
       </TooltipProvider>
     );
-    expect(view.getByRole("status").className).not.toContain("text-success");
+    expect(view.getByRole("status").className).not.toContain("text-success-text");
     fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
     expect(view.getByText(taskSendMessageArgs.message)).toBeTruthy();
   });
@@ -1064,7 +1535,7 @@ describe("TaskSendMessageToolCall", () => {
       const statuses = view.getAllByRole("status");
       expect(statuses).toHaveLength(2);
       for (const status of statuses) {
-        expect(status.className).not.toContain("text-success");
+        expect(status.className).not.toContain("text-success-text");
         expect(status.className.includes("text-danger")).toBe(expectedStatus === "failed");
         expect(status.textContent).not.toContain("Result unavailable");
       }
@@ -1084,7 +1555,7 @@ describe("TaskSendMessageToolCall", () => {
           <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
         </TooltipProvider>
       );
-      expect(view.getByRole("status").className).not.toContain("text-success");
+      expect(view.getByRole("status").className).not.toContain("text-success-text");
       expect(view.getByRole("status").textContent).toBe("Result unavailable");
     }
   );

@@ -2,27 +2,16 @@ import type { ModelMessage } from "ai";
 
 import type { MuxMessage, MuxReasoningPart } from "@/common/types/message";
 
-export interface ReasoningProviderMetadata {
-  anthropic?: {
-    signature?: string;
-    redactedData?: string;
-  };
-  // OpenAI/xAI Responses attach itemId + encrypted content so subsequent turns
-  // can restore reasoning without server-side response storage. OpenAI is
-  // replayed by encrypted content only (see attachReasoningReplayMetadata).
-  openai?: {
-    itemId?: string;
-    reasoningEncryptedContent?: string | null;
-  };
-  xai?: {
-    itemId?: string;
-    reasoningEncryptedContent?: string | null;
-  };
-  // Google attaches thought signatures that must be replayed on later turns.
-  google?: {
-    thoughtSignature?: string;
-  };
-}
+// The persisted replay shape (MuxReasoningPart.providerOptions), also read from SDK
+// providerMetadata.
+export type ReasoningProviderMetadata = NonNullable<MuxReasoningPart["providerOptions"]>;
+
+type AssistantModelPart = Exclude<
+  Extract<ModelMessage, { role: "assistant" }>["content"],
+  string
+>[number];
+/** A reasoning part of an assistant ModelMessage. */
+export type ReasoningModelPart = Extract<AssistantModelPart, { type: "reasoning" }>;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null
@@ -34,6 +23,29 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+// Persisted Gemini thought-signature namespace -> metadata namespaces it is read from.
+// @ai-sdk/google-vertex writes response metadata under both `googleVertex` and
+// `vertex` and replays from `googleVertex` first, so one canonical copy is kept.
+const GEMINI_THOUGHT_SIGNATURE_SOURCES = [
+  ["google", ["google"]],
+  ["googleVertex", ["googleVertex", "vertex"]],
+] as const;
+
+function geminiThoughtSignatures(
+  record: Record<string, unknown>
+): Pick<ReasoningProviderMetadata, "google" | "googleVertex"> {
+  const signatures: Pick<ReasoningProviderMetadata, "google" | "googleVertex"> = {};
+  for (const [namespace, sources] of GEMINI_THOUGHT_SIGNATURE_SOURCES) {
+    const thoughtSignature = sources
+      .map((source) => nonEmptyString(asRecord(record[source])?.thoughtSignature))
+      .find((signature) => signature != null);
+    if (thoughtSignature) {
+      signatures[namespace] = { thoughtSignature };
+    }
+  }
+  return signatures;
+}
+
 /**
  * Runtime-validate reasoning replay data into the persisted providerOptions
  * shape, keeping only recognized string/null fields. History rows are read
@@ -43,21 +55,25 @@ function nonEmptyString(value: unknown): string | undefined {
  */
 export function sanitizeReasoningReplayMetadata(
   value: unknown
-): MuxReasoningPart["providerOptions"] | undefined {
+): ReasoningProviderMetadata | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
 
-  const options: NonNullable<MuxReasoningPart["providerOptions"]> = {};
+  const options: ReasoningProviderMetadata = {};
 
-  const anthropicSignature = nonEmptyString(asRecord(record.anthropic)?.signature);
+  const anthropic = asRecord(record.anthropic);
+  const anthropicSignature = nonEmptyString(anthropic?.signature);
+  const anthropicRedactedData = nonEmptyString(anthropic?.redactedData);
   if (anthropicSignature) {
     options.anthropic = { signature: anthropicSignature };
+  } else if (anthropicRedactedData) {
+    // A `redacted_thinking` block: the SDK replays it from redactedData, and only
+    // when no signature is present. Dropping it would shift every later block off
+    // the prefix it was signed against.
+    options.anthropic = { redactedData: anthropicRedactedData };
   }
 
-  const googleThoughtSignature = nonEmptyString(asRecord(record.google)?.thoughtSignature);
-  if (googleThoughtSignature) {
-    options.google = { thoughtSignature: googleThoughtSignature };
-  }
+  Object.assign(options, geminiThoughtSignatures(record));
 
   for (const provider of ["openai", "xai"] as const) {
     const meta = asRecord(record[provider]);
@@ -88,26 +104,23 @@ export function sanitizeReasoningReplayMetadata(
  */
 export function reasoningProviderOptionsFromMetadata(
   providerMetadata: ReasoningProviderMetadata | undefined
-): MuxReasoningPart["providerOptions"] | undefined {
+): ReasoningProviderMetadata | undefined {
   return sanitizeReasoningReplayMetadata(providerMetadata);
 }
 
 export function mergeReasoningProviderOptions(
-  existing: MuxReasoningPart["providerOptions"] | undefined,
-  incoming: MuxReasoningPart["providerOptions"] | undefined
-): MuxReasoningPart["providerOptions"] | undefined {
+  existing: ReasoningProviderMetadata | undefined,
+  incoming: ReasoningProviderMetadata | undefined
+): ReasoningProviderMetadata | undefined {
   if (!existing) return incoming;
   if (!incoming) return existing;
 
-  const merged: NonNullable<MuxReasoningPart["providerOptions"]> = { ...existing };
+  const merged: ReasoningProviderMetadata = { ...existing };
 
   if (incoming.anthropic) {
     merged.anthropic = { ...existing.anthropic, ...incoming.anthropic };
   }
-  if (incoming.google) {
-    merged.google = { ...existing.google, ...incoming.google };
-  }
-  for (const provider of ["openai", "xai"] as const) {
+  for (const provider of ["openai", "xai", "google", "googleVertex"] as const) {
     if (!incoming[provider]) continue;
     merged[provider] = { ...existing[provider], ...incoming[provider] };
   }
@@ -121,7 +134,7 @@ export function mergeReasoningProviderOptions(
  * `providerOptions` field on the input part. Never persisted to history.
  */
 type ReasoningPartWithReplayMetadata = MuxReasoningPart & {
-  providerMetadata?: MuxReasoningPart["providerOptions"];
+  providerMetadata?: ReasoningProviderMetadata;
 };
 
 /**
@@ -192,13 +205,27 @@ export function attachReasoningReplayMetadata(messages: MuxMessage[]): MuxMessag
   });
 }
 
+/** True for a reasoning part that replays `namespace` reasoning data. */
+function isReasoningReplayOf(
+  part: AssistantModelPart,
+  namespace: "openai" | "anthropic"
+): part is ReasoningModelPart {
+  return part.type === "reasoning" && part.providerOptions?.[namespace] != null;
+}
+
 /**
- * Remove rejected OpenAI reasoning from a request, not persisted history.
+ * Remove one provider's rejected reasoning from a request, not persisted history.
  * SDK step messages also carry this namespace. Keep visible text, tools, and
- * other-provider reasoning; drop only assistants emptied by this repair.
+ * other-provider reasoning; drop only assistants this repair leaves without
+ * content (Anthropic rejects whitespace-only text blocks).
  * Preserve input identities on no-op so the caller can decline a useless retry.
+ * `onlyIf` narrows the strip to some of the namespace's parts (the receipt's point).
  */
-export function stripOpenAIReasoningReplay(messages: ModelMessage[]): ModelMessage[] {
+export function stripReasoningReplay(
+  messages: ModelMessage[],
+  namespace: "openai" | "anthropic",
+  onlyIf: (part: ReasoningModelPart) => boolean = () => true
+): ModelMessage[] {
   let changed = false;
   const stripped: ModelMessage[] = [];
   for (const message of messages) {
@@ -207,14 +234,14 @@ export function stripOpenAIReasoningReplay(messages: ModelMessage[]): ModelMessa
       continue;
     }
     const content = message.content.filter(
-      (part) => !(part.type === "reasoning" && part.providerOptions?.openai != null)
+      (part) => !(isReasoningReplayOf(part, namespace) && onlyIf(part))
     );
     if (content.length === message.content.length) {
       stripped.push(message);
       continue;
     }
     changed = true;
-    if (content.length > 0) {
+    if (content.some((part) => part.type !== "text" || part.text.trim().length > 0)) {
       stripped.push({ ...message, content });
     }
   }

@@ -1,3 +1,4 @@
+import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -10,8 +11,10 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { AIService } from "@/node/services/aiService";
 
+import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import * as agentSkillsService from "@/node/services/agentSkills/agentSkillsService";
+import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
 
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 
@@ -51,6 +54,8 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
   async function createSessionHarness(args: {
     workspacePath: string;
+    /** Main checkout when it differs from the workspace's own checkout (worktrees). */
+    projectPath?: string;
     workspaceId?: string;
     runtimeConfig?: FrontendWorkspaceMetadata["runtimeConfig"];
     aiServiceOverrides?: Partial<AIService>;
@@ -60,11 +65,11 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       id: workspaceId,
       name: "ws",
       projectName: "proj",
-      projectPath: args.workspacePath,
+      projectPath: args.projectPath ?? args.workspacePath,
       namedWorkspacePath: args.workspacePath,
       runtimeConfig: args.runtimeConfig ?? { type: "local" },
     } as unknown as FrontendWorkspaceMetadata;
-    const { session, historyService, cleanup } = await createAgentSessionHarness({
+    const { session, historyService, cleanup, config } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
         getWorkspaceMetadata: mock((_workspaceId: string) => Promise.resolve(Ok(workspaceMeta))),
@@ -72,6 +77,11 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       },
     });
     historyCleanup = cleanup;
+    // #6426: these tests use project plugin skills, which load only in a trusted project.
+    await config.editConfig((cfg) => {
+      cfg.projects.set(workspaceMeta.projectPath, { workspaces: [], trusted: true });
+      return cfg;
+    });
 
     const messages: MuxMessage[] = [];
     const send = session.sendMessage.bind(session);
@@ -134,6 +144,52 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(userText).toBe("do X");
   });
 
+  it("refuses a project skill whose SKILL.md links to a file the agent sandbox hides", async () => {
+    const workspacePath = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-hidden-"))
+    );
+    const token = path.join(workspacePath, "hf-token");
+    await fs.writeFile(token, "---\nname: leak\ndescription: Leak\n---\n\nhf_secret\n");
+    await fs.mkdir(path.join(workspacePath, ".mux", "skills", "leak"), { recursive: true });
+    await fs.symlink(token, path.join(workspacePath, ".mux", "skills", "leak", "SKILL.md"));
+    const policy = spyOn(LocalBaseRuntime.prototype, "agentSandboxPolicy").mockImplementation(
+      (input) => ({
+        writeRoots: [workspacePath],
+        gitCommonDirs: [],
+        denyWrite: [],
+        denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+        allowRead: [workspacePath],
+        network: "allowlist",
+        allowedHosts: [],
+        allowLocalBinding: true,
+      })
+    );
+    try {
+      const { session, messages } = await createSessionHarness({
+        workspacePath,
+        aiServiceOverrides: {
+          getWorkspaceSandboxEnv: mock(() => Promise.resolve({ HF_TOKEN_PATH: token })),
+        },
+      });
+
+      const result = await session.sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/leak",
+          skillName: "leak",
+          scope: "project",
+        },
+      });
+
+      expect(result.success).toBe(false);
+      expect(JSON.stringify(messages)).not.toContain("hf_secret");
+    } finally {
+      policy.mockRestore();
+    }
+  });
+
   it("honors disableWorkspaceAgents when resolving skill snapshots", async () => {
     const workspaceId = "ws-test";
 
@@ -172,11 +228,144 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(snapshotText).toContain("Project override for init skill.");
   });
 
+  it("leaves ${CLAUDE_SKILL_DIR} literal and unrun for project skills read from the main checkout", async () => {
+    // A new worktree's first message resolves project skills from the project path
+    // (disableWorkspaceAgents). That copy is not the worktree's, so its path must
+    // not reach the snapshot: bash would run the main checkout's script.
+    const { workspacePath: projectPath } = await createTestWorkspaceWithSkill({
+      skillName: "proj-hello",
+      skillBody:
+        'Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh\n!`echo ran-$((20+22)) "${CLAUDE_SKILL_DIR}"`\n!`echo ran-$((40+2)) $CLAUDE_SKILL_DIR`\n!`echo ran-$((41+1)) "$(printenv CLAUDE_SKILL_DIR)"`',
+    });
+    const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
+    const worktreePath = path.join(srcBaseDir, "proj", "ws");
+    await fs.mkdir(worktreePath, { recursive: true });
+    const { session, messages } = await createSessionHarness({
+      projectPath,
+      workspacePath: worktreePath,
+      runtimeConfig: { type: "worktree", srcBaseDir },
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      disableWorkspaceAgents: true,
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/proj-hello",
+        skillName: "proj-hello",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const snapshotText = getMessageText(messages[0]);
+    expect(snapshotText).toContain("Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh");
+    expect(snapshotText).not.toContain(projectPath);
+    // A directive with the unresolved placeholder must not run: the shell would
+    // expand it to "" and hit a path at the filesystem root.
+    expect(snapshotText).not.toContain("ran-42");
+    expect(snapshotText).toContain("not run: CLAUDE_SKILL_DIR has no value");
+  });
+
+  it("tells the model when a slash skill's files are not where bash runs", async () => {
+    // A devcontainer reads skills on the host but runs bash in the container,
+    // the same split as host plugin skills in SSH/Docker workspaces. No tool
+    // result reaches the model for a slash skill, so the snapshot must say it.
+    // Longer than the snapshot cap: the note must survive truncation.
+    const skillBody = `Run sh \${CLAUDE_SKILL_DIR}/scripts/hello.sh\n${"x".repeat(MAX_AGENT_SKILL_SNAPSHOT_CHARS)}`;
+    const offHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
+    const onHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
+    const cases = [
+      {
+        workspacePath: offHost.workspacePath,
+        runtimeConfig: {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        } as const,
+        expectNote: true,
+      },
+      {
+        workspacePath: onHost.workspacePath,
+        runtimeConfig: { type: "local" } as const,
+        expectNote: false,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { session, messages } = await createSessionHarness({
+        workspacePath: testCase.workspacePath,
+        runtimeConfig: testCase.runtimeConfig,
+      });
+      const result = await session.sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/split-skill",
+          skillName: "split-skill",
+          scope: "project",
+        },
+      });
+
+      expect(result.success).toBe(true);
+      const snapshotText = getMessageText(messages[0]);
+      expect(snapshotText.includes("agent_skill_read_file")).toBe(testCase.expectNote);
+      // The host path is never offered to the off-host bash.
+      expect(snapshotText.includes(testCase.workspacePath)).toBe(!testCase.expectNote);
+      await historyCleanup?.();
+      historyCleanup = undefined;
+    }
+  });
+
+  it("names the skill directory in /skill and $skill snapshots and in the copies compaction re-injects", async () => {
+    // Without the path, models searched the filesystem for the skill's files
+    // (and read another agent's copy). Local and worktree bash run on the host.
+    const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
+    const runtimeConfigs = [{ type: "local" }, { type: "worktree", srcBaseDir }] as const;
+    for (const runtimeConfig of runtimeConfigs) {
+      const { workspacePath } = await createTestWorkspaceWithSkills({
+        skills: [
+          { skillName: "slash-skill", skillBody: "Open playbooks/a.md." },
+          { skillName: "inline-skill", skillBody: "Open playbooks/b.md." },
+        ],
+      });
+      const { session, messages } = await createSessionHarness({ workspacePath, runtimeConfig });
+      const result = await session.sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/slash-skill do X",
+          skillName: "slash-skill",
+          scope: "project",
+          agentSkillRefs: [{ skillName: "inline-skill", scope: "project", source: "inline" }],
+        },
+      });
+      expect(result.success).toBe(true);
+
+      const reinjected = extractLoadedSkillSnapshotsFromMessages(messages);
+      for (const name of ["slash-skill", "inline-skill"]) {
+        const skillDir = `\`${path.join(workspacePath, ".mux", "skills", name)}\``;
+        const snapshot = messages.find((m) => m.metadata?.agentSkillSnapshot?.skillName === name);
+        if (snapshot == null) throw new Error(`no snapshot for ${name}`);
+        // Line 0 is the <agent-skill> header; the directory line opens the body.
+        expect(getMessageText(snapshot).split("\n")[1]).toContain(skillDir);
+        expect(reinjected.find((s) => s.name === name)?.body.split("\n")[0]).toContain(skillDir);
+      }
+      await historyCleanup?.();
+      historyCleanup = undefined;
+    }
+  });
+
   it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {
     const workspaceId = "ws-test";
 
-    // agent-plugins experiment: the workspace executes in a subdirectory of the
-    // checkout, while the plugin container lives at the checkout level.
+    // The workspace executes in a subdirectory of the checkout, while the
+    // plugin container lives at the checkout level.
     const checkout = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-checkout-"));
     const subprojectPath = path.join(checkout, "packages", "app");
     await fs.mkdir(subprojectPath, { recursive: true });
@@ -205,7 +394,6 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       workspaceId,
       workspacePath: subprojectPath,
       aiServiceOverrides: {
-        isAgentPluginsEnabled: () => true,
         // Mirrors AIService: checkout root anchors plugin containers even though
         // the execution path is the subproject directory.
         resolveXumToolScopeForWorkspace: () => ({
@@ -214,6 +402,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
           projectRoot: subprojectPath,
           projectStorageAuthority: "host-local",
           checkoutRoot: checkout,
+          projectPluginsTrusted: true,
         }),
       },
     });
@@ -237,6 +426,147 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(snapshotMessage.metadata?.agentSkillSnapshot?.skillName).toBe("plugin-skill");
     const snapshotText = snapshotMessage.parts.find((p) => p.type === "text")?.text;
     expect(snapshotText).toContain("Follow the plugin skill.");
+  });
+
+  it("materializes <plugin>:<skill> refs from the named plugin (plugin skill namespaces)", async () => {
+    // A project `tdd` hides the pstack plugin's `tdd` for the bare name.
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "tdd",
+      skillBody: "PROJECT-TDD",
+    });
+    const pluginDir = path.join(workspacePath, ".mux", "plugins", "pstack");
+    await fs.mkdir(path.join(pluginDir, "skills", "tdd"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    await fs.writeFile(
+      path.join(pluginDir, "skills", "tdd", "SKILL.md"),
+      "---\nname: tdd\ndescription: Plugin tdd\n---\n\nPSTACK-TDD\n"
+    );
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        agentSkillRefs: [
+          { skillName: "pstack:tdd", scope: "project", source: "slash" },
+          { skillName: "tdd", scope: "project", source: "inline" },
+          // Unknown plugin: skipped like any unknown inline skill.
+          { skillName: "nope:tdd", scope: "project", source: "inline" },
+        ],
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(messages).toHaveLength(3);
+    const [qualified, bare] = messages;
+    expect(qualified.metadata?.agentSkillSnapshot?.skillName).toBe("pstack:tdd");
+    expect(getMessageText(qualified)).toStartWith(
+      '<agent-skill name="pstack:tdd" scope="project">'
+    );
+    expect(getMessageText(qualified)).toContain("PSTACK-TDD");
+    expect(bare.metadata?.agentSkillSnapshot?.skillName).toBe("tdd");
+    expect(getMessageText(bare)).toContain("PROJECT-TDD");
+    expect(getMessageText(messages[2])).toBe("do X");
+  });
+
+  /** A project plugin `pstack` whose `poteto-mode` names its sibling `tdd` by bare name. */
+  async function writePstackPlugin(workspacePath: string): Promise<void> {
+    const pluginDir = path.join(workspacePath, ".mux", "plugins", "pstack");
+    await fs.mkdir(pluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    for (const [name, body] of [
+      ["tdd", "PSTACK-TDD"],
+      ["how", "PSTACK-HOW"],
+      ["poteto-mode", "See the **tdd** skill. POTETO-BODY"],
+    ]) {
+      const skillDir = path.join(pluginDir, "skills", name);
+      await fs.mkdir(skillDir, { recursive: true });
+      await fs.writeFile(
+        path.join(skillDir, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Plugin ${name}\n---\n\n${body}\n`
+      );
+    }
+  }
+
+  it("maps a plugin skill's shadowed siblings in its snapshot", async () => {
+    // Project `tdd` and `how` shadow pstack's. Two shadowed siblings, so a note
+    // wrongly put on the project `tdd` would still map `how` (the self-skip
+    // alone would hide a `tdd`-only note).
+    const { workspacePath } = await createTestWorkspaceWithSkills({
+      skills: [
+        { skillName: "tdd", skillBody: "PROJECT-TDD" },
+        { skillName: "how", skillBody: "PROJECT-HOW" },
+      ],
+    });
+    await writePstackPlugin(workspacePath);
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        agentSkillRefs: [
+          { skillName: "poteto-mode", scope: "project", source: "slash" },
+          { skillName: "tdd", scope: "project", source: "inline" },
+        ],
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const [poteto, bare] = messages.map(getMessageText);
+    expect(poteto).toContain("`pstack:tdd`");
+    expect(poteto.indexOf("`pstack:tdd`")).toBeLessThan(poteto.indexOf("POTETO-BODY"));
+    expect(bare).toContain("PROJECT-TDD");
+    expect(bare).not.toContain("pstack:");
+  });
+
+  it("sends a plugin skill snapshot without the sibling note when discovery fails", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "tdd",
+      skillBody: "PROJECT-TDD",
+    });
+    await writePstackPlugin(workspacePath);
+    const { session, messages } = await createSessionHarness({ workspacePath });
+    // The note is advisory: a failed discovery must not fail the send.
+    let discoverCalls = 0;
+    const discover = spyOn(agentSkillsService, "discoverAgentSkills").mockRejectedValue(
+      new RuntimeError("ssh: Connection refused", "network")
+    );
+
+    const result = await session
+      .sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "normal",
+          agentSkillRefs: [{ skillName: "poteto-mode", scope: "project", source: "slash" }],
+        },
+      })
+      .finally(() => {
+        // Read before mockRestore, which clears the call records.
+        discoverCalls = discover.mock.calls.length;
+        discover.mockRestore();
+      });
+
+    expect(result.success).toBe(true);
+    expect(discoverCalls).toBeGreaterThan(0);
+    const poteto = getMessageText(messages[0]);
+    expect(poteto).toContain("POTETO-BODY");
+    expect(poteto).not.toContain("pstack:");
   });
 
   it("dedupes identical skill snapshots when recently inserted", async () => {
@@ -392,6 +722,49 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(userMessage.role).toBe("user");
     expect(getMessageText(userMessage)).toBe("do X");
+  });
+
+  it("materializes a /compact follow-up's skill refs after the boundary", async () => {
+    const workspaceId = "ws-test";
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "test-skill",
+      skillBody: "Follow this skill.",
+    });
+    const { session, historyService } = await createSessionHarness({ workspaceId, workspacePath });
+    const followUpText = "$test-skill go";
+    for (const message of [
+      createMuxMessage("u0", "user", "original question"),
+      createMuxMessage("summary", "assistant", "compacted summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: followUpText,
+            model: "anthropic:claude-3-5-sonnet-latest",
+            agentId: "exec",
+            muxMetadata: {
+              type: "normal",
+              agentSkillRefs: [{ skillName: "test-skill", scope: "project", source: "inline" }],
+            },
+          },
+        },
+      }),
+    ]) {
+      expect((await historyService.appendToHistory(workspaceId, message)).success).toBe(true);
+    }
+
+    expect(await session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await session.waitForIdle();
+
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const [summary, snapshot, followUp] = history.data;
+    expect(summary.id).toBe("summary");
+    expect(snapshot.metadata?.agentSkillSnapshot?.skillName).toBe("test-skill");
+    expect(getMessageText(snapshot)).toContain("Follow this skill.");
+    expect(getMessageText(followUp)).toBe(followUpText);
   });
 
   it("dedupes slash + inline refs for the same skill, slash wins", async () => {
@@ -893,6 +1266,79 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(result.success).toBe(true);
     // $1 → "hi" happens before execution, so the command itself sees the argument.
     expect(getMessageText(messages[0])).toContain("```text (output of: echo hi)\nhi\n```");
+  });
+
+  // #6766: the plugin consent fingerprint covers the raw body's directive lines only, so a
+  // newline in a slash argument must not create a directive line that then runs.
+  it("runs only lines that were directives in the raw body, whatever the arguments", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "dyn",
+      skillBody: "Notes: $ARGUMENTS\n!`echo [$ARGUMENTS]`\n!$1`echo no-args`",
+    });
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+    const argumentsText = "a\n!`touch argument-directive.marker`";
+
+    const result = await session.sendMessage(`use dyn ${argumentsText}`, {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: `/dyn ${argumentsText}`,
+        skillName: "dyn",
+        scope: "project",
+        arguments: argumentsText,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const text = getMessageText(messages[0]);
+    // The argument's directive-like line stays text, in the prose line and in the directive.
+    expect(existsSync(path.join(workspacePath, "argument-directive.marker"))).toBe(false);
+    expect(text).toContain("Notes: a\n!`touch argument-directive.marker`");
+    expect(text).not.toContain("output of: touch");
+    // `!$1` with an argument is no directive; the line is text.
+    expect(text).toContain("!a`echo no-args`");
+  });
+
+  it("runs a bundled script through ${CLAUDE_SKILL_DIR} in a dynamic context directive", async () => {
+    // Shell syntax in the checkout path must stay data: a spliced path would run
+    // `$(echo injected)` and miss the script.
+    const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-skill-$(echo injected)-"));
+    const skillDir = path.join(workspacePath, ".mux", "skills", "bundled");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      '---\nname: bundled\ndescription: Test skill\n---\n\n!`sh "${CLAUDE_SKILL_DIR}/scripts/hello.sh"`\n',
+      "utf-8"
+    );
+    await fs.mkdir(path.join(skillDir, "scripts"), { recursive: true });
+    await fs.writeFile(path.join(skillDir, "scripts", "hello.sh"), "echo bundled-ok\n", "utf-8");
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("use bundled", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/bundled",
+        skillName: "bundled",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    // The directive ran the skill's own script, located without an install path.
+    expect(getMessageText(messages[0])).toContain("\nbundled-ok\n```");
   });
 
   it("injects dynamic context for inline skill refs (also user-initiated)", async () => {

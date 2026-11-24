@@ -4,41 +4,55 @@ import {
   getOpenAIReasoningEffort,
   getThinkingDisplayLabel,
   getThinkingOptionLabel,
-  isGpt6AstraModel,
+  isGpt6LunaModel,
+  openaiGptTier,
   openaiRejectsDisabledReasoning,
   openaiSupportsNativeMaxEffort,
   openaiSupportsProMode,
   parseThinkingInput,
 } from "./thinking";
 
+describe("Gemini thinking labels", () => {
+  test("labels Neon's native xhigh as XHIGH and keeps other Gemini models at MAX", () => {
+    expect(getThinkingDisplayLabel("xhigh", "google:gemini-4-neon")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "google-vertex:gemini-4-neon")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "google:gemini-4-carbon")).toBe("MAX");
+  });
+});
+
+describe("Muse Wonder thinking labels", () => {
+  test("distinguishes native xhigh from max without changing other model labels", () => {
+    expect(getThinkingDisplayLabel("xhigh", "meta:muse-wonder-1.0")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("max", "meta:muse-wonder-1.0")).toBe("MAX");
+    expect(getThinkingDisplayLabel("xhigh", "meta:muse-wonder-1.0-custom")).toBe("MAX");
+  });
+});
+
 describe("getThinkingDisplayLabel", () => {
   test("returns MAX for xhigh/max on Anthropic models", () => {
     expect(getThinkingDisplayLabel("xhigh", "anthropic:claude-opus-4-6")).toBe("MAX");
     expect(getThinkingDisplayLabel("max", "anthropic:claude-opus-4-6")).toBe("MAX");
-    expect(getThinkingDisplayLabel("xhigh", "mux-gateway:anthropic/claude-opus-4-6")).toBe("MAX");
+    expect(getThinkingDisplayLabel("xhigh", "openrouter:anthropic/claude-opus-4-6")).toBe("MAX");
     expect(getThinkingDisplayLabel("xhigh", "anthropic:claude-opus-4-5")).toBe("MAX");
   });
 
   test("returns XHIGH for xhigh/max on OpenAI models", () => {
     expect(getThinkingDisplayLabel("xhigh", "openai:gpt-5.2")).toBe("XHIGH");
     expect(getThinkingDisplayLabel("max", "openai:gpt-5.2")).toBe("XHIGH");
-    expect(getThinkingDisplayLabel("xhigh", "mux-gateway:openai/gpt-5.2")).toBe("XHIGH");
-    expect(getThinkingDisplayLabel("max", "mux-gateway:openai/gpt-5.2")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "openrouter:openai/gpt-5.2")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("max", "openrouter:openai/gpt-5.2")).toBe("XHIGH");
   });
 
-  test("returns MAX for max on the GPT-5.6 family (native max effort), XHIGH for xhigh", () => {
-    expect(getThinkingDisplayLabel("max", "openai:gpt-5.6-sol")).toBe("MAX");
-    expect(getThinkingDisplayLabel("xhigh", "openai:gpt-5.6-sol")).toBe("XHIGH");
-    expect(getThinkingDisplayLabel("max", "mux-gateway:openai/gpt-5.6-sol")).toBe("MAX");
-    expect(getThinkingDisplayLabel("max", "openai:gpt-5.6-terra")).toBe("MAX");
-    expect(getThinkingDisplayLabel("max", "openai:gpt-5.6-luna")).toBe("MAX");
-    // Pre-5.6 OpenAI models keep the max -> XHIGH display.
-    expect(getThinkingDisplayLabel("max", "openai:gpt-5.5-pro")).toBe("XHIGH");
+  test("returns MAX for max on GPT-6.1 Sol and GPT-6 Luna (native max effort), XHIGH for xhigh", () => {
+    expect(getThinkingDisplayLabel("max", "openai:gpt-6.1-sol")).toBe("MAX");
+    expect(getThinkingDisplayLabel("xhigh", "openai:gpt-6.1-sol")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("max", "openrouter:openai/gpt-6.1-sol")).toBe("MAX");
+    expect(getThinkingDisplayLabel("max", "openai:gpt-6-luna")).toBe("MAX");
   });
 
   test("returns MAX for max on GPT-6 Astra (native max effort), XHIGH for xhigh", () => {
     expect(getThinkingDisplayLabel("max", "openai:gpt-6-astra")).toBe("MAX");
-    expect(getThinkingDisplayLabel("max", "mux-gateway:openai/gpt-6-astra")).toBe("MAX");
+    expect(getThinkingDisplayLabel("max", "openrouter:openai/gpt-6-astra")).toBe("MAX");
     expect(getThinkingDisplayLabel("xhigh", "openai:gpt-6-astra")).toBe("XHIGH");
     // Unpublished variants keep the legacy display.
     expect(getThinkingDisplayLabel("max", "openai:gpt-6-astra-mini")).toBe("XHIGH");
@@ -46,7 +60,7 @@ describe("getThinkingDisplayLabel", () => {
 
   test("returns XHIGH for xhigh on Grok 4.6/4.7 (native effort), MAX on Grok 4.5", () => {
     expect(getThinkingDisplayLabel("xhigh", "xai:grok-4.7")).toBe("XHIGH");
-    expect(getThinkingDisplayLabel("xhigh", "mux-gateway:xai/grok-4.7")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "openrouter:xai/grok-4.7")).toBe("XHIGH");
     expect(getThinkingDisplayLabel("xhigh", "xai:grok-4.6")).toBe("XHIGH");
     expect(getThinkingDisplayLabel("xhigh", "xai:grok-4.5")).toBe("MAX");
   });
@@ -74,9 +88,9 @@ describe("getThinkingOptionLabel", () => {
     expect(getThinkingOptionLabel("max", "openai:gpt-5.2")).toBe("xhigh");
   });
 
-  test("renders distinct max/xhigh options on GPT-5.6 Sol", () => {
-    expect(getThinkingOptionLabel("max", "openai:gpt-5.6-sol")).toBe("max");
-    expect(getThinkingOptionLabel("xhigh", "openai:gpt-5.6-sol")).toBe("xhigh");
+  test("renders distinct max/xhigh options on GPT-6.1 Sol", () => {
+    expect(getThinkingOptionLabel("max", "openai:gpt-6.1-sol")).toBe("max");
+    expect(getThinkingOptionLabel("xhigh", "openai:gpt-6.1-sol")).toBe("xhigh");
   });
 
   test("preserves non-xhigh labels", () => {
@@ -85,15 +99,13 @@ describe("getThinkingOptionLabel", () => {
 });
 
 describe("openaiSupportsNativeMaxEffort", () => {
-  test("matches the GPT-5.6 family including prefixed and dated variants", () => {
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-5.6-sol")).toBe(true);
-    expect(openaiSupportsNativeMaxEffort("gpt-5.6-sol")).toBe(true);
-    expect(openaiSupportsNativeMaxEffort("mux-gateway:openai/gpt-5.6-sol")).toBe(true);
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-5.6-sol-2026-07-09")).toBe(true);
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-5.6-terra")).toBe(true);
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-5.6-luna")).toBe(true);
-    // The bare alias routes to Sol and shares the family capabilities.
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-5.6")).toBe(true);
+  test("matches GPT-6.1 Sol and GPT-6 Luna including prefixed and dated variants", () => {
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6.1-sol")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("gpt-6.1-sol")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openrouter:openai/gpt-6.1-sol")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6.1-sol-2026-09-29")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-luna")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-luna-2026-09-22")).toBe(true);
   });
 
   test("rejects other models and named variants", () => {
@@ -101,61 +113,73 @@ describe("openaiSupportsNativeMaxEffort", () => {
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.5")).toBe(false);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.5-pro")).toBe(false);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.61")).toBe(false);
+    // Removed tiers no longer carry the native max effort.
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-sol")).toBe(false);
   });
 
   test("matches GPT-6 Astra including prefixed and dated variants", () => {
     expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra")).toBe(true);
     expect(openaiSupportsNativeMaxEffort("gpt-6-astra")).toBe(true);
-    expect(openaiSupportsNativeMaxEffort("mux-gateway:openai/gpt-6-astra")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openrouter:openai/gpt-6-astra")).toBe(true);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-2026-09-30")).toBe(true);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-20260930")).toBe(true);
   });
 
-  test("does not extend the Astra matcher to named variants or other GPT-6 ids", () => {
-    expect(isGpt6AstraModel("openai:gpt-6-astra-mini")).toBe(false);
-    expect(isGpt6AstraModel("openai:gpt-6-astra.1")).toBe(false);
-    expect(isGpt6AstraModel("openai:gpt-6-astral")).toBe(false);
-    expect(isGpt6AstraModel("openai:gpt-6")).toBe(false);
-    expect(isGpt6AstraModel("openai:gpt-6-sol")).toBe(false);
-    expect(isGpt6AstraModel("openai:gpt-5.6-sol")).toBe(false);
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-6")).toBe(false);
+  test("does not extend the GPT tiers to named variants or other GPT-6 ids", () => {
+    for (const model of [
+      "openai:gpt-6-astra-mini",
+      "openai:gpt-6-astra.1",
+      "openai:gpt-6-astral",
+      "openai:gpt-6",
+      "openai:gpt-6-sol",
+      "openai:gpt-6.2",
+      "openai:gpt-6.2-terra",
+      "openai:gpt-6.2-sol-mini",
+    ]) {
+      expect(openaiGptTier(model)).toBeUndefined();
+      expect(openaiSupportsNativeMaxEffort(model)).toBe(false);
+    }
   });
 
-  test("accepts only dated Astra snapshots, not numeric-prefixed qualifiers", () => {
-    expect(isGpt6AstraModel("gpt-6-astra-2026-09-30")).toBe(true);
-    expect(isGpt6AstraModel("gpt-6-astra-20260930")).toBe(true);
+  test("accepts only dated snapshots, not numeric-prefixed qualifiers", () => {
+    expect(openaiRejectsDisabledReasoning("gpt-6-astra-2026-09-30")).toBe(true);
+    expect(openaiRejectsDisabledReasoning("gpt-6-astra-20260930")).toBe(true);
+    expect(openaiRejectsDisabledReasoning("gpt-6.2-sol-2026-11-17")).toBe(true);
     // Numeric-prefixed qualifiers are not dated snapshots and must not inherit
     // Astra's reasoning surface.
-    expect(isGpt6AstraModel("gpt-6-astra-2-mini")).toBe(false);
-    expect(isGpt6AstraModel("gpt-6-astra-2026-preview")).toBe(false);
-    expect(isGpt6AstraModel("gpt-6-astra-2026-09-30-preview")).toBe(false);
-    expect(isGpt6AstraModel("gpt-6-astra-2026")).toBe(false);
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-2-mini")).toBe(false);
+    for (const model of [
+      "gpt-6-astra-2-mini",
+      "gpt-6-astra-2026-preview",
+      "gpt-6-astra-2026-09-30-preview",
+      "gpt-6-astra-2026",
+      "gpt-6.2-astra-2026-11-17-2026-11-17",
+    ]) {
+      expect(openaiGptTier(model)).toBeUndefined();
+      expect(openaiRejectsDisabledReasoning(model)).toBe(false);
+    }
   });
 });
 
 describe("openaiSupportsProMode", () => {
-  test("matches the GPT-5.6 family including prefixed and dated variants", () => {
-    expect(openaiSupportsProMode("openai:gpt-5.6-sol")).toBe(true);
-    expect(openaiSupportsProMode("openai:gpt-5.6-terra")).toBe(true);
-    expect(openaiSupportsProMode("openai:gpt-5.6-luna")).toBe(true);
-    expect(openaiSupportsProMode("mux-gateway:openai/gpt-5.6-sol")).toBe(true);
-    expect(openaiSupportsProMode("gpt-5.6-terra-2026-07-09")).toBe(true);
-    // The bare alias routes to Sol and shares the family capabilities.
-    expect(openaiSupportsProMode("openai:gpt-5.6")).toBe(true);
+  test("matches GPT-6.1 Sol and GPT-6 Luna including prefixed and dated variants", () => {
+    expect(openaiSupportsProMode("openai:gpt-6.1-sol")).toBe(true);
+    expect(openaiSupportsProMode("openai:gpt-6-luna")).toBe(true);
+    expect(openaiSupportsProMode("openrouter:openai/gpt-6.1-sol")).toBe(true);
+    expect(openaiSupportsProMode("gpt-6-luna-2026-09-22")).toBe(true);
   });
 
   test("rejects older models and named variants", () => {
     expect(openaiSupportsProMode("openai:gpt-5.5-pro")).toBe(false);
     expect(openaiSupportsProMode("openai:gpt-5.6-sol-mini")).toBe(false);
     expect(openaiSupportsProMode("openai:gpt-5.61")).toBe(false);
+    expect(openaiSupportsProMode("openai:gpt-6-sol")).toBe(false);
     expect(openaiSupportsProMode("anthropic:claude-opus-4-7")).toBe(false);
   });
 
   test("supports Astra and dated snapshots without enabling unpublished variants", () => {
     for (const model of [
       "openai:gpt-6-astra",
-      "mux-gateway:openai/gpt-6-astra",
+      "openrouter:openai/gpt-6-astra",
       "openai:gpt-6-astra-2026-09-03",
       "gpt-6-astra-20260903",
     ]) {
@@ -168,39 +192,106 @@ describe("openaiSupportsProMode", () => {
 });
 
 describe("getOpenAIReasoningEffort", () => {
-  test("maps max to the native max effort on the GPT-5.6 family only", () => {
-    expect(getOpenAIReasoningEffort("max", "openai:gpt-5.6-sol")).toBe("max");
-    expect(getOpenAIReasoningEffort("xhigh", "openai:gpt-5.6-sol")).toBe("xhigh");
-    expect(getOpenAIReasoningEffort("max", "openai:gpt-5.6-terra")).toBe("max");
-    expect(getOpenAIReasoningEffort("max", "openai:gpt-5.6-luna")).toBe("max");
+  test("maps max to the native max effort on the GPT-6 tiers only", () => {
+    expect(getOpenAIReasoningEffort("max", "openai:gpt-6.1-sol")).toBe("max");
+    expect(getOpenAIReasoningEffort("xhigh", "openai:gpt-6.1-sol")).toBe("xhigh");
+    expect(getOpenAIReasoningEffort("max", "openai:gpt-6-luna")).toBe("max");
     expect(getOpenAIReasoningEffort("max", "openai:gpt-5.5-pro")).toBe("xhigh");
   });
 
-  test("maps off to the explicit none effort on GPT-5.6 (omission defaults to medium)", () => {
-    expect(getOpenAIReasoningEffort("off", "openai:gpt-5.6-sol")).toBe("none");
-    expect(getOpenAIReasoningEffort("off", "openai:gpt-5.6-luna")).toBe("none");
-    // Pre-5.6 models keep the omit-on-off behavior.
+  test("maps off to the explicit none effort on GPT-6 Luna (omission defaults to medium)", () => {
+    expect(getOpenAIReasoningEffort("off", "openai:gpt-6-luna")).toBe("none");
+    expect(getOpenAIReasoningEffort("off", "openrouter:openai/gpt-6-luna")).toBe("none");
+    // Older models keep the omit-on-off behavior.
     expect(getOpenAIReasoningEffort("off", "openai:gpt-5.5")).toBeUndefined();
   });
 
   test("keeps the standard mapping for lower levels", () => {
-    expect(getOpenAIReasoningEffort("high", "openai:gpt-5.6-sol")).toBe("high");
-    expect(getOpenAIReasoningEffort("low", "openai:gpt-5.6-sol")).toBe("low");
+    expect(getOpenAIReasoningEffort("high", "openai:gpt-6-luna")).toBe("high");
+    expect(getOpenAIReasoningEffort("low", "openai:gpt-6-luna")).toBe("low");
+  });
+
+  // https://developers.openai.com/api/docs/models/gpt-6.2-sol and gpt-6.2-astra:
+  // "The API rejects requests that set reasoning effort to `none`."
+  test("gives GPT-6.1 Sol and GPT-6.2 Astra's surface: native max, off clamps to low, Pro allowed", () => {
+    for (const id of [
+      "openai:gpt-6.1-sol",
+      "openrouter:openai/gpt-6.1-sol",
+      "openai:gpt-6.1-sol-2026-09-29",
+      "openai:gpt-6.2-sol",
+      "openai:gpt-6.2-astra",
+      "openrouter:openai/gpt-6.2-sol",
+    ]) {
+      expect(openaiRejectsDisabledReasoning(id)).toBe(true);
+      expect(openaiSupportsProMode(id)).toBe(true);
+      expect(getOpenAIReasoningEffort("max", id)).toBe("max");
+      expect(getOpenAIReasoningEffort("off", id)).toBe("low");
+    }
+    // GPT-6.1 Sol must not inherit Luna's "none" (Chat Completions tool clamp)
+    // behavior, and variants stay outside it.
+    expect(isGpt6LunaModel("openai:gpt-6.1-sol")).toBe(false);
+    expect(isGpt6LunaModel("openai:gpt-6.2-sol")).toBe(false);
+    expect(openaiRejectsDisabledReasoning("openai:gpt-6.1-sol-mini")).toBe(false);
+    expect(openaiRejectsDisabledReasoning("openai:gpt-6-sol")).toBe(false);
   });
 
   test("gives GPT-6 Astra native max but clamps off to low (it rejects none)", () => {
     expect(openaiRejectsDisabledReasoning("openai:gpt-6-astra")).toBe(true);
-    expect(openaiRejectsDisabledReasoning("openai:gpt-5.6-sol")).toBe(false);
+    expect(openaiRejectsDisabledReasoning("openai:gpt-6-luna")).toBe(false);
     expect(getOpenAIReasoningEffort("max", "openai:gpt-6-astra")).toBe("max");
     expect(getOpenAIReasoningEffort("xhigh", "openai:gpt-6-astra")).toBe("xhigh");
     expect(getOpenAIReasoningEffort("off", "openai:gpt-6-astra")).toBe("low");
-    expect(getOpenAIReasoningEffort("off", "mux-gateway:openai/gpt-6-astra-2026-09-03")).toBe(
-      "low"
-    );
-    expect(getOpenAIReasoningEffort("medium", "mux-gateway:openai/gpt-6-astra")).toBe("medium");
+    expect(getOpenAIReasoningEffort("off", "openrouter:openai/gpt-6-astra-2026-09-03")).toBe("low");
+    expect(getOpenAIReasoningEffort("medium", "openrouter:openai/gpt-6-astra")).toBe("medium");
     // Unpublished variants keep the legacy mapping.
     expect(getOpenAIReasoningEffort("max", "openai:gpt-6-astra-mini")).toBe("xhigh");
     expect(getOpenAIReasoningEffort("off", "openai:gpt-6-astra-mini")).toBeUndefined();
+  });
+});
+
+describe("GPT-5.6 catalogue models", () => {
+  // Not built in since #5258, but Settings → Models still offers them and OpenAI
+  // serves none through native max and Pro mode on the whole family.
+  const GPT_56_IDS = [
+    "openai:gpt-5.6",
+    "openai:gpt-5.6-sol",
+    "openai:gpt-5.6-terra",
+    "openai:gpt-5.6-luna",
+    "openrouter:openai/gpt-5.6-sol",
+    "openai:gpt-5.6-sol-2026-07-09",
+    "openai:gpt-5.6-sol-20260709",
+    // A mappedToModel target written without a provider.
+    "gpt-5.6-sol",
+  ];
+
+  test("get native max, explicit none, Pro mode, and distinct MAX/XHIGH labels", () => {
+    for (const id of GPT_56_IDS) {
+      expect(openaiSupportsNativeMaxEffort(id)).toBe(true);
+      expect(openaiSupportsProMode(id)).toBe(true);
+      expect(getOpenAIReasoningEffort("max", id)).toBe("max");
+      expect(getOpenAIReasoningEffort("xhigh", id)).toBe("xhigh");
+      expect(getOpenAIReasoningEffort("off", id)).toBe("none");
+      expect(getThinkingDisplayLabel("max", id)).toBe("MAX");
+      expect(getThinkingDisplayLabel("xhigh", id)).toBe("XHIGH");
+      expect(getThinkingOptionLabel("max", id)).toBe("max");
+      expect(getThinkingOptionLabel("xhigh", id)).toBe("xhigh");
+    }
+  });
+
+  test("leave Cyber, unannounced variants, and older GPT models on the legacy surface", () => {
+    for (const id of [
+      "openai:gpt-5.6-cyber",
+      "openai:gpt-5.6-sol-mini",
+      "openai:gpt-5.61",
+      "openai:gpt-5.5",
+      "openai:gpt-5.5-pro",
+      "openai:gpt-6-sol",
+    ]) {
+      expect(openaiSupportsNativeMaxEffort(id)).toBe(false);
+      expect(openaiSupportsProMode(id)).toBe(false);
+      expect(getOpenAIReasoningEffort("max", id)).toBe("xhigh");
+      expect(getOpenAIReasoningEffort("off", id)).toBeUndefined();
+    }
   });
 });
 

@@ -142,6 +142,13 @@ type WorkflowPriorAttemptPlan =
   | { kind: "rethrow" };
 
 /**
+ * classifyPriorAttempt's verdicts: a plan, or `fresh` — the checkpointed child was never published
+ * and is now tombstoned (tombstoneUnpublishedTask), so the step reserves a new child with no prior
+ * attempt to retire.
+ */
+type WorkflowPriorAttemptClassification = WorkflowPriorAttemptPlan | { kind: "fresh" };
+
+/**
  * The checkpointed child a replacement retires (G2). Its attempt is claimed before the
  * replacement is reserved, and the replacement's publishing commit consumes that claim once.
  */
@@ -306,6 +313,14 @@ export interface WorkflowTaskAdapter {
     attemptId: string,
     claimant: { stepId: string; inputHash: string }
   ): Promise<{ success: true; nonce: string } | { success: false; error: string }>;
+  /**
+   * Make sure a checkpointed child that was never published (no task record) can never be: its
+   * reservation's late publishing commit refuses once this succeeds. Absent → such a step stays
+   * unresolved (never replaced next to a commit that may still land).
+   */
+  tombstoneUnpublishedTask?(
+    taskId: string
+  ): Promise<{ success: true } | { success: false; error: string }>;
   waitForAgentTask?(
     taskId: string,
     spec: WorkflowAgentSpec,
@@ -344,7 +359,11 @@ export interface WorkflowTaskAdapter {
     spec: WorkflowApplyPatchSpec,
     options?: { abortSignal?: AbortSignal }
   ): Promise<unknown>;
-  interruptRun?(): Promise<void>;
+  /**
+   * Stop the run's agent tasks. `onChildrenSettled` runs once they settled (their settlement
+   * receipts durable) and before any best-effort cleanup (WorkflowService.interruptRunTree).
+   */
+  interruptRun?(options?: { onChildrenSettled?: () => Promise<void> }): Promise<void>;
   /**
    * Called when the run reaches a terminal state. Not called when the run is
    * backgrounded (the background continuation re-enters run()) or when the
@@ -353,12 +372,54 @@ export interface WorkflowTaskAdapter {
   onRunEnded?(): Promise<void> | void;
 }
 
+/**
+ * Lets an interrupt keep this runner's lease (still renewed) until the interrupt has written the
+ * run's durable "interrupted" status (WorkflowService.interruptRunTree). The interrupt terminates
+ * the run's children BEFORE that write, so in between the run still reads `running`; the held lease
+ * is what keeps crash recovery in any backend from starting another runner, whose new children the
+ * interrupt would never stop. Synchronous on both sides, so a hold is granted exactly when the
+ * runner will wait for it.
+ */
+export class WorkflowRunnerLeaseHold {
+  private closed = false;
+  private readonly holds: Array<Promise<void>> = [];
+  private readonly releasedSignal = Promise.withResolvers<void>();
+
+  /** Settles once the runner released its lease (or failed to), at the end of its exit. */
+  get released(): Promise<void> {
+    return this.releasedSignal.promise;
+  }
+
+  markReleased(): void {
+    this.releasedSignal.resolve();
+  }
+
+  /** True when the runner has not begun its exit: it then waits for `until` before releasing. */
+  tryHold(until: Promise<void>): boolean {
+    if (this.closed) return false;
+    this.holds.push(until);
+    return true;
+  }
+
+  /** The lease is no longer this runner's to keep: refuse new holds (held ones stay). */
+  refuse(): void {
+    this.closed = true;
+  }
+
+  /** The runner's exit, before it stops renewing: no hold can start after this call. */
+  async close(): Promise<void> {
+    this.closed = true;
+    await Promise.allSettled(this.holds);
+  }
+}
+
 export interface WorkflowRunnerRunOptions {
   onLeaseAcquired?: () => void;
   abortSignal?: AbortSignal;
   backgroundOnMessageQueued?: boolean;
   allowResumeFromInterrupted?: boolean;
   allowRetryFromFailedCheckpoint?: boolean;
+  leaseHold?: WorkflowRunnerLeaseHold;
 }
 
 interface WorkflowRunnerLeaseGuard {
@@ -440,6 +501,22 @@ function parseParallelAgentsOptions(raw: unknown): { maxParallel?: number } {
 
 function isAgentReportWaitTimeoutError(error: unknown): boolean {
   return isErrorWithName(error, "AgentReportWaitTimeoutError");
+}
+
+/** Milliseconds left until an ISO deadline (at least 1), or the fallback when none is usable. */
+function remainingMsUntilDeadline(
+  deadlineIso: string | undefined,
+  fallbackMs: number,
+  nowMs: number
+): number {
+  if (deadlineIso == null) {
+    return fallbackMs;
+  }
+  const parsedDeadlineMs = Date.parse(deadlineIso);
+  if (!Number.isFinite(parsedDeadlineMs)) {
+    return fallbackMs;
+  }
+  return Math.max(1, parsedDeadlineMs - nowMs);
 }
 
 function buildWorkflowAgentTimeoutFinalizationToken(
@@ -600,6 +677,8 @@ export class WorkflowRunner {
           ? `Workflow run lease lost: ${runId}: ${cause.message}`
           : `Workflow run lease lost: ${runId}`
       );
+      // A lost lease fences nothing: an interrupt must not order itself on this runner's hold.
+      options?.leaseHold?.refuse();
       activeRuntime?.abort();
     };
     const leaseGuard: WorkflowRunnerLeaseGuard = {
@@ -955,11 +1034,17 @@ export class WorkflowRunner {
       });
       return result;
     } finally {
+      // Before the renewal stops: a held lease must stay fresh (WorkflowRunnerLeaseHold).
+      await options?.leaseHold?.close();
       removeAbortListener();
       clearInterval(leaseRenewal);
       this.releaseOwnedAttempts(runId);
       await leaseRenewalInFlight;
-      await this.runStore.releaseLease(runId, this.runnerId);
+      try {
+        await this.runStore.releaseLease(runId, this.runnerId);
+      } finally {
+        options?.leaseHold?.markReleased();
+      }
     }
   }
 
@@ -1406,7 +1491,7 @@ export class WorkflowRunner {
         leaseGuard: options.leaseGuard,
         runAbortSignal: options.waitOptions?.abortSignal,
       });
-      if (plan.kind !== "replace") {
+      if (plan.kind === "adopt" || plan.kind === "reattach") {
         await this.recordTaskStartedEventIfMissing(runId, sequence, {
           stepId: spec.id,
           taskId: priorTaskId,
@@ -1435,7 +1520,14 @@ export class WorkflowRunner {
         options.startedAgentSteps.set(handleId, state);
         return { handleId };
       }
-      priorReplace = { taskId: priorTaskId, attemptId: plan.attemptId };
+      assert(
+        plan.kind === "replace" || plan.kind === "fresh",
+        "classifyPriorAttempt returns adopt, replace, fresh, or reattach"
+      );
+      // `fresh`: the tombstoned child was never published, so there is nothing to retire.
+      if (plan.kind === "replace") {
+        priorReplace = { taskId: priorTaskId, attemptId: plan.attemptId };
+      }
     } else if (existingStep?.status === "failed" && existingStep.taskId != null) {
       priorReplace = await this.consultFailedCheckpoint(
         { stepId: spec.id, taskId: existingStep.taskId },
@@ -2154,24 +2246,12 @@ export class WorkflowRunner {
         throw error;
       }
     };
-    const remainingMsUntil = (deadlineIso: string | undefined, fallbackMs: number): number => {
-      if (deadlineIso == null) {
-        return fallbackMs;
-      }
-      const parsedDeadlineMs = Date.parse(deadlineIso);
-      if (!Number.isFinite(parsedDeadlineMs)) {
-        return fallbackMs;
-      }
-      return Math.max(1, parsedDeadlineMs - this.clock.nowMs());
-    };
+    const remainingMsUntil = (deadlineIso: string | undefined, fallbackMs: number): number =>
+      remainingMsUntilDeadline(deadlineIso, fallbackMs, this.clock.nowMs());
     const tryReadAcceptedReport = async (): Promise<WorkflowAgentResult | null> => {
-      const completedStep = await this.runStore.getCompletedStep(
-        runId,
-        step.spec.id,
-        step.inputHash
-      );
-      if (completedStep?.result != null) {
-        return { ...completedStep.result, taskId: step.taskId };
+      const acceptedResult = await this.readCompletedAgentStepResult(runId, step);
+      if (acceptedResult != null) {
+        return acceptedResult;
       }
       try {
         return await waitForReport(1);
@@ -2185,36 +2265,12 @@ export class WorkflowRunner {
         return acceptedReportBeforeHardTimeout;
       }
 
-      const errorMessage = `Workflow agent step ${step.spec.id} exceeded its soft timeout (${timeout.softMs}ms) and did not produce a valid final response within the grace period (${timeout.graceMs}ms).`;
-      const hardTimedOutAt = this.clock.nowIso();
-      await this.recordStepTimeoutMetadata(runId, {
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        taskId: step.taskId,
-        startedAt: step.startedAt,
-        timeout: { hardTimedOutAt },
-      });
-      await this.appendEvent(runId, {
-        sequence: sequence.next(),
-        type: "timeout",
-        at: hardTimedOutAt,
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        phase: "hard",
-        details: { error: errorMessage },
-      });
-      await this.recordTaskEventIfMissing(runId, sequence, {
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        title: step.spec.title,
-        status: "timed_out",
-      });
-      await this.taskAdapter.failAgentTaskForHardTimeout?.(step.taskId, {
-        workflowRunId: runId,
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        reason: errorMessage,
-      });
+      const { errorMessage, hardTimedOutAt } = await this.recordAgentStepHardTimeout(
+        runId,
+        sequence,
+        step,
+        timeout
+      );
       const acceptedReportAfterHardTimeout = await tryReadAcceptedReport();
       if (acceptedReportAfterHardTimeout != null) {
         return acceptedReportAfterHardTimeout;
@@ -2229,37 +2285,14 @@ export class WorkflowRunner {
       });
       throw createWorkflowAgentHardTimeoutError(errorMessage);
     };
-    const buildHardDeadlineFromNow = (): string =>
-      new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
-    const recordFinalizationPromptAccepted = async (
+    const recordFinalizationPromptAccepted = (
       finalizationToken: string | undefined,
       finalizationResult: "prompted" | "queued" | "already_reported" | "not_active"
-    ): Promise<string> => {
-      const finalizationPromptSentAt = this.clock.nowIso();
-      const hardDeadlineAt = buildHardDeadlineFromNow();
-      step.leaseGuard.throwIfLost();
-      await this.recordStepTimeoutMetadata(runId, {
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        taskId: step.taskId,
-        startedAt: step.startedAt,
-        timeout: {
-          ...(finalizationToken != null ? { finalizationToken } : {}),
-          finalizationPromptSentAt,
-          hardDeadlineAt,
-        },
+    ): Promise<string> =>
+      this.recordAgentFinalizationPromptAccepted(runId, sequence, step, timeout, {
+        finalizationToken,
+        finalizationResult,
       });
-      await this.appendEvent(runId, {
-        sequence: sequence.next(),
-        type: "timeout",
-        at: finalizationPromptSentAt,
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        phase: "finalization_prompt_sent",
-        details: { result: finalizationResult },
-      });
-      return hardDeadlineAt;
-    };
     const waitDuringGrace = async (graceTimeoutMs: number): Promise<WorkflowAgentResult> => {
       try {
         const result = await waitForReport(graceTimeoutMs);
@@ -2326,26 +2359,66 @@ export class WorkflowRunner {
       }
     }
 
-    const completedAfterSoftTimeout = await this.runStore.getCompletedStep(
-      runId,
-      step.spec.id,
-      step.inputHash
-    );
-    if (completedAfterSoftTimeout?.result != null) {
-      return { ...completedAfterSoftTimeout.result, taskId: step.taskId };
+    const completedAfterSoftTimeout = await this.readCompletedAgentStepResult(runId, step);
+    if (completedAfterSoftTimeout != null) {
+      return completedAfterSoftTimeout;
     }
 
     assert(
       this.taskAdapter.requestAgentFinalReportForTimeout != null,
       "WorkflowRunner timeout wait requires requestAgentFinalReportForTimeout"
     );
+    const { finalizationToken, hardDeadlineAt } = await this.recordAgentStepSoftTimeout(
+      runId,
+      sequence,
+      step,
+      timeout
+    );
+
+    const finalizationResult = await this.taskAdapter.requestAgentFinalReportForTimeout(
+      step.taskId,
+      {
+        workflowRunId: runId,
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+        finalizationToken,
+        finalInstructions: timeout.finalInstructions,
+      }
+    );
+    if (finalizationResult === "already_reported") {
+      return await waitForReport(timeout.graceMs);
+    }
+    const acceptedHardDeadlineAt =
+      finalizationResult === "prompted"
+        ? await recordFinalizationPromptAccepted(finalizationToken, finalizationResult)
+        : hardDeadlineAt;
+
+    return await waitDuringGrace(remainingMsUntil(acceptedHardDeadlineAt, timeout.graceMs));
+  }
+
+  /** The step's journaled result when another writer already accepted the child's report. */
+  private async readCompletedAgentStepResult(
+    runId: string,
+    step: { spec: WorkflowAgentSpec; inputHash: string; taskId: string }
+  ): Promise<WorkflowAgentResult | null> {
+    const completedStep = await this.runStore.getCompletedStep(runId, step.spec.id, step.inputHash);
+    return completedStep?.result != null ? { ...completedStep.result, taskId: step.taskId } : null;
+  }
+
+  /** Journals a soft timeout: the grace deadline and token the finalization prompt carries. */
+  private async recordAgentStepSoftTimeout(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: { spec: WorkflowAgentSpec; inputHash: string; startedAt: string; taskId: string },
+    timeout: WorkflowAgentTimeoutSpec
+  ): Promise<{ finalizationToken: string; hardDeadlineAt: string }> {
     const softTimedOutAt = this.clock.nowIso();
     const finalizationToken = buildWorkflowAgentTimeoutFinalizationToken(
       runId,
       step,
       softTimedOutAt
     );
-    const hardDeadlineAt = buildHardDeadlineFromNow();
+    const hardDeadlineAt = new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
     await this.recordStepTimeoutMetadata(runId, {
       stepId: step.spec.id,
       inputHash: step.inputHash,
@@ -2372,26 +2445,92 @@ export class WorkflowRunner {
       title: step.spec.title,
       status: "finalizing",
     });
+    return { finalizationToken, hardDeadlineAt };
+  }
 
-    const finalizationResult = await this.taskAdapter.requestAgentFinalReportForTimeout(
-      step.taskId,
-      {
-        workflowRunId: runId,
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        finalizationToken,
-        finalInstructions: timeout.finalInstructions,
-      }
-    );
-    if (finalizationResult === "already_reported") {
-      return await waitForReport(timeout.graceMs);
+  /** Journals an accepted finalization prompt; the grace period restarts now. */
+  private async recordAgentFinalizationPromptAccepted(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: {
+      spec: WorkflowAgentSpec;
+      inputHash: string;
+      startedAt: string;
+      taskId: string;
+      leaseGuard: WorkflowRunnerLeaseGuard;
+    },
+    timeout: WorkflowAgentTimeoutSpec,
+    prompt: {
+      finalizationToken: string | undefined;
+      finalizationResult: "prompted" | "queued" | "already_reported" | "not_active";
     }
-    const acceptedHardDeadlineAt =
-      finalizationResult === "prompted"
-        ? await recordFinalizationPromptAccepted(finalizationToken, finalizationResult)
-        : hardDeadlineAt;
+  ): Promise<string> {
+    const finalizationPromptSentAt = this.clock.nowIso();
+    const hardDeadlineAt = new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
+    step.leaseGuard.throwIfLost();
+    await this.recordStepTimeoutMetadata(runId, {
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      taskId: step.taskId,
+      startedAt: step.startedAt,
+      timeout: {
+        ...(prompt.finalizationToken != null
+          ? { finalizationToken: prompt.finalizationToken }
+          : {}),
+        finalizationPromptSentAt,
+        hardDeadlineAt,
+      },
+    });
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "timeout",
+      at: finalizationPromptSentAt,
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      phase: "finalization_prompt_sent",
+      details: { result: prompt.finalizationResult },
+    });
+    return hardDeadlineAt;
+  }
 
-    return await waitDuringGrace(remainingMsUntil(acceptedHardDeadlineAt, timeout.graceMs));
+  /** Journals a hard timeout and asks the task adapter to fail the child. */
+  private async recordAgentStepHardTimeout(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: { spec: WorkflowAgentSpec; inputHash: string; startedAt: string; taskId: string },
+    timeout: WorkflowAgentTimeoutSpec
+  ): Promise<{ errorMessage: string; hardTimedOutAt: string }> {
+    const errorMessage = `Workflow agent step ${step.spec.id} exceeded its soft timeout (${timeout.softMs}ms) and did not produce a valid final response within the grace period (${timeout.graceMs}ms).`;
+    const hardTimedOutAt = this.clock.nowIso();
+    await this.recordStepTimeoutMetadata(runId, {
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      taskId: step.taskId,
+      startedAt: step.startedAt,
+      timeout: { hardTimedOutAt },
+    });
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "timeout",
+      at: hardTimedOutAt,
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      phase: "hard",
+      details: { error: errorMessage },
+    });
+    await this.recordTaskEventIfMissing(runId, sequence, {
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      title: step.spec.title,
+      status: "timed_out",
+    });
+    await this.taskAdapter.failAgentTaskForHardTimeout?.(step.taskId, {
+      workflowRunId: runId,
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      reason: errorMessage,
+    });
+    return { errorMessage, hardTimedOutAt };
   }
 
   private async runOrResumeAgentStep(
@@ -2417,7 +2556,9 @@ export class WorkflowRunner {
     }
   ): Promise<WorkflowAgentRunResult> {
     step.leaseGuard.throwIfLost();
-    const restart = async (priorChild: WorkflowPriorChild): Promise<WorkflowAgentRunResult> =>
+    const restart = async (
+      priorChild: WorkflowPriorChild | undefined
+    ): Promise<WorkflowAgentRunResult> =>
       await this.runOrResumeAgentStep(runId, sequence, {
         ...step,
         startedAt: this.clock.nowIso(),
@@ -2484,9 +2625,12 @@ export class WorkflowRunner {
         if (plan.kind === "replace") {
           return await restart({ taskId: attempt.taskId, attemptId: plan.attemptId });
         }
+        if (plan.kind === "fresh") {
+          return await restart(undefined);
+        }
         assert(
           plan.kind === "reattach",
-          "classifyPriorAttempt returns adopt, replace, or reattach"
+          "classifyPriorAttempt returns adopt, replace, fresh, or reattach"
         );
         await this.recordTaskStartedEventIfMissing(runId, sequence, {
           stepId: step.spec.id,
@@ -3169,7 +3313,8 @@ export class WorkflowRunner {
    * - reported → fresh run: the step failed after that report (e.g. its output was rejected), so
    *   adopting it again would fail the same way;
    * - no task record (strict read) → fresh run. On a STARTED checkpoint no-record may be a
-   *   reservation still before its publishing commit, so it stays unresolved there; a failed
+   *   reservation still before its publishing commit, so classifyPriorAttempt tombstones the ID
+   *   before it runs the step fresh (a refused tombstone leaves it unresolved); a failed
    *   label is only written after an outcome read of a published child or by the reserving
    *   runner once its own commit failed, so here the row was removed or never published;
    * - any other indeterminate outcome (including an adapter that cannot classify) → unresolved.
@@ -3228,7 +3373,7 @@ export class WorkflowRunner {
     sequence: WorkflowEventSequence,
     attempt: OwnedWorkflowAgentAttempt,
     options: { leaseGuard: WorkflowRunnerLeaseGuard; runAbortSignal?: AbortSignal }
-  ): Promise<WorkflowPriorAttemptPlan> {
+  ): Promise<WorkflowPriorAttemptClassification> {
     options.leaseGuard.throwIfLost();
     const outcome = await this.resolveAttemptOutcome(attempt.taskId, {
       ...(options.runAbortSignal != null ? { abortSignal: options.runAbortSignal } : {}),
@@ -3255,20 +3400,36 @@ export class WorkflowRunner {
         // result: it fails the step as it would have in the child's own process, never replaced.
         if (outcome.failure != null) throw new Error(outcome.failure.errorMessage);
         return { kind: "replace", attemptId: outcome.attemptId };
-      case "indeterminate":
+      case "indeterminate": {
+        let reason = outcome.reason;
+        if (outcome.code === "no-record") {
+          // The started checkpoint names a child no backend published (and this process
+          // owns no attempt for it): its reserving backend died, or is stalled, before the
+          // publishing commit. Tombstone the ID first, so that late commit can never land, then
+          // run the step fresh. Unfenced replacement could publish two children (see
+          // TaskService.tombstoneUnpublishedReservation).
+          if (this.taskAdapter.tombstoneUnpublishedTask != null) {
+            options.leaseGuard.throwIfLost();
+            const tombstoned = await this.taskAdapter.tombstoneUnpublishedTask(attempt.taskId);
+            options.leaseGuard.throwIfLost();
+            if (tombstoned.success) return { kind: "fresh" };
+            reason = `${reason}; tombstoning it was refused: ${tombstoned.error}`;
+          }
+        }
         await this.recordAgentAttemptIndeterminateEventIfMissing(runId, sequence, {
           stepId: attempt.stepId,
           inputHash: attempt.inputHash,
           taskId: attempt.taskId,
           title: attempt.title,
-          reason: outcome.reason,
+          reason,
         });
         throw new WorkflowPriorAttemptUnresolvedError(
           attempt.stepId,
           attempt.taskId,
           "indeterminate",
-          outcome.reason
+          reason
         );
+      }
       case "cleanup-pending":
       case "timeout":
         throw new WorkflowPriorAttemptUnresolvedError(

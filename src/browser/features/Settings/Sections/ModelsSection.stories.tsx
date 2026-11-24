@@ -5,11 +5,11 @@
  * exercised in the SettingsPage smoke story.
  */
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { ModelsSection } from "./ModelsSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
@@ -25,8 +25,8 @@ type Story = StoryObj<typeof meta>;
 export const ModelsEmpty: Story = {
   render: () => (
     <SettingsSectionStory
-      setup={() =>
-        setupSettingsStory({
+      setup={() => {
+        const client = setupSettingsStory({
           providersConfig: {
             anthropic: {
               apiKeySet: true,
@@ -43,8 +43,12 @@ export const ModelsEmpty: Story = {
               models: [],
             },
           },
-        })
-      }
+        });
+        // With OpenAI selected, the Anthropic catalogue match shows that
+        // suggestions name their own provider.
+        updatePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "openai");
+        return client;
+      }}
     >
       <ModelsSection />
     </SettingsSectionStory>
@@ -60,19 +64,29 @@ export const ModelsEmpty: Story = {
       },
       { timeout: 5000 }
     );
+
+    // Older models replaced by a newer built-in are found in the real catalogue
+    // search. Stops with the list open so the snapshot shows the suggestions;
+    // adding is covered by ModelsSection.discovery.test.tsx.
+    await userEvent.type(canvas.getByRole("combobox", { name: "Model ID" }), "fable");
+    const option = await canvas.findByRole("option", { name: /claude-fable-5$/ });
+    await expect(option).toHaveTextContent("Anthropic");
+    await expect(canvas.queryByRole("option", { name: /claude-fable-5-2/ })).toBeNull();
   },
 };
 
 export const ModelsConfigured: Story = {
   render: () => (
     <SettingsSectionStory
-      setup={() => {
-        window.localStorage.setItem(
-          "provider_options_anthropic",
-          JSON.stringify({ use1MContextModels: ["anthropic:claude-sonnet-4-20250514"] })
-        );
-
-        return setupSettingsStory({
+      setup={() =>
+        setupSettingsStory({
+          userPreferences: {
+            ai: {
+              providerOptions: {
+                anthropic: { use1MContextModels: ["anthropic:claude-sonnet-4-20250514"] },
+              },
+            },
+          },
           providersConfig: {
             anthropic: {
               apiKeySet: true,
@@ -96,8 +110,8 @@ export const ModelsConfigured: Story = {
               models: ["grok-beta"],
             },
           },
-        });
-      }}
+        })
+      }
     >
       <ModelsSection />
     </SettingsSectionStory>
@@ -268,16 +282,51 @@ export const CoderCatalogDiscoveredPhone: Story = {
     await canvas.findByText("anthropic/claude-x");
 
     const input = canvas.getByRole("combobox", { name: "Model ID" });
-    const row = input.parentElement?.parentElement;
-    if (!row) throw new Error("Expected the model field in the add row");
+    const addButton = canvas.getByRole("button", { name: "Add" });
+    let row = input.parentElement;
+    while (row && !row.contains(addButton)) row = row.parentElement;
+    if (!row) throw new Error("Expected the model field and Add button in one add row");
     await expect(row.getBoundingClientRect().width).toBeLessThanOrEqual(390);
     await expect(row.scrollWidth).toBeLessThanOrEqual(row.clientWidth);
-    await userEvent.click(input);
+
+    // Discovered and catalogue groups share the list; both must fit the row.
+    await userEvent.type(input, "claude");
     const list = await canvas.findByRole("listbox");
-    await expect(within(list).getAllByRole("option")).toHaveLength(2);
+    await within(list).findByRole("group", { name: "From catalogue" });
+    await expect(within(list).getByRole("group", { name: "Discovered models" })).toBeTruthy();
     await expect(list.getBoundingClientRect().right).toBeLessThanOrEqual(
       row.getBoundingClientRect().right
     );
     await expect(list.scrollWidth).toBeLessThanOrEqual(list.clientWidth);
   },
+};
+
+const MANY_CUSTOM_MODELS = Array.from(
+  { length: 60 },
+  (_, i) => `custom-model-${String(i + 1).padStart(2, "0")}`
+);
+
+// Manual viewing only: paging and filtering are covered by the
+// "table filter and paging" test in ModelsSection.discovery.test.tsx.
+export const ManyCustomModelsFilterAndPaging: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            anthropic: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              baseUrl: "",
+              models: MANY_CUSTOM_MODELS,
+            },
+          },
+        })
+      }
+    >
+      <ModelsSection />
+    </SettingsSectionStory>
+  ),
 };

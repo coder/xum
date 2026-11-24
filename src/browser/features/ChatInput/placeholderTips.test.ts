@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { PLACEHOLDER_TIPS, getPlaceholderTip, getPlaceholderTips } from "./placeholderTips";
+import { PLACEHOLDER_TIPS, getPlaceholderTip } from "./placeholderTips";
 
 interface StorybookGlobal {
   __MUX_STORYBOOK__?: boolean;
@@ -32,17 +32,6 @@ describe("PLACEHOLDER_TIPS", () => {
     // Demoting it from index 0 would silently regress both surfaces, so we
     // assert the position rather than just the presence.
     expect(PLACEHOLDER_TIPS[0]).toMatch(/\/orchestrate\b/);
-  });
-
-  test("advertises durable workflows only when the Dynamic Workflows experiment is on", () => {
-    // workflow_run is registered only under the experiment, so the default
-    // list must not point users at a tool the agent does not have. The
-    // variant swaps a single slot in place so the rotation stays aligned.
-    const withWorkflows = getPlaceholderTips({ dynamicWorkflows: true });
-    expect(PLACEHOLDER_TIPS.some((tip) => /workflow/i.test(tip))).toBe(false);
-    expect(withWorkflows.some((tip) => /workflow/i.test(tip))).toBe(true);
-    expect(withWorkflows).toHaveLength(PLACEHOLDER_TIPS.length);
-    expect(withWorkflows.filter((tip, i) => tip !== PLACEHOLDER_TIPS[i])).toHaveLength(1);
   });
 });
 

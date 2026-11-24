@@ -228,7 +228,6 @@ export const electronTest = base.extend<ElectronFixtures>({
         env: {
           ...process.env,
           NODE_ENV: "development",
-          VITE_DISABLE_MERMAID: "1",
           XUM_VITE_PORT: String(devServerPort),
           MUX_VITE_PORT: String(devServerPort),
         },
@@ -295,7 +294,9 @@ export const electronTest = base.extend<ElectronFixtures>({
       setXumE2EEnv(electronEnv, "E2E", "1");
       setXumE2EEnv(electronEnv, "PROFILE_REACT", shouldCaptureReactProfile ? "1" : "0");
       setXumE2EEnv(electronEnv, "E2E_LOAD_DIST", shouldLoadDist ? "1" : "0");
-      electronEnv.VITE_DISABLE_MERMAID = "1";
+      // Tutorials stay off in every scenario, including ones that rewrite config.json: their
+      // delayed backdrops race with Playwright clicks.
+      setXumE2EEnv(electronEnv, "ENABLE_TUTORIALS_IN_SANDBOX", "0");
 
       if (shouldStartDevServer) {
         setXumE2EEnv(electronEnv, "DEVSERVER_PORT", String(devServerPort));
@@ -382,20 +383,13 @@ export const electronTest = base.extend<ElectronFixtures>({
     const window = await app.firstWindow();
     await window.waitForLoadState("domcontentloaded");
     await window.setViewportSize({ width: 1600, height: 900 });
-
-    // Disable tutorials for e2e tests before React reads the state, then reload.
-    // Otherwise delayed tutorial backdrops can race with Playwright clicks and make
-    // unrelated UI scenarios flaky when a new tutorial sequence is added.
-    await window.evaluate(() => {
-      const tutorialState = {
-        disabled: true,
-        completed: { creation: true, workspace: true, review: true },
-      };
-      localStorage.setItem("tutorialState", JSON.stringify(tutorialState));
-    });
-    // Reload so React picks up the tutorial state on mount
-    await window.reload();
-    await window.waitForLoadState("domcontentloaded");
+    // Perf scenarios measure workspace operations after an app reload, as they did before #5916
+    // removed the tutorial reload. Without it they time the first page load and race startup work
+    // (nightly workspace-open first message doubled; chat typing saw transcript re-renders).
+    if (getXumE2EEnv("E2E_RUN_PERF") === "1") {
+      await window.reload();
+      await window.waitForLoadState("domcontentloaded");
+    }
 
     window.on("console", (msg) => {
       console.log(`[renderer:${msg.type()}]`, msg.text());
