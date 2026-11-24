@@ -180,16 +180,12 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
 };
 
 /**
- * The payload's per-file size cap still lets a repository-controlled block hold hundreds of
- * thousands of entries in one list or map, which preview, restore and every model picker would
- * then carry. No real setting comes near this; a larger value keeps the local one and is reported.
+ * The payload's per-file size cap still lets a repository-controlled block put megabytes into
+ * one setting (a huge list, map or model string) that config reads and every model picker would
+ * then carry. One bound on each value's serialized size covers every shape; no real setting
+ * comes near it, and a larger value keeps the local one and is reported.
  */
-const MAX_SETTING_ENTRIES = 2000;
-
-function entryCount(value: unknown): number {
-  if (Array.isArray(value)) return value.length;
-  return isPlainObject(value) ? Object.keys(value).length : 0;
-}
+const MAX_SETTING_JSON_CHARS = 256 * 1024;
 
 function isSupported(key: BackedUpSettingsKey, value: unknown): boolean {
   const schema = FIELD_SCHEMA_OVERRIDES[key] ?? AppConfigOnDiskSchema.shape[key];
@@ -197,7 +193,7 @@ function isSupported(key: BackedUpSettingsKey, value: unknown): boolean {
   // the agent defaults around it.
   const portable = key === "agentAiDefaults" ? withoutCacheTtl(value) : value;
   return (
-    entryCount(portable) <= MAX_SETTING_ENTRIES &&
+    JSON.stringify(portable).length <= MAX_SETTING_JSON_CHARS &&
     schema.safeParse(portable).success &&
     isCanonical(key, portable)
   );

@@ -382,11 +382,15 @@ describe("settingsProjection", () => {
       });
     }
 
-    // A list or map far past any real setting, which the file size cap alone would let through.
-    const models = Array.from({ length: 2001 }, (_, index) => `openai:gpt-${index}`);
+    // A value far larger than any real setting, which the file size cap alone would let
+    // through: a huge list or map, or one huge model string at the top level or nested.
+    const models = Array.from({ length: 20_000 }, (_, index) => `openai:gpt-${index}`);
+    const hugeModel = `openai:${"x".repeat(300_000)}`;
     for (const [key, value] of [
       ["hiddenModels", models],
       ["minThinkingLevelByModel", Object.fromEntries(models.map((model) => [model, "high"]))],
+      ["defaultModel", hugeModel],
+      ["agentAiDefaults", { exec: { modelString: hugeModel } }],
     ] as const) {
       expect(readBackupSettings({ settings: { [key]: value } })).toEqual({
         settings: {},
