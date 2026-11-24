@@ -413,6 +413,7 @@ struct NewChatView: View {
         sending = true
         error = nil
         defer { sending = false }
+        let serverID = model.servers.currentID
         do {
             let id: String
             if startFrom == .fork {
@@ -429,6 +430,9 @@ struct NewChatView: View {
             }
             message = ""
             model.sheet = nil
+            // The workspace lives on the server it was made on: after a switch, opening its ID
+            // would load whatever the current server has under it.
+            guard model.servers.currentID == serverID else { return }
             model.open(id)
         } catch {
             self.error = error.localizedDescription

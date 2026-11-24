@@ -498,7 +498,10 @@ struct TodoPill: View {
 /// choice and wording as the desktop SandboxApprovalCard.
 struct SandboxApprovalCard: View {
     let approval: SandboxApproval
-    var onAnswer: (Bool) -> Void
+    var onAnswer: (Bool) async throws -> Void
+    /// One answer per block: a second tap while the first is in flight could send the opposite
+    /// choice. A failed answer lets the user choose again.
+    @State private var answering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -521,21 +524,30 @@ struct SandboxApprovalCard: View {
                 .font(.system(size: 13)).foregroundStyle(Color.xText2)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 10) {
-                Button { onAnswer(false) } label: {
+                Button { answer(false) } label: {
                     Text("Deny").font(.system(size: 16, weight: .semibold)).foregroundStyle(Color.xText)
                         .padding(.horizontal, 22).frame(height: 48)
                         .background(Color.xFill, in: Capsule()).contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                Button { onAnswer(true) } label: {
+                Button { answer(true) } label: {
                     Text("Run outside once").font(.system(size: 16, weight: .semibold))
                         .frame(maxWidth: .infinity).frame(height: 48)
                 }
                 .buttonStyle(.glassProminent)
             }
+            .disabled(answering)
         }
         .padding(.init(top: 16, leading: 16, bottom: 14, trailing: 16))
         .glassRect(28)
+    }
+
+    private func answer(_ approved: Bool) {
+        guard !answering else { return }
+        answering = true
+        Task {
+            do { try await onAnswer(approved) } catch { answering = false }
+        }
     }
 }
 

@@ -219,6 +219,7 @@ final class AppModel {
     func createWorkspace(projectPath: String, runtime: RuntimeKind, trunk: String?, message: String,
                          model: String, agentId: String, thinking: ThinkingLevel) async throws -> String {
         guard let c = servers.currentClient else { throw APIError.unauthorized }
+        let serverID = servers.currentID
         var body: [String: JSONValue] = ["projectPath": .string(projectPath)]
         if let trunk { body["trunkBranch"] = .string(trunk) }
         // Worktree needs a server-side srcBaseDir, so omit it and let the project default apply.
@@ -230,7 +231,7 @@ final class AppModel {
         guard let id = res["metadata"]?["id"]?.string ?? res["id"]?.string else {
             throw APIError.http(0, res["error"]?.string ?? "Could not create workspace")
         }
-        startFirstSend(c, id, message, model: model, agentId: agentId, thinking: thinking)
+        startFirstSend(c, serverID, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
     }
 
@@ -255,9 +256,10 @@ final class AppModel {
     /// first: a first turn that asks a question or needs a sandbox approval waits on a card the
     /// user must see. On failure the text goes to the workspace's empty draft (the web's
     /// transferDraftToWorkspace), else back to the chat, which puts it in front of the draft.
-    private func startFirstSend(_ c: APIClient, _ id: String, _ message: String, model: String, agentId: String, thinking: ThinkingLevel) {
+    /// `serverID` is the server `c` belongs to, read before the create call: a switch while it
+    /// ran would otherwise tag an unsent message with the other server.
+    private func startFirstSend(_ c: APIClient, _ serverID: String?, _ id: String, _ message: String, model: String, agentId: String, thinking: ThinkingLevel) {
         let opts: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue)]
-        let serverID = servers.currentID
         Task {
             do {
                 try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message), "options": .object(opts)])
@@ -282,20 +284,22 @@ final class AppModel {
 
     func fork(_ sourceId: String, message: String, model: String, agentId: String, thinking: ThinkingLevel) async throws -> String {
         guard let c = servers.currentClient else { throw APIError.unauthorized }
+        let serverID = servers.currentID
         let res = try await c.call("workspace/fork", ["sourceWorkspaceId": .string(sourceId), "pendingAutoTitle": true])
         guard let id = res["metadata"]?["id"]?.string else { throw APIError.http(0, res["error"]?.string ?? "Could not fork") }
-        startFirstSend(c, id, message, model: model, agentId: agentId, thinking: thinking)
+        startFirstSend(c, serverID, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
     }
 
     func createScratch(projectPath: String?, message: String, model: String, agentId: String, thinking: ThinkingLevel) async throws -> String {
         guard let c = servers.currentClient else { throw APIError.unauthorized }
+        let serverID = servers.currentID
         _ = projectPath
         let res = try await c.call("workspace/createScratch", ["title": .string(String(message.prefix(48)))])
         guard let id = res["metadata"]?["id"]?.string ?? res["id"]?.string else {
             throw APIError.http(0, res["error"]?.string ?? "Could not create chat")
         }
-        startFirstSend(c, id, message, model: model, agentId: agentId, thinking: thinking)
+        startFirstSend(c, serverID, id, message, model: model, agentId: agentId, thinking: thinking)
         return id
     }
 }

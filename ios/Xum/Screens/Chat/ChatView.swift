@@ -403,7 +403,7 @@ struct ChatView: View {
             }
             if let approval = store.openApproval {
                 SandboxApprovalCard(approval: approval) { approved in
-                    Task { try? await store.answerSandbox(approval, approved: approved) }
+                    try await store.answerSandbox(approval, approved: approved)
                 }
                 .id(approval.toolCallId)
             } else if let question = store.pendingQuestion, sizeClass != .regular {
