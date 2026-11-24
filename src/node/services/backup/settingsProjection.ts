@@ -35,8 +35,9 @@ import {
  *   unattended in every workspace whose heartbeat has no message of its own;
  * - spend, concurrency and diagnostic limits: taskSettings (parallel agent tasks and nesting
  *   depth), goalDefaults (goal budget and turn caps), heartbeatDefaultIntervalMs (how often
- *   enabled heartbeats run unattended turns) and llmDebugLogs (records raw provider requests
- *   to disk). A restore shows no per-key approval, so a repository-controlled value
+ *   enabled heartbeats run unattended turns), llmDebugLogs (records raw provider requests
+ *   to disk) and the per-agent cacheTtl inside agentAiDefaults (a one-hour prompt cache
+ *   bills cache writes at a higher rate on every later turn). A restore shows no per-key approval, so a repository-controlled value
  *   would silently raise a limit the user set or start recording prompts;
  * - not yet reviewed for portability: toolSearchEnabled, bashAiProxyEnabled,
  *   agentHeartbeatsEnabled;
@@ -92,7 +93,8 @@ export interface BackupSettingsRead {
  * for settings load always fills in.
  */
 const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfig[K] } = {
-  agentAiDefaults: (value) => normalizeAiDefaultsModelStrings(normalizeAgentAiDefaults(value)),
+  agentAiDefaults: (value) =>
+    withoutCacheTtl(normalizeAiDefaultsModelStrings(normalizeAgentAiDefaults(value))),
   defaultModel: normalizeOptionalModelString,
   hiddenModels: normalizeOptionalModelStringArray,
   minThinkingLevelByModel: normalizeMinThinkingLevelByModel,
@@ -103,6 +105,39 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
 };
 
 /**
+ * Drops each agent's cacheTtl, and an entry that set nothing else, so a backup neither carries
+ * nor applies it. Other values pass through for the schema to judge.
+ */
+function withoutCacheTtl<T>(value: T): T {
+  if (!isPlainObject(value)) return value;
+  const kept: Record<string, unknown> = {};
+  for (const [agentId, entry] of Object.entries(value)) {
+    if (!isPlainObject(entry) || !("cacheTtl" in entry)) {
+      kept[agentId] = entry;
+      continue;
+    }
+    const { cacheTtl: _local, ...rest } = entry;
+    // Normalized entries spell unset fields as undefined properties.
+    if (Object.values(rest).some((field) => field !== undefined)) kept[agentId] = rest;
+  }
+  return kept as T;
+}
+
+/** The local per-agent cacheTtl values, laid over restored agent defaults. */
+function keepLocalCacheTtl(
+  restored: ProjectsConfig["agentAiDefaults"],
+  local: ProjectsConfig["agentAiDefaults"]
+): ProjectsConfig["agentAiDefaults"] {
+  const merged = { ...restored };
+  for (const [agentId, entry] of Object.entries(local ?? {})) {
+    if (entry.cacheTtl !== undefined) {
+      merged[agentId] = { ...merged[agentId], cacheTtl: entry.cacheTtl };
+    }
+  }
+  return merged;
+}
+
+/**
  * Load-time normalization heals what it cannot read: it drops invalid entries, caps chains,
  * strips unknown fields and fills defaults. Applying a healed copy of a damaged or newer-build
  * value would silently replace the target's setting, so a value is accepted only when
@@ -111,7 +146,9 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
  */
 function isCanonical(key: BackedUpSettingsKey, value: unknown): boolean {
   const normalized = NORMALIZE[key](value);
-  return normalized !== undefined && isDeepStrictEqual(copyJson(normalized), value);
+  // A per-agent cacheTtl is ignored, not a reason to reject the agent defaults around it.
+  const portable = key === "agentAiDefaults" ? withoutCacheTtl(value) : value;
+  return normalized !== undefined && isDeepStrictEqual(copyJson(normalized), portable);
 }
 
 /**
@@ -217,6 +254,9 @@ export function mergeBackupSettings(
   const merged: ProjectsConfig = { ...current };
   for (const key of BACKED_UP_SETTINGS_KEYS) {
     if (key in settings) assignSetting(merged, key, settings[key]);
+  }
+  if ("agentAiDefaults" in settings) {
+    merged.agentAiDefaults = keepLocalCacheTtl(merged.agentAiDefaults, current.agentAiDefaults);
   }
   if (settings.hiddenModels != null) {
     // As Config.updateModelPreferences does: the restored list is now the user's, so the

@@ -208,6 +208,42 @@ describe("settingsProjection", () => {
     expect(merged.heartbeatDefaultIntervalMs).toBe(900_000);
   });
 
+  it("never carries a per-agent cache TTL, which changes what every later turn costs", () => {
+    const local: ProjectsConfig = {
+      projects: new Map(),
+      agentAiDefaults: {
+        exec: { modelString: "openai:gpt-local", cacheTtl: "5m" },
+        explore: { cacheTtl: "5m" },
+      },
+    };
+    expect(projectBackupSettings(local).agentAiDefaults).toEqual({
+      exec: { modelString: "openai:gpt-local" },
+    });
+
+    // A block that carries one still restores the agent defaults around it, with the local TTLs.
+    const read = readBackupSettings({
+      settings: {
+        agentAiDefaults: {
+          exec: { modelString: "anthropic:claude-exec", cacheTtl: "1h" },
+          plan: { cacheTtl: "1h" },
+        },
+      },
+    });
+    expect(read).toEqual({
+      settings: { agentAiDefaults: { exec: { modelString: "anthropic:claude-exec" } } },
+      unsupported: [],
+    });
+    expect(mergeBackupSettings(local, read.settings!).agentAiDefaults).toEqual({
+      exec: { modelString: "anthropic:claude-exec", cacheTtl: "5m" },
+      explore: { cacheTtl: "5m" },
+    });
+    // A reset of the agent defaults keeps the local TTLs too.
+    expect(mergeBackupSettings(local, { agentAiDefaults: null }).agentAiDefaults).toEqual({
+      exec: { cacheTtl: "5m" },
+      explore: { cacheTtl: "5m" },
+    });
+  });
+
   it("reads only the portable settings block", () => {
     const none = { settings: undefined, unsupported: [] };
     expect(readBackupSettings({ appearance: { theme: "dark" } })).toEqual(none);
