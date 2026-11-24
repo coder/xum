@@ -914,6 +914,66 @@ async function repairStagedWorktreePatchPaths(params: {
   });
 }
 
+/**
+ * Builds the reverse-check script. A plain `git apply --reverse --check`
+ * (no --index/--cached) segfaults on git >= 2.40 when GIT_ATTR_SOURCE is set,
+ * which the no-repo-automation env always does, and the local runtime reports
+ * a signal death as exit 0, so the check would always read as "present".
+ * Checking against a throwaway index built from HEAD plus the patch paths'
+ * current worktree content avoids that code path. The temp files sit next to
+ * the patch copy so the patch's sandbox roots cover them, and the staged blobs
+ * go to a throwaway object dir so the check never grows the repo's store.
+ */
+async function buildIndexReverseCheckCommand(params: {
+  localPatchPath: string;
+  remotePatchPath: string;
+  gitPrefix: string;
+}): Promise<{ command: string } | { error: string }> {
+  let patchText: string;
+  try {
+    patchText = await fsPromises.readFile(params.localPatchPath, "utf-8");
+  } catch (error: unknown) {
+    return { error: `Could not read uncommitted-changes patch: ${getErrorMessage(error)}` };
+  }
+  const patchPaths = [
+    ...new Set([
+      ...parseDiffGitHeaderPaths(patchText),
+      ...parsePatchMetadataPaths(patchText).changedPaths,
+    ]),
+  ];
+  if (patchPaths.length === 0) {
+    return { error: "The uncommitted-changes patch names no paths to check." };
+  }
+  const tempDir = shellQuote(path.posix.dirname(params.remotePatchPath));
+  const chunkSize = 200;
+  const addCommands: string[] = [];
+  for (let i = 0; i < patchPaths.length; i += chunkSize) {
+    const pathspecs = patchPaths
+      .slice(i, i + chunkSize)
+      .map((filePath) => shellQuote(`:(literal)${filePath}`))
+      .join(" ");
+    // -f: a patch path the target ignores must still be compared. A path that
+    // exists neither in HEAD nor on disk fails the pathspec match, which
+    // correctly means the patch content is not present.
+    addCommands.push(
+      `GIT_INDEX_FILE="$TMP_INDEX" ${params.gitPrefix}git add -A -f -- ${pathspecs}`
+    );
+  }
+  const command = [
+    "set -e",
+    `TMP_INDEX="$(mktemp ${tempDir}/mux-reverse-check-index.XXXXXX)"`,
+    `TMP_OBJECTS="$(mktemp -d ${tempDir}/mux-reverse-check-objects.XXXXXX)"`,
+    'trap \'rm -f "$TMP_INDEX"; rm -rf "$TMP_OBJECTS"\' EXIT',
+    `REAL_OBJECTS="$(cd "$(${params.gitPrefix}git rev-parse --git-path objects)" && pwd)"`,
+    'export GIT_OBJECT_DIRECTORY="$TMP_OBJECTS"',
+    'export GIT_ALTERNATE_OBJECT_DIRECTORIES="$REAL_OBJECTS"',
+    `GIT_INDEX_FILE="$TMP_INDEX" ${params.gitPrefix}git read-tree HEAD`,
+    ...addCommands,
+    `GIT_INDEX_FILE="$TMP_INDEX" ${params.gitPrefix}git apply --cached --reverse --check --binary ${shellQuote(params.remotePatchPath)}`,
+  ].join("\n");
+  return { command };
+}
+
 /** Uses three-way apply so failed conflicts can be surfaced through conflictPaths. */
 async function applyWorktreeDiffPatch(params: {
   runtime: ToolConfiguration["runtime"];
@@ -979,16 +1039,26 @@ async function applyWorktreeDiffPatch(params: {
       }
       stagedBefore = snapshot;
     }
-    const gitFlags = isRealApply ? "--3way" : "--reverse --check";
-    const applyResult = await execBuffered(
-      params.runtime,
-      `${params.gitPrefix}git apply ${gitFlags} --binary ${shellQuote(remoteWorktreePatchPath)}`.trim(),
-      {
-        cwd: params.repoCwd,
-        timeout: 300,
-        sandboxRoots: runtimeTempSandboxRoots(remoteWorktreePatchPath),
+    let applyCommand: string;
+    if (isRealApply) {
+      applyCommand =
+        `${params.gitPrefix}git apply --3way --binary ${shellQuote(remoteWorktreePatchPath)}`.trim();
+    } else {
+      const reverseCheckCommand = await buildIndexReverseCheckCommand({
+        localPatchPath: params.localPatchPath,
+        remotePatchPath: remoteWorktreePatchPath,
+        gitPrefix: params.gitPrefix,
+      });
+      if ("error" in reverseCheckCommand) {
+        return { applied: false, error: reverseCheckCommand.error };
       }
-    );
+      applyCommand = reverseCheckCommand.command;
+    }
+    const applyResult = await execBuffered(params.runtime, applyCommand, {
+      cwd: params.repoCwd,
+      timeout: 300,
+      sandboxRoots: runtimeTempSandboxRoots(remoteWorktreePatchPath),
+    });
 
     if (applyResult.exitCode !== 0) {
       const errorOutput = [applyResult.stderr.trim(), applyResult.stdout.trim()]
