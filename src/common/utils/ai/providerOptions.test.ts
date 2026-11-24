@@ -3321,6 +3321,8 @@ describe("buildProviderOptions - Google", () => {
     };
     expect(level("google:gemini-4-neon", "google")).toBe("xhigh");
     expect(level("google-vertex:gemini-4-neon", "googleVertex")).toBe("xhigh");
+    expect(level("google:gemini-4-hydrogen", "google")).toBe("xhigh");
+    expect(level("google-vertex:gemini-4-hydrogen", "googleVertex")).toBe("xhigh");
     expect(level("google:gemini-4-carbon", "google")).toBe("high");
     expect(level("google-vertex:gemini-4-carbon", "googleVertex")).toBe("high");
   });

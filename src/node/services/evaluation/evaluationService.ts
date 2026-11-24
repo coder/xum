@@ -104,7 +104,7 @@ export function evaluationModelFromLanguageModel(
 /**
  * The adapter asks for reasoning "none", which @ai-sdk/google maps to
  * `thinkingLevel: "minimal"` for Gemini 4 models. Gemini 3.8 Flash and Gemini 4
- * Argon, Carbon and Neon have no minimal level (Neon and Carbon return HTTP 400), so
+ * Argon, Carbon, Neon and Hydrogen have no minimal level (all but Argon return HTTP 400), so
  * default them to "low", their lowest level. A caller-supplied thinkingLevel wins; other
  * google options merge, so a caller's `includeThoughts` keeps the "low" default.
  */

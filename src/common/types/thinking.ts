@@ -427,12 +427,12 @@ export function grokSupportsNativeXhigh(modelString: string): boolean {
 }
 
 /**
- * Gemini models with a native XHIGH thinking level (Google's Gemini 4 Neon developer
- * guide lists LOW/MEDIUM/HIGH/XHIGH). @ai-sdk/google's option schema accepts an explicit
- * "xhigh" from 4.0.119; older versions reject it before the request is sent.
+ * Gemini models with a native XHIGH thinking level (Google's Gemini 4 Neon and Hydrogen
+ * developer guides list LOW/MEDIUM/HIGH/XHIGH). @ai-sdk/google's option schema accepts an
+ * explicit "xhigh" from 4.0.119; older versions reject it before the request is sent.
  */
 export function geminiSupportsXhigh(modelString: string): boolean {
-  return /^gemini-4-neon(?:$|-)/.test(stripModelProviderPrefixes(modelString));
+  return /^gemini-4-(?:neon|hydrogen)(?:$|-)/.test(stripModelProviderPrefixes(modelString));
 }
 
 /**
