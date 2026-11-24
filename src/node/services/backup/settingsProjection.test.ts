@@ -237,6 +237,14 @@ describe("settingsProjection", () => {
       exec: { modelString: "anthropic:claude-exec", cacheTtl: "5m" },
       explore: { cacheTtl: "5m" },
     });
+    // So does a TTL this build cannot parse, as a newer build may write.
+    expect(
+      readBackupSettings({
+        settings: {
+          agentAiDefaults: { exec: { modelString: "anthropic:claude-exec", cacheTtl: "2h" } },
+        },
+      })
+    ).toEqual(read);
     // A reset of the agent defaults keeps the local TTLs too.
     expect(mergeBackupSettings(local, { agentAiDefaults: null }).agentAiDefaults).toEqual({
       exec: { cacheTtl: "5m" },
@@ -270,6 +278,15 @@ describe("settingsProjection", () => {
       // restore names them; known local keys stay silent.
       unsupported: ["muxGovernorToken", "unknownKey"],
     });
+
+    // The block is repository-controlled, so the names it can make a preview report are bounded.
+    const flood = Object.fromEntries(
+      Array.from({ length: 1000 }, (_, index) => [`${"k".repeat(200)}${index}`, true])
+    );
+    const { unsupported } = readBackupSettings({ settings: flood });
+    expect(unsupported).toHaveLength(21);
+    expect(unsupported.every((name) => name.length <= 81)).toBe(true);
+    expect(unsupported.at(-1)).toBe("980 more unknown settings");
   });
 
   it("keeps the local value for fields this build does not understand and names them", () => {

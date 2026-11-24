@@ -146,9 +146,7 @@ function keepLocalCacheTtl(
  */
 function isCanonical(key: BackedUpSettingsKey, value: unknown): boolean {
   const normalized = NORMALIZE[key](value);
-  // A per-agent cacheTtl is ignored, not a reason to reject the agent defaults around it.
-  const portable = key === "agentAiDefaults" ? withoutCacheTtl(value) : value;
-  return normalized !== undefined && isDeepStrictEqual(copyJson(normalized), portable);
+  return normalized !== undefined && isDeepStrictEqual(copyJson(normalized), value);
 }
 
 /**
@@ -183,7 +181,10 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
 
 function isSupported(key: BackedUpSettingsKey, value: unknown): boolean {
   const schema = FIELD_SCHEMA_OVERRIDES[key] ?? AppConfigOnDiskSchema.shape[key];
-  return schema.safeParse(value).success && isCanonical(key, value);
+  // A per-agent cacheTtl is ignored, even one this build cannot parse, not a reason to reject
+  // the agent defaults around it.
+  const portable = key === "agentAiDefaults" ? withoutCacheTtl(value) : value;
+  return schema.safeParse(portable).success && isCanonical(key, portable);
 }
 
 function setSetting<K extends BackedUpSettingsKey>(
@@ -214,13 +215,24 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
   return copyJson(projected);
 }
 
+const MAX_REPORTED_UNKNOWN_KEYS = 20;
+const MAX_REPORTED_KEY_CHARS = 80;
+
 /**
  * A key this build has never heard of is most likely a newer build's portable setting, so the
  * user should hear the restore kept the local value. Keys this build knows and keeps local (an
- * older export's heartbeat prompt) stay silent.
+ * older export's heartbeat prompt) stay silent. The block is repository-controlled, so the list
+ * is bounded: preview and restore return it over IPC and the Backup section renders each name.
  */
 function unknownSettingsKeys(block: Record<string, unknown>): string[] {
-  return Object.keys(block).filter((key) => !(key in AppConfigOnDiskSchema.shape));
+  const unknown = Object.keys(block).filter((key) => !(key in AppConfigOnDiskSchema.shape));
+  const named = unknown
+    .slice(0, MAX_REPORTED_UNKNOWN_KEYS)
+    .map((key) =>
+      key.length > MAX_REPORTED_KEY_CHARS ? `${key.slice(0, MAX_REPORTED_KEY_CHARS)}…` : key
+    );
+  const more = unknown.length - named.length;
+  return more > 0 ? [...named, `${more} more unknown settings`] : named;
 }
 
 /** Reads the `settings` block of a preferences document. */
