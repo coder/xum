@@ -320,6 +320,8 @@ describe("settingsProjection", () => {
       ],
       ["evaluationDefaults", {}],
       ["evaluationDefaults", { model: "garbage" }],
+      // A provider this build cannot build an evaluation model for.
+      ["evaluationDefaults", { model: "xai:grok-4" }],
     ] as const) {
       expect(readBackupSettings({ settings: { [key]: value } })).toEqual({
         settings: {},

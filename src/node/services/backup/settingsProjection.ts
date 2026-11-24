@@ -4,6 +4,7 @@ import { AppConfigOnDiskSchema } from "@/common/config/schemas/appConfigOnDisk";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import type { ProjectsConfig } from "@/common/types/project";
+import { isEvaluationProvider } from "@/common/utils/ai/evaluationModels";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   normalizeAiDefaultsModelStrings,
@@ -118,9 +119,14 @@ function isCanonical(key: BackedUpSettingsKey, value: unknown): boolean {
  * which would carry any key of a repository-controlled document into the config. Where
  * normalization keeps values lookups can never match, the schema is tightened: a per-model
  * floor needs a model-string key, a fallback chain model-string sources and targets, and the
- * evaluator a model string. (Auto routing's schema already checks its models.)
+ * evaluator a model on an evaluation provider. (Auto routing's schema already checks its models.)
  */
 const isModelString = (model: string) => normalizeOptionalModelString(model) === model;
+
+// The evaluator also needs a provider this build can build an evaluation model for; a newer
+// build's provider would otherwise replace a working local evaluator with one that fails.
+const isEvaluatorModel = (model: string) =>
+  isModelString(model) && isEvaluationProvider(model.slice(0, model.indexOf(":")));
 
 const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = {
   minThinkingLevelByModel: AppConfigOnDiskSchema.shape.minThinkingLevelByModel
@@ -135,7 +141,7 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
     ),
   evaluationDefaults: AppConfigOnDiskSchema.shape.evaluationDefaults
     .unwrap()
-    .refine((value) => value.model === undefined || isModelString(value.model)),
+    .refine((value) => value.model === undefined || isEvaluatorModel(value.model)),
 };
 
 function isSupported(key: BackedUpSettingsKey, value: unknown): boolean {
