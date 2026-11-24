@@ -91,3 +91,38 @@ export function StatusDot(props: {
     </div>
   );
 }
+
+// The corner dot of a flat-mode project avatar. The wrapper paints the 2px ring in the row's
+// background (`--row-bg`, set by the row) so the dot cuts out of the avatar; the pulse runs on
+// the inner dot only, so the ring never fades with it.
+const AVATAR_DOT_CLASSES: Partial<Record<VisualState, string>> = {
+  active: "bg-content-success workspace-status-dot-active",
+  waiting: "bg-backgrounded workspace-status-dot-active",
+  question: "bg-border-pending",
+  error: "bg-content-destructive",
+  idle: "bg-surface-invert-secondary",
+};
+
+/** Paints a ring in the row's background color (`--row-bg`, set by avatar rows). */
+export const AVATAR_RING_STYLE = {
+  backgroundColor: "var(--row-bg, var(--color-surface-primary))",
+} as const;
+
+const AVATAR_ACTIVE_GLOW = {
+  boxShadow: "0 0 8px color-mix(in srgb, var(--color-content-success) 80%, transparent)",
+} as const;
+
+export function AvatarStatusDot(props: { state: VisualState; hideIdle?: boolean }) {
+  const dotClasses = AVATAR_DOT_CLASSES[props.state];
+  if (dotClasses == null || (props.hideIdle === true && props.state === "idle")) {
+    return null;
+  }
+  return (
+    <span className="block rounded-full p-[2px]" style={AVATAR_RING_STYLE}>
+      <span
+        className={cn("block h-[9px] w-[9px] rounded-full", dotClasses)}
+        style={props.state === "active" ? AVATAR_ACTIVE_GLOW : undefined}
+      />
+    </span>
+  );
+}

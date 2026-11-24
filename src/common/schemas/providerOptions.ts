@@ -1,6 +1,10 @@
 import { z } from "zod";
 
-import { CacheTtlSchema, ServiceTierSchema } from "../config/schemas/providersConfig";
+import {
+  CacheTtlSchema,
+  ServiceTierSchema,
+  XAIServiceTierSchema,
+} from "../config/schemas/providersConfig";
 
 export const MuxProviderOptionsSchema = z.object({
   anthropic: z
@@ -33,7 +37,7 @@ export const MuxProviderOptionsSchema = z.object({
     .object({
       serviceTier: ServiceTierSchema.optional().meta({
         description:
-          "OpenAI service tier: priority (low-latency), flex (50% cheaper, higher latency), auto/default (standard)",
+          "OpenAI service tier: priority (low-latency), ultrafast (fastest, 6x Standard price, supported models only), flex (50% cheaper, higher latency), auto/default (standard)",
       }),
       wireFormat: z.enum(["responses", "chatCompletions"]).optional().meta({
         description:
@@ -56,6 +60,16 @@ export const MuxProviderOptionsSchema = z.object({
   openrouter: z.record(z.string(), z.unknown()).optional(),
   xai: z
     .object({
+      serviceTier: XAIServiceTierSchema.nullish().meta({
+        description:
+          'xAI processing tier: "priority" requests faster processing at 2× token pricing; "default" uses standard processing',
+      }),
+      // Request-level escape hatch only. Frontier Grok defaults to store=false in
+      // buildProviderOptions so ZDR and non-ZDR share one path (no settings UI).
+      store: z.boolean().optional().meta({
+        description:
+          "Whether xAI stores Responses. Frontier Grok defaults to false (ZDR-safe); set true only to opt back into server storage.",
+      }),
       searchParameters: z
         .object({
           mode: z.enum(["auto", "off", "on"]),

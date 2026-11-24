@@ -1,5 +1,10 @@
-import { appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
-import { waitFor, within, userEvent } from "@storybook/test";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "@/browser/stories/meta.js";
+import { expect, waitFor, within, userEvent } from "storybook/test";
+import {
+  getSettingsDialog,
+  openSettingsDialog,
+  waitForChatInputAutofocusDone,
+} from "@/browser/stories/storyPlayHelpers.js";
 import { setupSettingsStory } from "./Sections/settingsStoryUtils.js";
 
 export default {
@@ -8,73 +13,60 @@ export default {
 };
 
 const BASE_SECTION_LABELS = [
-  "General",
+  "Appearance",
+  "Terminal & editor",
+  "Keybinds",
+  "Behavior",
   "Agents",
+  "Heartbeats",
   "Providers",
   "Models",
   "MCP",
-  "Secrets",
-  "Security",
-  "Server Access",
-  "Layouts",
   "Runtimes",
+  "Sandbox & limits",
+  "Project trust",
+  "Secrets",
+  "Server access",
   "Experiments",
-  "Keybinds",
+  "Backup",
 ] as const;
 
 type BaseSectionLabel = (typeof BASE_SECTION_LABELS)[number];
-type SectionNavLabel = BaseSectionLabel;
 
 const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
-  General: /Theme/i,
-  Agents: /Max Parallel Agent Tasks/i,
+  Appearance: /Theme/i,
+  "Terminal & editor": /Terminal Font/i,
+  Behavior: /Max Parallel Agent Tasks/i,
+  Agents: /Agent defaults/i,
+  Heartbeats: /Default interval/i,
   Providers: /Configure API keys and endpoints for AI providers|API Key/i,
   Models: /Custom Models|Built-in Models/i,
   MCP: /MCP Servers/i,
   Secrets: /Secrets are stored in/i,
-  Security: /Project Trust/i,
-  "Server Access": /Server access sessions/i,
-  Layouts: /Layout Slots|Add layout/i,
-  Runtimes: /Default runtime/i,
+  "Project trust": /Project Trust/i,
+  "Server access": /Server access sessions/i,
+  Runtimes: /Default isolation/i,
+  "Sandbox & limits": /Run agent commands in a sandbox/i,
   Experiments: /Experimental features that are still in development/i,
   Keybinds: /Open agent picker/i,
+  Backup: /Settings backup/i,
 };
 
-async function openSettings(canvasElement: HTMLElement): Promise<void> {
-  const canvas = within(canvasElement);
-
-  const settingsButton = await canvas.findByTestId("settings-button", {}, { timeout: 10000 });
-  await userEvent.click(settingsButton);
-}
-
-async function clickSectionButton(
-  canvasElement: HTMLElement,
-  sectionLabel: SectionNavLabel
-): Promise<void> {
-  const canvas = within(canvasElement);
-
-  // Desktop + mobile settings nav buttons can both exist in the test DOM.
-  const sectionButtons = await canvas.findAllByRole("button", {
-    name: new RegExp(`^${sectionLabel}$`, "i"),
-  });
-  const sectionButton = sectionButtons[0];
-  if (!sectionButton) {
-    throw new Error(`Settings section button not found for ${sectionLabel}`);
-  }
-
-  await userEvent.click(sectionButton);
+async function clickSectionButton(dialog: HTMLElement, sectionLabel: string): Promise<void> {
+  const nav = await within(dialog).findByRole("navigation", { name: "Settings sections" });
+  await userEvent.click(within(nav).getByRole("button", { name: sectionLabel }));
 }
 
 async function assertSectionBodyRendered(
-  canvasElement: HTMLElement,
+  dialog: HTMLElement,
   sectionLabel: BaseSectionLabel
 ): Promise<void> {
-  const canvas = within(canvasElement);
+  const settings = within(dialog);
   const sectionContentMatcher = SECTION_CONTENT_MATCHERS[sectionLabel];
 
   await waitFor(
     () => {
-      if (canvas.queryAllByText(sectionContentMatcher).length === 0) {
+      if (settings.queryAllByText(sectionContentMatcher).length === 0) {
         throw new Error(`Expected ${sectionLabel} section content to render.`);
       }
     },
@@ -82,14 +74,279 @@ async function assertSectionBodyRendered(
   );
 }
 
+async function waitForSettingsClosed(): Promise<void> {
+  await waitFor(() =>
+    expect(within(document.body).queryByRole("dialog", { name: "Settings" })).toBeNull()
+  );
+}
+
+// Radix's DismissableLayer ignores Escape until one more render after the dialog mounts: its
+// `isHighestLayer` check uses a layer index computed during render, and the layer registers in
+// an effect that then forces that re-render. Nothing in the DOM marks the moment, so under CI
+// load a play that presses Escape right after the dialog appears can have the key dropped
+// (#5127). Press again while the dialog is still open; stop once it starts closing, so no extra
+// Escape reaches the element that gets focus back.
+async function closeSettingsWithEscape(): Promise<void> {
+  await waitFor(
+    async () => {
+      const dialog = within(document.body).queryByRole("dialog", { name: "Settings" });
+      if (dialog?.getAttribute("data-state") === "open") {
+        await userEvent.keyboard("{Escape}");
+      }
+      await expect(within(document.body).queryByRole("dialog", { name: "Settings" })).toBeNull();
+    },
+    { timeout: 5000 }
+  );
+}
+
 export const SectionsSmoke: AppStory = {
+  // Pixel budget: the App task and compaction settings stories already capture this
+  // dialog on desktop, so this file's snapshot slot goes to PhoneFullScreen.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
-    await openSettings(canvasElement);
+    const dialog = await openSettingsDialog(canvasElement);
 
     for (const sectionLabel of BASE_SECTION_LABELS) {
-      await clickSectionButton(canvasElement, sectionLabel);
-      await assertSectionBodyRendered(canvasElement, sectionLabel);
+      await clickSectionButton(dialog, sectionLabel);
+      await assertSectionBodyRendered(dialog, sectionLabel);
     }
+  },
+};
+
+const CUSTOM_MODEL_ID = "story-custom-model";
+
+// Real-browser Escape routing: an inline editor inside the modal cancels its own edit without
+// closing settings, while an unclaimed Escape closes the modal.
+export const EscapeInInlineEditor: AppStory = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            anthropic: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              baseUrl: "",
+              models: [CUSTOM_MODEL_ID],
+            },
+          },
+        })
+      }
+    />
+  ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    const settings = within(dialog);
+    await clickSectionButton(dialog, "Models");
+
+    // The custom model row's inline editor (ModelRow) cancels its own edit on Escape.
+    await userEvent.click(await settings.findByRole("button", { name: "Edit model" }));
+    const editor = await settings.findByDisplayValue(CUSTOM_MODEL_ID);
+    await expect(editor).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+
+    await waitFor(() => expect(settings.queryByDisplayValue(CUSTOM_MODEL_ID)).toBeNull());
+    await expect(getSettingsDialog()).toBe(dialog);
+    await expect(settings.getByRole("button", { name: "Edit model" })).toBeVisible();
+
+    dialog.focus();
+    await userEvent.keyboard("{Escape}");
+    await waitForSettingsClosed();
+    // Settings has no DialogTrigger, so focus must be returned to the opener explicitly.
+    await waitFor(() => expect(within(canvasElement).getByTestId("settings-button")).toHaveFocus());
+  },
+};
+
+// The palette item and model-selector entry that open settings unmount as it opens, so closing
+// must return focus to the chat input they came from instead of leaving it on the body.
+export const FocusReturnsWhenOpenerUnmounts: AppStory = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    await waitForChatInputAutofocusDone(canvasElement);
+    const chatInput = canvasElement.querySelector<HTMLElement>(
+      '[data-component="ChatInputSection"]'
+    );
+    if (!chatInput) {
+      throw new Error("Chat input section not found");
+    }
+    const composer = within(chatInput).getByRole("textbox");
+
+    await userEvent.click(composer);
+    await userEvent.keyboard("{Control>}{Shift>}p{/Shift}{/Control}");
+    await userEvent.keyboard(">Settings: Models{Enter}");
+    await body.findByRole("dialog", { name: "Settings" });
+    await closeSettingsWithEscape();
+    await waitFor(() => expect(composer).toHaveFocus());
+    await userEvent.keyboard("typed");
+    await expect(composer).toHaveValue("typed");
+
+    const modelSelector = chatInput.querySelector<HTMLElement>(
+      '[data-component="ModelSelectorGroup"]'
+    );
+    if (!modelSelector) {
+      throw new Error("Model selector not found");
+    }
+    await userEvent.click(within(modelSelector).getByRole("combobox"));
+    await userEvent.click(await body.findByRole("button", { name: "Model settings" }));
+    await body.findByRole("dialog", { name: "Settings" });
+    await closeSettingsWithEscape();
+    await waitFor(() => expect(composer).toHaveFocus());
+  },
+};
+
+export const HeartbeatDefaults: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSettingsStory({
+          heartbeatDefaultIntervalMs: 45 * 60_000,
+          heartbeatDefaultPrompt: "Review pending work before continuing.",
+        })
+      }
+    />
+  ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    await clickSectionButton(dialog, "Heartbeats");
+    const settings = within(dialog);
+    const threshold = await settings.findByLabelText("Default heartbeat threshold in minutes");
+    await waitFor(() => expect(threshold).toHaveValue(45));
+    const prompt = await settings.findByLabelText("Default heartbeat prompt");
+    await waitFor(() => expect(prompt).toHaveValue("Review pending work before continuing."));
+  },
+};
+
+const phoneParameters = { pixel: { matrix: { viewports: ["phone"] } } };
+
+// Ends with settings open so the phone capture shows the full-screen sheet.
+export const PhoneFullScreen: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: true,
+              deploymentUrl: "https://coder.example.com",
+              coderOauthSet: true,
+              discoveredProviders: [
+                { name: "anthropic", type: "anthropic" },
+                { name: "openai", type: "openai" },
+              ],
+              canonicalRoutes: { anthropic: "anthropic" },
+            },
+          },
+        })
+      }
+    />
+  ),
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: phoneParameters,
+  play: async ({ canvasElement, parameters }) => {
+    await expect(parameters.pixel).toEqual(phoneParameters.pixel);
+    const dialog = await openSettingsDialog(canvasElement);
+    await clickSectionButton(dialog, "Providers");
+    await assertSectionBodyRendered(dialog, "Providers");
+    // Coder model routing selects switch to full width below the sm breakpoint.
+    await userEvent.click(await within(dialog).findByRole("button", { name: /^Coder/ }));
+    const routeSelects = await within(dialog).findAllByRole("combobox", {
+      name: /Coder provider$/,
+    });
+
+    // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
+    if (window.innerWidth < 768) {
+      const rect = dialog.getBoundingClientRect();
+      await expect(rect.left).toBe(0);
+      await expect(rect.width).toBe(window.innerWidth);
+      await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
+      const close = within(dialog).getByRole("button", { name: "Close settings" });
+      await expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+      for (const select of routeSelects) {
+        await expect(select.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+      }
+    }
+  },
+};
+
+// Search: Ctrl+F focuses the field, every query word must match, arrows move the active result
+// and Enter opens its section with the matching row highlighted. Escape clears, then closes.
+export const SearchSettings: AppStory = {
+  // An interaction contract: the snapshot budget goes to the section and phone stories.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    const settings = within(dialog);
+    const search = settings.getByRole("combobox", { name: "Search settings" });
+    await userEvent.click(settings.getByRole("navigation", { name: "Settings sections" }));
+    // The open section stays mounted (hidden) under the results, so its unsaved drafts survive a
+    // search the user clears again.
+    const sectionRow = await waitFor(() => {
+      const row = dialog.querySelector('[data-setting-id="theme"]');
+      if (!row) throw new Error("Appearance is not open");
+      return row;
+    });
+    await userEvent.keyboard("{Control>}f{/Control}");
+    await waitFor(() => expect(search).toHaveFocus());
+    await userEvent.keyboard("theme");
+    await expect(sectionRow).not.toBeVisible();
+    await userEvent.keyboard("{Escape}");
+    await expect(sectionRow).toBeVisible();
+    await expect(sectionRow.isConnected).toBe(true);
+
+    await userEvent.keyboard("badge size");
+    const results = await settings.findByRole("listbox", { name: "Settings search results" });
+    const options = within(results).getAllByRole("option");
+    // "badge" and "size" must both match: Terminal Font Size has no "badge".
+    await expect(options.map((option) => option.textContent)).toEqual([
+      expect.stringContaining("Terminal Badge Font Size"),
+    ]);
+    await expect(options[0]).toHaveAttribute("aria-selected", "true");
+
+    await userEvent.keyboard("{Enter}");
+    // The badge sub-options render only while the badge is on (off here), so the result lands on
+    // the switch that reveals them.
+    await waitFor(() => {
+      const row = dialog.querySelector('[data-setting-id="terminal-badge"]');
+      if (row?.getAttribute("data-search-focused") !== "true") {
+        throw new Error("Terminal Badge row is not highlighted");
+      }
+    });
+    await expect(dialog.querySelector('[data-setting-id="terminal-badge-font-size"]')).toBeNull();
+    await expect(search).toHaveValue("");
+
+    await userEvent.click(search);
+    await userEvent.keyboard("zzzz");
+    await expect(await settings.findByText(/No settings match/)).toBeVisible();
+    await userEvent.keyboard("{Escape}");
+    await expect(search).toHaveValue("");
+    await expect(getSettingsDialog()).toBe(dialog);
+
+    // A result inside a collapsed disclosure opens it, so the form's fields are on screen.
+    await userEvent.keyboard("add mcp server{Enter}");
+    await waitFor(() => {
+      const mark = dialog.querySelector('[data-setting-id="mcp-add-server"]');
+      if (!mark?.closest("details")?.open) throw new Error("Add server form is collapsed");
+    });
+    await expect(dialog.querySelector("#server-name")).toBeVisible();
+
+    // A field inside a provider card expands the card and lands on the field, not the header.
+    await userEvent.click(search);
+    await userEvent.keyboard("response storage{Enter}");
+    await waitFor(() => {
+      const block = dialog.querySelector(
+        '[data-setting-id="openai-response-storage"]'
+      )?.parentElement;
+      if (block?.getAttribute("data-search-focused") !== "true") {
+        throw new Error("Response storage is not highlighted");
+      }
+    });
   },
 };

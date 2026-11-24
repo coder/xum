@@ -4,11 +4,15 @@ import * as path from "node:path";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { getErrorMessage } from "@/common/utils/errors";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
+import {
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForConfigKeys,
+} from "@/node/utils/gitNoHooksEnv";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
 import { LocalRuntime } from "./LocalRuntime";
-import type { InitLogger, Runtime } from "./Runtime";
+import type { ExecOptions, InitLogger, Runtime } from "./Runtime";
 
 const SUBMODULE_SYNC_TIMEOUT_SECS = 60;
 const SUBMODULE_UPDATE_TIMEOUT_SECS = 600;
@@ -16,7 +20,14 @@ const GITMODULES_PROBE_TIMEOUT_SECS = 10;
 const GITMODULES_PROBE_MISSING_EXIT_CODE = 2;
 const GITMODULES_PROBE_INVALID_EXIT_CODE = 3;
 const SUBMODULE_SYNC_COMMAND = "git submodule sync --recursive";
-const SUBMODULE_UPDATE_COMMAND = "git submodule update --init --recursive";
+const SUBMODULE_STATUS_COMMAND = "git submodule status --recursive";
+// Command-line --checkout overrides repo-configured
+// submodule.<name>.update=!command strategies.
+const SUBMODULE_UPDATE_COMMAND = "git submodule update --init --recursive --checkout";
+// Automation-off updates must neither initialize nor fetch. --no-fetch alone
+// still permits --init to clone dataset-controlled URLs; requiring initialized
+// submodules first and omitting --init keeps materialization on local objects.
+const SUBMODULE_UPDATE_NO_FETCH_COMMAND = "git submodule update --recursive --checkout --no-fetch";
 
 interface BaseSubmoduleSyncArgs {
   workspacePath: string;
@@ -28,18 +39,27 @@ interface BaseSubmoduleSyncArgs {
 
 interface RuntimeSubmoduleSyncArgs extends BaseSubmoduleSyncArgs {
   runtime: Runtime;
+  sandbox?: ExecOptions["sandbox"];
 }
 
 function buildGitExecutionEnv(options?: {
   env?: Record<string, string>;
   trusted?: boolean;
+  filterConfigKeys?: Iterable<string>;
 }): Record<string, string> {
+  const securityEnv = gitHooksAllowed(options?.trusted)
+    ? {}
+    : options?.filterConfigKeys == null
+      ? gitNoRepoAutomationEnv()
+      : gitNoRepoAutomationEnvForConfigKeys(options.filterConfigKeys);
   return {
     ...(options?.env ?? {}),
     ...NON_INTERACTIVE_ENV_VARS,
-    // Default-deny mirrors the rest of workspace materialization: untrusted repos
-    // must not get a chance to run repo-controlled git hooks during checkout.
-    ...(options?.trusted ? {} : GIT_NO_HOOKS_ENV),
+    // Default-deny mirrors the rest of workspace materialization: untrusted
+    // repos (and trusted ones under the project-automation kill switch) must
+    // not run repo-controlled hooks or checkout filters, including pre-seeded
+    // .git/modules/<name> config/info state.
+    ...securityEnv,
   };
 }
 
@@ -59,12 +79,14 @@ async function runSubmoduleCommand(args: {
   command: string;
   timeout: number;
   fallbackError: string;
+  sandbox?: ExecOptions["sandbox"];
 }): Promise<void> {
   const result = await execBuffered(args.runtime, args.command, {
     cwd: args.workspacePath,
     timeout: args.timeout,
     abortSignal: args.abortSignal,
     env: args.env,
+    sandbox: args.sandbox,
   });
 
   if (result.exitCode !== 0) {
@@ -72,8 +94,102 @@ async function runSubmoduleCommand(args: {
   }
 }
 
+const FILTER_CONFIG_DISCOVERY_COMMAND = `
+set -e
+reject_conditional_includes() {
+  if git config --local --null --name-only "$@" --get-regexp '^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$' >/dev/null; then
+    return 4
+  else
+    status=$?
+    [ "$status" -eq 1 ] || return "$status"
+  fi
+  worktree_config=$(git config --local --bool extensions.worktreeConfig || true)
+  if [ "$worktree_config" = true ]; then
+    if git config --worktree --null --name-only "$@" --get-regexp '^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$' >/dev/null; then
+      return 4
+    else
+      status=$?
+      [ "$status" -eq 1 ] || return "$status"
+    fi
+  fi
+}
+emit_filter_keys() {
+  git config --null --name-only --includes "$@" --get-regexp '^filter[.].*[.](clean|smudge|process|required)$' || [ "$?" -eq 1 ]
+}
+reject_conditional_includes
+emit_filter_keys
+git submodule foreach --quiet --recursive '
+  if git config --local --null --name-only --get-regexp "^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$" >/dev/null; then
+    exit 4
+  else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+  fi
+  worktree_config=$(git config --local --bool extensions.worktreeConfig || true)
+  if [ "$worktree_config" = true ]; then
+    if git config --worktree --null --name-only --get-regexp "^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$" >/dev/null; then
+      exit 4
+    else
+      status=$?
+      [ "$status" -eq 1 ] || exit "$status"
+    fi
+  fi
+  git config --null --name-only --includes --get-regexp "^filter[.].*[.](clean|smudge|process|required)$" || [ "$?" -eq 1 ]
+'
+`;
+
+async function discoverRuntimeGitFilterConfigKeys(
+  args: RuntimeSubmoduleSyncArgs
+): Promise<string[]> {
+  const result = await execBuffered(args.runtime, FILTER_CONFIG_DISCOVERY_COMMAND, {
+    cwd: args.workspacePath,
+    timeout: GITMODULES_PROBE_TIMEOUT_SECS,
+    abortSignal: args.abortSignal,
+    sandbox: args.sandbox,
+    env: {
+      ...buildGitExecutionEnv({ env: args.env, trusted: args.trusted }),
+      LC_ALL: "C",
+    },
+    maxOutputBytes: 256 * 1024,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr || result.stdout || "git filter discovery failed");
+  }
+  return result.stdout.split("\0");
+}
+
+async function assertSubmodulesInitialized(
+  args: RuntimeSubmoduleSyncArgs,
+  env: Record<string, string>
+): Promise<void> {
+  const result = await execBuffered(args.runtime, SUBMODULE_STATUS_COMMAND, {
+    cwd: args.workspacePath,
+    timeout: GITMODULES_PROBE_TIMEOUT_SECS,
+    abortSignal: args.abortSignal,
+    env,
+    sandbox: args.sandbox,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr || result.stdout || "git submodule status failed");
+  }
+  if (result.stdout.split("\n").some((line) => line.startsWith("-"))) {
+    throw new Error("Refusing to initialize git submodules while project automation is disabled");
+  }
+}
+
 async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Promise<void> {
-  const env = buildGitExecutionEnv({ env: args.env, trusted: args.trusted });
+  const hooksAllowed = gitHooksAllowed(args.trusted);
+  const filterConfigKeys = hooksAllowed
+    ? undefined
+    : await discoverRuntimeGitFilterConfigKeys(args);
+  const env = buildGitExecutionEnv({
+    env: args.env,
+    trusted: args.trusted,
+    filterConfigKeys,
+  });
+  if (!hooksAllowed) {
+    await assertSubmodulesInitialized(args, env);
+  }
 
   // Skills, docs, and other workspace-managed files can live inside submodules.
   // Materialize them before init hooks or downstream runtime setup so later discovery
@@ -89,15 +205,17 @@ async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Prom
       command: SUBMODULE_SYNC_COMMAND,
       timeout: SUBMODULE_SYNC_TIMEOUT_SECS,
       fallbackError: "git submodule sync failed",
+      sandbox: args.sandbox,
     });
     await runSubmoduleCommand({
       runtime: args.runtime,
       workspacePath: args.workspacePath,
       abortSignal: args.abortSignal,
       env,
-      command: SUBMODULE_UPDATE_COMMAND,
+      command: hooksAllowed ? SUBMODULE_UPDATE_COMMAND : SUBMODULE_UPDATE_NO_FETCH_COMMAND,
       timeout: SUBMODULE_UPDATE_TIMEOUT_SECS,
       fallbackError: "git submodule update failed",
+      sandbox: args.sandbox,
     });
   } catch (error) {
     throw formatSubmoduleSyncError(error);
@@ -159,6 +277,11 @@ export async function syncLocalGitSubmodules(args: BaseSubmoduleSyncArgs): Promi
   await runSubmoduleMaterialization({
     ...args,
     runtime: new LocalRuntime(args.workspacePath),
+    // Xum's own checkout, like `git worktree add`, which runs outside the agent sandbox: under it,
+    // `git submodule sync` and `update --init` cannot write .git/config and .git/modules, so the
+    // new worktree would fail (Codex review). The env above keeps untrusted repos from running
+    // hooks and filters, and the inherited PATH finds git-lfs and the like.
+    sandbox: "off",
   });
 }
 

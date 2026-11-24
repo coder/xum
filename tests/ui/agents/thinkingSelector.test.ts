@@ -1,0 +1,239 @@
+/**
+ * Integration coverage for the chat-input thinking selector: thinking options,
+ * route-aware Pro visibility, and the global OpenAI fast-mode indicator.
+ */
+
+import "../dom";
+import { fireEvent, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
+
+import { shouldRunIntegrationTests } from "../../testUtils";
+import { setupProviders } from "../../ipc/setup";
+import { createAppHarness } from "../harness";
+
+const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
+
+const SOL_MODEL = KNOWN_MODELS.GPT.id;
+// Every supported GPT built-in (GPT-6.2 Astra/Sol, GPT-6 Luna) supports Pro mode, so the
+// hidden case uses a custom direct OpenAI model that can still exercise the fast-mode row.
+const NON_PRO_PROVIDER_MODEL_ID = "some-custom-model";
+const NON_PRO_MODEL = `openai:${NON_PRO_PROVIDER_MODEL_ID}`;
+
+async function openModelSelector(container: HTMLElement): Promise<HTMLInputElement> {
+  window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR));
+
+  return await waitFor(() => {
+    const input = container.querySelector<HTMLInputElement>(
+      'input[placeholder="Search [provider:model-name]"]'
+    );
+    if (!input) {
+      throw new Error("Model selector input not found");
+    }
+    return input;
+  });
+}
+
+async function selectModel(
+  container: HTMLElement,
+  workspaceId: string,
+  model: string
+): Promise<void> {
+  const input = await openModelSelector(container);
+  const user = userEvent.setup({ document: container.ownerDocument });
+  await user.clear(input);
+  await user.type(input, model);
+
+  const modelName = model.split(":")[1] ?? model;
+  const option = await waitFor(() =>
+    within(container).getByText(formatModelDisplayName(modelName))
+  );
+  fireEvent.click(option);
+
+  await waitFor(() => {
+    const persisted = getWorkspaceAiSelection(workspaceId).model;
+    if (persisted !== model) {
+      throw new Error(`Expected model ${model} but got ${persisted}`);
+    }
+  });
+}
+
+async function openThinkingSelector(container: HTMLElement): Promise<HTMLElement> {
+  const existing = container.querySelector<HTMLElement>('[data-component="ThinkingSelectorMenu"]');
+  if (existing) return existing;
+
+  const trigger = await waitFor(() => {
+    const match = container.querySelector<HTMLButtonElement>("[data-thinking-selector-trigger]");
+    if (!match) throw new Error("Thinking selector trigger not found");
+    return match;
+  });
+  fireEvent.click(trigger);
+
+  return await waitFor(() => {
+    const menu = container.querySelector<HTMLElement>('[data-component="ThinkingSelectorMenu"]');
+    if (!menu) throw new Error("Thinking selector menu not found");
+    return menu;
+  });
+}
+
+async function expectPressed(toggle: HTMLElement, pressed: boolean): Promise<void> {
+  await waitFor(() => {
+    if (toggle.getAttribute("aria-pressed") !== String(pressed)) {
+      throw new Error(
+        `Expected ${toggle.dataset.component} aria-pressed=${pressed}, got ${toggle.getAttribute("aria-pressed")}`
+      );
+    }
+  });
+}
+
+describeIntegration("Thinking selector", () => {
+  test("selects effort, gates Pro, and exposes fast mode with a closed-state indicator", async () => {
+    const harness = await createAppHarness({
+      branchPrefix: "thinking-selector",
+      beforeRenderEnvironment: async (env) => {
+        await setupProviders(env, { xai: { apiKey: "dummy" } });
+        const result = await env.orpc.providers.setModels({
+          provider: "openai",
+          models: [NON_PRO_PROVIDER_MODEL_ID],
+        });
+        if (!result.success) throw new Error(`Failed to seed custom OpenAI model: ${result.error}`);
+      },
+    });
+
+    try {
+      const { container } = harness.view;
+      await selectModel(container, harness.workspaceId, SOL_MODEL);
+
+      let menu = await openThinkingSelector(container);
+      let escapeReachedWindow = false;
+      const handleWindowKeyDown = () => {
+        escapeReachedWindow = true;
+      };
+      window.addEventListener("keydown", handleWindowKeyDown);
+      fireEvent.keyDown(menu, { key: "Escape" });
+      window.removeEventListener("keydown", handleWindowKeyDown);
+      if (escapeReachedWindow) {
+        throw new Error("Selector Escape reached the native window listener");
+      }
+      if (container.querySelector('[data-component="ThinkingSelectorMenu"]')) {
+        throw new Error("Thinking selector did not close on Escape");
+      }
+
+      menu = await openThinkingSelector(container);
+      const highOption = within(menu).getByRole("option", { name: "High" });
+      fireEvent.click(highOption);
+      await waitFor(() => {
+        const label = container.querySelector("[data-thinking-label]")?.textContent?.trim();
+        if (label !== "HIGH") throw new Error(`Expected HIGH thinking label, got ${label}`);
+        if (!container.querySelector('[data-component="ThinkingSelectorMenu"]')) {
+          throw new Error("Thinking selector closed after choosing an effort");
+        }
+      });
+
+      const proToggle = within(menu).getByRole("button", { name: /Pro mode/i });
+      const fastToggle = within(menu).getByRole("button", { name: /^Fast mode/i });
+      await expectPressed(proToggle, false);
+      await expectPressed(fastToggle, false);
+
+      fireEvent.click(proToggle);
+      await expectPressed(proToggle, true);
+      if (!container.querySelector('[data-component="ThinkingSelectorMenu"]')) {
+        throw new Error("Thinking selector closed after toggling Pro mode");
+      }
+      if (!container.querySelector("[data-thinking-pro-status]")) {
+        throw new Error("Open selector did not immediately show Pro status");
+      }
+
+      fireEvent.click(fastToggle);
+      await expectPressed(fastToggle, true);
+      if (!container.querySelector('[data-component="ThinkingSelectorMenu"]')) {
+        throw new Error("Thinking selector closed after toggling Fast mode");
+      }
+      if (!container.querySelector("[data-fast-mode-indicator]")) {
+        throw new Error("Open selector did not immediately show Fast status");
+      }
+      fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
+      await waitFor(() => {
+        if (!container.querySelector("[data-thinking-pro-status]")) {
+          throw new Error("Closed-state Pro status was not rendered");
+        }
+        if (!container.querySelector("[data-fast-mode-indicator]")) {
+          throw new Error("Fast-mode lightning indicator was not rendered");
+        }
+      });
+
+      // A custom OpenAI model does not support reasoning.mode=pro, but fast mode
+      // remains available because it is a direct OpenAI service-tier option.
+      await selectModel(container, harness.workspaceId, NON_PRO_MODEL);
+      menu = await openThinkingSelector(container);
+      if (menu.querySelector('[data-component="ProModeToggle"]')) {
+        throw new Error("Pro toggle should not render for a non-Pro-capable model");
+      }
+      if (!menu.querySelector('[data-component="FastModeToggle"]')) {
+        throw new Error("Fast mode should remain available for direct OpenAI models");
+      }
+      if (menu.querySelector('[data-component="UltrafastModeToggle"]')) {
+        throw new Error("Ultrafast toggle should not render for a model without Ultrafast");
+      }
+      fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
+
+      // Workspace-scoped Pro and Fast state survive model switches, like the thinking level.
+      await selectModel(container, harness.workspaceId, SOL_MODEL);
+      menu = await openThinkingSelector(container);
+      await expectPressed(within(menu).getByRole("button", { name: /Pro mode/i }), true);
+      await expectPressed(within(menu).getByRole("button", { name: /^Fast mode/i }), true);
+
+      // Ultrafast sits next to Fast mode; the two premium tiers are mutually exclusive.
+      const ultrafastToggle = within(menu).getByRole("button", { name: /^Ultrafast mode/i });
+      await expectPressed(ultrafastToggle, false);
+      fireEvent.click(ultrafastToggle);
+      await expectPressed(ultrafastToggle, true);
+      await expectPressed(within(menu).getByRole("button", { name: /^Fast mode/i }), false);
+      await waitFor(() => {
+        if (!container.querySelector("[data-ultrafast-mode-indicator]")) {
+          throw new Error("Ultrafast indicator was not rendered");
+        }
+        if (container.querySelector("[data-fast-mode-indicator]")) {
+          throw new Error("Fast indicator should clear when Ultrafast replaces it");
+        }
+      });
+      fireEvent.click(ultrafastToggle);
+      await expectPressed(ultrafastToggle, false);
+      fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
+
+      // Grok uses the same thinking selector with its native low/medium/high/xhigh
+      // ladder; its Fast toggle reads and writes the same chat speed as OpenAI's.
+      await selectModel(container, harness.workspaceId, KNOWN_MODELS.GROK_47.id);
+      menu = await openThinkingSelector(container);
+      if (menu.querySelector('[data-component="ProModeToggle"]')) {
+        throw new Error("Pro toggle should not render for Grok");
+      }
+      if (within(menu).queryByRole("option", { name: "Off" })) {
+        throw new Error("Grok should not offer thinking Off");
+      }
+      within(menu).getByRole("option", { name: "Medium" });
+      within(menu).getByRole("option", { name: "High" });
+      within(menu).getByRole("option", { name: "Extra High" });
+
+      const grokFastToggle = within(menu).getByRole("button", { name: /^Fast mode/i });
+      await expectPressed(grokFastToggle, false);
+      fireEvent.click(grokFastToggle);
+      await expectPressed(grokFastToggle, true);
+      if (!container.querySelector("[data-fast-mode-indicator]")) {
+        throw new Error("Grok fast-mode indicator was not rendered");
+      }
+      fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
+
+      // The chat's Fast pick follows it back to OpenAI instead of the provider's setting.
+      await selectModel(container, harness.workspaceId, SOL_MODEL);
+      menu = await openThinkingSelector(container);
+      await expectPressed(within(menu).getByRole("button", { name: /^Fast mode/i }), true);
+    } finally {
+      await harness.dispose();
+    }
+  }, 90_000);
+});

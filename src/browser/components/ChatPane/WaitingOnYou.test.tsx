@@ -1,0 +1,487 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { useState, type ReactNode } from "react";
+import { Ban, Clock3, FileInput, MessageCircleQuestion } from "lucide-react";
+import { installDom, stubNarrowViewport } from "../../../../tests/ui/dom";
+
+import { ChatDockSurface } from "./chatDockColumn";
+import {
+  arrangeWaiting,
+  useInWaitingOnYouSheet,
+  useWaitingOnYou,
+  WaitingOnYouCard,
+  WaitingOnYouProvider,
+  WaitingOnYouSlot,
+  type WaitingOnYouEntry,
+  type WaitingOnYouId,
+} from "./WaitingOnYou";
+
+const QUESTION: WaitingOnYouEntry = {
+  icon: MessageCircleQuestion,
+  tab: "Question",
+  title: "Which reviewers?",
+  detail: "The agent asks you",
+  urgent: true,
+};
+const UNSENT: WaitingOnYouEntry = {
+  icon: Ban,
+  tab: "2 unsent",
+  title: "2 unsent messages",
+  detail: "Not sent",
+};
+const OLD_PLAN: WaitingOnYouEntry = {
+  icon: FileInput,
+  tab: "Old plan",
+  title: "Plan from an older Xum",
+  detail: "Check it is yours, then import it",
+};
+const QUEUED: WaitingOnYouEntry = {
+  icon: Clock3,
+  tab: "Queued",
+  title: "Queued · sends after this step",
+  detail: "Restack after the base lands",
+};
+
+/** Content with state of its own, to tell a moved item from a remounted one. */
+function Counter(props: { label: string }) {
+  const [count, setCount] = useState(0);
+  const inSheet = useInWaitingOnYouSheet();
+  return (
+    <ChatDockSurface>
+      <button type="button" data-in-sheet={inSheet} onClick={() => setCount((value) => value + 1)}>
+        {`${props.label} ${count}`}
+      </button>
+    </ChatDockSurface>
+  );
+}
+
+/** Content that decides by itself whether it waits on the user, like the question dock. */
+function SelfReporting(props: { open: boolean }) {
+  useWaitingOnYou(props.open ? QUESTION : null);
+  return props.open ? <Counter label="question" /> : null;
+}
+
+/** A notice that stops waiting but keeps showing, like an old plan that was no longer there. */
+function Notice(props: { settled: boolean }) {
+  useWaitingOnYou(props.settled ? null : OLD_PLAN);
+  return <Counter label="notice" />;
+}
+
+function Stack(props: {
+  question?: boolean;
+  unsent?: boolean;
+  /** One control per unsent message; one by default. */
+  unsentLabels?: readonly string[];
+  queued?: boolean;
+  notice?: "waiting" | "settled";
+}) {
+  const slot = (id: WaitingOnYouId, entry: WaitingOnYouEntry | undefined, node: ReactNode) => (
+    <WaitingOnYouSlot id={id} entry={entry}>
+      {node}
+    </WaitingOnYouSlot>
+  );
+  return (
+    <WaitingOnYouProvider>
+      <div data-testid="dock">
+        {props.queued === true && slot("queued", QUEUED, <Counter label="queued" />)}
+        {props.unsent === true &&
+          slot(
+            "held-inputs",
+            UNSENT,
+            (props.unsentLabels ?? ["unsent"]).map((label) => <Counter key={label} label={label} />)
+          )}
+        {slot("question", undefined, <SelfReporting open={props.question === true} />)}
+        {props.notice !== undefined &&
+          slot("legacy-plan", undefined, <Notice settled={props.notice === "settled"} />)}
+        <WaitingOnYouCard />
+      </div>
+    </WaitingOnYouProvider>
+  );
+}
+
+let cleanupDom: (() => void) | null = null;
+
+/** Visible here means not inside a `hidden` ancestor: happy-dom has no layout. */
+function isShown(element: HTMLElement): boolean {
+  return element.closest(".hidden, [hidden]") === null;
+}
+
+describe("arrangeWaiting", () => {
+  const entries = new Map<WaitingOnYouId, WaitingOnYouEntry>([
+    ["queued", QUEUED],
+    ["held-inputs", UNSENT],
+    ["question", QUESTION],
+  ]);
+
+  it("lists what blocks the agent first, and the queued message only on phones", () => {
+    expect(arrangeWaiting(entries, null, false).listed.map(([id]) => id)).toEqual([
+      "question",
+      "held-inputs",
+    ]);
+    expect(arrangeWaiting(entries, null, true).listed.map(([id]) => id)).toEqual([
+      "question",
+      "held-inputs",
+      "queued",
+    ]);
+  });
+
+  it("folds into a card from two waiting items; the queued message does not count", () => {
+    expect(arrangeWaiting(entries, null, false).consolidated).toBe(true);
+    const oneAndQueued = new Map(entries);
+    oneAndQueued.delete("held-inputs");
+    expect(arrangeWaiting(oneAndQueued, null, true).consolidated).toBe(false);
+  });
+
+  it("keeps the chosen item, and falls back to the first once it is gone", () => {
+    expect(arrangeWaiting(entries, "held-inputs", false).selected).toBe("held-inputs");
+    expect(arrangeWaiting(entries, "context-switch", false).selected).toBe("question");
+    // The desktop card has no queued tab to keep.
+    expect(arrangeWaiting(entries, "queued", false).selected).toBe("question");
+    expect(arrangeWaiting(new Map(), null, false).selected).toBeNull();
+  });
+});
+
+describe("Waiting on you", () => {
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  it("leaves a single item inline, without a card", () => {
+    const view = render(<Stack unsent queued />);
+    expect(view.queryByRole("region", { name: "Waiting on you" })).toBeNull();
+    expect(isShown(view.getByRole("button", { name: "unsent 0" }))).toBe(true);
+    expect(isShown(view.getByRole("button", { name: "queued 0" }))).toBe(true);
+  });
+
+  it("shows the chosen item in the card, and switching tabs keeps each item's state", () => {
+    const view = render(<Stack question unsent queued />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    expect(within(card).getByText(/2 waiting on you/)).not.toBeNull();
+    const tabs = within(card).getAllByRole("tab");
+    expect(tabs.map((tab) => [tab.textContent, tab.getAttribute("aria-selected")])).toEqual([
+      ["Question", "true"],
+      ["2 unsent", "false"],
+    ]);
+
+    const question = within(card).getByRole("button", { name: "question 0" });
+    fireEvent.click(question);
+    fireEvent.click(within(card).getByRole("tab", { name: "2 unsent" }));
+    expect(card.contains(view.getByRole("button", { name: "unsent 0" }))).toBe(true);
+    expect(card.contains(question)).toBe(false);
+    expect(isShown(question)).toBe(false);
+
+    fireEvent.click(within(card).getByRole("tab", { name: "Question" }));
+    expect(within(card).getByRole("button", { name: "question 1" })).toBe(question);
+  });
+
+  it("drops the docked gutter inside the card", () => {
+    const view = render(<Stack question unsent />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    const surface = within(card)
+      .getByRole("button", { name: "question 0" })
+      .closest('[data-component="ChatDockSurface"]');
+    // The card's own surface wraps the card; the item's surface inside adds no column.
+    expect(surface?.className ?? "").toBe("");
+  });
+
+  it("keeps the queued message as a row under the card, not a tab", () => {
+    const view = render(<Stack question unsent queued />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    const queued = view.getByRole("button", { name: "queued 0" });
+    expect(card.contains(queued)).toBe(false);
+    expect(isShown(queued)).toBe(true);
+    expect(card.compareDocumentPosition(queued) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(card).queryByRole("tab", { name: "Queued" })).toBeNull();
+  });
+
+  it("collapses to its tabs, and a tab opens it again", () => {
+    const view = render(<Stack question unsent />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    fireEvent.click(within(card).getByRole("button", { name: "Hide what is waiting" }));
+    expect(isShown(view.getByRole("button", { name: "question 0", hidden: true }))).toBe(false);
+
+    fireEvent.click(within(card).getByRole("tab", { name: "2 unsent" }));
+    expect(isShown(view.getByRole("button", { name: "unsent 0" }))).toBe(true);
+    expect(
+      within(card)
+        .getByRole("button", { name: "Hide what is waiting" })
+        .getAttribute("aria-expanded")
+    ).toBe("true");
+  });
+
+  it("moves between tabs with the arrow keys", () => {
+    const view = render(<Stack question unsent />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    const [questionTab, unsentTab] = within(card).getAllByRole("tab");
+    questionTab.focus();
+    fireEvent.keyDown(questionTab, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(unsentTab);
+    expect(unsentTab.getAttribute("aria-selected")).toBe("true");
+    // Wraps around at the ends.
+    fireEvent.keyDown(unsentTab, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(questionTab);
+    fireEvent.keyDown(questionTab, { key: "ArrowLeft" });
+    expect(document.activeElement).toBe(unsentTab);
+  });
+
+  it("puts an item back inline, same node and focus, when only one is left", () => {
+    const view = render(<Stack question unsent />);
+    const question = view.getByRole("button", { name: "question 0" });
+    fireEvent.click(question);
+    question.focus();
+    view.rerender(<Stack question />);
+    expect(view.queryByRole("region", { name: "Waiting on you" })).toBeNull();
+    // The same element, not a remount below the item's own state (a textarea would lose focus).
+    expect(view.getByRole("button", { name: "question 1" }) === question).toBe(true);
+    expect(isShown(question)).toBe(true);
+    expect(document.activeElement === question).toBe(true);
+  });
+
+  it("hands focus to the item left over when the card breaks up around its focused tab", () => {
+    const view = render(<Stack question unsent />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    within(card).getByRole("tab", { name: "2 unsent" }).focus();
+
+    view.rerender(<Stack question />);
+    expect(view.queryByRole("region", { name: "Waiting on you" })).toBeNull();
+    const focused = document.activeElement;
+    const question = view.getByRole("button", { name: "question 0" });
+    expect(focused !== document.body && focused?.contains(question) === true).toBe(true);
+  });
+
+  it("moves an item into the card, same node and focus, when a second one arrives", () => {
+    const view = render(<Stack question />);
+    const question = view.getByRole("button", { name: "question 0" });
+    question.focus();
+    view.rerender(<Stack question unsent />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    expect(within(card).getByRole("button", { name: "question 0" }) === question).toBe(true);
+    expect(document.activeElement === question).toBe(true);
+  });
+
+  it("forms the card when self-reporting content opens, and breaks it up when it closes", () => {
+    const view = render(<Stack unsent />);
+    expect(view.queryByRole("region", { name: "Waiting on you" })).toBeNull();
+    view.rerender(<Stack question unsent />);
+    expect(view.queryByRole("region", { name: "Waiting on you" })).not.toBeNull();
+    view.rerender(<Stack unsent />);
+    expect(view.queryByRole("region", { name: "Waiting on you" })).toBeNull();
+  });
+
+  it("shows content that stopped waiting inline, next to the card, state intact", () => {
+    const view = render(<Stack question unsent notice="waiting" />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    fireEvent.click(within(card).getByRole("tab", { name: "Old plan" }));
+    fireEvent.click(within(card).getByRole("button", { name: "notice 0" }));
+
+    view.rerender(<Stack question unsent notice="settled" />);
+    expect(within(card).getByText(/2 waiting on you/)).not.toBeNull();
+    expect(within(card).queryByRole("tab", { name: "Old plan" })).toBeNull();
+    const notice = view.getByRole("button", { name: "notice 1" });
+    expect(card.contains(notice)).toBe(false);
+    expect(isShown(notice)).toBe(true);
+    // Inline again, it lines up with the transcript column as before, not edge to edge.
+    const surface = notice.closest('[data-component="ChatDockSurface"]');
+    expect(surface?.className ?? "").not.toBe("");
+  });
+
+  it("moves focus to the next tab when the item on show leaves", () => {
+    const view = render(<Stack question unsent notice="waiting" />);
+    view.getByRole("button", { name: "question 0" }).focus();
+    view.rerender(<Stack unsent notice="waiting" />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    expect(document.activeElement === within(card).getByRole("tab", { name: "2 unsent" })).toBe(
+      true
+    );
+  });
+
+  it("leaves focus outside the card alone when the item on show leaves", () => {
+    const view = render(
+      <>
+        <button type="button">composer</button>
+        <Stack question unsent notice="waiting" />
+      </>
+    );
+    const composer = view.getByRole("button", { name: "composer" });
+    composer.focus();
+    view.rerender(
+      <>
+        <button type="button">composer</button>
+        <Stack unsent notice="waiting" />
+      </>
+    );
+    expect(document.activeElement === composer).toBe(true);
+  });
+
+  describe("on a phone", () => {
+    beforeEach(() => {
+      stubNarrowViewport(true);
+    });
+
+    it("folds everything into one summary row that opens a sheet", () => {
+      const view = render(<Stack question unsent queued />);
+      const summary = view.getByRole("button", { name: /Which reviewers\?/ });
+      expect(summary.textContent).toContain("The agent asks you · 1 more waiting · 1 queued");
+      // Nothing else takes the phone's height, the queued message included.
+      for (const name of ["question 0", "unsent 0", "queued 0"]) {
+        expect(isShown(view.getByRole("button", { name, hidden: true }))).toBe(false);
+      }
+
+      fireEvent.click(summary);
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      expect(within(sheet).getByRole("button", { name: "question 0" })).not.toBeNull();
+      const others = within(sheet).getByRole("list", { name: "Also waiting" });
+      expect(
+        within(others)
+          .getAllByRole("button")
+          .map((row) => row.textContent)
+      ).toEqual([
+        "2 unsent messagesNot sent",
+        "Queued · sends after this stepRestack after the base lands",
+      ]);
+
+      fireEvent.click(within(others).getByRole("button", { name: /Queued/ }));
+      expect(within(sheet).getByRole("button", { name: "queued 0" })).not.toBeNull();
+      // The chosen row left the list: focus moved to what it opened.
+      expect(sheet.contains(document.activeElement)).toBe(true);
+      // Still headed by what waits, not by the queued message.
+      expect(summary.textContent).toContain("Which reviewers?");
+
+      act(() => {
+        fireEvent.keyDown(sheet, { key: "Escape" });
+      });
+      expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+    });
+
+    // The queued message's menu opens downward there: the sheet scrolls, and clips upward.
+    it("tells the item the open sheet shows, and only it, that it is in the sheet", () => {
+      const view = render(<Stack question unsent />);
+      const question = view.getByRole("button", { name: "question 0", hidden: true });
+      const unsent = view.getByRole("button", { name: "unsent 0", hidden: true });
+      expect(question.dataset.inSheet).toBe("false");
+
+      fireEvent.click(view.getByRole("button", { name: /Which reviewers\?/ }));
+      expect(question.dataset.inSheet).toBe("true");
+      expect(unsent.dataset.inSheet).toBe("false");
+    });
+
+    it("closes on Escape from the page once focus left the sheet", () => {
+      const view = render(<Stack question unsent />);
+      const summary = view.getByRole("button", { name: /Which reviewers\?/ });
+      summary.focus();
+      fireEvent.click(summary);
+      view.getByRole("dialog", { name: /Waiting on you/ });
+      // Tab past the sheet's last control: the page behind is inert, so focus lands on <body>.
+      document.body.focus();
+
+      act(() => {
+        fireEvent.keyDown(document.body, { key: "Escape" });
+      });
+      expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+      expect(document.activeElement).toBe(summary);
+    });
+
+    it("keeps focus in the open sheet when the item on show leaves", () => {
+      const view = render(<Stack question unsent notice="waiting" />);
+      fireEvent.click(view.getByRole("button", { name: /Which reviewers\?/ }));
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      within(sheet).getByRole("button", { name: "question 0" }).focus();
+
+      view.rerender(<Stack unsent notice="waiting" />);
+      expect(view.getByRole("dialog", { name: /Waiting on you/ })).toBe(sheet);
+      expect(within(sheet).getByRole("button", { name: "unsent 0" })).not.toBeNull();
+      expect(sheet.contains(document.activeElement)).toBe(true);
+    });
+
+    it("keeps focus in the open sheet when a focused row's item leaves", () => {
+      const view = render(<Stack question unsent queued />);
+      fireEvent.click(view.getByRole("button", { name: /Which reviewers\?/ }));
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      const others = within(sheet).getByRole("list", { name: "Also waiting" });
+      within(others)
+        .getByRole("button", { name: /Queued/ })
+        .focus();
+
+      // The queued message sends itself; two items still wait, the one on show included.
+      view.rerender(<Stack question unsent />);
+      expect(view.getByRole("dialog", { name: /Waiting on you/ })).toBe(sheet);
+      expect(within(sheet).queryByRole("button", { name: /Queued/ })).toBeNull();
+      expect(sheet.contains(document.activeElement)).toBe(true);
+    });
+
+    it("keeps focus in the open sheet when a focused message of several unsent ones leaves", async () => {
+      const view = render(<Stack question unsent unsentLabels={["first", "second"]} />);
+      fireEvent.click(view.getByRole("button", { name: /Which reviewers\?/ }));
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      const others = within(sheet).getByRole("list", { name: "Also waiting" });
+      fireEvent.click(within(others).getByRole("button", { name: /unsent/ }));
+      within(sheet).getByRole("button", { name: "first 0" }).focus();
+
+      // The first one is sent. The second still waits, so its item stays, and the sheet too.
+      view.rerender(<Stack question unsent unsentLabels={["second"]} />);
+      expect(view.getByRole("dialog", { name: /Waiting on you/ })).toBe(sheet);
+      expect(within(sheet).queryByRole("button", { name: "first 0" })).toBeNull();
+      await waitFor(() => expect(sheet.contains(document.activeElement)).toBe(true));
+    });
+
+    it("hands focus to the item left over when a focused row's item leaves the last two", () => {
+      const view = render(<Stack question unsent />);
+      const summary = view.getByRole("button", { name: /Which reviewers\?/ });
+      // As a click does: happy-dom's <body>.focus() takes focus, which browsers ignore.
+      summary.focus();
+      fireEvent.click(summary);
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      within(within(sheet).getByRole("list", { name: "Also waiting" }))
+        .getByRole("button", { name: /unsent/ })
+        .focus();
+
+      // The unsent messages go (sent from another window): one item is left, so the sheet closes.
+      view.rerender(<Stack question />);
+      expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+      const focused = document.activeElement;
+      const question = view.getByRole("button", { name: "question 0" });
+      expect(focused !== document.body && focused?.contains(question) === true).toBe(true);
+    });
+
+    it("hands focus to the card's tab when the window outgrows the sheet", () => {
+      const view = render(<Stack question unsent />);
+      const summary = view.getByRole("button", { name: /Which reviewers\?/ });
+      // As a click does: the summary row, which the card replaces, opened the sheet.
+      summary.focus();
+      fireEvent.click(summary);
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      within(sheet).getByRole("button", { name: "Close" }).focus();
+
+      stubNarrowViewport(false);
+      view.rerender(<Stack question unsent />);
+      expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+      const card = view.getByRole("region", { name: "Waiting on you" });
+      const tab = within(card).getByRole("tab", { name: "Question" });
+      expect(document.activeElement === tab).toBe(true);
+    });
+
+    it("puts the item on show back inline, same node and focus, when only one is left", () => {
+      const view = render(<Stack question unsent />);
+      const summary = view.getByRole("button", { name: /Which reviewers\?/ });
+      // As a click does; happy-dom moves focus to <body> on body.focus(), which browsers ignore.
+      summary.focus();
+      fireEvent.click(summary);
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      const question = within(sheet).getByRole("button", { name: "question 0" });
+      question.focus();
+
+      view.rerender(<Stack question />);
+      expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+      expect(view.getByRole("button", { name: "question 0" }) === question).toBe(true);
+      expect(isShown(question)).toBe(true);
+      // The sheet kept the page inert up to that commit: an inert element cannot take focus.
+      expect(document.activeElement === question).toBe(true);
+    });
+  });
+});

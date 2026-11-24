@@ -4,8 +4,6 @@ export function useProviderOptions() {
   const context = useProviderOptionsContext();
   return {
     options: context.options,
-    setAnthropicOptions: context.setAnthropicOptions,
-    setGoogleOptions: context.setGoogleOptions,
     has1MContext: context.has1MContext,
     toggle1MContext: context.toggle1MContext,
   };

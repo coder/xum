@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 # Check for unresolved review comments from coder-agents-review.
-# Usage: ./scripts/check_coder_agents_review_comments.sh <pr_number>
+# Usage: ./scripts/check_coder_agents_review_comments.sh <pr_number> [--counts-only]
 # Exits 0 if all bot-authored review threads are resolved, 1 otherwise.
+#
+# Default output lists each unresolved thread with its path, user and body: reading them is
+# this script's job. The bot quotes PR code, so those bodies carry text that the PR author
+# controls. --counts-only prints the count and fixed text instead, for gates that must not
+# print them (wait_pr_ready.sh).
 
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
-if [ $# -ne 1 ]; then
-  echo "Usage: $0 <pr_number>" >&2
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  echo "Usage: $0 <pr_number> [--counts-only]" >&2
   exit 1
 fi
 
@@ -16,10 +24,23 @@ if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+COUNTS_ONLY=0
+if [ $# -eq 2 ]; then
+  if [ "$2" != "--counts-only" ]; then
+    echo "❌ Unknown argument: '$2'" >&2
+    echo "Usage: $0 <pr_number> [--counts-only]" >&2
+    exit 1
+  fi
+  COUNTS_ONLY=1
+fi
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./lib/coder_agents_review.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/coder_agents_review.sh"
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 BOT_LOGIN_REGEX="${CODER_AGENTS_REVIEW_BOT_LOGIN_REGEX:-^coder-agents-review(\[bot\])?$}"
 UNRESOLVED=""
 
@@ -85,7 +106,7 @@ fetch_unresolved_via_api() {
       return 1
     fi
 
-    page_threads=$(echo "$page_data" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
+    page_threads=$(reply_connection_nodes "$page_data" reviewThreads) || return 1
     unresolved_page=$(coder_agents_unresolved_threads_from_json "$page_threads" "$BOT_LOGIN_REGEX")
     append_unresolved_records "$unresolved_page"
 
@@ -104,7 +125,7 @@ fetch_unresolved_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -116,7 +137,12 @@ echo "Checking for unresolved coder-agents-review comments in PR #${PR_NUMBER}..
 fetch_unresolved_via_api
 
 if [ -n "$UNRESOLVED" ]; then
-  coder_agents_print_unresolved_threads "$UNRESOLVED"
+  if [ "$COUNTS_ONLY" -eq 1 ]; then
+    echo "❌ Unresolved coder-agents-review threads: $(echo "$UNRESOLVED" | jq -s 'length')"
+    echo "Read them with: ./scripts/check_coder_agents_review_comments.sh $PR_NUMBER"
+  else
+    coder_agents_print_unresolved_threads "$UNRESOLVED"
+  fi
   echo ""
 
   echo "View PR: https://github.com/${OWNER}/${REPO}/pull/$PR_NUMBER"

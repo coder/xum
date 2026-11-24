@@ -5,11 +5,35 @@
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { TUTORIAL_STATE_KEY, WORKSPACE_DRAFTS_BY_PROJECT_KEY } from "@/common/constants/storage";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
+
+/**
+ * Open Settings from the titlebar button and scope queries to the Settings dialog. The page
+ * behind the modal stays mounted, so broader queries can match background content too.
+ */
+export async function openSettingsDialog(container: HTMLElement) {
+  fireEvent.click(await within(container).findByTestId("settings-button"));
+  const body = container.ownerDocument.body;
+  return within(await within(body).findByRole("dialog", { name: "Settings" }, { timeout: 10000 }));
+}
+
+/** Open Analytics from the titlebar button and return its dialog (a modal like Settings). */
+export async function openAnalyticsDialog(container: HTMLElement): Promise<HTMLElement> {
+  fireEvent.click(await within(container).findByTestId("analytics-button"));
+  const body = container.ownerDocument.body;
+  return within(body).findByRole("dialog", { name: "Analytics" }, { timeout: 30000 });
+}
+
+/**
+ * Open (or show) the New tab of the right sidebar pane inside `scope` with the "+" button after
+ * its tabs.
+ */
+export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
+  fireEvent.click(await within(scope).findByRole("button", { name: "New tab" }));
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // REFRESH BUTTON HELPERS
@@ -27,7 +51,7 @@ export function getRefreshIconClass(refreshButton: HTMLElement): string {
  */
 export async function waitForRefreshButtonIdle(
   refreshButton: HTMLElement,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -47,7 +71,7 @@ export async function waitForRefreshButtonIdle(
 export async function assertRefreshButtonHasLastRefreshInfo(
   refreshButton: HTMLElement,
   expectedTrigger: string,
-  timeoutMs: number = 5_000
+  timeoutMs = 5_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -76,13 +100,35 @@ export function simulateFileModifyingToolEnd(workspaceId: string): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * Wait until a page navigation has settled. Pages are lazy chunks (T3 #5971): while a chunk loads,
+ * React keeps the previous page mounted with `display: none` next to the "Opening page..."
+ * fallback, so a query can match a control (an agent picker, a textarea) on the hidden old page.
+ */
+async function waitForPageSettled(container: HTMLElement): Promise<void> {
+  await waitFor(
+    () => {
+      const mains = [...container.querySelectorAll("main")];
+      if (
+        mains.some((main) => main.closest('[style*="display: none"]')) ||
+        mains.some((main) => main.textContent?.includes("Opening page"))
+      ) {
+        throw new Error("Page chunk still loading");
+      }
+    },
+    { timeout: 10_000 }
+  );
+}
+
+/**
  * Set up the full App UI and navigate to a workspace.
  * Expands project tree and selects the workspace.
  */
 export async function setupWorkspaceView(
   view: RenderedApp,
   metadata: FrontendWorkspaceMetadata,
-  workspaceId: string
+  workspaceId: string,
+  /** False for a test that acts during workspace setup (#7449). */
+  options: { waitForSetup?: boolean } = {}
 ): Promise<void> {
   await view.waitForReady();
 
@@ -108,7 +154,8 @@ export async function setupWorkspaceView(
     () => {
       const el = view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
       if (!el) throw new Error("Workspace not found in sidebar");
-      // Wait until the workspace is selectable (not still creating) before clicking.
+      // Wait until the workspace is selectable before clicking. aria-disabled covers only
+      // removing and archiving; the setup wait comes after the click.
       if (el.getAttribute("aria-disabled") === "true") {
         throw new Error("Workspace still disabled");
       }
@@ -117,6 +164,25 @@ export async function setupWorkspaceView(
     { timeout: 10_000 }
   );
   fireEvent.click(workspaceElement);
+  await waitForPageSettled(view.container);
+
+  // Wait until the row has left workspace setup: while setup runs, it shows a cancel button in
+  // place of its actions menu, hides quick archive, and the Review tab shows a placeholder. Tests
+  // that used those controls right away raced setup on slow runners (#7450, #7541, #7543).
+  // Positive signal, not copy: the row's actions-menu trigger (the only popover trigger carrying
+  // the row's data-workspace-id) renders only once setup has ended. If it is ever removed, this
+  // wait fails loudly instead of passing at once.
+  if (options.waitForSetup !== false) {
+    await waitFor(
+      () => {
+        const menuTrigger = view.container.querySelector(
+          `button[data-workspace-id="${workspaceId}"][aria-haspopup]`
+        );
+        if (!menuTrigger) throw new Error("Workspace still in setup (no actions menu yet)");
+      },
+      { timeout: 30_000 }
+    );
+  }
 
   // Ensure the workspace is registered and activated in the store so that
   // runOnChatSubscription starts. In the real app, WorkspaceContext handles
@@ -142,7 +208,7 @@ export async function openProjectCreationView(
     () => {
       const el = view.container.querySelector(
         `[data-project-path="${projectPath}"][aria-controls]`
-      ) as HTMLElement | null;
+      );
       if (!el) throw new Error("Project not found in sidebar");
       return el;
     },
@@ -150,6 +216,7 @@ export async function openProjectCreationView(
   );
 
   fireEvent.click(projectRow);
+  await waitForPageSettled(view.container);
 
   await waitFor(
     () => {
@@ -159,6 +226,21 @@ export async function openProjectCreationView(
       }
     },
     { timeout: 10_000 }
+  );
+  // The page renders its composer before the branch list loads, and until then the trunk branch
+  // is empty, so a send that fast is refused for a worktree runtime ("Trunk branch is required").
+  // A slow host reaches that state (#6016): wait for the branch list, as a user would.
+  await waitFor(
+    () => {
+      if (
+        !view.container.querySelector(
+          '[data-component="RuntimeTypeGroup"][data-branch-load="loaded"]'
+        )
+      ) {
+        throw new Error("Source branches not loaded");
+      }
+    },
+    { timeout: 30_000 }
   );
 }
 
@@ -245,26 +327,29 @@ export async function addProjectViaUI(view: RenderedApp, projectPath: string): P
 }
 
 export function getWorkspaceDraftIds(projectPath: string): string[] {
-  const parsedDrafts = readPersistedState<Record<string, { draftId: string }[]>>(
-    WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-    {}
-  );
-  const draftsForProject = parsedDrafts[projectPath] ?? [];
+  const draftsForProject = getCreationDraftStore().getDraftsByProject()[projectPath] ?? [];
   return draftsForProject.map((draft) => draft.draftId);
 }
 
-export async function waitForLatestDraftId(
-  projectPath: string,
-  timeoutMs: number = 5_000
-): Promise<string> {
+/** Delete every listed creation draft of a project (records live on the backend). */
+export async function clearWorkspaceDrafts(projectPath: string): Promise<void> {
+  await Promise.all(
+    getWorkspaceDraftIds(projectPath).map((draftId) => getCreationDraftStore().delete(draftId))
+  );
+}
+
+/**
+ * The creation draft the open project page shows (its `draft` route parameter). A new draft is
+ * not listed until it has content, so the route is the only place to read its id from.
+ */
+export async function waitForOpenDraftId(timeoutMs = 5_000): Promise<string> {
   return waitFor(
     () => {
-      const drafts = getWorkspaceDraftIds(projectPath);
-      const latestDraft = drafts[drafts.length - 1];
-      if (!latestDraft) {
-        throw new Error("Draft not registered yet");
+      const draftId = new URLSearchParams(window.location.search).get("draft");
+      if (!draftId) {
+        throw new Error("No draft in the route yet");
       }
-      return latestDraft;
+      return draftId;
     },
     { timeout: timeoutMs }
   );
@@ -287,7 +372,8 @@ export async function cleanupView(view: RenderedApp, cleanupDom: () => void): Pr
  * Called automatically by setupTestDom().
  */
 export function disableTutorial(): void {
-  updatePersistedState(TUTORIAL_STATE_KEY, { disabled: true, completed: {} });
+  // Runtime-only, like a sandbox launch: the tutorial preference lives in the backend config.
+  globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = false;
 }
 
 /**
@@ -299,14 +385,21 @@ export function disableTutorial(): void {
 export function setupTestDom(options?: { enableTutorial?: boolean }): () => void {
   // Import here to avoid circular dependency issues
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { installDom } = require("./dom");
+  const { installDom } = require("./dom") as typeof import("./dom");
   const cleanupDom = installDom();
 
-  if (!options?.enableTutorial) {
-    disableTutorial();
+  if (options?.enableTutorial) {
+    return cleanupDom;
   }
-
-  return cleanupDom;
+  // The workspace tutorial opens 300 ms after a workspace view mounts and moves focus into its
+  // bubble, so focus and blur assertions would race it (#7120). Cleanup restores the flag, so later
+  // renders in the same test file keep their own tutorial setting.
+  const previousTutorialOptIn = globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__;
+  disableTutorial();
+  return () => {
+    cleanupDom();
+    globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = previousTutorialOptIn;
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -342,7 +435,7 @@ export function getGitStatusFromElement(element: HTMLElement): Partial<GitStatus
 export async function waitForGitStatusElement(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 30_000
+  timeoutMs = 30_000
 ): Promise<HTMLElement> {
   const store = useGitStatusStoreRaw();
 
@@ -391,7 +484,7 @@ async function waitForGitStatus(
 export function waitForDirtyStatus(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(container, workspaceId, (s) => !!s.dirty, "dirty status", timeoutMs);
 }
@@ -402,7 +495,7 @@ export function waitForDirtyStatus(
 export function waitForCleanStatus(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(container, workspaceId, (s) => !s.dirty, "clean status", timeoutMs);
 }
@@ -414,7 +507,7 @@ export function waitForAheadStatus(
   container: HTMLElement,
   workspaceId: string,
   minAhead: number,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(
     container,
@@ -432,7 +525,7 @@ export function waitForBranchStatus(
   container: HTMLElement,
   workspaceId: string,
   expectedBranch: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(
     container,
@@ -451,7 +544,7 @@ export function waitForIdleGitStatus(
   workspaceId: string,
   predicate: (status: GitStatus) => boolean,
   description: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   const store = useGitStatusStoreRaw();
 
@@ -470,4 +563,88 @@ export function waitForIdleGitStatus(
     },
     { timeout: timeoutMs }
   );
+}
+
+export type CreationIsolationAxis = "Project isolation" | "Workspace isolation";
+
+/**
+ * Opens the creation page's environment panel unless it is open. The panel holds the isolation
+ * options, their fields (host, image, directory trust) and the base branch; it is portaled to
+ * document.body, so query its content there, not in the app container.
+ */
+export async function openCreationEnvironment(container: HTMLElement): Promise<void> {
+  const chip = await waitFor(
+    () => {
+      const button = container.querySelector<HTMLButtonElement>(
+        '[data-testid="creation-environment"]'
+      );
+      if (!button) throw new Error("Environment chip not found");
+      return button;
+    },
+    { timeout: 5_000 }
+  );
+  if (chip.getAttribute("aria-expanded") !== "true") fireEvent.click(chip);
+  await waitFor(() => {
+    if (!document.querySelector('[role="radiogroup"][aria-label="Project isolation"]')) {
+      throw new Error("Environment panel did not open");
+    }
+  });
+}
+
+/**
+ * Closes the environment panel if it is open. The panel is modal, so the page behind it takes no
+ * pointer input until it closes: do this before a test goes back to the composer or the page.
+ */
+export async function closeCreationEnvironment(container: HTMLElement): Promise<void> {
+  const chip = container.querySelector<HTMLButtonElement>('[data-testid="creation-environment"]');
+  if (chip?.getAttribute("aria-expanded") !== "true") return;
+  const done = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')
+  ).find((button) => button.textContent?.trim() === "Done");
+  if (!done) throw new Error("Environment panel has no Done button");
+  fireEvent.click(done);
+  await waitFor(() => {
+    if (chip.getAttribute("aria-expanded") === "true") {
+      throw new Error("Environment panel did not close");
+    }
+  });
+}
+
+/** An option row of the open environment panel, by the label it starts with. */
+export function findCreationIsolationOption(
+  axis: CreationIsolationAxis,
+  label: string
+): HTMLElement | null {
+  const group = document.querySelector(`[role="radiogroup"][aria-label="${axis}"]`);
+  return (
+    Array.from(group?.querySelectorAll<HTMLElement>('[role="radio"]') ?? []).find((option) =>
+      option.textContent?.startsWith(label)
+    ) ?? null
+  );
+}
+
+/** Picks an isolation option in the environment panel, opening the panel first if needed. */
+export async function selectCreationIsolation(
+  container: HTMLElement,
+  axis: CreationIsolationAxis,
+  label: string
+): Promise<void> {
+  await openCreationEnvironment(container);
+  const option = await waitFor(
+    () => {
+      const candidate = findCreationIsolationOption(axis, label);
+      if (!candidate) throw new Error(`${axis} option '${label}' not found`);
+      return candidate;
+    },
+    { timeout: 5_000 }
+  );
+  fireEvent.click(option);
+}
+
+/** The label of the checked option on one axis of the open environment panel. */
+export function checkedCreationIsolation(axis: CreationIsolationAxis): string {
+  const checked = document.querySelector(
+    `[role="radiogroup"][aria-label="${axis}"] [role="radio"][aria-checked="true"]`
+  );
+  return checked?.textContent ?? "";
 }

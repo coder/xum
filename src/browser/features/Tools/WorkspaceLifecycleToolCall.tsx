@@ -1,6 +1,7 @@
 import React from "react";
 import {
   Archive,
+  ArchiveRestore,
   Ban,
   CircleX,
   FolderX,
@@ -47,7 +48,7 @@ import type {
  * lifecycle `status` values. A thrown execute() surfaces instead as `{ success: false,
  * error }`, handled via the shared ErrorBox.
  *
- * Design intent ported from the "Workspace Lifecycle Tool Call" Mux Design System mockup;
+ * Design intent ported from the "Workspace Lifecycle Tool Call" Xum Design System mockup;
  * the mockup used a simplified placeholder schema (archive|delete, top-level success), so
  * this card preserves its visual vocabulary while binding to the real status union.
  */
@@ -100,6 +101,13 @@ interface StatusMeta {
 const STATUS_META: Record<TaskWorkspaceLifecycleStatus, StatusMeta> = {
   archived: { label: "Archived", tone: "warn", group: "settled", Icon: Archive },
   already_archived: { label: "Already archived", tone: "muted", group: "settled", Icon: Archive },
+  unarchived: { label: "Unarchived", tone: "info", group: "settled", Icon: ArchiveRestore },
+  already_unarchived: {
+    label: "Already unarchived",
+    tone: "muted",
+    group: "settled",
+    Icon: ArchiveRestore,
+  },
   deleted_worktree: { label: "Worktree deleted", tone: "warn", group: "settled", Icon: FolderX },
   already_transcript_only: {
     label: "Worktree already gone",
@@ -157,6 +165,12 @@ const ACTION_META: Record<TaskWorkspaceLifecycleToolArgs["action"], ActionMeta> 
     label: "Archive workspaces",
     unit: "workspace",
     note: "Archived workspaces are hidden from the active list and can be restored later.",
+  },
+  unarchive: {
+    gerund: "Unarchiving workspaces",
+    label: "Unarchive workspaces",
+    unit: "workspace",
+    note: "Restores archived workspaces to the active list without starting a new turn.",
   },
   delete_worktree: {
     gerund: "Deleting worktrees",
@@ -278,8 +292,10 @@ function blockedHint(
   switch (status) {
     case "requires_archive":
       return `Archive this workspace before ${action === "remove" ? "removing it" : "deleting its worktree"}.`;
+    // Historical rows only (#3950): the tool no longer accepts acknowledged paths, so point
+    // at the user-driven archive, which lists the files and asks for confirmation.
     case "requires_confirmation":
-      return "Re-run with these paths listed in acknowledged_untracked_paths to confirm.";
+      return "Archive this workspace from the sidebar to review and confirm these files.";
     case "active":
       return "Pass interrupt_active: true to act on a running turn.";
     default:
@@ -350,7 +366,8 @@ const WorkspaceRow: React.FC<{
         {row.paths && row.paths.length > 0 && (
           <DetailList
             label={
-              row.status === "requires_confirmation"
+              // Since #3950 the lossy-snapshot refusal is the only "error" row with paths.
+              row.status === "requires_confirmation" || row.status === "error"
                 ? "Untracked files that would be lost"
                 : "Paths"
             }

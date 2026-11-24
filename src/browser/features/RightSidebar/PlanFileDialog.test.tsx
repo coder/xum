@@ -1,61 +1,89 @@
-import type { ReactNode } from "react";
+import * as RealMarkdownCore from "../Messages/MarkdownCore";
+import * as RealMarkdownRenderer from "../Messages/MarkdownRenderer";
+import { APIContext, APIProvider } from "@/browser/contexts/API";
+import type { ReactElement, ReactNode } from "react";
+import { PlanFileDialog } from "./PlanFileDialog";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, render, waitFor } from "@testing-library/react";
+import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 type GetPlanContentResult =
   | { success: true; data: { content: string; path: string } }
   | { success: false; error: string };
 
-interface MockApiClient {
-  workspace: {
-    getPlanContent: () => Promise<GetPlanContentResult>;
-  };
+let mockApi: TestApiOverrides<APIClient> | null = null;
+
+// Scope module mocks to each test so renderer assertions use the real pipeline.
+const realModules: Array<[string, Record<string, unknown>]> = [
+  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
+  ["@/browser/features/Messages/MarkdownCore", { ...RealMarkdownCore }],
+  ["@/browser/features/Messages/MarkdownRenderer", { ...RealMarkdownRenderer }],
+];
+
+async function installModuleMocks() {
+  await mock.module("@/browser/components/Dialog/Dialog", () => ({
+    Dialog: (props: { open: boolean; children: ReactNode }) =>
+      props.open ? <div>{props.children}</div> : null,
+    DialogContent: (props: { children: ReactNode; className?: string }) => (
+      <div className={props.className}>{props.children}</div>
+    ),
+    DialogHeader: (props: { children: ReactNode }) => <div>{props.children}</div>,
+    DialogTitle: (props: { children: ReactNode; className?: string }) => (
+      <h2 className={props.className}>{props.children}</h2>
+    ),
+  }));
+
+  await mock.module("@/browser/features/Messages/MarkdownCore", () => ({
+    MarkdownCore: (props: { content: string }) => (
+      <div data-testid="plan-markdown-core">{props.content}</div>
+    ),
+  }));
+
+  await mock.module("@/browser/features/Messages/MarkdownRenderer", () => ({
+    PlanMarkdownContainer: (props: { children: ReactNode }) => (
+      <div data-testid="plan-markdown-container">{props.children}</div>
+    ),
+  }));
 }
 
-let mockApi: MockApiClient | null = null;
+// Inject the client through the real provider (a module mock of contexts/API is process-wide).
+// The wrapper reads mockApi at render time; a null mockApi models an unavailable backend.
+function ApiWrapper(props: { children: ReactNode }) {
+  if (mockApi === null) {
+    return (
+      <APIContext.Provider
+        value={{
+          status: "error",
+          api: null,
+          error: "API unavailable",
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        {props.children}
+      </APIContext.Provider>
+    );
+  }
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+}
 
-void mock.module("@/browser/components/Dialog/Dialog", () => ({
-  Dialog: (props: { open: boolean; children: ReactNode }) =>
-    props.open ? <div>{props.children}</div> : null,
-  DialogContent: (props: { children: ReactNode; className?: string }) => (
-    <div className={props.className}>{props.children}</div>
-  ),
-  DialogHeader: (props: { children: ReactNode }) => <div>{props.children}</div>,
-  DialogTitle: (props: { children: ReactNode; className?: string }) => (
-    <h2 className={props.className}>{props.children}</h2>
-  ),
-}));
+function renderWithApi(ui: ReactElement) {
+  return render(ui, { wrapper: ApiWrapper });
+}
 
-void mock.module("@/browser/features/Messages/MarkdownCore", () => ({
-  MarkdownCore: (props: { content: string }) => (
-    <div data-testid="plan-markdown-core">{props.content}</div>
-  ),
-}));
-
-void mock.module("@/browser/features/Messages/MarkdownRenderer", () => ({
-  PlanMarkdownContainer: (props: { children: ReactNode }) => (
-    <div data-testid="plan-markdown-container">{props.children}</div>
-  ),
-}));
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: mockApi ? "connected" : "error",
-    error: mockApi ? null : "API unavailable",
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
-
-import { PlanFileDialog } from "./PlanFileDialog";
+async function restoreModuleMocks() {
+  for (const [path, exports] of realModules) await mock.module(path, () => exports);
+}
 
 describe("PlanFileDialog", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await installModuleMocks();
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
@@ -63,8 +91,9 @@ describe("PlanFileDialog", () => {
     mockApi = null;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     cleanup();
+    await restoreModuleMocks();
     mock.restore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
@@ -88,7 +117,7 @@ describe("PlanFileDialog", () => {
     };
 
     const onOpenChange = () => undefined;
-    const view = render(
+    const view = renderWithApi(
       <PlanFileDialog open={false} onOpenChange={onOpenChange} workspaceId="workspace-1" />
     );
 
@@ -121,7 +150,7 @@ describe("PlanFileDialog", () => {
       },
     };
 
-    const view = render(
+    const view = renderWithApi(
       <PlanFileDialog open onOpenChange={() => undefined} workspaceId="workspace-2" />
     );
 
@@ -139,7 +168,7 @@ describe("PlanFileDialog", () => {
   test("renders API-unavailable state when not connected", async () => {
     mockApi = null;
 
-    const view = render(
+    const view = renderWithApi(
       <PlanFileDialog open onOpenChange={() => undefined} workspaceId="workspace-3" />
     );
 

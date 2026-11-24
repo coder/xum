@@ -398,7 +398,9 @@ describe("AnalyticsQueryToolCall", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Bar" }));
 
-    await waitFor(() => expect(view.queryByText("Added to analytics dashboard.")).toBeNull());
+    await waitFor(() =>
+      expect(view.queryByText("Added to analytics dashboard.") === null).toBe(true)
+    );
 
     expect(view.getByRole("button", { name: "Add to analytics dashboard" })).toBeTruthy();
     expect(view.queryByRole("button", { name: "Open dashboard" })).toBeNull();

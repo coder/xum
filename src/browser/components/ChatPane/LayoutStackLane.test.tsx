@@ -3,7 +3,11 @@ import { cleanup, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 
 import { ChatInputDecorationStackLane, TranscriptTailStackLane } from "./LayoutStackLane";
-import { createChatInputDecorationStackItem, createTranscriptTailStackItem } from "./layoutStack";
+import {
+  createChatInputDecorationStackItem,
+  createTranscriptTailStackItem,
+  selectVisibleChatInputDecorations,
+} from "./layoutStack";
 
 let cleanupDom: (() => void) | null = null;
 const COMPOSER_STACK_COMPONENT = "ChatInputDecorationStack";
@@ -48,6 +52,26 @@ describe("LayoutStackLane", () => {
 
     const stack = getRenderedStack(view.container, COMPOSER_STACK_COMPONENT);
     expect(stack.textContent).toBe("first bannersecond banner");
+  });
+
+  it("keeps immediate queued-message chrome visible while deferred decorations are gated", () => {
+    const queuedMessage = createChatInputDecorationStackItem({
+      key: "queued-message",
+      node: <div>queued follow-up</div>,
+      revealBeforeReady: true,
+    });
+    const backgroundProcesses = createChatInputDecorationStackItem({
+      key: "background-processes",
+      node: <div>background processes</div>,
+    });
+
+    expect(selectVisibleChatInputDecorations([queuedMessage, backgroundProcesses], false)).toEqual([
+      queuedMessage,
+    ]);
+    expect(selectVisibleChatInputDecorations([queuedMessage, backgroundProcesses], true)).toEqual([
+      queuedMessage,
+      backgroundProcesses,
+    ]);
   });
 
   it("opts the transcript tail out of scroll anchoring but not the composer decorations", () => {

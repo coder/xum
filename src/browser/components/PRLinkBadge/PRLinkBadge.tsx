@@ -40,7 +40,7 @@ export function getStatusColorClass(prLink: GitHubPRLinkWithStatus): string {
 
   if (mergeable === "CONFLICTING" || mergeStateStatus === "DIRTY") return "text-danger-soft";
 
-  if (mergeStateStatus === "CLEAN") return "text-success";
+  if (mergeStateStatus === "CLEAN") return "text-success-text";
   if (mergeStateStatus === "BEHIND") return "text-warning";
 
   // Prefer check rollup when available; fall back to mergeStateStatus.

@@ -38,15 +38,20 @@ jobs:
         shell: bash
         run: |
           BUILD_SHA=$(git rev-parse HEAD)
-          # --exclude 'v*-*' skips pre-release tags (e.g. v1.2.3-nightly.5)
-          # so we always base version computation on the last stable release.
+          # --match 'v*' skips nightly tags (e.g. 1.2.3-nightly.5) and
+          # --exclude 'v*-*' skips the older ones that had a v prefix, so we
+          # always base version computation on the last stable release.
           TAG_BASE=$(git describe --tags --abbrev=0 --match 'v*' --exclude 'v*-*')
           IFS='.' read -r MAJOR MINOR PATCH <<< "${TAG_BASE#v}"
           PATCH="${PATCH%%-*}"
           NEXT_PATCH="${MAJOR}.${MINOR}.$((PATCH + 1))"
           COMMITS=$(git rev-list --count HEAD "^$TAG_BASE")
           NIGHTLY_VERSION="${NEXT_PATCH}-nightly.${COMMITS}"
-          RELEASE_TAG="v${NIGHTLY_VERSION}"
+          # No v prefix: a tag rule reserves v* tags for stable releases, and
+          # this workflow's token may not create them. The tag must stay the
+          # bare version, because the updater skips a release whose tag is not
+          # semver with "nightly" as its first prerelease part.
+          RELEASE_TAG="${NIGHTLY_VERSION}"
 
           {
             echo "release_tag=$RELEASE_TAG"
@@ -70,10 +75,14 @@ jobs:
             nightly-docker.txt
             # Versioned Linux release assets ensure reruns don't skip partially
             # published AppImage/checksum outputs.
-            "mux-${RELEASE_VERSION}-x86_64.AppImage"
-            "mux-${RELEASE_VERSION}-arm64.AppImage"
-            "mux-${RELEASE_VERSION}-x86_64.AppImage.sha256"
-            "mux-${RELEASE_VERSION}-arm64.AppImage.sha256"
+            "xum-${RELEASE_VERSION}-x86_64-linux.AppImage"
+            "xum-${RELEASE_VERSION}-arm64-linux.AppImage"
+            "xum-${RELEASE_VERSION}-x86_64-linux.AppImage.sha256"
+            "xum-${RELEASE_VERSION}-arm64-linux.AppImage.sha256"
+            "mux-${RELEASE_VERSION}-x86_64-linux.AppImage"
+            "mux-${RELEASE_VERSION}-arm64-linux.AppImage"
+            "mux-${RELEASE_VERSION}-x86_64-linux.AppImage.sha256"
+            "mux-${RELEASE_VERSION}-arm64-linux.AppImage.sha256"
           )
 
           # Re-runs with no new commits may find an existing nightly release.
@@ -178,7 +187,7 @@ jobs:
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '
               .[]
               | select(.prerelease)
-              | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]+$"))
+              | select(.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]+$"))
               | .tag_name
             '
           )
@@ -189,6 +198,8 @@ jobs:
             fi
             echo "Deleting old nightly release $tag"
             # Keep this cleanup job checkout-free: use API-only deletion (no local git).
+            # A nightly from before the tags lost their v prefix loses its
+            # release here but keeps its tag: this token may not delete v* tags.
             if release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" --jq '.id' 2>/dev/null); then
               gh api --silent -X DELETE "repos/${GITHUB_REPOSITORY}/releases/$release_id"
             fi

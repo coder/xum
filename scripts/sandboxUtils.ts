@@ -6,6 +6,8 @@ import * as path from "path";
 
 import * as jsonc from "jsonc-parser";
 
+import { resolveXumEnvironmentEntry, type XumEnvironment } from "../src/common/compat/xumEnv";
+import { XUM_HOME_DIR_NAME } from "../src/common/constants/product";
 import {
   AZURE_OPENAI_ENV_VARS,
   BEDROCK_AUTH_ENV_VARS,
@@ -40,18 +42,57 @@ export type SeedSources = {
   configPath: string | null;
 };
 
+export type ChooseSeedSourcesOptions = {
+  env?: XumEnvironment;
+  homeDir?: string;
+};
+
+function uniqueExpandedPaths(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (!value) continue;
+    const expanded = expandTilde(value);
+    if (seen.has(expanded)) continue;
+    seen.add(expanded);
+    result.push(expanded);
+  }
+  return result;
+}
+
 /**
- * Pick seed files for a sandbox MUX_ROOT.
+ * Seed-root order when no explicit SEED_XUM_ROOT / SEED_MUX_ROOT is set:
+ * XUM_ROOT, MUX_ROOT, ~/.xum[-dev], then legacy ~/.mux[-dev] / ~/.cmux.
+ */
+export function listSandboxSeedCandidateRoots(options: ChooseSeedSourcesOptions = {}): string[] {
+  const env = options.env ?? process.env;
+  const homeDir = options.homeDir ?? os.homedir();
+
+  return uniqueExpandedPaths([
+    env.XUM_ROOT,
+    env.MUX_ROOT,
+    path.join(homeDir, `${XUM_HOME_DIR_NAME}-dev`),
+    path.join(homeDir, XUM_HOME_DIR_NAME),
+    // Leftover local homes remain accepted; remote ~/.mux and Docker /var/mux are separate contracts.
+    path.join(homeDir, ".mux-dev"),
+    path.join(homeDir, ".mux"),
+    path.join(homeDir, ".cmux"),
+  ]);
+}
+
+/**
+ * Pick seed files for a sandbox XUM_ROOT.
  *
  * providers.jsonc and config.json are chosen *independently* from the first
- * candidate root that has each file. A root like ~/.mux-dev often has only
- * config.json while provider credentials live in ~/.mux/providers.jsonc;
+ * candidate root that has each file. A root like ~/.xum-dev often has only
+ * config.json while provider credentials live in ~/.xum/providers.jsonc;
  * picking a single root would silently drop provider config and push the
  * sandboxed server onto env-var credential fallback, which can pair a real
  * API key with an unrelated *_BASE_URL proxy (e.g. Coder AI bridge) and fail
  * auth. See sanitizeSandboxProviderEnv for the env-side guard.
  */
-export function chooseSeedSources(): SeedSources {
+export function chooseSeedSources(options: ChooseSeedSourcesOptions = {}): SeedSources {
+  const env = options.env ?? process.env;
   const findFirstFile = (roots: string[], fileName: string): string | null => {
     for (const root of roots) {
       const candidate = path.join(root, fileName);
@@ -60,10 +101,13 @@ export function chooseSeedSources(): SeedSources {
     return null;
   };
 
-  if (process.env.SEED_MUX_ROOT) {
-    const explicit = expandTilde(process.env.SEED_MUX_ROOT);
+  const explicitSeed = env.SEED_XUM_ROOT ?? env.SEED_MUX_ROOT;
+  if (explicitSeed) {
+    const explicit = expandTilde(explicitSeed);
     if (!dirExists(explicit)) {
-      throw new Error(`SEED_MUX_ROOT does not exist or is not a directory: ${explicit}`);
+      throw new Error(
+        `SEED_XUM_ROOT/SEED_MUX_ROOT does not exist or is not a directory: ${explicit}`
+      );
     }
     // Explicit seed root: only look there.
     return {
@@ -72,12 +116,7 @@ export function chooseSeedSources(): SeedSources {
     };
   }
 
-  const candidates = [
-    process.env.MUX_ROOT ? expandTilde(process.env.MUX_ROOT) : null,
-    path.join(os.homedir(), ".mux-dev"),
-    path.join(os.homedir(), ".mux"),
-  ].filter((value): value is string => Boolean(value));
-
+  const candidates = listSandboxSeedCandidateRoots(options);
   return {
     providersPath: findFirstFile(candidates, "providers.jsonc"),
     configPath: findFirstFile(candidates, "config.json"),
@@ -121,6 +160,10 @@ function providerCredentialEnvVarNames(): string[] {
 const BEDROCK_CLEAN_ENV_VARS: string[] = [
   ...(PROVIDER_ENV_VARS.bedrock?.region ?? []),
   BEDROCK_AUTH_ENV_VARS.bearerToken,
+  // Google Vertex AI is likewise "configured" from a project env var alone
+  // (credentials flow via Google ADC), so a clean sandbox drops project/location.
+  ...(PROVIDER_ENV_VARS["google-vertex"]?.project ?? []),
+  ...(PROVIDER_ENV_VARS["google-vertex"]?.location ?? []),
 ];
 
 /**
@@ -222,11 +265,52 @@ export function sanitizeSandboxProviderEnv(options: {
   if (present.length > 0) {
     console.warn(
       `\nWARNING: no providers.jsonc was seeded into the sandbox; the server will fall back to provider env vars: ${present.join(", ")}.\n` +
-        "If a *_BASE_URL env var points at a proxy (e.g. Coder AI bridge), the env API key may not match it and provider auth will fail.\n"
+        "If a *_BASE_URL env var points at a proxy (e.g. Coder AI Gateway), the env API key may not match it and provider auth will fail.\n"
     );
   }
 
   return env;
+}
+
+/**
+ * The proxy URL template the sandbox reads, with the name of the variable that holds it:
+ * XUM_PROXY_URI (or its leftover alias), else VSCODE_PROXY_URI, as src/desktop/main.ts does.
+ */
+export function readProxyUriTemplate(
+  env: XumEnvironment
+): { name: string; template: string } | null {
+  const xum = resolveXumEnvironmentEntry("PROXY_URI", env);
+  if (xum?.value.trim()) return { name: xum.name, template: xum.value.trim() };
+
+  const vscode = env.VSCODE_PROXY_URI?.trim();
+  return vscode ? { name: "VSCODE_PROXY_URI", template: vscode } : null;
+}
+
+/**
+ * Hostname that Coder's subdomain port-forward proxy serves `port` under, or null.
+ *
+ * Reads the proxy URL template (see readProxyUriTemplate). Only a template with `{{port}}` in its
+ * hostname names a host that belongs to this sandbox. A path-based template names a host shared by
+ * every app, so it is not derived.
+ */
+export function deriveProxyAllowedHost(env: XumEnvironment, port: number): string | null {
+  const template = readProxyUriTemplate(env)?.template;
+  if (!template) return null;
+
+  // `{` is not valid in a hostname, so swap the placeholder for a hostname-safe marker before parsing.
+  const marker = "xumportmarker";
+  let hostname: string;
+  try {
+    hostname = new URL(template.replaceAll("{{port}}", marker)).hostname;
+  } catch {
+    return null;
+  }
+  if (!hostname.includes(marker)) return null;
+
+  // Only plain DNS labels: a leading "." would match every subdomain in Vite's allowedHosts, and
+  // "," would add a second entry.
+  const derived = hostname.replaceAll(marker, String(port));
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(derived) ? derived : null;
 }
 
 export function copyConfigClearingProjectsIfExists(sourcePath: string, destPath: string): boolean {

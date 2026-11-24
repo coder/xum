@@ -1,3 +1,5 @@
+import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
+
 export type SubagentReportStatus = "in_progress" | "completed";
 
 export interface SubagentReportEnvelope {
@@ -6,10 +8,28 @@ export interface SubagentReportEnvelope {
   status: SubagentReportStatus;
   title: string;
   reportMarkdown: string;
+  executionVersion?: string;
+  executionId?: string;
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
   structuredOutput?: unknown;
 }
 
 export const SUBAGENT_FAILURE_ENVELOPE_TAG = "<mux_subagent_failure>";
+
+// Fallback titles for untitled reports; the matcher lives here so consumers (timeline dedupe) can
+// treat them as absent titles without drifting from the builders.
+export function subagentUpdateFallbackTitle(agentType: string): string {
+  return `Subagent (${agentType}) update`;
+}
+
+export function subagentReportFallbackTitle(agentType: string): string {
+  return `Subagent (${agentType}) report`;
+}
+
+export function isSubagentFallbackTitle(title: string): boolean {
+  return /^Subagent \(.+\) (?:update|report)$/.test(title);
+}
 
 const ROOT_OPEN = "<mux_subagent_report>";
 const ROOT_CLOSE = "</mux_subagent_report>";
@@ -24,6 +44,10 @@ function isNonEmptyString(value: unknown): value is string {
 
 function isStatus(value: unknown): value is SubagentReportStatus {
   return value === "in_progress" || value === "completed";
+}
+
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
 }
 
 /**
@@ -64,6 +88,14 @@ function parseJsonEnvelope(inner: string): SubagentReportEnvelope | null {
     status: record.status,
     title: record.title,
     reportMarkdown: record.reportMarkdown,
+    ...(isNonEmptyString(record.executionVersion)
+      ? { executionVersion: record.executionVersion }
+      : {}),
+    ...(isNonEmptyString(record.executionId) ? { executionId: record.executionId } : {}),
+    // Model/thinking are display metadata: tolerate absent or malformed values so a bad
+    // producer can never invalidate an otherwise well-formed report.
+    ...(isNonEmptyString(record.model) ? { model: record.model } : {}),
+    ...(isThinkingLevel(record.thinkingLevel) ? { thinkingLevel: record.thinkingLevel } : {}),
     ...(Object.hasOwn(record, "structuredOutput")
       ? { structuredOutput: record.structuredOutput }
       : {}),
@@ -132,4 +164,8 @@ export function parseSubagentReportEnvelope(content: string): SubagentReportEnve
   const root = /^<mux_subagent_report>\n([\s\S]*)\n<\/mux_subagent_report>$/.exec(content);
   if (!root) return null;
   return parseJsonEnvelope(root[1]) ?? parseLegacyEnvelope(root[1]);
+}
+
+export function isCompletedSubagentReportEnvelope(content: string): boolean {
+  return parseSubagentReportEnvelope(content)?.status === "completed";
 }

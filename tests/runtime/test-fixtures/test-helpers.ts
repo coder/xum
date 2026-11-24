@@ -160,25 +160,6 @@ export class TestWorkspace {
 }
 
 /**
- * Configure SSH client to use test key
- *
- * Returns environment variables to pass to SSH commands
- * Note: sshConfig is used to document the connection params but the actual
- * SSH connection is handled by SSHRuntime with identityFile.
- */
-export function getSSHEnv(_sshConfig: SSHServerConfig): Record<string, string> {
-  // Filter out undefined values from process.env
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) {
-      env[key] = value;
-    }
-  }
-
-  return env;
-}
-
-/**
  * Wait for predicate to become true
  */
 export async function waitFor(

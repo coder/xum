@@ -14,8 +14,9 @@ import {
   Zap,
 } from "lucide-react";
 
-import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { WorkflowJsonBlock } from "@/browser/features/Tools/WorkflowToolShared";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { useReducedMotion } from "@/browser/hooks/useReducedMotion";
 import { useWorkflowRunById } from "@/browser/hooks/useWorkflowRunById";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
@@ -24,7 +25,11 @@ import {
 } from "@/common/types/workflow";
 
 import { WorkflowLiveDot } from "./WorkflowBadges";
+import { WorkflowLongText } from "./WorkflowLongText";
+import { WorkflowPhaseFlow, phaseFlowNodesFromView } from "./WorkflowPhaseFlow";
 import {
+  getActiveWorkflowPhase,
+  isUnvisitedPhaseLifecycle,
   projectWorkflowRun,
   type WorkflowPhaseView,
   type WorkflowRunView,
@@ -47,12 +52,15 @@ interface WorkflowTimelineProps {
   view: WorkflowRunView;
   workspaceId?: string;
   nestedDepth?: number;
+  showFinalReport?: boolean;
 }
 
 interface WorkflowPhaseSectionProps {
   phase: WorkflowPhaseView;
   workspaceId?: string;
   nestedDepth: number;
+  /** Registers the section root so the phase rail can scroll it into view. */
+  sectionRef?: (element: HTMLDivElement | null) => void;
 }
 
 interface WorkflowStepRowProps {
@@ -62,6 +70,17 @@ interface WorkflowStepRowProps {
   nestedDepth: number;
 }
 
+/**
+ * The provider-reported response model id is a bare id (`gpt-5`), and the
+ * evaluation service falls back to the requested bare id when a provider
+ * reports none, while the admitted `modelString` keeps its provider prefix
+ * (`openai:gpt-5`). Compare like with like so an ordinary completion does not
+ * render a second "↳ …" model line.
+ */
+function bareModelId(modelString: string): string {
+  return modelString.slice(modelString.indexOf(":") + 1);
+}
+
 function getNestedWorkflowSummary(input: {
   childView: WorkflowRunView | null;
   fallbackStatus?: WorkflowStepView["nestedWorkflowStatus"];
@@ -69,8 +88,7 @@ function getNestedWorkflowSummary(input: {
   if (input.childView == null) {
     return input.fallbackStatus ?? "loading";
   }
-  const activePhase =
-    input.childView.phases.find((phase) => phase.running) ?? input.childView.phases.at(-1);
+  const activePhase = getActiveWorkflowPhase(input.childView.phases);
   const phaseLabel =
     activePhase != null && activePhase.label.length > 0 ? ` · ${activePhase.label}` : "";
   return `${input.childView.status} · ${input.childView.stats.done}/${input.childView.stats.total} steps${phaseLabel}`;
@@ -198,19 +216,24 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
   );
   const hasResultTitle = step.result?.title != null && step.result.title.length > 0;
   const hasStructuredOutput = step.result?.structuredOutput !== undefined;
+  const evaluation = step.evaluation;
   const hasStepMetadata =
     step.durationMs != null ||
     step.usage?.tokens != null ||
     step.usage?.costUsd != null ||
-    step.taskId != null;
+    step.taskId != null ||
+    evaluation != null;
   const hasStandaloneStepResult =
     !hasNestedWorkflow && (hasResultTitle || showReport || hasStructuredOutput);
   const hasStandaloneStepMetadata = hasStepMetadata && !hasNestedWorkflow;
   const hasStepDetailContent =
     step.status === "failed" || hasStandaloneStepResult || hasStandaloneStepMetadata;
+  // Evaluation rows are expandable in every status: the admitted model and
+  // attempt are known from the moment the step starts, not only on completion.
   const expandable =
     step.status === "failed" ||
     hasNestedWorkflow ||
+    evaluation != null ||
     (step.status === "completed" && hasStepDetailContent);
   // Surface failures by default (including live failures that arrive after the row mounted while
   // running); active nested workflows also start open so their child progress is visible.
@@ -246,7 +269,7 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
         </span>
       )}
       {step.status === "running" && (
-        <span className="text-accent shrink-0 text-[11px]">running…</span>
+        <span className="text-accent-text shrink-0 text-[11px]">running…</span>
       )}
       {step.status === "failed" && (
         <span className="shrink-0 text-[11px]" style={{ color }}>
@@ -256,6 +279,11 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
       {hasNestedWorkflow && (
         <span className="border-border text-plan-mode shrink-0 rounded border px-1.5 py-px text-[10px]">
           nested
+        </span>
+      )}
+      {evaluation != null && (
+        <span className="border-border text-muted shrink-0 rounded border px-1.5 py-px text-[10px]">
+          {evaluation.cached ? "evaluation · cached" : "evaluation"}
         </span>
       )}
       {expandable &&
@@ -322,7 +350,11 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
               {step.status === "failed" ? (
                 <div className="flex gap-2 text-[12.5px] leading-relaxed" style={{ color }}>
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>{step.error ?? "Sub-agent failed"}</span>
+                  <WorkflowLongText
+                    className="flex-1"
+                    text={step.error ?? "Sub-agent failed"}
+                    title={`${step.title} — error`}
+                  />
                 </div>
               ) : (
                 <>
@@ -333,7 +365,12 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
                   )}
                   {showReport && (
                     <div className="text-content-secondary text-[12.5px]">
-                      <MarkdownRenderer content={step.result!.reportMarkdown} />
+                      <WorkflowLongText
+                        markdown
+                        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                        text={step.result!.reportMarkdown}
+                        title={`${step.title} — report`}
+                      />
                     </div>
                   )}
                   {hasStructuredOutput && (
@@ -348,27 +385,48 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
                       />
                     </div>
                   )}
-                  {hasStepMetadata && (
-                    <div className="border-border text-muted mt-2.5 flex flex-wrap gap-3 border-t pt-2 text-[11px] tabular-nums">
-                      {step.durationMs != null && (
-                        <span className="inline-flex items-center gap-1">
-                          <Clock className="h-3 w-3" /> {formatWorkflowDuration(step.durationMs)}
-                        </span>
-                      )}
-                      {step.usage?.tokens != null && (
-                        <span className="inline-flex items-center gap-1">
-                          <Zap className="h-3 w-3" /> {formatWorkflowTokens(step.usage.tokens)} tok
-                        </span>
-                      )}
-                      {step.usage?.costUsd != null && (
-                        <span className="inline-flex items-center gap-1">
-                          <Coins className="h-3 w-3" /> {formatWorkflowCost(step.usage.costUsd)}
-                        </span>
-                      )}
-                      {step.taskId != null && <span className="font-mono">task {step.taskId}</span>}
-                    </div>
-                  )}
                 </>
+              )}
+              {/* Shared by every status: a failed or still-running evaluation exposes its
+                  admitted model/attempt here, next to the error or the running marker. */}
+              {hasStepMetadata && (
+                <div className="border-border text-muted counter-nums mt-2.5 flex flex-wrap gap-3 border-t pt-2 text-[11px]">
+                  {step.durationMs != null && (
+                    <span className="inline-flex items-center gap-1">
+                      <Clock className="h-3 w-3" /> {formatWorkflowDuration(step.durationMs)}
+                    </span>
+                  )}
+                  {step.usage?.tokens != null && (
+                    <span className="inline-flex items-center gap-1">
+                      <Zap className="h-3 w-3" /> {formatWorkflowTokens(step.usage.tokens)} tok
+                    </span>
+                  )}
+                  {step.usage?.costUsd != null && (
+                    <span className="inline-flex items-center gap-1">
+                      <Coins className="h-3 w-3" /> {formatWorkflowCost(step.usage.costUsd)}
+                    </span>
+                  )}
+                  {step.taskId != null && <span className="font-mono">task {step.taskId}</span>}
+                  {evaluation != null && (
+                    <>
+                      {/* Untrusted display text (model ids); React escaping is the only rendering path. */}
+                      <span className="min-w-0 truncate font-mono">{evaluation.modelString}</span>
+                      {evaluation.responseModelId != null &&
+                        evaluation.responseModelId !== bareModelId(evaluation.modelString) && (
+                          <span className="min-w-0 truncate font-mono">
+                            ↳ {evaluation.responseModelId}
+                          </span>
+                        )}
+                      {evaluation.attempt > 1 && <span>attempt {evaluation.attempt}</span>}
+                      {evaluation.usage?.totalTokens != null && (
+                        <span className="inline-flex items-center gap-1">
+                          <Zap className="h-3 w-3" />{" "}
+                          {formatWorkflowTokens(evaluation.usage.totalTokens)} tok
+                        </span>
+                      )}
+                    </>
+                  )}
+                </div>
               )}
               {nestedWorkflowPanel}
             </div>
@@ -399,7 +457,13 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
         <Layers className="h-3 w-3" />
       </span>
       {phase.label.length > 0 && (
-        <span className="text-content-primary text-[13px] font-semibold">{phase.label}</span>
+        // Declared labels may run to 120 chars: truncate so the count/status/disclosure
+        // cells stay on-card at narrow widths, with the full text one hover away.
+        <TooltipIfPresent tooltip={phase.label}>
+          <span className="text-content-primary min-w-0 truncate text-[13px] font-semibold">
+            {phase.label}
+          </span>
+        </TooltipIfPresent>
       )}
       {phase.total > 0 && (
         <span className="text-muted text-[11px] tabular-nums">
@@ -420,7 +484,7 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
         ) : phase.failed ? (
           <AlertTriangle className="h-3 w-3" style={{ color: WORKFLOW_TONE_VAR.destructive }} />
         ) : allDone ? (
-          <Check className="text-success h-3 w-3" />
+          <Check className="text-success-text h-3 w-3" />
         ) : null}
         {hasBody &&
           (open ? (
@@ -433,23 +497,28 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
   );
 
   return (
-    <div>
+    <div ref={props.sectionRef}>
       {hasBody ? (
         <button
           type="button"
           onClick={() => setOpen((value) => !value)}
-          className="hover:bg-surface-secondary flex w-full items-center gap-2 rounded-md py-1.5 text-left"
+          className="hover:bg-surface-secondary flex w-full min-w-0 items-center gap-2 rounded-md py-1.5 text-left"
           aria-expanded={open}
         >
           {headerContent}
         </button>
       ) : (
-        <div className="flex items-center gap-2 py-1.5">{headerContent}</div>
+        <div className="flex min-w-0 items-center gap-2 py-1.5">{headerContent}</div>
       )}
       {open && hasInfo && (
         <div className="mb-1.5 ml-[30px] flex flex-col gap-1">
           {phase.detail != null && (
-            <div className="text-content-secondary text-[12px]">{phase.detail}</div>
+            <div className="text-content-secondary text-[12px]">
+              <WorkflowLongText
+                text={phase.detail}
+                title={`${phase.label.length > 0 ? phase.label : "Phase"} — details`}
+              />
+            </div>
           )}
           {detailObject != null && (
             <WorkflowJsonBlock
@@ -513,7 +582,7 @@ const WorkflowFinalReport: React.FC<{ view: WorkflowRunView }> = (props) => {
         <>
           {showReport && (
             <div className="text-content-secondary text-[12.5px]">
-              <MarkdownRenderer content={result.reportMarkdown} />
+              <WorkflowLongText markdown text={result.reportMarkdown} title="Final report" />
             </div>
           )}
           {stats.length > 0 && (
@@ -551,6 +620,17 @@ const WorkflowFinalReport: React.FC<{ view: WorkflowRunView }> = (props) => {
 export const WorkflowTimeline: React.FC<WorkflowTimelineProps> = (props) => {
   const view = props.view;
   const nestedDepth = props.nestedDepth ?? 0;
+  const phaseManifest = view.workflow.phaseManifest;
+  // The step stream keeps today's observed-only sections: declared-but-unvisited
+  // phases live on the rail (pending/skipped/…), not as empty step sections.
+  const visitedPhases = view.phases.filter((phase) => !isUnvisitedPhaseLifecycle(phase.lifecycle));
+  const phaseSectionRefs = React.useRef(new Map<string, HTMLDivElement>());
+  const prefersReducedMotion = useReducedMotion();
+  const scrollToPhase = (name: string) => {
+    phaseSectionRefs.current
+      .get(name)
+      ?.scrollIntoView({ behavior: prefersReducedMotion ? "auto" : "smooth", block: "start" });
+  };
   return (
     <div className="flex flex-col gap-4">
       {/* Surface a run-level failure (e.g. setup/compile/eval errors that occur before any step)
@@ -565,23 +645,43 @@ export const WorkflowTimeline: React.FC<WorkflowTimelineProps> = (props) => {
           }}
         >
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span>{view.errorMessage}</span>
+          <WorkflowLongText className="flex-1" text={view.errorMessage} title="Workflow error" />
         </div>
       )}
-      <WorkflowFinalReport view={view} />
+      {props.showFinalReport !== false && <WorkflowFinalReport view={view} />}
+      {/* Runs without a manifest render exactly as before (no rail). */}
+      {phaseManifest != null && (
+        <div className="flex flex-col gap-1">
+          <div className="text-muted flex items-center gap-1.5 text-[11px] font-semibold tracking-wide uppercase">
+            <GitBranch className="h-3 w-3" /> Phases
+          </div>
+          <WorkflowPhaseFlow
+            nodes={phaseFlowNodesFromView(view.phases)}
+            provenance={phaseManifest.provenance}
+            onPhaseSelect={scrollToPhase}
+          />
+        </div>
+      )}
       <div className="flex flex-col gap-1">
         <div className="text-muted flex items-center gap-1.5 text-[11px] font-semibold tracking-wide uppercase">
           <ListTree className="h-3 w-3" /> Step stream
         </div>
-        {view.phases.length === 0 ? (
+        {visitedPhases.length === 0 ? (
           <div className="text-muted px-2 py-3 text-xs">No steps yet.</div>
         ) : (
-          view.phases.map((phase) => (
+          visitedPhases.map((phase) => (
             <WorkflowPhaseSection
               key={phase.name || "__ungrouped"}
               phase={phase}
               workspaceId={props.workspaceId}
               nestedDepth={nestedDepth}
+              sectionRef={(element) => {
+                if (element != null) {
+                  phaseSectionRefs.current.set(phase.name, element);
+                } else {
+                  phaseSectionRefs.current.delete(phase.name);
+                }
+              }}
             />
           ))
         )}

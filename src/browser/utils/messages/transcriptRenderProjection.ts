@@ -1,3 +1,7 @@
+import {
+  TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS,
+  TRANSCRIPT_REVEAL_STEP_CHARS,
+} from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 
@@ -6,6 +10,8 @@ export type OperationalBundleMemberMessage = DisplayedMessage & { type: "reasoni
 export interface OperationalBundleSummary {
   title: string;
   details: string;
+  activeTitle?: string;
+  tone?: "danger" | "interrupted";
 }
 
 export interface OperationalBundleEntry {
@@ -43,6 +49,7 @@ export interface WorkBundleInfo {
 
 interface ComputeBundleInfosOptions {
   isTurnActive: boolean;
+  taskAwaitPollsOnly?: boolean;
 }
 
 type OperationalBundleCategory =
@@ -111,6 +118,59 @@ const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
   },
 };
 
+/** Nesting walked when charging a tool payload: provider/MCP results wrap content a few levels deep. */
+const TOOL_PAYLOAD_WALK_DEPTH = 4;
+
+/**
+ * Characters of string payload a tool card can render when expanded: every string reachable
+ * within a few levels (file contents, command output, a plan body, `{ type: "json", value }`
+ * result wrappers whose value an expanded card serializes in full). Nothing is serialized —
+ * expansion is per workspace/tool and not visible to this projection, so this errs toward
+ * charging the visible payload. The walk is bounded in depth and in work: the caller only
+ * needs to know whether a row exceeds one reveal step, so it stops once that ceiling is
+ * reached (a very wide result must not itself become a long task).
+ */
+function estimateToolPayloadChars(value: unknown, depth = TOOL_PAYLOAD_WALK_DEPTH): number {
+  if (typeof value === "string") return value.length;
+  if (value === null || typeof value !== "object" || depth === 0) return 0;
+  let chars = 0;
+  const fields = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+  for (const field of fields) {
+    if (chars >= TRANSCRIPT_REVEAL_STEP_CHARS) break;
+    chars += estimateToolPayloadChars(field, depth - 1);
+  }
+  return chars;
+}
+
+/**
+ * Relative render + layout cost of a transcript row for the tail-first reveal: the text body
+ * length for rows that render one (markdown, code blocks); for tool cards a nominal constant
+ * plus their string payload (args and result), since expanded cards — sticky per tool, and
+ * default for some tools — render it in full; a nominal constant for markers. A heuristic in
+ * characters, deliberately cheap — never serializes a message.
+ */
+export function estimateTranscriptRowWeight(message: DisplayedMessage): number {
+  switch (message.type) {
+    case "user":
+    case "assistant":
+    case "reasoning":
+    case "plan-display":
+      return message.content.length;
+    case "tool":
+      return (
+        TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS +
+        estimateToolPayloadChars(message.args) +
+        estimateToolPayloadChars(message.result)
+      );
+    case "stream-error":
+      // Rendered in full; distinct verbose provider failures are not merged, so a run of them
+      // must count as the text it mounts, not as markers.
+      return TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS + message.error.length;
+    default:
+      return TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS;
+  }
+}
+
 export function computeWorkBundleInfos(
   messages: DisplayedMessage[]
 ): Array<WorkBundleInfo | undefined> {
@@ -178,31 +238,36 @@ export function computeWorkBundleInfos(
 
 export function computeOperationalBundleInfos(
   messages: DisplayedMessage[],
-  _options: ComputeBundleInfosOptions
+  options: ComputeBundleInfosOptions
 ): Array<OperationalBundleInfo | undefined> {
   const infos = new Array<OperationalBundleInfo | undefined>(messages.length);
+  const taskAwaitPollsOnly = options.taskAwaitPollsOnly === true;
   let index = 0;
 
   while (index < messages.length) {
     const leadingReasoningStart = index;
     const leadingReasoningEntries: OperationalBundleEntry[] = [];
-    while (true) {
-      const message = messages[index];
-      if (message?.type !== "reasoning") {
-        break;
+    if (!taskAwaitPollsOnly) {
+      while (true) {
+        const message = messages[index];
+        if (message?.type !== "reasoning") break;
+        leadingReasoningEntries.push({ message, originalIndex: index });
+        index += 1;
       }
-      leadingReasoningEntries.push({ message, originalIndex: index });
-      index += 1;
+
+      if (leadingReasoningEntries.length > 0 && messages[index]?.type === "assistant") {
+        index += 1;
+      } else if (leadingReasoningEntries.length > 0) {
+        leadingReasoningEntries.length = 0;
+        index = leadingReasoningStart;
+      }
     }
 
-    if (leadingReasoningEntries.length > 0 && messages[index]?.type === "assistant") {
-      index += 1;
-    } else if (leadingReasoningEntries.length > 0) {
-      leadingReasoningEntries.length = 0;
-      index = leadingReasoningStart;
-    }
-
-    if (!isOperationalBundleMemberMessage(messages[index])) {
+    const firstMessage = messages[index];
+    if (
+      !isOperationalBundleMemberMessage(firstMessage) ||
+      (taskAwaitPollsOnly && !isTaskAwaitMessage(firstMessage))
+    ) {
       index += 1;
       continue;
     }
@@ -211,32 +276,41 @@ export function computeOperationalBundleInfos(
     const entries: OperationalBundleEntry[] = [...leadingReasoningEntries];
     while (index < messages.length) {
       const candidate = messages[index];
-      if (!isOperationalBundleMemberMessage(candidate)) {
+      if (
+        !isOperationalBundleMemberMessage(candidate) ||
+        (taskAwaitPollsOnly && !isTaskAwaitMessage(candidate))
+      ) {
         break;
       }
       entries.push({ message: candidate, originalIndex: index });
       index += 1;
     }
 
-    const frozenEntries = Object.freeze(entries);
-    const first = entries[0].message;
+    if (taskAwaitPollsOnly && entries.length < 2) {
+      continue;
+    }
 
+    const frozenEntries = Object.freeze(entries);
+    const messagesInBundle = frozenEntries.map((entry) => entry.message);
+    const allTaskAwaits = messagesInBundle.every(isTaskAwaitMessage);
     const state = frozenEntries.some((entry) => isActiveOperationalMessage(entry.message))
       ? "active"
       : "settled";
-    const defaultExpanded = state === "active";
-    const key = `bundle:${first.id}`;
-    const summary = summarizeOperationalBundle(frozenEntries.map((entry) => entry.message));
+    const needsAttention = hasTaskAwaitTerminalIssue(messagesInBundle);
+    const info: OperationalBundleInfo = {
+      key: `${taskAwaitPollsOnly ? "task-await-polls" : "bundle"}:${entries[0].message.id}`,
+      position: "head",
+      headIndex,
+      entries: frozenEntries,
+      summary: summarizeOperationalBundle(messagesInBundle),
+      state,
+      defaultExpanded: needsAttention || (state === "active" && !allTaskAwaits),
+    };
 
     for (const entry of frozenEntries) {
       infos[entry.originalIndex] = {
-        key,
+        ...info,
         position: entry.originalIndex === headIndex ? "head" : "member",
-        headIndex,
-        entries: frozenEntries,
-        summary,
-        state,
-        defaultExpanded,
       };
     }
   }
@@ -302,9 +376,6 @@ function findWorkBundleFinalIndex(
       if (finalIndex !== undefined) {
         break;
       }
-      if (message.type === "assistant" || isSideQuestionStart(messages, index)) {
-        continue;
-      }
       if (!canCrossVisibleConversation) {
         break;
       }
@@ -359,13 +430,6 @@ function findWorkBundleFinalIndex(
   }
 
   return undefined;
-}
-
-function isSideQuestionStart(messages: DisplayedMessage[], index: number): boolean {
-  const next = messages[index + 1];
-  return (
-    messages[index]?.type === "user" && next?.type === "assistant" && next.isSideAnswer === true
-  );
 }
 
 function hasFutureWorkBundleAgentMessage(
@@ -425,9 +489,7 @@ function isWorkBundleAgentMessage(
 }
 
 function isWorkBundleVisibleConversationMessage(message: DisplayedMessage | undefined): boolean {
-  return (
-    message?.type === "user" || (message?.type === "assistant" && message.isSideAnswer === true)
-  );
+  return message?.type === "user";
 }
 
 function isWorkBundleOperationalMessage(message: DisplayedMessage | undefined): boolean {
@@ -455,6 +517,7 @@ function computeWorkBundleDurationMs(
 ): number | undefined {
   const startTimestamp = getMessageTimestamp(entries[0].message);
   const endTimestamp =
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     getMessageTimestamp(finalMessage) ?? getMessageTimestamp(entries.at(-1)!.message);
   if (
     startTimestamp === undefined ||
@@ -471,6 +534,29 @@ export function summarizeOperationalBundle(
 ): OperationalBundleSummary {
   if (messages.length === 0) {
     throw new Error("Cannot summarize an empty operational bundle");
+  }
+
+  const allTaskAwaits = messages.every(isTaskAwaitMessage);
+  if (allTaskAwaits) {
+    const pollCount = messages.length;
+    const hasFailure =
+      messages.some(hasTaskAwaitCallFailure) || messages.some(hasTaskAwaitResultFailure);
+    const hasInterruption =
+      messages.some(hasTaskAwaitCallInterruption) || messages.some(hasTaskAwaitResultInterruption);
+    if (hasFailure || hasInterruption) {
+      return {
+        title: hasFailure ? "Task wait needs attention" : "Task wait interrupted",
+        activeTitle: hasFailure ? "Task wait needs attention" : "Task wait interrupted",
+        details: pollCount === 1 ? "" : `${pollCount} checks`,
+        tone: hasFailure ? "danger" : "interrupted",
+      };
+    }
+    return {
+      title: pollCount === 1 ? "Checked task status" : `Checked task status ${pollCount} times`,
+      activeTitle:
+        pollCount === 1 ? "Waiting for tasks" : `Waiting for tasks · ${pollCount} checks`,
+      details: "",
+    };
   }
 
   const allSearchMisses = messages.every(isEmptyCompletedWebSearch);
@@ -492,6 +578,69 @@ export function summarizeOperationalBundle(
     title: `Ran ${messages.length.toLocaleString()} operations`,
     details: formatDetails(messages),
   };
+}
+
+function isTaskAwaitMessage(message: OperationalBundleMemberMessage): boolean {
+  return message.type === "tool" && message.toolName === "task_await";
+}
+
+function getTaskAwaitResultEntries(message: OperationalBundleMemberMessage): object[] {
+  if (message.type !== "tool" || message.toolName !== "task_await") return [];
+
+  const result = unwrapJsonResult(message.result);
+  if (!isPlainObject(result) || !Array.isArray(result.results)) return [];
+
+  return result.results.filter(isPlainObject);
+}
+
+// eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
+function isInterruptedTaskAwaitEntry(entry: object): boolean {
+  if (!("status" in entry) || typeof entry.status !== "string") return false;
+  if (entry.status === "interrupted") return true;
+  return (
+    entry.status === "error" &&
+    "error" in entry &&
+    typeof entry.error === "string" &&
+    entry.error.trim().toLowerCase() === "interrupted"
+  );
+}
+
+function hasTaskAwaitResultInterruption(message: OperationalBundleMemberMessage): boolean {
+  return getTaskAwaitResultEntries(message).some(isInterruptedTaskAwaitEntry);
+}
+
+function hasTaskAwaitResultFailure(message: OperationalBundleMemberMessage): boolean {
+  return getTaskAwaitResultEntries(message).some((entry) => {
+    if (isInterruptedTaskAwaitEntry(entry)) return false;
+    if (!("status" in entry) || typeof entry.status !== "string") return false;
+    return (
+      entry.status === "error" || entry.status === "invalid_scope" || entry.status === "not_found"
+    );
+  });
+}
+
+function hasTaskAwaitCallFailure(message: OperationalBundleMemberMessage): boolean {
+  if (message.type !== "tool" || message.toolName !== "task_await") return false;
+  if (message.status === "failed") return true;
+
+  const result = unwrapJsonResult(message.result);
+  return isPlainObject(result) && result.success === false;
+}
+
+function hasTaskAwaitCallInterruption(message: OperationalBundleMemberMessage): boolean {
+  return (
+    message.type === "tool" && message.toolName === "task_await" && message.status === "interrupted"
+  );
+}
+
+function hasTaskAwaitTerminalIssue(messages: readonly OperationalBundleMemberMessage[]): boolean {
+  return messages.some(
+    (message) =>
+      hasTaskAwaitCallFailure(message) ||
+      hasTaskAwaitCallInterruption(message) ||
+      hasTaskAwaitResultFailure(message) ||
+      hasTaskAwaitResultInterruption(message)
+  );
 }
 
 function isEmptyCompletedWebSearch(message: OperationalBundleMemberMessage): boolean {

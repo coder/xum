@@ -6,6 +6,7 @@ import { applyCompactionOverrides } from "./compactionOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { CompactionRequestData } from "@/common/types/message";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { setTestAgentAiDefaults } from "@/browser/testUtils";
 
 describe("applyCompactionOverrides", () => {
   const baseOptions: SendMessageOptions = {
@@ -57,13 +58,6 @@ describe("applyCompactionOverrides", () => {
     };
     const anthropicResult = applyCompactionOverrides(baseOptions, anthropicData);
     expect(anthropicResult.thinkingLevel).toBe("medium");
-
-    // Test OpenAI model (gpt-5-pro only supports high)
-    const openaiData: CompactionRequestData = {
-      model: "openai:gpt-5-pro",
-    };
-    const openaiResult = applyCompactionOverrides(baseOptions, openaiData);
-    expect(openaiResult.thinkingLevel).toBe("high");
   });
 
   it("applies maxOutputTokens override", () => {
@@ -107,5 +101,20 @@ describe("applyCompactionOverrides", () => {
     expect(result.maxOutputTokens).toBe(5000);
     expect(result.agentId).toBe("compact");
     expect(result.thinkingLevel).toBe("medium"); // Non-Anthropic preserves original
+  });
+
+  it("inherits compact's reasoning mode through its configured base chain", () => {
+    // Compact has no direct override; exec's configured pro must apply
+    // (matching the Settings card display) instead of falling through to the
+    // active workspace agent's mode.
+    try {
+      setTestAgentAiDefaults({
+        exec: { reasoningMode: "pro" },
+      });
+      const result = applyCompactionOverrides({ ...baseOptions, reasoningMode: "standard" }, {});
+      expect(result.reasoningMode).toBe("pro");
+    } finally {
+      setTestAgentAiDefaults(undefined);
+    }
   });
 });

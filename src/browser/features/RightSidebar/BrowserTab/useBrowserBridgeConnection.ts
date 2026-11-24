@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import type {
   BrowserViewportMetadata,
@@ -184,7 +184,7 @@ export function useBrowserBridgeConnection(workspaceId: string): {
     throw new Error("Browser bridge connection requires a workspaceId");
   }
 
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [session, setSession] = useState<BrowserSession | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const generationRef = useRef(0);
@@ -229,7 +229,7 @@ export function useBrowserBridgeConnection(workspaceId: string): {
       const sessionId = `browser-${workspaceId}-${sessionName}-${generation}`;
       disconnectSocket(createSession(workspaceId, sessionName, sessionId, "starting"));
 
-      if (!api) {
+      if (!liveApi) {
         setSession((previousSession) =>
           previousSession?.id !== sessionId
             ? previousSession
@@ -245,7 +245,7 @@ export function useBrowserBridgeConnection(workspaceId: string): {
       }
 
       try {
-        const bootstrap = await api.browser.getBootstrap({
+        const bootstrap = await liveApi.browser.getBootstrap({
           workspaceId,
           sessionName,
           ...(options?.allowOtherWorkspaceSession === true

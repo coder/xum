@@ -17,7 +17,11 @@ test.describe("sidebar drag and drop", () => {
     await ui.projects.openFirstWorkspace();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    await expect(sidebar).toBeVisible({ timeout: 5000 });
+    await ui.metaSidebar.expectVisible();
+
+    // A fresh workspace shows only the New tab: open Stats, then Review, from its launcher.
+    await ui.metaSidebar.selectTab("Stats");
+    await ui.metaSidebar.selectTab("Review");
 
     const tablist = sidebar.getByRole("tablist");
     await expect(tablist).toBeVisible({ timeout: 5000 });
@@ -27,7 +31,8 @@ test.describe("sidebar drag and drop", () => {
     await expect(costsTab).toBeVisible({ timeout: 5000 });
     await expect(reviewTab).toBeVisible({ timeout: 5000 });
 
-    // Stats tab should be selected (active) by default
+    // Make Stats the active tab being dragged
+    await costsTab.click();
     await expect(costsTab).toHaveAttribute("aria-selected", "true");
 
     // Verify initial order: Stats comes before Review
@@ -54,9 +59,11 @@ test.describe("sidebar drag and drop", () => {
     await ui.projects.openFirstWorkspace();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    await expect(sidebar).toBeVisible({ timeout: 5000 });
+    await ui.metaSidebar.expectVisible();
 
-    // Add a terminal tab first (not present by default)
+    // Open Stats, Review, and a terminal (a fresh workspace shows only the New tab)
+    await ui.metaSidebar.selectTab("Stats");
+    await ui.metaSidebar.selectTab("Review");
     await ui.metaSidebar.addTerminal();
 
     const tablist = sidebar.getByRole("tablist");
@@ -110,9 +117,11 @@ test.describe("sidebar drag and drop", () => {
     await ui.projects.openFirstWorkspace();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    await expect(sidebar).toBeVisible();
+    await ui.metaSidebar.expectVisible();
 
-    // Add a terminal tab first (not present by default)
+    // Open Stats, Review, and a terminal (a fresh workspace shows only the New tab)
+    await ui.metaSidebar.selectTab("Stats");
+    await ui.metaSidebar.selectTab("Review");
     await ui.metaSidebar.addTerminal();
 
     const tablist = sidebar.getByRole("tablist");
@@ -147,6 +156,8 @@ test.describe("sidebar drag and drop", () => {
     ui,
   }) => {
     await ui.projects.openFirstWorkspace();
+    // Tabs start collapsed; explicitly open them before exercising the tabstrip.
+    await page.getByRole("button", { name: "Expand right sidebar", exact: true }).click();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
     await expect(sidebar).toBeVisible();
@@ -154,12 +165,13 @@ test.describe("sidebar drag and drop", () => {
     // Get workspaceId from context for per-workspace layout key
     const workspaceId = ui.context.workspaceId;
 
-    // Set up a split layout via localStorage (simulating persistence)
+    // Seed Stats, Review, and Goal in the first pane; the count below proves none is re-added.
     // Layout key is per-workspace: "right-sidebar:layout:{workspaceId}"
     await page.evaluate(
       ({ wsId }) => {
         const splitLayout = {
           version: 1,
+          openTabsOnly: true,
           nextId: 3,
           focusedTabsetId: "tabset-1",
           root: {
@@ -171,7 +183,7 @@ test.describe("sidebar drag and drop", () => {
               {
                 type: "tabset",
                 id: "tabset-1",
-                tabs: ["costs", "review"],
+                tabs: ["costs", "review", "goal"],
                 activeTab: "costs",
               },
               {
@@ -201,8 +213,7 @@ test.describe("sidebar drag and drop", () => {
     const tablists = await sidebar.getByRole("tablist").all();
     expect(tablists.length).toBe(2);
 
-    // Verify each tablist has expected tabs. The first tabset receives
-    // default-layout tabs injected by the migration (Stats, Review, Instructions).
+    // Only the persisted tabs show: nothing is re-added on load.
     await expect(tablists[0].getByRole("tab")).toHaveCount(3);
     await expect(tablists[1].getByRole("tab")).toHaveCount(1); // Stats (duplicate costs in split)
   });

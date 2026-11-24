@@ -1,17 +1,28 @@
 import type { ProjectConfig } from "@/common/types/project";
+import { isRootPathString } from "@/common/utils/pathRoot";
 import { PlatformPaths } from "@/common/utils/paths";
 
-function normalizeForDescendantComparison(value: string): string {
-  const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+export function normalizeForDescendantComparison(value: string): string {
+  const normalizedSeparators = value.replace(/\\/g, "/");
+  const isWindowsPath =
+    /^[a-z]:(?:\/|$)/i.test(normalizedSeparators) || normalizedSeparators.startsWith("//");
+  const normalized = normalizedSeparators.replace(/\/+$/, "");
   // Windows paths are case-insensitive, and user input / persisted config can
-  // differ in drive-letter or segment casing. Treat drive-letter paths as
-  // case-insensitive so hierarchy derivation is stable on Windows while POSIX
-  // paths keep their normal case-sensitive semantics.
-  return /^[a-z]:\//i.test(normalized) ? normalized.toLowerCase() : normalized;
+  // differ in segment casing. Detect the platform form before trimming a drive
+  // root separator so `C:/` and the dirname result `C:` stay equivalent.
+  return isWindowsPath ? normalized.toLowerCase() : normalized;
 }
 
 export function isPathDescendant(parentPath: string, candidatePath: string): boolean {
+  // A root project restored from an older config (POSIX "/", #5917; a Windows drive or UNC
+  // share root, #5919; a namespaced root such as "\\\\?\\UNC\\srv\\share", #5924) is never a
+  // parent: it would adopt every project below it, and the load-time hierarchy merge would move
+  // their workspace rows into the root's bucket. Keys can come from any runtime, so the win32
+  // rules apply; they also cover every POSIX root spelling.
+  if (isRootPathString(parentPath, "win32")) return false;
   const parent = normalizeForDescendantComparison(parentPath);
+  // "" is no root spelling, but it is no project either.
+  if (parent === "") return false;
   const candidate = normalizeForDescendantComparison(candidatePath);
   return candidate.startsWith(`${parent}/`) && candidate.length > parent.length + 1;
 }

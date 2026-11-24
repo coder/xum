@@ -7,10 +7,7 @@
  * workflow code just to read a description.
  */
 
-import {
-  parseStaticWorkflowMetadataLiteral,
-  replaceStaticMetadataStringProperty,
-} from "./staticWorkflowMetadata";
+import { parseStaticWorkflowMetadataLiteral } from "./staticWorkflowMetadata";
 
 export function parseWorkflowDescription(source: string): string | null {
   try {
@@ -28,16 +25,12 @@ export function parseWorkflowName(source: string): string | null {
   }
 }
 
-export function parseWorkflowMetadataName(rawMetadata: unknown): string | null {
+function parseWorkflowMetadataName(rawMetadata: unknown): string | null {
   return readWorkflowMetadataString(rawMetadata, "name");
 }
 
-export function parseWorkflowMetadataDescription(rawMetadata: unknown): string | null {
+function parseWorkflowMetadataDescription(rawMetadata: unknown): string | null {
   return readWorkflowMetadataString(rawMetadata, "description");
-}
-
-export function replaceWorkflowDescription(source: string, description: string): string | null {
-  return replaceStaticMetadataStringProperty(source, "description", description);
 }
 
 // `name` and `description` are both optional string fields read off the same

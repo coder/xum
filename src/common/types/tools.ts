@@ -4,10 +4,16 @@
  */
 
 import type { z } from "zod";
-import type { AgentSkillDescriptor, AgentSkillFrontmatter } from "@/common/types/agentSkill";
+import type {
+  AgentSkillDescriptor,
+  AgentSkillFrontmatter,
+  AgentSkillScope,
+} from "@/common/types/agentSkill";
 import type {
   AgentReportToolResultSchema,
   AgentSkillReadFileToolResultSchema,
+  MCPPromptGetToolResultSchema,
+  ModelsListToolResultSchema,
   AgentSkillReadToolResultSchema,
   AskUserQuestionQuestionSchema,
   AskUserQuestionToolResultSchema,
@@ -17,20 +23,27 @@ import type {
   BashToolResultSchema,
   FileEditInsertToolResultSchema,
   FileEditReplaceStringToolResultSchema,
-  MuxConfigReadToolResultSchema,
-  MuxConfigWriteToolResultSchema,
-  MuxAgentsReadToolResultSchema,
-  MuxAgentsWriteToolResultSchema,
+  XumConfigReadToolResultSchema,
+  XumConfigWriteToolResultSchema,
+  XumAgentsReadToolResultSchema,
+  XumAgentsWriteToolResultSchema,
   FileReadToolResultSchema,
   HeartbeatToolResultSchema,
   MemoryToolResultSchema,
   AttachFileToolResultSchema,
   TaskToolResultSchema,
+  TaskSendMessageToolResultSchema,
+  TaskRetitleToolResultSchema,
   TaskAwaitToolResultSchema,
   TaskApplyGitPatchToolResultSchema,
   TaskListToolResultSchema,
+  TaskStopToolResultSchema,
+  TaskRemoveToolResultSchema,
+  TaskTerminateToolArgsSchema,
+  TaskWorkspaceLifecycleToolArgsSchema,
   TaskTerminateToolResultSchema,
   TaskWorkspaceLifecycleToolResultSchema,
+  TimelineEventToolResultSchema,
   TOOL_DEFINITIONS,
   WebFetchToolResultSchema,
   WorkflowRunToolResultSchema,
@@ -55,12 +68,18 @@ export type AgentSkillReadFileToolArgs = z.infer<
   typeof TOOL_DEFINITIONS.agent_skill_read_file.schema
 >;
 export type AgentSkillReadFileToolResult = z.infer<typeof AgentSkillReadFileToolResultSchema>;
+export type MCPPromptGetToolResult = z.infer<typeof MCPPromptGetToolResultSchema>;
 
 // agent_skill_list args + result
 export type AgentSkillListToolArgs = z.infer<typeof TOOL_DEFINITIONS.agent_skill_list.schema>;
 export type AgentSkillListToolResult =
   | { success: true; skills: AgentSkillDescriptor[] }
   | { success: false; error: string };
+
+// models_list args + result (entries are the shared AvailableModel domain type)
+export type { AvailableModel } from "@/common/utils/ai/selectableModels";
+export type ModelsListToolArgs = z.infer<typeof TOOL_DEFINITIONS.models_list.schema>;
+export type ModelsListToolResult = z.infer<typeof ModelsListToolResultSchema>;
 
 // agent_skill_write result
 export type AgentSkillWriteToolResult =
@@ -70,6 +89,23 @@ export type AgentSkillWriteToolResult =
 // agent_skill_delete result
 export type AgentSkillDeleteToolResult =
   | { success: true; deleted: "file" | "skill" }
+  | { success: false; error: string };
+
+// refinement_rollback result (RLM mode only)
+export type RefinementRollbackToolResult =
+  | {
+      success: true;
+      /** Refinement row id that was rolled back. */
+      rollbackOf: string;
+      /** Envelope id of the journaled rollback row; null if journaling failed. */
+      rollbackRowId: string | null;
+      /** Files restored to their recorded prior contents. */
+      restored: string[];
+      /** Files deleted (the target row had created them). */
+      deleted: string[];
+      /** Rename that was undone. */
+      renamed?: { from: string; to: string };
+    }
   | { success: false; error: string };
 
 // skills_catalog_search result
@@ -100,15 +136,24 @@ export type SkillsCatalogReadToolResult =
       owner: string;
       repo: string;
       path: string;
-      frontmatter: AgentSkillFrontmatter;
+      /** On the first page only (no offset_chars). */
+      frontmatter?: AgentSkillFrontmatter;
       body: string;
       url: string;
+      /** Set when body is one page of a longer body (see offset_chars). */
+      nextCharOffset?: number;
+      startCharOffset?: number;
+      /** Content hash of the copy the pages come from; pass it back with offset_chars. */
+      snapshot?: string;
+      note?: string;
     }
   | { success: false; error: string };
 
 export interface AskUserQuestionUiOnlyPayload {
   questions: AskUserQuestionQuestion[];
   answers: Record<string, string>;
+  /** "message": asked without waiting; answers arrive later as a steering user message. */
+  answerDelivery?: "message";
 }
 
 export interface FileEditUiOnlyPayload {
@@ -137,6 +182,21 @@ export type FileReadToolResult = z.infer<typeof FileReadToolResultSchema>;
 export type HeartbeatToolArgs = z.infer<typeof TOOL_DEFINITIONS.heartbeat.schema>;
 export type HeartbeatToolResult = z.infer<typeof HeartbeatToolResultSchema>;
 
+// Timeline-event tool types, derived from schema (avoid drift)
+export type TimelineEventToolArgs = z.infer<typeof TOOL_DEFINITIONS.timeline_event.schema>;
+export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSchema>;
+
+// Status-update tool types (status page agent mode)
+export type StatusUpdateToolResult =
+  | { success: true; queued: true; note?: string }
+  | { success: false; error: string };
+
+// Session-history tool types, derived from schema (avoid drift)
+export type SessionHistoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
+export type SessionHistoryToolResult = z.infer<
+  typeof TOOL_DEFINITIONS.session_history.resultSchema
+>;
+
 // Memory tool types, derived from schema (avoid drift)
 export type MemoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory.schema>;
 export type MemoryToolResult = z.infer<typeof MemoryToolResultSchema>;
@@ -144,20 +204,20 @@ export type MemoryToolResult = z.infer<typeof MemoryToolResultSchema>;
 // AttachFileToolResult derived from Zod schema (single source of truth)
 export type AttachFileToolResult = z.infer<typeof AttachFileToolResultSchema>;
 
-// mux_config_read tool types
-export type MuxConfigReadToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_config_read.schema>;
-export type MuxConfigReadToolResult = z.infer<typeof MuxConfigReadToolResultSchema>;
+// xum_config_read tool types
+export type XumConfigReadToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_config_read.schema>;
+export type XumConfigReadToolResult = z.infer<typeof XumConfigReadToolResultSchema>;
 
-// mux_config_write tool types
-export type MuxConfigWriteToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_config_write.schema>;
-export type MuxConfigWriteToolResult = z.infer<typeof MuxConfigWriteToolResultSchema>;
+// xum_config_write tool types
+export type XumConfigWriteToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_config_write.schema>;
+export type XumConfigWriteToolResult = z.infer<typeof XumConfigWriteToolResultSchema>;
 
-// mux_agents_read tool types
-export type MuxAgentsReadToolResult = z.infer<typeof MuxAgentsReadToolResultSchema>;
+// xum_agents_read tool types
+export type XumAgentsReadToolResult = z.infer<typeof XumAgentsReadToolResultSchema>;
 
-// mux_agents_write tool types
-export type MuxAgentsWriteToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_agents_write.schema>;
-export type MuxAgentsWriteToolResult = z.infer<typeof MuxAgentsWriteToolResultSchema>;
+// xum_agents_write tool types
+export type XumAgentsWriteToolArgs = z.infer<typeof TOOL_DEFINITIONS.mux_agents_write.schema>;
+export type XumAgentsWriteToolResult = z.infer<typeof XumAgentsWriteToolResultSchema>;
 
 export interface FileEditDiffSuccessBase extends ToolOutputUiOnlyFields {
   success: true;
@@ -208,6 +268,27 @@ export const FILE_EDIT_TOOL_NAMES = [
 ] as const;
 
 /**
+ * Read-flavored tools whose successful results mark a workspace file as
+ * "already seen" for RLM post-compaction read tracking (paths only, never
+ * contents).
+ */
+export const FILE_READ_TOOL_NAMES = ["file_read"] as const;
+
+/**
+ * Field a successful direct file_read / file_edit_* result carries when the touched
+ * file matches a path-scoped skill (`paths` frontmatter). Unlike the model-only
+ * `__mux_notifications`, it is persisted to chat.jsonl: the pointer stays in the
+ * append-only prompt prefix, and later turns of the same context window see it and
+ * do not surface the skill again.
+ */
+export const PATH_SKILLS_RESULT_FIELD = "path_skills" as const;
+
+export interface PathSkillsResultField {
+  message: string;
+  skills: Array<{ name: string; scope: AgentSkillScope; description: string }>;
+}
+
+/**
  * Prefix for edit failure notes (agent-only messages).
  * This prefix signals to the agent that the file was not modified.
  */
@@ -219,7 +300,6 @@ export const EDIT_FAILED_NOTE_PREFIX = "EDIT FAILED - file was NOT modified.";
 export const NOTE_READ_FILE_RETRY = "Read the file to get current content, then retry.";
 export const NOTE_READ_FILE_FIRST_RETRY =
   "Read the file first to get the exact current content, then retry.";
-export const NOTE_READ_FILE_AGAIN_RETRY = "Read the file again and retry.";
 
 /**
  * Tool description warning for file edit tools
@@ -268,25 +348,36 @@ export type TaskListToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_list.schema>
 
 export type TaskListToolSuccessResult = z.infer<typeof TaskListToolResultSchema>;
 
+// Task Send Message Tool Types
+export type TaskSendMessageToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_send_message.schema>;
+
+export type TaskSendMessageToolSuccessResult = z.infer<typeof TaskSendMessageToolResultSchema>;
+
+// Task Retitle Tool Types
+export type TaskRetitleToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_retitle.schema>;
+export type TaskRetitleToolSuccessResult = z.infer<typeof TaskRetitleToolResultSchema>;
+
+// Task Stop Tool Types
+export type TaskStopToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_stop.schema>;
+export type TaskStopToolSuccessResult = z.infer<typeof TaskStopToolResultSchema>;
+
+// Task Remove Tool Types
+export type TaskRemoveToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_remove.schema>;
+export type TaskRemoveToolSuccessResult = z.infer<typeof TaskRemoveToolResultSchema>;
+
 // Task Terminate Tool Types
-export type TaskTerminateToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_terminate.schema>;
+export type TaskTerminateToolArgs = z.infer<typeof TaskTerminateToolArgsSchema>;
 
 export type TaskTerminateToolSuccessResult = z.infer<typeof TaskTerminateToolResultSchema>;
 
 // Task Workspace Lifecycle Tool Types (parent-owned archive/delete_worktree/remove)
-export type TaskWorkspaceLifecycleToolArgs = z.infer<
-  typeof TOOL_DEFINITIONS.task_workspace_lifecycle.schema
->;
+export type TaskWorkspaceLifecycleToolArgs = z.infer<typeof TaskWorkspaceLifecycleToolArgsSchema>;
 
 // Success shape is `{ results: [...] }` (no top-level `success`); a thrown execute()
 // surfaces as ToolErrorResult, so the renderable result is the union of both.
 export type TaskWorkspaceLifecycleToolSuccessResult = z.infer<
   typeof TaskWorkspaceLifecycleToolResultSchema
 >;
-
-export type TaskWorkspaceLifecycleToolResult =
-  | TaskWorkspaceLifecycleToolSuccessResult
-  | ToolErrorResult;
 
 // One per-target outcome row, discriminated on `status` (12 lifecycle states).
 export type TaskWorkspaceLifecycleTargetResult =
@@ -436,9 +527,27 @@ export type ToolSearchToolArgs = z.infer<typeof TOOL_DEFINITIONS.tool_catalog_se
 
 export interface ToolSearchToolResult {
   query: string;
-  matches: Array<{ name: string; description: string }>;
+  /** serverName is a bounded display label, not the raw server-config key. */
+  matches: Array<{ name: string; description: string; serverName?: string }>;
   /** Total deferred-catalog size, so the model/UI can see there are more undiscovered tools. */
   totalDeferred: number;
+  /**
+   * Present when an oversized definition kept a keyword search from
+   * auto-loading. Nothing was loaded (`matches` is empty, so activation and
+   * replay seeding skip the result by construction); the ranked candidates are
+   * listed, with approximate wire-token sizes, for an explicit exact-name
+   * re-search. Inline type literals (like `matches`) keep the result
+   * JSONValue-assignable for scoped-mode toModelOutput.
+   */
+  discovery?: {
+    candidates: Array<{
+      name: string;
+      serverName?: string;
+      approxTokens: number;
+      oversized?: true;
+    }>;
+    note: string;
+  };
 }
 
 // Notify Tool Types

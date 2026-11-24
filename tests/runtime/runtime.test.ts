@@ -14,6 +14,9 @@
 
 // Jest globals are available automatically - no need to import
 import * as os from "os";
+import { execFileSync } from "child_process";
+import * as fs from "fs/promises";
+import * as path from "path";
 // shouldRunIntegrationTests checks TEST_INTEGRATION env var
 function shouldRunIntegrationTests(): boolean {
   return process.env.TEST_INTEGRATION === "1" || process.env.TEST_INTEGRATION === "true";
@@ -31,9 +34,14 @@ import {
   type RuntimeType,
 } from "./test-fixtures/test-helpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
+import {
+  gitNoRepoAutomationEnvForLocalRepo,
+  gitNoRepoAutomationEnvForRuntimeRepo,
+} from "@/node/utils/gitNoHooksEnv";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { CoderService } from "@/node/services/coderService";
 import { RuntimeError } from "@/node/runtime/Runtime";
-import { computeBaseRepoPath, SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import {
   buildLegacyRemoteProjectLayout,
   buildRemoteProjectLayout,
@@ -43,6 +51,8 @@ import { createSSHTransport } from "@/node/runtime/transports";
 import { runFullInit } from "@/node/runtime/runtimeFactory";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 import { ssh2ConnectionPool } from "@/node/runtime/SSH2ConnectionPool";
+import { findUnpreservedSubagentWork } from "@/node/services/subagentRemovalWorkCheck";
+import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "@/node/runtime/testRemoteRuntime";
 
 const SSH_TEST_CWD = "/home/testuser";
 const execSSH = (runtime: Runtime, command: string, timeout = 30) =>
@@ -79,8 +89,8 @@ describeIntegration("Runtime integration tests", () => {
   // Reset SSH connection pool state before each test to prevent backoff from one
   // test affecting subsequent tests.
   beforeEach(() => {
-    sshConnectionPool.clearAllHealth();
-    ssh2ConnectionPool.clearAllHealth();
+    sshConnectionPool.clearAllHealthForTests();
+    ssh2ConnectionPool.clearAllHealthForTests();
   });
 
   // Test matrix: Run all tests for local, SSH, and Docker runtimes
@@ -185,6 +195,46 @@ describeIntegration("Runtime integration tests", () => {
           const result = await execWorkspace(runtime, workspace, "exit 42");
 
           expect(result.exitCode).toBe(42);
+        });
+
+        testForRuntime(
+          "a multi-line command with a missing cwd fails without running later lines",
+          async () => {
+            const runtime = createRuntime();
+            await using workspace = await TestWorkspace.create(runtime, type);
+
+            for (const command of MISSING_CWD_COMMANDS) {
+              const run = execWorkspace(runtime, workspace, command, {
+                cwd: `${workspace.path}/missing`,
+                env: { XUM_TEST_VAR: "set" },
+              });
+              if (type === "local") {
+                // Local runtimes check the cwd before spawning.
+                await expect(run).rejects.toThrow("Working directory does not exist");
+                continue;
+              }
+              const result = await run;
+              expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+                command,
+                failed: true,
+                stdout: "",
+              });
+            }
+          }
+        );
+
+        testForRuntime("multi-line commands keep their output and exit codes", async () => {
+          const runtime = createRuntime();
+          await using workspace = await TestWorkspace.create(runtime, type);
+
+          for (const c of MULTI_LINE_COMMAND_CASES) {
+            const result = await execWorkspace(runtime, workspace, c.command);
+            expect({ name: c.name, exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+              name: c.name,
+              exitCode: c.exitCode,
+              stdout: c.stdout,
+            });
+          }
         });
 
         testLocalOnly("handles stdin input", async () => {
@@ -862,6 +912,76 @@ describeIntegration("Runtime integration tests", () => {
           expect(result.stderr.toLowerCase()).toContain("permission denied");
         });
       });
+
+      // Sequential on purpose: the local side isolates process.env git config, and Jest runs a
+      // block's concurrent tests as one unit, so none run while this block does.
+      describe("Repository automation discovery", () => {
+        test("runtime discovery returns the local discovery env and fails closed on a missing cwd", async () => {
+          const seed = [
+            "git init -q plain",
+            "git init -q drivers",
+            "mkdir -p drivers/.git/info",
+            "printf '* filter=evil diff=evil merge=evil\\n' > drivers/.git/info/attributes",
+            "git -C drivers config filter.evil.smudge cat",
+            "git -C drivers config diff.evil.textconv cat",
+            "git -C drivers config merge.evil.driver 'cat %A'",
+            "git -C drivers config alias.evil '!echo hi'",
+            "git init -q wtcfg",
+            "git -C wtcfg config extensions.worktreeConfig true",
+            "git -C wtcfg config --worktree filter.wt.smudge cat",
+          ].join(" && ");
+          const runtime = createRuntime();
+          await using workspace = await TestWorkspace.create(runtime, type);
+          const localRoot = await fs.mkdtemp(path.join(os.tmpdir(), "git-discovery-parity-"));
+          const saved = {
+            global: process.env.GIT_CONFIG_GLOBAL,
+            nosystem: process.env.GIT_CONFIG_NOSYSTEM,
+          };
+          try {
+            // Host git config (for example git-lfs filters) would otherwise differ from the
+            // remote's.
+            const globalConfig = path.join(localRoot, "global.gitconfig");
+            await fs.writeFile(globalConfig, "");
+            process.env.GIT_CONFIG_GLOBAL = globalConfig;
+            process.env.GIT_CONFIG_NOSYSTEM = "1";
+            execFileSync("sh", ["-c", seed], { cwd: localRoot, stdio: "pipe" });
+            const seeded = await execWorkspace(runtime, workspace, seed);
+            expect(seeded.exitCode).toBe(0);
+
+            for (const name of ["plain", "drivers", "wtcfg"]) {
+              const local = await gitNoRepoAutomationEnvForLocalRepo(path.join(localRoot, name));
+              const remote = await gitNoRepoAutomationEnvForRuntimeRepo(
+                runtime,
+                `${workspace.path}/${name}`
+              );
+              expect({ name, env: JSON.stringify(remote) }).toEqual({
+                name,
+                env: JSON.stringify(local),
+              });
+              if (name === "drivers") {
+                expect(Object.values(remote)).toContain("filter.evil.smudge");
+              }
+            }
+
+            const missing = await gitNoRepoAutomationEnvForRuntimeRepo(
+              runtime,
+              `${workspace.path}/missing`,
+              undefined,
+              true
+            ).then(
+              () => null,
+              (error: unknown) => error
+            );
+            expect(missing).toBeInstanceOf(Error);
+          } finally {
+            if (saved.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+            else process.env.GIT_CONFIG_GLOBAL = saved.global;
+            if (saved.nosystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+            else process.env.GIT_CONFIG_NOSYSTEM = saved.nosystem;
+            await fs.rm(localRoot, { recursive: true, force: true });
+          }
+        }, 60000);
+      });
     }
   );
 
@@ -1042,6 +1162,58 @@ describeIntegration("Runtime integration tests", () => {
         // Cleanup
         await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
       });
+
+      // #5163: the cp -R -P fork inherits the source's whole stash, older entries included. The
+      // snapshot must record each entry, or the task_remove lossy check counts them as the fork's.
+      test("records every inherited stash entry in the source-ref snapshot (#5163)", async () => {
+        const runtime = createSSHRuntime();
+        const projectName = `fork-stash-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+        const layout = getLayout(`/some/path/${projectName}`);
+        const sourceWorkspacePath = getRemoteWorkspacePath(layout, "source");
+        const newWorkspacePath = getRemoteWorkspacePath(layout, "forked");
+        await execSSH(
+          runtime,
+          [
+            `mkdir -p "${sourceWorkspacePath}"`,
+            `cd "${sourceWorkspacePath}"`,
+            `git init -q`,
+            `git config user.email "test@example.com"`,
+            `git config user.name "Test"`,
+            `echo root > root.txt && git add root.txt && git commit -qm root`,
+            `echo one > root.txt && git add root.txt && git stash -q`,
+            `echo two > root.txt && git add root.txt && git stash -q`,
+          ].join(" && ")
+        );
+        const sourceEntries = await execSSH(
+          runtime,
+          `git -C "${sourceWorkspacePath}" rev-list --walk-reflogs refs/stash`
+        );
+        expect(sourceEntries.stdout.trim().split("\n")).toHaveLength(2);
+
+        const initLogger = {
+          logStep(_message: string) {},
+          logStdout(_line: string) {},
+          logStderr(_line: string) {},
+          logComplete(_exitCode: number) {},
+        };
+        const forkResult = await runtime.forkWorkspace({
+          projectPath: `/some/path/${projectName}`,
+          sourceWorkspaceName: "source",
+          newWorkspaceName: "forked",
+          initLogger,
+        });
+        expect(forkResult.success).toBe(true);
+
+        const recorded = await execSSH(
+          runtime,
+          `git -C "${newWorkspacePath}" for-each-ref '--format=%(objectname)' refs/xum/source-snapshot/stash-reflog/`
+        );
+        expect(recorded.stdout.trim().split("\n").sort()).toEqual(
+          sourceEntries.stdout.trim().split("\n").sort()
+        );
+
+        await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
+      });
     });
 
     describe("deleteWorkspace", () => {
@@ -1110,12 +1282,6 @@ describeIntegration("Runtime integration tests", () => {
     const createSSHRuntime = (): SSHRuntime =>
       createTestRuntime("ssh", srcBaseDir, sshConfig) as SSHRuntime;
     const getLayout = (projectPath: string) => buildRemoteProjectLayout(srcBaseDir, projectPath);
-
-    test("computeBaseRepoPath returns correct path", async () => {
-      const layout = getLayout("/some/path/my-project");
-      const result = computeBaseRepoPath(srcBaseDir, "/some/path/my-project");
-      expect(result).toBe(layout.baseRepoPath);
-    }, 10000);
 
     test("forkWorkspace uses worktree when base repo exists", async () => {
       const runtime = createSSHRuntime();
@@ -1222,7 +1388,12 @@ describeIntegration("Runtime integration tests", () => {
             `echo "legacy content" > legacy.txt`,
             `git add legacy.txt`,
             `git commit -m "legacy initial"`,
-            `git checkout -b legacy-branch`,
+            // A local-only branch and a stash the cp copy inherits (#5105).
+            `git checkout -b local-only`,
+            `git commit --allow-empty -m "local only"`,
+            `git checkout -b legacy-branch HEAD~1`,
+            `echo "stashed" >> legacy.txt`,
+            `git stash`,
           ].join(" && ")
         );
 
@@ -1255,6 +1426,30 @@ describeIntegration("Runtime integration tests", () => {
         // Verify content was copied.
         const fileCheck = await execSSH(runtime, `cat "${newWorkspacePath}/legacy.txt"`);
         expect(fileCheck.stdout.trim()).toBe("legacy content");
+
+        // #5105: removal deletes this copy with `rm -rf`. The fork recorded the inherited branch and
+        // stash, so the task_remove lossy check counts only commits the fork made itself.
+        const forkHead = (
+          await execSSH(runtime, `git -C "${newWorkspacePath}" rev-parse HEAD`)
+        ).stdout.trim();
+        const checkForkWork = () =>
+          findUnpreservedSubagentWork({
+            runtime,
+            projectRepos: [{ projectPath, projectName, repoCwd: newWorkspacePath }],
+            patchArtifact: null,
+            patchArtifactSessionDir: "/nonexistent-session-dir",
+            taskBaseCommitShaByProjectPath: { [projectPath]: forkHead },
+            removalDeletesBundleClone: false,
+          });
+        expect(await checkForkWork()).toEqual({ success: true, data: { kind: "none" } });
+        await execSSH(
+          runtime,
+          `cd "${newWorkspacePath}" && git checkout -q -b side && git commit -q --allow-empty -m side && git checkout -q ${newWorkspaceName}`
+        );
+        expect(await checkForkWork()).toEqual({
+          success: true,
+          data: { kind: "lossy", paths: [], uncapturedCommitCount: 0, otherRefCommitCount: 1 },
+        });
       } finally {
         await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
       }
@@ -2644,7 +2839,7 @@ describeIntegration("Runtime integration tests", () => {
       return new Promise((resolve) => {
         const proc = spawn("bash", ["-c", cmd]);
         let stdout = "";
-        proc.stdout.on("data", (data) => (stdout += data.toString()));
+        proc.stdout.on("data", (data: Buffer) => (stdout += data.toString()));
         proc.on("close", (code) => resolve({ stdout, exitCode: code ?? 0 }));
       });
     };
@@ -2960,13 +3155,12 @@ describeIntegration("Runtime integration tests", () => {
     // Create a CoderSSHRuntime with mock CoderService
     const createCoderSSHRuntime = async () => {
       const { CoderSSHRuntime } = await import("@/node/runtime/CoderSSHRuntime");
-      const { CoderService } = await import("@/node/services/coderService");
 
       // Mock CoderService with methods that CoderSSHRuntime may call
       const mockCoderService = {
         getWorkspaceStatus: () =>
           Promise.resolve({ kind: "running" as const, status: "running" as const }),
-      } as unknown as InstanceType<typeof CoderService>;
+      } as unknown as CoderService;
 
       const config = {
         host: "testuser@localhost",
@@ -3043,7 +3237,6 @@ describeIntegration("Runtime integration tests", () => {
 
       test("postCreateSetup after fork does not call coder create", async () => {
         const { CoderSSHRuntime } = await import("@/node/runtime/CoderSSHRuntime");
-        const { CoderService } = await import("@/node/services/coderService");
 
         // Track whether createWorkspace was called
         let createWorkspaceCalled = false;
@@ -3060,7 +3253,7 @@ describeIntegration("Runtime integration tests", () => {
           waitForStartupScripts: async function* () {
             // Yield nothing - workspace is already running
           },
-        } as unknown as InstanceType<typeof CoderService>;
+        } as unknown as CoderService;
 
         const config = {
           host: "testuser@localhost",

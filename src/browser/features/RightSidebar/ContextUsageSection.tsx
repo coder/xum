@@ -1,9 +1,7 @@
 import React from "react";
 import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { resolveCompactionModel } from "@/browser/utils/messages/compactionModelPreference";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { calculateTokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
@@ -22,14 +20,8 @@ interface ContextUsageSectionProps {
  */
 export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
-  const configuredCompactionModel = agentAiDefaults.compact?.modelString ?? "";
+  const configuredCompactionModel =
+    useAppConfig((config) => config.agentAiDefaults?.compact?.modelString) ?? "";
   const { has1MContext } = useProviderOptions();
   const pendingSendOptions = useSendMessageOptions(workspaceId);
   const { config: providersConfig } = useProvidersConfig();
@@ -42,8 +34,11 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     resolveCompactionModel(configuredCompactionModel) ?? contextDisplayModel;
 
   // Auto-compaction settings: threshold per-model (100 = disabled)
-  const { threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold } =
-    useAutoCompactionSettings(workspaceId, contextDisplayModel);
+  const {
+    threshold: autoCompactThreshold,
+    setThreshold: setAutoCompactThreshold,
+    rolloverEnabled,
+  } = useAutoCompactionSettings(workspaceId, contextDisplayModel);
 
   const contextUsage = usage.liveUsage ?? usage.lastContextUsage;
   if (!contextUsage) {
@@ -61,7 +56,8 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
   // Warn when the compaction model can't fit the auto-compact threshold to avoid failures.
   const contextWarning = (() => {
     const maxTokens = contextUsageData.maxTokens;
-    if (!maxTokens || autoCompactThreshold >= 100 || !effectiveCompactionModel) return undefined;
+    if (rolloverEnabled || !maxTokens || autoCompactThreshold >= 100 || !effectiveCompactionModel)
+      return undefined;
 
     const thresholdTokens = Math.round((autoCompactThreshold / 100) * maxTokens);
     const compactionMaxTokens = getEffectiveContextLimit(
@@ -89,6 +85,8 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
           threshold: autoCompactThreshold,
           setThreshold: setAutoCompactThreshold,
           contextWarning,
+          rolloverEnabled,
+          modelContextLimit: contextUsageData.maxTokens,
         }}
       />
     </div>

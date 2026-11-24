@@ -4,7 +4,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 /**
  * Best-effort request to apply a thinking-level change to the active turn's
  * NEXT model step (mid-turn override). Shared by every UI path that changes a
- * workspace's thinking level (slider, keybinds, command palette) so they all
+ * workspace's thinking level (selector, keybinds, command palette) so they all
  * behave identically during a stream.
  *
  * No streaming gate on purpose: the backend no-ops cheaply (accepted: false)

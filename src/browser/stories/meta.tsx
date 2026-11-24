@@ -9,14 +9,22 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { FC, ReactNode } from "react";
 import { useRef } from "react";
 import { AppLoader } from "../components/AppLoader/AppLoader";
+// App renders its pages through React.lazy (#6206). Its early chunk import runs only on a
+// /workspace/ route, and a story runs at /iframe.html, so each App story's first render waited
+// for the page chunk, and a busy runner timed out the transcript queries (#6231). Importing the
+// pages here puts them in the story bundle, so React.lazy resolves them at once.
+import "@/browser/components/AIView/AIView";
+import "@/browser/components/ProjectPage/ProjectPage";
+import "@/browser/components/ScratchPage/ScratchPage";
+// WorkspaceShell loads the right sidebar through its own React.lazy (#6206), so a story that shows
+// it waited for that chunk too (#6266). Importing it here puts it in the story bundle as well.
+import "@/browser/features/RightSidebar/RightSidebar";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import {
-  SELECTED_WORKSPACE_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
-  UI_THEME_KEY,
-} from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { resetAiSelectionIntentForTests } from "@/browser/utils/aiSelectionIntent";
+import { SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // META CONFIG
@@ -81,14 +89,14 @@ interface AppWithMocksProps {
 
 function resetStorybookPersistedStateForStory(): void {
   // Storybook can preserve localStorage across story renders on one origin.
-  // Reset persisted state so each story starts from a known route + theme.
+  // Reset persisted state so each story starts from a known route.
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-    localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
-    // Stories that disable sidebar age grouping must not leak the setting
-    // into later stories via the shared localStorage origin.
-    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
   }
+  // Startup waits for this story's own snapshot instead of the previous story's.
+  getAppConfigStore().updateOptimistically({ experiments: undefined, userPreferences: undefined });
+  // Unsent AI picks live in memory, and the test-runner renders all stories of a file in one page.
+  resetAiSelectionIntentForTests();
 }
 function getStorybookRenderKey(): string | null {
   if (typeof window === "undefined") {

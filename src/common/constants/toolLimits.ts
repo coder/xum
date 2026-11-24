@@ -1,4 +1,7 @@
-export const BASH_DEFAULT_TIMEOUT_SECS = 3;
+// Kill deadline for a bash call whose `timeout_secs` is absent. 60 is both the mode and the median
+// of the values models pass when they pass one. Background processes ignore it (they live until
+// stopped), so only a foreground command can be cut short, and its error says to raise the value.
+export const BASH_DEFAULT_TIMEOUT_SECS = 60;
 
 // tmpfile policy limits (AI agent - conservative for LLM context)
 export const BASH_HARD_MAX_LINES = 300;
@@ -10,12 +13,14 @@ export const BASH_MAX_FILE_BYTES = 100 * 1024; // 100KB max to save to temp file
 export const BASH_TRUNCATE_MAX_TOTAL_BYTES = 1024 * 1024; // 1MB total output
 export const BASH_TRUNCATE_MAX_FILE_BYTES = 1024 * 1024; // 1MB file limit (same as total for IPC)
 
-export const ADVISOR_LIVE_OUTPUT_MAX_CHARS = 256 * 1024;
-
 // tmpfile policy limits (AI agent only)
 export const BASH_MAX_LINE_BYTES = 1024; // 1KB per line for AI agent
 
-export const MAX_TODOS = 7; // Maximum number of TODO items in a list
+// Maximum number of TODO items in a list. Playbook routers (e.g. pstack) copy a playbook's 8-9
+// steps into the list before any task items, so 7 overflowed before the agent added its own work.
+// 15 fits a 9-step playbook plus a few task items while keeping the summarization pressure the
+// original cap (PR #261) added to stop 50+ item lists from costing ~2,500 tokens per update.
+export const MAX_TODOS = 15;
 
 // Init hook output limits (prevents OOM/freeze with large rsync output)
 // Keep only the most recent lines (tail), drop older lines
@@ -25,3 +30,54 @@ export const INIT_HOOK_MAX_LINES = 500;
 export const WEB_FETCH_TIMEOUT_SECS = 15; // curl timeout
 export const WEB_FETCH_MAX_OUTPUT_BYTES = 64 * 1024; // 64KB markdown output
 export const WEB_FETCH_MAX_HTML_BYTES = 5 * 1024 * 1024; // 5MB HTML input (curl --max-filesize)
+// Pinned addresses tried per request when the earlier ones are unreachable (#5977). A
+// hostname can return many addresses: each attempt is one curl process in the runtime.
+export const WEB_FETCH_MAX_ADDRESS_ATTEMPTS = 3;
+
+// Page size for long text a tool returns whole from storage (task_await reports, catalog
+// skill bodies). Since #6268 the rebuild no longer cuts tool strings at 12,000 chars, so this is
+// the cap: the tool returns one page and the offset of the next one (offset_chars paging).
+export const TOOL_TEXT_PAGE_MAX_CHARS = 50_000;
+
+// MCP tool results are server-controlled and previously unbounded: a 62MB
+// Grafana trace result persisted into chat.jsonl froze the renderer and made
+// every later provider request exceed API payload limits (#3138). Bound the
+// text surfaces like web_fetch output before results enter history. Charged
+// in serialized JSON bytes (escape expansion + per-part wrapper overhead) so
+// part count and escape-heavy content cannot multiply the persisted size.
+export const MCP_TOOL_RESULT_MAX_TEXT_BYTES = 64 * 1024;
+
+// Backstop for MCP result surfaces the per-text caps cannot reach (result- and
+// part-level _meta, unknown fields, resource URIs): results whose total
+// serialized size still exceeds this after text capping are flattened to
+// bounded text parts. Sized so capped legitimate results (64KB text + 64KB
+// structuredContent + notices) never trip it.
+export const MCP_TOOL_RESULT_MAX_TOTAL_BYTES = 256 * 1024;
+
+// MCP prompt expansions are server-controlled; bound them like web_fetch output.
+export const MCP_PROMPT_MAX_TEXT_BYTES = 64 * 1024;
+export const MCP_PROMPT_TRUNCATION_MARKER = "\n\n[Prompt text truncated]";
+// Prompt names feed key normalization (Unicode + regex over the raw name), so
+// oversized names are rejected before any key building can process them.
+export const MCP_PROMPT_MAX_NAME_CHARS = 200;
+// Server names prefix every prompt key, so an oversized name disables the
+// server's prompt catalog before key building can process it per prompt.
+export const MCP_PROMPT_MAX_SERVER_NAME_CHARS = 200;
+// Argument names must fit bounded discovery and error text; a prompt with an
+// oversized name is dropped so the advertised list always matches the server's.
+export const MCP_PROMPT_MAX_ARGUMENT_NAME_CHARS = 200;
+// Prompt and argument descriptions are server-controlled metadata; clamp them
+// at refresh to bound descriptor memory and IPC payloads.
+export const MCP_PROMPT_MAX_DESCRIPTION_CHARS = 500;
+// Drop over-cap argument arrays instead of truncating them because composer
+// slash invocation binds tokens positionally. This also bounds descriptor and
+// hint construction.
+export const MCP_PROMPT_MAX_ARGUMENTS = 64;
+
+// Per-skill description cap in the agent_skill_read index: skill frontmatter allows long
+// descriptions, and every workspace pays the index before its first message.
+export const AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS = 280;
+
+// Max sibling mappings in the note Xum puts on a plugin skill whose sibling skills
+// other skills shadow (pluginSiblingNote.ts). Bounds the note for large plugins.
+export const PLUGIN_SIBLING_NOTE_MAX_SKILLS = 30;

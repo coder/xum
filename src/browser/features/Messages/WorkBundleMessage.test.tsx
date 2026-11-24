@@ -1,13 +1,9 @@
-import type * as React from "react";
 import { cleanup, fireEvent, render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import type { WorkBundleInfo } from "@/browser/utils/messages/transcriptRenderProjection";
 import { WorkBundleMessage } from "./WorkBundleMessage";
-
-void mock.module("lucide-react", () => ({
-  ChevronRight: (props: React.SVGProps<SVGSVGElement>) => <svg {...props} />,
-}));
 
 const item: WorkBundleInfo = {
   key: "work:one",
@@ -22,14 +18,14 @@ const item: WorkBundleInfo = {
 
 describe("WorkBundleMessage", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
   });
 
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("renders duration and toggles expansion", () => {

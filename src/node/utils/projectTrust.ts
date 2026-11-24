@@ -1,6 +1,110 @@
-import type { Config } from "@/node/config";
+import type { Config, SecretsStore, Workspace } from "@/node/config";
+import type { Secret } from "@/common/types/secrets";
+import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
+import { isWorkspaceDirTrustedBy } from "@/common/utils/sshDirectoryTrust";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { isSshSharedProjectDirRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
+import type { Runtime } from "@/node/runtime/Runtime";
+
+/**
+ * The workspace fields that decide workspace-scoped trust. runtimeConfig is a required key
+ * (possibly undefined) so every caller that builds this shape must say which runtime it has.
+ */
+export type WorkspaceTrustSubject = Pick<WorkspaceMetadata, "kind" | "projectPath"> & {
+  runtimeConfig: RuntimeConfig | undefined;
+};
+
+/**
+ * Whether the directory a workspace runs in is covered by trust, on a config the caller already
+ * loaded. SSH+None runs in an existing host directory (projectDir) that is not the local project
+ * and that collaborators may control, so project trust alone cannot vouch for it: the user must
+ * also trust that exact directory for the project (trustedSshDirectories on the trust owner).
+ * Every other runtime runs in a checkout the project owns, so this is true for it. Workspace
+ * trust is project trust AND this.
+ */
+export function isWorkspaceDirTrusted(
+  projects: ProjectsConfig["projects"],
+  projectPath: string | null | undefined,
+  runtimeConfig: RuntimeConfig | undefined
+): boolean {
+  if (!isSshSharedProjectDirRuntime(runtimeConfig)) return true;
+  if (!projectPath) return false;
+  // Directory trust only counts while the project itself is trusted: revoking project trust keeps
+  // trustedSshDirectories on disk, and callers that check only the directory (secrets) must not
+  // keep vouching for it.
+  if (!isProjectTrustedIn(projects, projectPath)) return false;
+  return isWorkspaceDirTrustedBy(
+    trustOwnerConfig(projects, projectPath)?.trustedSshDirectories,
+    runtimeConfig
+  );
+}
+
+/**
+ * Whether a new checkout's .xum/init hook may run: the caller's project trust flag AND the
+ * directory's trust (isWorkspaceDirTrusted). An SSH+None host directory is not the local project,
+ * so it needs its own trust too. The config is loaded only when the project is trusted.
+ */
+export function isInitHookTrusted(
+  config: Pick<Config, "loadConfigOrDefault">,
+  projectTrusted: boolean | undefined,
+  projectPath: string,
+  runtimeConfig: RuntimeConfig | undefined
+): boolean {
+  return (
+    (projectTrusted ?? false) &&
+    isWorkspaceDirTrusted(config.loadConfigOrDefault().projects, projectPath, runtimeConfig)
+  );
+}
+
+/** A workspace's config entry, as findWorkspaceEntry returns it: the fields trust reads. */
+interface WorkspaceTrustEntry {
+  projectPath: string;
+  workspace: Pick<Workspace, "kind" | "runtimeConfig">;
+}
+
+/**
+ * #6426: project-plugin trust for a read of a child workspace's checkout and its parent's: the
+ * child's workspace trust AND the parent's directory trust. An SSH+None directory on either side
+ * that the user has not trusted keeps project plugins off. A missing parent adds no directory.
+ */
+export function isChildWorkspaceAndParentDirTrustedIn(
+  projects: ProjectsConfig["projects"],
+  child: WorkspaceTrustEntry,
+  parent: WorkspaceTrustEntry | null | undefined
+): boolean {
+  return (
+    isWorkspaceProjectTrustedIn(projects, {
+      kind: child.workspace.kind,
+      projectPath: child.projectPath,
+      runtimeConfig: child.workspace.runtimeConfig,
+    }) && isWorkspaceDirTrusted(projects, parent?.projectPath, parent?.workspace.runtimeConfig)
+  );
+}
+
+/**
+ * The project secrets to put in a workspace's process env (bash tool, init, MCP servers).
+ * Secrets were configured for the local project, but an SSH+None workspace runs commands in a
+ * host directory: until the user trusts that directory, a collaborator-controlled script there
+ * (a test runner, a git hook) must not read GH_TOKEN and the like, so it gets no project secrets.
+ * The config is loaded only for SSH+None.
+ */
+export function secretsForWorkspace(
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">,
+  config: Pick<Config, "loadConfigOrDefault">,
+  projectPath: string,
+  runtimeConfig: RuntimeConfig | undefined
+): Secret[] {
+  if (
+    isSshSharedProjectDirRuntime(runtimeConfig) &&
+    !isWorkspaceDirTrusted(config.loadConfigOrDefault().projects, projectPath, runtimeConfig)
+  ) {
+    return [];
+  }
+  return secretsStore.getEffectiveSecrets(projectPath);
+}
 
 /**
  * Workspace-scoped trust. Scratch workspaces are app-owned (created trusted
@@ -10,12 +114,9 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
  */
 export function isWorkspaceProjectTrusted(
   config: Config,
-  metadata: Pick<WorkspaceMetadata, "kind" | "projectPath">
+  metadata: WorkspaceTrustSubject
 ): boolean {
-  if (metadata.kind === "scratch") {
-    return true;
-  }
-  return isProjectTrusted(config, metadata.projectPath);
+  return isWorkspaceProjectTrustedIn(config.loadConfigOrDefault().projects, metadata);
 }
 
 /**
@@ -26,10 +127,76 @@ export function isProjectTrusted(config: Config, projectPath?: string | null): b
   if (!projectPath) {
     return false;
   }
+  return isProjectTrustedIn(config.loadConfigOrDefault().projects, projectPath);
+}
 
-  const projects = config.loadConfigOrDefault().projects;
+/**
+ * isWorkspaceProjectTrusted on a config the caller already loaded: no config read or stat
+ * (#6426, for per-agent lookups in a turn).
+ */
+export function isWorkspaceProjectTrustedIn(
+  projects: ProjectsConfig["projects"],
+  metadata: WorkspaceTrustSubject
+): boolean {
+  if (!isWorkspaceDirTrusted(projects, metadata.projectPath, metadata.runtimeConfig)) {
+    return false;
+  }
+  return metadata.kind === "scratch" || isProjectTrustedIn(projects, metadata.projectPath);
+}
+
+/** isProjectTrusted on a config the caller already loaded. */
+export function isProjectTrustedIn(
+  projects: ProjectsConfig["projects"],
+  projectPath?: string | null
+): boolean {
+  if (!projectPath) {
+    return false;
+  }
+  return trustOwnerConfig(projects, projectPath)?.trusted ?? false;
+}
+
+/** The trust owner's config: a sub-project's parent, else the project itself. */
+function trustOwnerConfig(
+  projects: ProjectsConfig["projects"],
+  projectPath: string
+): ProjectConfig | undefined {
   const normalizedProjectPath = stripTrailingSlashes(projectPath);
   const project = projects.get(normalizedProjectPath);
-  const trustOwnerPath = project?.parentProjectPath ?? normalizedProjectPath;
-  return projects.get(trustOwnerPath)?.trusted ?? false;
+  return projects.get(project?.parentProjectPath ?? normalizedProjectPath);
+}
+
+/** The path whose config holds trust for `projectPath`: a sub-project's parent, else itself. */
+export function trustOwnerPathIn(
+  projects: ProjectsConfig["projects"],
+  projectPath: string
+): string {
+  const normalizedProjectPath = stripTrailingSlashes(projectPath);
+  return projects.get(normalizedProjectPath)?.parentProjectPath ?? normalizedProjectPath;
+}
+
+/**
+ * #6426: a project's own Agent Plugins are one trust unit. Their skills and agents load only in a
+ * trusted project, as their MCP servers, hooks and slash commands do (computeAgentPluginContainers),
+ * and never under the project-automation kill switch. Missing trust means untrusted.
+ */
+export function projectPluginsAllowed(projectPluginsTrusted: boolean | undefined): boolean {
+  return projectPluginsTrusted === true && !projectAutomationDisabled();
+}
+
+/**
+ * #6426: the plugin container dirs of a project (`.xum/plugins`, `.mux/plugins`,
+ * `.agents/plugins` under `projectSearchRoot`), or none when projectPluginsAllowed is false.
+ */
+export function projectPluginContainerPaths(
+  runtime: Pick<Runtime, "normalizePath">,
+  projectSearchRoot: string,
+  projectPluginsTrusted: boolean | undefined
+): string[] {
+  if (!projectPluginsAllowed(projectPluginsTrusted)) return [];
+  return [
+    ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+      runtime.normalizePath(relativePath, projectSearchRoot)
+    ),
+    runtime.normalizePath(".agents/plugins", projectSearchRoot),
+  ];
 }

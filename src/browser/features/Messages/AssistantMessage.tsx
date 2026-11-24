@@ -12,15 +12,15 @@ import {
   Moon,
   Package,
 } from "lucide-react";
-import { cn } from "@/common/lib/utils";
-import {
-  SIDE_QUESTION_ANSWER_BLOCK_CLASS,
-  SIDE_QUESTION_MESSAGE_WINDOW_CLASS,
-} from "./sideQuestionStyles";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
+import {
+  isTranscriptMutationAllowed,
+  useTranscriptMutationAllowed,
+} from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import React, { useState } from "react";
 import { CompactingMessageContent } from "./CompactingMessageContent";
@@ -29,7 +29,9 @@ import type { ButtonConfig } from "./MessageWindow";
 import { MessageWindow } from "./MessageWindow";
 import { ModelDisplay } from "./ModelDisplay";
 import { ModelFallbackBadge } from "./ModelFallbackBadge";
+import { AutoModelRoutingBadge } from "./AutoModelRoutingBadge";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
+import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
 
 interface AssistantMessageProps {
   message: DisplayedMessage & { type: "assistant" };
@@ -48,6 +50,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
 }) => {
   const [showRaw, setShowRaw] = useState(false);
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const forkError = usePopoverError();
 
   const content = message.content;
@@ -55,7 +58,6 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
   const isCompacted = message.isCompacted;
   const isBeforeLatestContextBoundary = message.isBeforeLatestContextBoundary === true;
   const isStreamingCompaction = isStreaming && isCompacting;
-  const isSideAnswer = message.isSideAnswer === true;
 
   // Use Start Here hook for final assistant messages
   const {
@@ -79,33 +81,46 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     icon: copied ? <ClipboardCheck /> : <Clipboard />,
   };
 
+  // A response fork names this row's history id as the branch point, so it must not run
+  // against a provisional transcript (the row may be stale or already removed): the action
+  // follows the barrier like Start Here does, rendered disabled and re-checked on dispatch.
+  const transcriptMutationAllowed = useTranscriptMutationAllowed(workspaceId);
+
   const handleForkFromResponse = async () => {
     if (!workspaceId) {
       forkError.showError(message.historyId, "Workspace ID unavailable");
       return;
     }
 
-    if (!api) {
+    if (!liveApi) {
       forkError.showError(message.historyId, "Not connected to server");
       return;
     }
 
-    try {
-      // Response-level forks branch from this assistant turn instead of cloning the entire
-      // transcript, so users can explore alternatives without carrying over later replies.
-      const result = await forkWorkspace({
-        client: api,
-        sourceWorkspaceId: workspaceId,
-        sourceMessageId: message.historyId,
-      });
-
-      if (!result.success) {
-        forkError.showError(message.historyId, result.error ?? "Failed to fork chat");
-      }
-    } catch (error) {
-      const messageText = error instanceof Error ? error.message : "Failed to fork chat";
-      forkError.showError(message.historyId, messageText);
+    if (!isTranscriptMutationAllowed(workspaceId)) {
+      forkError.showError(message.historyId, TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+      return;
     }
+
+    await runWithCatch(
+      async () => {
+        // Response-level forks branch from this assistant turn instead of cloning the entire
+        // transcript, so users can explore alternatives without carrying over later replies.
+        const result = await forkWorkspace({
+          client: liveApi,
+          sourceWorkspaceId: workspaceId,
+          sourceMessageId: message.historyId,
+        });
+
+        if (!result.success) {
+          forkError.showError(message.historyId, result.error ?? "Failed to fork chat");
+        }
+      },
+      (error) => {
+        const messageText = error instanceof Error ? error.message : "Failed to fork chat";
+        forkError.showError(message.historyId, messageText);
+      }
+    );
   };
 
   // Scratch chats cannot be forked (the backend rejects it), so hide the
@@ -118,12 +133,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
 
   const buttons: ButtonConfig[] = isStreaming ? [] : [copyButton];
 
-  if (!isStreaming && !isSideAnswer) {
-    // Side answers intentionally show only Copy. The /btw side branch is
-    // meant to feel lightweight: Start Here / Fork / Show Text
-    // would imply the message is a fork point in the main agent thread,
-    // which it isn't. Keeping the action set minimal also keeps the pair
-    // visually quiet against the main transcript.
+  if (!isStreaming) {
     buttons.push({
       label: startHereLabel,
       onClick: openStartHereModal,
@@ -135,7 +145,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
       buttons.push({
         label: "Fork",
         onClick: () => void handleForkFromResponse(),
-        disabled: !workspaceId || !api,
+        disabled: !workspaceId || !api || !transcriptMutationAllowed,
         tooltip: "Fork a new workspace from this response",
         icon: <GitBranch />,
       });
@@ -211,18 +221,16 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     const isCompacted = message.isCompacted;
     const isIdleCompacted = message.isIdleCompacted;
 
+    // Keep compaction badges visible beside long model names on narrow transcripts.
     return (
-      <div className="flex items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
         {modelName && (
-          <ModelDisplay
-            modelString={modelName}
-            routedThroughGateway={message.routedThroughGateway}
-            routeProvider={message.routeProvider}
-          />
+          <ModelDisplay modelString={modelName} routeProvider={message.routeProvider} />
         )}
         {message.modelFallback && (
           <ModelFallbackBadge modelFallback={message.modelFallback} effectiveModel={modelName} />
         )}
+        {message.autoModelRouting && <AutoModelRoutingBadge record={message.autoModelRouting} />}
         {isCompacted && (
           <span className="text-plan-mode bg-plan-mode/10 inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
             {isIdleCompacted ? (
@@ -243,29 +251,16 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
       variant="assistant"
       message={message}
       buttons={buttons}
-      // For /btw answers the outer wrapper owns spacing around the pair.
-      className={cn(className, isSideAnswer && SIDE_QUESTION_MESSAGE_WINDOW_CLASS)}
+      className={className}
       backgroundEffect={isStreamingCompaction ? <CompactionBackground /> : undefined}
     >
       {renderContent()}
     </MessageWindow>
   );
 
-  // /btw side-answer: wrap the normal assistant bubble in the same
-  // thin-stripe block as the user question above it. Do not add another
-  // header here: the "Side question" label on the user row already marks
-  // the whole Q/A branch, and repeating it on the answer felt noisy.
-  const wrappedMessageWindow = isSideAnswer ? (
-    <div className={cn(SIDE_QUESTION_ANSWER_BLOCK_CLASS, className)} data-side-answer>
-      {messageWindow}
-    </div>
-  ) : (
-    messageWindow
-  );
-
   return (
     <>
-      {wrappedMessageWindow}
+      {messageWindow}
 
       <PopoverError
         error={forkError.error}

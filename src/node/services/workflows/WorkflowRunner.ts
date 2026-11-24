@@ -1,5 +1,6 @@
 import { StructuredTaskOutputSchema, WorkflowResultSchema } from "@/common/orpc/schemas";
 import { TaskApplyGitPatchToolResultSchema } from "@/common/utils/tools/toolDefinitions";
+import type { TaskAttemptOutcome, TaskAttemptSettlement } from "@/common/types/tasks";
 import type {
   StructuredTaskOutput,
   WorkflowResult,
@@ -15,10 +16,21 @@ import {
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
 } from "@/common/utils/jsonSchemaSubset";
+import {
+  WORKFLOW_AGENT_RESERVATION_TIMEOUT_MS,
+  WORKFLOW_ATTEMPT_SETTLEMENT_TIMEOUT_MS,
+} from "@/constants/terminationTimeouts";
 import { WORKFLOW_RUNTIME_STDLIB_SOURCE } from "./workflowRuntimeSources.generated";
+import { log } from "@/node/services/log";
 import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import type { AppendWorkflowRunEventOptions, WorkflowRunStore } from "./WorkflowRunStore";
+import type {
+  AppendWorkflowRunEventOptions,
+  WorkflowAgentAttemptWriteOptions,
+  WorkflowCancellationSettlement,
+  WorkflowRunStore,
+} from "./WorkflowRunStore";
+import { runWorkflowEvaluationStep, type WorkflowEvaluationPort } from "./workflowEvaluationStep";
 import { assertWorkflowStepId, hashWorkflowStepInput } from "./workflowReplayKey";
 
 export class WorkflowRunBackgroundedError extends Error {
@@ -33,6 +45,117 @@ class WorkflowAgentOutputValidationError extends Error {
     super(message);
     this.name = "WorkflowAgentOutputValidationError";
   }
+}
+
+const WORKFLOW_RUN_ALREADY_ACTIVE_PREFIX = "Workflow run is already active: ";
+
+/**
+ * Another runner holds the run's lease. The message carries the lease owner and how long ago
+ * it was last renewed so a stuck-lease diagnosis does not require reading lease.json by hand.
+ */
+export class WorkflowRunAlreadyActiveError extends Error {
+  constructor(
+    readonly runId: string,
+    readonly lease: { ownerId: string; renewedAgoMs: number } | null
+  ) {
+    super(
+      lease == null
+        ? `${WORKFLOW_RUN_ALREADY_ACTIVE_PREFIX}${runId}`
+        : `${WORKFLOW_RUN_ALREADY_ACTIVE_PREFIX}${runId} (lease owner ${lease.ownerId}, renewed ${Math.round(lease.renewedAgoMs / 1000)}s ago)`
+    );
+    this.name = "WorkflowRunAlreadyActiveError";
+  }
+}
+
+/**
+ * Callers classify by this predicate, never by exact message: the message now carries lease
+ * diagnostics, and errors that crossed a serialization boundary keep only the legacy text.
+ */
+export function isWorkflowRunAlreadyActiveError(error: unknown, runId: string): boolean {
+  if (error instanceof WorkflowRunAlreadyActiveError) {
+    return error.runId === runId;
+  }
+  const message = getErrorMessage(error);
+  const base = `${WORKFLOW_RUN_ALREADY_ACTIVE_PREFIX}${runId}`;
+  return message === base || message.startsWith(`${base} (`);
+}
+
+/** The reservation deadline fired while the child task was still in a cancellable admission stage. */
+export class WorkflowAgentReservationTimeoutError extends Error {
+  constructor(stepIds: readonly string[], timeoutMs: number) {
+    super(`Workflow agent reservation for ${stepIds.join(", ")} exceeded ${timeoutMs}ms`);
+    this.name = "WorkflowAgentReservationTimeoutError";
+  }
+}
+
+/**
+ * A resumed step's prior attempt could not be classified as reported, live, or settled without a
+ * report. The run is re-interrupted (never failed, never replaced): a later resume re-inspects.
+ */
+export class WorkflowPriorAttemptUnresolvedError extends Error {
+  constructor(
+    readonly stepId: string,
+    readonly taskId: string,
+    readonly outcome: "indeterminate" | "cleanup-pending" | "timeout" | "claim-refused" | "live",
+    detail: string
+  ) {
+    // Avoid the word "interrupted": the sandbox normalizes any such error text.
+    super(`Workflow agent step ${stepId} previous attempt ${taskId} is unresolved: ${detail}`);
+    this.name = "WorkflowPriorAttemptUnresolvedError";
+  }
+}
+
+function createReservationCanceledError(stepIds: readonly string[]): Error {
+  return new Error(`Workflow agent reservation canceled for ${stepIds.join(", ")}`);
+}
+
+/** A durably checkpointed attempt this runner instance owns until it settles or is replaced. */
+interface OwnedWorkflowAgentAttempt {
+  stepId: string;
+  inputHash: string;
+  taskId: string;
+  title?: string;
+  resultSpec: WorkflowAgentSpec;
+  startedAt: string;
+  /**
+   * Releases this attempt's share of its reservation's upstream abort link (see
+   * reserveAgentTasks). Called when the attempt settles, is superseded, or the run ends.
+   */
+  releaseLaunchSignal?: () => void;
+}
+
+function getOwnedAttemptKey(attempt: { stepId: string; inputHash: string }): string {
+  return `${attempt.stepId}\0${attempt.inputHash}`;
+}
+
+type WorkflowAttemptDisposition =
+  | { kind: "completed"; result: StructuredTaskOutput }
+  | { kind: "failed" }
+  | { kind: "retained"; outcome: TaskAttemptSettlement<WorkflowAgentResult>["kind"] };
+
+/** What a wait or classification decided about a prior attempt before the caller continues. */
+type WorkflowPriorAttemptPlan =
+  | { kind: "adopt"; report: WorkflowAgentResult }
+  | { kind: "reattach" }
+  /** `attemptId`: the ended attempt the replacement must retire (see reserveAgentTasks). */
+  | { kind: "replace"; attemptId: string | undefined }
+  | { kind: "rethrow" };
+
+/**
+ * classifyPriorAttempt's verdicts: a plan, or `fresh` — the checkpointed child was never published
+ * and is now tombstoned (tombstoneUnpublishedTask), so the step reserves a new child with no prior
+ * attempt to retire.
+ */
+type WorkflowPriorAttemptClassification = WorkflowPriorAttemptPlan | { kind: "fresh" };
+
+/**
+ * The checkpointed child a replacement retires (G2). Its attempt is claimed before the
+ * replacement is reserved, and the replacement's publishing commit consumes that claim once.
+ */
+interface WorkflowPriorChild {
+  taskId: string;
+  /** Undefined only for a pre-identity owned attempt: never replaced (unresolved instead). */
+  attemptId: string | undefined;
 }
 
 export interface WorkflowAgentTimeoutSpec {
@@ -74,6 +197,8 @@ export type WorkflowAgentResult = StructuredTaskOutput & { taskId: string };
 interface WorkflowAgentRunResult {
   rawResult: WorkflowAgentResult;
   resultSpec: WorkflowAgentSpec;
+  /** The checkpointed attempt this result settles; every terminal write is fenced to it. */
+  taskId: string;
 }
 
 interface StartedWorkflowAgentHandle {
@@ -167,13 +292,50 @@ export interface WorkflowTaskAdapter {
   ): Promise<WorkflowAgentResult>;
   createAgentTasks?(
     specs: WorkflowAgentSpec[],
-    lifecycle?: { onTaskCreated?: (index: number, taskId: string) => Promise<void> | void }
+    lifecycle?: {
+      onTaskCreated?: (index: number, taskId: string) => Promise<void> | void;
+      /**
+       * Cancels the reservation while it is still in a cancellable admission stage. Entered
+       * checkpoint and config writes are owned to completion regardless.
+       */
+      abortSignal?: AbortSignal;
+      /** Per spec, the claimed prior attempt the child replaces (single-use publication). */
+      retires?: ReadonlyArray<{ taskId: string; attemptId: string; nonce: string } | undefined>;
+    }
   ): Promise<Array<{ taskId: string; status: "queued" | "starting" | "running" }>>;
+  /**
+   * Retire a checkpointed child's attempt so exactly one replacement can be published for it.
+   * Absent → no replacement is ever reserved: the step stays unresolved (never an unclaimed
+   * replacement).
+   */
+  claimRetiredAttempt?(
+    taskId: string,
+    attemptId: string,
+    claimant: { stepId: string; inputHash: string }
+  ): Promise<{ success: true; nonce: string } | { success: false; error: string }>;
+  /**
+   * Make sure a checkpointed child that was never published (no task record) can never be: its
+   * reservation's late publishing commit refuses once this succeeds. Absent → such a step stays
+   * unresolved (never replaced next to a commit that may still land).
+   */
+  tombstoneUnpublishedTask?(
+    taskId: string
+  ): Promise<{ success: true } | { success: false; error: string }>;
   waitForAgentTask?(
     taskId: string,
     spec: WorkflowAgentSpec,
     waitOptions?: WorkflowAgentWaitOptions
   ): Promise<WorkflowAgentResult>;
+  /**
+   * Authoritative outcome of a checkpointed attempt. Absent when the task service cannot answer;
+   * the runner then treats the attempt as indeterminate rather than guessing.
+   */
+  readSettledAgentResult?(taskId: string): Promise<TaskAttemptOutcome<WorkflowAgentResult>>;
+  /** Bounded wait for an unsettled attempt; a timeout is never permission to replace it. */
+  waitForAttemptSettlement?(
+    taskId: string,
+    options: { abortSignal?: AbortSignal; timeoutMs: number }
+  ): Promise<TaskAttemptSettlement<WorkflowAgentResult>>;
   requestAgentFinalReportForTimeout?(
     taskId: string,
     options: {
@@ -197,7 +359,11 @@ export interface WorkflowTaskAdapter {
     spec: WorkflowApplyPatchSpec,
     options?: { abortSignal?: AbortSignal }
   ): Promise<unknown>;
-  interruptRun?(): Promise<void>;
+  /**
+   * Stop the run's agent tasks. `onChildrenSettled` runs once they settled (their settlement
+   * receipts durable) and before any best-effort cleanup (WorkflowService.interruptRunTree).
+   */
+  interruptRun?(options?: { onChildrenSettled?: () => Promise<void> }): Promise<void>;
   /**
    * Called when the run reaches a terminal state. Not called when the run is
    * backgrounded (the background continuation re-enters run()) or when the
@@ -206,12 +372,54 @@ export interface WorkflowTaskAdapter {
   onRunEnded?(): Promise<void> | void;
 }
 
+/**
+ * Lets an interrupt keep this runner's lease (still renewed) until the interrupt has written the
+ * run's durable "interrupted" status (WorkflowService.interruptRunTree). The interrupt terminates
+ * the run's children BEFORE that write, so in between the run still reads `running`; the held lease
+ * is what keeps crash recovery in any backend from starting another runner, whose new children the
+ * interrupt would never stop. Synchronous on both sides, so a hold is granted exactly when the
+ * runner will wait for it.
+ */
+export class WorkflowRunnerLeaseHold {
+  private closed = false;
+  private readonly holds: Array<Promise<void>> = [];
+  private readonly releasedSignal = Promise.withResolvers<void>();
+
+  /** Settles once the runner released its lease (or failed to), at the end of its exit. */
+  get released(): Promise<void> {
+    return this.releasedSignal.promise;
+  }
+
+  markReleased(): void {
+    this.releasedSignal.resolve();
+  }
+
+  /** True when the runner has not begun its exit: it then waits for `until` before releasing. */
+  tryHold(until: Promise<void>): boolean {
+    if (this.closed) return false;
+    this.holds.push(until);
+    return true;
+  }
+
+  /** The lease is no longer this runner's to keep: refuse new holds (held ones stay). */
+  refuse(): void {
+    this.closed = true;
+  }
+
+  /** The runner's exit, before it stops renewing: no hold can start after this call. */
+  async close(): Promise<void> {
+    this.closed = true;
+    await Promise.allSettled(this.holds);
+  }
+}
+
 export interface WorkflowRunnerRunOptions {
   onLeaseAcquired?: () => void;
   abortSignal?: AbortSignal;
   backgroundOnMessageQueued?: boolean;
   allowResumeFromInterrupted?: boolean;
   allowRetryFromFailedCheckpoint?: boolean;
+  leaseHold?: WorkflowRunnerLeaseHold;
 }
 
 interface WorkflowRunnerLeaseGuard {
@@ -228,8 +436,16 @@ export interface WorkflowRunnerOptions {
   runtimeFactory: IJSRuntimeFactory;
   taskAdapter: WorkflowTaskAdapter;
   nestedWorkflowAdapter?: WorkflowNestedWorkflowAdapter;
+  /**
+   * Model selection/dispatch/accounting for `evaluate()` steps. Absent when the
+   * host has no evaluation services; scripts then fail closed with
+   * `unsupported/runtime-unavailable` instead of silently skipping the step.
+   */
+  evaluationAdapter?: WorkflowEvaluationPort;
   runnerId: string;
   clock?: WorkflowRunnerClock;
+  /** Reservation liveness backstop; defaults to WORKFLOW_AGENT_RESERVATION_TIMEOUT_MS (tests shorten it). */
+  reservationTimeoutMs?: number;
 }
 
 const WORKFLOW_AGENT_MAX_ATTEMPTS = 3;
@@ -287,6 +503,22 @@ function isAgentReportWaitTimeoutError(error: unknown): boolean {
   return isErrorWithName(error, "AgentReportWaitTimeoutError");
 }
 
+/** Milliseconds left until an ISO deadline (at least 1), or the fallback when none is usable. */
+function remainingMsUntilDeadline(
+  deadlineIso: string | undefined,
+  fallbackMs: number,
+  nowMs: number
+): number {
+  if (deadlineIso == null) {
+    return fallbackMs;
+  }
+  const parsedDeadlineMs = Date.parse(deadlineIso);
+  if (!Number.isFinite(parsedDeadlineMs)) {
+    return fallbackMs;
+  }
+  return Math.max(1, parsedDeadlineMs - nowMs);
+}
+
 function buildWorkflowAgentTimeoutFinalizationToken(
   runId: string,
   step: { spec: WorkflowAgentSpec; inputHash: string; taskId: string },
@@ -322,16 +554,6 @@ function getTaskTerminalStatusForError(
 
 function isRetryableAgentOutputError(error: unknown): boolean {
   return error instanceof WorkflowAgentOutputValidationError;
-}
-
-function getTaskIdFromUnknownAgentResult(result: unknown): string | undefined {
-  if (result != null && typeof result === "object") {
-    const taskId = (result as Record<string, unknown>).taskId;
-    if (typeof taskId === "string" && taskId.length > 0) {
-      return taskId;
-    }
-  }
-  return undefined;
 }
 
 function buildRetryAgentSpec(
@@ -383,9 +605,17 @@ export class WorkflowRunner {
   private readonly runtimeFactory: IJSRuntimeFactory;
   private readonly taskAdapter: WorkflowTaskAdapter;
   private readonly nestedWorkflowAdapter?: WorkflowNestedWorkflowAdapter;
+  private readonly evaluationAdapter?: WorkflowEvaluationPort;
   private readonly runnerId: string;
   private readonly clock: WorkflowRunnerClock;
+  private readonly reservationTimeoutMs: number;
   private readonly taskEventMutex = new AsyncMutex();
+  /**
+   * Checkpointed attempts per active run, keyed by step identity. The cancellation drain settles
+   * exactly these after a Stop; entries leave when their terminal write lands or a replacement
+   * attempt is checkpointed under the same key.
+   */
+  private readonly ownedAttemptsByRun = new Map<string, Map<string, OwnedWorkflowAgentAttempt>>();
 
   constructor(options: WorkflowRunnerOptions) {
     assert(options.runnerId.length > 0, "WorkflowRunner: runnerId is required");
@@ -393,8 +623,12 @@ export class WorkflowRunner {
     this.runtimeFactory = options.runtimeFactory;
     this.taskAdapter = options.taskAdapter;
     this.nestedWorkflowAdapter = options.nestedWorkflowAdapter;
+    this.evaluationAdapter = options.evaluationAdapter;
     this.runnerId = options.runnerId;
     this.clock = options.clock ?? DEFAULT_CLOCK;
+    this.reservationTimeoutMs =
+      options.reservationTimeoutMs ?? WORKFLOW_AGENT_RESERVATION_TIMEOUT_MS;
+    assert(this.reservationTimeoutMs > 0, "WorkflowRunner: reservationTimeoutMs must be positive");
   }
 
   async run(runId: string, options?: WorkflowRunnerRunOptions): Promise<WorkflowResult> {
@@ -409,7 +643,7 @@ export class WorkflowRunner {
       // and will release the hold itself when it finishes.
       const keepsHold =
         error instanceof WorkflowRunBackgroundedError ||
-        (error instanceof Error && error.message === `Workflow run is already active: ${runId}`);
+        isWorkflowRunAlreadyActiveError(error, runId);
       if (!keepsHold) {
         await this.taskAdapter.onRunEnded?.();
       }
@@ -427,10 +661,14 @@ export class WorkflowRunner {
       this.clock.nowMs()
     );
     if (!leaseAcquired) {
-      throw new Error(`Workflow run is already active: ${runId}`);
+      const lease = await this.runStore.getLeaseDiagnostics(runId, this.clock.nowMs());
+      const error = new WorkflowRunAlreadyActiveError(runId, lease);
+      log.warn(`[workflow-runner] ${error.message}`);
+      throw error;
     }
 
     options?.onLeaseAcquired?.();
+    this.ownedAttemptsByRun.set(runId, new Map());
     let activeRuntime: IJSRuntime | null = null;
     let leaseLostError: Error | null = null;
     const markLeaseLost = (cause?: unknown) => {
@@ -439,6 +677,8 @@ export class WorkflowRunner {
           ? `Workflow run lease lost: ${runId}: ${cause.message}`
           : `Workflow run lease lost: ${runId}`
       );
+      // A lost lease fences nothing: an interrupt must not order itself on this runner's hold.
+      options?.leaseHold?.refuse();
       activeRuntime?.abort();
     };
     const leaseGuard: WorkflowRunnerLeaseGuard = {
@@ -448,13 +688,15 @@ export class WorkflowRunner {
         }
       },
     };
-    let leaseRenewalInFlight = false;
+    // Retained so the finally below can await a renewal already in flight: clearInterval only
+    // stops future ticks, and a renewal that takes the lease mutation lock after releaseLease()
+    // would make an immediate re-acquire (checkpoint retry) fail as "already active".
+    let leaseRenewalInFlight: Promise<void> | undefined;
     const leaseRenewal = setInterval(() => {
-      if (leaseRenewalInFlight) {
+      if (leaseRenewalInFlight != null) {
         return;
       }
-      leaseRenewalInFlight = true;
-      void this.runStore
+      leaseRenewalInFlight = this.runStore
         .renewLease(runId, this.runnerId, this.clock.nowMs())
         .then((renewed) => {
           if (!renewed) {
@@ -463,7 +705,7 @@ export class WorkflowRunner {
         })
         .catch(markLeaseLost)
         .finally(() => {
-          leaseRenewalInFlight = false;
+          leaseRenewalInFlight = undefined;
         });
     }, this.runStore.getLeaseRenewalIntervalMs());
 
@@ -485,7 +727,6 @@ export class WorkflowRunner {
       if (retryingFailedRun && options?.allowRetryFromFailedCheckpoint !== true) {
         throw new Error(`Workflow run failed: ${runId}`);
       }
-      const ignoreStartedTaskIds = resumingInterruptedRun;
       const allowLegacyMissingOutputSchema = run.agentOutputSchemaRequired !== true;
       // Runs persisted before agentType was removed lack this marker but may still resume their
       // original source snapshot. New runs set it to false at creation and fail fast.
@@ -500,6 +741,16 @@ export class WorkflowRunner {
           status: "backgrounded",
         }).then(() => undefined);
         await backgrounded;
+      };
+      // The sandbox flattens host errors to strings, so the typed blocker is kept here; it only
+      // matters if the script lets it end the run (a script that catches it continues as usual).
+      let priorAttemptUnresolved: WorkflowPriorAttemptUnresolvedError | null = null;
+      const noteAgentStepFailure = async (error: unknown): Promise<void> => {
+        if (isForegroundWaitBackgroundedError(error)) {
+          await markBackgrounded();
+        } else if (error instanceof WorkflowPriorAttemptUnresolvedError) {
+          priorAttemptUnresolved ??= error;
+        }
       };
 
       const startedWorkflowAgentSteps = new Map<string, StartedWorkflowAgentState>();
@@ -566,15 +817,12 @@ export class WorkflowRunner {
         setupRuntime.registerFunction("__workflowAgent", async (rawSpec) => {
           try {
             return await this.runAgentStep(runId, sequence, rawSpec, {
-              ignoreStartedTaskIds,
               allowLegacyMissingOutputSchema,
               waitOptions: getWorkflowAgentWaitOptions(setupRuntime, options),
               leaseGuard,
             });
           } catch (error) {
-            if (isForegroundWaitBackgroundedError(error)) {
-              await markBackgrounded();
-            }
+            await noteAgentStepFailure(error);
             throw error;
           }
         });
@@ -591,26 +839,56 @@ export class WorkflowRunner {
             throw error;
           }
         });
+        setupRuntime.registerFunction("__workflowEvaluate", async (rawState, rawSpec) => {
+          // Lifecycle lives in workflowEvaluationStep.ts; the runner only lends
+          // its lease-scoped journal wrappers. Interruption surfaces as the
+          // "Task interrupted" message the terminal-status classifier already
+          // maps to `interrupted`.
+          const abortSignal = setupRuntime.getAbortSignal();
+          // Host functions only run while the runtime executes, which is when
+          // the controller exists; a missing signal would silently make the
+          // step uninterruptible.
+          assert(
+            abortSignal !== undefined,
+            "evaluate() requires the executing runtime's abort signal"
+          );
+          return await runWorkflowEvaluationStep(
+            {
+              runId,
+              adapter: this.evaluationAdapter,
+              journal: {
+                getStep: (id, stepId, inputHash) => this.runStore.getStep(id, stepId, inputHash),
+                recordStepStarted: (input) => this.recordStepStarted(runId, input),
+                recordStepCompleted: (input) => this.recordStepCompleted(runId, input),
+                recordStepFailed: (input) => this.recordStepFailed(runId, input),
+                appendEvent: async (event) => {
+                  await this.appendEvent(runId, { ...event, sequence: sequence.next() });
+                },
+              },
+              clock: this.clock,
+              leaseGuard,
+              abortSignal,
+            },
+            rawState,
+            rawSpec
+          );
+        });
         setupRuntime.registerFunction("__workflowParallelAgents", async (rawSpecs, rawOptions) => {
           try {
             return await this.runAgentStepsInParallel(runId, sequence, rawSpecs, {
-              ignoreStartedTaskIds,
               allowLegacyMissingOutputSchema,
               waitOptions: getWorkflowAgentWaitOptions(setupRuntime, options),
               leaseGuard,
               rawOptions,
             });
           } catch (error) {
-            if (isForegroundWaitBackgroundedError(error)) {
-              await markBackgrounded();
-            }
+            await noteAgentStepFailure(error);
             throw error;
           }
         });
         setupRuntime.registerFunction("__workflowAgentStart", async (rawSpec) => {
           try {
             return await this.startAgentStepWithoutWaiting(runId, sequence, rawSpec, {
-              ignoreStartedTaskIds,
               allowLegacyMissingOutputSchema,
               waitOptions: getWorkflowAgentWaitOptions(setupRuntime, options),
               leaseGuard,
@@ -618,9 +896,7 @@ export class WorkflowRunner {
               createHandleId: createStartedWorkflowAgentHandleId,
             });
           } catch (error) {
-            if (isForegroundWaitBackgroundedError(error)) {
-              await markBackgrounded();
-            }
+            await noteAgentStepFailure(error);
             throw error;
           }
         });
@@ -632,9 +908,7 @@ export class WorkflowRunner {
               startedAgentSteps: startedWorkflowAgentSteps,
             });
           } catch (error) {
-            if (isForegroundWaitBackgroundedError(error)) {
-              await markBackgrounded();
-            }
+            await noteAgentStepFailure(error);
             throw error;
           }
         });
@@ -691,7 +965,20 @@ export class WorkflowRunner {
           throw new WorkflowRunBackgroundedError(runId);
         }
         if (options?.abortSignal?.aborted === true) {
+          // Asyncified host functions settle before eval returns, so every step's own handling
+          // is done; this runner is now the draining owner for its checkpointed attempts.
+          await this.settleOwnedAttemptsAfterCancellation(
+            runId,
+            sequence,
+            options.abortSignal,
+            leaseGuard
+          );
           throw new Error(execution.error ?? "Workflow run aborted");
+        }
+        if (priorAttemptUnresolved != null && leaseLostError == null) {
+          const unresolved: WorkflowPriorAttemptUnresolvedError = priorAttemptUnresolved;
+          await this.appendInterruptedForUnresolvedAttempt(runId, sequence, unresolved, leaseGuard);
+          throw unresolved;
         }
         await this.throwIfInterrupted(runId);
         leaseGuard.throwIfLost();
@@ -747,9 +1034,17 @@ export class WorkflowRunner {
       });
       return result;
     } finally {
+      // Before the renewal stops: a held lease must stay fresh (WorkflowRunnerLeaseHold).
+      await options?.leaseHold?.close();
       removeAbortListener();
       clearInterval(leaseRenewal);
-      await this.runStore.releaseLease(runId, this.runnerId);
+      this.releaseOwnedAttempts(runId);
+      await leaseRenewalInFlight;
+      try {
+        await this.runStore.releaseLease(runId, this.runnerId);
+      } finally {
+        options?.leaseHold?.markReleased();
+      }
     }
   }
 
@@ -1136,7 +1431,6 @@ export class WorkflowRunner {
     sequence: WorkflowEventSequence,
     rawSpec: unknown,
     options: {
-      ignoreStartedTaskIds: boolean;
       allowLegacyMissingOutputSchema: boolean;
       waitOptions?: WorkflowAgentWaitOptions;
       leaseGuard: WorkflowRunnerLeaseGuard;
@@ -1174,110 +1468,100 @@ export class WorkflowRunner {
       return { handleId };
     }
 
-    const taskId =
-      !options.ignoreStartedTaskIds && existingStep?.status === "started"
-        ? existingStep.taskId
-        : undefined;
-    if (taskId != null) {
-      assert(existingStep != null, "started pipeline step must have an existing step record");
-      assert(
-        this.taskAdapter.waitForAgentTask != null,
-        "pipeline requires workflow task adapter support for waiting on started agents"
-      );
-      await this.recordTaskStartedEventIfMissing(runId, sequence, {
-        stepId: spec.id,
-        taskId,
-        title: spec.title,
-      });
-      const resultSpec = options.allowLegacyMissingOutputSchema
-        ? omitWorkflowAgentOutputSchema(spec)
-        : spec;
-      options.startedAgentSteps.set(handleId, {
-        handleId,
-        spec,
-        resultSpec,
-        inputHash,
-        startedAt: existingStep.startedAt,
-        taskId,
-      });
-      return { handleId };
-    }
-
     assert(
       this.taskAdapter.createAgentTasks != null && this.taskAdapter.waitForAgentTask != null,
       "pipeline requires workflow task adapter support for nonblocking agent starts"
     );
-    const resultSpec = normalizeWorkflowAgentSpecForExecution(spec, {
-      allowMissingOutputSchema: options.allowLegacyMissingOutputSchema,
-    });
-    const startedAt = existingStep?.startedAt ?? this.clock.nowIso();
-    let recordedTaskId: string | undefined;
-    await this.recordAgentReservationEventIfMissing(runId, sequence, {
-      stepId: spec.id,
-      inputHash,
-      title: spec.title,
-      spec: resultSpec,
-    });
-    let createdTasks: Array<{ taskId: string; status: "queued" | "starting" | "running" }>;
-    try {
-      createdTasks = await this.taskAdapter.createAgentTasks([resultSpec], {
-        onTaskCreated: async (index, createdTaskId) => {
-          assert(index === 0, "WorkflowRunner.pipeline agent start lifecycle index mismatch");
-          assert(createdTaskId.length > 0, "WorkflowRunner.pipeline created taskId is required");
-          options.leaseGuard.throwIfLost();
-          recordedTaskId = createdTaskId;
-          await this.recordStepStarted(runId, {
-            stepId: spec.id,
+    const priorTaskId = existingStep?.status === "started" ? existingStep.taskId : undefined;
+    let priorReplace: WorkflowPriorChild | undefined;
+    if (priorTaskId != null) {
+      assert(existingStep != null, "started pipeline step must have an existing step record");
+      const resultSpec = options.allowLegacyMissingOutputSchema
+        ? omitWorkflowAgentOutputSchema(spec)
+        : spec;
+      const attempt: OwnedWorkflowAgentAttempt = {
+        stepId: spec.id,
+        inputHash,
+        taskId: priorTaskId,
+        title: spec.title,
+        resultSpec,
+        startedAt: existingStep.startedAt,
+      };
+      const plan = await this.classifyPriorAttempt(runId, sequence, attempt, {
+        leaseGuard: options.leaseGuard,
+        runAbortSignal: options.waitOptions?.abortSignal,
+      });
+      if (plan.kind === "adopt" || plan.kind === "reattach") {
+        await this.recordTaskStartedEventIfMissing(runId, sequence, {
+          stepId: spec.id,
+          taskId: priorTaskId,
+          title: spec.title,
+        });
+        const state: StartedWorkflowAgentState = {
+          handleId,
+          spec,
+          resultSpec,
+          inputHash,
+          startedAt: existingStep.startedAt,
+          taskId: priorTaskId,
+        };
+        if (plan.kind === "adopt") {
+          // Persisted before the interruption: record it now under the current lease so the
+          // handle resolves without waiting on a child that already reported.
+          state.terminalResult = await this.recordAgentResult(runId, sequence, {
+            spec: resultSpec,
             inputHash,
-            taskId: createdTaskId,
-            startedAt,
+            startedAt: existingStep.startedAt,
+            taskId: priorTaskId,
+            leaseGuard: options.leaseGuard,
+            rawResult: plan.report,
           });
-          await this.recordTaskStartedEventIfMissing(runId, sequence, {
-            stepId: spec.id,
-            taskId: createdTaskId,
-            title: spec.title,
-          });
-        },
-      });
-    } catch (error) {
-      await this.recordAgentReservationFailedEventIfMissing(runId, sequence, {
-        stepId: spec.id,
-        inputHash,
-        title: spec.title,
-        error,
-      });
-      throw error;
-    }
-    assert(createdTasks.length === 1, "pipeline agent start returned the wrong number of tasks");
-    const createdTask = createdTasks[0];
-    assert(createdTask != null, "pipeline agent start must return a task");
-    assert(createdTask.taskId.length > 0, "WorkflowRunner.pipeline created taskId is required");
-    if (recordedTaskId == null) {
-      await this.recordStepStarted(runId, {
-        stepId: spec.id,
-        inputHash,
-        taskId: createdTask.taskId,
-        startedAt,
-      });
-      await this.recordTaskStartedEventIfMissing(runId, sequence, {
-        stepId: spec.id,
-        taskId: createdTask.taskId,
-        title: spec.title,
-      });
-    } else {
+        }
+        options.startedAgentSteps.set(handleId, state);
+        return { handleId };
+      }
       assert(
-        recordedTaskId === createdTask.taskId,
-        "WorkflowRunner.pipeline lifecycle taskId must match created taskId"
+        plan.kind === "replace" || plan.kind === "fresh",
+        "classifyPriorAttempt returns adopt, replace, fresh, or reattach"
+      );
+      // `fresh`: the tombstoned child was never published, so there is nothing to retire.
+      if (plan.kind === "replace") {
+        priorReplace = { taskId: priorTaskId, attemptId: plan.attemptId };
+      }
+    } else if (existingStep?.status === "failed" && existingStep.taskId != null) {
+      priorReplace = await this.consultFailedCheckpoint(
+        { stepId: spec.id, taskId: existingStep.taskId },
+        { leaseGuard: options.leaseGuard, runAbortSignal: options.waitOptions?.abortSignal }
       );
     }
 
+    const resultSpec = normalizeWorkflowAgentSpecForExecution(spec, {
+      allowMissingOutputSchema: options.allowLegacyMissingOutputSchema,
+    });
+    const startedAt =
+      priorTaskId == null && existingStep != null ? existingStep.startedAt : this.clock.nowIso();
+    const [taskId] = await this.reserveAgentTasks(runId, sequence, {
+      steps: [
+        {
+          spec: resultSpec,
+          inputHash,
+          startedAt,
+          title: spec.title,
+          ...(priorReplace != null ? { priorChild: priorReplace } : {}),
+        },
+      ],
+      abortSignal: options.waitOptions?.abortSignal,
+      runAbortSignal: options.waitOptions?.abortSignal,
+      leaseGuard: options.leaseGuard,
+    });
+    assert(taskId != null, "pipeline agent start must return a task");
     options.startedAgentSteps.set(handleId, {
       handleId,
       spec,
       resultSpec,
       inputHash,
       startedAt,
-      taskId: createdTask.taskId,
+      taskId,
     });
     return { handleId };
   }
@@ -1340,7 +1624,47 @@ export class WorkflowRunner {
       }
     };
 
-    const settled = await Promise.race(
+    const toAttempt = (state: StartedWorkflowAgentState): OwnedWorkflowAgentAttempt => {
+      assert(state.taskId != null, `pipeline agent ${state.spec.id} has no started taskId`);
+      return {
+        stepId: state.spec.id,
+        inputHash: state.inputHash,
+        taskId: state.taskId,
+        title: state.spec.title,
+        resultSpec: state.resultSpec,
+        startedAt: state.startedAt,
+      };
+    };
+    // Fail-fast stopped the siblings through interruptRun; each still gets its report-first
+    // disposition (bounded settlement wait) so a report that landed before the stop is kept.
+    // Siblings are disposed concurrently and independently: their settlement waits share one
+    // teardown-scale bound instead of stacking it per sibling, one sibling's failure never
+    // skips another's disposition, and every disposition is awaited before the original
+    // failure propagates. Each write still runs under the attempt and lease fences.
+    const disposeSiblings = async (failed: StartedWorkflowAgentState): Promise<void> => {
+      await Promise.allSettled(
+        states
+          .filter((state) => state !== failed && state.terminalResult == null)
+          .map(async (state) => {
+            try {
+              await this.disposeStartedAttempt(runId, sequence, toAttempt(state), {
+                leaseGuard: options.leaseGuard,
+                ...(options.waitOptions?.abortSignal != null
+                  ? { abortSignal: options.waitOptions.abortSignal }
+                  : {}),
+                wait: "pending-or-live",
+              });
+            } catch (error) {
+              log.warn(`[workflow-runner] Draining pipeline sibling ${state.spec.id} failed`, {
+                runId,
+                error: getErrorMessage(error),
+              });
+            }
+          })
+      );
+    };
+
+    let settled = await Promise.race(
       states.map(async (state) => {
         assert(state.rawResultPromise != null, `pipeline agent ${state.spec.id} is not waiting`);
         try {
@@ -1352,34 +1676,46 @@ export class WorkflowRunner {
     );
 
     if ("error" in settled) {
-      if (!isForegroundWaitBackgroundedError(settled.error)) {
-        if (!isWorkflowAgentHardTimeoutError(settled.error) && settled.state.taskId != null) {
-          options.leaseGuard.throwIfLost();
-          await this.recordTaskTerminalEventIfMissing(runId, sequence, {
-            stepId: settled.state.spec.id,
-            taskId: settled.state.taskId,
-            title: settled.state.spec.title,
-            status: getTaskTerminalStatusForError(settled.error, options.waitOptions?.abortSignal),
-          });
+      if (isForegroundWaitBackgroundedError(settled.error)) {
+        throw settled.error;
+      }
+      const plan = await this.handleAgentWaitFailure(
+        runId,
+        sequence,
+        toAttempt(settled.state),
+        settled.error,
+        {
+          leaseGuard: options.leaseGuard,
+          waitOptions: options.waitOptions,
+          runAbortSignal: options.waitOptions?.abortSignal,
+          allowReplacement: false,
         }
+      );
+      if (plan.kind !== "adopt") {
         // A pipeline can have several active child waits; stop siblings when fail-fast throws.
         await interruptRemainingTasks();
+        await disposeSiblings(settled.state);
+        throw settled.error;
       }
-      throw settled.error;
+      // The wait failed but the child's report was already persisted: consume it normally.
+      settled = { state: settled.state, rawResult: plan.report };
     }
 
     let result: StructuredTaskOutput;
     try {
+      assert(settled.state.taskId != null, "pipeline agent result requires a started taskId");
       result = await this.recordAgentResult(runId, sequence, {
         spec: settled.state.resultSpec,
         inputHash: settled.state.inputHash,
         startedAt: settled.state.startedAt,
+        taskId: settled.state.taskId,
         leaseGuard: options.leaseGuard,
         rawResult: settled.rawResult,
       });
     } catch (error) {
       // Validation can fail after one child completes while sibling waits are still active.
       await interruptRemainingTasks();
+      await disposeSiblings(settled.state);
       throw error;
     }
     settled.state.terminalResult = result;
@@ -1391,7 +1727,6 @@ export class WorkflowRunner {
     sequence: WorkflowEventSequence,
     rawSpec: unknown,
     options: {
-      ignoreStartedTaskIds: boolean;
       allowLegacyMissingOutputSchema: boolean;
       waitOptions?: WorkflowAgentWaitOptions;
       leaseGuard: WorkflowRunnerLeaseGuard;
@@ -1416,15 +1751,21 @@ export class WorkflowRunner {
       return existingStep.result;
     }
 
+    const priorChild =
+      existingStep?.status === "failed" && existingStep.taskId != null
+        ? await this.consultFailedCheckpoint(
+            { stepId: spec.id, taskId: existingStep.taskId },
+            { leaseGuard: options.leaseGuard, runAbortSignal: options.waitOptions?.abortSignal }
+          )
+        : undefined;
     options.leaseGuard.throwIfLost();
     return await this.runAndRecordAgentStepWithRetries(runId, sequence, {
       spec,
       inputHash,
       startedAt: existingStep?.startedAt ?? this.clock.nowIso(),
-      taskId:
-        !options.ignoreStartedTaskIds && existingStep?.status === "started"
-          ? existingStep.taskId
-          : undefined,
+      // Classified by its authoritative outcome in runOrResumeAgentStep, never discarded blindly.
+      taskId: existingStep?.status === "started" ? existingStep.taskId : undefined,
+      ...(priorChild != null ? { priorChild } : {}),
       allowMissingOutputSchema: options.allowLegacyMissingOutputSchema,
       leaseGuard: options.leaseGuard,
       waitOptions: options.waitOptions,
@@ -1436,7 +1777,6 @@ export class WorkflowRunner {
     sequence: WorkflowEventSequence,
     rawSpecs: unknown,
     options: {
-      ignoreStartedTaskIds: boolean;
       allowLegacyMissingOutputSchema: boolean;
       waitOptions?: WorkflowAgentWaitOptions;
       leaseGuard: WorkflowRunnerLeaseGuard;
@@ -1466,6 +1806,9 @@ export class WorkflowRunner {
       inputHash: string;
       startedAt: string;
       taskId?: string;
+      reservedInThisRun?: boolean;
+      /** A failed checkpoint's ended child the first attempt retires (consultFailedCheckpoint). */
+      priorChild?: WorkflowPriorChild;
       attempt: number;
       retryMessage?: string;
       allowMissingOutputSchema: boolean;
@@ -1484,15 +1827,22 @@ export class WorkflowRunner {
         results[index] = existingStep.result;
         continue;
       }
+      const priorChild =
+        existingStep?.status === "failed" && existingStep.taskId != null
+          ? await this.consultFailedCheckpoint(
+              { stepId: step.spec.id, taskId: existingStep.taskId },
+              { leaseGuard: options.leaseGuard, runAbortSignal: options.waitOptions?.abortSignal }
+            )
+          : undefined;
       pending.push({
         index,
         spec: step.spec,
         inputHash: step.inputHash,
         startedAt: existingStep?.startedAt ?? this.clock.nowIso(),
-        taskId:
-          !options.ignoreStartedTaskIds && existingStep?.status === "started"
-            ? existingStep.taskId
-            : undefined,
+        // A started checkpoint is classified by its authoritative outcome when the step runs,
+        // for explicit resumes as much as for crash replay; it is never discarded blindly.
+        taskId: existingStep?.status === "started" ? existingStep.taskId : undefined,
+        ...(priorChild != null ? { priorChild } : {}),
         allowMissingOutputSchema: options.allowLegacyMissingOutputSchema,
         attempt: 1,
       });
@@ -1510,6 +1860,10 @@ export class WorkflowRunner {
         upstreamAbortSignal?.addEventListener("abort", abortBatch, { once: true });
       }
       let foregroundBackgrounded = false;
+      let batchFailed = false;
+      // The first failure is the root cause the batch surfaces; sibling aborts and draining
+      // failures that follow it are consequences and never replace it.
+      let firstBatchError: unknown;
       let interruptPromise: Promise<void> | undefined;
       const interruptRemainingTasks = async (): Promise<void> => {
         interruptPromise ??= this.taskAdapter.interruptRun?.() ?? Promise.resolve();
@@ -1522,15 +1876,47 @@ export class WorkflowRunner {
       // A child-task failure aborts the batch the same way regardless of which
       // launch path raised it: a foreground-backgrounded wait flips the batch to
       // backgrounded and aborts it (so the abort guards drain queued work),
-      // while any other failure interrupts the still-running siblings unless the
-      // batch was already backgrounded. Shared by the per-run and bulk-create
-      // catch blocks so the two stay in lockstep.
+      // while any other failure aborts the batch (unblocking siblings still stuck
+      // in a cancellable reservation stage) and then interrupts the still-running
+      // siblings unless the batch was already backgrounded. Shared by the per-run
+      // and bulk-create catch blocks so the two stay in lockstep.
       const applyChildFailureToBatch = async (error: unknown): Promise<void> => {
+        firstBatchError ??= error;
+        batchFailed = true;
         if (isForegroundWaitBackgroundedError(error)) {
           foregroundBackgrounded = true;
           abortBatch();
         } else if (!foregroundBackgrounded) {
+          abortBatch();
           await interruptRemainingTasks();
+        }
+      };
+      // Every sibling that settled while the batch was failing still gets its disposition: a
+      // fulfilled wait is recorded (validated) so its report is reused on replay, and a rejected
+      // one already ran its own disposition. Draining failures are logged, never surfaced.
+      const drainSettledSiblings = async (): Promise<void> => {
+        const settledSiblings = await Promise.allSettled(unsettledRuns.values());
+        for (const sibling of settledSiblings) {
+          if (sibling.status !== "fulfilled" || !("runResult" in sibling.value)) {
+            continue;
+          }
+          const { step, runResult } = sibling.value;
+          try {
+            options.leaseGuard.throwIfLost();
+            results[step.index] = await this.recordAgentResult(runId, sequence, {
+              spec: runResult.resultSpec,
+              inputHash: step.inputHash,
+              startedAt: step.startedAt,
+              taskId: runResult.taskId,
+              leaseGuard: options.leaseGuard,
+              rawResult: runResult.rawResult,
+            });
+          } catch (error) {
+            log.warn(`[workflow-runner] Draining sibling ${step.spec.id} did not record`, {
+              runId,
+              error: getErrorMessage(error),
+            });
+          }
         }
       };
       const batchWaitOptions: WorkflowAgentWaitOptions = {
@@ -1545,7 +1931,6 @@ export class WorkflowRunner {
       assert(maxActive > 0, "WorkflowRunner.parallel maxActive must be positive");
       const usesWindow = maxParallel != null && maxParallel < queued.length;
 
-      let batchFailed = false;
       const throwIfAbortPreventsQueuedWork = async (): Promise<void> => {
         if (queued.length === 0 || !batchAbortController.signal.aborted) {
           return;
@@ -1603,13 +1988,18 @@ export class WorkflowRunner {
               inputHash: step.inputHash,
               startedAt: step.startedAt,
               taskId: step.taskId,
+              reservedInThisRun: step.reservedInThisRun,
+              // Consumed by the first reservation only (bulk above, or here under a window).
+              ...(step.priorChild != null && step.reservedInThisRun !== true
+                ? { priorChild: step.priorChild }
+                : {}),
               allowMissingOutputSchema: step.allowMissingOutputSchema,
               leaseGuard: options.leaseGuard,
               waitOptions: batchWaitOptions,
+              runAbortSignal: upstreamAbortSignal,
             });
             return { runIndex, step, runResult };
           } catch (error) {
-            batchFailed = true;
             await applyChildFailureToBatch(error);
             return { runIndex, step, error };
           }
@@ -1634,55 +2024,23 @@ export class WorkflowRunner {
         await throwIfAbortPreventsQueuedWork();
         if (createAgentTasks != null && bulkCreatableSteps.length > 0) {
           try {
-            for (const step of bulkCreatableSteps) {
-              await this.recordAgentReservationEventIfMissing(runId, sequence, {
-                stepId: step.spec.id,
-                inputHash: step.inputHash,
-                title: step.spec.title,
+            const taskIds = await this.reserveAgentTasks(runId, sequence, {
+              steps: bulkCreatableSteps.map((step) => ({
                 spec: step.spec,
-              });
-            }
-            const createdTasks = await createAgentTasks(
-              bulkCreatableSteps.map((step) => step.spec),
-              {
-                onTaskCreated: async (index, taskId) => {
-                  const step = bulkCreatableSteps[index];
-                  assert(step != null, "WorkflowRunner.parallel bulk lifecycle index mismatch");
-                  assert(taskId.length > 0, "WorkflowRunner.parallel bulk taskId is required");
-                  options.leaseGuard.throwIfLost();
-                  await this.recordStepStarted(runId, {
-                    stepId: step.spec.id,
-                    inputHash: step.inputHash,
-                    taskId,
-                    startedAt: step.startedAt,
-                  });
-                  await this.recordTaskStartedEventIfMissing(runId, sequence, {
-                    stepId: step.spec.id,
-                    taskId,
-                    title: step.spec.title,
-                  });
-                },
-              }
-            );
-            if (createdTasks.length !== bulkCreatableSteps.length) {
-              throw new Error("parallel bulk task creation returned the wrong number of tasks");
-            }
-            for (const [index, createdTask] of createdTasks.entries()) {
-              assert(
-                createdTask.taskId.length > 0,
-                "WorkflowRunner.parallel created taskId is required"
-              );
-              bulkCreatableSteps[index].taskId = createdTask.taskId;
+                inputHash: step.inputHash,
+                startedAt: step.startedAt,
+                title: step.spec.title,
+                ...(step.priorChild != null ? { priorChild: step.priorChild } : {}),
+              })),
+              abortSignal: batchAbortController.signal,
+              runAbortSignal: upstreamAbortSignal,
+              leaseGuard: options.leaseGuard,
+            });
+            for (const [index, taskId] of taskIds.entries()) {
+              bulkCreatableSteps[index].taskId = taskId;
+              bulkCreatableSteps[index].reservedInThisRun = true;
             }
           } catch (error) {
-            for (const step of bulkCreatableSteps) {
-              await this.recordAgentReservationFailedEventIfMissing(runId, sequence, {
-                stepId: step.spec.id,
-                inputHash: step.inputHash,
-                title: step.spec.title,
-                error,
-              });
-            }
             await applyChildFailureToBatch(error);
             throw error;
           }
@@ -1695,17 +2053,18 @@ export class WorkflowRunner {
           const settled = await Promise.race(unsettledRuns.values());
           unsettledRuns.delete(settled.runIndex);
           if ("error" in settled) {
-            await Promise.allSettled(unsettledRuns.values());
+            await drainSettledSiblings();
             if (foregroundBackgrounded) {
               throw createForegroundWaitBackgroundedError();
             }
-            throw settled.error;
+            throw firstBatchError ?? settled.error;
           }
           try {
             results[settled.step.index] = await this.recordAgentResult(runId, sequence, {
               spec: settled.runResult.resultSpec,
               inputHash: settled.step.inputHash,
               startedAt: settled.step.startedAt,
+              taskId: settled.runResult.taskId,
               leaseGuard: options.leaseGuard,
               rawResult: settled.runResult.rawResult,
             });
@@ -1714,10 +2073,9 @@ export class WorkflowRunner {
               !isRetryableAgentOutputError(error) ||
               settled.step.attempt >= WORKFLOW_AGENT_MAX_ATTEMPTS
             ) {
-              batchFailed = true;
-              await interruptRemainingTasks();
-              await Promise.allSettled(unsettledRuns.values());
-              throw error;
+              await applyChildFailureToBatch(error);
+              await drainSettledSiblings();
+              throw firstBatchError ?? error;
             }
             options.leaseGuard.throwIfLost();
             await this.recordAgentRetry(
@@ -1731,6 +2089,7 @@ export class WorkflowRunner {
               ...settled.step,
               startedAt: this.clock.nowIso(),
               taskId: undefined,
+              priorChild: undefined,
               attempt: settled.step.attempt + 1,
               retryMessage: getErrorMessage(error),
             });
@@ -1753,6 +2112,8 @@ export class WorkflowRunner {
       inputHash: string;
       startedAt: string;
       taskId?: string;
+      /** A failed checkpoint's ended child the first attempt retires (consultFailedCheckpoint). */
+      priorChild?: WorkflowPriorChild;
       waitOptions?: WorkflowAgentWaitOptions;
       allowMissingOutputSchema: boolean;
       leaseGuard: WorkflowRunnerLeaseGuard;
@@ -1761,6 +2122,7 @@ export class WorkflowRunner {
     let attempt = 1;
     let startedAt = step.startedAt;
     let taskId = step.taskId;
+    let priorChild = step.priorChild;
     let spec = step.spec;
     while (attempt <= WORKFLOW_AGENT_MAX_ATTEMPTS) {
       const runResult = await this.runOrResumeAgentStep(runId, sequence, {
@@ -1768,15 +2130,19 @@ export class WorkflowRunner {
         inputHash: step.inputHash,
         startedAt,
         taskId,
+        ...(priorChild != null ? { priorChild } : {}),
         allowMissingOutputSchema: step.allowMissingOutputSchema,
         leaseGuard: step.leaseGuard,
         waitOptions: step.waitOptions,
+        // Single steps have no batch signal: the run signal is the wait signal.
+        runAbortSignal: step.waitOptions?.abortSignal,
       });
       try {
         return await this.recordAgentResult(runId, sequence, {
           spec: runResult.resultSpec,
           inputHash: step.inputHash,
           startedAt,
+          taskId: runResult.taskId,
           leaseGuard: step.leaseGuard,
           rawResult: runResult.rawResult,
         });
@@ -1789,6 +2155,7 @@ export class WorkflowRunner {
         spec = buildRetryAgentSpec(step.spec, attempt, getErrorMessage(error));
         startedAt = this.clock.nowIso();
         taskId = undefined;
+        priorChild = undefined;
         attempt += 1;
       }
     }
@@ -1879,24 +2246,12 @@ export class WorkflowRunner {
         throw error;
       }
     };
-    const remainingMsUntil = (deadlineIso: string | undefined, fallbackMs: number): number => {
-      if (deadlineIso == null) {
-        return fallbackMs;
-      }
-      const parsedDeadlineMs = Date.parse(deadlineIso);
-      if (!Number.isFinite(parsedDeadlineMs)) {
-        return fallbackMs;
-      }
-      return Math.max(1, parsedDeadlineMs - this.clock.nowMs());
-    };
+    const remainingMsUntil = (deadlineIso: string | undefined, fallbackMs: number): number =>
+      remainingMsUntilDeadline(deadlineIso, fallbackMs, this.clock.nowMs());
     const tryReadAcceptedReport = async (): Promise<WorkflowAgentResult | null> => {
-      const completedStep = await this.runStore.getCompletedStep(
-        runId,
-        step.spec.id,
-        step.inputHash
-      );
-      if (completedStep?.result != null) {
-        return { ...completedStep.result, taskId: step.taskId };
+      const acceptedResult = await this.readCompletedAgentStepResult(runId, step);
+      if (acceptedResult != null) {
+        return acceptedResult;
       }
       try {
         return await waitForReport(1);
@@ -1910,36 +2265,12 @@ export class WorkflowRunner {
         return acceptedReportBeforeHardTimeout;
       }
 
-      const errorMessage = `Workflow agent step ${step.spec.id} exceeded its soft timeout (${timeout.softMs}ms) and did not produce a valid final response within the grace period (${timeout.graceMs}ms).`;
-      const hardTimedOutAt = this.clock.nowIso();
-      await this.recordStepTimeoutMetadata(runId, {
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        taskId: step.taskId,
-        startedAt: step.startedAt,
-        timeout: { hardTimedOutAt },
-      });
-      await this.appendEvent(runId, {
-        sequence: sequence.next(),
-        type: "timeout",
-        at: hardTimedOutAt,
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        phase: "hard",
-        details: { error: errorMessage },
-      });
-      await this.recordTaskEventIfMissing(runId, sequence, {
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        title: step.spec.title,
-        status: "timed_out",
-      });
-      await this.taskAdapter.failAgentTaskForHardTimeout?.(step.taskId, {
-        workflowRunId: runId,
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        reason: errorMessage,
-      });
+      const { errorMessage, hardTimedOutAt } = await this.recordAgentStepHardTimeout(
+        runId,
+        sequence,
+        step,
+        timeout
+      );
       const acceptedReportAfterHardTimeout = await tryReadAcceptedReport();
       if (acceptedReportAfterHardTimeout != null) {
         return acceptedReportAfterHardTimeout;
@@ -1954,37 +2285,14 @@ export class WorkflowRunner {
       });
       throw createWorkflowAgentHardTimeoutError(errorMessage);
     };
-    const buildHardDeadlineFromNow = (): string =>
-      new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
-    const recordFinalizationPromptAccepted = async (
+    const recordFinalizationPromptAccepted = (
       finalizationToken: string | undefined,
       finalizationResult: "prompted" | "queued" | "already_reported" | "not_active"
-    ): Promise<string> => {
-      const finalizationPromptSentAt = this.clock.nowIso();
-      const hardDeadlineAt = buildHardDeadlineFromNow();
-      step.leaseGuard.throwIfLost();
-      await this.recordStepTimeoutMetadata(runId, {
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        taskId: step.taskId,
-        startedAt: step.startedAt,
-        timeout: {
-          ...(finalizationToken != null ? { finalizationToken } : {}),
-          finalizationPromptSentAt,
-          hardDeadlineAt,
-        },
+    ): Promise<string> =>
+      this.recordAgentFinalizationPromptAccepted(runId, sequence, step, timeout, {
+        finalizationToken,
+        finalizationResult,
       });
-      await this.appendEvent(runId, {
-        sequence: sequence.next(),
-        type: "timeout",
-        at: finalizationPromptSentAt,
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        phase: "finalization_prompt_sent",
-        details: { result: finalizationResult },
-      });
-      return hardDeadlineAt;
-    };
     const waitDuringGrace = async (graceTimeoutMs: number): Promise<WorkflowAgentResult> => {
       try {
         const result = await waitForReport(graceTimeoutMs);
@@ -2051,26 +2359,66 @@ export class WorkflowRunner {
       }
     }
 
-    const completedAfterSoftTimeout = await this.runStore.getCompletedStep(
-      runId,
-      step.spec.id,
-      step.inputHash
-    );
-    if (completedAfterSoftTimeout?.result != null) {
-      return { ...completedAfterSoftTimeout.result, taskId: step.taskId };
+    const completedAfterSoftTimeout = await this.readCompletedAgentStepResult(runId, step);
+    if (completedAfterSoftTimeout != null) {
+      return completedAfterSoftTimeout;
     }
 
     assert(
       this.taskAdapter.requestAgentFinalReportForTimeout != null,
       "WorkflowRunner timeout wait requires requestAgentFinalReportForTimeout"
     );
+    const { finalizationToken, hardDeadlineAt } = await this.recordAgentStepSoftTimeout(
+      runId,
+      sequence,
+      step,
+      timeout
+    );
+
+    const finalizationResult = await this.taskAdapter.requestAgentFinalReportForTimeout(
+      step.taskId,
+      {
+        workflowRunId: runId,
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+        finalizationToken,
+        finalInstructions: timeout.finalInstructions,
+      }
+    );
+    if (finalizationResult === "already_reported") {
+      return await waitForReport(timeout.graceMs);
+    }
+    const acceptedHardDeadlineAt =
+      finalizationResult === "prompted"
+        ? await recordFinalizationPromptAccepted(finalizationToken, finalizationResult)
+        : hardDeadlineAt;
+
+    return await waitDuringGrace(remainingMsUntil(acceptedHardDeadlineAt, timeout.graceMs));
+  }
+
+  /** The step's journaled result when another writer already accepted the child's report. */
+  private async readCompletedAgentStepResult(
+    runId: string,
+    step: { spec: WorkflowAgentSpec; inputHash: string; taskId: string }
+  ): Promise<WorkflowAgentResult | null> {
+    const completedStep = await this.runStore.getCompletedStep(runId, step.spec.id, step.inputHash);
+    return completedStep?.result != null ? { ...completedStep.result, taskId: step.taskId } : null;
+  }
+
+  /** Journals a soft timeout: the grace deadline and token the finalization prompt carries. */
+  private async recordAgentStepSoftTimeout(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: { spec: WorkflowAgentSpec; inputHash: string; startedAt: string; taskId: string },
+    timeout: WorkflowAgentTimeoutSpec
+  ): Promise<{ finalizationToken: string; hardDeadlineAt: string }> {
     const softTimedOutAt = this.clock.nowIso();
     const finalizationToken = buildWorkflowAgentTimeoutFinalizationToken(
       runId,
       step,
       softTimedOutAt
     );
-    const hardDeadlineAt = buildHardDeadlineFromNow();
+    const hardDeadlineAt = new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
     await this.recordStepTimeoutMetadata(runId, {
       stepId: step.spec.id,
       inputHash: step.inputHash,
@@ -2097,26 +2445,92 @@ export class WorkflowRunner {
       title: step.spec.title,
       status: "finalizing",
     });
+    return { finalizationToken, hardDeadlineAt };
+  }
 
-    const finalizationResult = await this.taskAdapter.requestAgentFinalReportForTimeout(
-      step.taskId,
-      {
-        workflowRunId: runId,
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        finalizationToken,
-        finalInstructions: timeout.finalInstructions,
-      }
-    );
-    if (finalizationResult === "already_reported") {
-      return await waitForReport(timeout.graceMs);
+  /** Journals an accepted finalization prompt; the grace period restarts now. */
+  private async recordAgentFinalizationPromptAccepted(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: {
+      spec: WorkflowAgentSpec;
+      inputHash: string;
+      startedAt: string;
+      taskId: string;
+      leaseGuard: WorkflowRunnerLeaseGuard;
+    },
+    timeout: WorkflowAgentTimeoutSpec,
+    prompt: {
+      finalizationToken: string | undefined;
+      finalizationResult: "prompted" | "queued" | "already_reported" | "not_active";
     }
-    const acceptedHardDeadlineAt =
-      finalizationResult === "prompted"
-        ? await recordFinalizationPromptAccepted(finalizationToken, finalizationResult)
-        : hardDeadlineAt;
+  ): Promise<string> {
+    const finalizationPromptSentAt = this.clock.nowIso();
+    const hardDeadlineAt = new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
+    step.leaseGuard.throwIfLost();
+    await this.recordStepTimeoutMetadata(runId, {
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      taskId: step.taskId,
+      startedAt: step.startedAt,
+      timeout: {
+        ...(prompt.finalizationToken != null
+          ? { finalizationToken: prompt.finalizationToken }
+          : {}),
+        finalizationPromptSentAt,
+        hardDeadlineAt,
+      },
+    });
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "timeout",
+      at: finalizationPromptSentAt,
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      phase: "finalization_prompt_sent",
+      details: { result: prompt.finalizationResult },
+    });
+    return hardDeadlineAt;
+  }
 
-    return await waitDuringGrace(remainingMsUntil(acceptedHardDeadlineAt, timeout.graceMs));
+  /** Journals a hard timeout and asks the task adapter to fail the child. */
+  private async recordAgentStepHardTimeout(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: { spec: WorkflowAgentSpec; inputHash: string; startedAt: string; taskId: string },
+    timeout: WorkflowAgentTimeoutSpec
+  ): Promise<{ errorMessage: string; hardTimedOutAt: string }> {
+    const errorMessage = `Workflow agent step ${step.spec.id} exceeded its soft timeout (${timeout.softMs}ms) and did not produce a valid final response within the grace period (${timeout.graceMs}ms).`;
+    const hardTimedOutAt = this.clock.nowIso();
+    await this.recordStepTimeoutMetadata(runId, {
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      taskId: step.taskId,
+      startedAt: step.startedAt,
+      timeout: { hardTimedOutAt },
+    });
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "timeout",
+      at: hardTimedOutAt,
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      phase: "hard",
+      details: { error: errorMessage },
+    });
+    await this.recordTaskEventIfMissing(runId, sequence, {
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      title: step.spec.title,
+      status: "timed_out",
+    });
+    await this.taskAdapter.failAgentTaskForHardTimeout?.(step.taskId, {
+      workflowRunId: runId,
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      reason: errorMessage,
+    });
+    return { errorMessage, hardTimedOutAt };
   }
 
   private async runOrResumeAgentStep(
@@ -2127,235 +2541,185 @@ export class WorkflowRunner {
       inputHash: string;
       startedAt: string;
       taskId?: string;
+      /**
+       * True when `taskId` was reserved by this run (bulk parallel reservation) rather than read
+       * from a prior checkpoint: it is awaited directly instead of classified as a prior attempt.
+       */
+      reservedInThisRun?: boolean;
       waitOptions?: WorkflowAgentWaitOptions;
+      /** Run-level signal (distinct from a batch signal) that bounds settlement waits. */
+      runAbortSignal?: AbortSignal;
       allowMissingOutputSchema: boolean;
       leaseGuard: WorkflowRunnerLeaseGuard;
+      /** Set by a replacement restart: the ended child the new reservation retires. */
+      priorChild?: WorkflowPriorChild;
     }
   ): Promise<WorkflowAgentRunResult> {
     step.leaseGuard.throwIfLost();
-    if (step.spec.timeout != null && this.taskAdapter.waitForAgentTask != null) {
-      const resultSpec = normalizeWorkflowAgentSpecForExecution(step.spec, {
-        allowMissingOutputSchema: step.allowMissingOutputSchema,
+    const restart = async (
+      priorChild: WorkflowPriorChild | undefined
+    ): Promise<WorkflowAgentRunResult> =>
+      await this.runOrResumeAgentStep(runId, sequence, {
+        ...step,
+        startedAt: this.clock.nowIso(),
+        taskId: undefined,
+        reservedInThisRun: false,
+        priorChild,
       });
-      let taskId = step.taskId;
-      if (taskId == null) {
-        assert(
-          this.taskAdapter.createAgentTasks != null,
-          "agent timeout requires workflow task adapter support for nonblocking agent starts"
-        );
-        await this.recordAgentReservationEventIfMissing(runId, sequence, {
-          stepId: step.spec.id,
-          inputHash: step.inputHash,
-          title: step.spec.title,
-          spec: resultSpec,
-        });
-        let createdTasks: Array<{ taskId: string; status: "queued" | "starting" | "running" }>;
-        try {
-          createdTasks = await this.taskAdapter.createAgentTasks([resultSpec], {
-            onTaskCreated: async (index, createdTaskId) => {
-              assert(index === 0, "WorkflowRunner timeout agent start lifecycle index mismatch");
-              taskId = createdTaskId;
-              step.leaseGuard.throwIfLost();
-              await this.recordStepStarted(runId, {
-                stepId: step.spec.id,
-                inputHash: step.inputHash,
-                taskId: createdTaskId,
-                startedAt: step.startedAt,
-              });
-              await this.recordTaskStartedEventIfMissing(runId, sequence, {
-                stepId: step.spec.id,
-                taskId: createdTaskId,
-                title: step.spec.title,
-              });
-            },
-          });
-        } catch (error) {
-          await this.recordAgentReservationFailedEventIfMissing(runId, sequence, {
-            stepId: step.spec.id,
-            inputHash: step.inputHash,
-            title: step.spec.title,
-            error,
-          });
+    const settleWaitFailure = async (
+      attempt: OwnedWorkflowAgentAttempt,
+      error: unknown,
+      allowReplacement: boolean
+    ): Promise<WorkflowAgentRunResult> => {
+      const plan = await this.handleAgentWaitFailure(runId, sequence, attempt, error, {
+        leaseGuard: step.leaseGuard,
+        waitOptions: step.waitOptions,
+        runAbortSignal: step.runAbortSignal,
+        allowReplacement,
+      });
+      switch (plan.kind) {
+        case "adopt":
+          return { rawResult: plan.report, resultSpec: attempt.resultSpec, taskId: attempt.taskId };
+        case "replace":
+          return await restart({ taskId: attempt.taskId, attemptId: plan.attemptId });
+        case "reattach":
+        case "rethrow":
           throw error;
-        }
-        assert(createdTasks.length === 1, "timeout agent start returned the wrong number of tasks");
-        const createdTask = createdTasks[0];
-        assert(createdTask != null, "timeout agent start must return a task");
-        if (taskId == null) {
-          taskId = createdTask.taskId;
-          await this.recordStepStarted(runId, {
-            stepId: step.spec.id,
-            inputHash: step.inputHash,
-            taskId,
-            startedAt: step.startedAt,
-          });
-          await this.recordTaskStartedEventIfMissing(runId, sequence, {
-            stepId: step.spec.id,
-            taskId,
-            title: step.spec.title,
-          });
-        }
-      } else {
-        await this.recordTaskStartedEventIfMissing(runId, sequence, {
-          stepId: step.spec.id,
-          taskId,
-          title: step.spec.title,
-        });
       }
-      try {
-        const rawResult = await this.waitForAgentTaskWithGracefulTimeout(runId, sequence, {
-          spec: step.spec,
-          inputHash: step.inputHash,
-          startedAt: step.startedAt,
-          taskId,
-          resultSpec,
-          waitOptions: step.waitOptions,
-          leaseGuard: step.leaseGuard,
-        });
-        return { rawResult, resultSpec };
-      } catch (error) {
-        if (!isForegroundWaitBackgroundedError(error) && !isWorkflowAgentHardTimeoutError(error)) {
-          step.leaseGuard.throwIfLost();
-          await this.recordTaskTerminalEventIfMissing(runId, sequence, {
-            stepId: step.spec.id,
-            taskId,
-            title: step.spec.title,
-            status: getTaskTerminalStatusForError(error, step.waitOptions?.abortSignal),
-          });
-        }
-        if (step.taskId == null || !shouldRestartUnrecoverableStartedTask(error)) {
-          throw error;
-        }
-        return await this.runOrResumeAgentStep(runId, sequence, {
-          ...step,
-          startedAt: this.clock.nowIso(),
-          taskId: undefined,
-        });
-      }
-    }
+    };
+    const usesTimeoutWait = step.spec.timeout != null && this.taskAdapter.waitForAgentTask != null;
 
     if (step.taskId != null && this.taskAdapter.waitForAgentTask != null) {
-      await this.recordTaskStartedEventIfMissing(runId, sequence, {
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        title: step.spec.title,
-      });
-      try {
-        const resultSpec = step.allowMissingOutputSchema
+      // A checkpointed prior attempt (crash replay or explicit resume) is classified before it
+      // is reattached or discarded: a persisted report wins, a live child is awaited, and only
+      // a positively absent report after settlement allows exactly one replacement.
+      const resultSpec = usesTimeoutWait
+        ? normalizeWorkflowAgentSpecForExecution(step.spec, {
+            allowMissingOutputSchema: step.allowMissingOutputSchema,
+          })
+        : step.allowMissingOutputSchema
           ? omitWorkflowAgentOutputSchema(step.spec)
           : step.spec;
-        const rawResult = await this.taskAdapter.waitForAgentTask(
-          step.taskId,
-          resultSpec,
-          step.waitOptions
-        );
-        return { rawResult, resultSpec };
-      } catch (error) {
-        if (!isForegroundWaitBackgroundedError(error)) {
-          step.leaseGuard.throwIfLost();
-          await this.recordTaskTerminalEventIfMissing(runId, sequence, {
+      const attempt: OwnedWorkflowAgentAttempt = {
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+        taskId: step.taskId,
+        title: step.spec.title,
+        resultSpec,
+        startedAt: step.startedAt,
+      };
+      const isPriorAttempt = step.reservedInThisRun !== true;
+      if (isPriorAttempt) {
+        const plan = await this.classifyPriorAttempt(runId, sequence, attempt, {
+          leaseGuard: step.leaseGuard,
+          runAbortSignal: step.runAbortSignal,
+        });
+        if (plan.kind === "adopt") {
+          await this.recordTaskStartedEventIfMissing(runId, sequence, {
             stepId: step.spec.id,
-            taskId: step.taskId,
+            taskId: attempt.taskId,
             title: step.spec.title,
-            status: getTaskTerminalStatusForError(error, step.waitOptions?.abortSignal),
           });
+          return { rawResult: plan.report, resultSpec, taskId: attempt.taskId };
         }
-        if (!shouldRestartUnrecoverableStartedTask(error)) {
-          throw error;
+        if (plan.kind === "replace") {
+          return await restart({ taskId: attempt.taskId, attemptId: plan.attemptId });
         }
+        if (plan.kind === "fresh") {
+          return await restart(undefined);
+        }
+        assert(
+          plan.kind === "reattach",
+          "classifyPriorAttempt returns adopt, replace, fresh, or reattach"
+        );
+        await this.recordTaskStartedEventIfMissing(runId, sequence, {
+          stepId: step.spec.id,
+          taskId: attempt.taskId,
+          title: step.spec.title,
+        });
+      }
+      try {
+        const rawResult = usesTimeoutWait
+          ? await this.waitForAgentTaskWithGracefulTimeout(runId, sequence, {
+              spec: step.spec,
+              inputHash: step.inputHash,
+              startedAt: step.startedAt,
+              taskId: attempt.taskId,
+              resultSpec,
+              waitOptions: step.waitOptions,
+              leaseGuard: step.leaseGuard,
+            })
+          : await this.taskAdapter.waitForAgentTask(attempt.taskId, resultSpec, step.waitOptions);
+        return { rawResult, resultSpec, taskId: attempt.taskId };
+      } catch (error) {
+        return await settleWaitFailure(attempt, error, isPriorAttempt);
       }
     }
 
     const resultSpec = normalizeWorkflowAgentSpecForExecution(step.spec, {
       allowMissingOutputSchema: step.allowMissingOutputSchema,
     });
-    if (this.taskAdapter.createAgentTasks != null && this.taskAdapter.waitForAgentTask != null) {
+    if (usesTimeoutWait || this.taskAdapter.createAgentTasks != null) {
+      assert(
+        this.taskAdapter.createAgentTasks != null && this.taskAdapter.waitForAgentTask != null,
+        usesTimeoutWait
+          ? "agent timeout requires workflow task adapter support for nonblocking agent starts"
+          : "WorkflowRunner: createAgentTasks requires waitForAgentTask"
+      );
       // Checkpoint the workflow step before reserving the child task. Reservation can
       // block on task-service gates, and replay needs a visible boundary instead of a
       // phase-only run if startup stalls before a taskId exists.
-      await this.recordAgentReservationEventIfMissing(runId, sequence, {
+      const [taskId] = await this.reserveAgentTasks(runId, sequence, {
+        steps: [
+          {
+            spec: resultSpec,
+            inputHash: step.inputHash,
+            startedAt: step.startedAt,
+            title: step.spec.title,
+            ...(step.priorChild != null ? { priorChild: step.priorChild } : {}),
+          },
+        ],
+        abortSignal: step.waitOptions?.abortSignal,
+        runAbortSignal: step.runAbortSignal,
+        leaseGuard: step.leaseGuard,
+      });
+      assert(taskId != null, "agent start must return a task");
+      const attempt: OwnedWorkflowAgentAttempt = {
         stepId: step.spec.id,
         inputHash: step.inputHash,
+        taskId,
         title: step.spec.title,
-        spec: resultSpec,
-      });
-      let recordedTaskId: string | undefined;
-      let createdTasks: Array<{ taskId: string; status: "queued" | "starting" | "running" }>;
+        resultSpec,
+        startedAt: step.startedAt,
+      };
       try {
-        createdTasks = await this.taskAdapter.createAgentTasks([resultSpec], {
-          onTaskCreated: async (index, createdTaskId) => {
-            assert(index === 0, "WorkflowRunner agent start lifecycle index mismatch");
-            assert(createdTaskId.length > 0, "WorkflowRunner created taskId is required");
-            step.leaseGuard.throwIfLost();
-            recordedTaskId = createdTaskId;
-            await this.recordStepStarted(runId, {
-              stepId: step.spec.id,
+        const rawResult = usesTimeoutWait
+          ? await this.waitForAgentTaskWithGracefulTimeout(runId, sequence, {
+              spec: step.spec,
               inputHash: step.inputHash,
-              taskId: createdTaskId,
               startedAt: step.startedAt,
-            });
-            await this.recordTaskStartedEventIfMissing(runId, sequence, {
-              stepId: step.spec.id,
-              taskId: createdTaskId,
-              title: step.spec.title,
-            });
-          },
-        });
+              taskId,
+              resultSpec,
+              waitOptions: step.waitOptions,
+              leaseGuard: step.leaseGuard,
+            })
+          : await this.taskAdapter.waitForAgentTask(taskId, resultSpec, step.waitOptions);
+        return { rawResult, resultSpec, taskId };
       } catch (error) {
-        await this.recordAgentReservationFailedEventIfMissing(runId, sequence, {
-          stepId: step.spec.id,
-          inputHash: step.inputHash,
-          title: step.spec.title,
-          error,
-        });
-        throw error;
-      }
-      assert(createdTasks.length === 1, "agent start returned the wrong number of tasks");
-      const createdTask = createdTasks[0];
-      assert(createdTask != null, "agent start must return a task");
-      assert(createdTask.taskId.length > 0, "WorkflowRunner created taskId is required");
-      if (recordedTaskId == null) {
-        recordedTaskId = createdTask.taskId;
-        await this.recordStepStarted(runId, {
-          stepId: step.spec.id,
-          inputHash: step.inputHash,
-          taskId: recordedTaskId,
-          startedAt: step.startedAt,
-        });
-        await this.recordTaskStartedEventIfMissing(runId, sequence, {
-          stepId: step.spec.id,
-          taskId: recordedTaskId,
-          title: step.spec.title,
-        });
-      } else {
-        assert(
-          recordedTaskId === createdTask.taskId,
-          "WorkflowRunner lifecycle taskId must match created taskId"
-        );
-      }
-
-      try {
-        const rawResult = await this.taskAdapter.waitForAgentTask(
-          recordedTaskId,
-          resultSpec,
-          step.waitOptions
-        );
-        return { rawResult, resultSpec };
-      } catch (error) {
-        if (!isForegroundWaitBackgroundedError(error)) {
-          step.leaseGuard.throwIfLost();
-          await this.recordTaskTerminalEventIfMissing(runId, sequence, {
-            stepId: step.spec.id,
-            taskId: recordedTaskId,
-            title: step.spec.title,
-            status: getTaskTerminalStatusForError(error, step.waitOptions?.abortSignal),
-          });
-        }
-        throw error;
+        return await settleWaitFailure(attempt, error, false);
       }
     }
 
     step.leaseGuard.throwIfLost();
+    if (step.priorChild != null) {
+      // runAgent creates children one by one (create()), which cannot consume a claim.
+      throw new WorkflowPriorAttemptUnresolvedError(
+        step.spec.id,
+        step.priorChild.taskId,
+        "claim-refused",
+        "replacing a previous attempt requires reservation support (createAgentTasks)"
+      );
+    }
     let recordedTaskId: string | undefined;
     let rawResult: WorkflowAgentResult;
     try {
@@ -2371,6 +2735,14 @@ export class WorkflowRunner {
               taskId,
               startedAt: step.startedAt,
             });
+            this.trackAttempt(runId, {
+              stepId: step.spec.id,
+              inputHash: step.inputHash,
+              taskId,
+              title: step.spec.title,
+              resultSpec,
+              startedAt: step.startedAt,
+            });
             await this.recordTaskStartedEventIfMissing(runId, sequence, {
               stepId: step.spec.id,
               taskId,
@@ -2381,32 +2753,870 @@ export class WorkflowRunner {
         step.waitOptions
       );
     } catch (error) {
-      if (recordedTaskId != null && !isForegroundWaitBackgroundedError(error)) {
-        step.leaseGuard.throwIfLost();
-        await this.recordTaskTerminalEventIfMissing(runId, sequence, {
+      if (recordedTaskId == null) {
+        throw error;
+      }
+      return await settleWaitFailure(
+        {
           stepId: step.spec.id,
+          inputHash: step.inputHash,
           taskId: recordedTaskId,
           title: step.spec.title,
-          status: getTaskTerminalStatusForError(error, step.waitOptions?.abortSignal),
-        });
-      }
-      throw error;
+          resultSpec,
+          startedAt: step.startedAt,
+        },
+        error,
+        false
+      );
     }
     step.leaseGuard.throwIfLost();
     if (recordedTaskId == null) {
+      recordedTaskId = rawResult.taskId;
       await this.recordStepStarted(runId, {
         stepId: step.spec.id,
         inputHash: step.inputHash,
-        taskId: rawResult.taskId,
+        taskId: recordedTaskId,
+        startedAt: step.startedAt,
+      });
+      this.trackAttempt(runId, {
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+        taskId: recordedTaskId,
+        title: step.spec.title,
+        resultSpec,
         startedAt: step.startedAt,
       });
       await this.recordTaskStartedEventIfMissing(runId, sequence, {
         stepId: step.spec.id,
-        taskId: rawResult.taskId,
+        taskId: recordedTaskId,
         title: step.spec.title,
       });
     }
-    return { rawResult, resultSpec };
+    return { rawResult, resultSpec, taskId: recordedTaskId };
+  }
+
+  private trackAttempt(runId: string, attempt: OwnedWorkflowAgentAttempt): void {
+    assert(attempt.taskId.length > 0, "WorkflowRunner: owned attempt taskId is required");
+    const owned = this.ownedAttemptsByRun.get(runId);
+    if (owned == null) {
+      attempt.releaseLaunchSignal?.();
+      return;
+    }
+    const key = getOwnedAttemptKey(attempt);
+    const superseded = owned.get(key);
+    if (superseded != null && superseded.taskId !== attempt.taskId) {
+      // A replacement attempt for the same step identity supersedes the obsolete one; the
+      // store's attempt fence already rejects the old task id, so only the current one is worth
+      // draining and only its launch can still be pending.
+      superseded.releaseLaunchSignal?.();
+    }
+    owned.set(key, attempt);
+  }
+
+  private untrackAttempt(
+    runId: string,
+    attempt: { stepId: string; inputHash: string; taskId: string }
+  ) {
+    const owned = this.ownedAttemptsByRun.get(runId);
+    const key = getOwnedAttemptKey(attempt);
+    const current = owned?.get(key);
+    if (owned != null && current?.taskId === attempt.taskId) {
+      current.releaseLaunchSignal?.();
+      owned.delete(key);
+    }
+  }
+
+  private releaseOwnedAttempts(runId: string): void {
+    const owned = this.ownedAttemptsByRun.get(runId);
+    if (owned == null) {
+      return;
+    }
+    for (const attempt of owned.values()) {
+      attempt.releaseLaunchSignal?.();
+    }
+    this.ownedAttemptsByRun.delete(runId);
+  }
+
+  /**
+   * Reads the authoritative attempt outcome and, when asked, waits within the teardown-scale
+   * bound for a settlement the owner has promised: `pending` waits on `cleanup-pending`,
+   * `pending-or-live` also on `live` (the caller already asked the child to stop), `never`
+   * only reads (the Stop drain must not pin the lease). Missing capability is unavailable
+   * authority: it reads as `indeterminate`, never as "no report". A wait cut short by
+   * `abortSignal` keeps the pre-wait outcome so the caller retains the checkpoint.
+   */
+  private async resolveAttemptOutcome(
+    taskId: string,
+    options: { abortSignal?: AbortSignal; wait: "never" | "pending" | "pending-or-live" }
+  ): Promise<TaskAttemptSettlement<WorkflowAgentResult>> {
+    assert(taskId.length > 0, "WorkflowRunner.resolveAttemptOutcome: taskId is required");
+    if (this.taskAdapter.readSettledAgentResult == null) {
+      return {
+        kind: "indeterminate",
+        reason: "task adapter cannot read attempt outcomes",
+      };
+    }
+    let outcome: TaskAttemptOutcome<WorkflowAgentResult>;
+    try {
+      outcome = await this.taskAdapter.readSettledAgentResult(taskId);
+    } catch (error) {
+      return {
+        kind: "indeterminate",
+        reason: `attempt outcome read failed: ${getErrorMessage(error)}`,
+      };
+    }
+    const settlementPromised =
+      options.wait !== "never" &&
+      (outcome.kind === "cleanup-pending" ||
+        (outcome.kind === "live" && options.wait === "pending-or-live"));
+    if (
+      !settlementPromised ||
+      this.taskAdapter.waitForAttemptSettlement == null ||
+      options.abortSignal?.aborted
+    ) {
+      return outcome;
+    }
+    try {
+      return await this.taskAdapter.waitForAttemptSettlement(taskId, {
+        ...(options.abortSignal != null ? { abortSignal: options.abortSignal } : {}),
+        timeoutMs: WORKFLOW_ATTEMPT_SETTLEMENT_TIMEOUT_MS,
+      });
+    } catch (error) {
+      if (options.abortSignal?.aborted === true) {
+        return outcome;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Terminal disposition for a checkpointed attempt, report-first: a persisted report is adopted
+   * (validated and recorded completed), a positively absent report after settlement is recorded
+   * failed, and everything else keeps the `started` checkpoint (`indeterminate` also leaves a
+   * diagnostic). Shared by fail-fast batch draining, pipeline sibling draining, reservation
+   * cleanup after a checkpoint, late reservations after abort, and the cancellation drain.
+   */
+  private async disposeStartedAttempt(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    attempt: OwnedWorkflowAgentAttempt,
+    options: {
+      leaseGuard: WorkflowRunnerLeaseGuard;
+      abortSignal?: AbortSignal;
+      wait: "never" | "pending" | "pending-or-live";
+      settlement?: WorkflowCancellationSettlement;
+    }
+  ): Promise<WorkflowAttemptDisposition> {
+    options.leaseGuard.throwIfLost();
+    const outcome = await this.resolveAttemptOutcome(attempt.taskId, {
+      ...(options.abortSignal != null ? { abortSignal: options.abortSignal } : {}),
+      wait: options.wait,
+    });
+    options.leaseGuard.throwIfLost();
+    switch (outcome.kind) {
+      case "reported": {
+        try {
+          const result = await this.recordAgentResult(
+            runId,
+            sequence,
+            {
+              spec: attempt.resultSpec,
+              inputHash: attempt.inputHash,
+              startedAt: attempt.startedAt,
+              taskId: attempt.taskId,
+              leaseGuard: options.leaseGuard,
+              rawResult: outcome.report,
+            },
+            options.settlement
+          );
+          return { kind: "completed", result };
+        } catch (error) {
+          if (!isRetryableAgentOutputError(error)) {
+            throw error;
+          }
+          // recordAgentResult already recorded the failed attempt; nothing consumes this result.
+          return { kind: "failed" };
+        }
+      }
+      case "terminal-no-report":
+        await this.recordStartedAttemptFailed(
+          runId,
+          sequence,
+          attempt,
+          `agent ${attempt.stepId} task ${attempt.taskId} ended without a report`,
+          options.settlement
+        );
+        return { kind: "failed" };
+      case "indeterminate":
+        await this.recordAgentAttemptIndeterminateEventIfMissing(runId, sequence, {
+          stepId: attempt.stepId,
+          inputHash: attempt.inputHash,
+          taskId: attempt.taskId,
+          title: attempt.title,
+          reason: outcome.reason,
+        });
+        return { kind: "retained", outcome: outcome.kind };
+      case "live":
+      case "cleanup-pending":
+      case "timeout":
+        log.debug(
+          `[workflow-runner] Retaining started checkpoint for ${attempt.stepId} (${attempt.taskId}): ${outcome.kind}`
+        );
+        return { kind: "retained", outcome: outcome.kind };
+    }
+  }
+
+  private async recordStartedAttemptFailed(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    attempt: OwnedWorkflowAgentAttempt,
+    error: string,
+    settlement?: WorkflowCancellationSettlement
+  ): Promise<void> {
+    const failedAt = this.clock.nowIso();
+    sequence.next();
+    await this.runStore.recordStepFailedIfCurrent(
+      runId,
+      {
+        stepId: attempt.stepId,
+        inputHash: attempt.inputHash,
+        taskId: attempt.taskId,
+        title: attempt.title,
+        error,
+        startedAt: attempt.startedAt,
+        completedAt: failedAt,
+      },
+      this.attemptWriteOptions(settlement)
+    );
+    this.untrackAttempt(runId, attempt);
+  }
+
+  private attemptWriteOptions(
+    settlement?: WorkflowCancellationSettlement
+  ): WorkflowAgentAttemptWriteOptions {
+    return {
+      expectedLeaseOwnerId: this.runnerId,
+      ...(settlement != null ? { settlement } : {}),
+    };
+  }
+
+  /**
+   * Diagnostic for an attempt whose owner cannot be established. Recorded on the existing
+   * `agent-step` event (status `reserved`) so no persisted schema changes; the `started`
+   * checkpoint stays untouched because the outcome is unknown, not failed.
+   */
+  private async recordAgentAttemptIndeterminateEventIfMissing(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    agent: { stepId: string; inputHash: string; taskId: string; title?: string; reason: string }
+  ): Promise<void> {
+    assert(agent.stepId.length > 0, "WorkflowRunner: indeterminate attempt stepId is required");
+    assert(agent.taskId.length > 0, "WorkflowRunner: indeterminate attempt taskId is required");
+    const details = { disposition: "indeterminate", taskId: agent.taskId, reason: agent.reason };
+    log.warn(`[workflow-runner] Workflow agent attempt outcome is indeterminate`, {
+      runId,
+      stepId: agent.stepId,
+      taskId: agent.taskId,
+      reason: agent.reason,
+    });
+    await using _lock = await this.taskEventMutex.acquire();
+    const run = await this.runStore.getRun(runId);
+    const alreadyRecorded = run.events.some(
+      (event) =>
+        event.type === "agent-step" &&
+        event.status === "reserved" &&
+        event.stepId === agent.stepId &&
+        event.inputHash === agent.inputHash &&
+        typeof event.details === "object" &&
+        event.details != null &&
+        !Array.isArray(event.details) &&
+        (event.details as Record<string, unknown>).disposition === details.disposition &&
+        (event.details as Record<string, unknown>).taskId === agent.taskId
+    );
+    if (alreadyRecorded) {
+      return;
+    }
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "agent-step",
+      at: this.clock.nowIso(),
+      stepId: agent.stepId,
+      inputHash: agent.inputHash,
+      status: "reserved",
+      title: agent.title,
+      details,
+    });
+  }
+
+  /**
+   * Reserves child tasks with a linked cancellation: the caller's batch/run signal or the
+   * reservation deadline aborts only the cancellable admission stages. `onTaskCreated` observes
+   * the signal BEFORE entering recordStepStarted (the last cancellation point); once the
+   * checkpoint write has entered the store lock it is owned to completion. Steps checkpointed by
+   * a reservation that then fails or completes after an abort are disposed report-first.
+   *
+   * Lifetime: the deadline is cleared when the reservation call returns, but the upstream abort
+   * link is NOT. createMany returns before the children launch (queued children may wait for
+   * capacity) and the task service re-checks this signal at launch admission, so the link stays
+   * connected until every attempt it reserved has settled, been superseded, or the run ends.
+   */
+  private async reserveAgentTasks(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    input: {
+      steps: ReadonlyArray<{
+        spec: WorkflowAgentSpec;
+        inputHash: string;
+        startedAt: string;
+        title?: string;
+        /** The checkpointed child this reservation replaces (see claimPriorChildren). */
+        priorChild?: WorkflowPriorChild;
+      }>;
+      abortSignal?: AbortSignal;
+      runAbortSignal?: AbortSignal;
+      leaseGuard: WorkflowRunnerLeaseGuard;
+    }
+  ): Promise<string[]> {
+    assert(input.steps.length > 0, "WorkflowRunner.reserveAgentTasks: steps are required");
+    assert(
+      this.taskAdapter.createAgentTasks != null,
+      "WorkflowRunner.reserveAgentTasks requires createAgentTasks"
+    );
+    const createAgentTasks = this.taskAdapter.createAgentTasks.bind(this.taskAdapter);
+    const stepIds = input.steps.map((step) => step.spec.id);
+    const retires = await this.claimPriorChildren(input.steps, input.leaseGuard);
+    for (const step of input.steps) {
+      await this.recordAgentReservationEventIfMissing(runId, sequence, {
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+        title: step.title,
+        spec: step.spec,
+      });
+    }
+
+    const reservation = new AbortController();
+    let deadlineFired = false;
+    const abortReservation = () => reservation.abort();
+    const upstream = input.abortSignal;
+    // Link the batch signal AND the run signal: a batch controller is unlinked from the run
+    // when its loop ends, but a child reserved by that batch may still be waiting to launch.
+    const upstreamSignals = Array.from(
+      new Set([input.abortSignal, input.runAbortSignal].filter((signal) => signal != null))
+    );
+    const linkedSignals = new Set<AbortSignal>();
+    for (const signal of upstreamSignals) {
+      if (signal.aborted) {
+        abortReservation();
+      } else {
+        signal.addEventListener("abort", abortReservation, { once: true });
+        linkedSignals.add(signal);
+      }
+    }
+    const releaseUpstreamLink = (): void => {
+      for (const signal of linkedSignals) {
+        signal.removeEventListener("abort", abortReservation);
+      }
+      linkedSignals.clear();
+    };
+    // Every checkpointed attempt holds one share of the link; the last release disconnects it.
+    let linkedAttempts = 0;
+    const releaseAttemptLink = (): void => {
+      linkedAttempts -= 1;
+      if (linkedAttempts <= 0) {
+        releaseUpstreamLink();
+      }
+    };
+    const deadline = setTimeout(() => {
+      deadlineFired = true;
+      abortReservation();
+    }, this.reservationTimeoutMs);
+    const checkpointed = new Map<number, OwnedWorkflowAgentAttempt>();
+    const reservationError = (): Error =>
+      deadlineFired && upstream?.aborted !== true
+        ? new WorkflowAgentReservationTimeoutError(stepIds, this.reservationTimeoutMs)
+        : createReservationCanceledError(stepIds);
+    const checkpoint = async (index: number, taskId: string): Promise<void> => {
+      const step = input.steps[index];
+      assert(step != null, "WorkflowRunner.reserveAgentTasks: lifecycle index mismatch");
+      assert(taskId.length > 0, "WorkflowRunner.reserveAgentTasks: created taskId is required");
+      assert(!checkpointed.has(index), "WorkflowRunner.reserveAgentTasks: duplicate checkpoint");
+      input.leaseGuard.throwIfLost();
+      linkedAttempts += 1;
+      const attempt: OwnedWorkflowAgentAttempt = {
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+        taskId,
+        title: step.title,
+        resultSpec: step.spec,
+        startedAt: step.startedAt,
+        releaseLaunchSignal: releaseAttemptLink,
+      };
+      await this.recordStepStarted(runId, {
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+        taskId,
+        startedAt: step.startedAt,
+      });
+      checkpointed.set(index, attempt);
+      this.trackAttempt(runId, attempt);
+      await this.recordTaskStartedEventIfMissing(runId, sequence, {
+        stepId: step.spec.id,
+        taskId,
+        title: step.title,
+      });
+    };
+    const disposeCheckpointed = async (): Promise<void> => {
+      for (const attempt of checkpointed.values()) {
+        try {
+          await this.disposeStartedAttempt(runId, sequence, attempt, {
+            leaseGuard: input.leaseGuard,
+            ...(input.runAbortSignal != null ? { abortSignal: input.runAbortSignal } : {}),
+            wait: "pending",
+          });
+        } catch (error) {
+          log.warn(`[workflow-runner] Failed to dispose reserved attempt ${attempt.taskId}`, {
+            runId,
+            stepId: attempt.stepId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+    };
+
+    let createdTasks: Array<{ taskId: string; status: "queued" | "starting" | "running" }>;
+    try {
+      createdTasks = await createAgentTasks(
+        input.steps.map((step) => step.spec),
+        {
+          abortSignal: reservation.signal,
+          ...(retires != null ? { retires } : {}),
+          onTaskCreated: async (index, taskId) => {
+            if (reservation.signal.aborted) {
+              // Last cancellation point: nothing durable exists for this task yet.
+              throw reservationError();
+            }
+            await checkpoint(index, taskId);
+          },
+        }
+      );
+    } catch (error) {
+      const failure = reservation.signal.aborted ? reservationError() : error;
+      for (const [index, step] of input.steps.entries()) {
+        if (!checkpointed.has(index)) {
+          await this.recordAgentReservationFailedEventIfMissing(runId, sequence, {
+            stepId: step.spec.id,
+            inputHash: step.inputHash,
+            title: step.title,
+            error: failure,
+          });
+        }
+      }
+      // A checkpoint whose reservation then failed is still disposed by its authoritative
+      // outcome: the child may have launched and reported before the failure surfaced.
+      await disposeCheckpointed();
+      // No launch can still be pending once the reservation call itself failed.
+      releaseUpstreamLink();
+      throw failure;
+    } finally {
+      // Only the deadline ends here: it bounds admission stages, never a pending launch.
+      clearTimeout(deadline);
+    }
+
+    if (createdTasks.length !== input.steps.length) {
+      throw new Error("Workflow agent reservation returned the wrong number of tasks");
+    }
+    for (const [index, createdTask] of createdTasks.entries()) {
+      assert(createdTask.taskId.length > 0, "WorkflowRunner: created taskId is required");
+      const attempt = checkpointed.get(index);
+      if (attempt == null) {
+        // Adapters without a reservation lifecycle checkpoint after creation.
+        await checkpoint(index, createdTask.taskId);
+      } else {
+        assert(
+          attempt.taskId === createdTask.taskId,
+          "WorkflowRunner lifecycle taskId must match created taskId"
+        );
+      }
+    }
+    if (upstream?.aborted === true) {
+      // Late reservation: the batch/run was aborted while admission was already past its fence.
+      // The children are run descendants, so stopping the run again (idempotent) covers them.
+      await this.taskAdapter.interruptRun?.();
+      await disposeCheckpointed();
+      throw createReservationCanceledError(stepIds);
+    }
+    return createdTasks.map((createdTask) => createdTask.taskId);
+  }
+
+  /**
+   * The single chokepoint for replacements (G2): before any reservation event or child exists,
+   * claim every prior child's ended attempt. The classifier decided the attempt ended without a
+   * report; the claim makes that decision exclusive, and the reservation's publishing commit
+   * consumes it once (#4452 gap 2). Any refusal leaves the step unresolved — never retried here,
+   * never replaced unclaimed. This includes this process's own settled attempts, so a
+   * pre-identity owned attempt (no attempt id to claim) is no longer replaced automatically.
+   *
+   * A crash (or stall) between recordStartedAttemptFailed and this claim leaves a failed
+   * checkpoint naming the ended child; its re-run consults that child (consultFailedCheckpoint)
+   * and claims it again, which re-stamps the nonce, so the stalled runner can no longer publish.
+   */
+  private async claimPriorChildren(
+    steps: ReadonlyArray<{
+      spec: WorkflowAgentSpec;
+      inputHash: string;
+      priorChild?: WorkflowPriorChild;
+    }>,
+    leaseGuard: WorkflowRunnerLeaseGuard
+  ): Promise<Array<{ taskId: string; attemptId: string; nonce: string } | undefined> | undefined> {
+    if (!steps.some((step) => step.priorChild != null)) return undefined;
+    const retires: Array<{ taskId: string; attemptId: string; nonce: string } | undefined> = [];
+    for (const step of steps) {
+      const prior = step.priorChild;
+      if (prior == null) {
+        retires.push(undefined);
+        continue;
+      }
+      const unresolved = (detail: string) =>
+        new WorkflowPriorAttemptUnresolvedError(
+          step.spec.id,
+          prior.taskId,
+          "claim-refused",
+          detail
+        );
+      if (prior.attemptId == null) {
+        throw unresolved("the previous attempt has no attempt identity, so it cannot be retired");
+      }
+      if (this.taskAdapter.claimRetiredAttempt == null) {
+        throw unresolved("the task adapter cannot retire attempts");
+      }
+      leaseGuard.throwIfLost();
+      const claim = await this.taskAdapter.claimRetiredAttempt(prior.taskId, prior.attemptId, {
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+      });
+      leaseGuard.throwIfLost();
+      if (!claim.success) {
+        throw unresolved(`retiring the previous attempt was refused: ${claim.error}`);
+      }
+      retires.push({ taskId: prior.taskId, attemptId: prior.attemptId, nonce: claim.nonce });
+    }
+    return retires;
+  }
+
+  /**
+   * Failed-checkpoint consultation (G2 PR B2): a step the journal records as FAILED may still name
+   * a child, and re-running it blindly could start a second child next to a live one, or replace
+   * an ended one without retiring it (a runner stalled between recording the failure and its
+   * claim could then still publish). So the named child is classified first:
+   * - live, cleanup pending or timed out → unresolved (resume again once it settles);
+   * - ended without a report → the fresh reservation retires it (claim, single-use publication);
+   * - reported → fresh run: the step failed after that report (e.g. its output was rejected), so
+   *   adopting it again would fail the same way;
+   * - no task record (strict read) → fresh run. On a STARTED checkpoint no-record may be a
+   *   reservation still before its publishing commit, so classifyPriorAttempt tombstones the ID
+   *   before it runs the step fresh (a refused tombstone leaves it unresolved); a failed
+   *   label is only written after an outcome read of a published child or by the reserving
+   *   runner once its own commit failed, so here the row was removed or never published;
+   * - any other indeterminate outcome (including an adapter that cannot classify) → unresolved.
+   * The disposition depends only on the child's evidence, never on the journal's "failed" label:
+   * that label is written before the claim (a runner can stall between the two), so it does not
+   * prove the child is retired, only that a runner decided to retire it.
+   * Returns the prior child to retire, or undefined for a plain fresh run.
+   */
+  private async consultFailedCheckpoint(
+    step: { stepId: string; taskId: string },
+    options: { leaseGuard: WorkflowRunnerLeaseGuard; runAbortSignal?: AbortSignal }
+  ): Promise<WorkflowPriorChild | undefined> {
+    options.leaseGuard.throwIfLost();
+    const outcome = await this.resolveAttemptOutcome(step.taskId, {
+      ...(options.runAbortSignal != null ? { abortSignal: options.runAbortSignal } : {}),
+      wait: "pending",
+    });
+    options.leaseGuard.throwIfLost();
+    switch (outcome.kind) {
+      case "terminal-no-report":
+        // No row to retire (e.g. its reservation was canceled before the commit): fresh run.
+        if (outcome.code === "no-record") return undefined;
+        // A terminal failure (e.g. a refusal under onRefusal: "fail") is the step's result, as in
+        // classifyPriorAttempt: it fails the step again, never retired and replaced.
+        if (outcome.failure != null) throw new Error(outcome.failure.errorMessage);
+        return { taskId: step.taskId, attemptId: outcome.attemptId };
+      case "reported":
+        return undefined;
+      case "indeterminate":
+        if (outcome.code === "no-record") return undefined;
+        throw new WorkflowPriorAttemptUnresolvedError(
+          step.stepId,
+          step.taskId,
+          "indeterminate",
+          `nothing proves the failed step's previous child ended (${outcome.reason}); stop or delete it to re-run the step`
+        );
+      case "live":
+      case "cleanup-pending":
+      case "timeout":
+        throw new WorkflowPriorAttemptUnresolvedError(
+          step.stepId,
+          step.taskId,
+          outcome.kind,
+          "the failed step's previous child has not settled; resume again once it does"
+        );
+    }
+  }
+
+  /**
+   * Decides what a resumed step does with its checkpointed prior attempt before reattaching or
+   * discarding it. Never replaces a child whose report may still arrive: only a positively
+   * absent report after settlement yields `replace`.
+   */
+  private async classifyPriorAttempt(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    attempt: OwnedWorkflowAgentAttempt,
+    options: { leaseGuard: WorkflowRunnerLeaseGuard; runAbortSignal?: AbortSignal }
+  ): Promise<WorkflowPriorAttemptClassification> {
+    options.leaseGuard.throwIfLost();
+    const outcome = await this.resolveAttemptOutcome(attempt.taskId, {
+      ...(options.runAbortSignal != null ? { abortSignal: options.runAbortSignal } : {}),
+      wait: "pending",
+    });
+    options.leaseGuard.throwIfLost();
+    switch (outcome.kind) {
+      case "reported":
+        this.trackAttempt(runId, attempt);
+        return { kind: "adopt", report: outcome.report };
+      case "live":
+        this.trackAttempt(runId, attempt);
+        return { kind: "reattach" };
+      case "terminal-no-report":
+        this.trackAttempt(runId, attempt);
+        await this.recordStartedAttemptFailed(
+          runId,
+          sequence,
+          attempt,
+          outcome.failure?.errorMessage ??
+            `agent ${attempt.stepId} task ${attempt.taskId} ended without a report`
+        );
+        // A terminal failure (e.g. a model refusal under onRefusal: "fail") is the step's
+        // result: it fails the step as it would have in the child's own process, never replaced.
+        if (outcome.failure != null) throw new Error(outcome.failure.errorMessage);
+        return { kind: "replace", attemptId: outcome.attemptId };
+      case "indeterminate": {
+        let reason = outcome.reason;
+        if (outcome.code === "no-record") {
+          // The started checkpoint names a child no backend published (and this process
+          // owns no attempt for it): its reserving backend died, or is stalled, before the
+          // publishing commit. Tombstone the ID first, so that late commit can never land, then
+          // run the step fresh. Unfenced replacement could publish two children (see
+          // TaskService.tombstoneUnpublishedReservation).
+          if (this.taskAdapter.tombstoneUnpublishedTask != null) {
+            options.leaseGuard.throwIfLost();
+            const tombstoned = await this.taskAdapter.tombstoneUnpublishedTask(attempt.taskId);
+            options.leaseGuard.throwIfLost();
+            if (tombstoned.success) return { kind: "fresh" };
+            reason = `${reason}; tombstoning it was refused: ${tombstoned.error}`;
+          }
+        }
+        await this.recordAgentAttemptIndeterminateEventIfMissing(runId, sequence, {
+          stepId: attempt.stepId,
+          inputHash: attempt.inputHash,
+          taskId: attempt.taskId,
+          title: attempt.title,
+          reason,
+        });
+        throw new WorkflowPriorAttemptUnresolvedError(
+          attempt.stepId,
+          attempt.taskId,
+          "indeterminate",
+          reason
+        );
+      }
+      case "cleanup-pending":
+      case "timeout":
+        throw new WorkflowPriorAttemptUnresolvedError(
+          attempt.stepId,
+          attempt.taskId,
+          outcome.kind,
+          "the previous attempt's cleanup is still in progress; resume again once it settles"
+        );
+    }
+  }
+
+  /**
+   * Disposition after a report wait rejected for a checkpointed attempt. Records the terminal
+   * task event as before, then decides report-first: an already persisted report is adopted, a
+   * positively absent one fails the attempt (and, for a resumed prior attempt on the exact
+   * restart sentinels, allows exactly one replacement), anything unresolved is retained. An
+   * aborted batch never recreates a child; a run-level abort leaves settlement to the
+   * cancellation drain.
+   */
+  private async handleAgentWaitFailure(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    attempt: OwnedWorkflowAgentAttempt,
+    error: unknown,
+    options: {
+      leaseGuard: WorkflowRunnerLeaseGuard;
+      waitOptions?: WorkflowAgentWaitOptions;
+      runAbortSignal?: AbortSignal;
+      allowReplacement: boolean;
+    }
+  ): Promise<WorkflowPriorAttemptPlan> {
+    if (isForegroundWaitBackgroundedError(error)) {
+      return { kind: "rethrow" };
+    }
+    const runAborted = options.runAbortSignal?.aborted === true;
+    if (!isWorkflowAgentHardTimeoutError(error)) {
+      options.leaseGuard.throwIfLost();
+      try {
+        await this.recordTaskTerminalEventIfMissing(runId, sequence, {
+          stepId: attempt.stepId,
+          taskId: attempt.taskId,
+          title: attempt.title,
+          status: getTaskTerminalStatusForError(error, options.waitOptions?.abortSignal),
+        });
+      } catch (eventError) {
+        // A Stop may have persisted `interrupted` already; the original failure is what matters.
+        if (!runAborted) {
+          throw eventError;
+        }
+        log.debug(
+          `[workflow-runner] Skipped terminal task event after abort: ${getErrorMessage(eventError)}`
+        );
+      }
+    }
+    if (isWorkflowAgentHardTimeoutError(error) || runAborted) {
+      // Hard timeouts already recorded their failed attempt; run aborts settle in the drain.
+      return { kind: "rethrow" };
+    }
+    if (options.waitOptions?.abortSignal?.aborted === true) {
+      // Batch-level abort (fail-fast): the batch asked the child to stop, so wait for it.
+      await this.disposeStartedAttempt(runId, sequence, attempt, {
+        leaseGuard: options.leaseGuard,
+        ...(options.runAbortSignal != null ? { abortSignal: options.runAbortSignal } : {}),
+        wait: "pending-or-live",
+      });
+      return { kind: "rethrow" };
+    }
+    const outcome = await this.resolveAttemptOutcome(attempt.taskId, {
+      ...(options.runAbortSignal != null ? { abortSignal: options.runAbortSignal } : {}),
+      wait: "pending-or-live",
+    });
+    options.leaseGuard.throwIfLost();
+    switch (outcome.kind) {
+      case "reported":
+        return { kind: "adopt", report: outcome.report };
+      case "terminal-no-report":
+        await this.recordStartedAttemptFailed(
+          runId,
+          sequence,
+          attempt,
+          `agent ${attempt.stepId} task ${attempt.taskId} ended without a report: ${getErrorMessage(error)}`
+        );
+        return options.allowReplacement &&
+          outcome.failure == null &&
+          shouldRestartUnrecoverableStartedTask(error)
+          ? { kind: "replace", attemptId: outcome.attemptId }
+          : { kind: "rethrow" };
+      case "indeterminate":
+        await this.recordAgentAttemptIndeterminateEventIfMissing(runId, sequence, {
+          stepId: attempt.stepId,
+          inputHash: attempt.inputHash,
+          taskId: attempt.taskId,
+          title: attempt.title,
+          reason: outcome.reason,
+        });
+        return { kind: "rethrow" };
+      case "live":
+      case "cleanup-pending":
+      case "timeout":
+        return { kind: "rethrow" };
+    }
+  }
+
+  /**
+   * Post-Stop disposition pass by the runner whose abort fired. Adopts reports that landed before
+   * the stop and fails attempts that settled without one; anything still live, cleaning up, or
+   * indeterminate keeps its checkpoint for the next resume. Deliberately does not wait for
+   * settlement: that bounded wait belongs to resume, and Stop must release the lease promptly.
+   */
+  private async settleOwnedAttemptsAfterCancellation(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    abortSignal: AbortSignal,
+    leaseGuard: WorkflowRunnerLeaseGuard
+  ): Promise<void> {
+    assert(abortSignal.aborted, "cancellation drain requires the runner's aborted signal");
+    const owned = this.ownedAttemptsByRun.get(runId);
+    if (owned == null || owned.size === 0) {
+      return;
+    }
+    const attempts = Array.from(owned.values());
+    let settlement: WorkflowCancellationSettlement;
+    try {
+      settlement = await this.runStore.openCancellationSettlement(
+        runId,
+        this.runnerId,
+        abortSignal
+      );
+    } catch (error) {
+      log.warn(`[workflow-runner] Skipping cancellation drain: ${getErrorMessage(error)}`, {
+        runId,
+      });
+      return;
+    }
+    using _settlement = settlement;
+    const dispositions = await Promise.allSettled(
+      attempts.map(async (attempt) => {
+        leaseGuard.throwIfLost();
+        try {
+          return await this.disposeStartedAttempt(runId, sequence, attempt, {
+            leaseGuard,
+            wait: "never",
+            settlement,
+          });
+        } catch (error) {
+          // The indeterminate diagnostic is an ordinary event and is rejected once the run is
+          // interrupted; the checkpoint itself is what matters and it stays intact.
+          log.warn(`[workflow-runner] Cancellation drain could not settle ${attempt.taskId}`, {
+            runId,
+            stepId: attempt.stepId,
+            error: getErrorMessage(error),
+          });
+          throw error;
+        }
+      })
+    );
+    log.debug(`[workflow-runner] Cancellation drain settled ${dispositions.length} attempt(s)`, {
+      runId,
+    });
+  }
+
+  /**
+   * A resumed step could not resolve its prior attempt. Re-interrupt (running → interrupted is a
+   * valid transition) instead of failing so the run stays explicitly resumable, and stop any
+   * children this attempt started through the existing cancellation path.
+   */
+  private async appendInterruptedForUnresolvedAttempt(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    error: WorkflowPriorAttemptUnresolvedError,
+    leaseGuard: WorkflowRunnerLeaseGuard
+  ): Promise<void> {
+    await this.throwIfInterrupted(runId);
+    leaseGuard.throwIfLost();
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "error",
+      at: this.clock.nowIso(),
+      message: error.message,
+    });
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "status",
+      at: this.clock.nowIso(),
+      status: "interrupted",
+    });
+    await this.taskAdapter.interruptRun?.();
   }
 
   private async recordAgentReservationEventIfMissing(
@@ -2614,34 +3824,39 @@ export class WorkflowRunner {
       spec: WorkflowAgentSpec;
       inputHash: string;
       startedAt: string;
+      taskId: string;
       leaseGuard: WorkflowRunnerLeaseGuard;
       rawResult: WorkflowAgentResult;
-    }
+    },
+    settlement?: WorkflowCancellationSettlement
   ): Promise<StructuredTaskOutput> {
+    assert(
+      step.rawResult.taskId === step.taskId,
+      `agent ${step.spec.id} result task ${step.rawResult.taskId} does not match attempt ${step.taskId}`
+    );
     let result: StructuredTaskOutput;
     try {
       result = StructuredTaskOutputSchema.parse(step.rawResult);
     } catch (error) {
       const message = `agent ${step.spec.id} returned invalid task output: ${getErrorMessage(error)}`;
-      await this.recordFailedAgentAttempt(runId, sequence, step, message);
+      await this.recordFailedAgentAttempt(runId, sequence, step, message, settlement);
       throw new WorkflowAgentOutputValidationError(message);
     }
 
     if (step.spec.outputSchema !== undefined) {
       if (!Object.hasOwn(result, "structuredOutput") || result.structuredOutput === undefined) {
         const message = `agent ${step.spec.id} structured output failed schema validation: $.structuredOutput: Required property is missing`;
-        await this.recordFailedAgentAttempt(runId, sequence, step, message);
+        await this.recordFailedAgentAttempt(runId, sequence, step, message, settlement);
         throw new WorkflowAgentOutputValidationError(message);
       }
       const validation = validateJsonSchemaSubset(step.spec.outputSchema, result.structuredOutput);
       if (!validation.success) {
         const message = `agent ${step.spec.id} structured output failed schema validation: ${formatJsonSchemaValidationErrors(validation.errors)}`;
-        await this.recordFailedAgentAttempt(runId, sequence, step, message);
+        await this.recordFailedAgentAttempt(runId, sequence, step, message, settlement);
         throw new WorkflowAgentOutputValidationError(message);
       }
     }
     step.leaseGuard.throwIfLost();
-    const taskId = this.getTaskIdFromAgentResult(step.rawResult, step.spec.id);
     const completedAt = this.clock.nowIso();
     sequence.next();
     await this.runStore.recordStepCompletedAndAppendTaskEvent(
@@ -2649,14 +3864,19 @@ export class WorkflowRunner {
       {
         stepId: step.spec.id,
         inputHash: step.inputHash,
-        taskId,
+        taskId: step.taskId,
         title: step.spec.title,
         result,
         startedAt: step.startedAt,
         completedAt,
       },
-      { expectedLeaseOwnerId: this.runnerId }
+      this.attemptWriteOptions(settlement)
     );
+    this.untrackAttempt(runId, {
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      taskId: step.taskId,
+    });
     return result;
   }
 
@@ -2667,24 +3887,22 @@ export class WorkflowRunner {
       spec: WorkflowAgentSpec;
       inputHash: string;
       startedAt: string;
+      taskId: string;
       leaseGuard: WorkflowRunnerLeaseGuard;
-      rawResult: WorkflowAgentResult;
     },
-    message: string
+    message: string,
+    settlement?: WorkflowCancellationSettlement
   ): Promise<void> {
     step.leaseGuard.throwIfLost();
-    const taskId = getTaskIdFromUnknownAgentResult(step.rawResult);
     const failedAt = this.clock.nowIso();
     sequence.next();
-    if (taskId != null) {
-      sequence.next();
-    }
+    sequence.next();
     await this.runStore.recordStepFailedAndAppendTaskEvent(
       runId,
       {
         stepId: step.spec.id,
         inputHash: step.inputHash,
-        taskId,
+        taskId: step.taskId,
         title: step.spec.title,
         error: message,
         startedAt: step.startedAt,
@@ -2692,17 +3910,13 @@ export class WorkflowRunner {
         validationAt: failedAt,
         taskFailedAt: failedAt,
       },
-      { expectedLeaseOwnerId: this.runnerId }
+      this.attemptWriteOptions(settlement)
     );
-  }
-
-  private getTaskIdFromAgentResult(result: WorkflowAgentResult, stepId: string): string {
-    const maybeTaskId = result.taskId;
-    assert(
-      typeof maybeTaskId === "string" && maybeTaskId.length > 0,
-      `agent ${stepId} returned no taskId`
-    );
-    return maybeTaskId;
+    this.untrackAttempt(runId, {
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      taskId: step.taskId,
+    });
   }
 }
 
@@ -3296,6 +4510,15 @@ function __muxApplyPatch(spec) {
   }
   return __workflowApplyPatch(spec);
 }
+function __muxEvaluate(state, options) {
+  if (__muxParallelCollectingAgents !== null || __muxPipelineCollectingAgents !== null) {
+    throw new Error("evaluate() cannot run inside parallel()/pipeline() yet; call it sequentially");
+  }
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new Error("evaluate requires an options object");
+  }
+  return __workflowEvaluate(state, options);
+}
 function __muxNestedWorkflow(scriptPathOrSpec, options) {
   let spec;
   if (typeof scriptPathOrSpec === "string") {
@@ -3393,6 +4616,7 @@ return (async () => await __muxWorkflow({
   parallel: __muxParallel,
   pipeline: __muxPipeline,
   applyPatch: __muxApplyPatch,
+  evaluate: __muxEvaluate,
   workflow: __muxNestedWorkflow,
 }))();
 `;

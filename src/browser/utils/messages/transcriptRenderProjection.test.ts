@@ -1,10 +1,17 @@
 import { describe, expect, test } from "bun:test";
+import { TRANSCRIPT_REVEAL_STEP_CHARS } from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import {
   computeOperationalBundleInfos,
   computeWorkBundleInfos,
+  estimateTranscriptRowWeight,
   summarizeOperationalBundle,
 } from "./transcriptRenderProjection";
+
+// ChatPane groups only task_await polls outside hyper density.
+function computeTaskAwaitPollGroupInfos(messages: DisplayedMessage[]) {
+  return computeOperationalBundleInfos(messages, { isTurnActive: false, taskAwaitPollsOnly: true });
+}
 
 let nextToolId = 0;
 
@@ -23,7 +30,6 @@ function tool(
     status: overrides.status ?? "completed",
     isPartial: overrides.isPartial ?? false,
     historySequence: overrides.historySequence ?? 1,
-    streamSequence: overrides.streamSequence,
     isLastPartOfMessage: overrides.isLastPartOfMessage,
     timestamp: overrides.timestamp,
     nestedCalls: overrides.nestedCalls,
@@ -42,7 +48,6 @@ function reasoning(
     historySequence: overrides.historySequence ?? 1,
     isStreaming: overrides.isStreaming ?? false,
     isPartial: overrides.isPartial ?? false,
-    streamSequence: overrides.streamSequence,
     isLastPartOfMessage: overrides.isLastPartOfMessage,
     isOnlyMessageContent: overrides.isOnlyMessageContent,
     timestamp: overrides.timestamp,
@@ -69,13 +74,11 @@ function assistant(
     historyId: overrides.historyId ?? `history-${id}`,
     content: overrides.content ?? "done",
     historySequence: overrides.historySequence ?? 1,
-    streamSequence: overrides.streamSequence,
     isStreaming: overrides.isStreaming ?? false,
     isPartial: overrides.isPartial ?? false,
     isLastPartOfMessage: overrides.isLastPartOfMessage,
     isCompacted: overrides.isCompacted ?? false,
     isIdleCompacted: overrides.isIdleCompacted ?? false,
-    isSideAnswer: overrides.isSideAnswer,
     timestamp: overrides.timestamp,
   };
 }
@@ -101,6 +104,49 @@ function planDisplay(id: string, historyId: string): DisplayedMessage & { type: 
     historySequence: 1,
   };
 }
+
+describe("estimateTranscriptRowWeight", () => {
+  test("charges a stream error for the text it mounts, not a nominal marker", () => {
+    const verbose = { ...streamError("e1", "h-e1"), error: "x".repeat(50_000) };
+    const marker = streamError("e2", "h-e2");
+    // Distinct verbose failures are not merged, so a run of them would otherwise mount far more
+    // than the step ceiling accounts for.
+    expect(estimateTranscriptRowWeight(verbose)).toBeGreaterThanOrEqual(50_000);
+    expect(estimateTranscriptRowWeight(verbose) - estimateTranscriptRowWeight(marker)).toBe(
+      50_000 - marker.error.length
+    );
+  });
+
+  test("charges tool payload nested inside result wrappers, not only top-level strings", () => {
+    const wrapped = tool({
+      id: "t1",
+      historyId: "h-t1",
+      timestamp: 1,
+      result: { type: "json", value: { content: [{ type: "text", text: "y".repeat(40_000) }] } },
+    });
+    const flat = tool({ id: "t2", historyId: "h-t2", timestamp: 1, result: "y".repeat(40_000) });
+    // A `{ type: "json", value }` result is serialized in full by an expanded card, so it must
+    // weigh like the same text delivered as a plain string.
+    expect(estimateTranscriptRowWeight(wrapped)).toBeGreaterThanOrEqual(40_000);
+    expect(estimateTranscriptRowWeight(wrapped)).toBeGreaterThanOrEqual(
+      estimateTranscriptRowWeight(flat)
+    );
+  });
+
+  test("stops charging a wide payload once it exceeds one reveal step", () => {
+    const wide = (fields: number) =>
+      tool({
+        id: `w-${fields}`,
+        historyId: `h-w-${fields}`,
+        timestamp: 1,
+        result: Array.from({ length: fields }, () => "z".repeat(1_000)),
+      });
+    // The caller only needs "heavier than one step": a result ten times wider weighs the same.
+    const saturated = estimateTranscriptRowWeight(wide(1_000));
+    expect(saturated).toBeGreaterThan(TRANSCRIPT_REVEAL_STEP_CHARS);
+    expect(estimateTranscriptRowWeight(wide(10_000))).toBe(saturated);
+  });
+});
 
 describe("work bundle coalescing", () => {
   test("collapses completed assistant work before the final row", () => {
@@ -208,58 +254,6 @@ describe("work bundle coalescing", () => {
     expect(infos[2]).toMatchObject({ key: "work:read-1", position: "member" });
     expect(infos[3]).toMatchObject({ key: "work:read-1", position: "member" });
     expect(infos[4]).toMatchObject({ key: "work:read-1", position: "final" });
-  });
-
-  test("keeps side-question answers visible while bundling surrounding agent work", () => {
-    const messages = [
-      user("u1"),
-      tool({ id: "read-1", historyId: "history-a1" }),
-      user("side-question-1"),
-      assistant("side-answer-1", { isSideAnswer: true }),
-      tool({ id: "bash-1", historyId: "history-a1", toolName: "bash" }),
-      assistant("final-1", { historyId: "history-a1" }),
-    ];
-
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[0]).toMatchObject({
-      key: "work:read-1",
-      headIndex: 0,
-      entries: [
-        { message: messages[1], originalIndex: 1 },
-        { message: messages[2], originalIndex: 2 },
-        { message: messages[3], originalIndex: 3 },
-        { message: messages[4], originalIndex: 4 },
-        { message: messages[5], originalIndex: 5 },
-      ],
-    });
-    expect(infos[1]).toMatchObject({ key: "work:read-1", position: "member" });
-    expect(infos[2]).toMatchObject({ key: "work:read-1", position: "member" });
-    expect(infos[3]).toMatchObject({ key: "work:read-1", position: "member" });
-    expect(infos[4]).toMatchObject({ key: "work:read-1", position: "member" });
-    expect(infos[5]).toMatchObject({ key: "work:read-1", position: "final" });
-  });
-
-  test("does not start a work bundle at a side-question answer", () => {
-    const messages = [
-      user("u1"),
-      assistant("side-answer-1", { isSideAnswer: true }),
-      tool({ id: "bash-1", historyId: "history-a1", toolName: "bash" }),
-      assistant("final-1", { historyId: "history-a1" }),
-    ];
-
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[0]).toBeUndefined();
-    expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toMatchObject({
-      key: "work:bash-1",
-      entries: [
-        { message: messages[2], originalIndex: 2 },
-        { message: messages[3], originalIndex: 3 },
-      ],
-    });
-    expect(infos[3]).toMatchObject({ key: "work:bash-1", position: "final" });
   });
 
   test("does not finalize work bundles before the first operation", () => {
@@ -502,6 +496,116 @@ describe("work bundle coalescing", () => {
   });
 });
 
+describe("task_await poll grouping", () => {
+  test("leaves standalone waits visible and collapses consecutive polls", () => {
+    const first = tool({ id: "await-1", toolName: "task_await", status: "completed" });
+    const second = tool({ id: "await-2", toolName: "task_await", status: "executing" });
+
+    expect(computeTaskAwaitPollGroupInfos([first])[0]).toBeUndefined();
+
+    const infos = computeTaskAwaitPollGroupInfos([first, second]);
+    expect(infos[0]).toMatchObject({
+      position: "head",
+      state: "active",
+      defaultExpanded: false,
+      summary: {
+        title: "Checked task status 2 times",
+        activeTitle: "Waiting for tasks · 2 checks",
+        details: "",
+      },
+    });
+    expect(infos[1]).toMatchObject({ position: "member", defaultExpanded: false });
+  });
+
+  test("expands poll groups with terminal failures", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({
+        id: "await-running",
+        toolName: "task_await",
+        result: { results: [{ status: "running", taskId: "task-1" }] },
+      }),
+      tool({
+        id: "await-failed",
+        toolName: "task_await",
+        result: { results: [{ status: "error", taskId: "task-1", error: "failed" }] },
+      }),
+    ]);
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: {
+        title: "Task wait needs attention",
+        activeTitle: "Task wait needs attention",
+        details: "2 checks",
+        tone: "danger",
+      },
+    });
+  });
+
+  test("expands groups with call-level task_await failures", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({
+        id: "await-running",
+        toolName: "task_await",
+        result: { results: [{ status: "running", taskId: "task-1" }] },
+      }),
+      tool({
+        id: "await-call-failed",
+        toolName: "task_await",
+        status: "failed",
+        result: { success: false, error: "service unavailable" },
+      }),
+    ]);
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Task wait needs attention", tone: "danger" },
+    });
+  });
+
+  test("expands groups with call-level interruptions", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({ id: "await-running", toolName: "task_await" }),
+      tool({
+        id: "await-interrupted",
+        toolName: "task_await",
+        status: "interrupted",
+      }),
+    ]);
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Task wait interrupted", tone: "interrupted" },
+    });
+  });
+
+  test("classifies interrupted error rows as cancelled waits", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({ id: "await-running", toolName: "task_await" }),
+      tool({
+        id: "await-aborted",
+        toolName: "task_await",
+        result: { results: [{ status: "error", taskId: "task-1", error: "Interrupted" }] },
+      }),
+    ]);
+
+    expect(infos[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Task wait interrupted", tone: "interrupted" },
+    });
+  });
+
+  test("conversation rows break poll groups", () => {
+    const infos = computeTaskAwaitPollGroupInfos([
+      tool({ id: "await-1", toolName: "task_await" }),
+      assistant("a1"),
+      tool({ id: "await-2", toolName: "task_await" }),
+    ]);
+
+    expect(infos.every((info) => info === undefined)).toBe(true);
+  });
+});
+
 describe("operational bundle coalescing", () => {
   test("groups consecutive reasoning and tool calls without mutating messages", () => {
     const first = reasoning({ id: "think-1" });
@@ -689,6 +793,36 @@ describe("operational bundle coalescing", () => {
     });
   });
 
+  test("keeps task_await operational bundles quiet unless they need attention", () => {
+    const active = computeOperationalBundleInfos(
+      [
+        tool({
+          id: "await-active",
+          toolName: "task_await",
+          status: "executing",
+          result: { results: [{ status: "running", taskId: "task-1" }] },
+        }),
+      ],
+      { isTurnActive: true }
+    );
+    expect(active[0]).toMatchObject({ defaultExpanded: false });
+
+    const failed = computeOperationalBundleInfos(
+      [
+        tool({
+          id: "await-failed",
+          toolName: "task_await",
+          result: { results: [{ status: "not_found", taskId: "task-1" }] },
+        }),
+      ],
+      { isTurnActive: false }
+    );
+    expect(failed[0]).toMatchObject({
+      defaultExpanded: true,
+      summary: { title: "Task wait needs attention", tone: "danger" },
+    });
+  });
+
   test("bundle key stays stable while an active bundle grows", () => {
     const one = computeOperationalBundleInfos([tool({ id: "read-1", status: "executing" })], {
       isTurnActive: true,
@@ -705,6 +839,20 @@ describe("operational bundle coalescing", () => {
 });
 
 describe("operational bundle summary", () => {
+  test("uses task-specific copy for repeated task_await polls", () => {
+    const summary = summarizeOperationalBundle([
+      tool({ id: "await-1", toolName: "task_await" }),
+      tool({ id: "await-2", toolName: "task_await" }),
+      tool({ id: "await-3", toolName: "task_await" }),
+    ]);
+
+    expect(summary).toEqual({
+      title: "Checked task status 3 times",
+      activeTitle: "Waiting for tasks · 3 checks",
+      details: "",
+    });
+  });
+
   test("summarizes mixed tools and reasoning", () => {
     const summary = summarizeOperationalBundle([
       reasoning({ id: "think-1" }),

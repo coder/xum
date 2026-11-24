@@ -30,6 +30,8 @@ export interface BuildTranscriptTruncationPlanArgs {
   displayedMessages: DisplayedMessage[];
   maxDisplayedMessages: number;
   alwaysKeepMessageTypes: Set<DisplayedMessage["type"]>;
+  /** Preserve a specific old row (for example a Timeline reveal) without disabling the DOM cap. */
+  shouldAlwaysKeepMessage?: (message: DisplayedMessage) => boolean;
   maxHiddenSegments?: number;
 }
 
@@ -47,7 +49,8 @@ interface OmissionRunState {
 
 function collectOmissions(
   oldMessages: DisplayedMessage[],
-  alwaysKeepMessageTypes: Set<DisplayedMessage["type"]>
+  alwaysKeepMessageTypes: Set<DisplayedMessage["type"]>,
+  shouldAlwaysKeepMessage?: (message: DisplayedMessage) => boolean
 ): CollectedOmissions {
   const keptOldMessages: DisplayedMessage[] = [];
   const segments: OmissionSegment[] = [];
@@ -55,7 +58,7 @@ function collectOmissions(
   let activeRun: OmissionRunState | null = null;
 
   for (const message of oldMessages) {
-    if (alwaysKeepMessageTypes.has(message.type)) {
+    if (alwaysKeepMessageTypes.has(message.type) || shouldAlwaysKeepMessage?.(message) === true) {
       if (activeRun !== null) {
         segments.push(activeRun);
         activeRun = null;
@@ -125,6 +128,29 @@ function capOmissionSegments(
   return [mergedPrefix, ...segments.slice(mergedPrefixCount)];
 }
 
+type HistoryHiddenRow = Extract<DisplayedMessage, { type: "history-hidden" }>;
+
+// Rows are memoized on prop identity, and markers are rebuilt on every recompute (each stream
+// delta, each page of older rows). Reusing an equal marker keeps it from re-rendering (#4961
+// F20). Marker ids are positional and capped at maxHiddenSegments, so this holds a few entries.
+const previousHistoryHiddenRowById = new Map<string, { key: string; row: HistoryHiddenRow }>();
+
+/** Every field of a marker except its id, as one comparable value. */
+function historyHiddenRowKey(row: HistoryHiddenRow): string {
+  const counts = row.omittedMessageCounts;
+  return [row.hiddenCount, row.historySequence, counts?.tool, counts?.reasoning].join("/");
+}
+
+function reuseEqualHistoryHiddenRow(row: HistoryHiddenRow): HistoryHiddenRow {
+  const key = historyHiddenRowKey(row);
+  const previous = previousHistoryHiddenRowById.get(row.id);
+  if (previous?.key === key) {
+    return previous.row;
+  }
+  previousHistoryHiddenRowById.set(row.id, { key, row });
+  return row;
+}
+
 function renderKeptRowsWithMarkers(
   keptOldMessages: DisplayedMessage[],
   segments: OmissionSegment[]
@@ -147,13 +173,15 @@ function renderKeptRowsWithMarkers(
           ? segment.omittedMessageCounts
           : undefined;
 
-      rows.push({
-        type: "history-hidden",
-        id: `history-hidden-${segmentIndex + 1}`,
-        hiddenCount: segment.hiddenCount,
-        historySequence: -1,
-        omittedMessageCounts,
-      });
+      rows.push(
+        reuseEqualHistoryHiddenRow({
+          type: "history-hidden",
+          id: `history-hidden-${segmentIndex + 1}`,
+          hiddenCount: segment.hiddenCount,
+          historySequence: -1,
+          omittedMessageCounts,
+        })
+      );
 
       segmentIndex += 1;
     }
@@ -192,7 +220,11 @@ export function buildTranscriptTruncationPlan(
   const recentMessages = args.displayedMessages.slice(-args.maxDisplayedMessages);
   const oldMessages = args.displayedMessages.slice(0, -args.maxDisplayedMessages);
 
-  const omissionCollection = collectOmissions(oldMessages, args.alwaysKeepMessageTypes);
+  const omissionCollection = collectOmissions(
+    oldMessages,
+    args.alwaysKeepMessageTypes,
+    args.shouldAlwaysKeepMessage
+  );
   if (omissionCollection.hiddenCount === 0) {
     return {
       rows: [...omissionCollection.keptOldMessages, ...recentMessages],

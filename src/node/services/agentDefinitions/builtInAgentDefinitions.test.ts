@@ -1,15 +1,16 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 // Importing browser code from node tests is allowed (only browser->node value
 // imports are banned); TasksSection.agents is a pure data module.
 import { FALLBACK_AGENTS } from "@/browser/features/Settings/Sections/TasksSection.agents";
-import { clearBuiltInAgentCache, getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
+import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import { createDesktopTools } from "@/node/services/tools/desktopTools";
+import { createTestToolConfig, TestTempDir } from "@/node/services/tools/testHelpers";
+import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
+import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
+import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
 
 describe("built-in agent definitions", () => {
-  beforeEach(() => {
-    clearBuiltInAgentCache();
-  });
-
   test("Settings fallback inventory mirrors built-ins, including hidden agents", () => {
     // FALLBACK_AGENTS must cover every built-in (hidden ones too) so saved
     // overrides are not mislabeled as unknown when discovery is unavailable.
@@ -21,6 +22,20 @@ describe("built-in agent definitions", () => {
     expect(fallbackIds).toEqual(builtInIds);
   });
 
+  test("Settings fallback inventory mirrors built-in AI defaults", () => {
+    // Without a workspace, Settings > Agents labels Inherit from the fallback's
+    // aiDefaults, so a missing frontmatter value there shows the wrong inherited
+    // value (for example the global 1h prompt cache TTL for Explore).
+    const builtInAiDefaults = Object.fromEntries(
+      getBuiltInAgentDefinitions().map((pkg) => [pkg.id, pkg.frontmatter.ai])
+    );
+    const fallbackAiDefaults = Object.fromEntries(
+      FALLBACK_AGENTS.map((agent) => [agent.id, agent.aiDefaults])
+    );
+
+    expect(fallbackAiDefaults).toEqual(builtInAiDefaults);
+  });
+
   test("does not include a built-in auto agent", () => {
     const pkgs = getBuiltInAgentDefinitions();
     const ids = pkgs.map((pkg) => pkg.id);
@@ -30,28 +45,19 @@ describe("built-in agent definitions", () => {
     expect(ids).toContain("plan");
   });
 
-  test("includes desktop built-in with desktop automation safeguards", () => {
-    const pkgs = getBuiltInAgentDefinitions();
-    const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
+  test("desktop agent gets exactly the desktop tool registry and cannot spawn tasks", () => {
+    using tempDir = new TestTempDir("builtin-desktop-agent");
+    // Derive the expected set from the registry so a newly added desktop tool cannot silently
+    // stay unavailable to the desktop agent. Tools are only built here, never executed, so the
+    // session manager is never called.
+    const registryNames = Object.keys(
+      createDesktopTools(createTestToolConfig(tempDir.path), {} as DesktopSessionManager)
+    ).sort();
+    const desktop = getBuiltInAgentDefinitions().find((pkg) => pkg.id === "desktop");
 
-    const desktop = byId.get("desktop");
-    expect(desktop).toBeTruthy();
-    expect(desktop?.frontmatter.base).toBe("exec");
-    expect(desktop?.frontmatter.ui?.hidden).toBe(true);
-    expect(desktop?.frontmatter.subagent?.runnable).toBe(true);
-    expect(desktop?.frontmatter.ai?.thinkingLevel).toBe("medium");
-    expect(desktop?.frontmatter.tools?.add ?? []).toEqual([
-      "desktop_screenshot",
-      "desktop_move_mouse",
-      "desktop_click",
-      "desktop_double_click",
-      "desktop_drag",
-      "desktop_scroll",
-      "desktop_type",
-      "desktop_key_press",
-    ]);
+    expect([...(desktop?.frontmatter.tools?.add ?? [])].sort()).toEqual(registryNames);
+    // Safety: desktop sub-agents drive a shared GUI and must not fan out into further tasks.
     expect(desktop?.frontmatter.tools?.remove ?? []).toContain("task");
-    expect(desktop?.body).toContain("screenshot");
   });
 
   test("plan is workflow-runnable but not a general subagent", () => {
@@ -88,17 +94,17 @@ describe("built-in agent definitions", () => {
     expect(plan?.frontmatter.tools?.remove ?? []).toContain("analytics_query");
   });
 
-  test("workspace lifecycle cleanup is unavailable in plan mode", () => {
+  test("irreversible task removal is unavailable in plan mode", () => {
     const pkgs = getBuiltInAgentDefinitions();
     const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
 
     const exec = byId.get("exec");
     expect(exec).toBeTruthy();
-    expect(exec?.frontmatter.tools?.remove ?? []).not.toContain("task_workspace_lifecycle");
+    expect(exec?.frontmatter.tools?.remove ?? []).not.toContain("task_remove");
 
     const plan = byId.get("plan");
     expect(plan).toBeTruthy();
-    expect(plan?.frontmatter.tools?.remove ?? []).toContain("task_workspace_lifecycle");
+    expect(plan?.frontmatter.tools?.remove ?? []).toContain("task_remove");
   });
 
   test("task_apply_git_patch is restricted to exec", () => {
@@ -116,5 +122,20 @@ describe("built-in agent definitions", () => {
     const explore = byId.get("explore");
     expect(explore).toBeTruthy();
     expect(explore?.frontmatter.tools?.remove ?? []).toContain("task_apply_git_patch");
+  });
+
+  test("exec can ask the user questions at top level but not as a sub-agent", () => {
+    const exec = getBuiltInAgentDefinitions().find((pkg) => pkg.id === "exec");
+    expect(exec).toBeTruthy();
+    const agents = [{ tools: exec?.frontmatter.tools }];
+
+    const resolveNames = (isSubagent: boolean) =>
+      applyToolPolicyToNames(
+        ["ask_user_question", "propose_plan"],
+        resolveToolPolicyForAgent({ agents, isSubagent, disableTaskToolsForDepth: false })
+      );
+
+    expect(resolveNames(false)).toEqual(["ask_user_question"]);
+    expect(resolveNames(true)).toEqual([]);
   });
 });

@@ -57,6 +57,11 @@ interface GoalTabProps {
    * read-only stories don't break.
    */
   workspaceId?: string;
+  /**
+   * Sub-agent workspace: its goal can be paused, resumed and completed, but archiving files the
+   * goal on the parent-only goal board, so that action is hidden.
+   */
+  isChildWorkspace?: boolean;
   goal: GoalSnapshot | null;
   openCompleteInputRequest?: number;
   // GoalTab UI only invokes user-facing transitions (pause/resume/complete);
@@ -312,10 +317,10 @@ export function GoalTab(props: GoalTabProps) {
   const canPause = canEdit && activeMode === "running";
   const canResume = canEdit && (activeMode === "paused" || lifecycle === "complete");
   // Mark-complete mirrors backend `validateStatusTransition` exactly:
-  // only `active` (running) and `budget_limited` are valid sources for
-  // the complete transition. Paused goals must be resumed first; this
+  // every lifecycle-active mode (running, paused, budget-limited) may
+  // complete. A paused goal's work can finish without a resume first; this
   // matches the slash command + palette gating.
-  const canComplete = canEdit && (activeMode === "running" || activeMode === "budget_limited");
+  const canComplete = canEdit && lifecycle === "active";
 
   const setStatus = async (
     status: Exclude<GoalStatus, "budget_limited">,
@@ -408,7 +413,11 @@ export function GoalTab(props: GoalTabProps) {
         ? "border-warning/40 bg-warning-overlay"
         : "border-border-light bg-surface-secondary";
   const headerLabelClass =
-    activeMode === "running" ? "text-success" : isStalledActive ? "text-warning" : "text-muted";
+    activeMode === "running"
+      ? "text-success-text"
+      : isStalledActive
+        ? "text-warning"
+        : "text-muted";
 
   return (
     <section className="flex h-full flex-col gap-4 overflow-y-auto p-4" aria-label="Workspace goal">
@@ -630,7 +639,7 @@ export function GoalTab(props: GoalTabProps) {
           {canResume && lifecycle !== "complete" && (
             <button
               type="button"
-              className="border-success/40 bg-success/10 text-success hover:bg-success/20 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm"
+              className="border-success/40 bg-success/10 text-success-text hover:bg-success/20 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm"
               aria-label="Resume goal"
               onClick={() => void setStatus("active")}
             >
@@ -667,33 +676,35 @@ export function GoalTab(props: GoalTabProps) {
                 <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
                 Reopen
               </button>
-              <button
-                type="button"
-                className="bg-accent text-accent-foreground hover:bg-accent-dark inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm"
-                aria-label="Archive goal"
-                onClick={() => {
-                  // Route through `archiveGoal` so the goal lands in the
-                  // Archived board section instead of the legacy
-                  // `clearGoal` path (which would record an
-                  // `endReason: "completed"` history entry and land it in
-                  // Completed). `refreshBoard` is the same nudge the row
-                  // Archive button in `CompletedSection` uses.
-                  if (api && props.goal) {
-                    void api.workspace
-                      .archiveGoal({
-                        workspaceId: props.workspaceId ?? "",
-                        goalId: props.goal.goalId,
-                      })
-                      .then(() => refreshBoard())
-                      .catch(() => {
-                        /* swallow; UI stays at the current state */
-                      });
-                  }
-                }}
-              >
-                <Inbox className="h-3.5 w-3.5" aria-hidden="true" />
-                Archive
-              </button>
+              {props.isChildWorkspace !== true && (
+                <button
+                  type="button"
+                  className="bg-accent text-accent-foreground hover:bg-accent-button-hover inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm"
+                  aria-label="Archive goal"
+                  onClick={() => {
+                    // Route through `archiveGoal` so the goal lands in the
+                    // Archived board section instead of the legacy
+                    // `clearGoal` path (which would record an
+                    // `endReason: "completed"` history entry and land it in
+                    // Completed). `refreshBoard` is the same nudge the row
+                    // Archive button in `CompletedSection` uses.
+                    if (api && props.goal) {
+                      void api.workspace
+                        .archiveGoal({
+                          workspaceId: props.workspaceId ?? "",
+                          goalId: props.goal.goalId,
+                        })
+                        .then(() => refreshBoard())
+                        .catch(() => {
+                          /* swallow; UI stays at the current state */
+                        });
+                    }
+                  }}
+                >
+                  <Inbox className="h-3.5 w-3.5" aria-hidden="true" />
+                  Archive
+                </button>
+              )}
             </>
           )}
         </div>

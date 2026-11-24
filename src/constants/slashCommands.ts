@@ -10,22 +10,28 @@ export const WORKSPACE_ONLY_COMMAND_KEYS: ReadonlySet<string> = new Set([
   "clear",
   "compact",
   "dream",
+  "refine",
   "fork",
   "new",
+  "side",
+  "btw",
   "plan",
   "heartbeat",
-  "btw",
 ]);
 
 /**
  * Parsed command types that require an existing workspace context.
+ * The literal union lets chatCommands narrow ParsedCommand with a type guard
+ * so its dispatch switch stays compiler-checked exhaustive.
  */
-export const WORKSPACE_ONLY_COMMAND_TYPES: ReadonlySet<string> = new Set([
+export const WORKSPACE_ONLY_COMMAND_TYPE_LIST = [
   "clear",
   "compact",
   "dream",
+  "refine",
   "fork",
   "new",
+  "side",
   "plan-show",
   "plan-open",
   "heartbeat-set",
@@ -36,6 +42,30 @@ export const WORKSPACE_ONLY_COMMAND_TYPES: ReadonlySet<string> = new Set([
   "goal-resume",
   "goal-complete",
   "goal-clear",
-  "side-question",
   "workflow-run",
+] as const;
+
+export type WorkspaceOnlyCommandType = (typeof WORKSPACE_ONLY_COMMAND_TYPE_LIST)[number];
+
+// Typed as ReadonlySet<string> so callers can probe arbitrary command types.
+export const WORKSPACE_ONLY_COMMAND_TYPES: ReadonlySet<string> = new Set(
+  WORKSPACE_ONLY_COMMAND_TYPE_LIST
+);
+
+/** Side chats inherit a workspace; they cannot start work or mutate its persistent settings. */
+export const SIDE_CHAT_DISALLOWED_COMMAND_TYPES: ReadonlySet<string> = new Set([
+  ...WORKSPACE_ONLY_COMMAND_TYPES,
+  "idle-compaction",
+  // Speed toggles change provider-wide preferences, not just the ephemeral side chat.
+  "speed-mode-toggle",
+]);
+
+/** Include invalid/missing-argument parses so they get the same side-chat gate. */
+export const SIDE_CHAT_DISALLOWED_COMMAND_KEYS: ReadonlySet<string> = new Set([
+  ...WORKSPACE_ONLY_COMMAND_KEYS,
+  "idle",
+  "fast",
+  "ultrafast",
+  "workflow",
+  "goal",
 ]);

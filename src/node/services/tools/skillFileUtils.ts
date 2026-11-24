@@ -1,6 +1,14 @@
-import * as fsPromises from "fs/promises";
 import * as path from "path";
 import type { Stats } from "node:fs";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import { SkillNameSchema } from "@/common/orpc/schemas";
+import type { SkillName } from "@/common/types/agentSkill";
+import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import {
+  GLOBAL_WRITE_SANDBOX_ERROR,
+  sandboxBlocksGlobalWrites,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 
 /**
  * Local filesystem-only skill file utilities.
@@ -27,7 +35,9 @@ export function isAbsolutePathAny(filePath: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(filePath);
 }
 
-function resolveSkillFilePath(
+// Exported for validateSkillWriteProposal (staging-time validation must run
+// the SAME lexical normalization as the write path, not a re-implementation).
+export function resolveSkillFilePath(
   skillDir: string,
   filePath: string
 ): {
@@ -65,7 +75,7 @@ function resolveSkillFilePath(
 
 async function lstatIfExists(targetPath: string): Promise<Stats | null> {
   try {
-    return await fsPromises.lstat(targetPath);
+    return await nodeHostFiles.promises.lstat(targetPath);
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
       return null;
@@ -89,15 +99,33 @@ export function isPathInsideRoot(rootPath: string, targetPath: string): boolean 
  * stays under `containmentRoot`. Returns the canonical path on success; throws on
  * escape.
  */
+/**
+ * True when two host paths name one directory, resolved through links (~/.xum can be a link to
+ * ~/.mux). A path that cannot be resolved compares as written.
+ */
+export async function isSameHostDirectory(
+  a: string,
+  b: string,
+  /** The host filesystem (phase 5: a RuntimeFactory's). Absent: the Node layer. */
+  files: HostFiles = nodeHostFiles
+): Promise<boolean> {
+  const [realA, realB] = await Promise.all(
+    [a, b].map((target) => files.promises.realpath(target).catch(() => path.resolve(target)))
+  );
+  return realA === realB;
+}
+
 export async function ensurePathContained(
   containmentRoot: string,
   candidatePath: string,
-  options?: { allowMissing?: boolean }
+  options?: { allowMissing?: boolean },
+  /** As in isSameHostDirectory. */
+  files: HostFiles = nodeHostFiles
 ): Promise<string> {
-  const containmentRootReal = await fsPromises.realpath(containmentRoot);
+  const containmentRootReal = await files.promises.realpath(containmentRoot);
   const candidateReal = options?.allowMissing
-    ? await resolveRealPathAllowMissing(candidatePath)
-    : await fsPromises.realpath(candidatePath);
+    ? await resolveRealPathAllowMissing(candidatePath, files)
+    : await files.promises.realpath(candidatePath);
 
   if (!isPathInsideRoot(containmentRootReal, candidateReal)) {
     throw new Error("Path resolves outside containment root after symlink resolution.");
@@ -106,13 +134,16 @@ export async function ensurePathContained(
   return candidateReal;
 }
 
-async function resolveRealPathAllowMissing(targetPath: string): Promise<string> {
+async function resolveRealPathAllowMissing(
+  targetPath: string,
+  files: HostFiles = nodeHostFiles
+): Promise<string> {
   const missingSegments: string[] = [];
   let currentPath = targetPath;
 
   while (true) {
     try {
-      const realPath = await fsPromises.realpath(currentPath);
+      const realPath = await files.promises.realpath(currentPath);
       return missingSegments.length === 0 ? realPath : path.join(realPath, ...missingSegments);
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT")) {
@@ -142,12 +173,12 @@ export async function resolveContainedSkillFilePath(
 
   const rootReal = options?.allowMissingLeaf
     ? await resolveRealPathAllowMissing(skillDir)
-    : await fsPromises.realpath(skillDir);
+    : await nodeHostFiles.promises.realpath(skillDir);
   const rootPrefix = rootReal.endsWith(path.sep) ? rootReal : `${rootReal}${path.sep}`;
 
   const targetReal = options?.allowMissingLeaf
     ? await resolveRealPathAllowMissing(requestedPath)
-    : await fsPromises.realpath(requestedPath);
+    : await nodeHostFiles.promises.realpath(requestedPath);
 
   if (targetReal !== rootReal && !targetReal.startsWith(rootPrefix)) {
     throw new Error(
@@ -165,6 +196,14 @@ export async function resolveContainedSkillFilePath(
 
 /**
  * Unified directory-scope validation for local skill operations (write / delete).
+ *
+ * SECURITY: mutations intentionally reject symlinked skills roots and skill
+ * directories even when the resolved target stays inside the containment root.
+ * Reads and discovery accept contained symlinks (agent_skill_list,
+ * agentSkillsService), but mutating through a symlink alias is exposed to
+ * check-to-use races and silently edits the link target owned by whoever
+ * installed the link (e.g. a skill package manager), so writes must address
+ * the real path instead.
  *
  * Checks (in order):
  * 1. Skills root is not a symlink.
@@ -205,4 +244,19 @@ export const SKILL_FILENAME = "SKILL.md";
 /** Case-insensitive check whether a normalized relative path refers to the root SKILL.md file. */
 export function isSkillMarkdownRootFile(relativePath: string): boolean {
   return relativePath.toLowerCase() === SKILL_FILENAME.toLowerCase();
+}
+
+/**
+ * The skill name that a skill write or delete changes, or why it must not: a bad name, or a
+ * global skill that the agent sandbox keeps the agent from changing.
+ */
+export function parseSkillNameForChange(
+  name: string,
+  config: ToolConfiguration
+): { success: true; data: SkillName } | { success: false; error: string } {
+  const parsedName = SkillNameSchema.safeParse(name);
+  if (!parsedName.success) return { success: false, error: parsedName.error.message };
+  if (sandboxBlocksGlobalWrites(config))
+    return { success: false, error: GLOBAL_WRITE_SANDBOX_ERROR };
+  return { success: true, data: parsedName.data };
 }

@@ -26,8 +26,12 @@ function formatLineDelta(additions: number, deletions: number): React.ReactNode 
 
   return (
     <span className="counter-nums inline-flex items-center gap-2 whitespace-nowrap">
-      <span className={cn(additions > 0 ? "text-success-light" : "text-muted")}>+{additions}</span>
-      <span className={cn(deletions > 0 ? "text-warning-light" : "text-muted")}>-{deletions}</span>
+      <span className={cn(additions > 0 ? "text-success-light-text" : "text-muted")}>
+        +{additions}
+      </span>
+      <span className={cn(deletions > 0 ? "text-warning-light-text" : "text-muted")}>
+        -{deletions}
+      </span>
     </span>
   );
 }
@@ -48,7 +52,7 @@ function getHeaderSummary(summary: MultiProjectGitSummary | null): React.ReactNo
     fragments.push({
       key: "diverged",
       text: `${summary.divergedProjectCount} diverged`,
-      className: "text-accent",
+      className: "text-accent-text",
     });
   }
   if (summary.dirtyProjectCount > 0) {

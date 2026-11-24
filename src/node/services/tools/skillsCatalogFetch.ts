@@ -1,16 +1,16 @@
 import * as path from "path";
-import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat } from "fs/promises";
-import { tmpdir } from "os";
 
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
-import { execFileAsync } from "@/node/utils/disposableExec";
 
 import { MAX_FILE_SIZE } from "./fileCommon";
 import { resolveContainedSkillFilePath } from "./skillFileUtils";
+import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
+import { nodeHostProcesses } from "@/node/services/hostProcesses/nodeHostProcesses";
 
 const SEARCH_TIMEOUT_MS = 10_000;
-const SEARCH_USER_AGENT = "mux-desktop";
+// Display/product attribution for skills.sh; no server-side mux contract.
+const SEARCH_USER_AGENT = "xum-desktop";
 
 export const SKILLS_API_BASE = process.env.SKILLS_API_URL ?? "https://skills.sh";
 
@@ -46,7 +46,7 @@ export async function searchSkillsCatalog(
   url.searchParams.set("q", query);
   url.searchParams.set("limit", String(limit));
 
-  const response = await fetch(url.toString(), {
+  const response = await nodeHostProcesses.fetchUrl(url.toString(), {
     headers: { "User-Agent": SEARCH_USER_AGENT },
     signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
   });
@@ -64,15 +64,9 @@ export function tryParseSource(source: string): { owner: string; repo: string } 
   return { owner, repo };
 }
 
-export function parseSource(source: string): { owner: string; repo: string } {
-  const parsed = tryParseSource(source);
-  if (!parsed) throw new Error(`Invalid source format '${source}'. Expected 'owner/repo'`);
-  return parsed;
-}
-
 async function assertGitAvailable(): Promise<void> {
   try {
-    using proc = execFileAsync("git", ["--version"]);
+    using proc = nodeHostProcesses.execFile("git", ["--version"]);
     await proc.result;
   } catch {
     throw new Error("git is required for skills_catalog_read but was not found in PATH");
@@ -80,7 +74,13 @@ async function assertGitAvailable(): Promise<void> {
 }
 
 async function detectBranch(repoDir: string): Promise<string> {
-  using proc = execFileAsync("git", ["-C", repoDir, "rev-parse", "--abbrev-ref", "HEAD"]);
+  using proc = nodeHostProcesses.execFile("git", [
+    "-C",
+    repoDir,
+    "rev-parse",
+    "--abbrev-ref",
+    "HEAD",
+  ]);
   const { stdout } = await proc.result;
   return stdout.trim();
 }
@@ -124,12 +124,12 @@ async function resolveReadableCatalogSkillPath(
 ): Promise<CatalogSkillCandidate> {
   const { resolvedPath } = await resolveContainedSkillFilePath(skillsRoot, relativeSkillPath);
 
-  const leaf = await lstat(resolvedPath);
+  const leaf = await nodeHostFiles.promises.lstat(resolvedPath);
   if (leaf.isSymbolicLink()) {
     throw new Error(`Unsafe catalog skill path (symbolic link): ${relativeSkillPath}`);
   }
 
-  const target = await stat(resolvedPath);
+  const target = await nodeHostFiles.promises.stat(resolvedPath);
   if (!target.isFile()) {
     throw new Error(`Unsafe catalog skill path (non-regular file): ${relativeSkillPath}`);
   }
@@ -143,7 +143,7 @@ async function resolveReadableCatalogSkillPath(
  * Missing roots (ENOENT/ENOTDIR) are non-fatal — fall through to "not found".
  */
 async function assertSafeCatalogSkillsRoot(cloneDir: string, skillsRoot: string): Promise<void> {
-  const skillsRootStat = await lstat(skillsRoot).catch((error: unknown) => {
+  const skillsRootStat = await nodeHostFiles.promises.lstat(skillsRoot).catch((error: unknown) => {
     if (isMissingPathError(error)) return null;
     throw error;
   });
@@ -156,8 +156,8 @@ async function assertSafeCatalogSkillsRoot(cloneDir: string, skillsRoot: string)
     throw new Error("Unsafe catalog skills root (non-directory): skills");
   }
 
-  const cloneDirReal = await realpath(cloneDir);
-  const skillsRootReal = await realpath(skillsRoot);
+  const cloneDirReal = await nodeHostFiles.promises.realpath(cloneDir);
+  const skillsRootReal = await nodeHostFiles.promises.realpath(skillsRoot);
   const clonePrefix = cloneDirReal.endsWith(path.sep) ? cloneDirReal : `${cloneDirReal}${path.sep}`;
   if (skillsRootReal !== cloneDirReal && !skillsRootReal.startsWith(clonePrefix)) {
     throw new Error("Unsafe catalog skills root (resolves outside clone): skills");
@@ -177,6 +177,19 @@ function shouldSkipOversizedCandidate(byteSize: number): boolean {
   return byteSize > MAX_FILE_SIZE;
 }
 
+/**
+ * The one parse of a catalog SKILL.md. The fetch decides which file is the requested skill and the
+ * read returns it, so they must accept the same files. A catalog skill is a discovered skill:
+ * Claude Code and Codex load one whose description is over 1024 characters, so
+ * `allowDisplayName` cuts it as discovery does. The model installs from the read result through
+ * `agent_skill_write`, which stays strict (1024 at most), so the cut text is what that writer
+ * accepts. There is no `directoryName`, so the name stays strict: a catalog directory can differ
+ * from the frontmatter name.
+ */
+export function parseCatalogSkill(content: string, byteSize: number) {
+  return parseSkillMarkdown({ content, byteSize, allowDisplayName: true });
+}
+
 async function evaluateCatalogCandidate(
   candidate: CatalogSkillCandidate,
   skillId: string,
@@ -187,12 +200,9 @@ async function evaluateCatalogCandidate(
     return null;
   }
 
-  const content = await readFile(candidate.resolvedPath, "utf-8");
+  const content = await nodeHostFiles.promises.readFile(candidate.resolvedPath, "utf-8");
   try {
-    const parsed = parseSkillMarkdown({
-      content,
-      byteSize: candidate.byteSize,
-    });
+    const parsed = parseCatalogSkill(content, candidate.byteSize);
     if (parsed.frontmatter.name !== skillId) {
       return null;
     }
@@ -210,7 +220,9 @@ export async function fetchSkillContent(
 ): Promise<FetchedSkillContent> {
   await assertGitAvailable();
 
-  const cloneDir = await mkdtemp(path.join(tmpdir(), "mux-skill-"));
+  const cloneDir = await nodeHostFiles.promises.mkdtemp(
+    path.join(nodeHostPaths.tmpDir(), "mux-skill-")
+  );
 
   try {
     // Validate skillId and establish containment root
@@ -218,7 +230,7 @@ export async function fetchSkillContent(
     const skillsRoot = path.resolve(cloneDir, "skills");
 
     const repoUrl = `https://github.com/${owner}/${repo}.git`;
-    using cloneProc = execFileAsync("git", [
+    using cloneProc = nodeHostProcesses.execFile("git", [
       "clone",
       "--depth",
       "1",
@@ -253,8 +265,8 @@ export async function fetchSkillContent(
 
     let entries: Array<{ name: string; isDirectory: () => boolean }> = [];
     try {
-      await stat(skillsRoot);
-      entries = await readdir(skillsRoot, { withFileTypes: true });
+      await nodeHostFiles.promises.stat(skillsRoot);
+      entries = await nodeHostFiles.promises.readdir(skillsRoot, { withFileTypes: true });
     } catch (error) {
       if (!isMissingPathError(error)) {
         throw error;
@@ -299,6 +311,8 @@ export async function fetchSkillContent(
     const msg = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to clone ${owner}/${repo}: ${msg}`);
   } finally {
-    await rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
+    await nodeHostFiles.promises
+      .rm(cloneDir, { recursive: true, force: true })
+      .catch(() => undefined);
   }
 }

@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouting } from "@/browser/hooks/useRouting";
-import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceState, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import {
   formatCompactionCommandLine,
   getFollowUpContentText,
@@ -16,13 +14,17 @@ import {
 } from "@/browser/utils/compaction/suggestion";
 import { executeCompaction } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
+import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
 import type { FilePart, ProvidersConfigMap } from "@/common/orpc/types";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
   buildAgentSkillMetadata,
+  buildMcpPromptUserText,
+  withAgentSkillRefs,
+  withMcpPromptRefs,
   type CompactionFollowUpInput,
   type DisplayedMessage,
+  type MuxMessageMetadata,
 } from "@/common/types/message";
 
 interface CompactAndRetryState {
@@ -39,7 +41,8 @@ function findTriggerUserMessage(
 ): Extract<DisplayedMessage, { type: "user" }> | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (msg.type === "user") {
+    // Token Budget warnings are notices, never the request to re-send.
+    if (msg.type === "user" && msg.contextBudgetWarning == null) {
       return msg;
     }
   }
@@ -48,33 +51,79 @@ function findTriggerUserMessage(
 }
 
 /**
+ * A failed /compact offers compaction recovery, except for errors compaction
+ * cannot fix (credentials, quota, OpenAI Daybreak access-program rejections):
+ * the recovery card would misreport them as a context overflow.
+ */
+export function isCompactionRecoveryError(
+  lastMessage: DisplayedMessage | undefined,
+  triggerUserMessage: Extract<DisplayedMessage, { type: "user" }> | null
+): boolean {
+  return (
+    lastMessage?.type === "stream-error" &&
+    !!triggerUserMessage?.compactionRequest &&
+    !isProviderConfigFixableError(lastMessage.errorType)
+  );
+}
+
+/**
  * Build follow-up content from a user message source.
  * Preserves skill metadata if the original message was a skill invocation.
  */
-function buildFollowUpFromSource(
+export function buildFollowUpFromSource(
   source: Extract<DisplayedMessage, { type: "user" }>
 ): CompactionFollowUpInput {
-  return {
-    text: source.content,
-    fileParts: source.fileParts,
-    reviews: source.reviews,
-    muxMetadata: source.agentSkill
+  const slashMcpPromptRef = source.mcpPromptRefs?.find((ref) => ref.source === "slash");
+  const skillMetadata =
+    source.agentSkill && source.agentSkill.skillName !== slashMcpPromptRef?.commandKey
       ? buildAgentSkillMetadata({
           rawCommand: source.content,
           skillName: source.agentSkill.skillName,
           scope: source.agentSkill.scope,
           arguments: source.agentSkill.arguments,
         })
-      : undefined,
+      : undefined;
+
+  // MCP slash messages display raw commands but send transformed text. Rebuild
+  // provider content and preserve slash metadata so retried rows remain editable
+  // as their original invocation.
+  let text = source.content;
+  let promptMetadata: MuxMessageMetadata | undefined;
+  // Trim only for command detection/extraction (the parser accepted the
+  // original send from a trimmed view); rawCommand keeps source.content
+  // verbatim so the retried row displays exactly like the original.
+  const trimmedContent = source.content.trimStart();
+  if (slashMcpPromptRef && trimmedContent.startsWith("/")) {
+    const argumentText = trimmedContent.replace(/^\/\S+/, "").trimStart();
+    text = buildMcpPromptUserText(
+      slashMcpPromptRef.serverName,
+      slashMcpPromptRef.promptName,
+      argumentText
+    );
+    promptMetadata = {
+      type: "normal",
+      rawCommand: source.content,
+      commandPrefix: `/${slashMcpPromptRef.commandKey}`,
+    };
+  }
+
+  return {
+    text,
+    fileParts: source.fileParts,
+    reviews: source.reviews,
+    // Inline skill refs must survive alongside prompt refs; withAgentSkillRefs
+    // dedupes against the slash ref that buildAgentSkillMetadata already added.
+    muxMetadata: withAgentSkillRefs(
+      withMcpPromptRefs(skillMetadata ?? promptMetadata, source.mcpPromptRefs ?? []),
+      source.agentSkillRefs ?? []
+    ),
   };
 }
 
 export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRetryState {
   const workspaceState = useWorkspaceState(props.workspaceId);
   const { api } = useAPI();
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
+  const liveApi = useLiveAPI();
   const [providersConfig, setProvidersConfig] = useState<ProvidersConfigMap | null>(null);
   const { routePriority, routeOverrides } = useRouting();
   const [isRetryingWithCompaction, setIsRetryingWithCompaction] = useState(false);
@@ -96,22 +145,15 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
     return findTriggerUserMessage(workspaceState.messages);
   }, [workspaceState]);
 
-  const isCompactionRecoveryFlow =
-    lastMessage?.type === "stream-error" && !!triggerUserMessage?.compactionRequest;
+  const isCompactionRecoveryFlow = isCompactionRecoveryError(lastMessage, triggerUserMessage);
 
   const isContextExceeded =
     lastMessage?.type === "stream-error" && lastMessage.errorType === "context_exceeded";
 
   const showCompactionUI = isContextExceeded || isCompactionRecoveryFlow;
 
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
-  const configuredCompactionModel = agentAiDefaults.compact?.modelString ?? "";
+  const configuredCompactionModel =
+    useAppConfig((config) => config.agentAiDefaults?.compact?.modelString) ?? "";
 
   useEffect(() => {
     if (!api) return;
@@ -157,7 +199,6 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       return getHigherContextCompactionSuggestion({
         currentModel: compactionTargetModel,
         providersConfig,
-        policy: effectivePolicy,
         routePriority,
         routeOverrides,
       });
@@ -168,7 +209,6 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       const explicit = getExplicitCompactionSuggestion({
         modelId: preferred,
         providersConfig,
-        policy: effectivePolicy,
         routePriority,
         routeOverrides,
       });
@@ -180,7 +220,6 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
     return getHigherContextCompactionSuggestion({
       currentModel: compactionTargetModel,
       providersConfig,
-      policy: effectivePolicy,
       routePriority,
       routeOverrides,
     });
@@ -189,7 +228,6 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
     showCompactionUI,
     isCompactionRecoveryFlow,
     providersConfig,
-    effectivePolicy,
     configuredCompactionModel,
     routePriority,
     routeOverrides,
@@ -219,7 +257,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       model: compactionSuggestion.modelArg,
     });
 
-    if (!api) {
+    if (!liveApi) {
       insertIntoChatInput(suggestedCommandLine + "\n");
       return;
     }
@@ -236,6 +274,13 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         return;
       }
 
+      // The edit fence is captured at the user's click; a `history-changed` refusal falls
+      // through the existing failure path (command inserted into the composer), no auto-retry.
+      const historyEditPrecondition = workspaceStore.captureHistoryEditPrecondition(
+        props.workspaceId,
+        source.id
+      );
+
       // For compaction recovery (retrying a failed /compact), preserve the original settings.
       // The nested follow-up content is already in the correct format.
       if (source.compactionRequest) {
@@ -243,13 +288,14 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         const maxOutputTokens = parsedCompaction.maxOutputTokens;
         const nestedFollowUp = parsedCompaction.followUpContent;
         const result = await executeCompaction({
-          api,
+          api: liveApi,
           workspaceId: props.workspaceId,
           sendMessageOptions,
           model: compactionSuggestion.modelId,
           maxOutputTokens,
           followUpContent: nestedFollowUp,
           editMessageId: source.id,
+          historyEditPrecondition,
         });
 
         if (!result.success) {
@@ -276,12 +322,13 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       // For normal messages (not /compact), build follow-up content directly.
       const followUpContent = buildFollowUpFromSource(source);
       const result = await executeCompaction({
-        api,
+        api: liveApi,
         workspaceId: props.workspaceId,
         sendMessageOptions,
         model: compactionSuggestion.modelId,
         followUpContent,
         editMessageId: source.id,
+        historyEditPrecondition,
       });
 
       if (!result.success) {
@@ -296,14 +343,14 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         setIsRetryingWithCompaction(false);
       }
     }
-  }, [api, compactionSuggestion, props.workspaceId, triggerUserMessage]);
+  }, [liveApi, compactionSuggestion, props.workspaceId, triggerUserMessage]);
 
   /**
    * Auto-compact on context_exceeded. Runs silently - never touches chat input.
    * Returns true if compaction was attempted, false if preconditions not met.
    */
   const autoCompact = useCallback(async (): Promise<boolean> => {
-    if (!api || !triggerUserMessage || triggerUserMessage.compactionRequest) {
+    if (!liveApi || !triggerUserMessage || triggerUserMessage.compactionRequest) {
       return false;
     }
 
@@ -316,12 +363,17 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       const followUpContent = buildFollowUpFromSource(triggerUserMessage);
 
       const result = await executeCompaction({
-        api,
+        api: liveApi,
         workspaceId: props.workspaceId,
         sendMessageOptions,
         model: compactionSuggestion?.modelId,
         followUpContent,
         editMessageId: triggerUserMessage.id,
+        // Captured at the trigger; a `history-changed` refusal just reports false (no retry).
+        historyEditPrecondition: workspaceStore.captureHistoryEditPrecondition(
+          props.workspaceId,
+          triggerUserMessage.id
+        ),
       });
 
       if (!result.success) {
@@ -336,12 +388,12 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         setIsRetryingWithCompaction(false);
       }
     }
-  }, [api, compactionSuggestion?.modelId, props.workspaceId, triggerUserMessage]);
+  }, [liveApi, compactionSuggestion?.modelId, props.workspaceId, triggerUserMessage]);
 
   // Auto-trigger compaction on context_exceeded for seamless recovery.
   // Only auto-compact if we have a compaction suggestion; otherwise show manual UI.
   const shouldAutoCompact =
-    api &&
+    liveApi &&
     isContextExceeded &&
     providersConfig !== undefined &&
     compactionSuggestion &&

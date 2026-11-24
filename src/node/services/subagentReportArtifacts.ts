@@ -1,12 +1,12 @@
 import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
 import { log } from "@/node/services/log";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export interface SubagentReportArtifactsFile {
   version: 1;
@@ -32,6 +32,11 @@ export interface SubagentReportArtifactIndexEntry {
   planFilePath?: string;
   /** Estimated token count of delivered report markdown (~4 chars/token). */
   reportTokenEstimate?: number;
+  /**
+   * The child's taskAttemptId whose report this is (#7003). Absent on legacy artifacts and on
+   * entries an older Xum rewrote: those are unbound, so readers never settle an attempt from them.
+   */
+  taskAttemptId?: string;
 }
 
 export interface SubagentReportArtifact extends SubagentReportArtifactIndexEntry {
@@ -44,6 +49,11 @@ const SUBAGENT_REPORT_ARTIFACTS_FILE_NAME = "subagent-reports.json";
 const SUBAGENT_REPORT_DIR_NAME = "subagent-reports";
 const SUBAGENT_REPORT_FILE_NAME = "report.json";
 export const CHARS_PER_TOKEN_ESTIMATE = 4;
+
+/** An attempt id read back from disk: a non-empty string, else unbound. */
+function coerceAttemptId(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");
@@ -116,18 +126,41 @@ export async function readSubagentReportArtifactIndexEntry(
   return file.artifactsByChildTaskId[childTaskId] ?? null;
 }
 
+/**
+ * Strict read outcome: `absent` is POSITIVE evidence (the report body was never written — it is
+ * the first file publication writes), while `unreadable` covers I/O failures other than ENOENT and
+ * corrupt/incomplete bodies. Attempt disposition must never treat `unreadable` as "no report".
+ */
+export type SubagentReportArtifactReadResult =
+  | { kind: "found"; artifact: SubagentReportArtifact }
+  | { kind: "absent" }
+  | { kind: "unreadable"; error: string };
+
+/** Lenient reader: self-heals every non-found outcome to null (existing callers). */
 export async function readSubagentReportArtifact(
   workspaceSessionDir: string,
   childTaskId: string
 ): Promise<SubagentReportArtifact | null> {
+  const result = await readSubagentReportArtifactStrict(workspaceSessionDir, childTaskId);
+  return result.kind === "found" ? result.artifact : null;
+}
+
+export async function readSubagentReportArtifactStrict(
+  workspaceSessionDir: string,
+  childTaskId: string
+): Promise<SubagentReportArtifactReadResult> {
   const meta = await readSubagentReportArtifactIndexEntry(workspaceSessionDir, childTaskId);
+  const unreadable = (error: string): SubagentReportArtifactReadResult => ({
+    kind: "unreadable",
+    error,
+  });
 
   const reportPath = getSubagentReportArtifactPath(workspaceSessionDir, childTaskId);
   try {
     const raw = await fsPromises.readFile(reportPath, "utf-8");
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object") {
-      return null;
+      return unreadable("report body is not an object");
     }
 
     const obj = parsed as {
@@ -143,11 +176,12 @@ export async function readSubagentReportArtifact(
       structuredOutput?: unknown;
       planFilePath?: unknown;
       reportMarkdown?: unknown;
+      taskAttemptId?: unknown;
     };
 
     const reportMarkdown = typeof obj.reportMarkdown === "string" ? obj.reportMarkdown : null;
     if (!reportMarkdown || reportMarkdown.length === 0) {
-      return null;
+      return unreadable("report body has no reportMarkdown");
     }
 
     const title = typeof obj.title === "string" ? obj.title : undefined;
@@ -168,16 +202,22 @@ export async function readSubagentReportArtifact(
     if (meta) {
       // Trust the index file for metadata (versioned), but allow per-task file to override title.
       return {
-        ...meta,
-        model:
-          typeof meta.model === "string" && meta.model.trim().length > 0
-            ? meta.model.trim()
-            : undefined,
-        thinkingLevel: coerceThinkingLevel(meta.thinkingLevel),
-        title: title ?? meta.title,
-        structuredOutput: obj.structuredOutput,
-        planFilePath: planFilePath ?? meta.planFilePath,
-        reportMarkdown,
+        kind: "found",
+        artifact: {
+          ...meta,
+          model:
+            typeof meta.model === "string" && meta.model.trim().length > 0
+              ? meta.model.trim()
+              : undefined,
+          thinkingLevel: coerceThinkingLevel(meta.thinkingLevel),
+          title: title ?? meta.title,
+          structuredOutput: obj.structuredOutput,
+          planFilePath: planFilePath ?? meta.planFilePath,
+          // From the body, which holds the markdown it labels: the index is a separate, later
+          // write that a reader can see stale (or that failed). An older Xum's rewrite drops both.
+          taskAttemptId: coerceAttemptId(obj.taskAttemptId),
+          reportMarkdown,
+        },
       };
     }
 
@@ -191,30 +231,34 @@ export async function readSubagentReportArtifact(
       : null;
 
     if (!parentWorkspaceId || !createdAtMs || !updatedAtMs || !ancestorWorkspaceIds) {
-      return null;
+      return unreadable("report body is missing index metadata and self-describing fields");
     }
 
     return {
-      childTaskId,
-      parentWorkspaceId,
-      createdAtMs,
-      updatedAtMs,
-      model,
-      thinkingLevel,
-      title,
-      ancestorWorkspaceIds,
-      workflowOwnedAncestorWorkspaceIds,
-      structuredOutput: obj.structuredOutput,
-      planFilePath,
-      reportMarkdown,
+      kind: "found",
+      artifact: {
+        childTaskId,
+        parentWorkspaceId,
+        createdAtMs,
+        updatedAtMs,
+        model,
+        thinkingLevel,
+        title,
+        ancestorWorkspaceIds,
+        workflowOwnedAncestorWorkspaceIds,
+        structuredOutput: obj.structuredOutput,
+        planFilePath,
+        taskAttemptId: coerceAttemptId(obj.taskAttemptId),
+        reportMarkdown,
+      },
     };
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return null;
+      return { kind: "absent" };
     }
 
     log.error("Failed to read subagent report artifact", { childTaskId, error });
-    return null;
+    return unreadable(error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -222,8 +266,11 @@ export async function updateSubagentReportArtifactsFile(params: {
   workspaceId: string;
   workspaceSessionDir: string;
   update: (file: SubagentReportArtifactsFile) => void;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentReportArtifactsFile> {
-  return workspaceFileLocks.withLock(params.workspaceId, async () => {
+  const fileLocks = params.locks.workspaceFiles;
+  return fileLocks.withLock(params.workspaceId, async () => {
     const file = await readSubagentReportArtifactsFile(params.workspaceSessionDir);
     params.update(file);
 
@@ -256,10 +303,15 @@ export async function upsertSubagentReportArtifact(params: {
   structuredOutput?: unknown;
   title?: string;
   nowMs?: number;
+  /** The reporting attempt (see SubagentReportArtifactIndexEntry.taskAttemptId). */
+  taskAttemptId?: string;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentReportArtifactIndexEntry> {
   let updated: SubagentReportArtifactIndexEntry | null = null;
 
-  await workspaceFileLocks.withLock(params.workspaceId, async () => {
+  const fileLocks = params.locks.workspaceFiles;
+  await fileLocks.withLock(params.workspaceId, async () => {
     const nowMs = params.nowMs ?? Date.now();
 
     const model =
@@ -299,6 +351,7 @@ export async function upsertSubagentReportArtifact(params: {
             workflowOwnedAncestorWorkspaceIds: params.workflowOwnedAncestorWorkspaceIds,
             planFilePath,
             structuredOutput: params.structuredOutput,
+            taskAttemptId: params.taskAttemptId,
             reportMarkdown: params.reportMarkdown,
           },
           null,
@@ -326,6 +379,7 @@ export async function upsertSubagentReportArtifact(params: {
       planFilePath,
       structuredOutput: params.structuredOutput,
       ancestorWorkspaceIds: params.ancestorWorkspaceIds,
+      taskAttemptId: params.taskAttemptId,
     };
     updated.reportTokenEstimate = Math.ceil(
       params.reportMarkdown.length / CHARS_PER_TOKEN_ESTIMATE

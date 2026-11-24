@@ -8,7 +8,6 @@ import type {
   WorkspaceForkParams,
   WorkspaceForkResult,
 } from "./Runtime";
-import { runWorkspaceInitHook } from "./initHook";
 import { getErrorMessage } from "@/common/utils/errors";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 
@@ -30,6 +29,16 @@ export class LocalRuntime extends LocalBaseRuntime {
   constructor(projectPath: string) {
     super();
     this.projectPath = projectPath;
+  }
+
+  // Callers also build LocalRuntime for a worktree path (skill loaders); that path matches no
+  // project, so those commands get the shared limit.
+  protected override agentCgroupProjectPath(): string {
+    return this.projectPath;
+  }
+
+  protected override sandboxCheckoutRoot(): string {
+    return this.projectPath;
   }
 
   /**
@@ -86,14 +95,7 @@ export class LocalRuntime extends LocalBaseRuntime {
   }
 
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
-    return runWorkspaceInitHook({
-      params,
-      runtimeType: "local",
-      hookCheckPath: params.projectPath,
-      runHook: async ({ muxEnv, initLogger, abortSignal }) => {
-        await this.runInitHook(params.workspacePath, muxEnv, initLogger, abortSignal);
-      },
-    });
+    return this.initLocalWorkspace(params, "local");
   }
 
   /**

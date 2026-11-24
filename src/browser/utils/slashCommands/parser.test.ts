@@ -19,6 +19,14 @@ describe("commandParser", () => {
       expect(parseCommand(" ")).toBeNull();
     });
 
+    it.each(["fast", "ultrafast"] as const)("parses /%s as a speed toggle, not a model", (mode) => {
+      expectParse(`/${mode}`, { type: "speed-mode-toggle", mode });
+      expectParse(`  /${mode}  `, { type: "speed-mode-toggle", mode });
+      for (const suffix of [" on", " --off", "\nexplain this code"]) {
+        expect(parseCommand(`/${mode}${suffix}`)?.type).toBe("command-invalid-args");
+      }
+    });
+
     it("should parse /clear command", () => {
       expectParse("/clear", { type: "clear", mode: "hard" });
     });
@@ -32,6 +40,24 @@ describe("commandParser", () => {
         type: "unknown-command",
         command: "clear",
         subcommand: "--unknown",
+      });
+    });
+
+    it("parses /refine and exact '/refine apply', rejecting all other arguments", () => {
+      expectParse("/refine", { type: "refine" });
+      expectParse("/refine apply", { type: "refine", apply: true });
+      // Mistyped approvals must NOT fall through to a fresh run — that would
+      // overwrite the staged proposal the user meant to approve and incur
+      // another model call.
+      expectParse("/refine Apply", {
+        type: "unknown-command",
+        command: "refine",
+        subcommand: "Apply",
+      });
+      expectParse("/refine apply now", {
+        type: "unknown-command",
+        command: "refine",
+        subcommand: "apply now",
       });
     });
 
@@ -62,7 +88,7 @@ describe("commandParser", () => {
     });
 
     it("should parse /model with full provider:model format", () => {
-      expectModelSet("/model anthropic:claude-sonnet-5", KNOWN_MODELS.SONNET.id);
+      expectModelSet(`/model ${KNOWN_MODELS.SONNET.id}`, KNOWN_MODELS.SONNET.id);
     });
 
     it("should parse /compact -m with alias", () => {
@@ -152,17 +178,6 @@ describe("commandParser", () => {
         type: "unknown-command",
         command: "vim",
         subcommand: "enable",
-      });
-    });
-
-    it("should parse /fork with no args (seamless fork)", () => {
-      expectParse("/fork", { type: "fork" });
-    });
-
-    it("should parse /fork with start message", () => {
-      expectParse("/fork let's explore this idea", {
-        type: "fork",
-        startMessage: "let's explore this idea",
       });
     });
   });

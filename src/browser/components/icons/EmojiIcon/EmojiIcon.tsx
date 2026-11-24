@@ -1,4 +1,3 @@
-import { cn } from "@/common/lib/utils";
 import type { LucideIcon } from "lucide-react";
 import {
   AlertTriangle,
@@ -105,5 +104,9 @@ export function EmojiIcon(props: {
   const Icon = EMOJI_TO_ICON[normalizedEmoji] ?? Sparkles;
   const shouldSpin = props.spin ?? SPINNING_EMOJI.has(normalizedEmoji);
 
-  return <Icon aria-hidden="true" className={cn(props.className, shouldSpin && "animate-spin")} />;
+  const icon = <Icon aria-hidden="true" className={props.className} />;
+
+  // Animate an HTML wrapper so Chromium can composite the transform instead of
+  // recalculating styles for a transform applied directly to the SVG.
+  return shouldSpin ? <span className="inline-flex animate-spin">{icon}</span> : icon;
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import type { DevToolsEvent, DevToolsRunSummary, DevToolsStep } from "@/common/types/devtools";
@@ -9,16 +9,21 @@ export function useDevToolsSubscription(workspaceId: string) {
   const [runs, setRuns] = useState<DevToolsRunSummary[]>([]);
   const [stepsByRun, setStepsByRun] = useState<Map<string, DevToolsStep[]>>(new Map());
   const [error, setError] = useState<string | null>(null);
+  // The workspace whose runs are shown. Only another workspace clears them: a re-run for the same
+  // one (no client during a reconnect, then a new client) keeps them until the new snapshot.
+  const shownWorkspaceIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!api) {
+    if (shownWorkspaceIdRef.current !== workspaceId) {
+      shownWorkspaceIdRef.current = workspaceId;
       setRuns([]);
       setStepsByRun(new Map());
+    }
+
+    if (!api) {
       return;
     }
 
-    setRuns([]);
-    setStepsByRun(new Map());
     setError(null);
 
     const controller = new AbortController();
@@ -43,20 +48,9 @@ export function useDevToolsSubscription(workspaceId: string) {
             setRuns(event.runs);
             setStepsByRun(new Map());
             break;
-          case "run-created": {
-            setRuns((previousRuns) => {
-              // De-duplicate if the run is already in state (e.g., from initial snapshot).
-              const existingRunIndex = previousRuns.findIndex((run) => run.id === event.run.id);
-              if (existingRunIndex >= 0) {
-                const updatedRuns = [...previousRuns];
-                updatedRuns[existingRunIndex] = event.run;
-                return updatedRuns;
-              }
-
-              return [event.run, ...previousRuns];
-            });
+          case "run-created":
+            setRuns((previousRuns) => upsertRun(previousRuns, event.run));
             break;
-          }
           case "run-updated":
             setRuns((previousRuns) =>
               previousRuns.map((run) => (run.id === event.run.id ? event.run : run))
@@ -68,6 +62,18 @@ export function useDevToolsSubscription(workspaceId: string) {
           case "step-updated":
             setStepsByRun((previousStepsByRun) => upsertStep(previousStepsByRun, event.step));
             break;
+          case "runs-evicted": {
+            const evictedRunIds = new Set(event.runIds);
+            setRuns((previousRuns) => previousRuns.filter((run) => !evictedRunIds.has(run.id)));
+            setStepsByRun((previousStepsByRun) => {
+              const nextStepsByRun = new Map(previousStepsByRun);
+              for (const runId of evictedRunIds) {
+                nextStepsByRun.delete(runId);
+              }
+              return nextStepsByRun;
+            });
+            break;
+          }
           case "cleared":
             setRuns([]);
             setStepsByRun(new Map());
@@ -92,6 +98,21 @@ export function useDevToolsSubscription(workspaceId: string) {
   }, [api, workspaceId]);
 
   return { runs, stepsByRun, error };
+}
+
+function upsertRun(
+  previousRuns: DevToolsRunSummary[],
+  incomingRun: DevToolsRunSummary
+): DevToolsRunSummary[] {
+  // De-duplicate if the run is already in state (e.g., from initial snapshot).
+  const existingRunIndex = previousRuns.findIndex((run) => run.id === incomingRun.id);
+  if (existingRunIndex >= 0) {
+    const updatedRuns = [...previousRuns];
+    updatedRuns[existingRunIndex] = incomingRun;
+    return updatedRuns;
+  }
+
+  return [incomingRun, ...previousRuns];
 }
 
 function upsertStep(

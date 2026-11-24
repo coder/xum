@@ -5,9 +5,33 @@
  * - Extension → webview: {@link ExtensionToWebviewMessage} (includes oRPC responses + chat updates)
  */
 
-import type { WorkspaceChatMessage } from "mux/common/orpc/types";
+import type { WorkspaceChatMessage } from "xum/common/orpc/types";
+import type { FrontendWorkspaceMetadata } from "xum/common/types/workspace";
 
 export type UiWorkspaceRuntimeType = "local" | "worktree" | "ssh";
+
+/**
+ * The workspace's persisted agent and AI settings: exactly the fields the webview needs to resolve
+ * its composer (setWorkspaceAiMetadata) and apply the sub-agent agent lock (#4738).
+ * Deliberately narrow: no paths, prompts, runtime settings or other metadata.
+ */
+export type UiWorkspaceAiState = Pick<
+  FrontendWorkspaceMetadata,
+  "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings" | "aiSettingsByAgent"
+>;
+
+/** Task fields the sub-agent tasks strip reads (#5109); sent for sub-agent workspaces only. */
+export type UiWorkspaceTaskState = Pick<
+  FrontendWorkspaceMetadata,
+  "title" | "taskStatus" | "taskExecutionStatus" | "workflowTask" | "reportedAt" | "archivedAt"
+>;
+
+/** One workspace's slice of workspace.activity for the dock (#4971, #5109). */
+export interface UiWorkspaceActivity {
+  activeBashMonitorCount: number;
+  streaming: boolean;
+  activeWorkflowRunIds: string[];
+}
 
 export interface UiWorkspace {
   id: string;
@@ -23,6 +47,10 @@ export interface UiWorkspace {
 
   createdAt: string;
   unarchivedAt?: string | undefined;
+
+  /** Absent means the settings are unknown: the webview then never persists AI settings (#4755). */
+  ai?: UiWorkspaceAiState;
+  task?: UiWorkspaceTaskState;
 }
 
 export interface UiConnectionStatus {
@@ -31,23 +59,23 @@ export interface UiConnectionStatus {
   error?: string;
 }
 
-export type OrpcCall = {
+export interface OrpcCall {
   type: "orpcCall";
   requestId: string;
   path: string[];
   input: unknown;
   lastEventId?: string | undefined;
-};
+}
 
-export type OrpcCancel = {
+export interface OrpcCancel {
   type: "orpcCancel";
   requestId: string;
-};
+}
 
-export type OrpcStreamCancel = {
+export interface OrpcStreamCancel {
   type: "orpcStreamCancel";
   streamId: string;
-};
+}
 
 export type OrpcResponse =
   | {
@@ -71,22 +99,22 @@ export type OrpcResponse =
       error: string;
     };
 
-export type OrpcStreamData = {
+export interface OrpcStreamData {
   type: "orpcStreamData";
   streamId: string;
   value: unknown;
-};
+}
 
-export type OrpcStreamEnd = {
+export interface OrpcStreamEnd {
   type: "orpcStreamEnd";
   streamId: string;
-};
+}
 
-export type OrpcStreamError = {
+export interface OrpcStreamError {
   type: "orpcStreamError";
   streamId: string;
   error: string;
-};
+}
 
 export type WebviewToExtensionMessage =
   | { type: "ready" }
@@ -106,6 +134,9 @@ export type ExtensionToWebviewMessage =
   | { type: "setSelectedWorkspace"; workspaceId: string | null }
   | { type: "chatReset"; workspaceId: string }
   | { type: "chatEvent"; workspaceId: string; event: WorkspaceChatMessage }
+  // Activity of the selected workspace and its descendants, from workspace.activity (#4971,
+  // #5109). A workspace the backend has not reported yet is absent.
+  | { type: "workspaceActivity"; workspaceId: string; activity: Record<string, UiWorkspaceActivity> }
   | { type: "uiNotice"; level: "info" | "error"; message: string }
   | { type: "debugProbe"; attempt: number; sentAtMs: number }
   | OrpcResponse

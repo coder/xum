@@ -1,6 +1,6 @@
 ---
 name: background-monitors
-description: Run bounded background monitors that wake the agent only when a condition changes or the monitor finishes
+description: Run bounded background monitors that wake the agent only when a condition changes or the monitor finishes. Use before you write any watcher, poll loop or background wait for CI, PR checks, Codex or review verdicts, the merge queue, deployments or logs.
 ---
 
 # Background monitors
@@ -9,12 +9,13 @@ Use this skill when you need a long-running watcher for CI, mergeability, PR rev
 
 ## What wakes the parent
 
-Mux wakes the owning workspace in these cases:
+Xum wakes the owning workspace in these cases:
 
 - A background **task** or **workflow** reaches a terminal state (`completed`, `failed`, `interrupted`, or `error`).
 - A raw background `bash` process is launched with a `monitor` block and a complete output line matches the monitor regex.
+- A monitored `bash` process **settles** (exits, is killed, or hits its `timeout_secs`), even when no line ever matched — unless the monitor was launched with `wake_on_exit: false`, was already retired by `max_events`, or the task was explicitly cancelled (`task_stop` / terminate without flush / workspace cleanup). The settlement wake carries the exit status, not the output.
 
-Use `bash({ run_in_background: true, monitor: { filter: "FAILED|ERROR", max_events: 1 } })` for line-oriented shell output watchers such as dev servers, watch tests, and log tails. The process keeps running; Mux wakes the parent with the matched lines, and the parent should call `task_await` only if it needs surrounding/full output.
+Use `bash({ run_in_background: true, monitor: { filter: "FAILED|ERROR", max_events: 1 } })` for line-oriented shell output watchers such as dev servers, watch tests, and log tails. The process keeps running; Xum wakes the parent when a line matches. The wake names the process but carries none of its output, so the parent reads the output with `task_await`.
 
 Use background `task({ run_in_background: true, ... })` or `workflow_run({ run_in_background: true, ... })` for state polling that is not naturally a single process output stream, such as CI checks, mergeability, PR reviews, deployments, and queue state.
 
@@ -52,7 +53,8 @@ bash({
 Rules for `bash.monitor`:
 
 - Keep the regex specific enough to avoid wake storms; use `max_events` for noisy logs.
-- Treat matched lines as a wake signal, not full context; call `task_await({ task_ids: ["bash:<id>"], timeout_secs: 0 })` only when you need surrounding output.
+- The wake carries no output lines. `task_await({ task_ids: ["bash:<id>"], timeout_secs: 0 })` returns, as a tool result, the output after the process's read cursor. Every read of the process moves that cursor, a filtered read or a read from another workspace included, so lines that an earlier read returned or dropped do not come back.
+- A monitored process wakes the owner at settlement (exit, kill, timeout) even if the filter never matched, so a watcher script that dies unexpectedly cannot strand the agent. Pass `wake_on_exit: false` only when the exit itself is genuinely uninteresting. Monitors retired by `max_events` stop watching entirely and do not exit-wake, and explicit cancellation (`task_stop`, terminate without flush, workspace cleanup) deliberately produces no settlement wake — do not stop a task and then wait on its wake.
 - Do not use `bash.monitor` for GitHub checks, mergeability, review state, deploy APIs, or any state that requires polling separate commands. Use a background task/workflow monitor for those.
 
 ### Ad-hoc task monitor
@@ -84,7 +86,7 @@ Instructions:
 });
 ```
 
-The parent may end its turn after the `task` tool returns. Mux will wake the parent when the monitor task calls `agent_report` or settles terminally.
+The parent may end its turn after the `task` tool returns. Xum will wake the parent when the monitor task calls `agent_report` or settles terminally.
 
 ### Parallel PR monitors
 
@@ -100,6 +102,15 @@ Each monitor should have a distinct title and idempotency key. Do not make the p
 ### Durable workflow monitor
 
 Use a workflow when monitoring must be reusable, resumable, or composed with other phases. A workflow can run in the background and own multiple bounded monitor steps. Workflow-owned child agents report through the workflow journal; the parent wakes when the workflow reaches a terminal result.
+
+## Before finishing a response
+
+A monitor is workspace-lifetime, not turn-lifetime: it can wake the agent after the current response is complete. Before sending a final response, review monitored tasks you started:
+
+- Leave a monitor running only when a later wake-up is still useful and intentional.
+- Terminate irrelevant monitors with `task_stop` using their `bash:<processId>` task IDs.
+- Explicit termination is cancellation: pending coalesced matches and undelivered synthetic wakes for that monitor are discarded, and no settlement wake fires. Natural process exit and timeout instead settle the monitor: one combined wake reports any pending matches together with the terminal status. Like every wake, it carries none of the output.
+- Do not terminate unrelated long-running background processes merely because the current turn is ending; only clean up work whose future output no longer matters.
 
 ## Heartbeat fallback
 

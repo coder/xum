@@ -5,42 +5,15 @@
  * The hunk ID is already a content-based hash, so we use it as the content address.
  * We track the first time we see each hunk ID, which represents when the edit
  * that created this hunk content was first observed.
+ *
+ * Persisted in the backend review-state store; the shared merge keeps the existing
+ * timestamp, so a second window reporting the same hunk never moves first-seen later.
  */
 
-import { useCallback, useRef } from "react";
-import { usePersistedState } from "./usePersistedState";
-import { getHunkFirstSeenKey } from "@/common/constants/storage";
+import { useCallback } from "react";
+import { getReviewStateStore, useReviewStateSelector } from "@/browser/stores/ReviewStateStore";
 
-/**
- * Maximum number of first-seen records to keep per workspace (LRU eviction)
- */
-const MAX_FIRST_SEEN_RECORDS = 2048;
-
-/**
- * First-seen timestamps keyed by hunk ID (content address)
- */
-export interface HunkFirstSeenState {
-  /** Hunk ID -> timestamp when first seen */
-  firstSeen: Record<string, number>;
-}
-
-/**
- * Evict oldest entries if count exceeds max.
- * Keeps the newest maxCount entries by timestamp.
- */
-function evictOldestEntries(
-  firstSeen: Record<string, number>,
-  maxCount: number
-): Record<string, number> {
-  const entries = Object.entries(firstSeen);
-  if (entries.length <= maxCount) return firstSeen;
-
-  // Sort by timestamp descending (newest first)
-  entries.sort((a, b) => b[1] - a[1]);
-
-  // Keep only the newest maxCount
-  return Object.fromEntries(entries.slice(0, maxCount));
-}
+const EMPTY_FIRST_SEEN: Record<string, number> = {};
 
 export interface UseHunkFirstSeenReturn {
   /** Get the first-seen timestamp for a hunk ID, or undefined if never seen */
@@ -58,68 +31,35 @@ export interface UseHunkFirstSeenReturn {
  * Automatically records first-seen timestamps and provides lookup.
  */
 export function useHunkFirstSeen(workspaceId: string): UseHunkFirstSeenReturn {
-  const [state, setState] = usePersistedState<HunkFirstSeenState>(
-    getHunkFirstSeenKey(workspaceId),
-    { firstSeen: {} }
+  const firstSeen = useReviewStateSelector(
+    workspaceId,
+    (view) => view.sections.firstSeen ?? EMPTY_FIRST_SEEN
   );
-
-  // Track pending updates to batch them
-  const pendingUpdatesRef = useRef<Set<string>>(new Set());
-  const updateScheduledRef = useRef(false);
 
   const getFirstSeen = useCallback(
     (hunkId: string): number | undefined => {
-      return state.firstSeen[hunkId];
+      return firstSeen[hunkId];
     },
-    [state.firstSeen]
+    [firstSeen]
   );
 
   const recordFirstSeen = useCallback(
     (hunkIds: string[]) => {
-      // Add new IDs to pending set
-      for (const id of hunkIds) {
-        if (!(id in state.firstSeen)) {
-          pendingUpdatesRef.current.add(id);
+      const timestamp = Date.now();
+      getReviewStateStore().mutate(workspaceId, "firstSeen", (prev) => {
+        const set: Record<string, number> = {};
+        for (const id of hunkIds) {
+          if (!(id in prev)) set[id] = timestamp;
         }
-      }
-
-      // If we have pending updates and haven't scheduled yet, schedule a batch update
-      if (pendingUpdatesRef.current.size > 0 && !updateScheduledRef.current) {
-        updateScheduledRef.current = true;
-
-        // Use microtask to batch multiple recordFirstSeen calls in same render
-        queueMicrotask(() => {
-          updateScheduledRef.current = false;
-          const pending = pendingUpdatesRef.current;
-          if (pending.size === 0) return;
-
-          pendingUpdatesRef.current = new Set();
-          const timestamp = Date.now();
-
-          setState((prev) => {
-            // Double-check which IDs are actually new (state may have changed)
-            const newIds = Array.from(pending).filter((id) => !(id in prev.firstSeen));
-            if (newIds.length === 0) return prev;
-
-            const newFirstSeen = { ...prev.firstSeen };
-            for (const id of newIds) {
-              newFirstSeen[id] = timestamp;
-            }
-
-            // Apply LRU eviction if needed
-            const evicted = evictOldestEntries(newFirstSeen, MAX_FIRST_SEEN_RECORDS);
-
-            return { firstSeen: evicted };
-          });
-        });
-      }
+        return { set };
+      });
     },
-    [state.firstSeen, setState]
+    [workspaceId]
   );
 
   return {
     getFirstSeen,
     recordFirstSeen,
-    firstSeenMap: state.firstSeen,
+    firstSeenMap: firstSeen,
   };
 }

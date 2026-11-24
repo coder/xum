@@ -6,6 +6,8 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { cn } from "@/common/lib/utils";
 import { getModelName, getModelProvider } from "@/common/utils/ai/models";
 
+import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
+
 /** Searchable model dropdown with keyboard navigation */
 export function SearchableModelSelect(props: {
   value: string;
@@ -14,6 +16,8 @@ export function SearchableModelSelect(props: {
   placeholder?: string;
   emptyOption?: { value: string; label: string };
   compact?: boolean;
+  /** Extra trigger classes, merged last so callers can override the height. */
+  className?: string;
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -21,10 +25,14 @@ export function SearchableModelSelect(props: {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
+  // getModelName("") returns "" (not undefined), so the placeholder only shows
+  // when the empty value is checked explicitly.
   const displayValue =
     props.emptyOption && !props.value
       ? props.emptyOption.label
-      : (getModelName(props.value) ?? props.placeholder ?? "Select model");
+      : props.value
+        ? getModelName(props.value)
+        : (props.placeholder ?? "Select model");
   const selectedProvider = props.value ? getModelProvider(props.value) : "";
 
   // Filter models based on search
@@ -34,6 +42,9 @@ export function SearchableModelSelect(props: {
       model.toLowerCase().includes(searchLower) ||
       (getModelName(model)?.toLowerCase().includes(searchLower) ?? false)
   );
+  const hiddenModelCount = Math.max(0, filteredModels.length - MAX_RENDERED_MODELS);
+  const visibleModels =
+    hiddenModelCount > 0 ? filteredModels.slice(0, MAX_RENDERED_MODELS) : filteredModels;
 
   // Build list of all selectable items (empty option + filtered models)
   const items: Array<{ value: string; label: string; provider?: string; isMuted?: boolean }> = [];
@@ -44,7 +55,7 @@ export function SearchableModelSelect(props: {
       isMuted: true,
     });
   }
-  for (const model of filteredModels) {
+  for (const model of visibleModels) {
     items.push({
       value: model,
       label: getModelName(model) ?? model,
@@ -118,15 +129,11 @@ export function SearchableModelSelect(props: {
         <button
           className={cn(
             "bg-background-secondary border-border-medium focus:border-accent flex w-full items-center justify-between rounded border px-2 text-xs",
-            props.compact ? "py-0.5" : "h-8"
+            props.compact ? "py-0.5" : "h-8",
+            props.className
           )}
         >
-          <span
-            className={cn(
-              "flex items-center gap-1.5 truncate",
-              !props.value && props.emptyOption && "text-muted"
-            )}
-          >
+          <span className={cn("flex items-center gap-1.5 truncate", !props.value && "text-muted")}>
             {selectedProvider && (
               <ProviderIcon provider={selectedProvider} className="text-muted shrink-0" />
             )}
@@ -179,6 +186,11 @@ export function SearchableModelSelect(props: {
                 <span className={cn("truncate", item.isMuted && "text-muted")}>{item.label}</span>
               </button>
             ))
+          )}
+          {hiddenModelCount > 0 && (
+            <div className="text-muted px-2 py-1 text-center text-[10px]">
+              +{hiddenModelCount} more, keep typing to filter
+            </div>
           )}
         </div>
       </PopoverContent>

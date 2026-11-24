@@ -45,6 +45,7 @@ export interface BuildMockStreamEventsOptions {
   messageId: string;
   model?: string;
   mode?: "plan" | "exec" | "compact";
+  agentId?: string;
   thinkingLevel?: MockStreamStartEvent["thinkingLevel"];
 
   /** Chunk size for stream-delta events. */
@@ -77,6 +78,7 @@ export function buildMockStreamEventsFromReply(
     messageId: options.messageId,
     model,
     ...(mode && { mode }),
+    ...(options.agentId && { agentId: options.agentId }),
     ...(options.thinkingLevel && { thinkingLevel: options.thinkingLevel }),
   });
 
@@ -106,13 +108,14 @@ export function buildMockStreamEventsFromReply(
   nextDelay += reply.toolCallDelayMs ?? 0;
 
   if (reply.toolCalls && reply.toolCalls.length > 0) {
-    for (const toolCall of reply.toolCalls) {
+    for (const [index, toolCall] of reply.toolCalls.entries()) {
       events.push({
         kind: "tool-start",
         delay: nextDelay,
         toolCallId: toolCall.toolCallId,
         toolName: toolCall.toolName,
         args: toolCall.args,
+        ...(reply.holdToolCalls === true && index === 0 && { holdUntilReleased: true }),
       });
       nextDelay += 5;
 
@@ -146,6 +149,7 @@ export function buildMockStreamEventsFromReply(
       delay: terminalDelay,
       error: reply.error.message,
       errorType: reply.error.type,
+      ...(reply.error.retryAfterMs != null ? { retryAfterMs: reply.error.retryAfterMs } : {}),
     });
 
     return events;

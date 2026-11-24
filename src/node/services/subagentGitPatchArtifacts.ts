@@ -1,7 +1,7 @@
 import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import type {
   SubagentGitPatchArtifact,
@@ -9,7 +9,7 @@ import type {
 } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export interface SubagentGitPatchArtifactsFile {
   version: 2;
@@ -373,6 +373,11 @@ function normalizeArtifactsByChildTaskId(
         throw new Error(`Invalid subagent git patch artifact for task ${childTaskId}`);
       }
 
+      // The map key, not the entry's own childTaskId, names the patch folder
+      // (getSubagentGitPatchMboxPath), so it needs the same path check. A bad
+      // key skips only its own entry instead of failing every later write.
+      assertSafeSubagentGitPatchPathComponent(childTaskId, "childTaskId key");
+
       const normalizedArtifact =
         version === 1
           ? normalizeLegacyArtifact(artifact as LegacySubagentGitPatchArtifactV1)
@@ -517,6 +522,8 @@ export async function updateSubagentGitPatchArtifactsFile(params: {
    * can happen here without a read-then-act race.
    */
   update: (file: SubagentGitPatchArtifactsFile) => void | Promise<void>;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
   /**
    * Write failures are best-effort (logged) by default. Safety-critical
    * markers (partial application) must fail loudly instead: a silently
@@ -532,7 +539,8 @@ export async function updateSubagentGitPatchArtifactsFile(params: {
    */
   propagateReadErrors?: boolean;
 }): Promise<SubagentGitPatchArtifactsFile> {
-  return workspaceFileLocks.withLock(params.workspaceId, async () => {
+  const fileLocks = params.locks.workspaceFiles;
+  return fileLocks.withLock(params.workspaceId, async () => {
     const file = await readSubagentGitPatchArtifactsFile(params.workspaceSessionDir, {
       propagateReadErrors: params.propagateReadErrors,
     });
@@ -563,6 +571,8 @@ export async function upsertSubagentGitPatchArtifact(params: {
   workspaceSessionDir: string;
   childTaskId: string;
   updater: (existing: SubagentGitPatchArtifact | null) => SubagentGitPatchArtifact;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
   /** See updateSubagentGitPatchArtifactsFile: safety-critical markers must fail loudly. */
   propagateWriteErrors?: boolean;
 }): Promise<SubagentGitPatchArtifact> {
@@ -571,6 +581,7 @@ export async function upsertSubagentGitPatchArtifact(params: {
   await updateSubagentGitPatchArtifactsFile({
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.workspaceSessionDir,
+    locks: params.locks,
     propagateWriteErrors: params.propagateWriteErrors,
     update: (file) => {
       const existing = file.artifactsByChildTaskId[params.childTaskId] ?? null;
@@ -610,12 +621,15 @@ export async function markSubagentGitPatchArtifactApplied(params: {
   partialHeadSha?: string;
   /** Only meaningful with partial: true; absent means "commits-applied". */
   partialStage?: SubagentGitPatchPartialStage;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentGitPatchArtifact | null> {
   let updated: SubagentGitPatchArtifact | null = null;
 
   await updateSubagentGitPatchArtifactsFile({
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.workspaceSessionDir,
+    locks: params.locks,
     // Every write here records application evidence, so all failures must
     // surface: a silently unpersisted partial marker would let a retry
     // replay the already-applied commit series, and a silently unpersisted
@@ -916,6 +930,8 @@ export async function setLocalPatchPartialApply(params: {
   completedHeadSha?: string;
   /** Completion was asserted via acknowledge_partial_recovery, not applied. */
   completedAcknowledged?: boolean;
+  /** The applying workspace's FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<void> {
   // Marker SETS and completion writes must surface failures: an undurable
   // marker lets a retry replay the already-applied commit series, and an
@@ -923,7 +939,7 @@ export async function setLocalPatchPartialApply(params: {
   // survives. Only a bare CLEAR (no completion) stays best-effort, because
   // a stale marker there only blocks a redundant retry.
   const mustSurfaceFailures = params.record != null || params.completedAtMs != null;
-  await workspaceFileLocks.withLock(params.workspaceId, async () => {
+  await params.locks.workspaceFiles.withLock(params.workspaceId, async () => {
     let file: LocalPatchApplyStateFile;
     try {
       file = await readLocalPatchApplyStateFile(params.workspaceSessionDir);

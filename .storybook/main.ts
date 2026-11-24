@@ -1,6 +1,35 @@
 import type { StorybookConfig } from "@storybook/react-vite";
-import { mergeConfig } from "vite";
+import { mergeConfig, type Plugin } from "vite";
+import { readFileSync } from "fs";
 import path from "path";
+
+// The boot loader's CSS is inlined in index.html so the pre-JS placeholder paints styled, and
+// LoadingScreen (plus the update restart overlay built on it) reuses those classes. Lift the same
+// rules into the preview so stories render them faithfully without a second copy of the CSS.
+function bootLoaderStyles(): string {
+  const html = readFileSync(path.join(process.cwd(), "index.html"), "utf8");
+  const start = html.indexOf(".boot-loader {");
+  const end = html.indexOf("</style>", start);
+  if (start === -1 || end === -1) {
+    throw new Error("index.html no longer contains the inline .boot-loader styles");
+  }
+  return html.slice(start, end);
+}
+
+// BootLoadFailure.stories.tsx renders index.html's own boot screen and script, so it needs the
+// file's source. `index.html?raw` is no way to get it: the dev server answers /index.html with
+// Storybook's own page.
+function indexHtmlSource(): Plugin {
+  const id = "virtual:index-html";
+  return {
+    name: "xum-index-html-source",
+    resolveId: (source) => (source === id ? `\0${id}` : undefined),
+    load: (resolved) =>
+      resolved === `\0${id}`
+        ? `export default ${JSON.stringify(readFileSync(path.join(process.cwd(), "index.html"), "utf8"))};`
+        : undefined,
+  };
+}
 
 const config: StorybookConfig = {
   stories: [
@@ -9,18 +38,24 @@ const config: StorybookConfig = {
     "../src/browser/features/**/*.stories.@(ts|tsx)",
   ],
   addons: ["@storybook/addon-links", "@storybook/addon-docs"],
+  previewHead: (head) => `${head ?? ""}<style>${bootLoaderStyles()}</style>`,
   framework: {
     name: "@storybook/react-vite",
     options: {},
   },
   viteFinal: async (config) => {
     return mergeConfig(config, {
+      plugins: [indexHtmlSource()],
       // Inherit project aliases. Storybook also needs a stable VERSION module so
       // stories that render chrome-only components (for example the landing-page
       // PR badge path through TitleBar/AboutDialog) do not depend on generated
       // src/version.ts existing in the local workspace.
       resolve: {
         alias: [
+          {
+            find: "@novnc/novnc/lib/rfb",
+            replacement: path.join(process.cwd(), "src/browser/stories/mocks/desktopRfb.ts"),
+          },
           {
             find: "@/version",
             replacement: path.join(process.cwd(), "src/browser/stories/mocks/version.ts"),

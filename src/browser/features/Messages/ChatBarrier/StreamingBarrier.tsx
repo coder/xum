@@ -2,18 +2,18 @@ import React from "react";
 import { StreamingBarrierView } from "./StreamingBarrierView";
 import { getModelName } from "@/common/utils/ai/models";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { AGENT_AI_DEFAULTS_KEY, VIM_ENABLED_KEY, getModelKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   useWorkspaceState,
   useWorkspaceAggregator,
   useWorkspaceStoreRaw,
   useWorkspaceStreamingStats,
 } from "@/browser/stores/WorkspaceStore";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
+import { stopStream } from "@/browser/utils/stopStream";
+import type { RuntimeStatusEvent } from "@/common/types/stream";
 
 type StreamingPhase =
   | "starting" // Message sent, waiting for stream-start
@@ -36,6 +36,10 @@ interface StreamingBarrierProps {
    * When provided, this path should preserve compaction edit state + follow-up content.
    */
   onCancelCompaction?: () => void;
+  /** Activity chips sharing the row; see StreamingBarrierView's `activity`. */
+  activity?: React.ReactNode;
+  /** Name the model in the status label (default true); the composer's live line drops it. */
+  showModelName?: boolean;
 }
 
 // Debounce delay for transient startup/streaming/compacting label churn.
@@ -134,6 +138,40 @@ function useStabilizedStreamingStatusText(
   return debouncedText;
 }
 
+/** Live turn state the barrier renders from; each host derives it from its own stream source. */
+export interface StreamingBarrierState {
+  canInterrupt: boolean;
+  isCompacting: boolean;
+  isStreamStarting: boolean;
+  /** The user triggered an interrupt and the stream-abort has not arrived yet. */
+  isInterrupting: boolean;
+  awaitingUserQuestion: boolean;
+  currentModel: string | null;
+  pendingStreamModel: string | null;
+  runtimeStatus: RuntimeStatusEvent | null;
+  activeBashMonitorCount: number;
+}
+
+/** Phases whose Stop button is shown; the host decides how each one cancels. */
+export type StreamingBarrierCancelPhase = "starting" | "streaming" | "compacting";
+
+interface StreamingBarrierContentProps {
+  workspaceId: string;
+  state: StreamingBarrierState;
+  streamingStats: { tokenCount: number; tps: number } | null;
+  vimEnabled?: boolean;
+  className?: string;
+  /** Stop button handler; called only for cancelable phases. */
+  onCancel: (phase: StreamingBarrierCancelPhase) => void;
+  /**
+   * Opens compaction-model settings. Hosts without a Settings surface omit it, and then the
+   * compaction "configure" hint is not shown.
+   */
+  onConfigureCompaction?: () => void;
+  activity?: React.ReactNode;
+  showModelName?: boolean;
+}
+
 /**
  * Self-contained streaming status barrier.
  * Computes streaming state internally from workspaceId.
@@ -142,8 +180,10 @@ function useStabilizedStreamingStatusText(
 export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
   workspaceId,
   className,
-  vimEnabled: vimEnabledFromParent,
+  vimEnabled,
   onCancelCompaction,
+  activity,
+  showModelName,
 }) => {
   const workspaceState = useWorkspaceState(workspaceId);
   const aggregator = useWorkspaceAggregator(workspaceId);
@@ -154,16 +194,108 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
   const { api } = useAPI();
   const { open: openSettings } = useSettings();
 
+  const state: StreamingBarrierState = {
+    canInterrupt: workspaceState.canInterrupt,
+    isCompacting: workspaceState.isCompacting,
+    isStreamStarting: workspaceState.isStreamStarting,
+    isInterrupting: aggregator?.hasInterruptingStream() ?? false,
+    awaitingUserQuestion: workspaceState.awaitingUserQuestion,
+    currentModel: workspaceState.currentModel,
+    pendingStreamModel: workspaceState.pendingStreamModel,
+    runtimeStatus: workspaceState.runtimeStatus,
+    activeBashMonitorCount: workspaceState.activeBashMonitorCount,
+  };
+
+  const handleCancel = (phase: StreamingBarrierCancelPhase) => {
+    if (!api) {
+      return;
+    }
+
+    if (phase === "compacting") {
+      // Reuse the established compaction-cancel flow from keyboard shortcuts so we keep
+      // edit restoration + follow-up content behavior consistent across input methods.
+      if (onCancelCompaction) {
+        onCancelCompaction();
+        return;
+      }
+
+      void stopStream(api, workspaceId, { abandonPartial: true, disableAutoRetry: true });
+      return;
+    }
+
+    if (phase === "streaming") {
+      storeRaw.setInterrupting(workspaceId);
+    }
+
+    void stopStream(api, workspaceId, { disableAutoRetry: true });
+  };
+
+  return (
+    <StreamingBarrierContent
+      workspaceId={workspaceId}
+      state={state}
+      streamingStats={streamingStats}
+      vimEnabled={vimEnabled}
+      className={className}
+      onCancel={handleCancel}
+      // The hint shows while no compaction model is set; that model is on the Compact card in
+      // Agents (route id `tasks`), not in Behavior with the compaction strategy.
+      onConfigureCompaction={() => openSettings("tasks")}
+      activity={activity}
+      showModelName={showModelName}
+    />
+  );
+};
+
+/**
+ * The model the status label names:
+ * - "starting" phase: prefer pendingStreamModel (from muxMetadata), then the composer model
+ * - Otherwise: use currentModel from active stream
+ * Null when the host leaves the name out: the composer's live line, where the model picker sits
+ * right below and the activity chips need the room.
+ */
+function getStatusModelName(input: {
+  phase: StreamingPhase | null;
+  showModelName: boolean;
+  workspaceId: string;
+  currentModel: string | null;
+  pendingStreamModel: string | null;
+}): string | null {
+  if (!input.showModelName) return null;
+  const model =
+    input.phase === "starting"
+      ? (input.pendingStreamModel ?? getWorkspaceAiSelection(input.workspaceId).model)
+      : input.currentModel;
+  return model ? getModelName(model) : null;
+}
+
+/**
+ * Presentational barrier logic shared by desktop and the VS Code webview (#4971): phase,
+ * status text (with debouncing), cancel affordance and stats. Returns null when there's
+ * nothing to show.
+ */
+export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = ({
+  workspaceId,
+  state,
+  streamingStats,
+  vimEnabled: vimEnabledFromParent,
+  className,
+  onCancel,
+  onConfigureCompaction,
+  activity,
+  showModelName = true,
+}) => {
   const {
     canInterrupt,
     isCompacting,
     isStreamStarting: isStarting,
+    isInterrupting,
     awaitingUserQuestion,
     currentModel,
     pendingStreamModel,
     runtimeStatus,
     activeBashMonitorCount,
-  } = workspaceState;
+  } = state;
 
   // Compute streaming phase
   const phase: StreamingPhase | null = (() => {
@@ -172,7 +304,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
     // bash monitor is still watching output, the agent will be woken on match.
     // Surface that so the idle chat doesn't read as "done" or stalled.
     if (!canInterrupt) return activeBashMonitorCount > 0 ? "waiting-on-monitor" : null;
-    if (aggregator?.hasInterruptingStream()) return "interrupting";
+    if (isInterrupting) return "interrupting";
     if (awaitingUserQuestion) return "awaiting-input";
     if (isCompacting) return "compacting";
     return "streaming";
@@ -186,19 +318,16 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
   const tokenCount = showTokenCount ? streamingStats?.tokenCount : undefined;
   const tps = showTokenCount ? streamingStats?.tps : undefined;
 
-  // Model to display:
-  // - "starting" phase: prefer pendingStreamModel (from muxMetadata), then localStorage
-  // - Otherwise: use currentModel from active stream
-  const model =
-    phase === "starting"
-      ? (pendingStreamModel ??
-        readPersistedState<string | null>(getModelKey(workspaceId), null) ??
-        getDefaultModel())
-      : currentModel;
-  const modelName = model ? getModelName(model) : null;
+  const modelName = getStatusModelName({
+    phase,
+    showModelName,
+    workspaceId,
+    currentModel,
+    pendingStreamModel,
+  });
 
   // Prefer parent vim state (subscribed in ChatPane) so the hint updates immediately.
-  const vimEnabled = vimEnabledFromParent ?? readPersistedState(VIM_ENABLED_KEY, false);
+  const vimEnabled = vimEnabledFromParent ?? getUserPreferences().appearance?.vimEnabled === true;
   const interruptKeybind = formatKeybind(
     vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL
   ).replace("Escape", "Esc");
@@ -223,9 +352,9 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       case "awaiting-input":
         return "Awaiting your input...";
       case "compacting":
-        return modelName ? `${modelName} compacting...` : "compacting...";
+        return modelName ? `${modelName} compacting` : "compacting";
       case "streaming":
-        return modelName ? `${modelName} streaming...` : "streaming...";
+        return modelName ? `${modelName} streaming` : "streaming";
       case "waiting-on-monitor":
         return activeBashMonitorCount === 1
           ? "Waiting on background bash monitor..."
@@ -235,7 +364,16 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
   const statusText = useStabilizedStreamingStatusText(workspaceId, phase, rawStatusText);
 
   if (!phase || statusText == null) {
-    return null;
+    // Between turns the row stays for its activity chips; it hides itself when none render.
+    return activity === undefined ? null : (
+      <StreamingBarrierView
+        statusText={null}
+        cancelText=""
+        reserveStatsSlot={false}
+        className={className}
+        activity={activity}
+      />
+    );
   }
 
   // Compute cancel hint based on phase
@@ -256,42 +394,17 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
 
   const canTapCancel = phase === "starting" || phase === "streaming" || phase === "compacting";
   const handleCancelClick = () => {
-    if (!api) {
-      return;
-    }
-
     if (phase !== "starting" && phase !== "streaming" && phase !== "compacting") {
       return;
     }
-
-    void api.workspace.setAutoRetryEnabled?.({ workspaceId, enabled: false });
-
-    if (phase === "compacting") {
-      // Reuse the established compaction-cancel flow from keyboard shortcuts so we keep
-      // edit restoration + follow-up content behavior consistent across input methods.
-      if (onCancelCompaction) {
-        onCancelCompaction();
-        return;
-      }
-
-      void api.workspace.interruptStream({
-        workspaceId,
-        options: { abandonPartial: true },
-      });
-      return;
-    }
-
-    if (phase === "streaming") {
-      storeRaw.setInterrupting(workspaceId);
-    }
-
-    void api.workspace.interruptStream({ workspaceId });
+    onCancel(phase);
   };
 
   // Show settings hint during compaction if no custom compaction model is configured
   const showCompactionHint =
     phase === "compacting" &&
-    !readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {}).compact?.modelString;
+    onConfigureCompaction != null &&
+    !getAppConfigStore().getSnapshot()?.agentAiDefaults?.compact?.modelString;
 
   return (
     <StreamingBarrierView
@@ -307,10 +420,14 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       reserveStatsSlot={phase !== "waiting-on-monitor"}
       hideHintOnNarrow={phase === "waiting-on-monitor"}
       className={className}
+      activity={activity}
+      compactStatusOnNarrow={
+        phase === "starting" || phase === "streaming" || phase === "awaiting-input"
+      }
       hintElement={
         showCompactionHint ? (
           <button
-            onClick={() => openSettings("tasks")}
+            onClick={onConfigureCompaction}
             className="text-muted hover:text-foreground text-[10px] underline decoration-dotted underline-offset-2"
           >
             configure

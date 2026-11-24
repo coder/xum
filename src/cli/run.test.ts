@@ -1,5 +1,5 @@
 /**
- * Integration tests for `mux run` CLI command.
+ * Integration tests for `xum run` CLI command.
  *
  * These tests verify the CLI interface without actually running agent sessions.
  * They test argument parsing, help output, and error handling.
@@ -115,7 +115,7 @@ async function runRunDirect(args: string[], timeoutMs = 5000): Promise<ExecResul
   });
 }
 
-describe("mux CLI", () => {
+describe("xum CLI", () => {
   beforeAll(() => {
     // Verify CLI files exist
     expect(Bun.file(CLI_PATH).size).toBeGreaterThan(0);
@@ -126,8 +126,8 @@ describe("mux CLI", () => {
     test("--help shows usage", async () => {
       const result = await runCli(["--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Usage: mux");
-      expect(result.stdout).toContain("Mux - AI agent orchestration");
+      expect(result.stdout).toContain("Usage: xum");
+      expect(result.stdout).toContain("Xum - AI agent orchestration");
       expect(result.stdout).toContain("run");
       expect(result.stdout).toContain("server");
     });
@@ -146,11 +146,11 @@ describe("mux CLI", () => {
     });
   });
 
-  describe("mux run", () => {
+  describe("xum run", () => {
     test("--help shows all options", async () => {
       const result = await runCli(["run", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Usage: mux run");
+      expect(result.stdout).toContain("Usage: xum run");
       expect(result.stdout).toContain("--dir");
       expect(result.stdout).toContain("--model");
       expect(result.stdout).toContain("--runtime");
@@ -167,7 +167,7 @@ describe("mux CLI", () => {
     test("shows default model as opus", async () => {
       const result = await runCli(["run", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("anthropic:claude-opus-5");
+      expect(result.stdout).toContain("anthropic:claude-opus-5-5");
     });
 
     test("--service-tier has no default auto", async () => {
@@ -244,6 +244,53 @@ describe("mux CLI", () => {
       expect(result.output).toContain("Invalid mode");
     });
 
+    test("experiment unsupported in headless runs shows error", async () => {
+      // agent-browser is a real experiment ID that a headless run does not
+      // support, so the CLI must reject it loudly instead of ignoring it.
+      const result = await runRunDirect(["-e", "agent-browser", "test message"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain('Unknown or unsupported experiment "agent-browser"');
+    });
+
+    test("Object.prototype property names are rejected as experiments", async () => {
+      // Object.prototype names must not pass the supported-ID check.
+      const result = await runRunDirect(["-e", "constructor", "test message"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain('Unknown or unsupported experiment "constructor"');
+    });
+
+    test("rlm-mode experiment is accepted", async () => {
+      // Use a nonexistent dir so the run fails AFTER experiment parsing
+      // without starting a session.
+      const result = await runRunDirect([
+        "-e",
+        "rlm-mode",
+        "-e",
+        "programmatic-tool-calling",
+        "--dir",
+        "/nonexistent/path/that/does/not/exist",
+        "test message",
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).not.toContain("Unknown or unsupported experiment");
+    });
+
+    test("promoted and retired experiment IDs are accepted as no-ops", async () => {
+      const result = await runRunDirect([
+        "-e",
+        "advisor-tool",
+        "-e",
+        "tool-search",
+        "-e",
+        "workspace-heartbeats",
+        "--dir",
+        "/nonexistent/path/that/does/not/exist",
+        "test message",
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).not.toContain("Unknown or unsupported experiment");
+    });
+
     test("nonexistent directory shows error", async () => {
       const result = await runRunDirect([
         "--dir",
@@ -314,11 +361,11 @@ describe("mux CLI", () => {
     });
   });
 
-  describe("mux server", () => {
+  describe("xum server", () => {
     test("--help shows all options", async () => {
       const result = await runCli(["server", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Usage: mux server");
+      expect(result.stdout).toContain("Usage: xum server");
       expect(result.stdout).toContain("--host");
       expect(result.stdout).toContain("--port");
       expect(result.stdout).toContain("--auth-token");
@@ -329,11 +376,11 @@ describe("mux CLI", () => {
     });
   });
 
-  describe("mux acp", () => {
+  describe("xum acp", () => {
     test("--help shows ACP options", async () => {
       const result = await runCli(["acp", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Usage: mux acp");
+      expect(result.stdout).toContain("Usage: xum acp");
       expect(result.stdout).toContain("--server-url");
       expect(result.stdout).toContain("--auth-token");
       expect(result.stdout).toContain("--log-file");

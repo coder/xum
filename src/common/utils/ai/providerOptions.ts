@@ -9,33 +9,81 @@
 import type { AnthropicProviderOptions } from "@ai-sdk/anthropic";
 import type { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
 import type { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
-import type { JSONValue } from "@ai-sdk/provider";
-import type { XaiProviderOptions } from "@ai-sdk/xai";
+import type { OpenAICompatibleLanguageModelChatOptions } from "@ai-sdk/openai-compatible";
+import type { JSONObject, JSONValue } from "@ai-sdk/provider";
+import type { ZaiLanguageModelChatOptions } from "@ai-sdk/zai";
+import type {
+  XaiProviderOptions,
+  // Chat options alias does not include store; Responses options do (frontier Grok / ZDR).
+  XaiResponsesProviderOptions,
+} from "@ai-sdk/xai";
 import type { ProviderName } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
+import assert from "@/common/utils/assert";
+import type {
+  AnthropicEffortLevel,
+  OpenAIReasoningMode,
+  ThinkingLevel,
+} from "@/common/types/thinking";
 import {
   getAnthropicEffort,
+  anthropicBindsThinkingToPrefix,
   anthropicRejectsDisabledThinking,
+  anthropicSupportsBetweenToolsThinking,
   anthropicSupportsNativeXhigh,
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
+  GEMINI_THINKING_LEVELS,
+  geminiSupportsXhigh,
   getOpenAIReasoningEffort,
+  isGpt6LunaModel,
+  grokSupportsNativeXhigh,
+  isGrokFrontierModel,
+  isGlm53Model,
   isKimiK3Model,
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
+  anthropicThinksUnlessDisabled,
 } from "@/common/types/thinking";
-import { isGeminiFlashThinkingLevelModelName } from "@/common/utils/thinking/policy";
-import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
+import {
+  isGeminiFlashMinimalRejectingModelName,
+  isGeminiFlashThinkingLevelModelName,
+  assistantThinkingLevels,
+  resolveBetweenToolsThinkingLevel,
+} from "@/common/utils/thinking/policy";
+import {
+  isOfficialProviderBaseUrl,
+  openaiExplicitPromptCachingAvailable,
+} from "@/common/utils/ai/cacheStrategy";
+import {
+  openaiModelSupportsServiceTier,
+  openaiServiceTierAvailable,
+} from "./openaiProviderOptionsAvailability";
+import { isFirstPartyAnthropicBaseUrl } from "./anthropicFastMode";
+import { openaiCyberAccessProgram } from "./cyberMode";
+import { openaiProModeAvailable } from "./proMode";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import { sessionHeaderNameError } from "@/common/utils/providers/sessionHeader";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
 import {
+  isGoogleFamilyProvider,
   normalizeToCanonical,
   resolveProviderOptionsNamespaceKey,
   supports1MContext,
 } from "./models";
+import {
+  bedrockOpenAIModelId,
+  CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
+  resolveCoderWireCanonicalModel,
+} from "@/common/constants/coderOAuth";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 
 // Re-export for existing consumers (aiService, providerModelFactory, tests):
 // the implementations moved to browser-safe modules because this module
@@ -44,23 +92,150 @@ export { resolveProviderOptionsNamespaceKey } from "./models";
 export { openaiProModeAvailable } from "./proMode";
 
 /**
+ * Canonical model string for OPTION/HEADER building. Same as
+ * normalizeToCanonical, except Coder gateway strings
+ * (coder:<instance>/<model>) are translated to the WIRE origin derived from
+ * the instance's type. The request bytes for coder:prod-anthropic/<model> are
+ * Anthropic-shaped, so thinking, cache, and beta-header decisions must run
+ * against anthropic:<model> — keying them on the "coder" prefix silently
+ * drops them, diverging from the identical model on a default-named instance.
+ * Routing identity is NOT affected: only the builders in this module use this
+ * translation.
+ *
+ * The RAW Coder identity is inspected BEFORE generic normalization: a valid
+ * instance can use a canonical route name with a different type (e.g.
+ * {name: "openai", type: "anthropic"}), and normalizeToCanonical would
+ * rewrite coder:openai/<model> to openai:<model> from the name alone —
+ * emitting OpenAI options for an Anthropic-wire request. Metadata-aware wire
+ * resolution must win over the name convention (which it still falls back to
+ * for unknown instances). Mirrors resolveAndCreateModel's raw-prefix shadow
+ * check: a custom provider named "coder" owns the prefix,
+ * and its model IDs must not get gateway wire treatment.
+ *
+ * A canonical model routed onto Coder sends the bytes of the instance
+ * canonicalRoutes selects (a google-typed instance speaks OpenAI chat), so
+ * it resolves like the explicit gateway string the factory builds for it.
+ */
+function resolveOptionsCanonicalModel(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
+): string {
+  const colonIndex = modelString.indexOf(":");
+  if (colonIndex === -1) {
+    return normalizeToCanonical(modelString);
+  }
+  const prefix = modelString.slice(0, colonIndex);
+  const prefixEntry = providersConfig?.[prefix];
+  if (isCustomProviderConfig(prefixEntry)) {
+    // Custom providers (including ones shadowing built-in ids) speak the wire
+    // their providerType selects, so thinking/cache/header decisions must key
+    // on that origin. Generic chat-completions providers keep their own
+    // identity. Must mirror resolveAndCreateModel's wireProviderName remap.
+    const wireOrigin = customProviderWireOrigin(prefixEntry.providerType);
+    return wireOrigin ? `${wireOrigin}:${modelString.slice(colonIndex + 1)}` : modelString;
+  }
+  const wire = resolveOptionsCoderWire(modelString, providersConfig, routeProvider);
+  return wire ? `${wire.origin}:${wire.modelId}` : normalizeToCanonical(modelString);
+}
+
+/** The Coder instance wire a non-custom model string speaks, or null off the Coder route. */
+function resolveOptionsCoderWire(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
+): ReturnType<typeof resolveCoderWireCanonicalModel> {
+  if (!modelString.startsWith("coder:") && routeProvider !== "coder") {
+    return null;
+  }
+  const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
+  return gatewayModelId == null
+    ? null
+    : resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder);
+}
+
+/** Whether a request goes to a google-typed Coder instance (see CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE). */
+function isCoderGoogleWire(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
+): boolean {
+  const rawPrefix = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
+  return (
+    !isCustomProviderConfig(providersConfig?.[rawPrefix]) &&
+    resolveOptionsCoderWire(modelString, providersConfig, routeProvider)?.providerType === "google"
+  );
+}
+
+/**
+ * The providerOptions namespace buildProviderOptions writes for a request: the
+ * one its SDK client reads, so model-parameter extras must merge there too.
+ */
+export function resolveRequestProviderOptionsNamespaceKey(
+  wireProviderName: string,
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
+): string {
+  return isCoderGoogleWire(modelString, providersConfig, routeProvider)
+    ? CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE
+    : resolveProviderOptionsNamespaceKey(wireProviderName, routeProvider);
+}
+
+/**
+ * Gemini thinking config for a Xum level, shared by the native Google payload
+ * and Gemini's OpenAI compatibility layer behind google-typed Coder instances.
+ */
+function geminiThinkingConfig(
+  capModelName: string,
+  effectiveThinking: ThinkingLevel
+): GoogleGenerativeAIProviderOptions["thinkingConfig"] {
+  const capBareModelName = capModelName.split("/").at(-1) ?? capModelName;
+  if (isGeminiFlashThinkingLevelModelName(capBareModelName) && effectiveThinking === "off") {
+    // Gemini Flash chat models default to medium and do not support true thinking-off;
+    // send minimal explicitly so Xum's "off" setting means lowest-effort behavior.
+    // Gemini 3.8 Flash rejects "minimal" with a 400 (policy already excludes "off");
+    // clamp to "low" here too so a caller bypassing policy cannot trigger the error.
+    return isGeminiFlashMinimalRejectingModelName(capBareModelName)
+      ? { includeThoughts: true, thinkingLevel: "low" }
+      : { thinkingLevel: "minimal" };
+  }
+  if (effectiveThinking === "off") {
+    return undefined;
+  }
+  if (/gemini-[34]/.test(capBareModelName)) {
+    // Policy enforcement should clamp to valid Google levels before this adapter runs.
+    // Avoid leaking xhigh/max to Google if a caller bypasses policy.
+    const thinkingLevel =
+      effectiveThinking === "xhigh" && geminiSupportsXhigh(capBareModelName)
+        ? "xhigh"
+        : GEMINI_THINKING_LEVELS[effectiveThinking];
+    return { includeThoughts: true, thinkingLevel };
+  }
+  // Gemini 2.5 uses thinkingBudget
+  const budget = GEMINI_THINKING_BUDGETS[effectiveThinking];
+  return { includeThoughts: true, ...(budget > 0 && { thinkingBudget: budget }) };
+}
+
+/**
  * OpenRouter reasoning options
  * @see https://openrouter.ai/docs/use-cases/reasoning-tokens
  */
 interface OpenRouterReasoningOptions {
   [key: string]: JSONValue | undefined;
+  service_tier?: OpenAIResponsesProviderOptions["serviceTier"];
   reasoning?: {
     enabled?: boolean;
     exclude?: boolean;
     // "max" is not in OpenRouter's generic low/medium/high set; it is the only
     // effort Kimi K3 accepts (model metadata supported_efforts: ["max"]).
-    effort?: "low" | "medium" | "high" | "max";
+    effort?: "none" | "low" | "medium" | "high" | "max";
   };
 }
 
 type OpenAICompatibleGatewayProviderOptions = Pick<
   OpenAIResponsesProviderOptions,
-  "reasoningEffort"
+  "reasoningEffort" | "serviceTier"
 >;
 
 /**
@@ -73,26 +248,226 @@ interface MoonshotAIProviderOptions {
 }
 
 /**
+ * xAI providerOptions payload. Chat models use XaiProviderOptions; frontier Grok
+ * Responses also accepts store (ZDR). Union keeps both families assignable.
+ */
+type XaiBuiltProviderOptions = XaiProviderOptions & Pick<XaiResponsesProviderOptions, "store">;
+
+/**
  * Provider-specific options structure for AI SDK
  */
 type ProviderOptions =
   | { anthropic: AnthropicProviderOptions }
   | { openai: OpenAIResponsesProviderOptions }
   | { google: GoogleGenerativeAIProviderOptions }
+  | { googleVertex: GoogleGenerativeAIProviderOptions }
   | { openrouter: OpenRouterReasoningOptions }
   | { moonshotai: MoonshotAIProviderOptions }
-  | { xai: XaiProviderOptions }
+  | { zai: ZaiLanguageModelChatOptions }
+  | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
+  | { bedrock: BedrockProviderOptions }
+  | { openaiCompatible: OpenAICompatibleLanguageModelChatOptions }
+  | { [CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE]: JSONObject }
   | Record<string, never>; // Empty object for unsupported providers
 
-const OPENAI_REASONING_SUMMARY_UNSUPPORTED_MODELS = new Set<string>([
-  // Codex Spark rejects reasoning.summary with:
-  // "Unsupported parameter: 'reasoning.summary' ...".
-  "gpt-5.3-codex-spark",
-]);
+/** GLM 5.3's reasoning effort for a level, on Z.ai and on OpenAI-compatible hosts alike. */
+function glm53ReasoningEffort(thinking: ThinkingLevel): "low" | "high" | "max" {
+  return thinking === "max" ? "max" : thinking === "high" || thinking === "xhigh" ? "high" : "low";
+}
 
-function supportsOpenAIReasoningSummary(modelName: string): boolean {
-  return !OPENAI_REASONING_SUMMARY_UNSUPPORTED_MODELS.has(modelName);
+// Simple direct providers have self-contained reasoning controls. Keep these
+// separate from the gateway/OpenAI branches so vendor-only settings cannot leak.
+const DIRECT_REASONING_BUILDERS: Record<
+  string,
+  ((model: string, thinking: ThinkingLevel) => ProviderOptions) | undefined
+> = {
+  meta: (_model, thinking) => ({
+    // Meta uses the OpenAI Responses wire format. Stateless encrypted replay
+    // preserves reasoning across agent tool turns under the existing SDK namespace.
+    openai: {
+      forceReasoning: true, // The OpenAI SDK does not recognize Meta's model IDs.
+      store: false,
+      include: ["reasoning.encrypted_content"],
+      reasoningEffort: thinking === "off" ? "low" : thinking,
+      reasoningSummary: "auto",
+    },
+  }),
+  moonshotai: (model): ProviderOptions => {
+    // Kimi K3 always reasons and supports only max; do not rely on the API default.
+    return isKimiK3Model(model) ? { moonshotai: { reasoningEffort: "max" } } : {};
+  },
+  zai: (model, thinking): ProviderOptions => {
+    if (!isGlm53Model(model)) return {};
+    return {
+      zai: {
+        thinking: { type: "enabled" },
+        reasoningEffort: glm53ReasoningEffort(thinking),
+        toolStream: true,
+      },
+    };
+  },
+};
+
+/** The subset of @ai-sdk/amazon-bedrock options Xum sends. */
+interface BedrockProviderOptions {
+  [key: string]: JSONValue | undefined;
+  additionalModelRequestFields?: Record<string, JSONValue>;
+  reasoningConfig?: {
+    type?: "adaptive";
+    maxReasoningEffort?: AnthropicEffortLevel;
+    display?: "summarized";
+  };
+}
+
+/**
+ * The thinking fields one Claude model takes at one level, independent of the
+ * wire (direct Anthropic or Bedrock). `effort` is set only for models with the
+ * effort parameter; `thinking` is undefined when the request omits it.
+ */
+interface AnthropicThinkingShape {
+  usesAdaptiveThinking: boolean;
+  effort?: AnthropicEffortLevel;
+  thinking?:
+    | { type: "adaptive"; summarized: boolean }
+    | { type: "enabled"; budgetTokens: number }
+    | { type: "disabled" }
+    | { type: "between_tools" };
+}
+
+/**
+ * Per-model Anthropic thinking rules, shared by the direct and Bedrock routes so
+ * they cannot drift (#5839).
+ *
+ * - Opus 4.6+ / Sonnet 4.6 / Sonnet 5+ / Haiku 5+ / Mythos-class: adaptive thinking
+ *   (the model decides when and how much) plus effort. Native-xhigh models (Opus
+ *   4.7+, Sonnet 5+, Haiku 5+, Mythos) get the native "xhigh" effort and need
+ *   `display: "summarized"` to return thinking; Opus 4.6 / Sonnet 4.6 keep
+ *   xhigh -> "max" and must not get `display`. Haiku 5.5 must land here: it
+ *   rejects `budget_tokens` (400).
+ * - Opus 4.5: enabled thinking with a budgetTokens ceiling, plus effort.
+ * - Older Claude: enabled thinking with budgetTokens, no effort.
+ *
+ * "off" on adaptive models: Sonnet 5.5 "off" is `between_tools` only for the
+ * Anthropic payload on an eligible route (the caller resolves that); Mythos-class
+ * and Opus 5.5 reject `{ type: "disabled" }`. The thinking policy excludes "off"
+ * for them and AIService clamps the effective level, but if a stray path gets
+ * here, omit `thinking` (the API defaults to adaptive) rather than hard-erroring.
+ * Opus 5 rejects disabled thinking above high effort; "off" maps to low, so this
+ * cannot produce that combination.
+ * See https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking#summarized-thinking
+ */
+function resolveAnthropicThinkingShape(
+  capabilityModel: string,
+  capModelName: string | undefined,
+  level: ThinkingLevel
+): AnthropicThinkingShape {
+  if (!anthropicUsesAdaptiveThinking(capabilityModel, capModelName ?? "")) {
+    return budgetThinkingShape(capabilityModel, capModelName ?? "", level);
+  }
+  const thinking =
+    level === "off"
+      ? adaptiveModelOffThinking(capabilityModel)
+      : ({
+          type: "adaptive",
+          summarized: anthropicSupportsNativeXhigh(capabilityModel),
+        } as const);
+  return {
+    usesAdaptiveThinking: true,
+    effort: getAnthropicEffort(level, capabilityModel),
+    ...(thinking && { thinking }),
+  };
+}
+
+function anthropicUsesAdaptiveThinking(capabilityModel: string, capModelName: string): boolean {
+  return (
+    capModelName.includes("opus-4-6") ||
+    capModelName.includes("sonnet-4-6") ||
+    anthropicSupportsNativeXhigh(capabilityModel)
+  );
+}
+
+/** Opus 4.5 and older Claude: a thinking budget; only Opus 4.5 has effort. */
+function budgetThinkingShape(
+  capabilityModel: string,
+  capModelName: string,
+  level: ThinkingLevel
+): AnthropicThinkingShape {
+  const budgetTokens = ANTHROPIC_THINKING_BUDGETS[level];
+  return {
+    usesAdaptiveThinking: false,
+    ...(capModelName.includes("opus-4-5") && {
+      effort: getAnthropicEffort(level, capabilityModel),
+    }),
+    ...(budgetTokens > 0 && { thinking: { type: "enabled" as const, budgetTokens } }),
+  };
+}
+
+/** The "off" thinking field of an adaptive model; undefined omits `thinking`. */
+function adaptiveModelOffThinking(capabilityModel: string): AnthropicThinkingShape["thinking"] {
+  if (anthropicSupportsBetweenToolsThinking(capabilityModel)) {
+    return { type: "between_tools" };
+  }
+  return anthropicRejectsDisabledThinking(capabilityModel) ? undefined : { type: "disabled" };
+}
+
+/**
+ * The canonical `anthropic:claude-*` id of a Claude model on Bedrock, or null for
+ * other models. Cross-region inference profiles (`us.`, `global.` ...) keep the
+ * `bedrock:` origin, and Bedrock ids end in -vN[:M]; both defeat the anchored
+ * capability matchers (a missed "rejects disabled" match would send a 400).
+ */
+function bedrockClaudeCapabilityModel(
+  formatProvider: string | undefined,
+  capabilityModel: string
+): string | null {
+  if (formatProvider !== "bedrock") return null;
+  const match = /(?:^|[.:])(claude-[a-z0-9-]+?)(?:-v\d+(?::\d+)?)?$/i.exec(capabilityModel);
+  return match ? `anthropic:${match[1].toLowerCase()}` : null;
+}
+
+/**
+ * Bedrock Converse fields for one thinking shape. Adaptive thinking and effort go
+ * through the SDK's typed `reasoningConfig`. The SDK serializes
+ * `reasoningConfig: { type: "disabled" }` as nothing for Claude, so "disabled"
+ * goes through additionalModelRequestFields verbatim.
+ *
+ * Budget-thinking models (Opus 4.5, Sonnet 4.5, Haiku 4.5 and older) keep the
+ * Bedrock default, which is no thinking, at every level (#7180). A budget there
+ * must fit the request's max_tokens, which the SDK's reasoningConfig budget
+ * overshoots, and Bedrock reasoning signatures are not yet kept for replay.
+ */
+function buildBedrockClaudeOptions(shape: AnthropicThinkingShape): ProviderOptions {
+  return shape.usesAdaptiveThinking ? bedrockAdaptiveClaudeOptions(shape) : {};
+}
+
+function bedrockAdaptiveClaudeOptions(shape: AnthropicThinkingShape): ProviderOptions {
+  const effort = shape.effort;
+  assert(effort != null, "adaptive Claude thinking always carries an effort");
+  if (shape.thinking?.type === "disabled") {
+    return {
+      bedrock: {
+        additionalModelRequestFields: {
+          thinking: { type: "disabled" },
+          output_config: { effort },
+        },
+      },
+    };
+  }
+  // between_tools needs the Anthropic payload (resolveBetweenToolsThinkingLevel
+  // never yields it here); like an omitted `thinking`, send the effort alone.
+  const adaptive = shape.thinking?.type === "adaptive" ? shape.thinking : undefined;
+  return {
+    bedrock: {
+      reasoningConfig: {
+        ...(adaptive && {
+          type: "adaptive" as const,
+          ...(adaptive.summarized && { display: "summarized" as const }),
+        }),
+        maxReasoningEffort: effort,
+      },
+    },
+  };
 }
 
 function resolveAnthropic1MCapabilityModel(
@@ -105,7 +480,14 @@ function resolveAnthropic1MCapabilityModel(
   const normalizedModel = normalizeToCanonical(modelString);
   return {
     normalizedModel,
-    capabilityModel: resolveModelForMetadata(normalizedModel, providersConfig ?? null),
+    // Metadata resolves from the RAW identity for Coder strings: name-based
+    // canonicalization rewrites cross-typed instances (coder:openai/x, type
+    // anthropic) to a direct-provider string before the instance metadata
+    // can map them to their real upstream.
+    capabilityModel: resolveModelForMetadata(
+      modelString.startsWith("coder:") ? modelString : normalizedModel,
+      providersConfig ?? null
+    ),
   };
 }
 
@@ -149,49 +531,217 @@ export function isAnthropic1MEffectivelyEnabled(
     return false;
   }
 
+  // providersConfig also flows into the gate itself: an unmappable Coder
+  // instance keeps its gateway-scoped string, and only the config-aware gate
+  // rejects it conclusively instead of name-normalizing it to anthropic:*.
   const { capabilityModel } = resolveAnthropic1MCapabilityModel(modelString, providersConfig);
-  if (!supports1MContext(capabilityModel)) {
+  // Coder strings go through the gate RAW: getAnthropic1MContextMode resolves
+  // the instance conclusively AND rejects wires that cannot carry the
+  // anthropic-beta header (vercel/google-typed instances fronting Claude).
+  // The pre-resolved capabilityModel (anthropic:*) would bypass that wire gate.
+  const gateModel = modelString.startsWith("coder:") ? modelString : capabilityModel;
+  if (!supports1MContext(gateModel, providersConfig)) {
     return false;
   }
 
   return hasAnthropic1MIntentForModel(modelString, capabilityModel, muxProviderOptions);
 }
 
-/**
- * Preserve Anthropic 1M beta intent across routed follow-ups only when the source request
- * had effective beta 1M enabled and the target model is also beta-eligible.
- */
-export function preserveAnthropic1MContextForFollowUp(
-  sourceModelString: string,
-  targetModelString: string,
-  muxProviderOptions?: MuxProviderOptions,
-  providersConfig?: ProvidersConfigMap | null
-): MuxProviderOptions | undefined {
-  if (!muxProviderOptions) {
-    return undefined;
-  }
-
-  if (!isAnthropic1MEffectivelyEnabled(sourceModelString, muxProviderOptions, providersConfig)) {
-    return muxProviderOptions;
-  }
-
-  const anthropicOptions = muxProviderOptions.anthropic;
-  if (!anthropicOptions) {
-    return muxProviderOptions;
-  }
-
-  const { capabilityModel } = resolveAnthropic1MCapabilityModel(targetModelString, providersConfig);
-  if (!supports1MContext(capabilityModel)) {
-    return muxProviderOptions;
-  }
-
+/** The provider options with Anthropic 1M context turned on for `modelString`. */
+export function withAnthropic1MContextIntent(
+  modelString: string,
+  muxProviderOptions: MuxProviderOptions | undefined
+): MuxProviderOptions {
+  const existingModels = muxProviderOptions?.anthropic?.use1MContextModels ?? [];
   return {
     ...muxProviderOptions,
     anthropic: {
-      ...anthropicOptions,
+      ...muxProviderOptions?.anthropic,
       use1MContext: true,
+      use1MContextModels: existingModels.includes(modelString)
+        ? existingModels
+        : [...existingModels, modelString],
     },
   };
+}
+
+/**
+ * True when 1M context is off for `modelString` and turning it on would take effect. This is
+ * the case in which AgentSession.resolveCompactionRetryPlan retries a compaction request with
+ * 1M context, so resolveCompactionInputBudgetTokens leaves its first attempt untrimmed.
+ */
+export function canSwitchToAnthropic1MContext(
+  modelString: string,
+  muxProviderOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  return (
+    !isAnthropic1MEffectivelyEnabled(modelString, muxProviderOptions, providersConfig) &&
+    isAnthropic1MEffectivelyEnabled(
+      modelString,
+      withAnthropic1MContextIntent(modelString, muxProviderOptions),
+      providersConfig
+    )
+  );
+}
+
+/**
+ * Route-aware eligibility for Anthropic's thinking block-binding control.
+ *
+ * The SDK pairs `thinking.blockBinding` with the
+ * `thinking-binding-controls-2026-08-01` beta header. Bedrock and Vertex reject
+ * that header until they support it per model, and a proxy that forwards the body
+ * without the header turns `block_binding` into a 400, so every check fails closed:
+ * - the backend-resolved route must be the direct `anthropic` provider, reached
+ *   through the built-in `anthropic:` namespace (no gateway or custom provider);
+ * - beta features must not be disabled (strict ZDR proxies);
+ * - a configured base URL (config or env) must be the official endpoint.
+ */
+function anthropicThinkingBlockBindingAvailable(
+  modelString: string,
+  routeProvider: ProviderName | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  muxProviderOptions: MuxProviderOptions | undefined
+): boolean {
+  if (routeProvider !== "anthropic" || !modelString.startsWith("anthropic:")) {
+    return false;
+  }
+  const anthropicConfig = providersConfig?.anthropic;
+  if (anthropicConfig == null || isCustomProviderConfig(anthropicConfig)) {
+    return false;
+  }
+  if (
+    anthropicConfig.disableBetaFeatures === true ||
+    muxProviderOptions?.anthropic?.disableBetaFeatures === true
+  ) {
+    return false;
+  }
+  const activeBaseUrl = anthropicConfig.baseUrl ?? anthropicConfig.baseUrlResolved;
+  return activeBaseUrl == null || isOfficialProviderBaseUrl(activeBaseUrl, "api.anthropic.com");
+}
+
+/**
+ * Block-binding eligibility on every route: the direct Anthropic API (checked by
+ * anthropicThinkingBlockBindingAvailable), or the `coder` route to an
+ * anthropic-typed AI Gateway instance. The Coder AI Gateway forwards the beta
+ * header and block_binding to such an instance's upstream (its Bedrock path
+ * converts or strips both together). Live probe through dogfood (2026-10-15):
+ * Opus/Sonnet/Haiku 5.5 and Fable 5.1 drop the stale block (200) instead of
+ * a 400, and adding block_binding keeps the prompt cache. Without it, every
+ * prefix change, such as an app restart that changes the MCP tool list, costs
+ * each conversation a rejected request and a retry.
+ */
+function anthropicBlockBindingRouteAvailable(
+  modelString: string,
+  routeProvider: ProviderName | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  muxProviderOptions: MuxProviderOptions | undefined
+): boolean {
+  if (routeProvider !== "coder") {
+    return anthropicThinkingBlockBindingAvailable(
+      modelString,
+      routeProvider,
+      providersConfig,
+      muxProviderOptions
+    );
+  }
+  // The backend's `providers.anthropic.disableBetaFeatures` (ZDR) is authoritative for
+  // Coder Anthropic instances too (the coder provider has no opt-out of its own), and
+  // a persisted request `false` must not override it: check both sources, as the
+  // direct route does.
+  return (
+    providersConfig?.anthropic?.disableBetaFeatures !== true &&
+    muxProviderOptions?.anthropic?.disableBetaFeatures !== true &&
+    anthropicTypedCoderRoute(modelString, providersConfig)
+  );
+}
+
+/**
+ * Route-aware eligibility for Anthropic's `thinking: { type: "between_tools" }`.
+ * It needs no beta header but must reach the API verbatim, which only
+ * @ai-sdk/anthropic 4.0.67+ does: the direct `anthropic` route (a base URL proxy
+ * forwards the body) and the `coder` route (Coder AI gateway, anthropic type).
+ * Everything else fails closed: Bedrock pins an older @ai-sdk/anthropic, and custom providers
+ * may validate the enum.
+ * On the coder route only an instance whose type is exactly "anthropic" qualifies:
+ * a bedrock-typed instance also speaks the Anthropic wire, but its upstream is
+ * Bedrock, and any other or unknown type may reject the enum.
+ */
+export function anthropicBetweenToolsRouteAvailable(
+  modelString: string,
+  routeProvider: ProviderName | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  if (!resolveOptionsCanonicalModel(modelString, providersConfig).startsWith("anthropic:")) {
+    return false;
+  }
+  if (routeProvider === "anthropic") {
+    const anthropicConfig = providersConfig?.anthropic;
+    return (
+      modelString.startsWith("anthropic:") &&
+      anthropicConfig != null &&
+      !isCustomProviderConfig(anthropicConfig)
+    );
+  }
+  return routeProvider === "coder" && anthropicTypedCoderRoute(modelString, providersConfig);
+}
+
+/**
+ * Whether Anthropic's native web_fetch (a server tool) can go on this route (#2922). Only the
+ * first-party API runs it: Vertex, Bedrock and Anthropic-compatible proxies (LiteLLM and
+ * others) reject the whole request on the unknown tool type. Unlike between_tools, a proxy
+ * that forwards fields verbatim is not enough, so a non-first-party base URL withholds it, and
+ * the model gets Xum's own web_fetch instead. A `coder` instance typed exactly "anthropic"
+ * forwards to the first-party API, so it keeps it.
+ */
+export function anthropicNativeWebFetchRouteAvailable(
+  modelString: string,
+  routeProvider: ProviderName | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  const prefix = modelString.split(":", 1)[0];
+  if (isCustomProviderConfig(providersConfig?.[prefix])) return false;
+  if (routeProvider === "coder") return anthropicTypedCoderRoute(modelString, providersConfig);
+  // No resolved route is the built-in provider; any other gateway transforms the request.
+  return isBuiltInAnthropicRoute(routeProvider) && anthropicBaseUrlIsFirstParty(providersConfig);
+}
+
+function isBuiltInAnthropicRoute(routeProvider: ProviderName | undefined): boolean {
+  return routeProvider === undefined || routeProvider === "anthropic";
+}
+
+/** True when the built-in Anthropic provider has no base URL or the first-party one. */
+function anthropicBaseUrlIsFirstParty(
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  const anthropicConfig = providersConfig?.anthropic;
+  const baseUrl = anthropicConfig?.baseUrlResolved ?? anthropicConfig?.baseUrl;
+  return baseUrl == null || baseUrl.trim() === "" || isFirstPartyAnthropicBaseUrl(baseUrl);
+}
+
+/**
+ * Whether a Claude model on the `coder` route reaches an instance whose type is
+ * exactly "anthropic": a bedrock-typed instance also speaks the Anthropic wire,
+ * but its upstream is Bedrock, and any other or unknown type may reject fields.
+ */
+function anthropicTypedCoderRoute(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  if (
+    !resolveOptionsCanonicalModel(modelString, providersConfig).startsWith("anthropic:") ||
+    isCustomProviderConfig(providersConfig?.coder)
+  ) {
+    return false;
+  }
+  // A model routed onto Coder from its canonical id (anthropic:x) goes to the
+  // instance canonicalRoutes selects, the same id the factory builds.
+  const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
+  return (
+    gatewayModelId != null &&
+    resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder)?.providerType ===
+      "anthropic"
+  );
 }
 
 /**
@@ -201,7 +751,7 @@ export function preserveAnthropic1MContextForFollowUp(
  * 1. Enable reasoning traces (transparency into model's thought process)
  * 2. Set reasoning level (control depth of reasoning based on task complexity)
  * 3. Enable parallel tool calls (allow concurrent tool execution)
- * 4. Keep provider-specific request knobs consistent with Mux's explicit history model
+ * 4. Keep provider-specific request knobs consistent with Xum's explicit history model
  *
  * @param modelString - Full model string (e.g., "anthropic:claude-opus-4-1")
  * @param thinkingLevel - Unified thinking level (must be pre-clamped via enforceThinkingPolicy)
@@ -231,9 +781,8 @@ export function buildProviderOptions(
 ): ProviderOptions {
   // Caller is responsible for enforcing thinking policy before calling this function.
   // agentSession.ts is the canonical enforcement point.
-  const effectiveThinking = thinkingLevel;
   // Parse origin from normalized model string
-  const normalizedModel = normalizeToCanonical(modelString);
+  const normalizedModel = resolveOptionsCanonicalModel(modelString, providersConfig, routeProvider);
   const [origin, modelName] = normalizedModel.split(":", 2);
 
   if (!origin || !modelName) {
@@ -246,13 +795,57 @@ export function buildProviderOptions(
   // SDK payload-family selection: passthrough gateways use origin payloads,
   // while transforming gateways use the route provider's payload schema.
   const formatProvider =
-    providerOptionsNamespaceKey === origin ? origin : (routeProvider ?? origin);
+    providerOptionsNamespaceKey === resolveProviderOptionsNamespaceKey(origin)
+      ? origin
+      : (routeProvider ?? origin);
+
+  // Fast mode follows the actual route/wire, not capability aliases or thinking.
+  // Ultrafast (and Flex on GPT-6.2) is additionally model-gated; unsupported models drop the tier.
+  const requestedServiceTier = muxProviderOptions?.openai?.serviceTier;
+  const serviceTierRouteOptions = {
+    providersConfig,
+    resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+    openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+  };
+  const serviceTier =
+    requestedServiceTier != null &&
+    openaiServiceTierAvailable(modelString, serviceTierRouteOptions) &&
+    openaiModelSupportsServiceTier(modelString, requestedServiceTier, serviceTierRouteOptions)
+      ? requestedServiceTier
+      : undefined;
 
   // Resolve aliases to their base model for capability detection while keeping
   // the original modelString for provider routing and metadata lookups.
-  const capabilityModel = resolveModelForMetadata(normalizedModel, providersConfig ?? null);
+  // Custom-provider model entries (mappedToModel aliases) live under the raw
+  // custom prefix; the wire-remapped identity above is only for namespace and
+  // payload-format selection, so metadata must resolve from the raw identity.
+  // Coder strings likewise resolve from the raw identity whenever the instance
+  // type maps them to an upstream model: the wire identity keeps Bedrock's
+  // openai.<model> namespace, which the GPT-6 effort matchers miss. A canonical
+  // model routed onto Coder keeps its own identity, not the instance's wire.
+  const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
+  const rawPrefixConfig = providersConfig?.[rawPrefixForMetadata];
+  const metadataModel =
+    isCustomProviderConfig(rawPrefixConfig) ||
+    resolveCoderGatewayMetadataModel(modelString, providersConfig) != null
+      ? modelString
+      : resolveOptionsCanonicalModel(modelString, providersConfig);
+  const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
+  // Sonnet 5.5 "off" is `between_tools` only for the Anthropic payload on an eligible
+  // route and with the effort pinned; elsewhere it runs as "low" adaptive. The turn
+  // path already resolved this; the pass covers headless callers (e.g. compaction).
+  // Claude on Bedrock resolves its rules from the canonical id (see
+  // bedrockClaudeCapabilityModel), the "off" clamp included.
+  const bedrockClaudeModel = bedrockClaudeCapabilityModel(formatProvider, capabilityModel);
+  const effectiveThinking = resolveBetweenToolsThinkingLevel(
+    bedrockClaudeModel ?? capabilityModel,
+    thinkingLevel,
+    formatProvider === "anthropic" &&
+      anthropicBetweenToolsRouteAvailable(modelString, routeProvider, providersConfig),
+    assistantThinkingLevels(messages ?? [])
+  );
 
   log.debug("buildProviderOptions", {
     modelString,
@@ -268,73 +861,39 @@ export function buildProviderOptions(
 
   // Build Anthropic-specific options
   if (formatProvider === "anthropic") {
-    // Anthropic prompt caching is already applied on Mux's manual cache markers
+    // Anthropic prompt caching is already applied on Xum's manual cache markers
     // (cached system message, conversation tail, last tool) deeper in the
     // request pipeline. Do not also send top-level cacheControl here: the SDK
     // serializes it to a top-level cache_control block, which adds an extra
     // breakpoint on direct Anthropic requests.
 
-    // Opus 4.5+, Sonnet 4.6, and Sonnet 5 use the effort parameter for reasoning control.
-    // Opus 4.6+ / Sonnet 4.6 / Sonnet 5 use adaptive thinking (model decides when/how much).
-    // Opus 4.5 uses enabled thinking with a budgetTokens ceiling.
-    const isOpus45 = capModelName?.includes("opus-4-5") ?? false;
-    const isOpus46 = capModelName?.includes("opus-4-6") ?? false;
-    // Opus 4.7+ and Sonnet 5+ — the native-xhigh tier, which also uses adaptive thinking.
-    const supportsNativeXhigh = anthropicSupportsNativeXhigh(capabilityModel);
-    const isSonnet46 = capModelName?.includes("sonnet-4-6") ?? false;
-    const usesAdaptiveThinking = isOpus46 || supportsNativeXhigh || isSonnet46;
+    const shape = resolveAnthropicThinkingShape(capabilityModel, capModelName, effectiveThinking);
+    // Replayed history is not yet append-only (model-only tool-result fields are
+    // stripped before replay), which invalidates later thinking blocks on models
+    // that bind them to the prefix. Ask the API to drop those blocks instead of
+    // rejecting the whole request.
+    const blockBinding =
+      shape.thinking?.type === "adaptive" &&
+      shape.thinking.summarized &&
+      anthropicBindsThinkingToPrefix(capabilityModel) &&
+      anthropicBlockBindingRouteAvailable(
+        modelString,
+        routeProvider,
+        providersConfig,
+        muxProviderOptions
+      )
+        ? ({ prefixMismatchBehavior: "drop_block" } as const)
+        : undefined;
+    const thinking: AnthropicProviderOptions["thinking"] =
+      shape.thinking?.type === "adaptive"
+        ? shape.thinking.summarized
+          ? { type: "adaptive", display: "summarized", ...(blockBinding && { blockBinding }) }
+          : { type: "adaptive" }
+        : shape.thinking;
 
-    if (isOpus45 || usesAdaptiveThinking) {
-      // Model-aware effort: native-xhigh models (Opus 4.7+ / Sonnet 5+ / Mythos)
-      // get the native "xhigh" wire value; other adaptive models keep xhigh → "max".
-      const effortLevel = getAnthropicEffort(effectiveThinking, capabilityModel);
-      const budgetTokens = ANTHROPIC_THINKING_BUDGETS[effectiveThinking];
-      // Opus 4.6+ / Sonnet 4.6 / Sonnet 5: adaptive thinking when on, disabled when off
-      // Opus 4.5: enabled thinking with budgetTokens ceiling (only when not "off")
-      // Mythos-class (Fable/Mythos) rejects `{ type: "disabled" }`. The thinking policy
-      // excludes "off" for them and AIService clamps the effective level via
-      // resolveEffectiveThinkingLevel, so "off" should not reach here — but if a stray
-      // path does, omit `thinking` (API defaults to adaptive) rather than hard-erroring.
-      //
-      // Opus 5 rejects disabled thinking above high effort. "off" maps to low,
-      // so this branch cannot produce that invalid combination.
-      //
-      // Native-xhigh models require `thinking.display: "summarized"` to return
-      // thinking content on adaptive requests; non-native adaptive models
-      // (Opus 4.6 / Sonnet 4.6) must not receive `display`.
-      // See https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking#summarized-thinking
-      const thinking: AnthropicProviderOptions["thinking"] = usesAdaptiveThinking
-        ? effectiveThinking === "off"
-          ? anthropicRejectsDisabledThinking(capabilityModel)
-            ? undefined
-            : { type: "disabled" }
-          : supportsNativeXhigh
-            ? { type: "adaptive", display: "summarized" }
-            : { type: "adaptive" }
-        : budgetTokens > 0
-          ? { type: "enabled", budgetTokens }
-          : undefined;
-
-      log.debug("buildProviderOptions: Anthropic effort model config", {
-        effort: effortLevel,
-        thinking,
-        thinkingLevel: effectiveThinking,
-      });
-
-      const anthropicOptions: AnthropicProviderOptions = {
-        disableParallelToolUse: false,
-        sendReasoning: true,
-        ...(thinking && { thinking }),
-        effort: effortLevel,
-      };
-
-      return { anthropic: anthropicOptions };
-    }
-
-    // Other Anthropic models: Use thinking parameter with budgetTokens
-    const budgetTokens = ANTHROPIC_THINKING_BUDGETS[effectiveThinking];
     log.debug("buildProviderOptions: Anthropic config", {
-      budgetTokens,
+      effort: shape.effort,
+      thinking,
       thinkingLevel: effectiveThinking,
     });
 
@@ -342,30 +901,52 @@ export function buildProviderOptions(
       anthropic: {
         disableParallelToolUse: false, // Always enable concurrent tool execution
         sendReasoning: true, // Include reasoning traces in requests sent to the model
-        // Conditionally add thinking configuration (non-Opus 4.5 models)
-        ...(budgetTokens > 0 && {
-          thinking: {
-            type: "enabled",
-            budgetTokens,
-          },
-        }),
+        ...(thinking && { thinking }),
+        ...(shape.effort && { effort: shape.effort }),
       },
     } satisfies { anthropic: AnthropicProviderOptions };
     log.debug("buildProviderOptions: Returning Anthropic options", options);
     return options;
   }
 
+  // A google-typed Coder instance fronts Gemini's OpenAI compatibility layer,
+  // which ignores reasoning_effort for thoughts (they need include_thoughts)
+  // and rejects it alongside thinking_config. The factory's compatible client
+  // copies this namespace's extra_body into the request verbatim.
+  if (
+    formatProvider === "openai" &&
+    isCoderGoogleWire(modelString, providersConfig, routeProvider)
+  ) {
+    const thinkingConfig = geminiThinkingConfig(capModelName, effectiveThinking);
+    const options = {
+      [CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE]: thinkingConfig
+        ? {
+            extra_body: {
+              google: {
+                thinking_config: {
+                  include_thoughts: thinkingConfig.includeThoughts,
+                  thinking_level: thinkingConfig.thinkingLevel,
+                  thinking_budget: thinkingConfig.thinkingBudget,
+                },
+              },
+            },
+          }
+        : {},
+    };
+    log.debug("buildProviderOptions: Coder Google options", options);
+    return options;
+  }
+
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
-    // Model-aware: the GPT-5.6 family maps ThinkingLevel "max" to the native
-    // "max" effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
+    // Model-aware: native-max models (the GPT-6 tiers and the GPT-5.6 family, see
+    // openaiSupportsNativeMaxEffort) map ThinkingLevel "max" to the native "max"
+    // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
     // capabilityModel so mapped aliases (mappedToModel) inherit their target's
-    // native effort. @ai-sdk/openai 4.0.11 accepts native max on both Responses
-    // and Chat Completions, so both wire formats now preserve the selected level.
-    // GPT-5.6 "off" remains explicit "none" because omission defaults to medium.
-    const reasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
+    // native effort. GPT-6 Luna and GPT-5.6 "off" must be explicit "none" because
+    // omission defaults to medium; the other GPT-6 tiers instead clamp "off" to "low".
 
-    // Mux always sends the latest conversation history explicitly. OpenAI's
+    // Xum always sends the latest conversation history explicitly. OpenAI's
     // previous_response_id is an alternative state-management path, not an additive one.
     // Chaining it on top of explicit history double-counts prior turns and caused GPT-5.4
     // requests to hit context_exceeded far below the documented native window.
@@ -377,26 +958,64 @@ export function buildProviderOptions(
     const cacheScope = promptCacheScope ?? workspaceId;
     const promptCacheKey = cacheScope ? `mux-v1-${cacheScope}` : undefined;
 
-    const serviceTier = muxProviderOptions?.openai?.serviceTier;
     const wireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
     const store = muxProviderOptions?.openai?.store;
     const isResponses = wireFormat === "responses";
+    // Luna only supports Chat Completions function calls at effort none.
+    // Xum turns are tool-driven, so keep tools working on this opt-in route;
+    // Responses (the default) preserves the selected reasoning effort.
+    const reasoningEffort =
+      !isResponses && isGpt6LunaModel(capabilityModel)
+        ? "none"
+        : getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
     const routeIsDirect = routeProvider == null || routeProvider === origin;
     const shouldUseProMode =
       isResponses &&
-      routeIsDirect &&
       reasoningMode === "pro" &&
-      openaiSupportsProMode(capabilityModel);
+      (routeIsDirect
+        ? openaiSupportsProMode(capabilityModel)
+        : routeProvider === "coder" &&
+          // The route-aware gate preserves scoped aliases without treating an
+          // alias's capability identity as the Coder instance's wire type.
+          openaiProModeAvailable(modelString, {
+            providersConfig,
+            resolvedRouteProvider: routeProvider,
+          }));
+    const cyberAccessProgram =
+      isResponses && reasoningMode === "cyber"
+        ? openaiCyberAccessProgram(modelString, {
+            providersConfig,
+            resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+            openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+          })
+        : undefined;
     const truncationMode = openaiTruncationMode ?? "disabled";
-    const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
+    // Bedrock Mantle keeps openai.<model> on the wire, which @ai-sdk/openai
+    // does not classify as a reasoning model (it anchors on gpt-*/o* IDs) and
+    // would drop the ENTIRE reasoning object (effort, summary, and pro mode).
+    // Force the classification; Mantle rejects every reasoning.summary value
+    // except "auto" with HTTP 400. Mantle is reachable through two Coder
+    // instance types: bedrock (whose OpenAI-namespaced IDs already select the
+    // Responses wire) and openai (Mantle speaks OpenAI Responses natively).
+    // Key on the wire model ID's namespace, not the instance type alone, so
+    // the real OpenAI upstream on an openai-typed instance keeps the SDK's
+    // own detection and "detailed" summaries.
+    const coderWire =
+      routeProvider === "coder" && modelString.startsWith("coder:")
+        ? resolveCoderWireCanonicalModel(modelString.slice("coder:".length), providersConfig?.coder)
+        : null;
+    const bedrockOpenAIWire =
+      coderWire != null &&
+      (coderWire.providerType === "bedrock" || coderWire.providerType === "openai") &&
+      bedrockOpenAIModelId(coderWire.modelId) != null;
 
     log.debug("buildProviderOptions: OpenAI config", {
       reasoningEffort,
-      shouldSendReasoningSummary,
       thinkingLevel: effectiveThinking,
       historyMessages: messages?.length ?? 0,
       promptCacheKey,
       reasoningMode: shouldUseProMode ? "pro" : undefined,
+      cyberAccessProgram,
       truncation: truncationMode,
       wireFormat,
     });
@@ -404,37 +1023,40 @@ export function buildProviderOptions(
     const options = {
       openai: {
         parallelToolCalls: true, // Always enable concurrent tool execution
+        ...(bedrockOpenAIWire && { forceReasoning: true }),
         ...(serviceTier != null && { serviceTier }),
         ...(store != null && { store }), // ZDR: pass store flag through to OpenAI SDK
         ...(isResponses && {
           // Default to disabled; allow auto truncation for compaction to avoid context errors
           truncation: truncationMode,
           // Pro mode is a native Responses option in @ai-sdk/openai 4.0.11.
-          // Keep the existing direct-route capability gate because mux-gateway
-          // currently drops this provider option and Codex OAuth strips it.
+          // Direct OpenAI and Coder Responses forward it; Codex OAuth strips it.
           ...(shouldUseProMode && { reasoningMode: "pro" as const }),
+          // Private per-call key the SDK ignores; providerModelFactory serializes
+          // it as access_programs.cyber on direct OpenAI only.
+          ...(cyberAccessProgram != null && { cyberAccessProgram }),
           // Stable prompt cache key to improve OpenAI cache hit rates
           // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
           ...(promptCacheKey && { promptCacheKey }),
         }),
-        // Chat Completions gets the same stable routing key only for GPT-5.6
-        // on the direct official OpenAI API (the stricter explicit-caching
+        // Chat Completions gets the same stable routing key only for the GPT-6
+        // tiers on the direct official OpenAI API (the stricter explicit-caching
         // gate). The broader legacy Responses behavior above stays unchanged.
         ...(!isResponses &&
           promptCacheKey &&
           openaiExplicitPromptCachingAvailable(
             modelString,
             routeProvider,
-            providersConfig ?? null
+            providersConfig ?? null,
+            {
+              openaiWireFormat: wireFormat,
+            }
           ) && { promptCacheKey }),
         // Conditionally add reasoning configuration
         ...(reasoningEffort && {
           reasoningEffort,
-          // AI SDK 7 defaults reasoningSummary to "detailed" whenever a
-          // reasoning effort is set, so models that reject the parameter must
-          // explicitly opt out with null.
           ...(isResponses && {
-            reasoningSummary: shouldSendReasoningSummary ? ("detailed" as const) : null,
+            reasoningSummary: bedrockOpenAIWire ? ("auto" as const) : ("detailed" as const),
           }),
           ...(isResponses && {
             // Include reasoning encrypted content to preserve reasoning context across conversation steps
@@ -449,57 +1071,26 @@ export function buildProviderOptions(
     return options;
   }
 
-  // Build Google-specific options
-  if (formatProvider === "google") {
-    const capBareModelName = capModelName.split("/").at(-1) ?? capModelName;
-    const usesGeminiThinkingLevelConfig = capBareModelName.includes("gemini-3");
-    const isGeminiFlashThinkingModel = isGeminiFlashThinkingLevelModelName(capBareModelName);
-    let thinkingConfig: GoogleGenerativeAIProviderOptions["thinkingConfig"];
-
-    if (isGeminiFlashThinkingModel && effectiveThinking === "off") {
-      // Gemini Flash chat models default to medium and do not support true thinking-off;
-      // send minimal explicitly so Mux's "off" setting means lowest-effort behavior.
-      thinkingConfig = { thinkingLevel: "minimal" };
-    } else if (effectiveThinking !== "off") {
-      thinkingConfig = {
-        includeThoughts: true,
-      };
-
-      if (usesGeminiThinkingLevelConfig) {
-        // Policy enforcement should clamp to valid Google levels before this adapter runs.
-        // Avoid leaking xhigh/max to Google if a caller bypasses policy.
-        thinkingConfig.thinkingLevel =
-          effectiveThinking === "xhigh" || effectiveThinking === "max" ? "high" : effectiveThinking;
-      } else {
-        // Gemini 2.5 uses thinkingBudget
-        const budget = GEMINI_THINKING_BUDGETS[effectiveThinking];
-        if (budget > 0) {
-          thinkingConfig.thinkingBudget = budget;
-        }
-      }
-    }
-
-    const options = {
-      google: {
-        thinkingConfig,
-      },
-    } satisfies { google: GoogleGenerativeAIProviderOptions };
+  // Build Google-specific options (Gemini API and Vertex AI share the Gemini payload)
+  if (isGoogleFamilyProvider(formatProvider)) {
+    const thinkingConfig = geminiThinkingConfig(capModelName, effectiveThinking);
+    const googleOptions = { thinkingConfig } satisfies GoogleGenerativeAIProviderOptions;
+    const options =
+      formatProvider === "google-vertex"
+        ? { googleVertex: googleOptions }
+        : { google: googleOptions };
     log.debug("buildProviderOptions: Google options", options);
     return options;
   }
 
-  // Build Moonshot-specific options
-  if (formatProvider === "moonshotai") {
-    // Kimi K3 always reasons and supports only the max reasoning effort. Send it
-    // explicitly rather than relying on the API default.
-    if (isKimiK3Model(capabilityModel)) {
-      const options = {
-        moonshotai: { reasoningEffort: "max" },
-      } satisfies { moonshotai: MoonshotAIProviderOptions };
-      log.debug("buildProviderOptions: Returning Moonshot options", options);
-      return options;
-    }
-    return {};
+  const directReasoningBuilder = DIRECT_REASONING_BUILDERS[formatProvider];
+  if (Object.hasOwn(DIRECT_REASONING_BUILDERS, formatProvider) && directReasoningBuilder) {
+    const options = directReasoningBuilder(capabilityModel, effectiveThinking);
+    log.debug("buildProviderOptions: Returning direct provider options", {
+      formatProvider,
+      options,
+    });
+    return options;
   }
 
   // Build OpenRouter-specific options
@@ -510,22 +1101,34 @@ export function buildProviderOptions(
     const reasoningEffort = isKimiK3Model(capabilityModel)
       ? "max"
       : OPENROUTER_REASONING_EFFORT[effectiveThinking];
+    // Haiku 5.5 reasons adaptively when `reasoning` is omitted, so "off" must
+    // disable it explicitly, as on the direct and Bedrock routes. OpenRouter
+    // documents effort "none" as disabling reasoning entirely.
+    const disableReasoning =
+      !reasoningEffort &&
+      effectiveThinking === "off" &&
+      anthropicThinksUnlessDisabled(capabilityModel);
 
     log.debug("buildProviderOptions: OpenRouter config", {
       reasoningEffort,
+      disableReasoning,
       thinkingLevel: effectiveThinking,
     });
 
-    // Only add reasoning config if thinking is enabled
-    if (reasoningEffort) {
+    // OpenRouter spreads this namespace directly into the HTTP body.
+    if (reasoningEffort || disableReasoning || serviceTier != null) {
       const options = {
         openrouter: {
-          reasoning: {
-            enabled: true,
-            effort: reasoningEffort,
-            // Don't exclude reasoning content - we want to display it in the UI
-            exclude: false,
-          },
+          ...(serviceTier != null && { service_tier: serviceTier }),
+          ...(reasoningEffort && {
+            reasoning: {
+              enabled: true,
+              effort: reasoningEffort,
+              // Don't exclude reasoning content - we want to display it in the UI
+              exclude: false,
+            },
+          }),
+          ...(disableReasoning && { reasoning: { effort: "none" } }),
         },
       } satisfies { openrouter: OpenRouterReasoningOptions };
       log.debug("buildProviderOptions: Returning OpenRouter options", options);
@@ -539,36 +1142,74 @@ export function buildProviderOptions(
 
   // Build xAI-specific options
   if (formatProvider === "xai") {
-    const overrides = muxProviderOptions?.xai ?? {};
+    // serviceTier is applied by providerModelFactory's fetch wrapper because the
+    // current xAI AI SDK provider does not expose service_tier as a typed option.
+    const {
+      serviceTier: _serviceTier,
+      searchParameters,
+      store,
+      ...overrides
+    } = muxProviderOptions?.xai ?? {};
+    const isGrokFrontier = isGrokFrontierModel(capabilityModel);
+    // Grok 4.6/4.7 support native xhigh effort; Grok 4.5 tops out at high.
+    const topEffort = grokSupportsNativeXhigh(capabilityModel) ? "xhigh" : "high";
+    const reasoningEffort: XaiProviderOptions["reasoningEffort"] = isGrokFrontier
+      ? effectiveThinking === "xhigh" || effectiveThinking === "max"
+        ? topEffort
+        : effectiveThinking === "off"
+          ? "low"
+          : effectiveThinking
+      : undefined;
 
     const defaultSearchParameters: XaiProviderOptions["searchParameters"] = {
       mode: "auto",
       returnCitations: true,
     };
 
+    // Frontier Grok Responses: always prefer store=false.
+    // Xum already resends full history explicitly and persists encrypted reasoning
+    // client-side, so server storage is unnecessary. Forcing store=false means ZDR
+    // and non-ZDR orgs share one code path and one quality bar (no settings surface).
+    // Explicit muxProviderOptions.xai.store still wins for tests/escapes.
+    const effectiveStore = isGrokFrontier ? (store ?? false) : store;
+
     const options = {
       xai: {
         ...overrides,
-        searchParameters: overrides.searchParameters ?? defaultSearchParameters,
+        ...(reasoningEffort != null && { reasoningEffort }),
+        ...(effectiveStore != null && { store: effectiveStore }),
+        // Frontier Grok uses xAI's modern Responses tools; getToolsForModel translates
+        // legacy Live Search settings instead of sending deprecated search_parameters.
+        ...(!isGrokFrontier && {
+          searchParameters: searchParameters ?? defaultSearchParameters,
+        }),
       },
-    } satisfies { xai: XaiProviderOptions };
+    } satisfies { xai: XaiBuiltProviderOptions };
     log.debug("buildProviderOptions: Returning xAI options", options);
     return options;
   }
 
-  if (origin === "openai" && formatProvider !== origin) {
+  if (
+    (origin === "openai" && formatProvider !== origin) ||
+    (providerOptionsNamespaceKey === "github-copilot" && serviceTier != null)
+  ) {
     // capabilityModel keeps mapped aliases consistent with raw ids on the same route.
     // Copilot's Chat Completions upstream has not published native-max or
-    // explicit-none support, so degrade GPT-5.6 "max" to xhigh (the pre-5.6 top
-    // effort) and "none" back to omission instead of risking a rejection.
-    const nativeReasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
+    // explicit-none support, so degrade native-max models' (the GPT-6 tiers and
+    // GPT-5.6) "max" to xhigh (the older top effort) and "none" back to omission
+    // instead of risking a rejection.
+    // Explicit Copilot IDs gain the tier only; don't reinterpret their reasoning capabilities.
+    const nativeReasoningEffort =
+      origin === "openai"
+        ? getOpenAIReasoningEffort(effectiveThinking, capabilityModel)
+        : undefined;
     const reasoningEffort =
       nativeReasoningEffort === "max"
         ? "xhigh"
         : nativeReasoningEffort === "none"
           ? undefined
           : nativeReasoningEffort;
-    if (!reasoningEffort) {
+    if (!reasoningEffort && serviceTier == null) {
       log.debug(
         "buildProviderOptions: OpenAI-compatible gateway (thinking off, no provider options)",
         {
@@ -583,10 +1224,25 @@ export function buildProviderOptions(
 
     const options = {
       "github-copilot": {
-        reasoningEffort,
+        ...(reasoningEffort && { reasoningEffort }),
+        ...(serviceTier != null && { serviceTier }),
       },
     } satisfies { "github-copilot": OpenAICompatibleGatewayProviderOptions };
     log.debug("buildProviderOptions: Returning OpenAI-compatible gateway options", options);
+    return options;
+  }
+
+  // Claude on Bedrock gets the same per-model thinking shape as the direct route
+  // (#5839); without it the level picker did nothing there.
+  if (bedrockClaudeModel != null) {
+    const options = buildBedrockClaudeOptions(
+      resolveAnthropicThinkingShape(
+        bedrockClaudeModel,
+        bedrockClaudeModel.slice("anthropic:".length),
+        effectiveThinking
+      )
+    );
+    log.debug("buildProviderOptions: Returning Bedrock options", options);
     return options;
   }
 
@@ -597,7 +1253,33 @@ export function buildProviderOptions(
     routeProvider,
     providerOptionsNamespaceKey,
   });
-  return {};
+  return openaiCompatibleGlm53Options(rawPrefixConfig, capabilityModel, effectiveThinking);
+}
+
+/**
+ * Custom OpenAI-compatible endpoints get no reasoning field by default, since a
+ * strict server may reject unknown fields. GLM 5.3's chat template runs at max
+ * effort unless reasoning_effort is exactly "low" or "high", so a model Xum
+ * recognizes as GLM 5.3 (by id or mappedToModel) gets it. Every OpenAI-compatible
+ * chat model reads the `openaiCompatible` key, whatever the custom provider's id.
+ */
+function openaiCompatibleGlm53Options(
+  providerConfig: ProvidersConfigMap[string] | undefined,
+  capabilityModel: string,
+  thinking: ThinkingLevel
+): ProviderOptions {
+  if (
+    !isCustomProviderConfig(providerConfig) ||
+    providerConfig.providerType !== "openai-compatible" ||
+    !isGlm53Model(capabilityModel)
+  ) {
+    return {};
+  }
+  const options = {
+    openaiCompatible: { reasoningEffort: glm53ReasoningEffort(thinking) },
+  } satisfies { openaiCompatible: OpenAICompatibleLanguageModelChatOptions };
+  log.debug("buildProviderOptions: Returning OpenAI-compatible GLM 5.3 options", options);
+  return options;
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +1289,11 @@ export function buildProviderOptions(
 /** Header value for Anthropic 1M context beta */
 export const ANTHROPIC_1M_CONTEXT_HEADER = "context-1m-2025-08-07";
 
-/** HTTP header sent on AI requests for workspace-level observability. */
+/**
+ * HTTP header sent on AI requests for workspace-level observability.
+ * The JS symbol can stay Xum-branded; the wire value remains X-Mux-Workspace-Id
+ * so existing correlation pipelines keep matching.
+ */
 export const MUX_WORKSPACE_ID_HEADER = "X-Mux-Workspace-Id";
 
 const HTTP_HEADER_VALUE_SAFE_PATTERN = /^[\t\x20-\x7E\x80-\xFF]+$/;
@@ -629,6 +1315,21 @@ function toWorkspaceHeaderValue(workspaceId: string): string {
 }
 
 /**
+ * The session header name of the custom provider in `modelString` (custom
+ * providers are always their own direct route). Names that fail validation (a
+ * hand-edited providers.jsonc) are skipped, so they never replace credentials
+ * or make fetch reject the request.
+ */
+function resolveSessionHeaderName(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null | undefined
+): string | null {
+  const providerConfig = providersConfig?.[modelString.split(":", 1)[0]];
+  const name = isCustomProviderConfig(providerConfig) ? providerConfig.sessionHeader : undefined;
+  return name != null && sessionHeaderNameError(name) == null ? name : null;
+}
+
+/**
  * Build per-request HTTP headers for provider-specific features.
  *
  * These flow through streamText({ headers }) to the provider SDK, which merges
@@ -647,9 +1348,13 @@ export function buildRequestHeaders(
 
   if (workspaceId != null) {
     headers[MUX_WORKSPACE_ID_HEADER] = toWorkspaceHeaderValue(workspaceId);
+    const sessionHeader = resolveSessionHeaderName(modelString, providersConfig);
+    if (sessionHeader != null) {
+      headers[sessionHeader] = headers[MUX_WORKSPACE_ID_HEADER];
+    }
   }
 
-  const normalized = normalizeToCanonical(modelString);
+  const normalized = resolveOptionsCanonicalModel(modelString, providersConfig, routeProvider);
   const [origin] = normalized.split(":", 2);
 
   // 1M context header — only when origin supports it AND route is passthrough (or direct)
@@ -659,6 +1364,13 @@ export function buildRequestHeaders(
   if (
     origin === "anthropic" &&
     routePassesHeaders &&
+    // Wire origin gates WHICH header can be attached; capability is
+    // evaluated on the RAW identity. The wire-canonical string mangles
+    // metadata-divergent instances (coder:bedrock/anthropic.claude-* becomes
+    // anthropic:anthropic.claude-*, which the anchored Claude patterns
+    // reject), while the raw string resolves through the provider-type-aware
+    // metadata identity — matching the UI/compaction gates AND the raw-keyed
+    // per-model 1M intent toggles.
     isAnthropic1MEffectivelyEnabled(modelString, muxProviderOptions, providersConfig)
   ) {
     headers["anthropic-beta"] = ANTHROPIC_1M_CONTEXT_HEADER;

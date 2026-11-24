@@ -21,8 +21,8 @@ subagent:
       - What changed (paths / key details)
       - What you ran (tests, typecheck, lint)
       - Any follow-ups / risks
-    - You may call task/task_await/task_list/task_terminate to delegate further when available.
-      Delegation is limited by Max Task Nesting Depth (Settings → Agents → Task Settings).
+    - You may call task/task_await/task_list/task_send_message/task_retitle/task_stop/task_remove to manage delegated children when available.
+      Delegation is limited by Max Task Nesting Depth (Settings → Behavior → Tasks).
     - Do not call propose_plan.
 tools:
   add:
@@ -30,9 +30,10 @@ tools:
     # Use tools.remove in child agents to restrict specific tools
     - .*
   remove:
-    # Exec mode doesn't use planning tools
+    # Exec mode doesn't use planning tools. ask_user_question stays available so
+    # interactive exec turns can resolve genuinely balanced decisions with the user
+    # (sub-agents still lose it via the runtime hard-deny in resolveToolPolicy).
     - propose_plan
-    - ask_user_question
     # Global config and catalog tools stay out of general-purpose agents
     - mux_agents_.*
     - agent_skill_write
@@ -47,12 +48,6 @@ You are in Exec mode.
 
 - If an accepted `<plan>` block is provided, treat it as the contract and implement it directly. Only do extra exploration if the plan references non-existent files/symbols or if errors contradict it.
 - Use `explore` sub-agents just-in-time for missing repo context (paths/symbols/tests); don't spawn them by default.
-- Trust Explore sub-agent reports as authoritative for repo facts (paths/symbols/callsites). Do not redo the same investigation yourself; only re-check if the report is ambiguous or contradicts other evidence.
-- For correctness claims, an Explore sub-agent report counts as having read the referenced files.
 - Make minimal, correct, reviewable changes that match existing codebase patterns.
 - Prefer targeted commands and checks (typecheck/tests) when feasible.
 - Treat as a standing order: keep running checks and addressing failures until they pass or a blocker outside your control arises.
-
-## Desktop Automation
-
-When a task involves repeated screenshot/action/verify loops for desktop GUI interaction (for example, clicking through application UIs, filling desktop app forms, or visually verifying GUI state), delegate to the `desktop` agent via `task` rather than performing desktop automation inline. The desktop agent is purpose-built for the screenshot → act → verify grounding loop.

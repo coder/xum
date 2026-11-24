@@ -123,7 +123,7 @@ describe("Chat truncation UI", () => {
         () => {
           const nodes = Array.from(
             view?.container.querySelectorAll('[data-testid="chat-message"]') ?? []
-          ).filter((node) => node.textContent?.match(/some messages are hidden for performance/i));
+          ).filter((node) => /some messages are hidden for performance/i.exec(node.textContent));
           if (nodes.length === 0) {
             throw new Error("Truncation indicator not found");
           }
@@ -154,15 +154,20 @@ describe("Chat truncation UI", () => {
         view.container.querySelectorAll('[data-testid="chat-message"]')
       );
       const hiddenIndicatorCount = messageBlocks.filter((node) =>
-        node.textContent?.match(/some messages are hidden for performance/i)
+        /some messages are hidden for performance/i.exec(node.textContent)
       ).length;
       expect(hiddenIndicatorCount).toBe(MAX_HISTORY_HIDDEN_SEGMENTS);
       const indicatorIndex = messageBlocks.findIndex((node) =>
-        node.textContent?.match(/some messages are hidden for performance/i)
+        /some messages are hidden for performance/i.exec(node.textContent)
       );
       expect(indicatorIndex).toBeGreaterThan(0);
-      expect(messageBlocks[indicatorIndex - 1]?.textContent).toContain("user-0");
-      // The earliest marker still appears at the first omission seam.
+      // The earliest marker still appears at the first omission seam: after user-0's turn
+      // (which the workspace creation card follows) and before user-1.
+      const rowsBeforeIndicator = messageBlocks
+        .slice(0, indicatorIndex)
+        .map((node) => node.textContent ?? "");
+      expect(rowsBeforeIndicator.some((text) => text.includes("user-0"))).toBe(true);
+      expect(rowsBeforeIndicator.some((text) => text.includes("user-1"))).toBe(false);
       expect(messageBlocks[indicatorIndex + 1]?.textContent).toContain("user-1");
 
       // Verify assistant meta rows survive in the recent (non-truncated) section.

@@ -1,5 +1,65 @@
 import { describe, it, expect } from "bun:test";
-import { transformMCPResult, MAX_IMAGE_DATA_BYTES } from "./mcpResultTransform";
+import {
+  MCP_TOOL_RESULT_MAX_TEXT_BYTES,
+  MCP_TOOL_RESULT_MAX_TOTAL_BYTES,
+} from "@/common/constants/toolLimits";
+import {
+  omitMCPProtocolMeta,
+  transformMCPResult,
+  MAX_IMAGE_DATA_BYTES,
+} from "./mcpResultTransform";
+
+describe("omitMCPProtocolMeta", () => {
+  it("removes result, content block, and embedded resource metadata only", () => {
+    const input = {
+      isError: true,
+      content: [
+        { type: "text", text: 'literal {"_meta": 1} stays', _meta: { trace: "block" } },
+        { type: "resource", resource: { uri: "x://r", text: "body", _meta: { s: "inner" } } },
+        { type: "resource", resource: { uri: "x://w", text: "w" }, _meta: { s: "wrapper" } },
+        { type: "image", data: "abc", mimeType: "image/png" },
+      ],
+      structuredContent: { _meta: "application data" },
+      _meta: { cursor: "page-2" },
+    };
+    const snapshot = structuredClone(input);
+
+    expect(omitMCPProtocolMeta(input)).toEqual({
+      isError: true,
+      content: [
+        { type: "text", text: 'literal {"_meta": 1} stays' },
+        { type: "resource", resource: { uri: "x://r", text: "body" } },
+        { type: "resource", resource: { uri: "x://w", text: "w" } },
+        { type: "image", data: "abc", mimeType: "image/png" },
+      ],
+      structuredContent: { _meta: "application data" },
+    });
+    // Copy-on-write: the raw result is never mutated.
+    expect(input).toEqual(snapshot);
+  });
+
+  it("strips root metadata even when content is not an array", () => {
+    const input = { content: "not-an-array", _meta: { trace: "root" } };
+    expect(omitMCPProtocolMeta(input)).toEqual({ content: "not-an-array" });
+  });
+
+  it.each([
+    { content: [{ type: "text", text: "ok" }] },
+    // `_meta` outside the protocol locations is application data.
+    { content: [{ type: "text", text: "ok" }], structuredContent: { _meta: { keep: true } } },
+    { toolResult: { _meta: { keep: true } } },
+    { content: [{ type: "text", text: "ok", resource: { _meta: { keep: true } } }] },
+    // Malformed shapes pass through untouched.
+    { _meta: ["invalid"] },
+    { content: [null, "raw", { type: "resource", resource: "not-an-object" }], _meta: null },
+  ])("returns the same reference when there is nothing to strip: %j", (input) => {
+    expect(omitMCPProtocolMeta(input)).toBe(input);
+  });
+
+  it.each([null, undefined, "text", 42, ["_meta"]])("passes non-objects through: %j", (input) => {
+    expect(omitMCPProtocolMeta(input)).toBe(input);
+  });
+});
 
 describe("transformMCPResult", () => {
   describe("image data overflow handling", () => {
@@ -96,6 +156,245 @@ describe("transformMCPResult", () => {
     });
   });
 
+  describe("text output cap", () => {
+    interface TextContentResult {
+      content: Array<{ type: string; text?: string; resource?: { uri: string; text?: string } }>;
+      isError?: boolean;
+      structuredContent?: unknown;
+    }
+
+    it("truncates an oversized text-only result with a notice, preserving MCP shape", () => {
+      const bigText = "x".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 10_000);
+      const original = {
+        isError: true,
+        content: [{ type: "text" as const, text: bigText }],
+      };
+
+      const result = transformMCPResult(original) as TextContentResult;
+
+      // MCP wire shape (and the isError flag) must survive so toModelOutput
+      // still surfaces errors to the model.
+      expect(result.isError).toBe(true);
+      expect(result.content).toHaveLength(1);
+      const text = result.content[0].text!;
+      expect(Buffer.byteLength(text, "utf8")).toBeLessThan(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 300);
+      expect(text.startsWith("xxx")).toBe(true);
+      expect(text).toContain("[MCP tool result text truncated:");
+      // Original object must not be mutated.
+      expect(original.content[0].text).toHaveLength(bigText.length);
+    });
+
+    it("returns text-only results under the cap unchanged (same reference)", () => {
+      // 100 bytes of headroom covers the serialized part-wrapper overhead.
+      const underCap = {
+        content: [
+          { type: "text" as const, text: "a".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES - 100) },
+        ],
+      };
+      expect(transformMCPResult(underCap)).toBe(underCap);
+    });
+
+    it("shares one budget across parts and appends an omission notice", () => {
+      const nearCapText = "b".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES - 40);
+      const result = transformMCPResult({
+        content: [
+          { type: "text" as const, text: nearCapText },
+          { type: "text" as const, text: "dropped entirely" },
+          { type: "text" as const, text: "also dropped" },
+        ],
+      }) as TextContentResult;
+
+      expect(result.content).toHaveLength(2);
+      expect(result.content[0].text).toBe(nearCapText);
+      expect(result.content[1].text).toContain("[2 content part(s) omitted:");
+    });
+
+    it("bounds serialized size when a result carries very many tiny parts", () => {
+      // Per Codex review: budgeting only raw text bytes lets 40k one-byte
+      // parts serialize to >1MB of JSON wrapper overhead.
+      const result = transformMCPResult({
+        content: Array.from({ length: 40_000 }, () => ({ type: "text" as const, text: "x" })),
+      }) as TextContentResult;
+
+      expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(
+        MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+      );
+      expect(result.content.at(-1)!.text).toContain("content part(s) omitted:");
+    });
+
+    it("bounds serialized size of escape-heavy text (JSON escapes expand 6x)", () => {
+      // Raw-byte budgeting lets 64KB of control characters serialize to ~384KB.
+      const result = transformMCPResult({
+        content: [{ type: "text" as const, text: "\u0001".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES) }],
+      }) as TextContentResult;
+
+      expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(
+        MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+      );
+      expect(result.content[0].text).toContain("[MCP tool result text truncated:");
+    });
+
+    it("caps oversized text resources in text-only results", () => {
+      const result = transformMCPResult({
+        content: [
+          {
+            type: "resource" as const,
+            resource: {
+              uri: "file:///big.json",
+              text: "r".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000),
+            },
+          },
+        ],
+      }) as TextContentResult;
+
+      const text = result.content[0].resource!.text!;
+      expect(Buffer.byteLength(text, "utf8")).toBeLessThan(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 300);
+      expect(text).toContain("[MCP tool result text truncated:");
+      expect(result.content[0].resource!.uri).toBe("file:///big.json");
+    });
+
+    it("caps text parts in results that also carry binary content", () => {
+      const smallImageData = "img".repeat(100);
+      const result = transformMCPResult({
+        content: [
+          { type: "text" as const, text: "t".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000) },
+          { type: "image" as const, data: smallImageData, mimeType: "image/png" },
+        ],
+      }) as {
+        type: string;
+        value: Array<{ type: string; text?: string; data?: string; mediaType?: string }>;
+      };
+
+      expect(result.type).toBe("content");
+      expect(result.value[0].type).toBe("text");
+      expect(result.value[0].text).toContain("[MCP tool result text truncated:");
+      // Media parts are exempt from the text budget (guarded separately).
+      expect(result.value[1]).toEqual({
+        type: "media",
+        data: smallImageData,
+        mediaType: "image/png",
+      });
+    });
+
+    it("does not cut truncated text mid-way through a multi-byte character", () => {
+      const result = transformMCPResult({
+        content: [{ type: "text" as const, text: "€".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES) }],
+      }) as TextContentResult;
+
+      const text = result.content[0].text!;
+      expect(text).toContain("[MCP tool result text truncated:");
+      expect(text).not.toContain("\uFFFD");
+    });
+
+    it("passes small structuredContent through unchanged", () => {
+      const withStructured = {
+        content: [{ type: "text" as const, text: "ok" }],
+        structuredContent: { rows: [1, 2, 3] },
+      };
+      expect(transformMCPResult(withStructured)).toBe(withStructured);
+    });
+
+    it("drops oversized structuredContent with a notice", () => {
+      const result = transformMCPResult({
+        content: [{ type: "text" as const, text: "summary" }],
+        structuredContent: { blob: "s".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000) },
+      }) as TextContentResult;
+
+      expect(result.structuredContent).toBeUndefined();
+      expect("structuredContent" in result).toBe(false);
+      expect(result.content[0].text).toBe("summary");
+      expect(result.content[1].text).toContain("[MCP structuredContent omitted:");
+    });
+
+    it("replaces an oversized toolResult with a bounded notice", () => {
+      const result = transformMCPResult({
+        toolResult: { data: "t".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000) },
+      }) as { toolResult: string };
+
+      expect(result.toolResult).toContain("[MCP toolResult omitted:");
+      expect(result.toolResult.length).toBeLessThan(300);
+    });
+
+    it("replaces an oversized result without a content array with a bounded notice", () => {
+      const result = transformMCPResult({
+        something: "e".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000),
+      }) as TextContentResult;
+
+      expect(result.content[0].type).toBe("text");
+      expect(result.content[0].text).toContain("[MCP tool result omitted:");
+    });
+
+    it("passes small results with modest metadata through unchanged", () => {
+      const withMeta = {
+        content: [{ type: "text" as const, text: "ok" }],
+        _meta: { traceId: "abc123" },
+      };
+      expect(transformMCPResult(withMeta)).toBe(withMeta);
+    });
+
+    it("flattens results whose result-level metadata exceeds the total serialized cap", () => {
+      const result = transformMCPResult({
+        content: [{ type: "text" as const, text: "small useful text" }],
+        _meta: { blob: "m".repeat(MCP_TOOL_RESULT_MAX_TOTAL_BYTES + 10_000) },
+      }) as TextContentResult & { _meta?: unknown };
+
+      expect(result._meta).toBeUndefined();
+      expect(result.content[0].text).toBe("small useful text");
+      expect(result.content.at(-1)!.text).toContain("[MCP result metadata omitted:");
+      expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(
+        MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+      );
+    });
+
+    it("bounds oversized metadata riding on individual content parts", () => {
+      const result = transformMCPResult({
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: "hello",
+            _meta: { blob: "m".repeat(MCP_TOOL_RESULT_MAX_TOTAL_BYTES + 10_000) },
+          },
+        ],
+      }) as TextContentResult;
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("hello");
+      expect(result.content.at(-1)!.text).toContain("[MCP result metadata omitted:");
+      expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(
+        MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+      );
+    });
+
+    it("bounds resource parts with oversized URIs and no text", () => {
+      const result = transformMCPResult({
+        content: [
+          {
+            type: "resource" as const,
+            resource: { uri: "data:x," + "u".repeat(MCP_TOOL_RESULT_MAX_TOTAL_BYTES + 10_000) },
+          },
+        ],
+      }) as TextContentResult;
+
+      // Flattened to a truncated stringified text part plus the metadata notice.
+      expect(result.content[0].type).toBe("text");
+      expect(result.content[0].text).toContain("[MCP tool result text truncated:");
+      expect(result.content.at(-1)!.text).toContain("[MCP result metadata omitted:");
+      expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(
+        MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+      );
+    });
+
+    it("truncates oversized primitive string results", () => {
+      const result = transformMCPResult(
+        "p".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000)
+      ) as string;
+
+      expect(Buffer.byteLength(result, "utf8")).toBeLessThan(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 300);
+      expect(result).toContain("[MCP tool result text truncated:");
+    });
+  });
+
   describe("existing functionality", () => {
     it("should return null for null input", () => {
       expect(transformMCPResult(null)).toBeNull();
@@ -109,12 +408,36 @@ describe("transformMCPResult", () => {
       expect(transformMCPResult("serena")).toBe("serena");
     });
 
-    it("should pass through error results unchanged", () => {
+    it("should pass through text-only error results unchanged", () => {
       const errorResult = {
         isError: true,
         content: [{ type: "text" as const, text: "Error!" }],
       };
       expect(transformMCPResult(errorResult)).toBe(errorResult);
+    });
+
+    it("should convert binary content in error results and mark the error", () => {
+      // Error results carrying binary payloads must not bypass the media
+      // conversion (or the size guard); the error flag is surfaced as text.
+      const bigData = "x".repeat(9 * 1024 * 1024);
+      const errorResult = {
+        isError: true,
+        content: [
+          { type: "text" as const, text: "capture failed" },
+          { type: "image" as const, data: "abc123", mimeType: "image/png" },
+          { type: "image" as const, data: bigData, mimeType: "image/png" },
+        ],
+      };
+      const result = transformMCPResult(errorResult) as {
+        type: string;
+        value: Array<{ type: string; text?: string; data?: string; mediaType?: string }>;
+      };
+      expect(result.type).toBe("content");
+      expect(result.value[0]).toEqual({ type: "text", text: "[Tool reported an error]" });
+      expect(result.value[1]).toEqual({ type: "text", text: "capture failed" });
+      expect(result.value[2]).toEqual({ type: "media", data: "abc123", mediaType: "image/png" });
+      expect(result.value[3].type).toBe("text");
+      expect(result.value[3].text).toContain("Image omitted");
     });
 
     it("should pass through toolResult unchanged", () => {

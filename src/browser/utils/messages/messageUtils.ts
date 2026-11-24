@@ -28,15 +28,6 @@ export function getEditableUserMessageDraftContent(
   };
 }
 
-/**
- * Returns the text that should be placed into the ChatInput when editing a user message.
- */
-export function getEditableUserMessageText(
-  message: Extract<DisplayedMessage, { type: "user" }>
-): string {
-  return getEditableUserMessageDraftContent(message).text;
-}
-
 function stripRenderedReviews(content: string, reviews?: ReviewNoteDataForDisplay[]): string {
   if (!reviews || reviews.length === 0) {
     return content;
@@ -90,8 +81,11 @@ export interface BashOutputGroupInfo {
   collapsedCount: number;
   /** Process ID for the collapsed indicator */
   processId: string;
-  /** Index of the first message in this group (used as expand/collapse key) */
-  firstIndex: number;
+  /**
+   * ID of the first message in this group: the expand/collapse key. An ID, not an index, so
+   * older rows loaded above the group leave it unchanged.
+   */
+  groupKey: string;
 }
 
 interface InterruptedBarrierVisibilityOptions {
@@ -257,6 +251,31 @@ export function mergeConsecutiveStreamErrors(messages: DisplayedMessage[]): Disp
   return result;
 }
 
+// Rows are memoized on prop identity, and the infos are recomputed for every new message
+// snapshot (each stream delta, each page of older rows). Reusing an equal info per row message
+// keeps unchanged group rows from re-rendering (#4961 F20). Keyed weakly by the row's message
+// object, so entries go away with the messages.
+const bashOutputGroupInfoByMessage = new WeakMap<DisplayedMessage, BashOutputGroupInfo>();
+
+function reuseEqualBashOutputGroupInfo(
+  message: DisplayedMessage,
+  info: BashOutputGroupInfo
+): BashOutputGroupInfo {
+  const previous = bashOutputGroupInfoByMessage.get(message);
+  if (
+    previous !== undefined &&
+    previous.position === info.position &&
+    previous.totalCount === info.totalCount &&
+    previous.collapsedCount === info.collapsedCount &&
+    previous.processId === info.processId &&
+    previous.groupKey === info.groupKey
+  ) {
+    return previous;
+  }
+  bashOutputGroupInfoByMessage.set(message, info);
+  return info;
+}
+
 /**
  * Precompute bash_output grouping metadata for all rows in one linear pass.
  *
@@ -299,13 +318,13 @@ export function computeBashOutputGroupInfos(
           position = "last";
         }
 
-        groupInfos[groupIndex] = {
+        groupInfos[groupIndex] = reuseEqualBashOutputGroupInfo(messages[groupIndex], {
           position,
           totalCount: groupSize,
           collapsedCount,
           processId,
-          firstIndex: index,
-        };
+          groupKey: msg.id,
+        });
       }
     }
 

@@ -7,7 +7,6 @@ import {
   collectActiveWorkflowGroupKeys,
   computeSidebarTaskGroups,
   computeTaskGroupMemberRowMeta,
-  ensureWorkflowGroupMembersVisible,
   shortenWorkflowRunId,
 } from "./sidebarTaskGroups";
 
@@ -16,6 +15,7 @@ function createWorkspace(
   opts?: {
     parentWorkspaceId?: string;
     taskStatus?: FrontendWorkspaceMetadata["taskStatus"];
+    taskExecutionStatus?: FrontendWorkspaceMetadata["taskExecutionStatus"];
     title?: string;
     createdAt?: string;
     bestOf?: FrontendWorkspaceMetadata["bestOf"];
@@ -32,6 +32,7 @@ function createWorkspace(
     runtimeConfig: DEFAULT_RUNTIME_CONFIG,
     createdAt: opts?.createdAt,
     parentWorkspaceId: opts?.parentWorkspaceId,
+    taskExecutionStatus: opts?.taskExecutionStatus,
     taskStatus: opts?.taskStatus,
     bestOf: opts?.bestOf,
     workflowTask: opts?.workflowTask,
@@ -45,6 +46,7 @@ function workflowChild(
   runId: string,
   opts?: {
     taskStatus?: FrontendWorkspaceMetadata["taskStatus"];
+    taskExecutionStatus?: FrontendWorkspaceMetadata["taskExecutionStatus"];
     createdAt?: string;
     workflowName?: string;
     title?: string;
@@ -53,6 +55,7 @@ function workflowChild(
   return createWorkspace(id, {
     parentWorkspaceId: "parent",
     taskStatus: opts?.taskStatus ?? "running",
+    taskExecutionStatus: opts?.taskExecutionStatus,
     createdAt: opts?.createdAt,
     title: opts?.title,
     workflowTask: {
@@ -64,6 +67,36 @@ function workflowChild(
 }
 
 describe("computeSidebarTaskGroups", () => {
+  test("keeps a reported workflow worker active until its Bash monitor retires", () => {
+    const child = workflowChild("watcher", "wfr_monitor", {
+      taskStatus: "reported",
+      taskExecutionStatus: "completed",
+    });
+    const rows = [parent, child];
+    let monitorActive = true;
+    const options = { hasActiveBashMonitor: (id: string) => id === child.id && monitorActive };
+    const key = "workflow:parent:wfr_monitor";
+    const active = computeSidebarTaskGroups({
+      rows,
+      allRows: rows,
+      ...options,
+    }).groupsByStorageKey.get(key);
+    expect(active?.runningCount).toBe(1);
+    expect(active?.completedCount).toBe(0);
+    expect(active?.displayMembers.map((member) => member.id)).toEqual([child.id]);
+    expect(collectActiveWorkflowGroupKeys(rows, options).has(key)).toBe(true);
+
+    monitorActive = false;
+    const retired = computeSidebarTaskGroups({
+      rows,
+      allRows: rows,
+      ...options,
+    }).groupsByStorageKey.get(key);
+    expect(retired?.runningCount).toBe(0);
+    expect(retired?.displayMembers).toEqual([]);
+    expect(collectActiveWorkflowGroupKeys(rows, options).has(key)).toBe(false);
+  });
+
   test("groups workflow tasks per runId from the first member, separating concurrent runs", () => {
     const a1 = workflowChild("a1", "wfr_alpha", { workflowName: "review-pipeline" });
     const b1 = workflowChild("b1", "wfr_beta");
@@ -125,7 +158,7 @@ describe("computeSidebarTaskGroups", () => {
     expect(result.groupsByStorageKey.size).toBe(0);
   });
 
-  test("active workflow groups display hidden completed siblings; inactive ones do not", () => {
+  test("workflow groups display only active members from the visible sidebar rows", () => {
     const done = workflowChild("done", "wfr_alpha", {
       taskStatus: "reported",
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -135,35 +168,45 @@ describe("computeSidebarTaskGroups", () => {
       createdAt: "2026-01-01T00:01:00.000Z",
     });
     const allRows = [parent, done, running];
-    // Completed-sub-agent filtering hid "done" from the visible rows.
     const visibleRows = [parent, running];
 
     const active = computeSidebarTaskGroups({ rows: visibleRows, allRows });
     const activeGroup = active.groupsByStorageKey.get("workflow:parent:wfr_alpha");
     expect(activeGroup?.hasActiveMember).toBe(true);
-    expect(activeGroup?.displayMembers.map((m) => m.id)).toEqual(["done", "running"]);
+    expect(activeGroup?.displayMembers.map((member) => member.id)).toEqual(["running"]);
 
-    // Same run, fully terminal: hidden completed members stay hidden...
-    const doneToo = { ...running, taskStatus: "reported" as const };
-    const inactive = computeSidebarTaskGroups({
-      rows: [parent, doneToo],
-      allRows: [parent, done, doneToo],
-    });
-    const inactiveGroup = inactive.groupsByStorageKey.get("workflow:parent:wfr_alpha");
-    expect(inactiveGroup?.hasActiveMember).toBe(false);
-    expect(inactiveGroup?.displayMembers.map((m) => m.id)).toEqual(["running"]);
-
-    // ...unless one of them is selected, which must stay reachable on expand.
-    const withSelection = computeSidebarTaskGroups({
-      rows: [parent, doneToo],
-      allRows: [parent, done, doneToo],
+    const selectedInactive = computeSidebarTaskGroups({
+      rows: visibleRows,
+      allRows,
       selectedWorkspaceId: "done",
     });
     expect(
-      withSelection.groupsByStorageKey
+      selectedInactive.groupsByStorageKey
         .get("workflow:parent:wfr_alpha")
-        ?.displayMembers.map((m) => m.id)
-    ).toEqual(["done", "running"]);
+        ?.displayMembers.map((member) => member.id)
+    ).toEqual(["running"]);
+  });
+
+  test("counts reawakened grouped children by continuation state before retained reports", () => {
+    const running = workflowChild("reawakened-running", "wfr_reawakened", {
+      taskStatus: "reported",
+      taskExecutionStatus: "running",
+    });
+    const queued = workflowChild("reawakened-queued", "wfr_reawakened", {
+      taskStatus: "reported",
+      taskExecutionStatus: "queued",
+    });
+    const rows = [parent, running, queued];
+
+    const result = computeSidebarTaskGroups({ rows, allRows: rows });
+    const group = result.groupsByStorageKey.get("workflow:parent:wfr_reawakened");
+
+    expect(group).toMatchObject({
+      runningCount: 1,
+      queuedCount: 1,
+      completedCount: 0,
+      hasActiveMember: true,
+    });
   });
 
   test("counts queued members as active so new runs default to expanded", () => {
@@ -191,52 +234,20 @@ describe("workflow group session stickiness", () => {
     expect(keys.has("workflow:parent:wfr_gamma")).toBe(true);
   });
 
-  test("re-includes hidden members of session-active runs so the group never unmounts", () => {
-    // Step gap: the only member is terminal and hidden by completed-sub-agent
-    // filtering, but the run was active earlier this session.
-    const done = workflowChild("done", "wfr_alpha", { taskStatus: "reported" });
-    const other = createWorkspace("other", { parentWorkspaceId: "parent" });
-    const allRows = [parent, done, other];
-    const visibleRows = [parent, other];
-
-    const result = ensureWorkflowGroupMembersVisible({
-      allRows,
-      visibleRows,
-      sessionActiveGroupKeys: new Set(["workflow:parent:wfr_alpha"]),
+  test("retains workflow groups for reawakened children before consulting retained reports", () => {
+    const running = workflowChild("reawakened-running", "wfr_running", {
+      taskStatus: "reported",
+      taskExecutionStatus: "running",
+    });
+    const queued = workflowChild("reawakened-queued", "wfr_queued", {
+      taskStatus: "reported",
+      taskExecutionStatus: "queued",
     });
 
-    // Original order preserved.
-    expect(result.map((w) => w.id)).toEqual(["parent", "done", "other"]);
+    const keys = collectActiveWorkflowGroupKeys([parent, running, queued]);
 
-    // Non-sticky runs stay hidden.
-    const untouched = ensureWorkflowGroupMembersVisible({
-      allRows,
-      visibleRows,
-      sessionActiveGroupKeys: new Set(["workflow:parent:wfr_other"]),
-    });
-    expect(untouched.map((w) => w.id)).toEqual(["parent", "other"]);
-  });
-
-  test("never resurrects members whose parent is hidden or that have their own subtree", () => {
-    const done = workflowChild("done", "wfr_alpha", { taskStatus: "reported" });
-    const grandchild = createWorkspace("grandchild", { parentWorkspaceId: "done" });
-    const sticky = new Set(["workflow:parent:wfr_alpha"]);
-
-    // Member has children (leaf-only rule) => not re-included.
-    const withSubtree = ensureWorkflowGroupMembersVisible({
-      allRows: [parent, done, grandchild],
-      visibleRows: [parent],
-      sessionActiveGroupKeys: sticky,
-    });
-    expect(withSubtree.map((w) => w.id)).toEqual(["parent"]);
-
-    // Parent itself hidden => member stays hidden.
-    const parentHidden = ensureWorkflowGroupMembersVisible({
-      allRows: [parent, done],
-      visibleRows: [],
-      sessionActiveGroupKeys: sticky,
-    });
-    expect(parentHidden).toEqual([]);
+    expect(keys.has("workflow:parent:wfr_running")).toBe(true);
+    expect(keys.has("workflow:parent:wfr_queued")).toBe(true);
   });
 });
 
@@ -254,7 +265,7 @@ describe("computeTaskGroupMemberRowMeta", () => {
   };
 
   test("members form a sibling run under the header and inherit its trunks", () => {
-    const first = workflowChild("first", "wfr_alpha", { taskStatus: "reported" });
+    const first = workflowChild("first", "wfr_alpha", { taskStatus: "queued" });
     const second = workflowChild("second", "wfr_alpha", { taskStatus: "running" });
     const rows = [parent, first, second];
     const group = computeSidebarTaskGroups({ rows, allRows: rows }).groupsByStorageKey.get(
@@ -282,6 +293,32 @@ describe("computeTaskGroupMemberRowMeta", () => {
       { depth: 1, active: false },
       { depth: 1, active: true },
     ]);
+  });
+
+  test("uses live activity for interrupted grouped-member connector state", () => {
+    const first = workflowChild("first", "wfr_live", { taskStatus: "queued" });
+    const interrupted = workflowChild("interrupted", "wfr_live", {
+      taskStatus: "interrupted",
+    });
+    const rows = [parent, first, interrupted];
+    const group = computeSidebarTaskGroups({
+      rows,
+      allRows: rows,
+      isWorkspaceLiveActive: (workspaceId) => workspaceId === interrupted.id,
+    }).groupsByStorageKey.get("workflow:parent:wfr_live");
+    expect(group).toBeDefined();
+
+    const meta = computeTaskGroupMemberRowMeta({
+      group: group!,
+      headerMeta: headerMetaBase,
+      headerDepth: 1,
+      isWorkspaceLiveActive: (workspaceId) => workspaceId === interrupted.id,
+    });
+
+    expect(meta.get("first")?.sharedTrunkActiveThroughRow).toBe(true);
+    expect(meta.get("first")?.sharedTrunkActiveBelowRow).toBe(true);
+    expect(meta.get("interrupted")?.sharedTrunkActiveThroughRow).toBe(true);
+    expect(meta.get("interrupted")?.sharedTrunkActiveBelowRow).toBe(false);
   });
 
   test("does not add a pass-through trunk when the header is the last sibling", () => {

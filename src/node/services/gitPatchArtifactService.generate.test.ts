@@ -7,6 +7,7 @@ import { execSync } from "node:child_process";
 import { Config } from "@/node/config";
 import { GitPatchArtifactService } from "@/node/services/gitPatchArtifactService";
 import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 
 function initGitRepo(repoPath: string): void {
@@ -96,9 +97,12 @@ describe("GitPatchArtifactService worktree capture", () => {
   });
 
   it("keeps a clean zero-commit tree skipped with no worktree fields", async () => {
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("skipped");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.status).toBe("skipped");
@@ -116,9 +120,9 @@ describe("GitPatchArtifactService worktree capture", () => {
     // the stale file must not survive for apply-side canonical probing to
     // re-apply outdated changes after git am.
     await fsPromises.writeFile(path.join(childRepo, "dirty.txt"), "dirty\n", "utf-8");
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
     const firstArtifact = await readSubagentGitPatchArtifact(
-      config.getSessionDir(parentId),
+      path.join(config.sessionsDir, parentId),
       childId
     );
     const canonicalPatchPath = firstArtifact?.projectArtifacts[0]?.worktreePatchPath;
@@ -128,9 +132,12 @@ describe("GitPatchArtifactService worktree capture", () => {
       cwd: childRepo,
       stdio: "ignore",
     });
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("ready");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.worktreePatchPath).toBeUndefined();
@@ -144,9 +151,12 @@ describe("GitPatchArtifactService worktree capture", () => {
   it("captures dirty tracked changes for a zero-commit tree as a ready worktree patch", async () => {
     await fsPromises.writeFile(path.join(childRepo, "base.txt"), "modified\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("ready");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.commitCount).toBe(0);
@@ -163,9 +173,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     execSync("git config diff.noprefix true", { cwd: childRepo, stdio: "ignore" });
     await fsPromises.writeFile(path.join(childRepo, "base.txt"), "modified\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.worktreePatchPath).toBeDefined();
     const patch = await fsPromises.readFile(projectArtifact!.worktreePatchPath!, "utf-8");
@@ -190,9 +203,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     // A regular dirty file so a root patch still gets captured alongside.
     await fsPromises.writeFile(path.join(childRepo, "base.txt"), "modified\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
     expect(projectArtifact?.worktreePatchSkippedReason).toContain("nested-repo");
@@ -214,9 +230,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     await commitFile(nestedRepo, "inner.txt", "inner\n", "inner commit");
     await fsPromises.writeFile(path.join(childRepo, "base.txt"), "modified\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
     expect(projectArtifact?.worktreePatchSkippedReason).toContain("nested repo");
@@ -237,9 +256,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     await commitFile(nestedRepo, "inner.txt", "inner\n", "inner commit");
     await fsPromises.writeFile(path.join(childRepo, "nestedXrepo"), "sibling\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
     expect(projectArtifact?.worktreePatchSkippedReason).toContain("nested*repo");
@@ -255,9 +277,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     initGitRepo(nestedRepo);
     await commitFile(nestedRepo, "inner.txt", "inner\n", "inner commit");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
     expect(projectArtifact?.worktreePatchPath).toBeUndefined();
@@ -268,11 +293,11 @@ describe("GitPatchArtifactService worktree capture", () => {
     await fsPromises.writeFile(path.join(childRepo, "base.txt"), "modified\n", "utf-8");
     // A FILE at the patch directory's ancestor makes the capture's local
     // file write reject (ENOTDIR), simulating a runtime/filesystem failure.
-    const sessionDir = config.getSessionDir(parentId);
+    const sessionDir = path.join(config.sessionsDir, parentId);
     await fsPromises.mkdir(sessionDir, { recursive: true });
     await fsPromises.writeFile(path.join(sessionDir, "subagent-patches"), "not a dir", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
     // The artifacts file itself lives outside subagent-patches/, so the
     // conservative metadata is still recorded.
@@ -304,13 +329,13 @@ describe("GitPatchArtifactService worktree capture", () => {
       return realStat(statPath, options);
     }) as typeof fsPromises.stat);
     try {
-      await runGenerate(new GitPatchArtifactService(config));
+      await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
     } finally {
       statSpy.mockRestore();
     }
     expect(failedStat).toBe(true);
 
-    const sessionDir = config.getSessionDir(parentId);
+    const sessionDir = path.join(config.sessionsDir, parentId);
     const artifact = await readSubagentGitPatchArtifact(sessionDir, childId);
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -329,9 +354,12 @@ describe("GitPatchArtifactService worktree capture", () => {
   it("captures untracked non-ignored files", async () => {
     await fsPromises.writeFile(path.join(childRepo, "untracked.txt"), "new file\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(artifact?.status).toBe("ready");
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -352,9 +380,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     };
     const before = await looseObjectCount();
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.worktreePatchPath).toBeDefined();
     // Staged blobs went to the throwaway object dir, not .git/objects.
@@ -366,14 +397,17 @@ describe("GitPatchArtifactService worktree capture", () => {
     await fsPromises.rm(path.join(childRepo, ".git"), { recursive: true, force: true });
     await fsPromises.writeFile(path.join(childRepo, ".git"), "gitdir: /nonexistent\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.status).toBe("failed");
     // Unknown dirty state must not read as clean.
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
-    expect(projectArtifact?.worktreePatchSkippedReason).toContain("Could not inspect");
+    expect(projectArtifact?.worktreePatchSkippedReason).toContain("NOT captured");
   });
 
   it("records dirty work even when commit metadata resolution fails", async () => {
@@ -390,9 +424,12 @@ describe("GitPatchArtifactService worktree capture", () => {
       return cfg;
     });
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.status).toBe("failed");
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -427,9 +464,12 @@ describe("GitPatchArtifactService worktree capture", () => {
   it("reports dirty submodule contents as uncaptured instead of an empty diff", async () => {
     await addDirtySubmodule();
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("skipped");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -442,9 +482,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     // the quoted literal would miss the submodule entirely.
     await addDirtySubmodule("s\u00fcb-m\u00f6dule");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("skipped");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -455,9 +498,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     await addDirtySubmodule();
     await fsPromises.writeFile(path.join(childRepo, "base.txt"), "modified\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("ready");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.worktreePatchPath).toBeDefined();
@@ -472,9 +518,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     await commitFile(path.join(childRepo, "sub"), "inner.txt", "committed inner\n", "sub move");
     await fsPromises.writeFile(path.join(childRepo, "base.txt"), "modified\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("ready");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.worktreePatchPath).toBeDefined();
@@ -495,7 +544,7 @@ describe("GitPatchArtifactService worktree capture", () => {
     const realExecBuffered = runtimeHelpers.execBuffered;
     const execSpy = spyOn(runtimeHelpers, "execBuffered").mockImplementation(
       (runtime, command, options) => {
-        if (command === "git ls-files -s -z") {
+        if (command.endsWith("git ls-files -s -z")) {
           return Promise.resolve({
             stdout: "",
             stderr: "simulated probe failure",
@@ -507,12 +556,15 @@ describe("GitPatchArtifactService worktree capture", () => {
       }
     );
     try {
-      await runGenerate(new GitPatchArtifactService(config));
+      await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
     } finally {
       execSpy.mockRestore();
     }
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("skipped");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -546,12 +598,15 @@ describe("GitPatchArtifactService worktree capture", () => {
       }
     );
     try {
-      await runGenerate(new GitPatchArtifactService(config));
+      await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
     } finally {
       execSpy.mockRestore();
     }
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("skipped");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -564,9 +619,12 @@ describe("GitPatchArtifactService worktree capture", () => {
     await commitFile(childRepo, "committed.txt", "committed\n", "child commit");
     await fsPromises.writeFile(path.join(childRepo, "dirty.txt"), "dirty\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("ready");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.commitCount).toBe(1);
@@ -589,9 +647,12 @@ describe("GitPatchArtifactService worktree capture", () => {
       stdio: "ignore",
     });
 
-    await runGenerate(new GitPatchArtifactService(config));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.status).toBe("failed");
     expect(projectArtifact?.error).toContain("git format-patch failed");
@@ -602,9 +663,12 @@ describe("GitPatchArtifactService worktree capture", () => {
   it("records a skip reason instead of capturing when the diff exceeds the size cap", async () => {
     await fsPromises.writeFile(path.join(childRepo, "big.txt"), "x".repeat(4096), "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config, 100));
+    await runGenerate(new GitPatchArtifactService(config, nodeSessionLocks, 100));
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("skipped");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -617,9 +681,14 @@ describe("GitPatchArtifactService worktree capture", () => {
     // path-quoting needs the porcelain -z parse (space in the name).
     await fsPromises.writeFile(path.join(childRepo, "big file.txt"), "x".repeat(64 * 1024));
 
-    await runGenerate(new GitPatchArtifactService(config, 10 * 1024 * 1024, 4096));
+    await runGenerate(
+      new GitPatchArtifactService(config, nodeSessionLocks, 10 * 1024 * 1024, 4096)
+    );
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("skipped");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
@@ -630,9 +699,14 @@ describe("GitPatchArtifactService worktree capture", () => {
   it("captures normally when dirty files stay under the staged-bytes bound", async () => {
     await fsPromises.writeFile(path.join(childRepo, "small.txt"), "small change\n", "utf-8");
 
-    await runGenerate(new GitPatchArtifactService(config, 10 * 1024 * 1024, 1024 * 1024));
+    await runGenerate(
+      new GitPatchArtifactService(config, nodeSessionLocks, 10 * 1024 * 1024, 1024 * 1024)
+    );
 
-    const artifact = await readSubagentGitPatchArtifact(config.getSessionDir(parentId), childId);
+    const artifact = await readSubagentGitPatchArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(artifact?.status).toBe("ready");
     const projectArtifact = artifact?.projectArtifacts[0];
     expect(projectArtifact?.worktreePatchPath).toBeDefined();
@@ -657,14 +731,14 @@ describe("GitPatchArtifactService worktree capture", () => {
       return cfg;
     });
     await fsPromises.writeFile(path.join(childRepo, "dirty.txt"), "dirty\n", "utf-8");
-    const parentSessionDir = config.getSessionDir(parentId);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
     // Directory at the artifacts-file path: reads self-heal to empty but
     // the atomic write's rename fails.
     await fsPromises.mkdir(path.join(parentSessionDir, "subagent-patches.json"), {
       recursive: true,
     });
 
-    const service = new GitPatchArtifactService(config);
+    const service = new GitPatchArtifactService(config, nodeSessionLocks);
     let onCompleteCalls = 0;
     let startError: unknown;
     try {
@@ -694,7 +768,7 @@ describe("GitPatchArtifactService worktree capture", () => {
   });
 
   it("shouldGeneratePatchForTask distinguishes exec-like from read-only tasks", async () => {
-    const service = new GitPatchArtifactService(config);
+    const service = new GitPatchArtifactService(config, nodeSessionLocks);
     // The harness child has no persisted agent identity.
     expect(await service.shouldGeneratePatchForTask(parentId, childId)).toBe(false);
 

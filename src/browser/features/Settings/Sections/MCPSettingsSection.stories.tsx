@@ -1,20 +1,27 @@
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
+import { wrapAsyncIterator } from "@orpc/shared";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
+import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "@storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { Secret } from "@/common/types/secrets";
 
+import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { MCPSettingsSection } from "./MCPSettingsSection";
 
 const MOCK_TOOLS = [
@@ -53,6 +60,8 @@ interface MCPSectionStoryOptions {
   testResults?: Record<string, string[]>;
   secrets?: Secret[];
   preCacheTools?: boolean;
+  experiments?: Partial<Record<ExperimentId, boolean>>;
+  mcpAppViewDomainsListError?: string;
 }
 
 function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): APIClient {
@@ -91,6 +100,8 @@ function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): API
     globalSecrets: options.secrets ?? [],
     mcpTestResults,
     mcpOauthAuthStatus: options.mcpOauthAuthStatus,
+    experiments: options.experiments,
+    mcpAppViewDomainsListError: options.mcpAppViewDomainsListError,
   });
 }
 
@@ -103,16 +114,13 @@ const MCPSettingsSectionStoryShell: FC<{ setup: () => APIClient; children: React
   if (clientRef.current === null || setupRef.current !== setup) {
     setupRef.current = setup;
     clientRef.current = setup();
+    getAppConfigStore().setClient(clientRef.current);
   }
 
   return (
     <ThemeProvider>
       <TooltipProvider>
-        <APIProvider client={clientRef.current}>
-          <ExperimentsProvider>
-            <PolicyProvider>{children}</PolicyProvider>
-          </ExperimentsProvider>
-        </APIProvider>
+        <APIProvider client={clientRef.current}>{children}</APIProvider>
       </TooltipProvider>
     </ThemeProvider>
   );
@@ -166,6 +174,82 @@ export const ProjectSettingsEmpty: Story = {
 
     await canvas.findByText("MCP Servers");
     await canvas.findByText("No MCP servers configured yet.");
+  },
+};
+
+const PLUGIN_SERVER_KEY = "plugin:0123456789abcdef:echo";
+const setPluginEnabled = fn<APIClient["mcp"]["setEnabled"]>();
+
+export const AgentPluginServer: Story = {
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() => {
+        const client = setupMCPSettingsSectionStory({
+          servers: {
+            [PLUGIN_SERVER_KEY]: {
+              transport: "stdio",
+              command: "bun echo-mcp.ts",
+              disabled: true,
+              plugin: {
+                pluginName: "hello-plugin",
+                serverName: "echo",
+                sourceScope: "global",
+                sourceLocation: ".xum/plugins/hello-plugin",
+              },
+            },
+          },
+        });
+        setPluginEnabled.mockReset().mockImplementation(client.mcp.setEnabled);
+        client.mcp.setEnabled = setPluginEnabled;
+        return client;
+      }}
+    >
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole("switch", { name: "Toggle hello-plugin/echo enabled" });
+    await expect(toggle).toBeEnabled();
+    await expect(toggle).not.toBeChecked();
+
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenCalledWith({ name: PLUGIN_SERVER_KEY, enabled: true });
+    await expect(toggle).toBeChecked();
+
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenLastCalledWith({
+      name: PLUGIN_SERVER_KEY,
+      enabled: false,
+    });
+    await expect(toggle).not.toBeChecked();
+  },
+};
+
+export const AgentPluginServerEnableError: Story = {
+  ...AgentPluginServer,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole("switch", { name: "Toggle hello-plugin/echo enabled" });
+    const error = "Unable to save global MCP settings";
+    let failToggle: () => void = () => {
+      throw new Error("The toggle request has not started");
+    };
+    setPluginEnabled.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          failToggle = () => resolve({ success: false, error });
+        })
+    );
+
+    await expect(toggle).toBeEnabled();
+    await userEvent.click(toggle);
+    await expect(setPluginEnabled).toHaveBeenCalledWith({ name: PLUGIN_SERVER_KEY, enabled: true });
+    // Hold the backend response to prove both the optimistic state and its rollback.
+    await expect(toggle).toBeChecked();
+    failToggle();
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    await expect(canvas.findByText(error)).resolves.toBeVisible();
   },
 };
 
@@ -342,6 +426,46 @@ export const ProjectSettingsWithToolAllowlist: Story = {
   },
 };
 
+// #4300: small help text must meet WCAG AA (4.5:1) in both themes, and the
+// Tools disclosure must show a focus ring on keyboard focus (global CSS
+// removes the browser's default outline).
+const helpTextAccessibilityPlay: Story["play"] = async ({ canvasElement }) => {
+  const canvas = within(canvasElement);
+  const disclosure = await canvas.findByRole("button", { name: /Tools: 3\/8/ });
+  const helpTexts = [
+    await canvas.findByText(/Configure global MCP servers/),
+    within(disclosure).getByText(/Tools: 3\/8/),
+    within(disclosure).getByText(/^\(.+\)$/),
+  ];
+  for (const helpText of helpTexts) {
+    await expect(textContrast(helpText)).toBeGreaterThanOrEqual(4.5);
+  }
+
+  disclosure.focus();
+  // Precondition: the runner reports script focus as keyboard-visible focus.
+  await expect(disclosure.matches(":focus-visible")).toBe(true);
+  const shadow = getComputedStyle(disclosure).boxShadow;
+  await expect(shadow.replaceAll("rgba(0, 0, 0, 0)", "")).toMatch(/rgb|oklch|oklab|color\(/);
+};
+
+export const HelpTextAccessibilityLight: Story = {
+  ...ProjectSettingsWithToolAllowlist,
+  globals: { theme: "light" },
+  // Behavioral contract only: ProjectSettingsWithToolAllowlist already snapshots
+  // this layout, and the Pixel budget has no headroom for duplicate captures.
+  parameters: { pixel: { exclude: true } },
+  play: helpTextAccessibilityPlay,
+};
+
+export const HelpTextAccessibilityDark: Story = {
+  ...ProjectSettingsWithToolAllowlist,
+  globals: { theme: "dark" },
+  // Behavioral contract only: ProjectSettingsWithToolAllowlist already snapshots
+  // this layout, and the Pixel budget has no headroom for duplicate captures.
+  parameters: { pixel: { exclude: true } },
+  play: helpTextAccessibilityPlay,
+};
+
 export const ProjectSettingsOAuthNotLoggedIn: Story = {
   decorators: withDesktopWindowApi,
   render: () => (
@@ -424,5 +548,310 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
     await userEvent.click(moreActionsButton);
     await body.findByRole("button", { name: /Re-login/i });
     await body.findByRole("button", { name: /^Logout$/i });
+  },
+};
+
+/**
+ * #6622: the server refused a tool call with 403 insufficient_scope. The tokens stay, and the row
+ * names the scopes and the next step. Phone width: long scope URLs wrap. Out of Pixel snapshots
+ * (snapshot budget); the play checks it.
+ */
+export const ProjectSettingsOAuthInsufficientScope: Story = {
+  decorators: withDesktopWindowApi,
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() =>
+        setupMCPSettingsSectionStory({
+          servers: {
+            "remote-oauth": {
+              transport: "http",
+              url: "https://example.com/mcp",
+              disabled: false,
+            },
+          },
+          mcpOauthAuthStatus: new Map<string, MCPOAuthAuthStatus>([
+            [
+              "https://example.com/mcp",
+              {
+                serverUrl: "https://example.com/mcp",
+                isLoggedIn: true,
+                hasRefreshToken: true,
+                updatedAtMs: Date.now() - 60_000,
+                insufficientScopes: ["https://www.googleapis.com/auth/drive.file", "files.write"],
+              },
+            ],
+          ]),
+        })
+      }
+    >
+      <div style={{ width: 375 }}>
+        <MCPSettingsSection />
+      </div>
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    await body.findByText(/Logged in/i);
+    const scopes = "https://www.googleapis.com/auth/drive.file files.write";
+    // By role, not by copy: the prompt is the status line that names the scopes.
+    const prompt = (await body.findAllByRole("status")).find((el) =>
+      el.textContent?.includes(scopes)
+    );
+    if (!prompt) throw new Error("The sign-in prompt must name the requested scopes");
+    await expect(prompt.textContent).toContain(scopes);
+    await expect(prompt.scrollWidth).toBeLessThanOrEqual(prompt.clientWidth + 1);
+  },
+};
+
+function setupDesignStory(
+  enabled = true,
+  reuseEnabled = false,
+  sibling?: { disconnect: () => void },
+  pendingDisable?: { finish: () => void }
+): APIClient {
+  // One stream per subscription, like the backend: the section and its card both subscribe.
+  const subscribers: Array<(update: { enabled: boolean; revision: number }) => void> = [];
+  let revision = 0;
+  let streamEnabled = enabled;
+  const publish = () => {
+    revision++;
+    for (const push of subscribers) push({ enabled: streamEnabled, revision });
+  };
+  const client = setupMCPSettingsSectionStory({
+    // A pending disable: the config snapshot already reads off while the stream still reports on.
+    experiments: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled && !pendingDisable },
+    servers: enabled
+      ? {
+          claude_design: {
+            transport: "http",
+            url: CLAUDE_DESIGN_URL,
+            managed: "claude-design",
+            disabled: true,
+          },
+        }
+      : {},
+  });
+  let status: ClaudeDesignStatus = {
+    state: reuseEnabled ? "connected" : "disabled",
+    backendHost: "remote-backend.example.test",
+    platform: "linux",
+    settings: {
+      source: { type: "file", path: "/home/example/.claude/.credentials.json" },
+      reuseEnabled,
+      serverEnabled: sibling !== undefined,
+    },
+  };
+  client.experiments = {
+    onDesignChange: (_input, { signal } = {}) => {
+      const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+      updates.push({ enabled: streamEnabled, revision });
+      subscribers.push(updates.push);
+      signal?.addEventListener("abort", updates.end, { once: true });
+      return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+    },
+    set: () => Promise.resolve(),
+    // The flight recorder status stream: off, like a fresh profile.
+    onPerfFlightRecorderChange: () =>
+      Promise.resolve(
+        wrapAsyncIterator(
+          (async function* () {
+            yield await Promise.resolve({ enabled: false, state: "off" as const });
+          })(),
+          {}
+        )
+      ),
+  };
+  client.mcp.designStatus = () => Promise.resolve(status);
+  client.mcp.configureDesign = (settings) => {
+    status = {
+      ...status,
+      settings: { ...status.settings, ...settings },
+      state: settings.reuseEnabled ? "not_configured" : "disabled",
+    };
+    publish();
+    return Promise.resolve(status);
+  };
+  if (sibling) {
+    client.mcp.list = () =>
+      Promise.resolve({
+        claude_design: {
+          transport: "http",
+          url: CLAUDE_DESIGN_URL,
+          managed: "claude-design",
+          disabled: !status.settings.serverEnabled,
+        },
+      });
+    sibling.disconnect = () => {
+      status = {
+        ...status,
+        state: "disabled",
+        settings: { ...status.settings, reuseEnabled: false, serverEnabled: false },
+      };
+      publish();
+    };
+  }
+  if (pendingDisable) {
+    pendingDisable.finish = () => {
+      streamEnabled = false;
+      publish();
+      // An update from before the disable that arrives late.
+      for (const push of subscribers) push({ enabled: true, revision: revision - 1 });
+    };
+  }
+  client.mcp.test = () => {
+    status = { ...status, state: "consent_required" };
+    return Promise.resolve({ success: false, error: "Claude Design: consent_required" });
+  };
+  return client;
+}
+
+export const ClaudeDesignOptIn: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory()}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const connect = await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.queryByRole("button", { name: "Login" })).toBeNull();
+    await expect(canvas.queryByRole("button", { name: "Edit server" })).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+    await userEvent.click(connect);
+    await canvas.findByText(/Design requires consent/);
+    await userEvent.click(canvas.getByRole("button", { name: "Disconnect" }));
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignPhone: Story = {
+  ...ClaudeDesignOptIn,
+  tags: ["claude-design"],
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  // The test-runner ignores viewport globals; the wrapper enforces the contract there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell setup={() => setupDesignStory()}>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async (context) => {
+    await ClaudeDesignOptIn.play?.(context);
+    const card = within(context.canvasElement).getByRole("region", { name: "Claude Design" });
+    await expect(card.getBoundingClientRect().width).toBeLessThanOrEqual(375);
+    await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+  },
+};
+
+// A failed load of the MCP App view-domain approvals shows its error with a Retry instead of an
+// empty list (#6181). Phone width: the error wraps and Retry stays on screen.
+export const ViewDomainsLoadErrorPhone: Story = {
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  // The test-runner ignores viewport globals; the wrapper enforces the width there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell
+        setup={() =>
+          setupMCPSettingsSectionStory({ mcpAppViewDomainsListError: "The backend is busy" })
+        }
+      >
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const error = await canvas.findByText(/Could not load allowed view domains: The backend/);
+    const row = error.parentElement!;
+    await expect(within(row).getByRole("button", { name: "Retry" })).toBeVisible();
+    await expect(row.getBoundingClientRect().right).toBeLessThanOrEqual(375);
+  },
+};
+
+export const ClaudeDesignDisabled: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(false)}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("No MCP servers configured yet.");
+    await expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull();
+  },
+};
+
+export const ClaudeDesignConflictDisconnect: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
+      <ClaudeDesignCard conflict onChange={() => Promise.resolve()} />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const disconnect = await canvas.findByRole("button", { name: "Disconnect" });
+    await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
+    await expect(disconnect).toBeEnabled();
+    await userEvent.click(disconnect);
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignSiblingDisconnect: Story = {
+  tags: ["claude-design"],
+  render: () => {
+    const sibling: { disconnect: () => void } = { disconnect: () => undefined };
+    return (
+      <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true, sibling)}>
+        <button onClick={() => sibling.disconnect()}>Disconnect in sibling window</button>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: "Retry connection" });
+    await expect(
+      canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
+    ).toBeChecked();
+    await userEvent.click(canvas.getByRole("button", { name: "Disconnect in sibling window" }));
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.queryByRole("button", { name: "Retry connection" })).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+    await expect(
+      canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
+    ).not.toBeChecked();
+  },
+};
+
+const pendingDesignDisable: { finish: () => void } = { finish: () => undefined };
+
+export const ClaudeDesignHidesAfterRetirement: Story = {
+  tags: ["claude-design"],
+  parameters: { pixel: { exclude: true } },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() => setupDesignStory(true, false, undefined, pendingDesignDisable)}
+    >
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The Design stream reports a disable only after the backend retired affected clients.
+    await canvas.findByRole("region", { name: "Claude Design" });
+    // A direct call, not a click, so React renders the disable and the late older update
+    // together: the card hides only if the older update is ignored.
+    pendingDesignDisable.finish();
+    await waitFor(() => expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull());
   },
 };

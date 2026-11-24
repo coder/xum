@@ -2,6 +2,7 @@ import { spawnSync } from "child_process";
 import { accessSync, constants, statSync } from "fs";
 import path from "path";
 
+import { DEFAULT_WINDOWS_PATHEXT } from "@/constants/windowsPathExt";
 import { getBashPath } from "@/node/utils/main/bashPath";
 
 export interface ResolvedPtyShell {
@@ -59,7 +60,7 @@ function defaultIsPathAccessible(shellPath: string): boolean {
       return false;
     }
 
-    const pathExtEnv = process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD";
+    const pathExtEnv = process.env.PATHEXT ?? DEFAULT_WINDOWS_PATHEXT;
     const allowedExts = new Set(
       pathExtEnv
         .split(";")

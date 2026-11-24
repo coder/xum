@@ -2,11 +2,27 @@ import React from "react";
 import { AlertTriangle, X } from "lucide-react";
 import { getModelName } from "@/common/utils/ai/models";
 import type { ContextSwitchWarning as WarningData } from "@/browser/utils/compaction/contextSwitchCheck";
+import type { WaitingOnYouEntry } from "@/browser/components/ChatPane/WaitingOnYou";
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(".0", "")}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
   return String(n);
+}
+
+/** The warning as the "Waiting on you" card names it. */
+export function contextSwitchEntry(warning: WarningData): WaitingOnYouEntry {
+  const compactName = warning.compactionModel ? getModelName(warning.compactionModel) : null;
+  return {
+    icon: AlertTriangle,
+    tab: "Context limit",
+    title: `Context may exceed the ${getModelName(warning.targetModel)} limit`,
+    detail:
+      compactName === null
+        ? "Compact before you send"
+        : `Compact with ${compactName} before you send`,
+    urgent: true,
+  };
 }
 
 interface Props {

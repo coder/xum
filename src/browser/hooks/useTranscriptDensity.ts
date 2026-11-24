@@ -1,17 +1,14 @@
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  DEFAULT_TRANSCRIPT_DENSITY,
-  normalizeTranscriptDensity,
-  TRANSCRIPT_DENSITY_KEY,
-  type TranscriptDensity,
-} from "@/common/constants/storage";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { normalizeTranscriptDensity, type TranscriptDensity } from "@/common/constants/storage";
+
+function setTranscriptDensity(transcriptDensity: TranscriptDensity): void {
+  updateUserPreferences({ appearance: { transcriptDensity } });
+}
 
 export function useTranscriptDensity(): [TranscriptDensity, (density: TranscriptDensity) => void] {
-  const [rawDensity, setRawDensity] = usePersistedState<unknown>(
-    TRANSCRIPT_DENSITY_KEY,
-    DEFAULT_TRANSCRIPT_DENSITY,
-    { listener: true }
+  const density = useUserPreferences((preferences) =>
+    normalizeTranscriptDensity(preferences.appearance?.transcriptDensity)
   );
 
-  return [normalizeTranscriptDensity(rawDensity), setRawDensity];
+  return [density, setTranscriptDensity];
 }

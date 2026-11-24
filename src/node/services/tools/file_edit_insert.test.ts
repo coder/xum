@@ -7,6 +7,7 @@ import type { FileEditInsertToolArgs, FileEditInsertToolResult } from "@/common/
 import type { ToolExecutionOptions } from "ai";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { getTestDeps } from "./testHelpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -16,6 +17,7 @@ const mockToolCallOptions: ToolExecutionOptions<unknown> = {
 
 function createTestTool(cwd: string) {
   return createFileEditInsertTool({
+    sessionLocks: nodeSessionLocks,
     ...getTestDeps(),
     cwd,
     runtime: createRuntime({ type: "local", srcBaseDir: cwd }),
@@ -114,6 +116,22 @@ describe("file_edit_insert tool", () => {
     expect(await fs.readFile(testFilePath, "utf-8")).toBe(original);
   });
 
+  // #2732: a guard missing only because of whitespace names the line of the near match.
+  it("names the line of a guard that differs only in whitespace", async () => {
+    const tool = createTestTool(testDir);
+    const args: FileEditInsertToolArgs = {
+      path: path.relative(testDir, testFilePath),
+      content: "Line 4\n",
+      insert_after: "Line  3",
+    };
+
+    const result = (await tool.execute!(args, mockToolCallOptions)) as FileEditInsertToolResult;
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.note).toMatch(/line 2\b/u);
+    expect(await fs.readFile(testFilePath, "utf-8")).toBe("Line 1\nLine 3");
+  });
+
   it("fails when both insert_before and insert_after are provided", async () => {
     const tool = createTestTool(testDir);
     const args: FileEditInsertToolArgs = {
@@ -184,6 +202,7 @@ describe("file_edit_insert outside-cwd access", () => {
 
     try {
       const tool = createFileEditInsertTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: workspaceCwd,
         runtime: createRuntime({ type: "local", srcBaseDir: workspaceCwd }),
@@ -216,6 +235,7 @@ describe("file_edit_insert outside-cwd access", () => {
 
     try {
       const tool = createFileEditInsertTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: workspaceCwd,
         runtime: createRuntime({ type: "local", srcBaseDir: workspaceCwd }),
@@ -258,6 +278,7 @@ describe("file_edit_insert plan mode enforcement", () => {
     await fs.mkdir(workspaceCwd, { recursive: true });
 
     const tool = createFileEditInsertTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: workspaceCwd,
       runtime: createRuntime({ type: "local", srcBaseDir: workspaceCwd }),
@@ -286,6 +307,7 @@ describe("file_edit_insert plan mode enforcement", () => {
     await fs.mkdir(workspaceCwd, { recursive: true });
 
     const tool = createFileEditInsertTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: workspaceCwd,
       runtime: createRuntime({ type: "local", srcBaseDir: workspaceCwd }),
@@ -312,6 +334,7 @@ describe("file_edit_insert plan mode enforcement", () => {
     await fs.mkdir(workspaceCwd, { recursive: true });
 
     const tool = createFileEditInsertTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: workspaceCwd,
       runtime: createRuntime({ type: "local", srcBaseDir: workspaceCwd }),
@@ -335,6 +358,7 @@ describe("file_edit_insert plan mode enforcement", () => {
     await fs.writeFile(testFilePath, "const x = 1;");
 
     const tool = createFileEditInsertTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: testDir }),
@@ -366,6 +390,7 @@ describe("file_edit_insert plan mode enforcement", () => {
     await fs.mkdir(path.dirname(realPlanPath), { recursive: true });
 
     const tool = createFileEditInsertTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: workspaceCwd,
       runtime: createRuntime({ type: "local", srcBaseDir: workspaceCwd }),
@@ -396,5 +421,50 @@ describe("file_edit_insert plan mode enforcement", () => {
       .then(() => true)
       .catch(() => false);
     expect(wrongFileExists).toBe(false);
+  });
+
+  it("follows the agent sandbox: blocks writes outside it, keeps the plan file writable", async () => {
+    const root = await fs.realpath(testDir);
+    const workspace = path.join(root, "ws");
+    const plans = path.join(root, "plans");
+    await fs.mkdir(workspace);
+    await fs.mkdir(plans);
+    const runtime = createRuntime({ type: "local", srcBaseDir: workspace });
+    // A stand-in policy over temp folders, never the developer's real home.
+    runtime.agentSandboxPolicy = () => ({
+      writeRoots: [workspace],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: [root],
+      allowRead: [workspace],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+    const planFilePath = path.join(plans, "plan.md");
+    const tool = createFileEditInsertTool({
+      sessionLocks: nodeSessionLocks,
+      ...getTestDeps(),
+      cwd: workspace,
+      runtime,
+      runtimeTempDir: workspace,
+      planFilePath,
+    });
+
+    const outside = path.join(root, "outside.txt");
+    const blocked = (await tool.execute!(
+      { path: outside, content: "x" },
+      mockToolCallOptions
+    )) as FileEditInsertToolResult;
+    const plan = (await tool.execute!(
+      { path: planFilePath, content: "# Plan" },
+      mockToolCallOptions
+    )) as FileEditInsertToolResult;
+
+    expect(blocked.success).toBe(false);
+    expect(blocked.success ? "" : blocked.error).toContain("The agent sandbox blocks writes");
+    expect(await fs.stat(outside).catch(() => null)).toBeNull();
+    expect(plan.success).toBe(true);
+    expect(await fs.readFile(planFilePath, "utf-8")).toBe("# Plan");
   });
 });
