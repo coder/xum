@@ -337,6 +337,26 @@ describe("subagentGitPatchArtifacts", () => {
     expect(thrownMessage).toContain("Could not read local patch apply state");
   });
 
+  test("readLocalPatchPartialApply fails closed on an unsupported state version", async () => {
+    await fsPromises.writeFile(
+      path.join(testDir, "subagent-patches-local-apply.json"),
+      JSON.stringify({ version: 2, partialsByChildTaskId: {}, completionsByChildTaskId: {} }),
+      "utf-8"
+    );
+
+    let thrownMessage = "";
+    try {
+      await readLocalPatchPartialApply({
+        workspaceSessionDir: testDir,
+        childTaskId: "task_x",
+        projectPath: "/repo",
+      });
+    } catch (error) {
+      thrownMessage = error instanceof Error ? error.message : String(error);
+    }
+    expect(thrownMessage).toContain("unsupported version 2");
+  });
+
   test("readLocalPatchPartialApply degrades a corrupted record to a conservative marker", async () => {
     // The entry's presence is the evidence of partial application (clears
     // delete the key); dropping it for a corrupt appliedAtMs would let the
@@ -562,6 +582,8 @@ describe("subagentGitPatchArtifacts", () => {
     // fence and capture metadata are dropped rather than bricking retries.
     expect(projectArtifact?.appliedPartial).toBe(true);
     expect(projectArtifact?.appliedPartialHeadSha).toBeUndefined();
+    // A lost ancestry fence must not leave a usable commits-applied stage.
+    expect(projectArtifact?.appliedPartialStage).toBe("unknown");
     expect(projectArtifact?.hadUncommittedChanges).toBe(true);
     expect(projectArtifact?.worktreePatchPath).toBeUndefined();
     expect(projectArtifact?.worktreePatchBytes).toBeUndefined();

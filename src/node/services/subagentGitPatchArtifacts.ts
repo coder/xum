@@ -250,7 +250,11 @@ function sanitizeDirtyCaptureFields(
     (typeof sanitized.appliedPartialHeadSha !== "string" ||
       sanitized.appliedPartialHeadSha.trim().length === 0)
   ) {
+    // Without its ancestry fence a commits-applied stage would let a retry
+    // after a target reset skip git am and report the commits as applied.
     delete sanitized.appliedPartialHeadSha;
+    sanitized.appliedPartial = true;
+    sanitized.appliedPartialStage = "unknown";
   }
   // Same policy as a corrupt appliedAtMs: dropping just the field would
   // silently change what replay-safe validation checks, so the record
@@ -788,6 +792,13 @@ async function readLocalPatchApplyStateFile(
   }
   if (parsed == null || typeof parsed !== "object") {
     throw new Error("Could not read local patch apply state: not a JSON object");
+  }
+  // A newer build may move partial or completion records; reading its file
+  // with v1 semantics could replay an applied artifact after a downgrade.
+  if (parsed.version !== undefined && parsed.version !== 1) {
+    throw new Error(
+      `Could not read local patch apply state: unsupported version ${String(parsed.version)}`
+    );
   }
   // Fail closed on present-but-malformed containers at every level (like
   // the file-level corruption above): silently treating one as empty would
