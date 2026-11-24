@@ -43,9 +43,16 @@ struct ConnectLinkSheet: View {
     }
 
     private var parsed: ConnectionLink? { ConnectionLink.parse(text) }
-    @State private var allowCleartext = false
+    /// The server the user accepted plain HTTP for: an edit to another link needs its own consent.
+    @State private var cleartextAllowedFor: URL?
     /// Sending the token is allowed: the transport protects it, or the user accepted plain HTTP.
-    private func mayUseToken(_ link: ConnectionLink) -> Bool { link.isProtectedTransport || allowCleartext }
+    private func mayUseToken(_ link: ConnectionLink) -> Bool {
+        link.isProtectedTransport || cleartextAllowedFor == link.baseURL
+    }
+    private var allowCleartext: Binding<Bool> {
+        Binding(get: { parsed.map { cleartextAllowedFor == $0.baseURL } ?? false },
+                set: { cleartextAllowedFor = $0 ? parsed?.baseURL : nil })
+    }
 
     var body: some View {
         NavigationStack {
@@ -109,7 +116,7 @@ struct ConnectLinkSheet: View {
                 // Opaque, so the form does not show through when it scrolls under the button.
                 .background(Color.xBg2)
             }
-            .task(id: "\(text)|\(allowCleartext)") { await probe() }
+            .task(id: "\(text)|\(cleartextAllowedFor?.absoluteString ?? "")") { await probe() }
             .task { checkClipboardOrigin() }
             .onChange(of: parsed) { _, link in
                 if let link, !nameEdited { name = link.suggestedName }
@@ -173,7 +180,7 @@ struct ConnectLinkSheet: View {
                 .font(.system(size: 13))
                 .foregroundStyle(Color.xText2)
                 .fixedSize(horizontal: false, vertical: true)
-            Toggle("Connect over plain HTTP", isOn: $allowCleartext)
+            Toggle("Connect over plain HTTP", isOn: allowCleartext)
                 .font(.system(size: 15))
                 .tint(Color.xWarn)
         }
