@@ -11,6 +11,7 @@ import {
   normalizeAutoModelRoutingConfig,
 } from "@/common/types/autoModelRouting";
 import type { ProjectsConfig } from "@/common/types/project";
+import { MODEL_FALLBACK_CHAIN_LIMIT } from "@/common/utils/ai/modelFallbacks";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { normalizeIsolationChoice } from "@/common/types/isolation";
 import {
@@ -22,7 +23,6 @@ import {
   normalizeOptionalModelString,
   normalizeOptionalModelStringArray,
   normalizeRuntimeEnablementOverrides,
-  parseOptionalHeartbeatIntervalMs,
   resolvePersistedDefaultIsolation,
 } from "@/node/config";
 
@@ -44,8 +44,9 @@ import {
  * - agent-executed text: heartbeatDefaultPrompt. A repository-controlled prompt would run
  *   unattended in every workspace whose heartbeat has no message of its own;
  * - spend, concurrency and diagnostic limits: taskSettings (parallel agent tasks and nesting
- *   depth), goalDefaults (goal budget and turn caps) and llmDebugLogs (records raw provider
- *   requests to disk). A restore shows no per-key approval, so a repository-controlled value
+ *   depth), goalDefaults (goal budget and turn caps), heartbeatDefaultIntervalMs (how often
+ *   enabled heartbeats run unattended turns) and llmDebugLogs (records raw provider requests
+ *   to disk). A restore shows no per-key approval, so a repository-controlled value
  *   would silently raise a limit the user set or start recording prompts;
  * - not yet reviewed for portability: toolSearchEnabled, bashAiProxyEnabled,
  *   agentHeartbeatsEnabled;
@@ -65,7 +66,6 @@ const BACKED_UP_SETTINGS_KEYS = [
   // The per-agent Auto flags in agentAiDefaults mean nothing without the tiers they route to.
   "autoModelRouting",
   "evaluationDefaults",
-  "heartbeatDefaultIntervalMs",
   "chatTranscriptFullWidth",
   "runtimeEnablement",
   "defaultIsolation",
@@ -112,7 +112,6 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
   modelFallbacks: normalizeModelFallbacks,
   autoModelRouting: (value) => (value == null ? undefined : normalizeAutoModelRoutingConfig(value)),
   evaluationDefaults: normalizeEvaluationDefaults,
-  heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs,
   chatTranscriptFullWidth: (value) => value === true,
   runtimeEnablement: normalizeRuntimeEnablementOverrides,
   defaultIsolation: normalizeIsolationChoice,
@@ -148,14 +147,25 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
   ),
   defaultModel: ModelStringSchema,
   hiddenModels: z.array(ModelStringSchema),
+  // Normalization caps each chain; a longer one (a newer build's limit) would restore truncated.
   modelFallbacks: AppConfigOnDiskSchema.shape.modelFallbacks
     .unwrap()
-    .refine(acceptedBy(normalizeModelFallbacks)),
+    .refine(acceptedBy(normalizeModelFallbacks))
+    .refine((value) =>
+      Object.values(value).every((entry) => entry.models.length <= MODEL_FALLBACK_CHAIN_LIMIT)
+    ),
   runtimeEnablement: AppConfigOnDiskSchema.shape.runtimeEnablement
     .unwrap()
     .refine(acceptedBy(normalizeRuntimeEnablementOverrides)),
   // The on-disk shape degrades anything to absent and load heals each field to its default.
-  autoModelRouting: AutoModelRoutingConfigSchema,
+  // Load also drops repeated tier ids, and below the minimum count falls back to the defaults.
+  autoModelRouting: AutoModelRoutingConfigSchema.refine(
+    (value) => normalizeAutoModelRoutingConfig(value).tiers.length === value.tiers.length
+  ),
+  // An unset block is spelled null; an object without a usable model would reset the target.
+  evaluationDefaults: AppConfigOnDiskSchema.shape.evaluationDefaults
+    .unwrap()
+    .refine((value) => normalizeEvaluationDefaults(value) !== undefined),
 };
 
 /**

@@ -801,7 +801,7 @@ function parseOptionalPort(value: unknown): number | undefined {
   return value;
 }
 
-export function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
+function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
   }

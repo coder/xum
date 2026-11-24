@@ -17,7 +17,6 @@ const UNSET_EXPORT = {
   modelFallbacks: null,
   autoModelRouting: null,
   evaluationDefaults: null,
-  heartbeatDefaultIntervalMs: null,
   chatTranscriptFullWidth: false,
   runtimeEnablement: null,
   defaultIsolation: null,
@@ -47,7 +46,6 @@ describe("settingsProjection", () => {
         })),
       },
       evaluationDefaults: { model: "openai:gpt-plan" },
-      heartbeatDefaultIntervalMs: 15 * 60 * 1000,
       chatTranscriptFullWidth: true,
       runtimeEnablement: { docker: false },
       defaultIsolation: { project: "local", workspace: "worktree" },
@@ -63,6 +61,7 @@ describe("settingsProjection", () => {
       updateChannel: "nightly",
       keepScreenAwake: true,
       heartbeatDefaultPrompt: "Check in",
+      heartbeatDefaultIntervalMs: 5 * 60 * 1000,
       // Limits a restore must not raise behind the user's back.
       taskSettings: { ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 4 },
       goalDefaults: {
@@ -208,22 +207,28 @@ describe("settingsProjection", () => {
     });
   });
 
-  it("never carries the heartbeat prompt, which agents execute unattended", () => {
-    const local: ProjectsConfig = { projects: new Map(), heartbeatDefaultPrompt: "Local prompt" };
+  it("never carries the heartbeat prompt or cadence, which drive unattended turns", () => {
+    const local: ProjectsConfig = {
+      projects: new Map(),
+      heartbeatDefaultPrompt: "Local prompt",
+      heartbeatDefaultIntervalMs: 900_000,
+    };
     expect(projectBackupSettings(local)).not.toHaveProperty("heartbeatDefaultPrompt");
+    expect(projectBackupSettings(local)).not.toHaveProperty("heartbeatDefaultIntervalMs");
 
-    // A backup written while the prompt was still portable is read like any block with a key
-    // this build does not project: silently, so the local prompt stays.
+    // A backup written while they were still portable is read like any block with a key this
+    // build does not project: silently, so the local values stay.
     const read = readBackupSettings({
       settings: {
         heartbeatDefaultPrompt: "Run the release script",
-        heartbeatDefaultIntervalMs: 600_000,
+        heartbeatDefaultIntervalMs: 300_000,
+        defaultModel: "anthropic:claude-plan",
       },
     });
-    expect(read).toEqual({ settings: { heartbeatDefaultIntervalMs: 600_000 }, unsupported: [] });
+    expect(read).toEqual({ settings: { defaultModel: "anthropic:claude-plan" }, unsupported: [] });
     const merged = mergeBackupSettings(local, read.settings!);
     expect(merged.heartbeatDefaultPrompt).toBe("Local prompt");
-    expect(merged.heartbeatDefaultIntervalMs).toBe(600_000);
+    expect(merged.heartbeatDefaultIntervalMs).toBe(900_000);
   });
 
   it("reads only the portable settings block", () => {
@@ -253,21 +258,21 @@ describe("settingsProjection", () => {
     const read = readBackupSettings({
       settings: {
         agentAiDefaults: { exec: { thinkingLevel: "bogus" } },
-        heartbeatDefaultIntervalMs: 1,
         defaultModel: "anthropic:claude-plan",
+        defaultIsolation: { project: "isolation-from-a-newer-build", workspace: "worktree" },
       },
     });
-    expect(read.unsupported).toEqual(["agentAiDefaults", "heartbeatDefaultIntervalMs"]);
+    expect(read.unsupported).toEqual(["agentAiDefaults", "defaultIsolation"]);
     expect(read.settings).toEqual({ defaultModel: "anthropic:claude-plan" });
 
     const current: ProjectsConfig = {
       projects: new Map(),
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
-      heartbeatDefaultIntervalMs: 900_000,
+      defaultIsolation: { project: "local", workspace: "docker" },
     };
     const merged = mergeBackupSettings(current, read.settings!);
     expect(merged.agentAiDefaults).toEqual(current.agentAiDefaults);
-    expect(merged.heartbeatDefaultIntervalMs).toBe(900_000);
+    expect(merged.defaultIsolation).toEqual(current.defaultIsolation);
     expect(merged.defaultModel).toBe("anthropic:claude-plan");
 
     expect(readBackupSettings({ settings: null })).toEqual({
@@ -298,6 +303,28 @@ describe("settingsProjection", () => {
       runtimeEnablement: { ssh: false },
     };
     expect(mergeBackupSettings(current, read.settings!)).toEqual(current);
+
+    // Values load would quietly shorten or drop: a chain over this build's limit, repeated tier
+    // ids (fewer than the minimum remain, so load falls back to the default tiers), and an
+    // evaluation block without a usable model.
+    const tier = getDefaultAutoModelRoutingConfig().tiers[0];
+    for (const [key, value] of [
+      [
+        "modelFallbacks",
+        {
+          "openai:gpt-a": {
+            models: ["openai:gpt-b", "openai:gpt-c", "openai:gpt-d", "openai:gpt-e"],
+          },
+        },
+      ],
+      ["autoModelRouting", { tiers: [tier, tier] }],
+      ["evaluationDefaults", {}],
+    ] as const) {
+      expect(readBackupSettings({ settings: { [key]: value } })).toEqual({
+        settings: {},
+        unsupported: [key],
+      });
+    }
 
     // Empty spellings are still resets.
     expect(
