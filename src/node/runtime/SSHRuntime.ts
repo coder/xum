@@ -43,7 +43,6 @@ import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
-import { PROMISOR_CONFIG_KEYS } from "@/common/utils/git/gitStatus";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import {
   type SSHRuntimeConfig,
@@ -114,7 +113,11 @@ const BASE_REPO_MAINTENANCE_WAIT_TIMEOUT_SECONDS = 30 * 60;
  *  `repo_has_promisor_remote()`. Unsetting all three is what makes
  *  receive-pack's `check_connected()` skip the buggy partial-clone fast
  *  path on subsequent pushes (see `stripBaseRepoPromisorConfig`). */
-const BASE_REPO_PROMISOR_CONFIG_KEYS = PROMISOR_CONFIG_KEYS;
+const BASE_REPO_PROMISOR_CONFIG_KEYS = [
+  "remote.origin.promisor",
+  "remote.origin.partialclonefilter",
+  "extensions.partialclone",
+] as const;
 const BASE_REPO_FRAGMENTED_PACK_THRESHOLD = 25;
 const PROJECT_SYNC_MAX_ATTEMPTS = 3;
 const PROJECT_SYNC_RETRYABLE_ERRORS = [
@@ -2891,39 +2894,21 @@ export class SSHRuntime extends RemoteRuntime {
       `git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${baseRepoUnbornHeadArg} 2>/dev/null || { echo WARM_MISS:base-head-normalization-failed; exit 0; }`,
     ];
 
-    // Best-effort promisor heal, mirroring GIT_FETCH_SCRIPT's heal block. The
-    // warm path skips ensureBaseRepo(), and background status fetches that
-    // ran `git fetch --filter=blob:none` inside sibling worktrees register
-    // the shared base repo as a promisor remote (remote.origin.promisor +
-    // partialclonefilter). Left in place, `git worktree add` below would
-    // lazy-fetch missing blobs from upstream mid-checkout, so a transient
-    // network drop aborts workspace creation with "could not fetch <oid>
-    // from promisor remote" instead of the repairable missing-objects path.
-    // But stripping the keys while objects are still missing is worse: a
-    // plain fetch never resends blobs of commits the client already has, so
-    // the repo would lose its lazy-fetch fallback and worktree add would
-    // silently fall back to the stale bundle ref despite origin being
-    // reachable. So: batch-fetch exactly the missing OIDs first (an eager
-    // lazy fetch, done while the promisor config still allows it), then strip
-    // the keys only when enumeration proves the object store complete.
-    // Enumeration failure counts as "not proven complete". Everything is
-    // best-effort; when the keys stay, lazy fetch plus the promisor-remote
-    // failure classification below still cover worktree materialization.
-    // This block runs after originPreamble so the backfill sees the freshly
-    // configured origin URL.
+    // Best-effort heal, mirroring GIT_FETCH_SCRIPT's heal block. The warm path
+    // skips ensureBaseRepo(), and older background status fetches ran
+    // `git fetch --filter=blob:none` inside sibling worktrees, which registers
+    // the shared base repo as a blobless partial clone. `git worktree add`
+    // below would then lazy-fetch the omitted blobs mid-checkout, so a
+    // transient network drop aborts workspace creation. Remove the filter and
+    // batch-fetch the missing OIDs while origin is configured (an eager lazy
+    // fetch). The promisor keys stay: they keep lazy fetch working for any
+    // object the backfill could not restore, and a failed lazy fetch is
+    // classified as missing-objects below so the slow path repairs it.
     const warmBaseRepoPromisorHealPreamble = [
       `if [ "$(git --git-dir=${baseRepoPathArg} config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then`,
-      `  xum_base_missing=$(git --git-dir=${baseRepoPathArg} rev-list --objects --missing=print --all --reflog 2>/dev/null) && xum_base_missing=$(printf '%s\\n' "$xum_base_missing" | sed -n 's/^?//p') || xum_base_missing=enumeration-failed`,
-      `  if [ -n "$xum_base_missing" ] && [ "$xum_base_missing" != "enumeration-failed" ]; then`,
-      `    printf '%s\\n' "$xum_base_missing" | git --git-dir=${baseRepoPathArg} -c protocol.version=2 fetch origin --stdin --no-tags --no-recurse-submodules --no-write-fetch-head >/dev/null 2>&1 || true`,
-      `    xum_base_missing=$(git --git-dir=${baseRepoPathArg} rev-list --objects --missing=print --all --reflog 2>/dev/null) && xum_base_missing=$(printf '%s\\n' "$xum_base_missing" | sed -n 's/^?//p') || xum_base_missing=enumeration-failed`,
-      `  fi`,
-      `  if [ -z "$xum_base_missing" ]; then`,
-      ...BASE_REPO_PROMISOR_CONFIG_KEYS.map(
-        (key) =>
-          `    git --git-dir=${baseRepoPathArg} config --local --unset-all ${shescape.quote(key)} 2>/dev/null || true`
-      ),
-      `  fi`,
+      `  git --git-dir=${baseRepoPathArg} config --local --unset-all remote.origin.partialclonefilter 2>/dev/null || true`,
+      `  xum_base_missing=$(git --git-dir=${baseRepoPathArg} rev-list --objects --missing=print --all --reflog 2>/dev/null | sed -n 's/^?//p')`,
+      `  [ -z "$xum_base_missing" ] || printf '%s\\n' "$xum_base_missing" | git --git-dir=${baseRepoPathArg} -c protocol.version=2 fetch origin --stdin --no-tags --no-recurse-submodules --no-write-fetch-head >/dev/null 2>&1 || true`,
       `fi`,
     ].join("\n");
 

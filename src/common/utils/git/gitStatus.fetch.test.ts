@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "fs/promises";
+import { mkdtemp, rm, symlink, unlink, writeFile } from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "child_process";
@@ -117,15 +117,14 @@ describe("GIT_FETCH_SCRIPT", () => {
       // LOCAL_SHA/REMOTE_SHA early-exit is hit: the heal must run before it.
       const script = GIT_FETCH_SCRIPT;
       const output = run(script, workspaceDir);
-      expect(output).toContain("HEAL: backfilling promisor partial clone");
+      expect(output).toContain("HEAL:");
 
-      // Promisor config removed and previously missing blobs backfilled.
+      // Filter removed and previously missing blobs backfilled. The promisor
+      // key stays so lazy fetch keeps covering anything the backfill missed.
       expect(
         run("git config --local --get remote.origin.partialclonefilter || echo GONE", workspaceDir)
       ).toBe("GONE");
-      expect(
-        run("git config --local --get remote.origin.promisor || echo GONE", workspaceDir)
-      ).toBe("GONE");
+      expect(run("git config --local --get remote.origin.promisor", workspaceDir)).toBe("true");
       const missingAfter = run(
         "git rev-list --objects --missing=print origin/main | grep -c '^?' || true",
         workspaceDir
@@ -136,12 +135,25 @@ describe("GIT_FETCH_SCRIPT", () => {
       const secondOutput = run(script, workspaceDir);
       expect(secondOutput).not.toContain("HEAL:");
       expect(secondOutput).toContain("SKIP: Remote SHA already fetched");
+
+      // With the filter gone, a plain user fetch downloads blobs again even
+      // though the repo is still a promisor remote.
+      await writeFile(path.join(seedDir, "later.txt"), "fetched after heal\n");
+      run("git add later.txt", seedDir);
+      run('git commit -m "later"', seedDir);
+      run("git push origin main", seedDir);
+      run("git fetch origin", workspaceDir);
+      const missingAfterPlainFetch = run(
+        "git rev-list --objects --missing=print origin/main | grep -c '^?' || true",
+        workspaceDir
+      );
+      expect(Number(missingAfterPlainFetch)).toBe(0);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
   }, 20000);
 
-  test("keeps promisor config when refetch cannot restore locally referenced blobs", async () => {
+  test("keeps lazy fetch for blobs the backfill cannot restore", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "mux-git-heal-incomplete-"));
     const originDir = path.join(tempDir, "origin.git");
     const seedDir = path.join(tempDir, "seed");
@@ -188,147 +200,53 @@ describe("GIT_FETCH_SCRIPT", () => {
       run("git push origin :feature", seedDir);
       run(`git -C ${originDir} gc --prune=now`);
 
-      const output = run(GIT_FETCH_SCRIPT, workspaceDir);
-      expect(output).toContain(
-        "HEAL: objects still missing after backfill; keeping promisor config"
-      );
+      run(GIT_FETCH_SCRIPT, workspaceDir);
 
-      // Promisor config retained so the lazy-fetch fallback keeps working.
-      expect(run("git config --local --get remote.origin.partialclonefilter", workspaceDir)).toBe(
-        "blob:none"
+      // The blob is gone upstream, so it stays missing. The filter is removed
+      // anyway, and the promisor key stays so the repo remains a valid partial
+      // clone instead of one whose checkouts fail with "unable to read sha1".
+      const missingAfter = run(
+        "git rev-list --objects --missing=print keep | grep -c '^?' || true",
+        workspaceDir
       );
-      // Incomplete-heal marker set: retries are throttled to daily.
+      expect(Number(missingAfter)).toBeGreaterThan(0);
       expect(
-        Number(run("git config --local --get xum.promisorHealIncompleteAt", workspaceDir))
-      ).toBeGreaterThan(0);
-
-      // Within the daily window a second run must not attempt another refetch.
-      const secondOutput = run(GIT_FETCH_SCRIPT, workspaceDir);
-      expect(secondOutput).not.toContain("HEAL:");
+        run("git config --local --get remote.origin.partialclonefilter || echo GONE", workspaceDir)
+      ).toBe("GONE");
+      expect(run("git config --local --get remote.origin.promisor", workspaceDir)).toBe("true");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
   }, 20000);
 
-  test("keeps promisor config when object enumeration fails", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "mux-git-heal-enum-"));
+  test("skips the heal while a sibling holds a fresh lock and takes over a stale one", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "mux-git-heal-lock-"));
     const originDir = path.join(tempDir, "origin.git");
-    const seedDir = path.join(tempDir, "seed");
     const workspaceDir = path.join(tempDir, "workspace");
+    const lockPath = path.join(workspaceDir, ".git", "xum-promisor-heal.lock");
 
     const run = (cmd: string, cwd?: string) =>
       execSync(cmd, { cwd, stdio: "pipe" }).toString().trim();
-    const configureIdentity = (cwd: string) => {
-      run('git config user.email "test@example.com"', cwd);
-      run('git config user.name "Test User"', cwd);
-      run("git config commit.gpgsign false", cwd);
-    };
 
     try {
       run(`git init --bare ${originDir}`);
-      run(`git -C ${originDir} config uploadpack.allowFilter true`);
-
-      run(`git clone ${originDir} ${seedDir}`);
-      configureIdentity(seedDir);
-      await writeFile(path.join(seedDir, "README.md"), "init\n");
-      run("git add README.md", seedDir);
-      run('git commit -m "init"', seedDir);
-      run("git branch -M main", seedDir);
-      run("git push -u origin main", seedDir);
-      run("git symbolic-ref HEAD refs/heads/main", originDir);
-
       run(`git clone ${originDir} ${workspaceDir}`);
-      configureIdentity(workspaceDir);
+      run("git config --local remote.origin.promisor true", workspaceDir);
+      run("git config --local remote.origin.partialclonefilter blob:none", workspaceDir);
 
-      await writeFile(path.join(seedDir, "data.txt"), "poisoned blob content\n");
-      run("git add data.txt", seedDir);
-      run('git commit -m "add data"', seedDir);
-      run("git push origin main", seedDir);
-      run("git fetch origin --filter=blob:none", workspaceDir);
-
-      // Point a local ref at an object the repo does not have at all:
-      // rev-list then exits 128 without reporting anything, which must read
-      // as "not proven complete" — never as "nothing missing".
-      await writeFile(
-        path.join(workspaceDir, ".git", "refs", "heads", "broken"),
-        "0123456789abcdef0123456789abcdef01234567\n"
-      );
-
-      const output = run(GIT_FETCH_SCRIPT, workspaceDir);
-      expect(output).toContain("HEAL: backfilling promisor partial clone");
-      expect(output).not.toContain("HEAL: promisor config removed");
+      const nowSecs = Math.floor(Date.now() / 1000);
+      await symlink(String(nowSecs), lockPath);
+      expect(run(GIT_FETCH_SCRIPT, workspaceDir)).not.toContain("HEAL:");
       expect(run("git config --local --get remote.origin.partialclonefilter", workspaceDir)).toBe(
         "blob:none"
       );
-    } finally {
-      await rm(tempDir, { recursive: true, force: true });
-    }
-  }, 20000);
 
-  test("keeps promisor config when a force-push strands blobless commits in the reflog", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "mux-git-heal-reflog-"));
-    const originDir = path.join(tempDir, "origin.git");
-    const seedDir = path.join(tempDir, "seed");
-    const workspaceDir = path.join(tempDir, "workspace");
-
-    const run = (cmd: string, cwd?: string) =>
-      execSync(cmd, { cwd, stdio: "pipe" }).toString().trim();
-    const configureIdentity = (cwd: string) => {
-      run('git config user.email "test@example.com"', cwd);
-      run('git config user.name "Test User"', cwd);
-      run("git config commit.gpgsign false", cwd);
-    };
-
-    try {
-      run(`git init --bare ${originDir}`);
-      run(`git -C ${originDir} config uploadpack.allowFilter true`);
-
-      run(`git clone ${originDir} ${seedDir}`);
-      configureIdentity(seedDir);
-      await writeFile(path.join(seedDir, "README.md"), "init\n");
-      run("git add README.md", seedDir);
-      run('git commit -m "init"', seedDir);
-      run("git branch -M main", seedDir);
-      run("git push -u origin main", seedDir);
-      run("git symbolic-ref HEAD refs/heads/main", originDir);
-
-      run(`git clone ${originDir} ${workspaceDir}`);
-      configureIdentity(workspaceDir);
-
-      // Advance main with a commit whose blob the workspace only ever sees
-      // through a filtered fetch, then poison the workspace.
-      await writeFile(path.join(seedDir, "displaced.txt"), "blob displaced by force-push\n");
-      run("git add displaced.txt", seedDir);
-      run('git commit -m "displaced"', seedDir);
-      run("git push origin main", seedDir);
-      run("git fetch origin --filter=blob:none", workspaceDir);
-
-      // Force-push main back and forward so the blobless commit survives only
-      // in the workspace's remote-tracking reflog, then GC it away upstream.
-      run("git reset --hard HEAD~1", seedDir);
-      await writeFile(path.join(seedDir, "replacement.txt"), "replacement history\n");
-      run("git add replacement.txt", seedDir);
-      run('git commit -m "replacement"', seedDir);
-      run("git push --force origin main", seedDir);
-      run(`git -C ${originDir} gc --prune=now`);
-      const replacementSha = run("git rev-parse main", seedDir);
-
-      const output = run(GIT_FETCH_SCRIPT, workspaceDir);
-      expect(output).toContain(
-        "HEAL: objects still missing after backfill; keeping promisor config"
-      );
-
-      // The heal itself moved origin/main to the replacement history, which is
-      // exactly what strands the displaced commit in the reflog: without
-      // --reflog in the completeness check the config would now be unset and
-      // "git reset --hard origin/main@{1}" could never lazy-fetch its blobs.
-      expect(run("git rev-parse origin/main", workspaceDir)).toBe(replacementSha);
-      expect(run("git config --local --get remote.origin.partialclonefilter", workspaceDir)).toBe(
-        "blob:none"
-      );
+      await unlink(lockPath);
+      await symlink(String(nowSecs - 2 * 3600), lockPath);
+      expect(run(GIT_FETCH_SCRIPT, workspaceDir)).toContain("HEAL:");
       expect(
-        Number(run("git config --local --get xum.promisorHealIncompleteAt", workspaceDir))
-      ).toBeGreaterThan(0);
+        run("git config --local --get remote.origin.partialclonefilter || echo GONE", workspaceDir)
+      ).toBe("GONE");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

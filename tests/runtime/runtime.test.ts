@@ -2402,9 +2402,9 @@ describeIntegration("Runtime integration tests", () => {
             `git --git-dir="${baseRepoPath}" config --local core.worktree "${bogusWorktreePath}"`,
             `git --git-dir="${baseRepoPath}" symbolic-ref HEAD refs/heads/main`,
             // Simulate what a background `git fetch --filter=blob:none` from a
-            // sibling worktree registers in the shared gitdir. A promisor base
-            // repo lazy-fetches missing blobs over the network mid-checkout, so
-            // the warm path must strip these before `git worktree add`.
+            // sibling worktree registers in the shared gitdir. The persisted
+            // filter keeps later fetches blobless, so the warm path removes it
+            // before `git worktree add`.
             `git --git-dir="${baseRepoPath}" config --local remote.origin.promisor true`,
             `git --git-dir="${baseRepoPath}" config --local remote.origin.partialclonefilter blob:none`,
           ].join(" && ")
@@ -2444,13 +2444,13 @@ describeIntegration("Runtime integration tests", () => {
         );
         expect(baseRepoCoreWorktreeCheck.exitCode).toBe(1);
 
-        // Promisor/partial-clone registration must be stripped so worktree
-        // materialization never lazy-fetches blobs over the network.
+        // The filter is removed; the promisor key stays so lazy fetch still
+        // covers any object the warm-path backfill could not restore.
         const baseRepoPromisorCheck = await execSSH(
           runtime,
           `git --git-dir="${baseRepoPath}" config --get remote.origin.promisor`
         );
-        expect(baseRepoPromisorCheck.exitCode).toBe(1);
+        expect(baseRepoPromisorCheck.stdout.trim()).toBe("true");
 
         const baseRepoFilterCheck = await execSSH(
           runtime,
