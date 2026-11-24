@@ -11,6 +11,9 @@ struct NewChatView: View {
     @State private var runtime: RuntimeKind = .worktree
     @State private var trunk = "main"
     @State private var branches: [String] = ["main"]
+    /// The project whose branch discovery finished (or failed): until it is the selected one, the
+    /// trunk can still be the placeholder or the previous project's.
+    @State private var branchesProject: String?
     @State private var message = ""
     @State private var agentId = "exec"
     /// The user's pick; until then the sheet follows the current server's default, which can
@@ -241,7 +244,7 @@ struct NewChatView: View {
                 Chip {
                     HStack(spacing: 6) {
                         Text("from").foregroundStyle(Color.xText2)
-                        Text(trunk).font(.xMono(14, weight: .medium))
+                        Text(branches.contains(trunk) ? trunk : "default").font(.xMono(14, weight: .medium))
                         Image(systemName: "chevron.down").font(.system(size: 11)).foregroundStyle(Color.xText2)
                     }
                 }
@@ -365,11 +368,14 @@ struct NewChatView: View {
 
     private var canSend: Bool {
         !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !sending && !busy
+            // The previous server's default model may not route here.
+            && (model.modelsLoaded || pickedModel.map(model.modelChoices.contains) == true)
     }
 
     /// A workspace start needs a project; scratch chats always work.
     private var busy: Bool {
-        (startFrom == .workspace && selectedProject == nil) || (startFrom == .fork && mostRecentWorkspace == nil)
+        (startFrom == .workspace && (selectedProject == nil || branchesProject != selectedProject?.path))
+            || (startFrom == .fork && mostRecentWorkspace == nil)
     }
 
     private var modelId: String {
@@ -384,7 +390,10 @@ struct NewChatView: View {
             let res = try await client.call("projects/listBranches", ["projectPath": .string(path)])
             let loaded = (res["branches"]?.array ?? []).compactMap { b in b.string ?? b["name"]?.string }
             // The user picked another project while this ran; its own load sets the branches.
-            guard selectedProject?.path == path, !loaded.isEmpty else { return }
+            guard selectedProject?.path == path else { return }
+            branchesProject = path
+            // No branches known: let the server use the project's default trunk.
+            guard !loaded.isEmpty else { branches = []; return }
             branches = loaded
             if let recommended = res["recommendedTrunk"]?.string, loaded.contains(recommended) {
                 trunk = recommended
@@ -392,7 +401,10 @@ struct NewChatView: View {
                 trunk = loaded.first { $0 == "main" } ?? loaded[0]
             }
         } catch {
-            // Leave the `main` fallback; the trunk menu just stays short.
+            // Unknown branches: send no trunk, so the server uses the project's default.
+            guard selectedProject?.path == path else { return }
+            branchesProject = path
+            branches = []
         }
     }
 
@@ -410,7 +422,8 @@ struct NewChatView: View {
                                                    model: modelId, agentId: agentId, thinking: thinking)
             } else {
                 guard let project = selectedProject else { return }
-                id = try await model.createWorkspace(projectPath: project.path, runtime: runtime, trunk: trunk,
+                id = try await model.createWorkspace(projectPath: project.path, runtime: runtime,
+                                                     trunk: branches.contains(trunk) ? trunk : nil,
                                                      message: message, model: modelId, agentId: agentId, thinking: thinking)
             }
             message = ""

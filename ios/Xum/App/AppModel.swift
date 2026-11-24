@@ -48,6 +48,9 @@ final class AppModel {
     var defaultModel = "anthropic:claude-opus-5-5"
     /// The current server's usable models (`ModelName.catalog`); the built-ins until it loads.
     private(set) var serverModels: [String] = []
+    /// The current server's catalog and default have loaded. Until then `defaultModel` can still be
+    /// the previous server's, which this one may not route.
+    private(set) var modelsLoaded = false
     var modelChoices: [String] { serverModels.isEmpty ? ModelName.builtIn : serverModels }
 
     /// A server with only local or custom models must not get a fixed Anthropic default: its
@@ -67,6 +70,7 @@ final class AppModel {
         // The server's own default is valid by its routing even when this catalog misses it.
         if let d = serverDefault, !d.isEmpty, !models.contains(d) { models.insert(d, at: 0) }
         serverModels = models
+        modelsLoaded = true
         guard !models.isEmpty else { return true }
         if let d = serverDefault, models.contains(d) {
             defaultModel = d
@@ -117,6 +121,7 @@ final class AppModel {
         list = l
         l.start()
         serverModels = []
+        modelsLoaded = false
         startLoadingModels()
     }
 

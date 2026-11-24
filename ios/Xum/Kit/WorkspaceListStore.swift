@@ -52,7 +52,20 @@ final class WorkspaceListStore {
         tasks = []
     }
 
+    /// Metadata events counted as they arrive, so a refresh can tell which ones are newer than its
+    /// `workspace/list` snapshot (the list may answer after an event changed the same workspace).
+    private var metadataSeq = 0
+    private var lastSnapshotSeq = 0
+    private var refreshing = 0
+    private var eventLog: [(seq: Int, id: String, workspace: Workspace?)] = []
+
     func refresh() async {
+        refreshing += 1
+        defer {
+            refreshing -= 1
+            if refreshing == 0 { eventLog = [] }
+        }
+        let startSeq = metadataSeq
         do {
             let p = try await client.call("projects/list")
             projects = (p.array ?? []).compactMap { pair in
@@ -61,7 +74,14 @@ final class WorkspaceListStore {
                 return Project(path: path, name: custom?.isEmpty == false ? custom! : URL(fileURLWithPath: path).lastPathComponent)
             }
             let w = try await client.call("workspace/list", [:])
-            setWorkspaces((w.array ?? []).compactMap(Workspace.init(json:)))
+            // A metadata snapshot since the request is newer than this list: keep it. Otherwise
+            // replay the events that arrived meanwhile on top of the list, so a workspace created or
+            // archived elsewhere is not undone.
+            if lastSnapshotSeq <= startSeq {
+                var merged = (w.array ?? []).compactMap(Workspace.init(json:))
+                for e in eventLog where e.seq > startSeq { Self.apply(e.id, e.workspace, to: &merged) }
+                setWorkspaces(merged)
+            }
             let a = try await client.call("workspace/activity/list")
             // `null` means the server could not read activity, not that every workspace is idle.
             if let snapshot = a.object {
@@ -84,13 +104,17 @@ final class WorkspaceListStore {
         while !Task.isCancelled {
             do {
                 for try await ev in client.subscribe("workspace/onMetadata", [:]) {
+                    metadataSeq += 1
                     if ev["type"]?.string == "snapshot" {
+                        lastSnapshotSeq = metadataSeq
                         setWorkspaces((ev["workspaces"]?.array ?? []).compactMap(Workspace.init(json:)))
                         // A project created while disconnected arrives only as its workspaces' path.
                         workspaces.forEach(addProject(of:))
                     } else if let id = ev["workspaceId"]?.string {
-                        if let m = ev["metadata"], let w = Workspace(json: m) {
-                            if let i = workspaces.firstIndex(where: { $0.id == id }) { workspaces[i] = w } else { workspaces.append(w) }
+                        let w = ev["metadata"].flatMap(Workspace.init(json:))
+                        if refreshing > 0 { eventLog.append((metadataSeq, id, w)) }
+                        if let w {
+                            Self.apply(id, w, to: &workspaces)
                             addProject(of: w)
                         } else {
                             setWorkspaces(workspaces.filter { $0.id != id })
@@ -99,6 +123,15 @@ final class WorkspaceListStore {
                 }
             } catch {}
             try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+    }
+
+    /// One metadata event: the workspace's new metadata, or nil when it is gone.
+    private static func apply(_ id: String, _ w: Workspace?, to list: inout [Workspace]) {
+        if let w {
+            if let i = list.firstIndex(where: { $0.id == id }) { list[i] = w } else { list.append(w) }
+        } else {
+            list.removeAll { $0.id == id }
         }
     }
 

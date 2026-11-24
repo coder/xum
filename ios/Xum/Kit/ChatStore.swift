@@ -450,6 +450,9 @@ final class ChatStore {
                 }
             }
             if streamingMessageId == ev["messageId"]?.string { streamingMessageId = nil }
+        case "auto-retry-abandoned":
+            // The retries ended without another stream-end or stream-abort.
+            if autoRetryRollbackPending { Task { await rollbackAutoRetry() } }
         case "stream-error", "error":
             lastError = ev["error"]?.string ?? "Stream failed"
             lastErrorFromStream = true

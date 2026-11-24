@@ -106,6 +106,7 @@ struct ChatView: View {
                     .id(tool.id)
             } else if let question = pendingQuestion, let store {
                 QuestionCard(question: question, panel: true) { answers in
+                    guard modelReady(store) else { return }
                     Task { try? await store.answer(question, answers: answers, options: sendOptions) }
                 }
                 .id(question.toolCallId)
@@ -350,6 +351,7 @@ struct ChatView: View {
                 canImplement: store.latestPlanToolId == tool.id && !implementing,
                 fileContent: planFile?.toolId == tool.id ? planFile?.content : nil,
                 onImplement: {
+                    guard modelReady(store) else { return }
                     // The composer moves to Exec with it, so the next message does not go back to Plan.
                     settingsEdited = true
                     applySettings(for: "exec")
@@ -391,6 +393,7 @@ struct ChatView: View {
                 .id(approval.toolCallId)
             } else if let question = store.pendingQuestion, sizeClass != .regular {
                 QuestionCard(question: question) { answers in
+                    guard modelReady(store) else { return }
                     Task { try? await store.answer(question, answers: answers, options: sendOptions) }
                 }
                 // A new call gets fresh state: the old page index could be out of its range.
@@ -437,11 +440,19 @@ struct ChatView: View {
         ["model": .string(modelId), "agentId": .string(agent), "thinkingLevel": .string(thinking.rawValue)]
     }
 
+    /// The composer's model is one this server routes: its own saved pick, or anything once the
+    /// server's catalog and default have loaded (until then the default can be the last server's).
+    private func modelReady(_ store: ChatStore) -> Bool {
+        if model.modelsLoaded || pickedModel.map(model.modelChoices.contains) == true { return true }
+        store.report("This server's models are still loading. Try again in a moment.")
+        return false
+    }
+
     private func send(_ store: ChatStore) {
         // The draft takes the text as typed and trims what it sends, as the web composer does:
         // a trimmed take would not match the composer text the backend removes it from.
         let text = store.draft.text
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, modelReady(store) else { return }
         // The draft takes the text out of the composer and puts it back if it was not sent.
         Task { try? await store.send(text, model: modelId, agentId: agent, thinking: thinking) }
     }
