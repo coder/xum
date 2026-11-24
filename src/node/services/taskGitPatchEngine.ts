@@ -1159,6 +1159,11 @@ async function checkAppliedWorkStillPresent(params: {
       ...parsePatchMetadataPaths(patchText).changedPaths,
     ]),
   ];
+  // The failed reverse check proves the whole patch is not present as-is, so
+  // every patch path needs its own evidence (still dirty, or changed since the
+  // recorded post-apply HEAD): one surviving file must not vouch for a
+  // discarded sibling.
+  const unaccountedPaths = new Set(patchPaths);
   const chunkSize = 200;
   for (let i = 0; i < patchPaths.length; i += chunkSize) {
     const pathspecs = patchPaths
@@ -1173,22 +1178,27 @@ async function checkAppliedWorkStillPresent(params: {
     if (statusResult.exitCode !== 0) {
       return `whether the child's applied uncommitted changes are still present cannot be verified (${statusResult.stderr.trim() || "git status failed"})`;
     }
-    if (statusResult.stdout.length > 0) {
-      return null;
+    for (const entry of parseGitStatusPorcelainZ(statusResult.stdout)) {
+      unaccountedPaths.delete(entry.path);
     }
+    // --no-renames: a detected rename would list only its destination and
+    // leave the source path unaccounted for.
     const diffResult = await execBuffered(
       params.runtime,
-      `${params.gitPrefix}git diff --name-only -z ${shellQuote(params.recordedHeadSha)} HEAD -- ${pathspecs}`,
+      `${params.gitPrefix}git diff --name-only --no-renames -z ${shellQuote(params.recordedHeadSha)} HEAD -- ${pathspecs}`,
       { cwd: params.repoCwd, timeout: 30 }
     );
     if (diffResult.exitCode !== 0) {
       return `whether the child's applied uncommitted changes are still present cannot be verified (${diffResult.stderr.trim() || "git diff failed"})`;
     }
-    if (diffResult.stdout.length > 0) {
-      return null;
+    for (const changedPath of diffResult.stdout.split("\0")) {
+      unaccountedPaths.delete(changedPath);
     }
   }
-  return "the child's applied uncommitted changes are no longer present in the worktree (they were likely discarded)";
+  if (unaccountedPaths.size === 0) {
+    return null;
+  }
+  return `the child's applied uncommitted changes are no longer present in the worktree (they were likely discarded): ${[...unaccountedPaths].join(", ")}`;
 }
 
 /**

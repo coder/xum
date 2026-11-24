@@ -504,6 +504,21 @@ describe("task_apply_git_patch uncommitted-changes (worktree) patches", () => {
     expect(intactRetry.success).toBe(true);
     expect(intactRetry.projectResults?.[0]?.note).toContain("already applied");
 
+    // Discarding one applied file must fail even though its sibling survives.
+    execSync("git checkout -- README.md", { cwd: harness.targetRepo, stdio: "ignore" });
+    const partlyDiscardedRetry = await applyTaskGitPatchArtifact(
+      deps,
+      { task_id: harness.childTaskId, three_way: true },
+      { allowAlreadyApplied: true }
+    );
+    expect(partlyDiscardedRetry.success).toBe(false);
+    expect(partlyDiscardedRetry.projectResults?.[0]?.error).toContain("README.md");
+    await fsPromises.writeFile(
+      path.join(harness.targetRepo, "README.md"),
+      "child update\n",
+      "utf-8"
+    );
+
     // Committing the applied work afterwards is a legitimate evolution of
     // the target, not a discard: the patch paths changed since the recorded
     // post-apply HEAD.
