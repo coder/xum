@@ -12,7 +12,7 @@ import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
-import { isGpt61SolModel, isGpt6AstraModel } from "@/common/types/thinking";
+import { openaiGptTier } from "@/common/types/thinking";
 
 export interface OpenAIDirectProviderOptionsAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
@@ -61,29 +61,78 @@ export function resolveProviderOptionsRoute(
   return options?.resolvedRouteProvider ?? "direct";
 }
 
+function resolveServiceTierModel(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null | undefined
+): string {
+  if (modelString.startsWith("coder:")) {
+    return resolveCoderGatewayMetadataModel(modelString, providersConfig) ?? modelString;
+  }
+  return normalizeToCanonical(modelString);
+}
+
 /**
- * Whether the model accepts the given OpenAI service tier. Every tier but
- * Ultrafast is route-gated only (see openaiServiceTierAvailable).
+ * Whether the route and model accept the given OpenAI service tier. The caller
+ * first checks if the route accepts any service tiers (openaiServiceTierAvailable).
  *
- * Ultrafast (`service_tier: "ultrafast"`, launched at DevDay 2026-09-29, billed
- * at 6x Standard) is model-gated: among the supported models OpenAI serves it
- * for GPT-6 Astra and, since 2026-10-08, GPT-6.1 Sol (GPT-5.6 Sol preview access
- * is no longer supported). Callers drop the tier for other models (Standard or
- * the project default) instead of switching to Fast, which is a different paid
- * tier. Ultrafast is also Responses-only: the Chat Completions service_tier enum
- * has no "ultrafast" and rejects it with a 400 (see ultrafastWireAccepted).
- * https://developers.openai.com/api/docs/guides/ultrafast-mode
+ * Ultrafast (`service_tier: "ultrafast"`, launched at DevDay 2026-09-29) is
+ * model-gated: among the supported models OpenAI serves it only for the GPT
+ * tiers OPENAI_GPT_TIERS marks (GPT-5.6 Sol preview access is no longer
+ * supported). Ultrafast is also Responses-only: the Chat Completions
+ * service_tier enum has no "ultrafast" and rejects it with a 400 (see
+ * ultrafastWireAccepted). https://developers.openai.com/api/docs/guides/ultrafast-mode
+ *
+ * Flex is dropped only for a GPT tier that OpenAI does not offer it on (GPT-6.2);
+ * other models, custom ids included, keep the route-only gate.
+ *
+ * Callers drop a refused tier (Standard or the project default) instead of
+ * switching to another paid tier.
  */
 export function openaiModelSupportsServiceTier(
   modelString: string,
   serviceTier: string,
   options?: OpenAIDirectProviderOptionsAvailability
 ): boolean {
-  if (serviceTier !== "ultrafast") return true;
-  if (!ultrafastWireAccepted(modelString, options)) return false;
-  // Resolve mapped aliases and Coder gateway identities to the upstream model.
-  const capabilityModel = resolveModelForMetadata(modelString, options?.providersConfig ?? null);
-  return isGpt6AstraModel(capabilityModel) || isGpt61SolModel(capabilityModel);
+  if (serviceTier === "ultrafast") {
+    // Codex OAuth and the API accept Ultrafast on the same Responses models.
+    return (
+      ultrafastWireAccepted(modelString, options) &&
+      openaiServiceTierCapabilities(modelString, options)?.ultrafast === true
+    );
+  }
+  if (usesCodexServiceTier(modelString, options)) {
+    return CODEX_STANDARD_AND_FAST_TIERS.has(serviceTier);
+  }
+  return (
+    serviceTier !== "flex" || openaiServiceTierCapabilities(modelString, options)?.flex !== false
+  );
+}
+
+const CODEX_STANDARD_AND_FAST_TIERS = new Set(["priority", "default"]);
+
+function usesCodexServiceTier(
+  modelString: string,
+  options?: OpenAIDirectProviderOptionsAvailability
+): boolean {
+  const { providersConfig, openaiWireFormat } = options ?? {};
+  return (
+    resolveProviderOptionsRoute(modelString, options) === "direct" &&
+    wouldRouteOpenAIThroughCodexOauth(
+      resolveServiceTierModel(modelString, providersConfig),
+      providersConfig,
+      {
+        openaiWireFormat,
+      }
+    )
+  );
+}
+
+function openaiServiceTierCapabilities(
+  modelString: string,
+  options?: OpenAIDirectProviderOptionsAvailability
+) {
+  // Mapped aliases and Coder models use the upstream model's tier capabilities.
+  return openaiGptTier(resolveModelForMetadata(modelString, options?.providersConfig ?? null));
 }
 
 /**
@@ -152,9 +201,7 @@ export function openaiServiceTierAvailable(
     return wire?.providerType === "openai" || wire?.providerType === "openai-compat";
   }
 
-  const normalized = modelString.startsWith("coder:")
-    ? (resolveCoderGatewayMetadataModel(modelString, options?.providersConfig) ?? modelString)
-    : normalizeToCanonical(modelString);
+  const normalized = resolveServiceTierModel(modelString, options?.providersConfig);
   const [origin, modelId] = normalized.split(":", 2);
   if (origin === "github-copilot") {
     // Copilot's unscoped catalog mixes upstreams; capability mappings cannot
@@ -165,10 +212,8 @@ export function openaiServiceTierAvailable(
   if (route === "openrouter" || route === "github-copilot") {
     return true;
   }
-  return openaiDirectProviderOptionsAvailable(normalized, {
-    ...options,
-    resolvedRouteProvider: route,
-  });
+  // Both direct OpenAI API requests and Codex OAuth requests support Fast.
+  return route === "direct";
 }
 
 export function openaiDirectProviderOptionsAvailable(

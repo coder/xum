@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 
+import { SettingsMark } from "../Components/SettingsLayout";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
@@ -249,25 +250,29 @@ export function HeartbeatSection() {
 
   return (
     <div className="flex flex-col gap-6">
-      <ConfigSwitchSetting
-        title="Let agents set up their own heartbeats"
-        description="Give agents a heartbeat tool to schedule recurring follow-ups. Each heartbeat runs a billed agent turn."
-        help={
-          <>
-            When on, an agent can turn on, change, or turn off its workspace&apos;s heartbeat
-            without asking you. Each heartbeat starts a new agent turn while the workspace is idle,
-            so model usage and cost keep accruing until the heartbeat is turned off. Sub-agents
-            never get this tool.
-          </>
-        }
-        ariaLabel="Let agents set up their own heartbeats"
-        placeholderChecked={false}
-        load={loadAgentHeartbeatsEnabled}
-        save={saveAgentHeartbeatsEnabled}
-        saveErrorMessage="Failed to update agent heartbeats"
-      />
+      <div>
+        <SettingsMark id="heartbeat-enable" />
+        <ConfigSwitchSetting
+          title="Let agents set up their own heartbeats"
+          description="Give agents a heartbeat tool to schedule recurring follow-ups. Each heartbeat runs a billed agent turn."
+          help={
+            <>
+              When on, an agent can turn on, change, or turn off its workspace&apos;s heartbeat
+              without asking you. Each heartbeat starts a new agent turn while the workspace is
+              idle, so model usage and cost keep accruing until the heartbeat is turned off.
+              Sub-agents never get this tool.
+            </>
+          }
+          ariaLabel="Let agents set up their own heartbeats"
+          placeholderChecked={false}
+          load={loadAgentHeartbeatsEnabled}
+          save={saveAgentHeartbeatsEnabled}
+          saveErrorMessage="Failed to update agent heartbeats"
+        />
+      </div>
 
       <div>
+        <SettingsMark id="heartbeat-interval" />
         <div className="flex items-center justify-between gap-4">
           <label htmlFor="heartbeat-default-threshold" className="min-w-0 flex-1">
             <div className="text-foreground text-sm font-medium">Default interval</div>
@@ -302,6 +307,7 @@ export function HeartbeatSection() {
       </div>
 
       <div>
+        <SettingsMark id="heartbeat-prompt" />
         <label htmlFor="heartbeat-default-prompt" className="block">
           <div className="text-foreground text-sm font-medium">Default prompt</div>
           <div className="text-muted mt-0.5 text-xs">

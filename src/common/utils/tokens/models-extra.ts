@@ -473,6 +473,52 @@ export const modelsExtra: Record<string, ModelData> = {
 
   // GPT-6 tiers: the 1.05M total window accepts at most 922K input tokens. Above
   // 272K input, the full request costs 2x input/cache and 1.5x output.
+  // GPT-6.2 Sol and Astra - Released November 17, 2026. Cache writes are the
+  // 30-minute rate (1.25x input); Xum does not request 12-hour retention. Like
+  // GPT-6.1 Sol, reasoning cannot be disabled and Chat Completions has no tool
+  // calling, so supports_function_calling holds for the default Responses wire
+  // format only.
+  // Ref: https://developers.openai.com/api/docs/models/gpt-6.2-sol
+  // Ref: https://developers.openai.com/api/docs/models/gpt-6.2-astra
+  "gpt-6.2-sol": {
+    max_input_tokens: 922000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000002, // $2 per million input tokens (<272K prompt tokens)
+    input_cost_per_token_above_272k_tokens: 0.000004, // $4 per million input tokens (>272K)
+    output_cost_per_token: 0.00001, // $10 per million output tokens (<272K prompt tokens)
+    output_cost_per_token_above_272k_tokens: 0.000015, // $15 per million output tokens (>272K)
+    cache_read_input_token_cost: 0.0000001, // $0.10 per million cached input tokens (<272K)
+    cache_read_input_token_cost_above_272k_tokens: 0.0000002, // $0.20 per million cached input tokens (>272K)
+    cache_creation_input_token_cost: 0.0000025, // $2.50 per million tokens (1.25x input)
+    cache_creation_input_token_cost_above_272k_tokens: 0.000005, // $5 per million tokens (1.25x long-context input)
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-06-01",
+  },
+  "gpt-6.2-astra": {
+    max_input_tokens: 922000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000008, // $8 per million input tokens (<272K prompt tokens)
+    input_cost_per_token_above_272k_tokens: 0.000016, // $16 per million input tokens (>272K)
+    output_cost_per_token: 0.00004, // $40 per million output tokens (<272K prompt tokens)
+    output_cost_per_token_above_272k_tokens: 0.00006, // $60 per million output tokens (>272K)
+    cache_read_input_token_cost: 0.0000004, // $0.40 per million cached input tokens (<272K)
+    cache_read_input_token_cost_above_272k_tokens: 0.0000008, // $0.80 per million cached input tokens (>272K)
+    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25x input)
+    cache_creation_input_token_cost_above_272k_tokens: 0.00002, // $20 per million tokens (1.25x long-context input)
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-05-18",
+  },
+
   // GPT-6.1 Sol - Released September 29, 2026: $2/M input, $10/M output, cached
   // input 5% of input ($0.10/M). Like Astra, reasoning cannot be disabled and Chat
   // Completions has no tool calling, so supports_function_calling holds for the
@@ -705,6 +751,28 @@ export const modelsExtra: Record<string, ModelData> = {
     input_cost_per_token: 0.000002, // $2 per million input tokens (intro rate)
     output_cost_per_token: 0.00001, // $10 per million output tokens, including thinking tokens (intro rate)
     cache_read_input_token_cost: 0.0000001, // $0.10 per million cached input tokens (intro rate)
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
+  // Gemini 4 Neon - GA on the paid Gemini API on November 18, 2026. Stable
+  // `gemini-4-neon` model ID; limits as Carbon (one shared 1,048,576-token window, 65,536
+  // tokens per synchronous request). No introductory rate: $3/M input, $15/M output,
+  // $0.15/M implicitly cached input (explicit caching is not supported). No >200K tier.
+  // Source: Gemini API model and pricing docs, 2026-11-20.
+  "gemini-4-neon": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.000003, // $3 per million input tokens
+    output_cost_per_token: 0.000015, // $15 per million output tokens, including thinking tokens
+    cache_read_input_token_cost: 0.00000015, // $0.15 per million cached input tokens
     litellm_provider: "vertex_ai-language-models",
     mode: "chat",
     supports_function_calling: true,

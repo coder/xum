@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g., v1.2.3). If provided, will checkout and release this tag regardless of current branch."
+        description: "Tag to release (e.g., v1.2.3). Dispatch from main: the release builds the tag's commit, which must be on main."
         required: false
         type: string
 
@@ -19,27 +19,59 @@ jobs:
   preflight:
     name: Validate release target
     runs-on: ubuntu-latest
+    outputs:
+      # The commit every build job checks out: the release tag's commit, which
+      # must be on main. desktop-builds signs in the code-signing environment,
+      # which is granted from the dispatch ref (main), so it must not build a
+      # commit that never reached main.
+      ref: ${{ steps.target.outputs.ref }}
     steps:
       - name: Ensure release tag context
+        id: target
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "$RELEASE_TAG" ]; then
             echo "::error::RELEASE_TAG is empty. Ensure this workflow runs on a release event or refs/tags/* ref."
             exit 1
           fi
 
+          # The macOS release key (coder/gcp, xum_macos.tf) answers a dispatch only on main, and
+          # a release only for a vX.Y.Z tag. Refuse anything else here, before any job signs or
+          # uploads, instead of failing in the macOS signing job after Windows has shipped.
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -n "$INPUT_TAG" ]; then
-              echo "workflow_dispatch with explicit tag input: $INPUT_TAG"
-            elif [[ "$GITHUB_REF" != refs/tags/* ]]; then
-              echo "::error::workflow_dispatch runs must either provide a 'tag' input or target a tag ref. Current ref: $GITHUB_REF"
+            if [ "$GITHUB_REF" != "refs/heads/main" ] || [ -z "$INPUT_TAG" ]; then
+              echo "::error::Dispatch this workflow from main with the 'tag' input. Current ref: $GITHUB_REF"
               exit 1
             fi
+            echo "workflow_dispatch with explicit tag input: $INPUT_TAG"
+            tag_ref="refs/tags/$INPUT_TAG"
+          else
+            tag_ref="$GITHUB_REF"
+          fi
+          if [[ ! "${tag_ref#refs/tags/}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::only a release tag like v1.2.3 can be released, got '${tag_ref#refs/tags/}'"
+            exit 1
           fi
 
-          echo "Publishing tag $RELEASE_TAG"
+          # Pin the build to the tag's commit, so moving the tag mid-run has
+          # no effect, and require that commit to be on main.
+          if ! sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag_ref" --jq .sha); then
+            echo "::error::tag ${tag_ref#refs/tags/} does not exist"
+            exit 1
+          fi
+          # The branch's commit, not the name main: a tag can have that name too.
+          main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...$main" --jq .status)
+          if [ "$status" != "ahead" ] && [ "$status" != "identical" ]; then
+            echo "::error::${tag_ref#refs/tags/} points at $sha, which is not on main"
+            exit 1
+          fi
+          echo "ref=$sha" >> "$GITHUB_OUTPUT"
+
+          echo "Publishing tag $RELEASE_TAG from $sha (${tag_ref#refs/tags/})"
 
   desktop-builds:
     name: Build and Release Desktop Apps
@@ -49,7 +81,7 @@ jobs:
       id-token: write # GCP workload identity for Windows code signing
     uses: ./.github/workflows/_desktop-release.yml
     with:
-      ref: ${{ inputs.tag || github.ref }}
+      ref: ${{ needs.preflight.outputs.ref }}
       release_tag: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
     secrets: inherit # zizmor: ignore[secrets-inherit] -- reusable workflow needs platform signing secrets
 
@@ -62,7 +94,7 @@ jobs:
       packages: write # Push to GHCR
     uses: ./.github/workflows/_docker-release.yml
     with:
-      ref: ${{ inputs.tag || github.ref }}
+      ref: ${{ needs.preflight.outputs.ref }}
       version: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
       is_latest: true
 
@@ -76,7 +108,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.preflight.outputs.ref }}
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 

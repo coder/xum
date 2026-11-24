@@ -466,7 +466,7 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
-  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon, Carbon and Hydrogen", () => {
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon, Carbon, Neon and Hydrogen", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         max_output_tokens: 32768,
@@ -480,6 +480,7 @@ describe("resolveModelParameterOverrides", () => {
       "google:gemini-3.8-flash",
       "google:gemini-4-argon",
       "google:gemini-4-carbon",
+      "google:gemini-4-neon",
       "google:gemini-4-hydrogen",
       "openrouter:google/gemini-4-hydrogen",
     ]) {
@@ -493,7 +494,7 @@ describe("resolveModelParameterOverrides", () => {
     }
   });
 
-  it("strips penalty parameters for Gemini 4 Carbon and Hydrogen only", () => {
+  it("strips penalty parameters for Gemini 4 Carbon, Neon and Hydrogen only", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         seed: 42,
@@ -504,6 +505,7 @@ describe("resolveModelParameterOverrides", () => {
 
     for (const model of [
       "google:gemini-4-carbon",
+      "google:gemini-4-neon",
       "google:gemini-4-hydrogen",
       "google-vertex:gemini-4-hydrogen",
     ]) {

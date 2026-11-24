@@ -1,6 +1,6 @@
 /**
  * Auto model routing (auto-model-routing experiment): the composer's Auto entries
- * send each prompt to the user's evaluation model (AI SDK `experimental_evaluate`)
+ * send each prompt to the user's evaluation model (AI SDK `experimental_decide`)
  * for a single difficulty-tier choice and run the turn on that tier's model and/or
  * thinking level.
  */
@@ -13,7 +13,7 @@
 export const TYPESAFE_PROVIDER_KEY = "typesafe";
 
 /**
- * Providers whose AI SDK package exposes `evaluationModel()`. The evaluation model
+ * Providers Xum can build an AI SDK decision model for. The evaluation model
  * is a user choice (`provider:model`); nothing else about routing is provider-specific.
  */
 export const AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS = [

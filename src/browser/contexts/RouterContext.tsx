@@ -40,7 +40,10 @@ export interface RouterContext {
     options?: { replace?: boolean }
   ) => void;
   navigateToHome: () => void;
-  navigateToSettings: (section?: string, options?: { replace?: boolean }) => void;
+  navigateToSettings: (
+    section?: string,
+    options?: { replace?: boolean; sectionless?: boolean }
+  ) => void;
   navigateFromSettings: () => void;
   navigateToAnalytics: () => void;
   navigateFromAnalytics: () => void;
@@ -56,6 +59,12 @@ export interface RouterContext {
 
   /** Settings section from URL (null when settings is closed). */
   currentSettingsSection: string | null;
+
+  /**
+   * True when this settings history entry was opened without naming a section (the settings
+   * button or shortcut). Kept on the entry, so Back to a deep-linked section reads false.
+   */
+  currentSettingsSectionless: boolean;
 
   /** Project identifier from URL (does not include full filesystem path). */
   currentProjectId: string | null;
@@ -350,6 +359,21 @@ interface ModalBackgroundLocation {
 }
 
 const SETTINGS_ROUTE_PATTERN = /^\/settings\/([^/]+)$/;
+
+const SETTINGS_SECTIONLESS_KEY = "settingsSectionless";
+
+function readSettingsSectionless(state: unknown): boolean {
+  return (
+    (state as Partial<Record<string, unknown>> | null | undefined)?.[SETTINGS_SECTIONLESS_KEY] ===
+    true
+  );
+}
+
+/** The entry's state with the sectionless flag set for this entry only (not inherited). */
+function withSettingsSectionless(state: unknown, options?: { sectionless?: boolean }): unknown {
+  const base = typeof state === "object" && state !== null ? state : {};
+  return { ...base, [SETTINGS_SECTIONLESS_KEY]: options?.sectionless === true };
+}
 const ANALYTICS_ROUTE = "/analytics";
 const ROOT_BACKGROUND: ModalBackgroundLocation = { pathname: "/", search: "", state: null };
 
@@ -430,6 +454,7 @@ function RouterContextInner(props: {
 
   const settingsMatch = SETTINGS_ROUTE_PATTERN.exec(location.pathname);
   const currentSettingsSection = settingsMatch ? decodePathSegment(settingsMatch[1]) : null;
+  const currentSettingsSectionless = readSettingsSectionless(locationState);
 
   // Settings and analytics render as modals over the page they were opened from, so page-level
   // route state (workspace, project, draft) comes from that background location. Cold modal links
@@ -540,10 +565,10 @@ function RouterContextInner(props: {
   // These close over the rendered location (not a ref updated in an effect): settings redirect
   // effects run in children before this provider's effects, so a ref could still be stale.
   const navigateToSettings = useCallback(
-    (section?: string, options?: { replace?: boolean }) => {
+    (section?: string, options?: { replace?: boolean; sectionless?: boolean }) => {
       const nextSection = section ?? "general";
       // Section switches and redirects inside settings keep the original background.
-      const state = SETTINGS_ROUTE_PATTERN.test(location.pathname)
+      const background = SETTINGS_ROUTE_PATTERN.test(location.pathname)
         ? locationState
         : {
             settingsBackground: {
@@ -555,7 +580,7 @@ function RouterContextInner(props: {
           };
       void navigateRef.current(`/settings/${encodeURIComponent(nextSection)}`, {
         replace: options?.replace === true,
-        state,
+        state: withSettingsSectionless(background, options),
       });
     },
     [location.pathname, location.search, locationState, usesBrowserHistory]
@@ -638,6 +663,7 @@ function RouterContextInner(props: {
       usesBrowserHistory,
       currentWorkspaceId,
       currentSettingsSection,
+      currentSettingsSectionless,
       currentProjectId,
       currentProjectPathFromState,
       pendingDraftId,
@@ -654,6 +680,7 @@ function RouterContextInner(props: {
       usesBrowserHistory,
       currentWorkspaceId,
       currentSettingsSection,
+      currentSettingsSectionless,
       currentProjectId,
       currentProjectPathFromState,
       pendingDraftId,

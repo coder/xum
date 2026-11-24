@@ -2,7 +2,6 @@
  * Centralized model metadata. Update model versions here and everywhere else will follow.
  */
 
-import type { OpenAICyberAccessProgram } from "../types/openaiAccessPrograms";
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
 type ModelProvider =
@@ -30,16 +29,6 @@ interface KnownModelDefinition {
   warm?: boolean;
   /** Optional tokenizer override for ai-tokenizer */
   tokenizerOverride?: string;
-  /**
-   * OpenAI `access_programs.cyber` value sent in Cyber mode. Set only for the
-   * exact request model ids OpenAI's Daybreak guide maps to a program
-   * (https://developers.openai.com/api/docs/guides/daybreak, retrieved
-   * 2026-09-30). The value follows the model, not the organization's approval
-   * level. GPT-6 Luna is not listed, and GPT-6 Sol is listed but no longer a
-   * Xum model. Daybreak aliases and gpt-5.6-cyber accept only one program,
-   * which the API already selects when the field is omitted.
-   */
-  cyberAccessProgram?: OpenAICyberAccessProgram;
 }
 
 interface KnownModel extends KnownModelDefinition {
@@ -128,22 +117,21 @@ const MODEL_DEFINITIONS = {
     // counting (same situation as OPUS above).
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // GPT-6.1 Sol - released September 29, 2026, successor to GPT-6 Sol at the same
-  // Standard pricing ($2/M input, $10/M output) with cheaper cache reads ($0.10/M).
-  // Like Astra, it cannot disable reasoning. Keep the durable gpt/sol aliases on the
-  // latest Sol tier without moving users to the more expensive Astra tier. OpenAI GPT
-  // models older than GPT-6 (and GPT-6 Sol) are no longer supported: Pro reasoning
-  // mode on the GPT-6 tiers supersedes the separate gpt-5.5-pro model id.
+  // GPT-6.2 Sol - released November 17, 2026, successor to GPT-6.1 Sol at the same
+  // Standard pricing ($2/M input, $10/M output, $0.10/M cache reads). Like Astra, it
+  // cannot disable reasoning. Keep the durable gpt/sol aliases on the latest Sol tier
+  // without moving users to the more expensive Astra tier. GPT-6.1 Sol stays usable as
+  // the custom model string `openai:gpt-6.1-sol`. OpenAI GPT models older than GPT-6
+  // (and GPT-6 Sol) are no longer supported: Pro reasoning mode on the GPT-6 tiers
+  // supersedes the separate gpt-5.5-pro model id.
+  // https://developers.openai.com/api/docs/models/gpt-6.2-sol
   GPT: {
     provider: "openai",
-    providerModelId: "gpt-6.1-sol",
+    providerModelId: "gpt-6.2-sol",
     aliases: ["gpt", "sol"],
     warm: true,
     // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
-    // OpenAI requires Daybreak Red approval for reduced refusals, yet the model
-    // rejects daybreak_red.
-    cyberAccessProgram: "daybreak_blue",
   },
   // GPT-6 Luna - the latest cost-efficient tier, released September 22, 2026.
   GPT_6_LUNA: {
@@ -152,16 +140,18 @@ const MODEL_DEFINITIONS = {
     aliases: ["luna"],
     tokenizerOverride: "openai/gpt-5",
   },
-  // Astra stays a separate frontier-tier choice rather than taking over `gpt`.
-  // Not warmed: its tokenizer override is already warmed via GPT.
+  // GPT-6.2 Astra - released November 17, 2026, successor to GPT-6 Astra at lower
+  // Standard pricing ($8/M input, $40/M output). Astra stays a separate frontier-tier
+  // choice rather than taking over `gpt`. The version alias follows the version, as
+  // `grok-4.7` did: GPT-6 Astra stays usable as the custom model string
+  // `openai:gpt-6-astra`. Not warmed: its tokenizer override is already warmed via GPT.
+  // https://developers.openai.com/api/docs/models/gpt-6.2-astra
   GPT_6_ASTRA: {
     provider: "openai",
-    providerModelId: "gpt-6-astra",
-    aliases: ["astra", "gpt-6-astra"],
+    providerModelId: "gpt-6.2-astra",
+    aliases: ["astra", "gpt-6.2-astra"],
     // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
-    // Same Daybreak constraint as GPT (see its cyberAccessProgram).
-    cyberAccessProgram: "daybreak_blue",
   },
   // Gemini 3.1 Pro supersedes Gemini 3 Pro; keep bare aliases pointed at the latest Pro tier.
   GEMINI_31_PRO: {
@@ -194,6 +184,16 @@ const MODEL_DEFINITIONS = {
     provider: "google",
     providerModelId: "gemini-4-carbon",
     aliases: ["carbon", "gemini-carbon"],
+    tokenizerOverride: "google/gemini-2.5-pro",
+  },
+  // Gemini 4 Neon - GA on the paid Gemini API on November 18, 2026 (stable ID
+  // `gemini-4-neon`; not on the free tier). Adapted from Carbon; Google places it
+  // between Hydrogen and Carbon. `gemini-4` stays on Argon. See models-extra for limits
+  // and pricing.
+  GEMINI_4_NEON: {
+    provider: "google",
+    providerModelId: "gemini-4-neon",
+    aliases: ["neon", "gemini-neon"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
   // Gemini 4 Hydrogen - GA on the free and paid Gemini API tiers in November 2026
@@ -323,6 +323,8 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
   "anthropic:claude-haiku-4-5": "anthropic/claude-3.5-haiku",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "openai:gpt-6.1-sol": "openai/gpt-5",
+  "openai:gpt-6-astra": "openai/gpt-5",
   "openai:daybreak-blue-latest": "openai/gpt-5",
   "openai:daybreak-red-latest": "openai/gpt-5",
 };

@@ -13,14 +13,18 @@ function parseRunnerPayload() {
   assert(payload && typeof payload === "object", "Runner payload must decode to an object");
 
   assert(
-    typeof payload.createEventsTableSql === "string" && payload.createEventsTableSql.trim().length > 0,
+    typeof payload.createEventsTableSql === "string" &&
+      payload.createEventsTableSql.trim().length > 0,
     "Runner payload must include a createEventsTableSql string"
   );
   assert(
     typeof payload.seedEventsRowSql === "string" && payload.seedEventsRowSql.trim().length > 0,
     "Runner payload must include a seedEventsRowSql string"
   );
-  assert(payload.sample && typeof payload.sample === "object", "Runner payload must include sample");
+  assert(
+    payload.sample && typeof payload.sample === "object",
+    "Runner payload must include sample"
+  );
   assert(
     typeof payload.sample.label === "string" && payload.sample.label.trim().length > 0,
     "Sample query label must be a non-empty string"
@@ -45,7 +49,10 @@ async function runSampleQuery() {
     const rows = await result.getRowObjectsJS();
     // Every sample query must return data against the seeded fixture rows —
     // an empty result means the query no longer matches what the ETL writes.
-    assert(rows.length > 0, `Sample query "${payload.sample.label}" returned no rows against the seed`);
+    assert(
+      rows.length > 0,
+      `Sample query "${payload.sample.label}" returned no rows against the seed`
+    );
   } finally {
     conn.closeSync();
     instance.closeSync();

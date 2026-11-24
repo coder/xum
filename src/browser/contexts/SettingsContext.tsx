@@ -28,7 +28,11 @@ interface SettingsContextValue {
   activeSection: string;
   open: (section?: string, options?: OpenSettingsOptions) => void;
   close: () => void;
-  setActiveSection: (section: string, options?: { replace?: boolean }) => void;
+  /** `sectionless` marks the entry as the section list (phones show the list for it). */
+  setActiveSection: (
+    section: string,
+    options?: { replace?: boolean; sectionless?: boolean }
+  ) => void;
 
   /** Subscribe to settings close events. Returns an unsubscribe function. */
   registerOnClose: (callback: () => void) => () => void;
@@ -51,6 +55,12 @@ interface SettingsContextValue {
 
   /** One-shot hint for InstructionsSection to pre-select a project. */
   instructionsProjectPath: string | null;
+
+  /**
+   * True when Settings was opened without naming a section (the settings button, the shortcut).
+   * Phones then start on the section list; a deep link starts on its section.
+   */
+  openedWithoutSection: boolean;
   setInstructionsProjectPath: (path: string | null) => void;
 }
 
@@ -60,6 +70,11 @@ export function useSettings(): SettingsContextValue {
   const ctx = useContext(SettingsContext);
   if (!ctx) throw new Error("useSettings must be used within SettingsProvider");
   return ctx;
+}
+
+/** For components that can also render outside Settings (stories, isolated tests). */
+export function useOptionalSettings(): SettingsContextValue | null {
+  return useContext(SettingsContext);
 }
 
 const DEFAULT_SECTION = "general";
@@ -102,7 +117,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       } else {
         setInstructionsProjectPath(null);
       }
-      router.navigateToSettings(nextSection);
+      router.navigateToSettings(nextSection, { sectionless: section == null });
     },
     [router]
   );
@@ -141,7 +156,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
   }, [router]);
 
   const setActiveSection = useCallback(
-    (section: string, options?: { replace?: boolean }) => {
+    (section: string, options?: { replace?: boolean; sectionless?: boolean }) => {
       if (section !== "providers") {
         setProvidersExpandedProvider(null);
         setProvidersStartCoderLogin(false);
@@ -179,6 +194,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       setSecretsProjectPath,
       instructionsProjectPath,
       setInstructionsProjectPath,
+      openedWithoutSection: router.currentSettingsSectionless,
     }),
     [
       isOpen,
@@ -192,6 +208,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       runtimesProjectPath,
       secretsProjectPath,
       instructionsProjectPath,
+      router.currentSettingsSectionless,
     ]
   );
 

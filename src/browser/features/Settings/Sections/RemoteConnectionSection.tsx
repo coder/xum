@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { Button } from "@/browser/components/Button/Button";
 import { Input } from "@/browser/components/Input/Input";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
@@ -156,6 +157,7 @@ export function RemoteConnectionSection() {
         className="space-y-3"
       >
         <div className="space-y-1.5">
+          <SettingsMark id="remote-server-url" />
           <label htmlFor="remote-connection-url" className="text-foreground text-sm font-medium">
             Server URL
           </label>

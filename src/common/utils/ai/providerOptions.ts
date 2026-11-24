@@ -35,6 +35,7 @@ import {
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
   GEMINI_THINKING_LEVELS,
+  geminiSupportsXhigh,
   getOpenAIReasoningEffort,
   isGpt6LunaModel,
   grokSupportsNativeXhigh,
@@ -205,7 +206,11 @@ function geminiThinkingConfig(
   if (/gemini-[34]/.test(capBareModelName)) {
     // Policy enforcement should clamp to valid Google levels before this adapter runs.
     // Avoid leaking xhigh/max to Google if a caller bypasses policy.
-    return { includeThoughts: true, thinkingLevel: GEMINI_THINKING_LEVELS[effectiveThinking] };
+    const thinkingLevel =
+      effectiveThinking === "xhigh" && geminiSupportsXhigh(capBareModelName)
+        ? "xhigh"
+        : GEMINI_THINKING_LEVELS[effectiveThinking];
+    return { includeThoughts: true, thinkingLevel };
   }
   // Gemini 2.5 uses thinkingBudget
   const budget = GEMINI_THINKING_BUDGETS[effectiveThinking];
@@ -795,7 +800,7 @@ export function buildProviderOptions(
       : (routeProvider ?? origin);
 
   // Fast mode follows the actual route/wire, not capability aliases or thinking.
-  // Ultrafast is additionally model-gated; unsupported models drop the tier.
+  // Ultrafast (and Flex on GPT-6.2) is additionally model-gated; unsupported models drop the tier.
   const requestedServiceTier = muxProviderOptions?.openai?.serviceTier;
   const serviceTierRouteOptions = {
     providersConfig,
@@ -939,7 +944,7 @@ export function buildProviderOptions(
     // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
     // capabilityModel so mapped aliases (mappedToModel) inherit their target's
     // native effort. GPT-6 Luna and GPT-5.6 "off" must be explicit "none" because
-    // omission defaults to medium; Astra and GPT-6.1 Sol instead clamp "off" to "low".
+    // omission defaults to medium; the other GPT-6 tiers instead clamp "off" to "low".
 
     // Xum always sends the latest conversation history explicitly. OpenAI's
     // previous_response_id is an alternative state-management path, not an additive one.

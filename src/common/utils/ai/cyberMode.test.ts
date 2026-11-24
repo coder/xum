@@ -28,8 +28,11 @@ const providersConfig: ProvidersConfigMap = {
   },
 };
 
+// A model the Daybreak guide maps to a program, for the route and setting gates below.
+const CYBER_MODEL = "openai:gpt-6.1-sol";
+
 describe("openaiCyberAccessProgram", () => {
-  test.each(["gpt", "sol", "astra", " gpt-6-astra ", "openai:gpt-6.1-sol", "openai:gpt-6-astra"])(
+  test.each([" openai:gpt-6.1-sol ", "openai:gpt-6.1-sol", "openai:gpt-6-astra"])(
     "maps %p to the model's Daybreak program on direct OpenAI Responses",
     (model) => {
       expect(openaiCyberAccessProgram(model, { providersConfig })).toBe("daybreak_blue");
@@ -37,8 +40,16 @@ describe("openaiCyberAccessProgram", () => {
   );
 
   // Only exact ids the Daybreak guide maps are eligible; the API rejects a
-  // program the requested model does not take.
+  // program the requested model does not take. The guide's table
+  // (https://developers.openai.com/api/docs/guides/daybreak, 2026-11-17) has no
+  // GPT-6.2 row, so the aliases that moved to GPT-6.2 lose Cyber.
   test.each([
+    "gpt",
+    "sol",
+    "astra",
+    "openai:gpt-6.2-sol",
+    "openai:gpt-6.2-astra",
+    "gpt-6-astra",
     "openai:gpt",
     "openai:gpt-6.1-sol-2026-09-29",
     "luna",
@@ -55,21 +66,26 @@ describe("openaiCyberAccessProgram", () => {
       ...providersConfig,
       openai: { ...enabledOpenAI, cyberModelEnabled: false },
     };
-    expect(openaiCyberAccessProgram("gpt", { providersConfig: off })).toBeUndefined();
-    expect(openaiCyberAccessProgram("gpt")).toBeUndefined();
+    expect(openaiCyberAccessProgram(CYBER_MODEL, { providersConfig: off })).toBeUndefined();
+    expect(openaiCyberAccessProgram(CYBER_MODEL)).toBeUndefined();
     const { openai: _openai, ...withoutOpenAI } = providersConfig;
-    expect(openaiCyberAccessProgram("gpt", { providersConfig: withoutOpenAI })).toBeUndefined();
+    expect(
+      openaiCyberAccessProgram(CYBER_MODEL, { providersConfig: withoutOpenAI })
+    ).toBeUndefined();
   });
 
   test("is unavailable on Chat Completions", () => {
     expect(
-      openaiCyberAccessProgram("gpt", { providersConfig, openaiWireFormat: "chatCompletions" })
+      openaiCyberAccessProgram(CYBER_MODEL, {
+        providersConfig,
+        openaiWireFormat: "chatCompletions",
+      })
     ).toBeUndefined();
     const storedChat: ProvidersConfigMap = {
       ...providersConfig,
       openai: { ...enabledOpenAI, wireFormat: "chatCompletions" },
     };
-    expect(openaiCyberAccessProgram("gpt", { providersConfig: storedChat })).toBeUndefined();
+    expect(openaiCyberAccessProgram(CYBER_MODEL, { providersConfig: storedChat })).toBeUndefined();
   });
 
   test("is unavailable when Codex OAuth serves the request", () => {
@@ -77,7 +93,7 @@ describe("openaiCyberAccessProgram", () => {
       ...providersConfig,
       openai: { ...enabledOpenAI, apiKeySet: false, codexOauthSet: true },
     };
-    expect(openaiCyberAccessProgram("gpt", { providersConfig: oauth })).toBeUndefined();
+    expect(openaiCyberAccessProgram(CYBER_MODEL, { providersConfig: oauth })).toBeUndefined();
   });
 
   test.each([

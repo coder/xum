@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { ArchiveRestore, CloudUpload, RefreshCw, TriangleAlert } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
@@ -898,6 +899,7 @@ export function BackupSection() {
       </div>
 
       <section className="border-border-light space-y-4 rounded-md border p-4">
+        <SettingsMark id="backup-repository" />
         <div className="grid min-w-0 gap-4 sm:grid-cols-2">
           <label className="min-w-0 space-y-1.5 sm:col-span-2">
             <span className="text-foreground text-xs font-medium">Repository URL</span>
@@ -938,6 +940,7 @@ export function BackupSection() {
           <legend className="text-foreground text-xs font-medium">
             What to back up and restore
           </legend>
+          <SettingsMark id="backup-contents" />
           {contentOptions.map((option) => {
             const parentOff = option.parent !== undefined && !draft[option.parent];
             return (
@@ -992,6 +995,7 @@ export function BackupSection() {
       </section>
 
       <section className="border-border-light space-y-3 rounded-md border p-4">
+        <SettingsMark id="backup-access" />
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <h3 className="text-foreground text-sm font-medium">Repository access</h3>
@@ -1026,6 +1030,7 @@ export function BackupSection() {
       </section>
 
       <section className="space-y-3">
+        <SettingsMark id="backup-preview" />
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h3 className="text-foreground text-sm font-medium">Preview</h3>

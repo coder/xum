@@ -12,7 +12,7 @@ import { stableStringify } from "@/common/utils/stableStringify";
 
 /**
  * Shared shapes for the workflow `evaluate()` primitive: the question/answer
- * contract of AI SDK `experimental_evaluate` (choice | score | boolean) plus the
+ * contract of AI SDK `experimental_decide` (choice | score | boolean) plus the
  * pure, question-aware answer validator that guards both fresh provider output
  * and replayed step results.
  *
@@ -47,7 +47,7 @@ export const EvaluationJsonValueSchema: z.ZodType<EvaluationJsonValue> = z.lazy(
 /**
  * Shared state and structured instructions: string | JSON object | JSON array.
  * Bare numbers, booleans and null are rejected (mirrors the SDK's
- * `EvaluationModelV4Input`), so a sandbox passing `evaluate(42, …)` fails as
+ * `DecisionModelV4Input`), so a sandbox passing `evaluate(42, …)` fails as
  * invalid input instead of becoming a billable request.
  */
 export const EvaluationInputSchema = z.union([

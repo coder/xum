@@ -1026,6 +1026,11 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
         expected: thinkingConfig({ include_thoughts: true, thinking_level: "high" }),
       },
       {
+        model: "gemini-4-neon",
+        thinking: "xhigh",
+        expected: thinkingConfig({ include_thoughts: true, thinking_level: "xhigh" }),
+      },
+      {
         model: "gemini-2.5-pro",
         thinking: "high",
         expected: thinkingConfig({ include_thoughts: true, thinking_budget: 16384 }),
@@ -1668,26 +1673,32 @@ describe("buildProviderOptions - OpenAI", () => {
       }
     );
 
-    test.each([false, true])("uses native route auth when codexOauthSet=%s", (codexOauthSet) => {
+    test.each([
+      ["priority", "priority"],
+      ["default", "default"],
+      ["ultrafast", "ultrafast"],
+      ["flex", undefined],
+      ["auto", undefined],
+    ] as const)("applies Codex OAuth tier support to %s", (serviceTier, expected) => {
       const options = buildProviderOptions(
-        "openai:gpt-6-astra",
+        "openai:gpt-6.2-astra",
         "off",
         undefined,
         undefined,
-        { openai: { serviceTier: "priority" } },
+        { openai: { serviceTier } },
         undefined,
         undefined,
         {
           openai: {
-            apiKeySet: !codexOauthSet,
-            codexOauthSet,
+            apiKeySet: false,
+            codexOauthSet: true,
             isEnabled: true,
             isConfigured: true,
           },
         },
         "openai"
       );
-      expect(getOpenAIOptions(options)?.serviceTier).toBe(codexOauthSet ? undefined : "priority");
+      expect(getOpenAIOptions(options)?.serviceTier).toBe(expected);
     });
 
     test("should include explicit non-auto serviceTier", () => {
@@ -1705,6 +1716,8 @@ describe("buildProviderOptions - OpenAI", () => {
       ["openai:gpt-6-astra", "ultrafast"],
       ["openai:gpt-6.1-sol", "ultrafast"],
       ["openai:gpt-6.1-sol-2026-09-29", "ultrafast"],
+      ["openai:gpt-6.2-astra", "ultrafast"],
+      ["openai:gpt-6.2-sol", "ultrafast"],
       // GPT-5.6 Sol preview access is no longer supported, so the tier is dropped.
       ["openai:gpt-5.6-sol", undefined],
       ["openai:gpt-5.6", undefined],
@@ -1726,6 +1739,46 @@ describe("buildProviderOptions - OpenAI", () => {
         buildProviderOptions("openai:gpt-6.1-sol", "medium", undefined, undefined, {
           openai: { serviceTier: "ultrafast", wireFormat: "chatCompletions" },
         })
+      );
+      expect(openai?.serviceTier).toBeUndefined();
+    });
+
+    // GPT-6.2 is missing from the Flex pricing table; custom ids keep the route-only gate.
+    test.each([
+      ["openai:gpt-6.2-sol", undefined],
+      ["openai:gpt-6.2-astra", undefined],
+      ["openrouter:openai/gpt-6.2-sol", undefined],
+      ["openrouter:openai/gpt-6.1-sol", "flex"],
+      ["openai:gpt-6.1-sol", "flex"],
+      ["openai:gpt-6-astra", "flex"],
+      ["openai:some-custom-model", "flex"],
+    ] as const)("gates the Flex tier by model: %s -> %s", (model, expected) => {
+      const result = buildProviderOptions(model, "medium", undefined, undefined, {
+        openai: { serviceTier: "flex" },
+      });
+      expect(getOpenAIOptions(result)?.serviceTier).toBe(expected);
+    });
+
+    test("drops Flex for a mapped alias of GPT-6.2", () => {
+      const openai = getOpenAIOptions(
+        buildProviderOptions(
+          "openai:team-sol",
+          "medium",
+          undefined,
+          undefined,
+          { openai: { serviceTier: "flex" } },
+          undefined,
+          undefined,
+          {
+            openai: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              models: [{ id: "team-sol", mappedToModel: "openai:gpt-6.2-sol" }],
+            },
+          },
+          "openai"
+        )
       );
       expect(openai?.serviceTier).toBeUndefined();
     });
@@ -3256,6 +3309,20 @@ describe("buildProviderOptions - Google", () => {
         },
       },
     });
+  });
+
+  test("sends native xhigh only to Gemini models that have it, on Gemini API and Vertex AI", () => {
+    const level = (model: string, provider: "google" | "googleVertex"): unknown => {
+      const options = buildProviderOptions(model, "xhigh") as Record<
+        string,
+        { thinkingConfig?: { thinkingLevel?: string } }
+      >;
+      return options[provider]?.thinkingConfig?.thinkingLevel;
+    };
+    expect(level("google:gemini-4-neon", "google")).toBe("xhigh");
+    expect(level("google-vertex:gemini-4-neon", "googleVertex")).toBe("xhigh");
+    expect(level("google:gemini-4-carbon", "google")).toBe("high");
+    expect(level("google-vertex:gemini-4-carbon", "googleVertex")).toBe("high");
   });
 
   test("defensively maps unsupported Gemini 3.5 Flash xhigh to high", () => {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
 import {
   getThinkingPolicyForModel,
@@ -108,9 +109,18 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("low");
   });
 
-  test("gpt-6.1-sol follows Astra: 5 levels (no off), off and unset clamp to low", () => {
+  // GPT-6.2 model pages: "The API rejects requests that set reasoning effort to `none`."
+  test("gpt-6.1-sol, GPT-6.2 and their aliases follow Astra: 5 levels (no off), off and unset clamp to low", () => {
     const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
-    for (const id of ["openai:gpt-6.1-sol", "coder:openai/gpt-6.1-sol"]) {
+    for (const id of [
+      "openai:gpt-6.1-sol",
+      "coder:openai/gpt-6.1-sol",
+      "openai:gpt-6.2-sol",
+      "openai:gpt-6.2-astra",
+      "openrouter:openai/gpt-6.2-sol-2026-11-17",
+      KNOWN_MODELS.GPT.id,
+      KNOWN_MODELS.GPT_6_ASTRA.id,
+    ]) {
       expect(getThinkingPolicyForModel(id)).toEqual(fiveLevels);
       expect(enforceThinkingPolicy(id, "off")).toBe("low");
       expect(resolveEffectiveThinkingLevel(id, undefined)).toBe("low");
@@ -346,10 +356,10 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash, Argon and Carbon but not older Flash", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash, Argon, Carbon and Neon but not older Flash", () => {
     // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
     // request envelope and debug snapshots agree with what the Google adapter sends.
-    // Argon and Carbon have no "off" either; unclamped, they would run at their medium default.
+    // Argon, Carbon and Neon have no "off" either; unclamped, they would run at their own default.
     for (const model of [
       "google:gemini-3.8-flash",
       "openrouter:google/gemini-3.8-flash",
@@ -358,6 +368,7 @@ describe("getThinkingPolicyForModel", () => {
       "google:gemini-4-hydrogen",
       "openrouter:google/gemini-4-hydrogen",
       "google-vertex:gemini-4-carbon-cyber-permissive",
+      "google:gemini-4-neon",
     ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
@@ -557,6 +568,16 @@ describe("getThinkingPolicyForModel", () => {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
       expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("high");
+    }
+  });
+
+  test("returns low/medium/high/xhigh (no off) for Gemini 4 Neon", () => {
+    for (const model of ["google:gemini-4-neon", "google-vertex:gemini-4-neon"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high", "xhigh"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("xhigh");
+      expect(enforceThinkingPolicy(model, "max")).toBe("xhigh");
     }
     // @ai-sdk/google rejects thinkingLevel "xhigh", so Hydrogen's native xhigh must clamp.
     expect(enforceThinkingPolicy("google:gemini-4-hydrogen", "xhigh")).toBe("high");

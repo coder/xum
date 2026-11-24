@@ -64,7 +64,7 @@ Xum also discovers skills packaged in [Agent Plugins 1.0.0](https://agent-plugin
 - **Workspace-local**: `.xum/plugins/<plugin>/` and `.agents/plugins/<plugin>/`
 - **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`
 
-Project plugins load their skills only in a trusted project, as their MCP servers, hooks and slash commands already do. In an untrusted project, Xum neither lists nor reads the skills of `.xum/plugins` and `.agents/plugins`, and it skips them under the project-automation kill switch too. Plain project skills (`.xum/skills`, `.agents/skills`) and global plugins do not depend on Project Trust. To use a repository's plugin skills, trust the project in **Settings → Security**.
+Project plugins load their skills only in a trusted project, as their MCP servers, hooks and slash commands already do. In an untrusted project, Xum neither lists nor reads the skills of `.xum/plugins` and `.agents/plugins`, and it skips them under the project-automation kill switch too. Plain project skills (`.xum/skills`, `.agents/skills`) and global plugins do not depend on Project Trust. To use a repository's plugin skills, trust the project in **Settings → Project trust**.
 
 SSH, Docker, and devcontainer workspaces load the global plugins (their skills, agents, and workflows) from the Xum host. In a trusted SSH or Docker project, Xum also loads the skills and agents of the checkout's own plugins (`.xum/plugins`, `.mux/plugins` and `.agents/plugins` on the remote host). Xum lists them with one remote command, keeps that copy in memory on the Xum host, and reads the skill and agent files from it, so a turn makes no extra remote round trip. Devcontainer workspaces and Windows hosts do not load project plugins.
 

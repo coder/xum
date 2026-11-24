@@ -1,6 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 
-import { getSettingsSectionRedirect, getSettingsSections } from "./SettingsPage";
+import type React from "react";
+import {
+  getSettingsSectionRedirect,
+  getSettingsSections,
+  handleFocusSearchKey,
+} from "./SettingsPage";
 
 describe("SettingsPage", () => {
   test("keeps Goals out of settings navigation", () => {
@@ -15,6 +20,18 @@ describe("SettingsPage", () => {
       section: "experiments",
       replace: true,
     });
+  });
+
+  test("every section in the registry has a component, gated ones included", () => {
+    expect(() => getSettingsSections(true, true)).not.toThrow();
+  });
+
+  test("keeps the existing route ids so old deep links still open their section", () => {
+    const ids = getSettingsSections(true, true).map((section) => section.id);
+    for (const id of ["general", "tasks", "runtimes", "security", "server-access", "providers"]) {
+      expect(ids).toContain(id);
+      expect(getSettingsSectionRedirect(id, true, true)).toBeNull();
+    }
   });
 
   test.each(["governor", "layouts"])("replaces the removed %s route with General", (section) => {
@@ -68,5 +85,59 @@ describe("SettingsPage", () => {
     expect(getSettingsSections(false).map((section) => section.id)).toContain("backup");
     expect(getSettingsSections(true).map((section) => section.id)).toContain("backup");
     expect(getSettingsSectionRedirect("backup", false)).toBeNull();
+  });
+});
+
+describe("handleFocusSearchKey", () => {
+  const realRaf = globalThis.requestAnimationFrame;
+  afterEach(() => {
+    globalThis.requestAnimationFrame = realRaf;
+  });
+
+  function keyEvent(init: { key: string; ctrlKey?: boolean }) {
+    const event = {
+      code: "",
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      ...init,
+      preventDefault: mock(() => undefined),
+      stopPropagation: mock(() => undefined),
+      nativeEvent: { stopPropagation: mock(() => undefined) },
+    };
+    return { event, react: event as unknown as React.KeyboardEvent };
+  }
+
+  test("the shortcut shows the list, then focuses and selects the field, and stops the event", () => {
+    const frames: Array<() => void> = [];
+    globalThis.requestAnimationFrame = ((callback: () => void) => {
+      frames.push(callback);
+      return frames.length;
+    }) as typeof requestAnimationFrame;
+    const input = { focus: mock(() => undefined), select: mock(() => undefined) };
+    const showList = mock(() => undefined);
+    const { event, react } = keyEvent({ key: "f", ctrlKey: true });
+
+    const handled = handleFocusSearchKey(react, showList, {
+      current: input as unknown as HTMLInputElement,
+    });
+    expect(handled).toBe(true);
+    expect(showList).toHaveBeenCalledTimes(1);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(event.nativeEvent.stopPropagation).toHaveBeenCalled();
+    // The field is focused only after the list (which holds it on phones) is on screen.
+    expect(input.focus).not.toHaveBeenCalled();
+    frames.forEach((frame) => frame());
+    expect(input.focus).toHaveBeenCalled();
+    expect(input.select).toHaveBeenCalled();
+  });
+
+  test("any other key passes through untouched", () => {
+    const showList = mock(() => undefined);
+    const { event, react } = keyEvent({ key: "f" });
+    expect(handleFocusSearchKey(react, showList, { current: null })).toBe(false);
+    expect(showList).not.toHaveBeenCalled();
+    expect(event.preventDefault).not.toHaveBeenCalled();
   });
 });

@@ -5,7 +5,7 @@
  * Trust gates all repo-controlled automation (project workflows, hooks, and
  * .mux configuration), so it lives at the top level of the CLI rather than
  * under any single feature's subcommand. The desktop app records trust in
- * ~/.xum/config.json via Settings → Security; this command writes the same
+ * ~/.xum/config.json via Settings → Project trust; this command writes the same
  * entry directly so headless environments (no desktop app or server running,
  * project possibly never added to mux) can grant or revoke trust. A running
  * desktop instance picks the change up through its config-file watcher.

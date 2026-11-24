@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { ShieldCheck, ShieldOff } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
@@ -37,6 +38,7 @@ export function SecuritySection() {
   return (
     <div className="flex flex-col gap-6">
       <div>
+        <SettingsMark id="project-trust" />
         <h3 className="text-foreground mb-1 text-sm font-medium">Project Trust</h3>
         <p className="text-muted text-xs">
           Trusted projects can run hooks and scripts from the repository. Untrusted projects have

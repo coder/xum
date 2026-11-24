@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { Effect } from "effect";
-import { Experimental_EvaluationMockModelV4 } from "ai/test";
+import { Experimental_DecisionMockModelV4 } from "ai/test";
 import type { EvaluationAdmission, EvaluationQuestions } from "@/common/types/evaluation";
 import { EVALUATION_ANALYTICS_SOURCE } from "@/common/utils/ai/evaluationModels";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -44,7 +44,7 @@ const RESULT: EvaluationCallResult<typeof QUESTIONS> = {
 
 function pinned(modelString: string, fingerprint = `fp:${modelString}`): PinnedEvaluationModel {
   return {
-    model: new Experimental_EvaluationMockModelV4({
+    model: new Experimental_DecisionMockModelV4({
       provider: "mock",
       modelId: modelString,
       supportedQuestionTypes: ["choice", "score", "boolean"],

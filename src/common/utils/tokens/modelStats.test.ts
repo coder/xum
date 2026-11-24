@@ -113,12 +113,20 @@ describe("getModelStats", () => {
     }
   );
 
-  test("resolves GPT-6 Astra by alias, dated snapshot, and gateway prefix", () => {
+  test("resolves GPT-6.2 Astra by alias, dated snapshot, and gateway prefix", () => {
     const astra = expectStats(KNOWN_MODELS.GPT_6_ASTRA.id);
-    expect(expectStats("openai:gpt-6-astra-2026-09-30")).toEqual(astra);
-    expect(expectStats("coder:openai/gpt-6-astra")).toEqual(astra);
+    expect(expectStats("openai:gpt-6.2-astra-2026-11-17")).toEqual(astra);
+    expect(expectStats("coder:openai/gpt-6.2-astra")).toEqual(astra);
     // OpenAI has published no Astra variants; do not resolve unknown ids to it.
-    expect(getModelStats("openai:gpt-6-astra-mini")).toBeNull();
+    expect(getModelStats("openai:gpt-6.2-astra-mini")).toBeNull();
+  });
+
+  // The aliases moved to GPT-6.2; the ids they left keep their own metadata.
+  test("keeps GPT-6 Astra and GPT-6.1 Sol resolvable as custom model strings", () => {
+    expect(expectStats("openai:gpt-6-astra-2026-09-30")).toEqual(expectStats("openai:gpt-6-astra"));
+    // GPT-6 Astra keeps its own $10/M input, not GPT-6.2 Astra's $8/M.
+    expect(expectStats("coder:openai/gpt-6-astra").input_cost_per_token).toBe(0.00001);
+    expect(expectStats("openai:gpt-6.1-sol").input_cost_per_token).toBe(0.000002);
   });
 
   test("resolves Gemini 3.8 Flash with the billed introductory pricing and limits", () => {
@@ -146,6 +154,16 @@ describe("getModelStats", () => {
       input_cost_per_token: 0.000002,
       output_cost_per_token: 0.00001,
       cache_read_input_token_cost: 0.0000001,
+    });
+  });
+
+  test("resolves Gemini 4 Neon with its list pricing and synchronous output cap", () => {
+    expect(expectStats("google:gemini-4-neon")).toMatchObject({
+      max_input_tokens: 1048576,
+      max_output_tokens: 65536,
+      input_cost_per_token: 0.000003,
+      output_cost_per_token: 0.000015,
+      cache_read_input_token_cost: 0.00000015,
     });
   });
 

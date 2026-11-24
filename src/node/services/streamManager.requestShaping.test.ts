@@ -32,6 +32,7 @@ import {
   createStreamResultForTests,
   prepareStepForTests,
   type PreparedStepForTests,
+  type TurnOptionsWith,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -43,9 +44,7 @@ let capturedStreamCounter = 0;
  * spy and waits for the turn to finish. Request-shaping tests assert on the
  * arguments StreamManager hands to streamText.
  */
-async function startStreamCapturingStreamTextForTests(
-  overrides: Partial<TurnExecutionOptions> & Pick<TurnExecutionOptions, "model">
-) {
+async function startStreamCapturingStreamTextForTests(overrides: TurnOptionsWith<"model">) {
   const streamText = mock((_options: Parameters<typeof aiSdk.streamText>[0]) =>
     createStreamResultForTests(
       (async function* () {
