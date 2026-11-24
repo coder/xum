@@ -257,8 +257,6 @@ import {
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
 import type { TaskService } from "@/node/services/taskService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import type { MemoryChangeEvent } from "@/node/services/memoryService";
-import { resolveMemoryProjectIdentityFromConfigEntry } from "@/node/services/memoryService";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -2286,10 +2284,6 @@ export class WorkspaceService extends EventEmitter {
   // Blocks new sends while a context reset is committing its durable boundary and cleanup.
   private readonly resettingContextWorkspaces = new Set<string>();
 
-  // Counts appended reset boundaries per workspace so startup auto-retry
-  // checks can detect a boundary that landed after their history reads.
-  private readonly contextResetBoundaryEpochs = new Map<string, number>();
-
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
   private readonly autoTitlingWorkspaces = new Set<string>();
@@ -3576,10 +3570,6 @@ export class WorkspaceService extends EventEmitter {
       initStateManager: this.initStateManager,
       workspaceGoalService: this.workspaceGoalService,
       backgroundProcessManager: this.backgroundProcessManager,
-      getContextResetState: () => ({
-        resetting: this.resettingContextWorkspaces.has(workspaceId),
-        boundaryEpoch: this.contextResetBoundaryEpochs.get(workspaceId) ?? 0,
-      }),
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -9679,11 +9669,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean {
-    const trimmed = workspaceId.trim();
-    // Startup-recovery sessions live outside `sessions` but can hold a
-    // scheduled auto-retry that will start a turn on its own.
-    const session =
-      this.sessions.get(trimmed) ?? this.transientStartupRecoverySessions.get(trimmed);
+    const session = this.sessions.get(workspaceId.trim());
     if (!session) {
       return false;
     }
@@ -9823,53 +9809,6 @@ export class WorkspaceService extends EventEmitter {
     return Ok(undefined);
   }
 
-  /**
-   * Invalidates session-cached memory contexts. When a change event is given,
-   * only sessions that can observe the changed file are invalidated: global
-   * memory fans out to every session, workspace memory to that workspace, and
-   * project memory to sessions in the same project (project identity, not
-   * checkout path, per MemoryChangeEvent).
-   */
-  invalidateMemoryContexts(
-    event?: Pick<MemoryChangeEvent, "scope" | "workspaceId" | "projectPath">
-  ): void {
-    // Synchronous on purpose: this runs inside MemoryService's change emit,
-    // so mutation routes cannot return (and the next stream cannot start)
-    // with a stale cache still in place.
-    let cfg: ReturnType<Config["loadConfigOrDefault"]> | undefined;
-    const affects = (workspaceId: string): boolean => {
-      if (!event || event.scope === "global") {
-        return true;
-      }
-      if (event.scope === "workspace") {
-        return workspaceId === event.workspaceId;
-      }
-      cfg ??= this.config.loadConfigOrDefault();
-      const entry = findWorkspaceEntry(cfg, workspaceId);
-      if (entry == null) {
-        return false;
-      }
-      // Project events carry the memory project identity (scratch workspaces
-      // use their scratch directory, not the config bucket key), so matching
-      // must resolve the same identity the event was built from.
-      return (
-        resolveMemoryProjectIdentityFromConfigEntry(entry.projectPath, entry.workspace) ===
-        event.projectPath
-      );
-    };
-
-    for (const [workspaceId, session] of this.sessions) {
-      if (affects(workspaceId)) {
-        session.invalidateMemoryContext();
-      }
-    }
-    for (const [workspaceId, session] of this.transientStartupRecoverySessions) {
-      if (affects(workspaceId)) {
-        session.invalidateMemoryContext();
-      }
-    }
-  }
-
   async resetContext(workspaceId: string): Promise<Result<"reset" | "noop">> {
     if (this.resettingContextWorkspaces.has(workspaceId)) {
       return Err("Context reset is already in progress for this workspace.");
@@ -9877,34 +9816,17 @@ export class WorkspaceService extends EventEmitter {
 
     this.resettingContextWorkspaces.add(workspaceId);
     try {
-      // Startup-recovery retries run on a session tracked outside `sessions`,
-      // so the busy guard must resolve both maps, freshly on each check.
-      const isTurnActive = (): boolean =>
-        this.sessions.get(workspaceId)?.isBusy() === true ||
-        this.transientStartupRecoverySessions.get(workspaceId)?.isBusy() === true ||
-        this.aiService.isStreaming(workspaceId);
-      const turnBlockError = (): string | undefined => {
-        if (isTurnActive()) {
-          return "Cannot reset context while a turn is active. Press Esc to stop the stream first.";
-        }
-        if (this.hasPendingQueuedOrPreparingTurn(workspaceId)) {
-          return "Cannot reset context while queued user input is pending. Send or clear the queued message first.";
-        }
-        // A startup-recovery check that is mid-decision is neither busy nor
-        // holding a scheduled retry yet, but it can start a retry from
-        // pre-reset history as soon as its reads settle.
-        if (
-          this.sessions.get(workspaceId)?.isStartupRecoveryInFlight() === true ||
-          this.transientStartupRecoverySessions.get(workspaceId)?.isStartupRecoveryInFlight() ===
-            true
-        ) {
-          return "Cannot reset context while startup recovery is checking for an interrupted turn. Try again in a moment.";
-        }
-        return undefined;
-      };
-      const entryBlockError = turnBlockError();
-      if (entryBlockError != null) {
-        return Err(entryBlockError);
+      const session = this.sessions.get(workspaceId);
+      if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
+        return Err(
+          "Cannot reset context while a turn is active. Press Esc to stop the stream first."
+        );
+      }
+
+      if (this.hasPendingQueuedOrPreparingTurn(workspaceId)) {
+        return Err(
+          "Cannot reset context while queued user input is pending. Send or clear the queued message first."
+        );
       }
 
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -9917,16 +9839,6 @@ export class WorkspaceService extends EventEmitter {
       );
       if (!hasProviderEligibleMessages(activeContextMessages)) {
         return Ok("noop");
-      }
-
-      // The history read above is an await window: a startup-recovery retry
-      // starting during it already built its request from pre-reset history,
-      // and appending the boundary would land it inside that active turn. A
-      // retry that is merely scheduled must block too: its timer can fire
-      // during the boundary append below, which has no later recheck.
-      const preAppendBlockError = turnBlockError();
-      if (preAppendBlockError != null) {
-        return Err(preAppendBlockError);
       }
 
       const boundaryMessage = createMuxMessage(
@@ -9943,29 +9855,13 @@ export class WorkspaceService extends EventEmitter {
       if (!appendResult.success) {
         return Err(`Failed to append context reset boundary: ${appendResult.error}`);
       }
-      // Bump before anything else observes the append: a startup auto-retry
-      // check whose history reads predate this boundary compares epochs at
-      // its retry decision and defers instead of resuming pre-reset context.
-      this.contextResetBoundaryEpochs.set(
-        workspaceId,
-        (this.contextResetBoundaryEpochs.get(workspaceId) ?? 0) + 1
-      );
 
       const typedBoundaryMessage = { ...boundaryMessage, type: "message" as const };
-      const liveSession = this.sessions.get(workspaceId);
-      if (liveSession) {
-        liveSession.emitChatEvent(typedBoundaryMessage);
+      if (session) {
+        session.emitChatEvent(typedBoundaryMessage);
       } else {
         this.emit("chat", { workspaceId, message: typedBoundaryMessage });
       }
-
-      // Invalidate synchronously before any further await: a startup-recovery
-      // retry (tracked outside `sessions`, rejected by the busy rechecks above
-      // only while it is running) could otherwise start during the
-      // acknowledgment await and build its provider request from the
-      // pre-reset memory snapshot.
-      const resetSession = liveSession ?? this.transientStartupRecoverySessions.get(workspaceId);
-      resetSession?.invalidateMemoryContext();
 
       try {
         await this.workspaceGoalService?.requireUserAcknowledgment(workspaceId);

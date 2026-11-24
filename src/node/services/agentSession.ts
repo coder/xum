@@ -335,13 +335,6 @@ interface AgentSessionOptions {
   onIdleCompactionOutcome?: (success: boolean) => void;
   /** Called when post-compaction context state may have changed (plan/file edits) */
   onPostCompactionStateChange?: () => void;
-  /**
-   * Snapshot of WorkspaceService.resetContext activity for this workspace.
-   * boundaryEpoch counts appended reset boundaries, so a boundary landing
-   * between the startup auto-retry check's history reads and its retry
-   * decision is detectable even after the reset finished.
-   */
-  getContextResetState?: () => { resetting: boolean; boundaryEpoch: number };
 }
 
 enum TurnPhase {
@@ -368,7 +361,6 @@ export class AgentSession {
   private readonly workspaceGoalService?: WorkspaceGoalService;
   private readonly keepBackgroundProcesses: boolean;
   private readonly onPostCompactionStateChange?: () => void;
-  private readonly getContextResetState: () => { resetting: boolean; boundaryEpoch: number };
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -407,7 +399,6 @@ export class AgentSession {
   private startupRecoveryPromise: Promise<void> | null = null;
   private startupAutoRetryCheckScheduled = false;
   private startupAutoRetryCheckPromise: Promise<void> | null = null;
-  private startupAutoRetryCheckInFlight = false;
   private startupAutoRetryHistoryReadFailureCount = 0;
   private startupAutoRetryDeferredRetryDelayMs = 0;
   private autoRetryEnabledPreference: boolean | null = null;
@@ -453,15 +444,10 @@ export class AgentSession {
    * the memory tool description plus an optional hot-memories block, keyed by
    * model because the hot set is token-budgeted with the active model's
    * tokenizer. Index-only entries can be upgraded once final tool policy keeps
-   * the memory tool. Cleared at compaction boundaries, on context reset, and
-   * on any memory change so requests never advertise stale memory files.
+   * the memory tool; compaction clears the map so repeated turns keep
+   * prompt-cache-stable bytes without preserving stale files forever.
    */
   private readonly memoryContextByModelString = new Map<string, CachedMemoryContext>();
-  /**
-   * Bumped on every invalidation so builds that were already in flight when a
-   * memory change arrived cannot repopulate the cache with a stale snapshot.
-   */
-  private memoryContextGeneration = 0;
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
    * when post-compaction context is disabled.
@@ -564,7 +550,6 @@ export class AgentSession {
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
-      getContextResetState,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -580,8 +565,6 @@ export class AgentSession {
     this.workspaceGoalService = workspaceGoalService;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
-    this.getContextResetState =
-      getContextResetState ?? (() => ({ resetting: false, boundaryEpoch: 0 }));
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -1626,19 +1609,6 @@ export class AgentSession {
   }
 
   private async scheduleStartupAutoRetryIfNeeded(): Promise<StartupAutoRetryCheckOutcome> {
-    // Mid-check the session is neither busy nor holding a pending retry, so
-    // resetContext's guards need this in-flight marker to know a retry
-    // decision may be imminent.
-    this.startupAutoRetryCheckInFlight = true;
-    try {
-      return await this.evaluateStartupAutoRetry();
-    } finally {
-      this.startupAutoRetryCheckInFlight = false;
-    }
-  }
-
-  private async evaluateStartupAutoRetry(): Promise<StartupAutoRetryCheckOutcome> {
-    const contextResetStateAtStart = this.getContextResetState();
     if (this.disposed || this.isBusy() || this.isAiStreaming()) {
       // Busy/streaming deferrals are state-driven; do not carry history-error backoff.
       this.startupAutoRetryDeferredRetryDelayMs = 0;
@@ -1725,18 +1695,6 @@ export class AgentSession {
     // Disk reads above may race with user actions; retry once the current work settles
     // instead of permanently suppressing startup auto-retry for this session.
     if (this.disposed || this.isBusy() || this.isAiStreaming()) {
-      this.startupAutoRetryDeferredRetryDelayMs = 0;
-      return "deferred";
-    }
-    // A context reset overlapping this check invalidates the tail the reads
-    // above captured: its boundary can land between those reads and the
-    // retry start, and the retry would resume pre-reset context. Defer; the
-    // re-run reads history again and sees the boundary.
-    const contextResetState = this.getContextResetState();
-    if (
-      contextResetState.resetting ||
-      contextResetState.boundaryEpoch !== contextResetStateAtStart.boundaryEpoch
-    ) {
       this.startupAutoRetryDeferredRetryDelayMs = 0;
       return "deferred";
     }
@@ -1929,15 +1887,6 @@ export class AgentSession {
       this.aiService.isStreaming(this.workspaceId) ||
       this.retryManager.isRetryPending
     );
-  }
-
-  /**
-   * True while startup recovery is mid-decision: the session is not busy and
-   * holds no scheduled retry yet, but a retry can start as soon as pending
-   * reads settle. resetContext's guards treat this like a pending turn.
-   */
-  isStartupRecoveryInFlight(): boolean {
-    return this.startupRecoveryPromise !== null || this.startupAutoRetryCheckInFlight;
   }
 
   scheduleStartupRecovery(): void {
@@ -5835,11 +5784,6 @@ export class AgentSession {
     this.fileChangeTracker.clear();
   }
 
-  invalidateMemoryContext(): void {
-    this.memoryContextGeneration++;
-    this.memoryContextByModelString.clear();
-  }
-
   /**
    * Resolve the memory session context (index snapshot + optional hot block)
    * for the current session segment.
@@ -5847,11 +5791,10 @@ export class AgentSession {
    * Computed lazily on the first stream for each model. The first pass is
    * index-only so final tool policy can strip memory without paying hot-set
    * tokenization cost; if memory survives policy, the cache is upgraded with
-   * the token-budgeted hot block. Compaction, context reset, and memory
-   * changes clear the cache. Invoked by AIService.streamMessage after
-   * runtime.ensureReady(): caching before the runtime is started (stopped
-   * Docker/remote workspace) would pin an empty/partial context for the
-   * whole segment.
+   * the token-budgeted hot block. Compaction clears the cache. Invoked by
+   * AIService.streamMessage after runtime.ensureReady(): caching before the
+   * runtime is started (stopped Docker/remote workspace) would pin an
+   * empty/partial context for the whole segment.
    */
   private async resolveMemoryContext(
     modelString: string,
@@ -5864,32 +5807,18 @@ export class AgentSession {
       return cached.context ?? undefined;
     }
 
-    // A memory change during a build makes that snapshot stale for the
-    // current request, not just later ones: rebuild until a build completes
-    // without a concurrent invalidation. Bounded so pathological invalidation
-    // churn cannot livelock the stream; the final snapshot is then served
-    // uncached so the next request rebuilds.
-    const maxBuildAttempts = 3;
-    for (let attempt = 1; ; attempt++) {
-      const generationAtBuildStart = this.memoryContextGeneration;
-      // Guard for test mocks that may not implement buildMemorySessionContext.
-      const context =
-        typeof this.aiService.buildMemorySessionContext === "function"
-          ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
-              includeHotMemories,
-            })
-          : null;
-      if (generationAtBuildStart === this.memoryContextGeneration) {
-        this.memoryContextByModelString.set(modelString, {
-          context,
-          includesHotMemories: includeHotMemories,
-        });
-        return context ?? undefined;
-      }
-      if (attempt >= maxBuildAttempts) {
-        return context ?? undefined;
-      }
-    }
+    // Guard for test mocks that may not implement buildMemorySessionContext.
+    const context =
+      typeof this.aiService.buildMemorySessionContext === "function"
+        ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
+            includeHotMemories,
+          })
+        : null;
+    this.memoryContextByModelString.set(modelString, {
+      context,
+      includesHotMemories: includeHotMemories,
+    });
+    return context ?? undefined;
   }
 
   /**
@@ -5912,7 +5841,7 @@ export class AgentSession {
       // Compaction boundary: invalidate the session-cached memory context so
       // the next stream recomputes the index and hot set from current
       // files/pins/usage stats.
-      this.invalidateMemoryContext();
+      this.memoryContextByModelString.clear();
       // Clear file state cache since history context is gone
       this.fileChangeTracker.clear();
 

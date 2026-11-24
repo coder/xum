@@ -27,7 +27,7 @@ import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpO
 import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
-import { MemoryService, type MemoryChangeEvent } from "@/node/services/memoryService";
+import { MemoryService } from "@/node/services/memoryService";
 import { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
@@ -157,11 +157,6 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.opResolver
   );
   aiService.setWorkspaceHeartbeatService(workspaceService);
-  // Memory changes invalidate live sessions' cached contexts; the event scopes
-  // the fan-out (global -> all, workspace/project -> matching sessions only).
-  memoryService.on("change", (event: MemoryChangeEvent) =>
-    workspaceService.invalidateMemoryContexts(event)
-  );
   // Tool-started workflows share the same sidebar activity cache as ORPC-started workflows,
   // so terminal updates must prune active run counts regardless of launch path.
   aiService.setWorkflowRunStatusChangedHandler((event) =>

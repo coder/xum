@@ -39,7 +39,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import type { Config } from "@/node/config";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
@@ -291,26 +291,6 @@ function isPathWithinRoot(
  */
 export function resolveMemoryProjectIdentity(metadata: WorkspaceMetadata): string {
   return isMultiProject(metadata) ? "" : metadata.projectPath;
-}
-
-/**
- * Same identity as resolveMemoryProjectIdentity, computed synchronously from
- * a config workspace entry: mutation paths must invalidate matching caches
- * before yielding, so they cannot go through async metadata resolution.
- * Mirrors Config.getAllWorkspaceMetadata's projectPath resolution (scratch
- * identity is the scratch directory, not the "_scratch" bucket key).
- */
-export function resolveMemoryProjectIdentityFromConfigEntry(
-  bucketProjectPath: string,
-  workspace: Pick<WorkspaceConfigEntry, "kind" | "path" | "projects">
-): string {
-  if ((workspace.projects?.length ?? 0) > 1) {
-    return "";
-  }
-  if (workspace.kind === "scratch") {
-    return workspace.path;
-  }
-  return workspace.projects?.[0]?.projectPath ?? bucketProjectPath;
 }
 
 class LocalMemoryStore implements MemoryStore {
@@ -662,29 +642,6 @@ export class MemoryService extends EventEmitter {
   // -------------------------------------------------------------------------
   // Commands
   // -------------------------------------------------------------------------
-
-  /**
-   * Pins live in the meta sidecar, not the file stores, but they feed hot-set
-   * selection, so they must flow through MemoryService to emit a change event
-   * that invalidates session-cached memory contexts.
-   */
-  async setPinned(
-    ctx: MemoryScopeContext,
-    virtualPath: string,
-    pinned: boolean,
-    actor: MemoryActor
-  ): Promise<void> {
-    const parsed = parseMemoryPath(virtualPath);
-    const scope = this.requireFilePath(parsed, virtualPath);
-    const key = this.logicalKeyFor(ctx, scope, parsed.relPath);
-    if (key === null) {
-      throw new MemoryCommandError(
-        `Cannot pin ${virtualPath}: this scope has no stable identity in the current context`
-      );
-    }
-    await this.metaService.setPinned(key, pinned);
-    this.emitChange(ctx, scope, parsed.relPath, actor);
-  }
 
   async view(
     ctx: MemoryScopeContext,

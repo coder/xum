@@ -22,12 +22,7 @@ import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
 import type { Config } from "@/node/config";
-import {
-  StreamManager,
-  type ModelFallbackOptions,
-  type RefreshMemoryDependentContext,
-  type StreamTextOnChunk,
-} from "./streamManager";
+import { StreamManager, type ModelFallbackOptions, type StreamTextOnChunk } from "./streamManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import type { InitStateManager } from "./initStateManager";
 import type { SendMessageError } from "@/common/types/errors";
@@ -97,10 +92,7 @@ import {
   type MemorySessionContext,
 } from "@/node/services/memoryService";
 import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
-import {
-  buildMemoryToolDescription,
-  resolveMemoryAccessPolicy,
-} from "@/node/services/tools/memory";
+import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
 import {
   buildProviderOptions,
@@ -220,14 +212,6 @@ export function prepareProviderRequestMessages(
     sideQuestionFilteredCount,
     contextBoundarySlicedCount,
   };
-}
-
-/**
- * Replace a tool's advertised description without widening the Tool union
- * (a plain spread of the union does not narrow back to Tool).
- */
-function withToolDescription<T extends Tool>(toolValue: T, description: string): T {
-  return { ...toolValue, description };
 }
 
 function replaceOrAppendMessageById(messages: MuxMessage[], replacement: MuxMessage): MuxMessage[] {
@@ -603,8 +587,12 @@ export class AIService extends EventEmitter {
    * frequently used memory files; memory-hot-set sub-experiment). Returns
    * null when the memory experiment is off.
    *
-   * AgentSession invalidates cached results at compaction, context reset, and
-   * memory changes.
+   * Callers (AgentSession) cache the result per model and recompute it only
+   * on the first use of a model in a session segment, or at compaction
+   * boundaries, so repeated turns keep prompt-cache-stable bytes. Memories
+   * written mid-segment surface in the next segment's index for cached models
+   * (the writing agent already has its own tool calls in context, and `view`
+   * lists live state).
    */
   async buildMemorySessionContext(
     workspaceId: string,
@@ -1478,25 +1466,21 @@ export class AIService extends EventEmitter {
       // claude-skills-compat is host-evaluated (like memory-hot-set): sub-agents share the
       // host ExperimentsService, so it is not inherited through SendMessageOptions.experiments.
       const claudeSkillsCompatExperimentEnabled = this.isClaudeSkillsCompatEnabled();
-      // Once final tool policy keeps the memory tool, re-resolve the memory
-      // context for the model that will actually stream; the hot-set
-      // experiment gates only the token-budgeted hot block, not the resolve
-      // itself, so a memory change since an earlier capture is picked up even
-      // with hot preloading off (the session cache makes the no-change case
-      // an identity-stable cache hit). Returns the unchanged `fallbackContext`
-      // reference when the memory tool was stripped, so callers can use
-      // identity comparison to decide whether the system prompt must be
-      // rebuilt.
+      // Once final tool policy keeps the memory tool, upgrade the index-only
+      // memory context (resolved pre-policy with includeHotMemories: false) to
+      // the token-budgeted hot block for the model that will actually stream.
+      // Returns the unchanged pre-policy `memoryContext` reference when hot
+      // preloading is off or the memory tool was stripped, so callers can use
+      // identity comparison to decide whether the system prompt must be rebuilt.
       const upgradeMemoryContextForModel = async (
         memoryToolAvailableForModel: boolean,
-        modelStringForContext: string,
-        fallbackContext: MemorySessionContext | undefined
+        modelStringForContext: string
       ): Promise<MemorySessionContext | undefined> =>
-        memoryToolAvailableForModel && resolveMemoryContext !== undefined
-          ? await resolveMemoryContext(modelStringForContext, {
-              includeHotMemories: memoryHotSetExperimentEnabled,
-            })
-          : fallbackContext;
+        memoryToolAvailableForModel &&
+        memoryHotSetExperimentEnabled &&
+        resolveMemoryContext !== undefined
+          ? await resolveMemoryContext(modelStringForContext, { includeHotMemories: true })
+          : memoryContext;
       emitStartupBreadcrumb("loading_workspace_context");
       const resolveAgentForStreamStartedAt = Date.now();
       const agentResult = await resolveAgentForStream({
@@ -2043,15 +2027,6 @@ export class AIService extends EventEmitter {
       // stay scoped to this specific assistant turn. The placeholder is appended to history below
       // (after the abort check).
       const assistantMessageId = createAssistantMessageId();
-      // Memory changes during the async preparation above (agent/skill
-      // discovery, MCP startup) invalidate the session cache but cannot
-      // update the earlier `memoryContext` capture. Re-resolve immediately
-      // before tool assembly: a cache hit returns the identical reference,
-      // an invalidation forces a rebuild, and the identity change makes the
-      // final system-prompt comparison below rebuild too.
-      const memoryContextForTools = resolveMemoryContext
-        ? await resolveMemoryContext(modelString, { includeHotMemories: false })
-        : undefined;
       const allowLegacyInvalidWorkflowAgentOutputSchema =
         await this.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
       // Hoisted so the refusal-fallback prepare() can rebuild the toolset for a
@@ -2252,7 +2227,7 @@ export class AIService extends EventEmitter {
         availableSkills,
         // Session-segment memory index advertised in the memory tool
         // description (same disclosure mechanic as skills).
-        memoryIndexEntries: memoryContextForTools?.indexEntries,
+        memoryIndexEntries: memoryContext?.indexEntries,
         // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
         trusted: sharedExecutionTrusted,
       };
@@ -2318,59 +2293,15 @@ export class AIService extends EventEmitter {
         }
       }
 
-      // getToolsForModel appended any configured "Tool: memory" instructions
-      // to the built description, so every later description refresh (memory
-      // index changes, hot-set upgrades, fallback rebuilds) must re-append
-      // them or the refreshed tool silently drops the agent's custom rules.
-      const refreshedMemoryToolDescription = (
-        indexEntries: Parameters<typeof buildMemoryToolDescription>[0]
-      ): string => {
-        const rebuilt = buildMemoryToolDescription(indexEntries);
-        const memoryInstructions = toolInstructions.memory;
-        return memoryInstructions ? `${rebuilt}\n\n${memoryInstructions}` : rebuilt;
-      };
-
       const advisorToolAvailable = tools.advisor !== undefined;
       const memoryToolAvailable = tools.memory !== undefined;
-      // Tool assembly awaited above (getToolsForModel, policy/experiments)
-      // is another invalidation window: re-resolve once more and refresh the
-      // already-created memory tool's description if the snapshot moved, so
-      // the request cannot advertise paths deleted during assembly.
-      const memoryContextAfterAssembly = resolveMemoryContext
-        ? await resolveMemoryContext(modelString, { includeHotMemories: false })
-        : undefined;
-      if (tools.memory !== undefined && memoryContextAfterAssembly !== memoryContextForTools) {
-        tools = {
-          ...tools,
-          memory: withToolDescription(
-            tools.memory,
-            refreshedMemoryToolDescription(memoryContextAfterAssembly?.indexEntries)
-          ),
-        };
-      }
       const finalMemoryContext = await upgradeMemoryContextForModel(
         memoryToolAvailable,
-        modelString,
-        memoryContextAfterAssembly
+        modelString
       );
-      // The hot-set upgrade is one more awaited window: a memory change
-      // during it lands in finalMemoryContext (and the system prompt rebuild
-      // below), so the already-created memory tool must advertise the same
-      // snapshot instead of the pre-upgrade capture.
-      if (tools.memory !== undefined && finalMemoryContext !== memoryContextAfterAssembly) {
-        tools = {
-          ...tools,
-          memory: withToolDescription(
-            tools.memory,
-            refreshedMemoryToolDescription(finalMemoryContext?.indexEntries)
-          ),
-        };
-      }
       const finalStreamSystemContext =
         advisorToolAvailable === advisorToolEligible &&
         memoryToolAvailable === memoryToolEligible &&
-        // Identity against the context the pre-policy prompt was built from:
-        // a mid-preparation invalidation produced a fresh reference above.
         finalMemoryContext === memoryContext
           ? prePolicyStreamSystemContext
           : await (async () => {
@@ -2518,63 +2449,6 @@ export class AIService extends EventEmitter {
           await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
         }
         return Ok(undefined);
-      }
-
-      // Memory can also change while the later awaited stages run (final
-      // system-prompt rebuild, tokenizer loading, message preparation, history
-      // append). Everything from here to startStream is synchronous, so
-      // re-resolve once more and repeat the memory-dependent assembly while
-      // the snapshot keeps moving; bounded like resolveMemoryContext's rebuild
-      // so invalidation churn cannot livelock the stream.
-      let memoryContextAtBoundary = finalMemoryContext;
-      const revalidateMemoryDependentState = async (): Promise<boolean> => {
-        let changed = false;
-        for (let revalidation = 0; revalidation < 3; revalidation++) {
-          const revalidatedMemoryContext = await upgradeMemoryContextForModel(
-            memoryToolAvailable,
-            modelString,
-            memoryContextAtBoundary
-          );
-          if (revalidatedMemoryContext === memoryContextAtBoundary) {
-            break;
-          }
-          changed = true;
-          memoryContextAtBoundary = revalidatedMemoryContext;
-          if (tools.memory !== undefined) {
-            tools = {
-              ...tools,
-              memory: withToolDescription(
-                tools.memory,
-                refreshedMemoryToolDescription(revalidatedMemoryContext?.indexEntries)
-              ),
-            };
-          }
-          const revalidatedStreamSystemContext = await buildStreamSystemContextForToolset(
-            { advisorToolAvailable, memoryToolAvailable },
-            modelString,
-            revalidatedMemoryContext
-          );
-          systemMessage = revalidatedStreamSystemContext.systemMessage;
-          systemMessageTokens = revalidatedStreamSystemContext.systemMessageTokens;
-          if (mcpWarningPrefix != null) {
-            systemMessage = `${mcpWarningPrefix}${systemMessage}`;
-            const tokenizer = await getTokenizerForModel(
-              modelString,
-              resolveModelForMetadata(modelString, this.providerService.getConfig())
-            );
-            systemMessageTokens = await tokenizer.countTokens(systemMessage);
-          }
-        }
-        return changed;
-      };
-      try {
-        await revalidateMemoryDependentState();
-      } catch (error) {
-        // The placeholder was persisted above; failing without deleting it
-        // would leave an empty non-partial assistant in history that the next
-        // load treats as a trailing assistant turn (synthetic [CONTINUE]).
-        await deleteAbortedPlaceholder(assistantMessageId);
-        throw error;
       }
 
       // Build provider options based on thinking level and request-sliced message history.
@@ -2781,38 +2655,6 @@ export class AIService extends EventEmitter {
       }
       const toolsForStream = tools;
 
-      // startStream awaits its own setup (workspace mutex, stream safety,
-      // temp-dir creation) before registering the request; a memory change
-      // during those awaits would be invisible in the system/tools captured
-      // below, so this hook re-runs the bounded revalidation immediately
-      // before registration. Best-effort: the request-boundary snapshot is
-      // complete and valid, so a failed rebuild keeps it rather than failing
-      // the stream (and leaving the persisted placeholder behind).
-      const refreshMemoryDependentContext: RefreshMemoryDependentContext = async () => {
-        try {
-          const changed = await revalidateMemoryDependentState();
-          if (!changed) {
-            return null;
-          }
-          // The debug snapshot above captured the pre-refresh system message;
-          // update it so the modal shows the request that was actually sent.
-          const capturedSnapshot = this.lastLlmRequestByWorkspace.get(workspaceId);
-          if (capturedSnapshot?.messageId === assistantMessageId) {
-            this.lastLlmRequestByWorkspace.set(workspaceId, {
-              ...capturedSnapshot,
-              systemMessage,
-            });
-          }
-          return { system: systemMessage, tools, systemMessageTokens };
-        } catch (error) {
-          workspaceLog.warn(
-            "Memory revalidation at stream registration failed; keeping the request-boundary snapshot",
-            { error: getErrorMessage(error) }
-          );
-          return null;
-        }
-      };
-
       const canQueueDevToolsRunMetadata =
         this.devToolsService?.enabled === true &&
         typeof modelResult.data.model !== "string" &&
@@ -2948,21 +2790,8 @@ export class AIService extends EventEmitter {
                   const nextMemoryToolAvailable = nextTools.memory !== undefined;
                   const nextMemoryContext = await upgradeMemoryContextForModel(
                     nextMemoryToolAvailable,
-                    next.canonicalModelString,
-                    memoryContextAfterAssembly
+                    next.canonicalModelString
                   );
-                  // The rebuilt toolset used the config's captured index
-                  // entries; refresh the description from the snapshot just
-                  // resolved for the fallback model.
-                  if (nextTools.memory !== undefined) {
-                    nextTools = {
-                      ...nextTools,
-                      memory: withToolDescription(
-                        nextTools.memory,
-                        refreshedMemoryToolDescription(nextMemoryContext?.indexEntries)
-                      ),
-                    };
-                  }
 
                   // Rebuild the system prompt for the fallback model (tool
                   // instructions and "Model:" sections are model-keyed), keeping
@@ -3012,82 +2841,6 @@ export class AIService extends EventEmitter {
                     anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
                     workspaceId,
                   });
-
-                  // Fallback request boundary: the awaited stages above
-                  // (system rebuild, tokenizer, message preparation) are
-                  // invalidation windows too, and everything after this loop
-                  // is synchronous until prepare() returns. Mirror the
-                  // primary path's bounded revalidation.
-                  let fallbackMemoryContext = nextMemoryContext;
-                  const revalidateNextMemoryDependentState = async (): Promise<boolean> => {
-                    let changed = false;
-                    for (let revalidation = 0; revalidation < 3; revalidation++) {
-                      const revalidatedMemoryContext = await upgradeMemoryContextForModel(
-                        nextMemoryToolAvailable,
-                        next.canonicalModelString,
-                        fallbackMemoryContext
-                      );
-                      if (revalidatedMemoryContext === fallbackMemoryContext) {
-                        break;
-                      }
-                      changed = true;
-                      fallbackMemoryContext = revalidatedMemoryContext;
-                      if (nextTools.memory !== undefined) {
-                        nextTools = {
-                          ...nextTools,
-                          memory: withToolDescription(
-                            nextTools.memory,
-                            refreshedMemoryToolDescription(revalidatedMemoryContext?.indexEntries)
-                          ),
-                        };
-                      }
-                      const revalidatedSystemContext = await buildStreamSystemContextForToolset(
-                        {
-                          advisorToolAvailable: nextTools.advisor !== undefined,
-                          memoryToolAvailable: nextMemoryToolAvailable,
-                        },
-                        next.canonicalModelString,
-                        revalidatedMemoryContext
-                      );
-                      nextSystem = revalidatedSystemContext.systemMessage;
-                      nextSystemTokens = revalidatedSystemContext.systemMessageTokens;
-                      if (mcpWarningPrefix != null) {
-                        nextSystem = `${mcpWarningPrefix}${nextSystem}`;
-                        const revalidationTokenizer = await getTokenizerForModel(
-                          next.canonicalModelString,
-                          resolveModelForMetadata(
-                            next.canonicalModelString,
-                            this.providerService.getConfig()
-                          )
-                        );
-                        nextSystemTokens = await revalidationTokenizer.countTokens(nextSystem);
-                      }
-                    }
-                    return changed;
-                  };
-                  await revalidateNextMemoryDependentState();
-                  // Per-step hook for the fallback stream, mirroring the
-                  // primary path's refreshMemoryDependentContext.
-                  const refreshNextMemoryDependentContext: RefreshMemoryDependentContext =
-                    async () => {
-                      try {
-                        const changed = await revalidateNextMemoryDependentState();
-                        if (!changed) {
-                          return null;
-                        }
-                        return {
-                          system: nextSystem,
-                          tools: nextTools,
-                          systemMessageTokens: nextSystemTokens,
-                        };
-                      } catch (error) {
-                        workspaceLog.warn(
-                          "Fallback memory revalidation failed; keeping the current snapshot",
-                          { error: getErrorMessage(error) }
-                        );
-                        return null;
-                      }
-                    };
 
                   const nextProviderOptions = buildProviderOptions(
                     next.canonicalModelString,
@@ -3214,7 +2967,6 @@ export class AIService extends EventEmitter {
                     thinkingLevel: nextThinkingLevel,
                     rebuildProviderOptionsForThinkingLevel:
                       rebuildNextProviderOptionsForThinkingLevel,
-                    refreshMemoryDependentContext: refreshNextMemoryDependentContext,
                     initialMetadataPatch: {
                       routedThroughGateway: next.routedThroughGateway,
                       ...(next.routeProvider != null ? { routeProvider: next.routeProvider } : {}),
@@ -3284,8 +3036,7 @@ export class AIService extends EventEmitter {
         modelFallback,
         toolSearchRuntime?.state,
         activeTurnThinkingOverride,
-        rebuildProviderOptionsForThinkingLevel,
-        refreshMemoryDependentContext
+        rebuildProviderOptionsForThinkingLevel
       );
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 

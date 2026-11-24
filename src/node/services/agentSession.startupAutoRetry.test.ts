@@ -15,7 +15,6 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Ok } from "@/common/types/result";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 
 interface AutoRetryResumeRequest {
   options: SendMessageOptions;
@@ -34,10 +33,7 @@ interface SessionBundle {
   cleanup: () => Promise<void>;
 }
 
-async function createSessionBundle(
-  workspaceId: string,
-  getContextResetState?: () => { resetting: boolean; boundaryEpoch: number }
-): Promise<SessionBundle> {
+async function createSessionBundle(workspaceId: string): Promise<SessionBundle> {
   const workspaceMetadata: WorkspaceMetadata = {
     id: workspaceId,
     name: workspaceId,
@@ -60,7 +56,6 @@ async function createSessionBundle(
     initStateManagerOverrides: {
       replayInit: mock(() => Promise.resolve()),
     },
-    getContextResetState,
     captureEvents: true,
   });
 }
@@ -125,66 +120,6 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.agentId).toBe(WORKSPACE_DEFAULTS.agentId);
     expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: ".*", action: "disable" }]);
     expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
-
-    session.dispose();
-  });
-
-  test("defers the retry when a context reset boundary lands after the history reads", async () => {
-    const workspaceId = "startup-retry-reset-overlap";
-    let boundaryEpoch = 0;
-    const { session, historyService, events, cleanup } = await createSessionBundle(
-      workspaceId,
-      () => ({ resetting: false, boundaryEpoch })
-    );
-    cleanups.push(cleanup);
-
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "interrupted turn", { timestamp: Date.now() })
-    );
-    expect(appendResult.success).toBe(true);
-
-    // Simulate resetContext committing its boundary between this check's
-    // history reads and its retry decision: the reads return the pre-reset
-    // tail, then the boundary lands and the epoch advances. Scheduling the
-    // retry from that stale tail would resume the context the user reset.
-    const realGetLastMessages = historyService.getLastMessages.bind(historyService);
-    let overlapped = false;
-    spyOn(historyService, "getLastMessages").mockImplementation(async (readWorkspaceId, count) => {
-      const result = await realGetLastMessages(readWorkspaceId, count);
-      if (!overlapped) {
-        overlapped = true;
-        const boundaryAppend = await historyService.appendToHistory(
-          readWorkspaceId,
-          createMuxMessage("reset-boundary", "assistant", "", {
-            timestamp: Date.now(),
-            contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
-          })
-        );
-        expect(boundaryAppend.success).toBe(true);
-        boundaryEpoch += 1;
-      }
-      return result;
-    });
-
-    session.ensureStartupAutoRetryCheck();
-
-    // The deferred check re-runs when idle and settles on the post-boundary
-    // history; wait for the pipeline to finish before asserting.
-    const priv = session as unknown as {
-      startupAutoRetryCheckScheduled: boolean;
-      startupAutoRetryCheckPromise: Promise<void> | null;
-    };
-    const deadline = Date.now() + 5000;
-    while (!(priv.startupAutoRetryCheckScheduled && priv.startupAutoRetryCheckPromise === null)) {
-      if (Date.now() > deadline) {
-        throw new Error("Startup auto-retry check did not settle");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-
-    expect(events.find((event) => event.type === "auto-retry-scheduled")).toBeUndefined();
-    expect(session.hasPendingAutoRetry()).toBe(false);
 
     session.dispose();
   });

@@ -3879,18 +3879,13 @@ export const router = (authToken?: string) => {
               error: "Project memory is unavailable: no project is associated with this session",
             };
           }
-          // Route through MemoryService so the pin change emits a change
-          // event and invalidates session-cached memory contexts.
-          try {
-            await context.memoryService.setPinned(
-              resolved.scopeCtx,
-              input.path,
-              input.pinned,
-              "user"
-            );
-          } catch (error) {
-            return { success: false as const, error: getErrorMessage(error) };
-          }
+          await context.memoryMetaService.setPinned(
+            memoryLogicalKey(scope, relPath, {
+              projectPath: resolved.projectPath,
+              workspaceId: input.workspaceId ?? "",
+            }),
+            input.pinned
+          );
           return { success: true as const, data: undefined };
         }),
       consolidationStatus: t

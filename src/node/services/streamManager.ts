@@ -208,13 +208,6 @@ interface StreamRequestConfig {
    * options for the stream's model. `null` ⇒ not applicable / no-op.
    */
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
-  /**
-   * Per-step memory revalidation: prepareStep consults the hook before every
-   * model step so a memory change while earlier steps ran (e.g. during tool
-   * execution) reaches the next provider request instead of waiting for the
-   * next turn.
-   */
-  memoryRefreshState?: MemoryRefreshStepState;
 }
 
 /**
@@ -238,11 +231,6 @@ export interface PreparedModelFallback {
    * that OpenAI rejects).
    */
   tools: Record<string, Tool> | undefined;
-  /**
-   * Per-step memory revalidation hook bound to the fallback model's rebuilt
-   * system/toolset, mirroring the primary request's hook.
-   */
-  refreshMemoryDependentContext?: RefreshMemoryDependentContext;
   providerOptions?: Record<string, unknown>;
   headers?: Record<string, string | undefined>;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
@@ -256,38 +244,6 @@ export interface PreparedModelFallback {
    * options for the wrong model).
    */
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
-}
-
-/**
- * Built by AIService to pull a fresh memory-dependent snapshot (system prompt,
- * tool descriptions, token count) immediately before the stream request is
- * registered: startStream's own awaited setup (workspace mutex, stream safety,
- * temp-dir creation) opens a window in which a memory change would otherwise
- * be invisible because system/tools were captured as call arguments. Returns
- * null when nothing changed (or on a failed rebuild, where the request-boundary
- * snapshot, which is complete and valid, is kept instead of failing the stream).
- */
-export type RefreshMemoryDependentContext = () => Promise<{
-  system: string;
-  tools: Record<string, Tool> | undefined;
-  systemMessageTokens: number;
-} | null>;
-
-/**
- * Per-step memory revalidation state. `appliedSystemText` tracks the system
- * prompt text currently in effect for this request so the cached system
- * message embedded in `messages` (Anthropic path) can be replaced by exact
- * match only.
- */
-interface MemoryRefreshStepState {
-  hook: RefreshMemoryDependentContext;
-  appliedSystemText: string;
-  /**
-   * Wired once the stream registration exists; propagates the refreshed
-   * system token count into the live stream metadata so stream-end token
-   * attribution matches the system prompt the later steps actually sent.
-   */
-  onApplied?: (refreshed: { systemMessageTokens: number }) => void;
 }
 
 export interface ModelFallbackPrepareOptions {
@@ -1649,8 +1605,7 @@ export class StreamManager extends EventEmitter {
     toolSearchState?: ToolSearchStreamState,
     onToolExecutionStart?: (toolCallId: string) => void,
     thinkingOverrideState?: ActiveTurnThinkingOverride,
-    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    refreshMemoryDependentContext?: RefreshMemoryDependentContext
+    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel
   ): StreamRequestConfig {
     // Mid-turn thinking overrides mutate providerOptions IN PLACE (the SDK's
     // per-step deep-merge reads the object passed at streamText() time, so
@@ -1732,10 +1687,6 @@ export class StreamManager extends EventEmitter {
       toolSearchState,
       thinkingOverrideState,
       rebuildProviderOptionsForThinkingLevel,
-      memoryRefreshState:
-        refreshMemoryDependentContext != null
-          ? { hook: refreshMemoryDependentContext, appliedSystemText: system }
-          : undefined,
     };
   }
 
@@ -1842,75 +1793,6 @@ export class StreamManager extends EventEmitter {
     return rebuilt.providerOptions;
   }
 
-  /**
-   * Re-run AIService's memory revalidation before a model step: steps are
-   * separate provider requests, so a memory change while earlier steps ran
-   * (e.g. during a long tool execution) would otherwise keep advertising
-   * renamed or deleted memory paths until the next turn. The SDK has no
-   * per-step tools override, so the memory tool description is updated IN
-   * PLACE (prepareTools re-reads descriptions from the same reference on
-   * every step, like the providerOptions deep-merge). The system prompt is
-   * swapped through the step return value: an `instructions` override when
-   * streamText received a system argument (the SDK persists a returned
-   * instructions override across subsequent steps, so later no-change steps
-   * keep it), or an exact-match replacement of the cached system message for
-   * providers that carry it inside `messages`.
-   * The hook resolves null on both no-change and failed rebuilds, so a cache
-   * rebuild failure keeps the current snapshot instead of failing the loop.
-   */
-  private async applyPendingMemoryRefresh(
-    request: StreamRequestConfig,
-    stepMessages: ModelMessage[]
-  ): Promise<
-    { instructions?: string | SystemModelMessage; messages?: ModelMessage[] } | undefined
-  > {
-    const state = request.memoryRefreshState;
-    if (state == null) {
-      return undefined;
-    }
-    const refreshed = await state.hook();
-    if (refreshed == null) {
-      return undefined;
-    }
-    const refreshedDescription = refreshed.tools?.memory?.description;
-    const requestMemoryTool = request.tools?.memory;
-    if (typeof refreshedDescription === "string" && requestMemoryTool != null) {
-      requestMemoryTool.description = refreshedDescription;
-    }
-    if (refreshed.system === state.appliedSystemText) {
-      return undefined;
-    }
-    if (request.system != null) {
-      // Structured system messages (OpenAI explicit prompt-cache breakpoint)
-      // keep their providerOptions: only the content is swapped, and the
-      // structured object is returned so the per-step override does not
-      // downgrade the request to a plain string.
-      request.system =
-        typeof request.system === "string"
-          ? refreshed.system
-          : { ...request.system, content: refreshed.system };
-      state.appliedSystemText = refreshed.system;
-      state.onApplied?.({ systemMessageTokens: refreshed.systemMessageTokens });
-      return { instructions: request.system };
-    }
-    let replaced = false;
-    const nextMessages = stepMessages.map((message) => {
-      if (!replaced && message.role === "system" && message.content === state.appliedSystemText) {
-        replaced = true;
-        return { ...message, content: refreshed.system };
-      }
-      return message;
-    });
-    if (!replaced) {
-      // No exact-match cached system message; leave appliedSystemText alone
-      // so a later step can still find and replace the original.
-      return undefined;
-    }
-    state.appliedSystemText = refreshed.system;
-    state.onApplied?.({ systemMessageTokens: refreshed.systemMessageTokens });
-    return { messages: nextMessages };
-  }
-
   private createStreamResult(
     request: StreamRequestConfig,
     abortController: AbortController,
@@ -1937,10 +1819,7 @@ export class StreamManager extends EventEmitter {
         const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
         const rewritten =
           await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
-        // Memory revalidation before this step's provider request is built:
-        // may replace the cached system message inside the step messages.
-        const memoryRefresh = await this.applyPendingMemoryRefresh(request, rewritten);
-        const effectiveMessages = memoryRefresh?.messages ?? rewritten;
+        const effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
         if (stepTracker) {
           stepTracker.latestMessages = effectiveMessages;
         }
@@ -1955,18 +1834,14 @@ export class StreamManager extends EventEmitter {
         // this step's provider request is built.
         const thinkingOverride = this.applyPendingThinkingOverride(request);
         if (
-          effectiveMessages === stepMessages &&
-          memoryRefresh === undefined &&
+          rewritten === stepMessages &&
           activeTools === undefined &&
           thinkingOverride === undefined
         ) {
           return undefined;
         }
         return {
-          ...(effectiveMessages === stepMessages ? {} : { messages: effectiveMessages }),
-          ...(memoryRefresh?.instructions !== undefined
-            ? { instructions: memoryRefresh.instructions }
-            : {}),
+          ...(rewritten === stepMessages ? {} : { messages: rewritten }),
           ...(activeTools !== undefined ? { activeTools } : {}),
           // Defense in depth: the in-place request mutation is authoritative
           // (per-step deep-merge cannot delete keys); returning the rebuilt
@@ -2018,8 +1893,7 @@ export class StreamManager extends EventEmitter {
     modelFallback?: ModelFallbackOptions,
     toolSearchState?: ToolSearchStreamState,
     thinkingOverrideState?: ActiveTurnThinkingOverride,
-    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    refreshMemoryDependentContext?: RefreshMemoryDependentContext
+    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel
   ): WorkspaceStreamInfo {
     // abortController is created and linked to the caller-provided abortSignal in startStream().
 
@@ -2044,8 +1918,7 @@ export class StreamManager extends EventEmitter {
       toolSearchState,
       (toolCallId) => this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
       thinkingOverrideState,
-      rebuildProviderOptionsForThinkingLevel,
-      refreshMemoryDependentContext
+      rebuildProviderOptionsForThinkingLevel
     );
 
     // Start streaming - this can throw immediately if API key is missing
@@ -2119,15 +1992,6 @@ export class StreamManager extends EventEmitter {
       if (request.thinkingOverrideState.applied) {
         streamInfo.thinkingLevel = request.thinkingOverrideState.applied;
       }
-    }
-
-    // Per-step memory refresh: route the refreshed system token count into
-    // this stream's metadata so stream-end attribution matches the system
-    // prompt the later steps actually sent.
-    if (request.memoryRefreshState) {
-      request.memoryRefreshState.onApplied = ({ systemMessageTokens }) => {
-        streamInfo.initialMetadata = { ...streamInfo.initialMetadata, systemMessageTokens };
-      };
     }
 
     // Atomically register the stream
@@ -2766,17 +2630,8 @@ export class StreamManager extends EventEmitter {
       // hop) with a closure bound to the FALLBACK model. Attached before
       // createStreamResult below in case the SDK eagerly prepares step 1.
       streamInfo.request.thinkingOverrideState,
-      prepared.data.rebuildProviderOptionsForThinkingLevel,
-      prepared.data.refreshMemoryDependentContext
+      prepared.data.rebuildProviderOptionsForThinkingLevel
     );
-    // Rebind the metadata sink for the swapped request, mirroring
-    // createStreamAtomically. Attached before createStreamResult below in
-    // case the SDK eagerly prepares step 1.
-    if (nextRequest.memoryRefreshState) {
-      nextRequest.memoryRefreshState.onApplied = ({ systemMessageTokens }) => {
-        streamInfo.initialMetadata = { ...streamInfo.initialMetadata, systemMessageTokens };
-      };
-    }
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
     // later disk-reset await cannot wipe freshly prepared fallback messages.
@@ -4227,8 +4082,7 @@ export class StreamManager extends EventEmitter {
     modelFallback?: ModelFallbackOptions,
     toolSearchState?: ToolSearchStreamState,
     thinkingOverrideState?: ActiveTurnThinkingOverride,
-    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    refreshMemoryDependentContext?: RefreshMemoryDependentContext
+    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel
   ): Promise<Result<StreamToken, SendMessageError>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
 
@@ -4285,25 +4139,6 @@ export class StreamManager extends EventEmitter {
           return Ok(streamToken);
         }
 
-        // Memory can change while the awaited setup above runs; pull a fresh
-        // memory-dependent snapshot now, while everything from here to
-        // registration is synchronous, so the provider request cannot
-        // advertise a renamed or deleted memory path.
-        if (refreshMemoryDependentContext) {
-          const refreshed = await refreshMemoryDependentContext();
-          if (streamAbortController.signal.aborted) {
-            return Ok(streamToken);
-          }
-          if (refreshed != null) {
-            system = refreshed.system;
-            tools = refreshed.tools;
-            initialMetadata = {
-              ...initialMetadata,
-              systemMessageTokens: refreshed.systemMessageTokens,
-            };
-          }
-        }
-
         // Step 4: Atomic stream creation and registration
         const streamInfo = this.createStreamAtomically(
           typedWorkspaceId,
@@ -4333,8 +4168,7 @@ export class StreamManager extends EventEmitter {
           modelFallback,
           toolSearchState,
           thinkingOverrideState,
-          rebuildProviderOptionsForThinkingLevel,
-          refreshMemoryDependentContext
+          rebuildProviderOptionsForThinkingLevel
         );
 
         // Guard against a narrow race:

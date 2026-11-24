@@ -66,7 +66,6 @@ export interface AgentSessionHarnessOptions {
   backgroundProcessManager?: BackgroundProcessManager;
   backgroundProcessManagerOverrides?: Partial<BackgroundProcessManager>;
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
-  getContextResetState?: () => { resetting: boolean; boundaryEpoch: number };
   captureEvents?: boolean;
 }
 
@@ -109,7 +108,6 @@ export async function createAgentSessionHarness(
     initStateManager,
     backgroundProcessManager,
     onCompactionComplete: options.onCompactionComplete,
-    getContextResetState: options.getContextResetState,
   });
 
   const events: WorkspaceChatMessage[] = [];
