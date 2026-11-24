@@ -179,12 +179,28 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
     .refine((value) => value.model === undefined || isEvaluatorModel(value.model)),
 };
 
+/**
+ * The payload's per-file size cap still lets a repository-controlled block hold hundreds of
+ * thousands of entries in one list or map, which preview, restore and every model picker would
+ * then carry. No real setting comes near this; a larger value keeps the local one and is reported.
+ */
+const MAX_SETTING_ENTRIES = 2000;
+
+function entryCount(value: unknown): number {
+  if (Array.isArray(value)) return value.length;
+  return isPlainObject(value) ? Object.keys(value).length : 0;
+}
+
 function isSupported(key: BackedUpSettingsKey, value: unknown): boolean {
   const schema = FIELD_SCHEMA_OVERRIDES[key] ?? AppConfigOnDiskSchema.shape[key];
   // A per-agent cacheTtl is ignored, even one this build cannot parse, not a reason to reject
   // the agent defaults around it.
   const portable = key === "agentAiDefaults" ? withoutCacheTtl(value) : value;
-  return schema.safeParse(portable).success && isCanonical(key, portable);
+  return (
+    entryCount(portable) <= MAX_SETTING_ENTRIES &&
+    schema.safeParse(portable).success &&
+    isCanonical(key, portable)
+  );
 }
 
 function setSetting<K extends BackedUpSettingsKey>(

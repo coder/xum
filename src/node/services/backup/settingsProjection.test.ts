@@ -382,6 +382,21 @@ describe("settingsProjection", () => {
       });
     }
 
+    // A list or map far past any real setting, which the file size cap alone would let through.
+    const models = Array.from({ length: 2001 }, (_, index) => `openai:gpt-${index}`);
+    for (const [key, value] of [
+      ["hiddenModels", models],
+      ["minThinkingLevelByModel", Object.fromEntries(models.map((model) => [model, "high"]))],
+    ] as const) {
+      expect(readBackupSettings({ settings: { [key]: value } })).toEqual({
+        settings: {},
+        unsupported: [key],
+      });
+    }
+    expect(
+      readBackupSettings({ settings: { hiddenModels: models.slice(0, 2000) } }).unsupported
+    ).toEqual([]);
+
     // `null` is the only spelling of unset; an empty spelling load would read as unset is
     // reported rather than applied as a reset. An empty hidden list is a real value.
     expect(
