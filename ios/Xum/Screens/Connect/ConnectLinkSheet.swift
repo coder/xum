@@ -176,7 +176,7 @@ struct ConnectLinkSheet: View {
             Label("This link is not encrypted", systemImage: "lock.open")
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(Color.xWarn)
-            Text("Anyone on this network can read the token and use it to run commands on the server. Use an HTTPS link, or turn on Tailscale on this iPhone for a Tailscale address.")
+            Text("Anyone on this network can read the token and use it to run commands on the server. Use an HTTPS link if the server has one.")
                 .font(.system(size: 13))
                 .foregroundStyle(Color.xText2)
                 .fixedSize(horizontal: false, vertical: true)

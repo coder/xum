@@ -70,31 +70,17 @@ struct ConnectionLinkTransportTests {
         ("https://devbox.example.com/?token=t", true),
         ("http://127.0.0.1:3000/?token=t", true),
         ("http://localhost:3000/?token=t", true),
-        ("http://100.100.16.68:3000/?token=t", true),
-        ("http://devbox.tail4e2c.ts.net:3000/?token=t", true),
+        ("http://100.100.16.68:3000/?token=t", false),
+        ("http://devbox.tail4e2c.ts.net:3000/?token=t", false),
         ("http://192.168.1.20:3000/?token=t", false),
-        ("http://100.12.0.1:3000/?token=t", false),
         ("http://devbox.local:3000/?token=t", false),
         ("http://127.attacker.example:3000/?token=t", false),
-        ("http://100.64.1.2.attacker.example:3000/?token=t", false),
         ("http://[::1]:3000/?token=t", true),
-        ("http://[fd7a:115c:a1e0::1]:3000/?token=t", true),
-        ("http://[fd7a:115c:a1e1::1]:3000/?token=t", false),
+        ("http://[fd7a:115c:a1e0::1]:3000/?token=t", false),
     ])
     func protectedTransport(link: String, protected: Bool) throws {
         let parsed = try #require(ConnectionLink.parse(link))
-        #expect(parsed.protectedTransport(tailnetUp: true) == protected)
-    }
-
-    /// Without Tailscale on this device a 100.64.0.0/10 address may be carrier NAT.
-    @Test(arguments: [
-        "http://100.100.16.68:3000/?token=t", "http://[fd7a:115c:a1e0::1]:3000/?token=t",
-        "http://devbox.tail4e2c.ts.net:3000/?token=t",
-    ])
-    func tailscaleNeedsTheTailnet(link: String) throws {
-        let parsed = try #require(ConnectionLink.parse(link))
-        #expect(!parsed.protectedTransport(tailnetUp: false))
-        #expect(try #require(ConnectionLink.parse("http://127.0.0.1:3000/?token=t")).protectedTransport(tailnetUp: false))
+        #expect(parsed.isProtectedTransport == protected)
     }
 
     @Test func urlStringRoundTrips() throws {
