@@ -125,10 +125,12 @@ struct ChatView: View {
     }
 
     /// The first send runs after the chat opens, so its failure can arrive while it is shown. Its
-    /// text is already back in this workspace's draft (AppModel.startFirstSend).
+    /// text is back in this workspace's draft, or, when that write was not confirmed, comes back
+    /// here (AppModel.startFirstSend).
     private func takeUnsentFirstMessage() {
-        guard let reason = model.takeUnsentFirstMessage(workspaceId) else { return }
-        store?.report("The first message did not send: \(reason)")
+        guard let store, let unsent = model.takeUnsentFirstMessage(workspaceId) else { return }
+        if let text = unsent.text, !store.draft.text.contains(text) { restoreToComposer(text) }
+        store.report("The first message did not send: \(unsent.reason)")
     }
 
     private func attach() {
@@ -137,6 +139,7 @@ struct ChatView: View {
         store = model.chatStore(workspaceId)
         takeUnsentFirstMessage()
         info = model.servers.currentClient.map { WorkspaceInfoStore(workspaceId: workspaceId, client: $0) }
+        info?.projectPath = workspace?.projectPath
         seedSettings()
     }
 
@@ -147,8 +150,12 @@ struct ChatView: View {
         planFile = (toolId, content)
     }
 
-    /// Agent/model/thinking start from the workspace's saved per-agent settings, then app defaults.
-    private func seedSettings() { applySettings(for: model.defaultAgent) }
+    /// Agent/model/thinking start from the workspace's last selected agent (metadata `agentId`)
+    /// and its saved per-agent settings, then app defaults.
+    private func seedSettings() {
+        let saved = workspace?.raw["agentId"]?.string.flatMap { AgentOption.selectable.contains($0) ? $0 : nil }
+        applySettings(for: saved ?? model.defaultAgent)
+    }
 
     private func applySettings(for agentId: String) {
         func setting(_ key: String) -> String? {
@@ -382,7 +389,8 @@ struct ChatView: View {
             } else {
                 Composer(
                     text: Binding(get: { store.draft.text }, set: { store.draft.setText($0) }),
-                    agent: $agent,
+                    // Each agent has its own saved model and thinking, as Implement applies them.
+                    agent: Binding(get: { agent }, set: { if $0 != agent { applySettings(for: $0) } }),
                     modelId: Binding(get: { modelId }, set: { pickedModel = $0 }),
                     thinking: $thinking,
                     placeholder: store.isStreaming ? "Queue a follow-up" : "Message \(workspace?.displayName ?? "agent")",

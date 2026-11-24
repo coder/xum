@@ -151,7 +151,10 @@ final class ChatStore {
     /// The server ended the replay with `historyReplayStatus: "failed"`: the rows are incomplete.
     private(set) var replayFailed = false
     private(set) var streamingMessageId: String?
-    private(set) var lastError: String?
+    private(set) var lastError: String? { didSet { lastErrorFromStream = false } }
+    /// `lastError` is a replayed or live `stream-error`, which a full replay re-sends while it is
+    /// still the outcome; a local error (a refused send, the first message) is not replayed.
+    private var lastErrorFromStream = false
     private(set) var contextTokens: Int?
     private(set) var hasQueued = false
     /// Rows exist before the oldest loaded one (an earlier compaction epoch).
@@ -241,6 +244,13 @@ final class ChatStore {
         draft.stop()
     }
 
+    /// Stop for good (evicted, server switched): a store opened later knows nothing of the
+    /// auto-retry this one turned on for a resumed attempt, so turn it back off now.
+    func close() {
+        stop()
+        if autoRetryRollbackPending { Task { await rollbackAutoRetry() } }
+    }
+
     private func run() async {
         var backoff: UInt64 = 1
         while !Task.isCancelled {
@@ -266,6 +276,8 @@ final class ChatStore {
     }
 
     private func resetForReplay() {
+        // Another client may have retried or truncated the failed turn while this one was away.
+        if lastErrorFromStream { lastError = nil }
         messages = []
         answeredQuestionIds = []
         sandboxApprovals = []
@@ -440,6 +452,7 @@ final class ChatStore {
             if streamingMessageId == ev["messageId"]?.string { streamingMessageId = nil }
         case "stream-error", "error":
             lastError = ev["error"]?.string ?? "Stream failed"
+            lastErrorFromStream = true
             mutate(ev["messageId"]?.string) { m in m.isStreaming = false }
             streamingMessageId = nil
         case "usage-delta":
@@ -663,19 +676,33 @@ final class ChatStore {
     func answer(_ q: PendingQuestion, answers: QuestionAnswers, options: [String: JSONValue]) async throws {
         guard q.answerByMessage else { return try await answer(toolCallId: q.toolCallId, answers: answers.answers, options: options) }
         answeredQuestionIds.insert(q.toolCallId)
+        let message = answers.message(toolCallId: q.toolCallId)
+        // A retry of the unconfirmed answer reuses its send id, so a lost reply of an accepted
+        // send cannot add a second answer row (the web's useNonBlockingAnswerSender).
+        let sendId: String
+        if let p = pendingAnswer, p.toolCallId == q.toolCallId, p.message == message {
+            sendId = p.sendId
+        } else {
+            sendId = UUID().uuidString.lowercased()
+        }
+        pendingAnswer = (q.toolCallId, message, sendId)
         var opts = options
-        opts["sendId"] = .string(UUID().uuidString.lowercased())
+        opts["sendId"] = .string(sendId)
         opts["muxMetadata"] = ["type": "normal", "askUserQuestionAnswer": ["toolCallId": .string(q.toolCallId), "answers": .object(answers.answers.mapValues { .string($0) })]]
         do {
             try await client.call("workspace/sendMessage", [
-                "workspaceId": .string(workspaceId), "message": .string(answers.message(toolCallId: q.toolCallId)), "options": .object(opts),
+                "workspaceId": .string(workspaceId), "message": .string(message), "options": .object(opts),
             ])
+            if pendingAnswer?.sendId == sendId { pendingAnswer = nil }
         } catch {
             answeredQuestionIds.remove(q.toolCallId)
             lastError = "Answer not sent: \(error.localizedDescription)"
             throw error
         }
     }
+
+    /// The last answer message whose send is not confirmed.
+    private var pendingAnswer: (toolCallId: String, message: String, sendId: String)?
 
     /// Set when a question's resume turned auto-retry on for one attempt: it goes back off once
     /// that attempt ends (the web card's rollback).

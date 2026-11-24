@@ -207,10 +207,32 @@ final class WorkspaceInfoStore {
 
     // MARK: - Changes (git, through executeBash like the desktop Review tab)
 
-    /// Diff base: the merge base with origin's default branch (origin/HEAD, so `develop` or
-    /// `master` trunks work), else origin/main, main or master, else HEAD. Shared with the list's
-    /// diff badges so both count the same changes.
-    static let base = #"t=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); b=$({ [ -n "$t" ] && git merge-base HEAD "$t"; } 2>/dev/null || git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || git merge-base HEAD master 2>/dev/null || git rev-parse HEAD)"#
+    /// Diff base (sets `$b`): the merge base with the project's review base when one is set (the
+    /// desktop Review panel's `defaultBaseByProject`), else with origin's default branch
+    /// (origin/HEAD, so `develop` or `master` trunks work), else origin/main, main or master, else
+    /// HEAD. Shared with the list's diff badges so both count the same changes.
+    static func base(reviewBase: String?) -> String {
+        let fallback = #"t=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); b=$({ [ -n "$t" ] && git merge-base HEAD "$t"; } 2>/dev/null || git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || git merge-base HEAD master 2>/dev/null || git rev-parse HEAD)"#
+        // A base that starts with "-" would reach git as an option, so it falls back instead.
+        guard let reviewBase, !reviewBase.isEmpty, !reviewBase.hasPrefix("-") else { return fallback }
+        return "r=\(shellQuoted(reviewBase)); b=$(git merge-base HEAD \"$r\" 2>/dev/null) || { \(fallback); }"
+    }
+
+    /// One shell word with exactly this text: the config value is user text, never shell code.
+    static func shellQuoted(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: #"'\''"#) + "'"
+    }
+
+    /// The review base of each project that has one (`userPreferences.review.defaultBaseByProject`).
+    static func reviewBases(_ client: APIClient) async -> [String: String] {
+        let config = try? await client.call("config/getConfig")
+        return (config?["userPreferences"]?["review"]?["defaultBaseByProject"]?.object ?? [:]).compactMapValues(\.string)
+    }
+
+    /// The workspace's project, for its review base; nil uses the automatic base.
+    var projectPath: String?
+    /// The review base the Changes list was loaded against, so a file's diff uses the same one.
+    private var reviewBase: String?
 
     private func bash(_ script: String) async throws -> String {
         let r = try await client.call("workspace/executeBash", ["workspaceId": .string(workspaceId), "script": .string(script),
@@ -221,7 +243,8 @@ final class WorkspaceInfoStore {
 
     func loadChanges() async {
         do {
-            let out = try await bash(Self.base + #"; printf 'BASE %s\0' "$b"; git diff --numstat -z "$b"; printf 'UNTRACKED\0'; git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do printf '%s\0%s\0' "$(awk 'END {print NR}' "./$f" 2>/dev/null)" "$f"; done"#)
+            if let projectPath { reviewBase = await Self.reviewBases(client)[projectPath] }
+            let out = try await bash(Self.base(reviewBase: reviewBase) + #"; printf 'BASE %s\0' "$b"; git diff --numstat -z "$b"; printf 'UNTRACKED\0'; git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do printf '%s\0%s\0' "$(awk 'END {print NR}' "./$f" 2>/dev/null)" "$f"; done"#)
             (changesBase, changes) = Self.parseChanges(out)
             changesError = nil
         } catch {
@@ -259,8 +282,8 @@ final class WorkspaceInfoStore {
     }
 
     func diff(_ file: ChangedFile) async throws -> String {
-        let quoted = "'" + file.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let quoted = Self.shellQuoted(file.path)
         if file.untracked { return try await bash("git diff --no-index -- /dev/null \(quoted); true") }
-        return try await bash(Self.base + "; git diff \"$b\" -- \(quoted)")
+        return try await bash(Self.base(reviewBase: reviewBase) + "; git diff \"$b\" -- \(quoted)")
     }
 }

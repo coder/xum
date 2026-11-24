@@ -154,7 +154,9 @@ final class WorkspaceListStore {
     }
 
     func scanAttention() async {
-        let ordered = workspaces.sorted { (activity[$0.id]?.recency ?? .distantPast) > (activity[$1.id]?.recency ?? .distantPast) }
+        // Side chats are ephemeral and hidden like in Search: opening one from the Inbox would
+        // skip the discard-on-leave lifecycle the desktop gives them.
+        let ordered = workspaces.filter { !$0.isSideChat }.sorted { (activity[$0.id]?.recency ?? .distantPast) > (activity[$1.id]?.recency ?? .distantPast) }
         await withTaskGroup(of: Void.self) { g in
             var next = ordered.makeIterator()
             for _ in 0..<4 { if let w = next.next() { g.addTask { await self.scan(w.id) } } }
@@ -165,6 +167,7 @@ final class WorkspaceListStore {
     }
 
     func scan(_ id: String) async {
+        guard workspace(id)?.isSideChat != true else { attention[id] = nil; return }
         let store = ChatStore(workspaceId: id, client: client)
         do {
             for try await ev in client.subscribe("workspace/onChat", ["workspaceId": .string(id), "mode": ["type": "full"]]) {
@@ -191,9 +194,10 @@ final class WorkspaceListStore {
     /// File names reach `awk` as `./`-prefixed arguments, never as options, assignments or shell
     /// text: a repository can hold untracked files with any name, and this runs when the list opens.
     func refreshDiffStats() async {
-        let script = WorkspaceInfoStore.base + #"; u=$(git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do awk 'END {print NR}' "./$f" 2>/dev/null; done | awk '{s+=$1} END {print s+0}'); git diff --numstat "$b" | awk -v u="$u" '{a+=$1;d+=$2} END {print a+u, d+0}'"#
+        let reviewBases = await WorkspaceInfoStore.reviewBases(client)
         await withTaskGroup(of: (String, (Int, Int)?).self) { g in
             for w in workspaces where !w.isScratch {
+                let script = WorkspaceInfoStore.base(reviewBase: reviewBases[w.projectPath]) + #"; u=$(git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do awk 'END {print NR}' "./$f" 2>/dev/null; done | awk '{s+=$1} END {print s+0}'); git diff --numstat "$b" | awk -v u="$u" '{a+=$1;d+=$2} END {print a+u, d+0}'"#
                 g.addTask {
                     let r = try? await self.client.call("workspace/executeBash", ["workspaceId": .string(w.id), "script": .string(script), "options": ["timeout_secs": 10]])
                     var out = ""

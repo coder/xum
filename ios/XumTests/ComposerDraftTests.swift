@@ -11,12 +11,16 @@ final class FakeServer {
     var sendReply: Result<JSONValue, Error> = .success(["success": true, "data": [:]])
     var receiverId = "r1"
     private var waiting: [CheckedContinuation<Void, Never>] = []
+    /// Receiver lookups wait for `releaseLookups` while this is set.
+    var holdLookups = false
+    private var lookups: [CheckedContinuation<Void, Never>] = []
     var pendingSends: [JSONValue] = []
 
     func call(_ procedure: String, _ body: JSONValue?) async throws -> JSONValue {
         calls.append((procedure, body))
         switch procedure {
         case "workspace/getSendStatus":
+            if holdLookups { await withCheckedContinuation { lookups.append($0) } }
             return ["success": true, "data": ["receiverId": .string(receiverId), "statuses": []]]
         case "drafts/beginSend":
             if let p = body?["pendingSend"] { pendingSends.append(p) }
@@ -54,6 +58,13 @@ final class FakeServer {
         w.forEach { $0.resume() }
     }
 
+    func releaseLookups() {
+        holdLookups = false
+        let l = lookups
+        lookups = []
+        l.forEach { $0.resume() }
+    }
+
     func procedures() -> [String] { calls.map(\.procedure) }
     func bodies(_ procedure: String) -> [JSONValue] { calls.filter { $0.procedure == procedure }.compactMap(\.body) }
 }
@@ -87,6 +98,24 @@ struct ComposerDraftTests {
         #expect(begun["pendingSend"]?["sendId"] == sent["options"]?["sendId"])
         #expect(begun["pendingSend"]?["request"]?["options"]?["sendId"] == nil)
         #expect(begun["pendingSend"]?["receiverId"]?.string == "r1")
+        server.finishSend()
+    }
+
+    @Test func aSecondTapDuringTheReceiverLookupSendsNothing() async throws {
+        let server = FakeServer()
+        server.holdLookups = true
+        let d = draft(server)
+        d.setText("hi")
+        let first = Task { try await d.send(message: "hi", options: [:]) }
+        await settle()
+        let second = Task { try await d.send(message: "hi", options: [:]) }
+        await settle()
+        server.releaseLookups()
+        try await first.value
+        try await second.value
+        await settle()
+        #expect(server.bodies("drafts/beginSend").count == 1)
+        #expect(server.bodies("workspace/sendMessage").count == 1)
         server.finishSend()
     }
 

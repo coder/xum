@@ -82,7 +82,7 @@ final class AppModel {
 
     func connectCurrent() {
         list?.stop()
-        chatStores.values.forEach { $0.stop() }
+        chatStores.values.forEach { $0.close() }
         chatStores = [:]
         chatOrder = []
         path = []
@@ -131,7 +131,7 @@ final class AppModel {
         chatOrder.append(workspaceId)
         while chatOrder.count > Self.liveChatLimit {
             let old = chatOrder.removeFirst()
-            chatStores.removeValue(forKey: old)?.stop()
+            chatStores.removeValue(forKey: old)?.close()
         }
         if let s = chatStores[workspaceId] { return s }
         guard let c = servers.currentClient else { return nil }
@@ -209,10 +209,16 @@ final class AppModel {
         return id
     }
 
-    /// Why a workspace's first message did not send, by workspace. Its text is back in that
-    /// workspace's draft, so a retry sends it there instead of making another workspace.
-    private(set) var unsentFirstMessages: [String: String] = [:]
-    func takeUnsentFirstMessage(_ workspaceId: String) -> String? { unsentFirstMessages.removeValue(forKey: workspaceId) }
+    /// A first message that did not send: why, and its text unless the workspace's draft
+    /// confirmed it holds that text (a retry then sends it there instead of making another workspace).
+    struct UnsentFirstMessage {
+        var reason: String
+        var text: String?
+    }
+
+    /// The unsent first message of each workspace, until its chat takes it.
+    private(set) var unsentFirstMessages: [String: UnsentFirstMessage] = [:]
+    func takeUnsentFirstMessage(_ workspaceId: String) -> UnsentFirstMessage? { unsentFirstMessages.removeValue(forKey: workspaceId) }
 
     /// The web creation flow's first send: no client send id (the backend mints one) and no
     /// draft entry. `sendMessage` returns only when the turn ends, so the new workspace opens
@@ -226,11 +232,19 @@ final class AppModel {
                 try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message), "options": .object(opts)])
             } catch {
                 let scope: JSONValue = ["kind": "workspace", "workspaceId": .string(id)]
-                let current = try? await c.call("drafts/get", ["scope": scope])
-                if (current?["text"]?.string ?? "").isEmpty, (current?["attachments"]?.array ?? []).isEmpty {
-                    _ = try? await c.call("drafts/update", ["scope": scope, "text": .string(message)])
+                // The draft calls often fail for the same reason the send did. Until a write is
+                // confirmed, the text stays here and the chat restores it through its own draft,
+                // whose writes retry.
+                var kept: String? = message
+                if let current = try? await c.call("drafts/get", ["scope": scope]) {
+                    if (current["text"]?.string ?? "").isEmpty, (current["attachments"]?.array ?? []).isEmpty {
+                        if (try? await c.call("drafts/update", ["scope": scope, "text": .string(message)])) != nil { kept = nil }
+                    } else {
+                        // The draft already holds something, so the message does not go there.
+                        kept = nil
+                    }
                 }
-                unsentFirstMessages[id] = error.localizedDescription
+                unsentFirstMessages[id] = UnsentFirstMessage(reason: error.localizedDescription, text: kept)
             }
         }
         Task { await list?.refresh() }

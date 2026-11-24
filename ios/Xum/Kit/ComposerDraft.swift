@@ -49,6 +49,7 @@ final class ComposerDraft {
     private var subscription: Task<Void, Never>?
     private var receiverId: String?
     private var issuing: Set<String> = []
+    private var lookingUpReceiver = false
     private var resending: [String: String] = [:]
     private var lastStatus: [String: String] = [:]
     /// Answers for sends whose reply just came back, kept until their sender reads them (the
@@ -207,9 +208,20 @@ final class ComposerDraft {
     /// (the composer is usable again at once); throws only when nothing was taken. Whether the
     /// backend accepted it arrives later through the draft, and `onNotAccepted` says why it did not.
     func send(message: String, options: [String: JSONValue]) async throws {
+        // The receiver lookup comes before the text leaves the composer, so a second tap while it
+        // runs would send the same text again under another id.
+        guard !lookingUpReceiver else { return }
+        lookingUpReceiver = true
         retriesStopped = false
         retryAttempt = 0
-        let receiver = try await currentReceiver()
+        let receiver: String
+        do {
+            receiver = try await currentReceiver()
+        } catch {
+            lookingUpReceiver = false
+            throw error
+        }
+        lookingUpReceiver = false
         let sendId = UUID().uuidString.lowercased()
         var request: [String: JSONValue] = options
         request.removeValue(forKey: "sendId")
