@@ -1911,7 +1911,9 @@ describe("task_apply_git_patch uncommitted-changes (worktree) patches", () => {
     expect(badAck.error).toContain("nothing to acknowledge");
   }, 20_000);
 
-  it("acknowledges a later partial project past an already-applied sibling", async () => {
+  async function runAckSweepPastAppliedSibling(
+    projectAOverrides: Partial<SubagentGitProjectPatchArtifact> = {}
+  ) {
     const childRepoA = path.join(rootDir, "child-a");
     const childRepoB = path.join(rootDir, "child-b");
     const targetRepoA = path.join(rootDir, "target-a");
@@ -1966,6 +1968,7 @@ describe("task_apply_git_patch uncommitted-changes (worktree) patches", () => {
             headSha: headShaA,
           })),
           appliedAtMs: Date.now(),
+          ...projectAOverrides,
         },
         {
           ...(await buildReadyProjectArtifact({
@@ -1997,7 +2000,15 @@ describe("task_apply_git_patch uncommitted-changes (worktree) patches", () => {
     const result = (await tool.execute!(
       { task_id: childTaskId, acknowledge_partial_recovery: true },
       mockToolCallOptions
-    )) as { success: boolean; projectResults: Array<{ status: string }> };
+    )) as {
+      success: boolean;
+      projectResults: Array<{ status: string; error?: string }>;
+    };
+    return { result, sessionDir, childTaskId, headShaA };
+  }
+
+  it("acknowledges a later partial project past an already-applied sibling", async () => {
+    const { result, sessionDir, childTaskId } = await runAckSweepPastAppliedSibling();
     expect(result.success).toBe(true);
     expect(result.projectResults.map((projectResult) => projectResult.status)).toEqual([
       "skipped",
@@ -2007,6 +2018,19 @@ describe("task_apply_git_patch uncommitted-changes (worktree) patches", () => {
     const artifact = await readSubagentGitPatchArtifact(sessionDir, childTaskId);
     expect(artifact?.projectArtifacts[1]?.appliedPartial).toBeUndefined();
     expect(artifact?.projectArtifacts[1]?.appliedAtMs).toBeDefined();
+  }, 20_000);
+
+  it("fails an acknowledgment sweep when the applied sibling's commits are gone", async () => {
+    // Project A's completion record names a post-apply HEAD that target A no
+    // longer contains (it was reset), so its commits are missing.
+    const { result } = await runAckSweepPastAppliedSibling({
+      appliedHeadSha: "0123456789abcdef0123456789abcdef01234567",
+    });
+    expect(result.success).toBe(false);
+    expect(result.projectResults[0]?.status).toBe("failed");
+    expect(result.projectResults[0]?.error).toContain(
+      "no longer contains the recorded post-apply HEAD"
+    );
   }, 20_000);
 
   it("applies an untouched project during an acknowledgment sweep", async () => {

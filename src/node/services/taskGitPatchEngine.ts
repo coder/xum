@@ -27,6 +27,7 @@ import {
   markSubagentGitPatchArtifactApplied,
   matchesProjectArtifactProjectPath,
   readLocalPatchApplyCompletion,
+  type LocalPatchApplyCompletionRecord,
   readLocalPatchPartialApply,
   readSubagentGitPatchArtifact,
   setLocalPatchPartialApply,
@@ -1188,6 +1189,47 @@ async function checkAppliedWorkStillPresent(params: {
     }
   }
   return "the child's applied uncommitted changes are no longer present in the worktree (they were likely discarded)";
+}
+
+/**
+ * Replay targets prove completion with their target-local record (pass it as
+ * localCompletion); direct targets with the shared artifact's applied fields.
+ * A project that cannot be resolved in this workspace (no repoCwd) can be
+ * neither validated nor re-applied, so it keeps the legacy skip.
+ */
+async function findStaleRecordedCompletion(params: {
+  config: TaskGitPatchApplyConfig;
+  repoCwd: string | undefined;
+  taskId: string;
+  workspaceId: string;
+  projectArtifact: SubagentGitProjectPatchArtifact;
+  artifactSessionDir: string;
+  localCompletion: LocalPatchApplyCompletionRecord | null | undefined;
+  abortSignal?: AbortSignal;
+}): Promise<string | null> {
+  if (params.repoCwd == null) return null;
+  const isReplay = params.localCompletion !== undefined;
+  return await checkAppliedWorkStillPresent({
+    runtime: params.config.runtime,
+    runtimeTempDir: params.config.runtimeTempDir,
+    repoCwd: params.repoCwd,
+    taskId: params.taskId,
+    workspaceId: params.workspaceId,
+    gitPrefix: await gitNoRepoAutomationPrefixForRuntime({
+      runtime: params.config.runtime,
+      cwd: params.repoCwd,
+      trusted: params.config.trusted === true,
+    }),
+    projectArtifact: params.projectArtifact,
+    artifactSessionDir: params.artifactSessionDir,
+    recordedHeadSha: isReplay
+      ? params.localCompletion?.headCommitSha
+      : params.projectArtifact.appliedHeadSha,
+    recordedAcknowledged: isReplay
+      ? params.localCompletion?.acknowledged === true
+      : params.projectArtifact.appliedAcknowledged === true,
+    abortSignal: params.abortSignal,
+  });
 }
 
 function validatePatchRuntimePathComponent(value: string, label: string): string | undefined {
@@ -3466,6 +3508,35 @@ async function applyPatch(
             ? localCompletion != null
             : Boolean(projectArtifact.appliedAtMs);
           if (provenApplied) {
+            // The record proves the apply finished, not that the work is still
+            // present: a sweep that skipped a reset sibling would let a workflow
+            // checkpoint past its missing work, as an ordinary retry would.
+            const staleReason = await findStaleRecordedCompletion({
+              config,
+              repoCwd:
+                repoTargetsByProjectPath.get(projectArtifact.projectPath)?.repoCwd ??
+                (artifact.projectArtifacts.length === 1 ? config.cwd : undefined),
+              taskId,
+              workspaceId,
+              projectArtifact,
+              artifactSessionDir,
+              localCompletion: isReplay ? localCompletion : undefined,
+              abortSignal: options.abortSignal,
+            });
+            if (staleReason != null) {
+              projectResults.push({
+                projectPath: projectArtifact.projectPath,
+                projectName: projectArtifact.projectName,
+                status: "failed",
+                error: `A completion record says this project's patch was applied, but ${staleReason}.`,
+                note: mergeNotes(
+                  artifactLookupNote,
+                  "Verify the target repository's state, then re-run with force=true to re-apply the child's work."
+                ),
+              });
+              shouldStopAfterFailure = true;
+              continue;
+            }
             projectResults.push({
               projectPath: projectArtifact.projectPath,
               projectName: projectArtifact.projectName,
@@ -3580,29 +3651,18 @@ async function applyPatch(
         // before skipping so a workflow cannot checkpoint past missing work.
         // A project that cannot be resolved in this workspace can be neither
         // validated nor re-applied, so it keeps the legacy skip.
-        const alreadyAppliedRepoCwd =
-          repoTargetsByProjectPath.get(projectArtifact.projectPath)?.repoCwd ??
-          (artifact.projectArtifacts.length === 1 ? config.cwd : undefined);
-        const staleReason =
-          alreadyAppliedRepoCwd != null
-            ? await checkAppliedWorkStillPresent({
-                runtime: config.runtime,
-                runtimeTempDir: config.runtimeTempDir,
-                repoCwd: alreadyAppliedRepoCwd,
-                taskId,
-                workspaceId,
-                gitPrefix: await gitPrefixFor(alreadyAppliedRepoCwd),
-                projectArtifact,
-                artifactSessionDir,
-                recordedHeadSha: isReplay
-                  ? localCompletion?.headCommitSha
-                  : projectArtifact.appliedHeadSha,
-                recordedAcknowledged: isReplay
-                  ? localCompletion?.acknowledged === true
-                  : projectArtifact.appliedAcknowledged === true,
-                abortSignal: options.abortSignal,
-              })
-            : null;
+        const staleReason = await findStaleRecordedCompletion({
+          config,
+          repoCwd:
+            repoTargetsByProjectPath.get(projectArtifact.projectPath)?.repoCwd ??
+            (artifact.projectArtifacts.length === 1 ? config.cwd : undefined),
+          taskId,
+          workspaceId,
+          projectArtifact,
+          artifactSessionDir,
+          localCompletion: isReplay ? localCompletion : undefined,
+          abortSignal: options.abortSignal,
+        });
         if (staleReason != null) {
           projectResults.push({
             projectPath: projectArtifact.projectPath,

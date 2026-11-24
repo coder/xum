@@ -222,6 +222,12 @@ function sanitizeDirtyCaptureFields(
   ) {
     delete sanitized.worktreePatchSkippedReason;
   }
+  // Every writer pairs a skip reason with hadUncommittedChanges: true, and the
+  // apply gate and cleanup blocker both key on that flag, so a retained reason
+  // must keep the record dirty rather than let a flipped flag hide the work.
+  if (sanitized.worktreePatchSkippedReason !== undefined) {
+    sanitized.hadUncommittedChanges = true;
+  }
   if (sanitized.appliedPartial !== undefined && typeof sanitized.appliedPartial !== "boolean") {
     sanitized.appliedPartial = true;
   }

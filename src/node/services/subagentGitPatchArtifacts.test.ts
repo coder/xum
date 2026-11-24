@@ -692,11 +692,13 @@ describe("subagentGitPatchArtifacts", () => {
               projectArtifact("project-a", 0),
               projectArtifact("project-b", null),
               projectArtifact("project-c", ""),
+              // Type-valid but contradicted by the retained skip reason.
+              projectArtifact("project-d", false),
             ],
-            readyProjectCount: 3,
+            readyProjectCount: 4,
             failedProjectCount: 0,
             skippedProjectCount: 0,
-            totalCommitCount: 3,
+            totalCommitCount: 4,
           },
         },
       }),
@@ -707,7 +709,9 @@ describe("subagentGitPatchArtifacts", () => {
     // Coercing falsey corruption to false would erase the dirty-work
     // evidence the apply gate and cleanup deferral key on, while the skip
     // reason still records uncaptured work.
-    for (const artifact of file.artifactsByChildTaskId[childTaskId]?.projectArtifacts ?? []) {
+    const artifacts = file.artifactsByChildTaskId[childTaskId]?.projectArtifacts ?? [];
+    expect(artifacts).toHaveLength(4);
+    for (const artifact of artifacts) {
       expect(artifact.hadUncommittedChanges).toBe(true);
       expect(artifact.worktreePatchSkippedReason).toBe("diff exceeded the capture cap");
     }
