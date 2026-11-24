@@ -60,7 +60,7 @@ export interface WorkspaceUI {
     close(): Promise<void>;
     expectOpen(): Promise<void>;
     expectClosed(): Promise<void>;
-    selectSection(section: "General" | "Providers" | "Models"): Promise<void>;
+    selectSection(section: "Appearance" | "Providers" | "Models"): Promise<void>;
     expandProvider(providerName: string): Promise<void>;
   };
   readonly context: DemoProjectConfig;
@@ -694,7 +694,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       await expect(settingsDialog).toBeHidden({ timeout: 5000 });
     },
 
-    async selectSection(section: "General" | "Providers" | "Models"): Promise<void> {
+    async selectSection(section: "Appearance" | "Providers" | "Models"): Promise<void> {
       const sectionButton = settingsDialog.getByRole("button", { name: section, exact: true });
       await expect(sectionButton).toBeVisible();
       await sectionButton.click();

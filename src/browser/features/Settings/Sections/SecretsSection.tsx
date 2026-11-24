@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 import { Loader2, Trash2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
 import type { Secret } from "@/common/types/secrets";
@@ -537,6 +538,7 @@ export const SecretsSection: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      <SettingsMark id="secrets-editor" />
       <div className="flex items-start justify-between gap-4">
         <div>
           <p className="text-muted text-xs">

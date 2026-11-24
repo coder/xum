@@ -294,7 +294,16 @@ export const Settings: AppStory = {
   render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
   play: async ({ canvasElement }) => {
     const dialog = await openSettingsDialog(canvasElement);
-    await expectTokenTextsReadable(dialog, { "--color-muted": 3 });
+    // Settings rows describe themselves in the content tokens the rest of the app uses.
+    const found = await waitFor(
+      () => {
+        const texts = tokenTextContrasts(dialog, ["--color-content-secondary"]);
+        if (texts.length < 3) throw new Error(`expected 3+ secondary texts, found ${texts.length}`);
+        return texts;
+      },
+      { timeout: 15_000 }
+    );
+    await expectReadable(found.map((entry) => ({ ...entry, label: entry.token })));
   },
 };
 
@@ -705,7 +714,7 @@ const accentLinkStory = (theme: ThemeMode): AppStory => ({
     // it renders (light: 3.46:1 before #6449, flexoki-dark: 3.87:1 before #5946).
     const dialog = await openSettingsDialog(canvasElement);
     const section = await findTexts("selected Settings section", 1, () => [
-      within(dialog).getByRole("button", { name: "General" }),
+      within(dialog).getByRole("button", { name: "Appearance" }),
     ]);
     await expectReadable([...links, ...section]);
   },

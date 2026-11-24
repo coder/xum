@@ -44,6 +44,7 @@ describe("Known Models Integration", () => {
     ["gemini", /^google:gemini-.*pro/],
     ["argon", /^google:gemini-4-argon/],
     ["carbon", /^google:gemini-4-carbon/],
+    ["neon", /^google:gemini-4-neon/],
     ["gemini-flash", /^google:gemini-.*flash/],
     ["grok", /^xai:grok-/],
     ["muse", /^meta:muse-wonder-/],

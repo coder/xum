@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { SettingsMark } from "../Components/SettingsLayout";
 
 import { Button } from "@/browser/components/Button/Button";
 import { ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
@@ -110,6 +111,7 @@ export function CoderCanonicalRoutes() {
 
   return (
     <div className="border-border-light space-y-2 border-t pt-3">
+      <SettingsMark id="coder-model-routing" />
       <div>
         <label className="text-foreground block text-xs font-medium">Model routing</label>
         <p className="text-muted text-xs">

@@ -2,19 +2,23 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { Data, Effect } from "effect";
 import {
   APICallError,
-  Experimental_EvaluationUnsupportedQuestionTypeError,
+  Experimental_DecisionUnsupportedQuestionTypeError,
   InvalidArgumentError,
   InvalidResponseDataError,
   JSONParseError,
   TypeValidationError,
-  experimental_evaluate,
+  experimental_decide,
+  type Experimental_DecisionState,
 } from "ai";
 import type {
-  Experimental_EvaluationModelV4,
+  Experimental_DecisionModelV4,
+  JSONObject,
   JSONValue,
+  LanguageModelV4,
   SharedV4ProviderMetadata,
   SharedV4ProviderOptions,
 } from "@ai-sdk/provider";
+import { Experimental_DecisionLanguageModel } from "@ai-sdk/provider-utils/experimental-decision";
 import {
   EvaluationRoundingSchema,
   validateAnswersAgainstQuestions,
@@ -25,15 +29,16 @@ import {
   type EvaluationRounding,
   type EvaluationState,
 } from "@/common/types/evaluation";
+import { isGeminiNoOffModelName } from "@/common/utils/thinking/policy";
 import { isKnownOpenAIServiceTier } from "@/common/utils/tokens/serviceTierPricing";
 import { getAnthropicCacheWrite1hTokens } from "@/common/utils/tokens/usageHelpers";
 
 /**
- * Effect service around AI SDK `experimental_evaluate` for the workflow
+ * Effect service around AI SDK `experimental_decide` for the workflow
  * `evaluate()` primitive.
  *
- * This is the ONLY module that imports the experimental evaluation exports
- * from `ai`, so an SDK rename touches one file. The service is deliberately
+ * This module and auto model routing are the only importers of the experimental
+ * decision exports, so an SDK rename touches few files. The service is deliberately
  * narrow: it takes an already-resolved evaluation model instance plus state and
  * questions and returns validated answers with bounded metadata. Model
  * selection, admission, journaling and usage recording belong to the workflow
@@ -72,7 +77,105 @@ export class EvaluationError extends Data.TaggedError("EvaluationError")<{
   readonly billedUsage?: EvaluationBilledUsage;
 }> {}
 
-export type EvaluationModelInstance = Experimental_EvaluationModelV4;
+export type EvaluationModelInstance = Experimental_DecisionModelV4;
+
+/**
+ * An evaluation model that answers through one JSON `doGenerate` call on a chat
+ * model (provider-utils' DecisionLanguageModel). `.evaluationModel()` on
+ * @ai-sdk/openai and @ai-sdk/google now calls their native `/decisions`
+ * endpoints, which serve only dedicated decision models, so the gpt-* and gemini-*
+ * ids users pick keep the adapter those factories used before: the Responses
+ * model for OpenAI, the generateContent model for Google.
+ */
+export function evaluationModelFromLanguageModel(
+  model: LanguageModelV4,
+  providerName: "openai" | "google"
+): EvaluationModelInstance {
+  const decisionModel = new Experimental_DecisionLanguageModel({
+    model,
+    provider: `${providerName}.decision`,
+  });
+  const bareModelName = model.modelId.split("/").at(-1) ?? model.modelId;
+  return providerName === "google" && isGeminiNoOffModelName(bareModelName)
+    ? withGeminiLowThinkingDefault(decisionModel)
+    : decisionModel;
+}
+
+/**
+ * The adapter asks for reasoning "none", which @ai-sdk/google maps to
+ * `thinkingLevel: "minimal"` for Gemini 4 models. Gemini 3.8 Flash and Gemini 4
+ * Argon, Carbon and Neon have no minimal level (Neon and Carbon return HTTP 400), so
+ * default them to "low", their lowest level. A caller-supplied thinkingLevel wins; other
+ * google options merge, so a caller's `includeThoughts` keeps the "low" default.
+ */
+function withGeminiLowThinkingDefault(model: EvaluationModelInstance): EvaluationModelInstance {
+  // The wrapper hides the adapter's inner model; evaluate() needs it for billing capture.
+  installInnerBillingCapture(model);
+  return {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    modelId: model.modelId,
+    supportedQuestionTypes: model.supportedQuestionTypes,
+    doDecide: (options) =>
+      model.doDecide({
+        ...options,
+        providerOptions: {
+          ...options.providerOptions,
+          google: withLowThinkingLevel(options.providerOptions?.google),
+        },
+      }),
+  };
+}
+
+function withLowThinkingLevel(google: JSONObject | undefined): JSONObject {
+  const thinkingConfig = google?.thinkingConfig;
+  const callerConfig =
+    thinkingConfig != null && typeof thinkingConfig === "object" && !Array.isArray(thinkingConfig)
+      ? thinkingConfig
+      : {};
+  return { ...google, thinkingConfig: { thinkingLevel: "low", ...callerConfig } };
+}
+
+/**
+ * @ai-sdk/typesafe-ai (3.0.3x) rejects a null Score level before sending the request,
+ * while Xum's question schema and the workflow-authoring guide allow null levels
+ * ("no description"), and the TypeSafe API took them before. Levels are indexed from
+ * zero, so a null level is sent as its index.
+ */
+export function withTypeSafeScoreLevelLabels(
+  model: EvaluationModelInstance
+): EvaluationModelInstance {
+  return {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    modelId: model.modelId,
+    supportedQuestionTypes: model.supportedQuestionTypes,
+    doDecide: (options) =>
+      model.doDecide({
+        ...options,
+        questions: Object.fromEntries(
+          Object.entries(options.questions).map(([id, question]) => [
+            id,
+            question.type === "score"
+              ? {
+                  ...question,
+                  criteria: question.criteria.map((level, index) => level ?? String(index)),
+                }
+              : question,
+          ])
+        ),
+      }),
+  };
+}
+
+/**
+ * `experimental_decide` reads a top-level array as ordered state parts
+ * (text/json/file), so a JSON array state travels as one json part. Strings and
+ * objects keep their own SDK normalization.
+ */
+function toDecisionState(state: EvaluationState): Experimental_DecisionState {
+  return Array.isArray(state) ? [{ type: "json", value: state }] : state;
+}
 
 export interface EvaluationCall<Q extends EvaluationQuestions> {
   readonly model: EvaluationModelInstance;
@@ -233,8 +336,8 @@ const billingScope = new AsyncLocalStorage<BillingScope>();
 const INNER_BILLING_CAPTURE = Symbol("xum.evaluationInnerBillingCapture");
 
 /**
- * provider-utils' `EvaluationLanguageModel` (behind the OpenAI, Anthropic and
- * Google `.evaluationModel()`) validates answers inside `doEvaluate` and throws
+ * provider-utils' `DecisionLanguageModel` (behind Anthropic's `.decisionModel()`
+ * and `evaluationModelFromLanguageModel`) validates answers inside `doDecide` and throws
  * before returning usage, so a billed response it rejects would never reach the
  * ledger (#4728). It keeps the wrapped LanguageModelV4 on `model`, an SDK
  * internal pinned by a contract test. Wrap that instance's `doGenerate` once;
@@ -274,7 +377,7 @@ export function installInnerBillingCapture(model: EvaluationModelInstance): void
 }
 
 /**
- * Per-call view of the model that records what `doEvaluate` returned, so the
+ * Per-call view of the model that records what `doDecide` returned, so the
  * SDK's own answer validation (which throws after this returns) cannot drop it.
  */
 function withBillingCapture(
@@ -286,8 +389,8 @@ function withBillingCapture(
     provider: model.provider,
     modelId: model.modelId,
     supportedQuestionTypes: model.supportedQuestionTypes,
-    doEvaluate: async (options) => {
-      const result = await model.doEvaluate(options);
+    doDecide: async (options) => {
+      const result = await model.doDecide(options);
       scope.billed = projectBilledUsage(result.usage, result.providerMetadata);
       return result;
     },
@@ -328,7 +431,7 @@ export function createEvaluationBillingCapture(
  * `cause`, request values and `data` payloads are dropped here.
  */
 export function classifyEvaluationError(error: unknown): EvaluationError {
-  if (Experimental_EvaluationUnsupportedQuestionTypeError.isInstance(error)) {
+  if (Experimental_DecisionUnsupportedQuestionTypeError.isInstance(error)) {
     return new EvaluationError({ reason: "unsupported", code: "unsupported-question-type" });
   }
   if (InvalidArgumentError.isInstance(error)) {
@@ -406,14 +509,14 @@ export function makeEvaluationService(): EvaluationService {
           // rejection is discarded by the runtime as interruption, not mapped
           // into an EvaluationError.
           try: (signal) => {
-            // experimental_evaluate logs provider warnings unless this global is false, and a
+            // experimental_decide logs provider warnings unless this global is false, and a
             // warning can echo the evaluated state. Set it here instead of relying on
             // streamManager having been imported first (#4363).
             globalThis.AI_SDK_LOG_WARNINGS = false;
             return capture.run(() =>
-              experimental_evaluate({
+              experimental_decide({
                 model: capture.model,
-                state: call.state,
+                state: toDecisionState(call.state),
                 questions: call.questions,
                 providerOptions: call.providerOptions,
                 abortSignal: signal,

@@ -13,7 +13,8 @@ import type {
 } from "./streamManager";
 import { fakeStreamText } from "./streamManager.testHarness";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
-import type { LanguageModel, ModelMessage, streamText } from "ai";
+import type { ModelMessage, streamText } from "ai";
+import type { LanguageModelV4 } from "@ai-sdk/provider";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -41,9 +42,9 @@ export function installStreamManagerTestHistory(): void {
 export function createTestLanguageModel(
   modelId = "cleanup-model",
   provider = "test"
-): LanguageModel {
+): LanguageModelV4 {
   return {
-    specificationVersion: "v3",
+    specificationVersion: "v4",
     provider,
     modelId,
     supportedUrls: {},
@@ -58,10 +59,20 @@ export const TEST_USAGE = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
 export const LOCAL_TEST_RUNTIME = createRuntime({ type: "local", srcBaseDir: "/tmp" });
 
+/**
+ * TurnExecutionOptions with `K` required and every other key optional. The
+ * required keys are Omit-ted from the Partial half: `Partial<T> & Pick<T, "model">`
+ * intersects `LanguageModel | undefined` with `LanguageModel` (a ~500-member gateway
+ * id union in ai 7.0.17x), which exceeds TypeScript's union cross-product limit (TS2590).
+ */
+export type TurnOptionsWith<K extends keyof TurnExecutionOptions> = Partial<
+  Omit<TurnExecutionOptions, K>
+> &
+  Pick<TurnExecutionOptions, K>;
+
 /** Base startStream options; scenarios override only what they assert. */
 export function testStartOptions(
-  overrides: Partial<TurnExecutionOptions> &
-    Pick<TurnExecutionOptions, "workspaceId" | "messageId" | "model">
+  overrides: TurnOptionsWith<"workspaceId" | "messageId" | "model">
 ): TurnExecutionOptions {
   return {
     messages: [{ role: "user", content: "hello" }],

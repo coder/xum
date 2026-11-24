@@ -26,6 +26,7 @@ import {
   anthropicRejectsDisabledThinking,
   isGpt6LunaModel,
   isGrokFrontierModel,
+  openaiGptTier,
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { Ok, Err } from "@/common/types/result";
@@ -43,6 +44,8 @@ import {
 } from "@/common/utils/ai/evaluationModels";
 import { computeConfigFingerprint } from "@/node/services/evaluation/evaluationDigest";
 import {
+  evaluationModelFromLanguageModel,
+  withTypeSafeScoreLevelLabels,
   installInnerBillingCapture,
   type EvaluationModelInstance,
 } from "@/node/services/evaluation/evaluationService";
@@ -636,11 +639,74 @@ function withOpenAICyberAccessProgram(
 }
 
 /**
- * Preserve OpenAI request options that @ai-sdk/openai drops by model-name capability
- * checks, without rewriting the raw model/endpoint routing identity.
+ * Names of the function tools a call leaves without a strict mode. Since 4.0.77
+ * (2abd503), @ai-sdk/openai sends `strict: false` for them on Responses; before, it
+ * omitted the key, and OpenAI then applies strict mode, which schemaSanitizer's
+ * nullable widening of optional properties is built for. Chat Completions still
+ * omits an unset `strict`, and its tools carry no top-level `name`.
+ */
+function unsetStrictFunctionToolNames(
+  tools: LanguageModelV4CallOptions["tools"]
+): ReadonlySet<string> {
+  return new Set(
+    (tools ?? []).flatMap((tool) =>
+      tool.type === "function" && tool.strict === undefined ? [tool.name] : []
+    )
+  );
+}
+
+/** Drop the SDK's defaulted `strict: false` from those Responses function tools. */
+function withoutDefaultedToolStrict(
+  body: Record<string, unknown>,
+  names: ReadonlySet<string>
+): Record<string, unknown> {
+  if (!Array.isArray(body.tools)) return body;
+  return {
+    ...body,
+    tools: body.tools.map((tool: unknown) => {
+      if (!isPlainObject(tool) || tool.strict !== false || tool.type !== "function") return tool;
+      if (typeof tool.name !== "string" || !names.has(tool.name)) return tool;
+      const { strict: _defaulted, ...rest } = tool;
+      return rest;
+    }),
+  };
+}
+
+/**
+ * A model whose Responses requests omit `strict` on the function tools a call left
+ * unset (see unsetStrictFunctionToolNames). A model on another wire is returned as
+ * built. Per-call models keep concurrent calls' tool sets independent.
+ */
+function withUnsetToolStrictOmitted(
+  createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
+  baseFetch: typeof fetch
+): LanguageModelV4 {
+  const model = createModel(baseFetch);
+  // `${providerName}.responses` is the SDK's provider id for its Responses model.
+  if (!model.provider.endsWith(".responses")) return model;
+  const modelForCall = (params: LanguageModelV4CallOptions): LanguageModelV4 => {
+    const names = unsetStrictFunctionToolNames(params.tools);
+    if (names.size === 0) return model;
+    return createModel(
+      wrapFetchWithJsonBodyPatch(baseFetch, (body) => withoutDefaultedToolStrict(body, names))
+    );
+  };
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      wrapGenerate: ({ params }) => modelForCall(params).doGenerate(params),
+      wrapStream: ({ params }) => modelForCall(params).doStream(params),
+    },
+  });
+}
+
+/**
+ * Preserve OpenAI request options that @ai-sdk/openai drops or defaults by model-name
+ * capability checks, without rewriting the raw model/endpoint routing identity.
  */
 function createOpenAIModelWithPreservedOptions(
-  createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
+  createSdkModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
   baseFetch: typeof fetch,
   options: {
     serviceTierAvailable: boolean;
@@ -649,6 +715,9 @@ function createOpenAIModelWithPreservedOptions(
     cyberAccessProgramAvailable?: boolean;
   }
 ): LanguageModelV4 {
+  // Every model built here, per-call ones included, omits an unset tool `strict`.
+  const createModel = (fetch: typeof globalThis.fetch) =>
+    withUnsetToolStrictOmitted(createSdkModel, fetch);
   const model = createModel(baseFetch);
   // @ai-sdk/openai (through at least 4.0.72) allowlists GPT-6 reasoning efforts
   // without "none" and silently strips it, but Luna accepts "none" and OpenAI
@@ -1407,8 +1476,8 @@ export function withAnthropicEvaluationEffort(
     provider: model.provider,
     modelId: model.modelId,
     supportedQuestionTypes: model.supportedQuestionTypes,
-    doEvaluate: (options) =>
-      model.doEvaluate({
+    doDecide: (options) =>
+      model.doDecide({
         ...options,
         providerOptions: {
           ...options.providerOptions,
@@ -1560,6 +1629,7 @@ const CODEX_ALLOWED_PARAMS = new Set([
   "store",
   "prompt_cache_key",
   "reasoning",
+  "service_tier",
   "temperature",
   "top_p",
   "include",
@@ -1619,13 +1689,10 @@ function extractTextContent(content: unknown): string {
   return "";
 }
 
-export function normalizeCodexResponsesBody(body: string): string {
-  const json = JSON.parse(body) as Record<string, unknown>;
-
-  // ChatGPT's Codex endpoint is stricter than the public OpenAI Responses API
-  // and currently rejects the `truncation` field entirely.
-  delete json.truncation;
-
+function normalizeCodexOptions(
+  json: Record<string, unknown>,
+  modelTier: ReturnType<typeof openaiGptTier>
+): void {
   // Strip the native pro-mode field before forwarding to the stricter ChatGPT
   // backend. Unknown nested reasoning fields risk a hard 4xx, and falling back
   // to standard mode is safer. Preserve effort/summary.
@@ -1635,6 +1702,27 @@ export function normalizeCodexResponsesBody(body: string): string {
       delete json.reasoning;
     }
   }
+
+  // Forward only paid speed tiers that Codex accepts. Standard omits the field.
+  if (
+    json.service_tier !== "priority" &&
+    !(json.service_tier === "ultrafast" && modelTier?.ultrafast === true)
+  ) {
+    delete json.service_tier;
+  }
+}
+
+export function normalizeCodexResponsesBody(
+  body: string,
+  modelTier?: ReturnType<typeof openaiGptTier>
+): string {
+  const json = JSON.parse(body) as Record<string, unknown>;
+
+  // ChatGPT's Codex endpoint is stricter than the public OpenAI Responses API
+  // and currently rejects the `truncation` field entirely.
+  delete json.truncation;
+
+  normalizeCodexOptions(json, modelTier);
 
   // Codex-compatible Responses requests must disable storage and strip unsupported params.
   json.store = false;
@@ -2501,6 +2589,8 @@ export class ProviderModelFactory {
           // Includes request-level overrides from muxProviderOptions, not just config.
           const effectiveWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
 
+          const capabilityModel = resolveModelForMetadata(fullModelId, providersConfig);
+          const modelTier = openaiGptTier(capabilityModel);
           const baseFetch = getProviderFetch(providerConfig);
           const codexOauthService = self.oauthServices?.codexOauthService;
           const webSocketTransportEnabled =
@@ -2557,7 +2647,7 @@ export class ProviderModelFactory {
                     nextInit = {
                       ...init,
                       headers,
-                      body: normalizeCodexResponsesBody(body),
+                      body: normalizeCodexResponsesBody(body, modelTier),
                     };
                   } catch {
                     // If body isn't JSON, fall through to normal fetch (but still allow Codex routing).
@@ -2630,20 +2720,17 @@ export class ProviderModelFactory {
               ? provider.chat(modelId)
               : provider.responses(modelId);
           };
-          // Reuse the same transport across per-call adapters. Inject tiers before
-          // its HTTP/WebSocket dispatch, and keep OAuth's normalization unchanged.
-          // Mappings are metadata, not authority over the raw/proxy model's tier support.
+          // Inject tiers before dispatch. Use the Codex backend's tier rules, not the SDK's
+          // API model rules, for OAuth. Mapped IDs also need to bypass the SDK's model rules.
           // Explicit mappings forward the requested tier for upstream validation;
           // only unmapped native IDs retain the SDK's name-based restrictions.
-          const capabilityModel = resolveModelForMetadata(fullModelId, providersConfig);
           const isMappedAlias = capabilityModel !== fullModelId;
           const preservedModel = createOpenAIModelWithPreservedOptions(
             createNativeModel,
             webSocketTransport.fetch,
             {
-              // Codex OAuth keeps its existing tier behavior; only effort is preserved.
               serviceTierAvailable:
-                !shouldRouteThroughCodexOauth && serviceTierAvailable && isMappedAlias,
+                shouldRouteThroughCodexOauth || (serviceTierAvailable && isMappedAlias),
               wireModelId: modelId,
               // Codex OAuth needs no gate: normalizeCodexResponsesBody's allowlist drops access_programs.
               cyberAccessProgramAvailable: true,
@@ -3236,7 +3323,7 @@ export class ProviderModelFactory {
             providerDef.import()
           )) as Record<
             string,
-            (config: Record<string, unknown>) => (modelId: string) => LanguageModel
+            (config: Record<string, unknown>) => (modelId: string) => LanguageModelV4
           >;
           const factory = providerModule[providerDef.factoryName];
           if (!factory) {
@@ -3254,11 +3341,14 @@ export class ProviderModelFactory {
           };
 
           const providerFetch = getProviderFetch(providerConfig);
-          const provider = factory({
-            ...configWithCreds,
-            fetch: providerFetch,
-          });
-          return Ok(provider(modelId));
+          // Meta serves the OpenAI Responses wire through @ai-sdk/openai; other generic
+          // providers' models come back as built.
+          return Ok(
+            withUnsetToolStrictOmitted(
+              (fetch) => factory({ ...configWithCreds, fetch })(modelId),
+              providerFetch
+            )
+          );
         }
 
         return Err({
@@ -3552,7 +3642,7 @@ export class ProviderModelFactory {
             PROVIDER_REGISTRY.anthropic()
           );
           model = withAnthropicEvaluationEffort(
-            createAnthropic({ ...normalizedConfig, fetch: providerFetch }).evaluationModel(modelId),
+            createAnthropic({ ...normalizedConfig, fetch: providerFetch }).decisionModel(modelId),
             modelId
           );
           break;
@@ -3570,8 +3660,9 @@ export class ProviderModelFactory {
             ...(creds.organization && { organization: creds.organization }),
           };
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          model = createOpenAI({ ...configWithCreds, fetch: providerFetch }).evaluationModel(
-            modelId
+          model = evaluationModelFromLanguageModel(
+            createOpenAI({ ...configWithCreds, fetch: providerFetch }).responses(modelId),
+            "openai"
           );
           break;
         }
@@ -3589,10 +3680,10 @@ export class ProviderModelFactory {
           const { createGoogleGenerativeAI } = yield* Effect.promise(async () =>
             PROVIDER_REGISTRY.google()
           );
-          model = createGoogleGenerativeAI({
-            ...configWithCreds,
-            fetch: providerFetch,
-          }).evaluationModel(modelId);
+          model = evaluationModelFromLanguageModel(
+            createGoogleGenerativeAI({ ...configWithCreds, fetch: providerFetch }).chat(modelId),
+            "google"
+          );
           break;
         }
         case TYPESAFE_PROVIDER_KEY: {
@@ -3603,12 +3694,14 @@ export class ProviderModelFactory {
           // and trimmed it; the raw `configuredBaseURL` would embed a stray
           // space before the SDK's `/systemone` suffix.
           effectiveBaseURL = creds.baseUrl;
-          model = createTypeSafeAi({
-            apiKey: creds.apiKey,
-            ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
-            headers: providerConfig.headers,
-            fetch: providerFetch,
-          }).evaluationModel(modelId);
+          model = withTypeSafeScoreLevelLabels(
+            createTypeSafeAi({
+              apiKey: creds.apiKey,
+              ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
+              headers: providerConfig.headers,
+              fetch: providerFetch,
+            }).decisionModel(modelId)
+          );
           break;
         }
       }

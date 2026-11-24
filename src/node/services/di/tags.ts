@@ -176,7 +176,7 @@ export class AutoModelRouterTag extends Context.Service<AutoModelRouterTag, Auto
   "xum/AutoModelRouter"
 ) {}
 
-/** Headless `experimental_evaluate` wrapper for the workflow `evaluate()` primitive. */
+/** Headless `experimental_decide` wrapper for the workflow `evaluate()` primitive. */
 export class Evaluation extends Context.Service<Evaluation, EvaluationService>()(
   "xum/Evaluation"
 ) {}

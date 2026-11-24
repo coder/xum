@@ -45,6 +45,17 @@ export function usePhoneTouchViewport(): boolean {
   return useSyncExternalStore(subscribePhoneTouch, getPhoneTouchSnapshot, getServerSnapshot);
 }
 
+// Exactly the complement of Tailwind's `md:` (min-width: 48rem). NARROW_VIEWPORT_QUERY includes
+// 768px itself, where `md:` already applies, so a layout styled with `md:` must switch on this.
+const BELOW_MD_QUERY = "(width < 48rem)";
+const subscribeBelowMd = (onChange: () => void) => subscribeToQuery(BELOW_MD_QUERY, onChange);
+const getBelowMdSnapshot = () => queryMatches(BELOW_MD_QUERY);
+
+/** True below Tailwind's `md:` breakpoint: for layouts whose CSS switches with `md:`/`max-md:`. */
+export function useBelowMdViewport(): boolean {
+  return useSyncExternalStore(subscribeBelowMd, getBelowMdSnapshot, getServerSnapshot);
+}
+
 /** True at short viewport heights, such as a phone in landscape. */
 export function useShortViewport(): boolean {
   return useSyncExternalStore(subscribeShort, getShortSnapshot, getServerSnapshot);

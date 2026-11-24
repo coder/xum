@@ -356,16 +356,17 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash, Argon and Carbon but not older Flash", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash, Argon, Carbon and Neon but not older Flash", () => {
     // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
     // request envelope and debug snapshots agree with what the Google adapter sends.
-    // Argon and Carbon have no "off" either; unclamped, they would run at their medium default.
+    // Argon, Carbon and Neon have no "off" either; unclamped, they would run at their own default.
     for (const model of [
       "google:gemini-3.8-flash",
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-4-argon",
       "google:gemini-4-carbon",
       "google-vertex:gemini-4-carbon-cyber-permissive",
+      "google:gemini-4-neon",
     ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
@@ -563,6 +564,16 @@ describe("getThinkingPolicyForModel", () => {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
       expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("high");
+    }
+  });
+
+  test("returns low/medium/high/xhigh (no off) for Gemini 4 Neon", () => {
+    for (const model of ["google:gemini-4-neon", "google-vertex:gemini-4-neon"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high", "xhigh"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("xhigh");
+      expect(enforceThinkingPolicy(model, "max")).toBe("xhigh");
     }
   });
 
