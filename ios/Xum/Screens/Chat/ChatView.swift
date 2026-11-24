@@ -457,14 +457,15 @@ struct ChatView: View {
     }
 
     /// A send needs the whole transcript (the desktop's transcript barrier: a send on partial
-    /// history acts on what the user cannot see) and this server's models (until they load, the
-    /// default and the built-in fallback list can name models it does not route).
-    private func canDispatch(_ store: ChatStore) -> Bool { store.caughtUp && model.modelsLoaded }
+    /// history acts on what the user cannot see), the stored draft (a send writes the composer
+    /// text over it) and this server's models (until they load, the default and the built-in
+    /// fallback list can name models it does not route).
+    private func canDispatch(_ store: ChatStore) -> Bool { store.caughtUp && store.draft.loaded && model.modelsLoaded }
 
     private func modelReady(_ store: ChatStore) -> Bool {
         if canDispatch(store) { return true }
-        store.report(store.caughtUp ? "This server's models are still loading. Try again in a moment."
-                                    : "The chat is still loading. Try again in a moment.")
+        store.report(store.caughtUp && store.draft.loaded ? "This server's models are still loading. Try again in a moment."
+                                                          : "The chat is still loading. Try again in a moment.")
         return false
     }
 

@@ -30,6 +30,9 @@ final class ComposerDraft {
     /// The visible text (without the text pending sends retain).
     private(set) var text = ""
     private(set) var pendingSends: [PendingSend] = []
+    /// Whether a server view of the draft has arrived. Until then an edit is kept but not
+    /// written: the write would replace a draft another client already holds.
+    private(set) var loaded = false
     /// Sends whose last answer was unknown or a failed lookup: still being resolved.
     var unresolvedCount: Int { pendingSends.filter { isUnresolved($0.sendId) }.count }
     /// A send the backend did not accept, with its reason (its text is back in the composer).
@@ -138,15 +141,26 @@ final class ComposerDraft {
     private func applyView(_ v: JSONValue) {
         guard let r = v["revision"]?.double, r >= revision else { return }
         revision = r
+        let first = !loaded
+        loaded = true
         pendingSends = (v["pendingSends"]?.array ?? []).compactMap(Self.pendingSend)
-        if !dirty { text = v["text"]?.string ?? "" }
+        let remote = v["text"]?.string ?? ""
+        if !dirty {
+            text = remote
+        } else if first {
+            // Text set before the draft loaded goes after the stored draft, once.
+            text = remote.components(separatedBy: "\n\n").contains(text) ? remote : Self.join(remote, text)
+            scheduleWrite()
+        }
         lastStatus = lastStatus.filter { id, _ in pendingSends.contains { $0.sendId == id } }
     }
 
     private func applyDeleted(revision r: Double?) {
         if let r { guard r >= revision else { return }; revision = r }
+        let first = !loaded
+        loaded = true
         pendingSends = []
-        if !dirty { text = "" }
+        if !dirty { text = "" } else if first { scheduleWrite() }
     }
 
     static func pendingSend(_ v: JSONValue) -> PendingSend? {
@@ -164,7 +178,7 @@ final class ComposerDraft {
         }
         text = new
         edit += 1
-        scheduleWrite()
+        if loaded { scheduleWrite() }
     }
 
     /// Puts returned text in front of what the composer holds (the web's `restore` mode: a newer

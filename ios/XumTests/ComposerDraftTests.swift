@@ -237,6 +237,22 @@ struct ComposerDraftTests {
         #expect(server.bodies("workspace/sendMessage").count == 1)
     }
 
+    /// Typing before the stored draft arrives must not overwrite another client's draft.
+    @Test func textSetBeforeTheDraftLoadsGoesAfterTheStoredDraft() async throws {
+        let server = FakeServer()
+        let d = draft(server)
+        d.setText("mine")
+        try await Task.sleep(for: ComposerDraft.writeDelay * 2)
+        #expect(server.bodies("drafts/update").isEmpty)
+        d.applyEvent(["type": "snapshot", "drafts": [[
+            "scope": ["kind": "workspace", "workspaceId": "ws"], "text": "theirs", "attachments": [], "revision": 1,
+            "pendingSends": [],
+        ]]])
+        #expect(d.text == "theirs\n\nmine")
+        try await Task.sleep(for: ComposerDraft.writeDelay * 2)
+        #expect(server.bodies("drafts/update").last?["text"]?.string == "theirs\n\nmine")
+    }
+
     @Test func aRestoreSkipsSendsTheDraftStillHolds() {
         let store = ChatStore(workspaceId: "ws", client: APIClient(baseURL: URL(string: "http://127.0.0.1:1")!, token: "t"))
         store.draft.applyEvent(["type": "snapshot", "drafts": [[

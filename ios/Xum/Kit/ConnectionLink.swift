@@ -1,7 +1,8 @@
 import Foundation
 
 /// A Xum connection link: `<baseUrl>/?token=<urlencoded token>` (the "Open in browser" link that
-/// `xum server` prints). Also accepts `xum://connect?url=<baseUrl>&token=<token>`.
+/// `xum server` prints). Never a `xum://` link: any app can register that scheme, and an app
+/// that receives it reads the token.
 struct ConnectionLink: Equatable, Sendable {
     var baseURL: URL
     var token: String
@@ -38,12 +39,6 @@ struct ConnectionLink: Equatable, Sendable {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let comps = URLComponents(string: trimmed), let scheme = comps.scheme?.lowercased() else { return nil }
         let items = comps.queryItems ?? []
-        if scheme == "xum" {
-            guard let u = items.first(where: { $0.name == "url" })?.value,
-                  let t = items.first(where: { $0.name == "token" })?.value,
-                  let inner = parse("\(u)?token=\(t.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? t)") else { return nil }
-            return inner
-        }
         guard scheme == "http" || scheme == "https", let host = comps.host, !host.isEmpty,
               let token = items.first(where: { $0.name == "token" })?.value, !token.isEmpty else { return nil }
         var base = URLComponents()

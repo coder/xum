@@ -173,7 +173,7 @@ final class AppModel {
         list?.clearAttention(workspaceId)
     }
 
-    /// `xum://connect?url=…&token=…` and `http(s)://host/?token=…` open the link sheet prefilled.
+    /// `http(s)://host/?token=…` opens the link sheet prefilled; a `xum://` link never carries a token.
     func handle(url: URL) {
         let raw = url.absoluteString
         if url.scheme == "xum", url.host() == "open", let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "workspace" })?.value {
@@ -206,9 +206,11 @@ final class AppModel {
         }
         #if DEBUG
         // Simulator automation: `xum://connect?url=…&token=…&auto=1` saves without the sheet.
-        if url.scheme == "xum", URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains(where: { $0.name == "auto" }) == true,
-           let link = ConnectionLink.parse(raw) {
-            addServer(link, name: URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "name" })?.value ?? link.suggestedName, version: nil)
+        if url.scheme == "xum", let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+           items.contains(where: { $0.name == "auto" }),
+           let u = items.first(where: { $0.name == "url" })?.value, let t = items.first(where: { $0.name == "token" })?.value,
+           let link = ConnectionLink.parse("\(u)?token=\(t.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? t)") {
+            addServer(link, name: items.first(where: { $0.name == "name" })?.value ?? link.suggestedName, version: nil)
             return
         }
         #endif
