@@ -9,6 +9,8 @@ struct Composer: View {
     var placeholder: String
     var isStreaming: Bool
     var contextFraction: Double?
+    /// False while the chat cannot take a send yet (transcript or models still loading).
+    var ready = true
     var onSend: () -> Void
     var onStop: () -> Void
 
@@ -16,7 +18,7 @@ struct Composer: View {
     @State private var showPicker = false
 
     private var canSend: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        ready && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {

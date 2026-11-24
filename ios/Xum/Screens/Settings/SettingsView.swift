@@ -25,7 +25,8 @@ struct SettingsView: View {
         .background(Color.xBg2.ignoresSafeArea())
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(sidebar ? .large : .automatic)
-        .task(id: model.servers.currentID) { await loadStats() }
+        // Agent discovery needs a project, which a just-switched server lists a moment later.
+        .task(id: "\(model.servers.currentID ?? "")|\(model.list?.projects.isEmpty ?? true)") { await loadStats() }
     }
 
     static var appVersion: String {

@@ -247,6 +247,13 @@ final class WorkspaceInfoStore {
         let r = try await client.call("workspace/executeBash", ["workspaceId": .string(workspaceId), "script": .string(script),
                                                                 "options": ["timeout_secs": 15]])
         let result = r["data"] ?? r
+        // Partial output (a timeout, a failure, the output cap) must not read as the whole diff.
+        if result["success"]?.bool == false {
+            throw APIError.rejected(result["error"]?.string ?? "The git command failed")
+        }
+        if let cut = result["truncated"], !cut.isNull {
+            throw APIError.rejected("The diff is too large to show here (\(cut["reason"]?.string ?? "output limit"))")
+        }
         return result["output"]?.string ?? ""
     }
 

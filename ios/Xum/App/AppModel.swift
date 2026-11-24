@@ -239,11 +239,16 @@ final class AppModel {
     struct UnsentFirstMessage {
         var reason: String
         var text: String?
+        /// The server the workspace lives on: another server can list the same workspace ID.
+        var serverID: String?
     }
 
     /// The unsent first message of each workspace, until its chat takes it.
     private(set) var unsentFirstMessages: [String: UnsentFirstMessage] = [:]
-    func takeUnsentFirstMessage(_ workspaceId: String) -> UnsentFirstMessage? { unsentFirstMessages.removeValue(forKey: workspaceId) }
+    func takeUnsentFirstMessage(_ workspaceId: String) -> UnsentFirstMessage? {
+        guard unsentFirstMessages[workspaceId]?.serverID == servers.currentID else { return nil }
+        return unsentFirstMessages.removeValue(forKey: workspaceId)
+    }
 
     /// The web creation flow's first send: no client send id (the backend mints one) and no
     /// draft entry. `sendMessage` returns only when the turn ends, so the new workspace opens
@@ -252,6 +257,7 @@ final class AppModel {
     /// transferDraftToWorkspace), else back to the chat, which puts it in front of the draft.
     private func startFirstSend(_ c: APIClient, _ id: String, _ message: String, model: String, agentId: String, thinking: ThinkingLevel) {
         let opts: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue)]
+        let serverID = servers.currentID
         Task {
             do {
                 try await c.call("workspace/sendMessage", ["workspaceId": .string(id), "message": .string(message), "options": .object(opts)])
@@ -268,7 +274,7 @@ final class AppModel {
                    (try? await c.call("drafts/update", ["scope": scope, "text": .string(message)])) != nil {
                     kept = nil
                 }
-                unsentFirstMessages[id] = UnsentFirstMessage(reason: error.localizedDescription, text: kept)
+                unsentFirstMessages[id] = UnsentFirstMessage(reason: error.localizedDescription, text: kept, serverID: serverID)
             }
         }
         Task { await list?.refresh() }

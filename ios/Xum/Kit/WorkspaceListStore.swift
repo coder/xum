@@ -211,7 +211,8 @@ final class WorkspaceListStore {
     }
 
     func scan(_ id: String) async {
-        guard workspace(id)?.isSideChat != true else { attention[id] = nil; return }
+        // Only workspaces this server lists: a chat of the previous server can still ask on its way out.
+        guard let w = workspace(id), !w.isSideChat else { attention[id] = nil; return }
         let store = ChatStore(workspaceId: id, client: client)
         do {
             for try await ev in client.subscribe("workspace/onChat", ["workspaceId": .string(id), "mode": ["type": "full"]]) {

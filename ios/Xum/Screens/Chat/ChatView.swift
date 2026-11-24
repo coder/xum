@@ -73,7 +73,10 @@ struct ChatView: View {
         // saves its agent and settings after that.
         .onChange(of: savedSettings) { if !settingsEdited { seedSettings() } }
         // The project's review base needs its path, which late metadata brings too.
-        .onChange(of: workspace?.projectPath) { info?.projectPath = workspace?.projectPath }
+        .onChange(of: workspace?.projectPath) {
+            info?.projectPath = workspace?.projectPath
+            if let info, info.changesLoaded { Task { await info.loadChanges() } }
+        }
         // Opening a chat does not answer it: rescan so a question or plan stays in the Inbox.
         .onDisappear { if let list = model.list { Task { await list.scan(workspaceId) } } }
         // Regular width (iPhone Duo inner display): the tool detail is a persistent side panel
@@ -138,7 +141,9 @@ struct ChatView: View {
     /// here (AppModel.startFirstSend).
     private func takeUnsentFirstMessage() {
         guard let store, let unsent = model.takeUnsentFirstMessage(workspaceId) else { return }
-        if let text = unsent.text, !store.draft.text.contains(text) { restoreToComposer(text) }
+        // Skip only a draft that holds it as a whole block (a write whose reply was lost), never
+        // a follow-up that merely contains the same words.
+        if let text = unsent.text, !store.draft.text.components(separatedBy: "\n\n").contains(text) { restoreToComposer(text) }
         store.report("The first message did not send: \(unsent.reason)")
     }
 
@@ -152,11 +157,19 @@ struct ChatView: View {
         seedSettings()
     }
 
+    /// Retried with backoff while the task runs: a plan whose text is only in its file has no
+    /// Implement until this read succeeds.
     private func loadPlanFile() async {
         guard scenePhase == .active, let toolId = store?.latestPlanToolId, let c = model.servers.currentClient else { return }
-        guard let r = try? await c.call("workspace/getPlanContent", ["workspaceId": .string(workspaceId)]),
-              let content = r["data"]?["content"]?.string, store?.latestPlanToolId == toolId else { return }
-        planFile = (toolId, content)
+        var delay: UInt64 = 1
+        while !Task.isCancelled {
+            if let r = try? await c.call("workspace/getPlanContent", ["workspaceId": .string(workspaceId)]) {
+                if let content = r["data"]?["content"]?.string, store?.latestPlanToolId == toolId { planFile = (toolId, content) }
+                return
+            }
+            try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+            delay = min(delay * 2, 30)
+        }
     }
 
     private var savedSettings: [JSONValue?] { [workspace?.raw["agentId"], workspace?.raw["aiSettingsByAgent"]] }
@@ -410,6 +423,7 @@ struct ChatView: View {
                     placeholder: store.isStreaming ? "Queue a follow-up" : "Message \(workspace?.displayName ?? "agent")",
                     isStreaming: store.isStreaming,
                     contextFraction: store.contextTokens.map { min(1, Double($0) / Double(ModelName.contextWindow(store.lastModel ?? modelId))) },
+                    ready: canDispatch(store),
                     onSend: { send(store) },
                     onStop: { Task { try? await store.interrupt() } }
                 )
@@ -442,11 +456,15 @@ struct ChatView: View {
         ["model": .string(modelId), "agentId": .string(agent), "thinkingLevel": .string(thinking.rawValue)]
     }
 
-    /// The composer's model is one this server routes: its own saved pick, or anything once the
-    /// server's catalog and default have loaded (until then the default can be the last server's).
+    /// A send needs the whole transcript (the desktop's transcript barrier: a send on partial
+    /// history acts on what the user cannot see) and this server's models (until they load, the
+    /// default and the built-in fallback list can name models it does not route).
+    private func canDispatch(_ store: ChatStore) -> Bool { store.caughtUp && model.modelsLoaded }
+
     private func modelReady(_ store: ChatStore) -> Bool {
-        if model.modelsLoaded || pickedModel.map(model.modelChoices.contains) == true { return true }
-        store.report("This server's models are still loading. Try again in a moment.")
+        if canDispatch(store) { return true }
+        store.report(store.caughtUp ? "This server's models are still loading. Try again in a moment."
+                                    : "The chat is still loading. Try again in a moment.")
         return false
     }
 

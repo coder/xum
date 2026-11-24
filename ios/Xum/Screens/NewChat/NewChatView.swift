@@ -368,8 +368,9 @@ struct NewChatView: View {
 
     private var canSend: Bool {
         !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !sending && !busy
-            // The previous server's default model may not route here.
-            && (model.modelsLoaded || pickedModel.map(model.modelChoices.contains) == true)
+            // The previous server's default, or a built-in picked from the fallback list, may not
+            // route here.
+            && model.modelsLoaded
     }
 
     /// A workspace start needs a project; scratch chats always work.
