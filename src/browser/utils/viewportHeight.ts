@@ -105,7 +105,7 @@ export function installViewportHeightSync(): () => void {
   // landscape height, and no later resize follows, so the app kept filling only the old height.
   // Folding the iPhone Duo does the same once iosCoverColumn.ts has taken the cover display's
   // column back, and its height arrives about three frames later, so a next-frame re-read misses
-  // it. The viewport box above syncs again once the new layout exists.
+  // it. observeLayoutViewportSize syncs again once the new layout exists.
   const removeLayoutObserver = observeLayoutViewportSize(
     syncViewportHeight,
     "Viewport height sync"
