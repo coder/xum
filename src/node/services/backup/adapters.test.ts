@@ -1223,7 +1223,7 @@ describe("backup adapters", () => {
       },
       defaultModel: "anthropic:claude-exec",
       hiddenModels: ["openai:gpt-old"],
-      taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 2 },
+      evaluationDefaults: { model: "openai:gpt-eval" },
     };
     config.state = { projects: new Map(), ...backedUp, apiServerPort: 4321 };
     const gitRepo = createBackupGitRepo({ cacheRoot });
@@ -1246,7 +1246,7 @@ describe("backup adapters", () => {
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
       defaultModel: "openai:gpt-local",
       hiddenModels: ["openai:gpt-old"],
-      taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 2 },
+      evaluationDefaults: { model: "openai:gpt-eval" },
       apiServerPort: 9999,
       terminalDefaultShell: "/bin/fish",
     };

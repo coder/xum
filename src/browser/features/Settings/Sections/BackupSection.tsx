@@ -29,6 +29,7 @@ import {
   type BackupContentFlag,
   type BackupContents,
 } from "@/common/config/schemas/settingsBackup";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 import {
@@ -108,7 +109,7 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
     flag: "includePreferences",
     label: "Portable preferences",
     description:
-      "Appearance and workflow preferences, plus model and agent settings such as default models, hidden models, thinking levels, model fallbacks, task settings, and runtime defaults.",
+      "Appearance and workflow preferences, plus model and agent settings such as default models, hidden models, thinking levels, model fallbacks, Auto routing tiers, and runtime defaults.",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
   },
   {
@@ -749,6 +750,9 @@ export function BackupSection() {
             targetPath: projectImportSelections[candidate.token]?.targetPath.trim() ?? "",
           })),
       });
+      // AppConfigStore follows the config change on its own; the agent list is cached apart
+      // from it. A failed restore may already have written config too, so refresh either way.
+      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED));
       if (!result.success) {
         // A failure after the snapshot completed may have overwritten files already; the
         // snapshot is the only recovery path, so its location belongs in the error.

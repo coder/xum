@@ -6,6 +6,7 @@ import * as jsonc from "jsonc-parser";
 import { Config } from "@/node/config";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import { getDefaultAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { backupCachePath } from "./gitRepo";
 import { BackupService } from "./backupService";
@@ -450,7 +451,14 @@ describe("BackupService against a real repository", () => {
       defaultModel: "anthropic:claude-exec",
       hiddenModels: ["openai:gpt-old"],
       minThinkingLevelByModel: { "anthropic:claude-exec": "medium" as const },
-      taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 2 },
+      evaluationDefaults: { model: "openai:gpt-eval" },
+      autoModelRouting: {
+        ...getDefaultAutoModelRoutingConfig(),
+        tiers: getDefaultAutoModelRoutingConfig().tiers.map((tier) => ({
+          ...tier,
+          model: "anthropic:claude-exec",
+        })),
+      },
     };
     await config.editConfig((current) => ({
       ...current,
@@ -467,6 +475,7 @@ describe("BackupService against a real repository", () => {
       hiddenModels: [],
       minThinkingLevelByModel: {},
       heartbeatDefaultPrompt: "Local prompt",
+      evaluationDefaults: { model: "openai:gpt-local-eval" },
       taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 1 },
       apiServerPort: 9999,
     }));
@@ -478,7 +487,10 @@ describe("BackupService against a real repository", () => {
     expect(loaded.defaultModel).toBe(backedUp.defaultModel);
     expect(loaded.hiddenModels).toEqual(backedUp.hiddenModels);
     expect(loaded.minThinkingLevelByModel).toEqual(backedUp.minThinkingLevelByModel);
-    expect(loaded.taskSettings).toMatchObject(backedUp.taskSettings);
+    expect(loaded.evaluationDefaults).toEqual(backedUp.evaluationDefaults);
+    expect(loaded.autoModelRouting).toEqual(backedUp.autoModelRouting);
+    // Concurrency limits stay local, like the port.
+    expect(loaded.taskSettings).toMatchObject({ maxParallelAgentTasks: 1, maxTaskNestingDepth: 1 });
     // Agents run the heartbeat prompt unattended, so it stays local like the port.
     expect(loaded.heartbeatDefaultPrompt).toBe("Local prompt");
     expect(loaded.apiServerPort).toBe(9999);

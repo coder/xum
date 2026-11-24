@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { ProjectsConfig } from "@/common/types/project";
+import { getDefaultAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
-import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import {
   mergeBackupSettings,
   projectBackupSettings,
@@ -15,11 +15,10 @@ const UNSET_EXPORT = {
   hiddenModels: null,
   minThinkingLevelByModel: null,
   modelFallbacks: null,
-  taskSettings: DEFAULT_TASK_SETTINGS,
+  autoModelRouting: null,
+  evaluationDefaults: null,
   heartbeatDefaultIntervalMs: null,
-  goalDefaults: DEFAULT_GOAL_DEFAULTS,
   chatTranscriptFullWidth: false,
-  llmDebugLogs: false,
   runtimeEnablement: null,
   defaultIsolation: null,
 };
@@ -40,20 +39,16 @@ describe("settingsProjection", () => {
       hiddenModels: ["openai:gpt-old"],
       minThinkingLevelByModel: { "openai:gpt-plan": "medium" },
       modelFallbacks: { "anthropic:claude-exec": { models: ["openai:gpt-plan"] } },
-      taskSettings: {
-        ...DEFAULT_TASK_SETTINGS,
-        maxParallelAgentTasks: 4,
-        maxTaskNestingDepth: 2,
-        preserveSubagentsUntilArchive: true,
+      autoModelRouting: {
+        ...getDefaultAutoModelRoutingConfig(),
+        tiers: getDefaultAutoModelRoutingConfig().tiers.map((tier) => ({
+          ...tier,
+          model: "anthropic:claude-exec",
+        })),
       },
+      evaluationDefaults: { model: "openai:gpt-plan" },
       heartbeatDefaultIntervalMs: 15 * 60 * 1000,
-      goalDefaults: {
-        defaultBudgetCents: 500,
-        defaultTurnCap: 20,
-        alwaysRequireExplicitBudget: false,
-      },
       chatTranscriptFullWidth: true,
-      llmDebugLogs: false,
       runtimeEnablement: { docker: false },
       defaultIsolation: { project: "local", workspace: "worktree" },
     } satisfies Partial<ProjectsConfig>;
@@ -68,6 +63,14 @@ describe("settingsProjection", () => {
       updateChannel: "nightly",
       keepScreenAwake: true,
       heartbeatDefaultPrompt: "Check in",
+      // Limits a restore must not raise behind the user's back.
+      taskSettings: { ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 4 },
+      goalDefaults: {
+        defaultBudgetCents: 500,
+        defaultTurnCap: 20,
+        alwaysRequireExplicitBudget: true,
+      },
+      llmDebugLogs: true,
       routePriority: ["anthropic"],
       routeOverrides: { "anthropic:claude-exec": "direct" },
       viewedSplashScreens: ["welcome"],
@@ -92,8 +95,6 @@ describe("settingsProjection", () => {
         agentAiDefaults: {},
         hiddenModels: undefined,
         chatTranscriptFullWidth: undefined,
-        taskSettings: DEFAULT_TASK_SETTINGS,
-        goalDefaults: DEFAULT_GOAL_DEFAULTS,
       })
     ).toEqual(UNSET_EXPORT);
     // An emptied hidden list is a choice, not an unset value.
@@ -158,7 +159,7 @@ describe("settingsProjection", () => {
       settings: {
         agentAiDefaults: { plan: { modelString: "anthropic:claude-plan" } },
         hiddenModels: [],
-        taskSettings: { maxParallelAgentTasks: 2 },
+        evaluationDefaults: { model: "openai:gpt-eval" },
       },
     }).settings!;
     const merged = mergeBackupSettings(current, sparse);
@@ -168,7 +169,7 @@ describe("settingsProjection", () => {
     expect(merged.defaultModel).toBe("openai:gpt-local");
     expect(merged.apiServerPort).toBe(4321);
     expect(merged.terminalDefaultShell).toBe("/bin/fish");
-    expect(merged.taskSettings).toEqual({ ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 2 });
+    expect(merged.evaluationDefaults).toEqual({ model: "openai:gpt-eval" });
     expect(merged.migrations).toEqual({
       daybreakModelsHidden: true,
       hiddenModelsInitialized: true,
@@ -237,6 +238,10 @@ describe("settingsProjection", () => {
           apiServerPort: 4321,
           muxGovernorToken: "smuggled",
           unknownKey: true,
+          // Limits and diagnostics stay local even when a block carries them.
+          taskSettings: { maxParallelAgentTasks: 256 },
+          goalDefaults: { alwaysRequireExplicitBudget: false, defaultTurnCap: null },
+          llmDebugLogs: true,
         },
       })
     ).toEqual({ settings: { defaultModel: "anthropic:claude-plan" }, unsupported: [] });
@@ -278,6 +283,8 @@ describe("settingsProjection", () => {
       defaultModel: "garbage",
       hiddenModels: ["anthropic:claude-plan", "garbage"],
       modelFallbacks: { "openai:gpt-a": { models: ["openai:gpt-a"] } },
+      // Load would heal a tier list it cannot parse to the default tiers.
+      autoModelRouting: { tiers: [{ id: "tier-from-a-newer-build" }] },
       runtimeEnablement: { "runtime-from-a-newer-build": false },
     };
     const read = readBackupSettings({ settings: rejected });

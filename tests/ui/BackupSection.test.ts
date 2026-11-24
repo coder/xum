@@ -17,6 +17,7 @@ import {
   SettingsBackupInputSchema,
 } from "@/common/config/schemas/settingsBackup";
 import { backup, EMPTY_BACKUP_PLUGIN_REPORT } from "@/common/orpc/schemas/backup";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments } from "@/browser/testUtils";
 
@@ -1814,6 +1815,22 @@ describe("BackupSection", () => {
 
       await waitFor(() => expect(canvas.queryByText("Plugins in this backup")).toBeNull());
     });
+  });
+
+  test("asks the agent list to refresh after a restore rewrites agent defaults", async () => {
+    const refreshRequests = jest.fn();
+    window.addEventListener(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED, refreshRequests);
+    try {
+      const { view } = renderBackupSection();
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      expect(refreshRequests).not.toHaveBeenCalled();
+
+      await confirmRestore(canvas);
+      await waitFor(() => expect(refreshRequests).toHaveBeenCalledTimes(1));
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED, refreshRequests);
+    }
   });
 
   test("names the backed-up settings this version cannot apply after a preview", async () => {

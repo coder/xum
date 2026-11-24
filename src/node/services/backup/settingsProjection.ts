@@ -3,18 +3,20 @@ import {
   AgentAiDefaultsEntrySchema,
   AgentAiSubagentProfileSchema,
   AppConfigOnDiskSchema,
-  GoalDefaultsSchema,
 } from "@/common/config/schemas/appConfigOnDisk";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
+import {
+  AutoModelRoutingConfigSchema,
+  normalizeAutoModelRoutingConfig,
+} from "@/common/types/autoModelRouting";
 import type { ProjectsConfig } from "@/common/types/project";
-import { normalizeTaskSettings } from "@/common/types/tasks";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { normalizeIsolationChoice } from "@/common/types/isolation";
-import { normalizeGoalDefaults } from "@/constants/goals";
 import {
   applyPersistedDefaultIsolation,
   normalizeAiDefaultsModelStrings,
+  normalizeEvaluationDefaults,
   normalizeMinThinkingLevelByModel,
   normalizeModelFallbacks,
   normalizeOptionalModelString,
@@ -41,8 +43,12 @@ import {
  *   workspaces, and unpushed work with them, with no prompt naming the policy;
  * - agent-executed text: heartbeatDefaultPrompt. A repository-controlled prompt would run
  *   unattended in every workspace whose heartbeat has no message of its own;
- * - not yet reviewed for portability: autoModelRouting, toolSearchEnabled, bashAiProxyEnabled,
- *   agentHeartbeatsEnabled, evaluationDefaults;
+ * - spend, concurrency and diagnostic limits: taskSettings (parallel agent tasks and nesting
+ *   depth), goalDefaults (goal budget and turn caps) and llmDebugLogs (records raw provider
+ *   requests to disk). A restore shows no per-key approval, so a repository-controlled value
+ *   would silently raise a limit the user set or start recording prompts;
+ * - not yet reviewed for portability: toolSearchEnabled, bashAiProxyEnabled,
+ *   agentHeartbeatsEnabled;
  * - save-time projections and internal state: defaultRuntime (the legacy mirror config derives
  *   from defaultIsolation), subagentAiDefaults, preferredCompactionModel
  *   (unused), projects (the project bundle), viewedSplashScreens, migrations, writeId,
@@ -56,11 +62,11 @@ const BACKED_UP_SETTINGS_KEYS = [
   "hiddenModels",
   "minThinkingLevelByModel",
   "modelFallbacks",
-  "taskSettings",
+  // The per-agent Auto flags in agentAiDefaults mean nothing without the tiers they route to.
+  "autoModelRouting",
+  "evaluationDefaults",
   "heartbeatDefaultIntervalMs",
-  "goalDefaults",
   "chatTranscriptFullWidth",
-  "llmDebugLogs",
   "runtimeEnablement",
   "defaultIsolation",
 ] as const satisfies ReadonlyArray<keyof ProjectsConfig & keyof typeof AppConfigOnDiskSchema.shape>;
@@ -104,11 +110,10 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
   hiddenModels: normalizeOptionalModelStringArray,
   minThinkingLevelByModel: normalizeMinThinkingLevelByModel,
   modelFallbacks: normalizeModelFallbacks,
-  taskSettings: normalizeTaskSettings,
+  autoModelRouting: (value) => (value == null ? undefined : normalizeAutoModelRoutingConfig(value)),
+  evaluationDefaults: normalizeEvaluationDefaults,
   heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs,
-  goalDefaults: (value) => normalizeGoalDefaults(GoalDefaultsSchema.safeParse(value).data),
   chatTranscriptFullWidth: (value) => value === true,
-  llmDebugLogs: (value) => value === true,
   runtimeEnablement: normalizeRuntimeEnablementOverrides,
   defaultIsolation: normalizeIsolationChoice,
 };
@@ -149,6 +154,8 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
   runtimeEnablement: AppConfigOnDiskSchema.shape.runtimeEnablement
     .unwrap()
     .refine(acceptedBy(normalizeRuntimeEnablementOverrides)),
+  // The on-disk shape degrades anything to absent and load heals each field to its default.
+  autoModelRouting: AutoModelRoutingConfigSchema,
 };
 
 /**
