@@ -236,7 +236,7 @@ function normalizeWorkspaceMetadataHeartbeat(
   };
 }
 
-export function parseOptionalNonEmptyString(value: unknown): string | undefined {
+function parseOptionalNonEmptyString(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
@@ -813,7 +813,7 @@ function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
   return value;
 }
 
-export function normalizeRuntimeEnablementId(value: unknown): RuntimeEnablementId | undefined {
+function normalizeRuntimeEnablementId(value: unknown): RuntimeEnablementId | undefined {
   const trimmed = parseOptionalNonEmptyString(value);
   if (!trimmed) {
     return undefined;
@@ -827,7 +827,7 @@ export function normalizeRuntimeEnablementId(value: unknown): RuntimeEnablementI
   return undefined;
 }
 
-export function normalizeRuntimeEnablementOverrides(
+function normalizeRuntimeEnablementOverrides(
   value: unknown
 ): Partial<Record<RuntimeEnablementId, false>> | undefined {
   if (!value || typeof value !== "object") {
@@ -1042,7 +1042,7 @@ function setProjectAgentResourceLimits(project: ProjectConfig, value: unknown): 
  * backend yet (e.g. ssh × docker) mirrors its nearest supported runtime so old builds still get a
  * usable default. Returns no fields when neither is set, so callers delete both.
  */
-export function resolvePersistedDefaultIsolation(record: {
+function resolvePersistedDefaultIsolation(record: {
   defaultIsolation?: unknown;
   defaultRuntime?: unknown;
 }): { defaultIsolation: IsolationChoice; defaultRuntime: RuntimeEnablementId | undefined } | null {
@@ -1059,7 +1059,7 @@ export function resolvePersistedDefaultIsolation(record: {
 }
 
 /** Write the canonical isolation default and its legacy mirror onto `target`, or delete both. */
-export function applyPersistedDefaultIsolation(
+function applyPersistedDefaultIsolation(
   target: { defaultIsolation?: IsolationChoice; defaultRuntime?: RuntimeEnablementId },
   resolved: ReturnType<typeof resolvePersistedDefaultIsolation>
 ): void {

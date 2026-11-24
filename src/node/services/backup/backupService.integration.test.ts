@@ -512,7 +512,6 @@ describe("BackupService against a real repository", () => {
       minThinkingLevelByModel: { "openai:gpt-local": "high" },
       heartbeatDefaultPrompt: "Local prompt",
       chatTranscriptFullWidth: true,
-      defaultIsolation: { project: "local", workspace: "docker" },
       apiServerPort: 9999,
     }));
     const changed = await service.preview(settings);
@@ -528,8 +527,6 @@ describe("BackupService against a real repository", () => {
     expect(loaded.minThinkingLevelByModel).toBeUndefined();
     expect(loaded.heartbeatDefaultPrompt).toBe("Local prompt");
     expect(loaded.chatTranscriptFullWidth).toBeFalsy();
-    expect(loaded.defaultIsolation).toBeUndefined();
-    expect(loaded.defaultRuntime).toBeUndefined();
     expect(loaded.apiServerPort).toBe(9999);
 
     const preview = await service.preview(settings);

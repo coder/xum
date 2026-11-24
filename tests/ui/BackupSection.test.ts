@@ -1843,7 +1843,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [],
         projectBundleSkipped: false,
-        unsupportedSettings: ["agentAiDefaults", "defaultIsolation"],
+        unsupportedSettings: ["agentAiDefaults", "autoModelRouting"],
         pushError: null,
       },
     });
@@ -1853,6 +1853,6 @@ describe("BackupSection", () => {
 
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText("agentAiDefaults");
-    expect(canvas.getByText("defaultIsolation")).toBeTruthy();
+    expect(canvas.getByText("autoModelRouting")).toBeTruthy();
   });
 });

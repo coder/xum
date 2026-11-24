@@ -109,7 +109,7 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
     flag: "includePreferences",
     label: "Portable preferences",
     description:
-      "Appearance and workflow preferences, plus model and agent settings such as default models, hidden models, thinking levels, model fallbacks, Auto routing tiers, and runtime defaults.",
+      "Appearance and workflow preferences, plus model and agent settings such as default models, hidden models, thinking levels, model fallbacks, and Auto routing tiers.",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
   },
   {

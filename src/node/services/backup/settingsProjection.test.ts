@@ -18,8 +18,6 @@ const UNSET_EXPORT = {
   autoModelRouting: null,
   evaluationDefaults: null,
   chatTranscriptFullWidth: false,
-  runtimeEnablement: null,
-  defaultIsolation: null,
 };
 
 describe("settingsProjection", () => {
@@ -47,8 +45,6 @@ describe("settingsProjection", () => {
       },
       evaluationDefaults: { model: "openai:gpt-plan" },
       chatTranscriptFullWidth: true,
-      runtimeEnablement: { docker: false },
-      defaultIsolation: { project: "local", workspace: "worktree" },
     } satisfies Partial<ProjectsConfig>;
     const config: ProjectsConfig = {
       projects: new Map([["/repo", { workspaces: [] }]]),
@@ -62,6 +58,9 @@ describe("settingsProjection", () => {
       keepScreenAwake: true,
       heartbeatDefaultPrompt: "Check in",
       heartbeatDefaultIntervalMs: 5 * 60 * 1000,
+      // Isolation policy a restore must not reduce.
+      defaultIsolation: { project: "local", workspace: "none" },
+      runtimeEnablement: { worktree: false },
       // Limits a restore must not raise behind the user's back.
       taskSettings: { ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 4 },
       goalDefaults: {
@@ -108,8 +107,6 @@ describe("settingsProjection", () => {
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
       modelFallbacks: { "openai:gpt-local": { models: ["anthropic:claude-exec"] } },
       chatTranscriptFullWidth: true,
-      defaultIsolation: { project: "local", workspace: "docker" },
-      defaultRuntime: "docker",
       apiServerPort: 4321,
     };
 
@@ -121,25 +118,9 @@ describe("settingsProjection", () => {
     expect(merged.agentAiDefaults).toEqual({});
     expect(merged.modelFallbacks).toBeUndefined();
     expect(merged.chatTranscriptFullWidth).toBe(false);
-    expect(merged.defaultIsolation).toBeUndefined();
-    // The legacy mirror goes with it, or load would resolve the default from it again.
-    expect(merged.defaultRuntime).toBeUndefined();
     expect(merged.apiServerPort).toBe(4321);
     // The round trip closes: the restored target exports what the source exported.
     expect(projectBackupSettings(merged)).toEqual(UNSET_EXPORT);
-  });
-
-  it("restores the default isolation together with the legacy runtime older builds read", () => {
-    const merged = mergeBackupSettings(
-      {
-        projects: new Map(),
-        defaultIsolation: { project: "local", workspace: "docker" },
-        defaultRuntime: "docker",
-      },
-      { defaultIsolation: { project: "local", workspace: "worktree" } }
-    );
-    expect(merged.defaultIsolation).toEqual({ project: "local", workspace: "worktree" });
-    expect(merged.defaultRuntime).toBe("worktree");
   });
 
   it("replaces the keys a sparse block carries and keeps the rest of the local config", () => {
@@ -243,10 +224,12 @@ describe("settingsProjection", () => {
           apiServerPort: 4321,
           muxGovernorToken: "smuggled",
           unknownKey: true,
-          // Limits and diagnostics stay local even when a block carries them.
+          // Limits, diagnostics and isolation policy stay local even when a block carries them.
           taskSettings: { maxParallelAgentTasks: 256 },
           goalDefaults: { alwaysRequireExplicitBudget: false, defaultTurnCap: null },
           llmDebugLogs: true,
+          defaultIsolation: { project: "local", workspace: "none" },
+          runtimeEnablement: { worktree: false },
         },
       })
     ).toEqual({ settings: { defaultModel: "anthropic:claude-plan" }, unsupported: [] });
@@ -258,21 +241,21 @@ describe("settingsProjection", () => {
     const read = readBackupSettings({
       settings: {
         agentAiDefaults: { exec: { thinkingLevel: "bogus" } },
+        minThinkingLevelByModel: { "openai:gpt-a": "level-from-a-newer-build" },
         defaultModel: "anthropic:claude-plan",
-        defaultIsolation: { project: "isolation-from-a-newer-build", workspace: "worktree" },
       },
     });
-    expect(read.unsupported).toEqual(["agentAiDefaults", "defaultIsolation"]);
+    expect(read.unsupported).toEqual(["agentAiDefaults", "minThinkingLevelByModel"]);
     expect(read.settings).toEqual({ defaultModel: "anthropic:claude-plan" });
 
     const current: ProjectsConfig = {
       projects: new Map(),
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
-      defaultIsolation: { project: "local", workspace: "docker" },
+      minThinkingLevelByModel: { "openai:gpt-a": "high" },
     };
     const merged = mergeBackupSettings(current, read.settings!);
     expect(merged.agentAiDefaults).toEqual(current.agentAiDefaults);
-    expect(merged.defaultIsolation).toEqual(current.defaultIsolation);
+    expect(merged.minThinkingLevelByModel).toEqual(current.minThinkingLevelByModel);
     expect(merged.defaultModel).toBe("anthropic:claude-plan");
 
     expect(readBackupSettings({ settings: null })).toEqual({
@@ -290,7 +273,6 @@ describe("settingsProjection", () => {
       modelFallbacks: { "openai:gpt-a": { models: ["openai:gpt-a"] } },
       // Load would heal a tier list it cannot parse to the default tiers.
       autoModelRouting: { tiers: [{ id: "tier-from-a-newer-build" }] },
-      runtimeEnablement: { "runtime-from-a-newer-build": false },
     };
     const read = readBackupSettings({ settings: rejected });
     expect(read.unsupported).toEqual(Object.keys(rejected));
@@ -300,7 +282,6 @@ describe("settingsProjection", () => {
       projects: new Map(),
       defaultModel: "anthropic:claude-local",
       hiddenModels: ["openai:gpt-hidden"],
-      runtimeEnablement: { ssh: false },
     };
     expect(mergeBackupSettings(current, read.settings!)).toEqual(current);
 
@@ -333,7 +314,6 @@ describe("settingsProjection", () => {
           defaultModel: " ",
           hiddenModels: [],
           modelFallbacks: {},
-          runtimeEnablement: {},
         },
       })
     ).toEqual({
@@ -341,7 +321,6 @@ describe("settingsProjection", () => {
         defaultModel: null,
         hiddenModels: [],
         modelFallbacks: null,
-        runtimeEnablement: null,
       },
       unsupported: [],
     });

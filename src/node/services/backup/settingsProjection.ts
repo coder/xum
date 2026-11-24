@@ -13,17 +13,13 @@ import {
 import type { ProjectsConfig } from "@/common/types/project";
 import { MODEL_FALLBACK_CHAIN_LIMIT } from "@/common/utils/ai/modelFallbacks";
 import { isPlainObject } from "@/common/utils/isPlainObject";
-import { normalizeIsolationChoice } from "@/common/types/isolation";
 import {
-  applyPersistedDefaultIsolation,
   normalizeAiDefaultsModelStrings,
   normalizeEvaluationDefaults,
   normalizeMinThinkingLevelByModel,
   normalizeModelFallbacks,
   normalizeOptionalModelString,
   normalizeOptionalModelStringArray,
-  normalizeRuntimeEnablementOverrides,
-  resolvePersistedDefaultIsolation,
 } from "@/node/config";
 
 /**
@@ -35,8 +31,9 @@ import {
  *   agentResourceLimits, agentResourceLimitsEnabled;
  * - derived from providers.jsonc credentials, which are never exported: routePriority,
  *   routeOverrides;
- * - agent sandbox policy: agentSandbox. A repository-controlled value could loosen the sandbox
- *   every later agent command runs in;
+ * - agent sandbox and workspace isolation policy: agentSandbox, defaultIsolation and
+ *   runtimeEnablement. A repository-controlled value could loosen the sandbox every later agent
+ *   command runs in, or move new workspaces from a worktree into the project directory itself;
  * - destructive archive policies: coderWorkspaceArchiveBehavior and worktreeArchiveBehavior
  *   (with their legacy deleteWorktreeOnArchive and stopCoderWorkspaceOnArchive spellings). A
  *   repository-controlled "delete" would make every later archive remove worktrees and Coder
@@ -50,8 +47,8 @@ import {
  *   would silently raise a limit the user set or start recording prompts;
  * - not yet reviewed for portability: toolSearchEnabled, bashAiProxyEnabled,
  *   agentHeartbeatsEnabled;
- * - save-time projections and internal state: defaultRuntime (the legacy mirror config derives
- *   from defaultIsolation), subagentAiDefaults, preferredCompactionModel
+ * - save-time projections and internal state: defaultRuntime (the legacy mirror of
+ *   defaultIsolation), subagentAiDefaults, preferredCompactionModel
  *   (unused), projects (the project bundle), viewedSplashScreens, migrations, writeId,
  *   settingsBackup, onePasswordAccountName, legacyOnePasswordAccountName, and the retired
  *   advisor settings (inert downgrade data).
@@ -67,8 +64,6 @@ const BACKED_UP_SETTINGS_KEYS = [
   "autoModelRouting",
   "evaluationDefaults",
   "chatTranscriptFullWidth",
-  "runtimeEnablement",
-  "defaultIsolation",
 ] as const satisfies ReadonlyArray<keyof ProjectsConfig & keyof typeof AppConfigOnDiskSchema.shape>;
 
 type BackedUpSettingsKey = (typeof BACKED_UP_SETTINGS_KEYS)[number];
@@ -89,7 +84,7 @@ export interface BackupSettingsRead {
   settings: BackupSettings | undefined;
   /**
    * Keys whose values fail this build's schema, so a restore keeps the local value: a newer
-   * build's export (a thinking level or runtime this build predates) or a damaged document.
+   * build's export (a thinking level or Auto tier field this build predates) or a damaged document.
    * Reported rather than failing the restore, which would strand every other backed-up file
    * behind an upgrade.
    */
@@ -113,8 +108,6 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
   autoModelRouting: (value) => (value == null ? undefined : normalizeAutoModelRoutingConfig(value)),
   evaluationDefaults: normalizeEvaluationDefaults,
   chatTranscriptFullWidth: (value) => value === true,
-  runtimeEnablement: normalizeRuntimeEnablementOverrides,
-  defaultIsolation: normalizeIsolationChoice,
 };
 
 function isEmptySpelling(value: unknown): boolean {
@@ -129,9 +122,9 @@ const acceptedBy = (normalize: (value: unknown) => unknown) => (value: unknown) 
 const ModelStringSchema = z.string().refine(acceptedBy(normalizeOptionalModelString));
 
 /**
- * Where the on-disk schema accepts values load-time normalization rejects (any string is a model
- * string, at the top level and inside each agent's defaults; any id is a runtime), the field schema is tightened to what the normalizer accepts. Otherwise a damaged or
- * newer-build value would pass the schema, normalize to unset, and reset the target's setting,
+ * Where the on-disk schema accepts values load-time normalization rejects or shortens (any
+ * string is a model string, at the top level and inside each agent's defaults), the field schema
+ * is tightened to what the normalizer keeps. Otherwise a damaged or newer-build value would pass the schema, normalize to unset, and reset the target's setting,
  * when the contract is to keep the local value and report the key as unsupported. Empty
  * spellings (`""`, `[]`, `{}`) still canonicalize to unset.
  */
@@ -154,9 +147,6 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
     .refine((value) =>
       Object.values(value).every((entry) => entry.models.length <= MODEL_FALLBACK_CHAIN_LIMIT)
     ),
-  runtimeEnablement: AppConfigOnDiskSchema.shape.runtimeEnablement
-    .unwrap()
-    .refine(acceptedBy(normalizeRuntimeEnablementOverrides)),
   // The on-disk shape degrades anything to absent and load heals each field to its default.
   // Load also drops repeated tier ids, and below the minimum count falls back to the defaults.
   autoModelRouting: AutoModelRoutingConfigSchema.refine(
@@ -235,14 +225,6 @@ export function mergeBackupSettings(
   const merged: ProjectsConfig = { ...current };
   for (const key of BACKED_UP_SETTINGS_KEYS) {
     if (key in settings) assignSetting(merged, key, settings[key]);
-  }
-  if ("defaultIsolation" in settings) {
-    // Load and save resolve the default from defaultIsolation, falling back to the legacy
-    // defaultRuntime mirror, so a stale mirror would bring back a default the backup cleared.
-    applyPersistedDefaultIsolation(
-      merged,
-      resolvePersistedDefaultIsolation({ defaultIsolation: merged.defaultIsolation })
-    );
   }
   if (settings.hiddenModels != null) {
     // As Config.updateModelPreferences does: the restored list is now the user's, so the
