@@ -58,14 +58,21 @@ final class WorkspaceListStore {
     private var lastSnapshotSeq = 0
     private var refreshing = 0
     private var eventLog: [(seq: Int, id: String, workspace: Workspace?)] = []
+    /// The same for activity events over `workspace/activity/list`.
+    private var activitySeq = 0
+    private var activityLog: [(seq: Int, id: String, activity: WorkspaceActivity?)] = []
 
     func refresh() async {
         refreshing += 1
         defer {
             refreshing -= 1
-            if refreshing == 0 { eventLog = [] }
+            if refreshing == 0 {
+                eventLog = []
+                activityLog = []
+            }
         }
         let startSeq = metadataSeq
+        let startActivitySeq = activitySeq
         do {
             let p = try await client.call("projects/list")
             projects = (p.array ?? []).compactMap { pair in
@@ -87,6 +94,7 @@ final class WorkspaceListStore {
             if let snapshot = a.object {
                 var act: [String: WorkspaceActivity] = [:]
                 for (k, v) in snapshot { act[k] = WorkspaceActivity(json: v) }
+                for e in activityLog where e.seq > startActivitySeq { act[e.id] = e.activity }
                 activity = act
             }
             loaded = true
@@ -146,7 +154,10 @@ final class WorkspaceListStore {
                 for try await ev in client.subscribe("workspace/activity/subscribe") {
                     guard ev["type"]?.string == "activity", let id = ev["workspaceId"]?.string else { continue }
                     let wasStreaming = activity[id]?.streaming ?? false
-                    if let a = ev["activity"], !a.isNull { activity[id] = WorkspaceActivity(json: a) } else { activity[id] = nil }
+                    let a = ev["activity"].flatMap { $0.isNull ? nil : WorkspaceActivity(json: $0) }
+                    activitySeq += 1
+                    if refreshing > 0 { activityLog.append((activitySeq, id, a)) }
+                    activity[id] = a
                     if wasStreaming, activity[id]?.streaming != true { await scan(id) }
                 }
             } catch {}

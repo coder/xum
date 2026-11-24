@@ -50,9 +50,10 @@ final class ComposerDraft {
     private var receiverId: String?
     private var issuing: Set<String> = []
     private var lookingUpReceiver = false
-    /// The web's send mark (#6405): the text the last edit wrote while a send looks up its
-    /// receiver, and whether every edit since the tap only appended to the sent text.
-    private var sendMark: (last: String, intact: Bool)?
+    /// The web's send mark (#6405, #6585): the text the last edit wrote while a send looks up its
+    /// receiver, whether every edit since the tap only appended to the sent text, and whether the
+    /// user edited it some other way.
+    private var sendMark: (last: String, intact: Bool, edited: Bool)?
     private var resending: [String: String] = [:]
     private var lastStatus: [String: String] = [:]
     /// Answers for sends whose reply just came back, kept until their sender reads them (the
@@ -157,7 +158,10 @@ final class ComposerDraft {
 
     func setText(_ new: String) {
         guard new != text else { return }
-        if let m = sendMark { sendMark = (new, m.intact && text == m.last && new.hasPrefix(m.last)) }
+        if let m = sendMark {
+            let appended = text == m.last && new.hasPrefix(m.last)
+            sendMark = (new, m.intact && appended, m.edited || !appended)
+        }
         text = new
         edit += 1
         scheduleWrite()
@@ -230,7 +234,7 @@ final class ComposerDraft {
         // runs would send the same text again under another id.
         guard !lookingUpReceiver else { return }
         lookingUpReceiver = true
-        sendMark = (text, text == message)
+        sendMark = (text, text == message, false)
         retriesStopped = false
         retryAttempt = 0
         let receiver: String
@@ -245,7 +249,10 @@ final class ComposerDraft {
         // Keys typed during the lookup follow the sent text: take exactly that prefix, and let
         // the backend repeat that take (localTake) instead of its whitespace rule, which cannot
         // split `hello` from `hellonext`.
+        // A text the user replaced or edited before its end is theirs now: the take removes
+        // nothing ("edited"), so a duplicate can show but nothing they typed is lost.
         let typedAfter = sendMark.map { $0.intact && $0.last == text } ?? false
+        let edited = !typedAfter && sendMark?.edited == true
         sendMark = nil
         let sendId = UUID().uuidString.lowercased()
         var request: [String: JSONValue] = options
@@ -256,7 +263,7 @@ final class ComposerDraft {
         writeTask?.cancel()
         issuing.insert(sendId)
         // The composer shows what the user types from here on; the draft write takes the sent text.
-        let after = typedAfter ? String(visible.dropFirst(message.count)) : ""
+        let after = typedAfter ? String(visible.dropFirst(message.count)) : edited ? visible : ""
         text = after
         edit += 1
         let taken = edit
@@ -269,6 +276,7 @@ final class ComposerDraft {
             "basisSends": basisSends,
         ]
         if typedAfter { body["localTake"] = ["kind": "typed-after"] }
+        if edited { body["localTake"] = ["kind": "edited"] }
         do {
             let v = try await call("drafts/beginSend", .object(body))
             if edit == taken { savedEdit = taken }
@@ -280,7 +288,11 @@ final class ComposerDraft {
             // next write and lookup settle the entry the backend may hold.
             undone[sendId] = pending
             // Keys typed after the take still follow the sent text.
-            text = !after.isEmpty && text.hasPrefix(after) ? message + text : Self.join(visible, text)
+            if edited {
+                text = Self.join(message, text)
+            } else {
+                text = !after.isEmpty && text.hasPrefix(after) ? message + text : Self.join(visible, text)
+            }
             edit += 1
             scheduleWrite()
             throw error

@@ -248,8 +248,8 @@ final class AppModel {
     /// The web creation flow's first send: no client send id (the backend mints one) and no
     /// draft entry. `sendMessage` returns only when the turn ends, so the new workspace opens
     /// first: a first turn that asks a question or needs a sandbox approval waits on a card the
-    /// user must see. On failure the text goes to the workspace's draft unless that already
-    /// holds something (the web's transferDraftToWorkspace).
+    /// user must see. On failure the text goes to the workspace's empty draft (the web's
+    /// transferDraftToWorkspace), else back to the chat, which puts it in front of the draft.
     private func startFirstSend(_ c: APIClient, _ id: String, _ message: String, model: String, agentId: String, thinking: ThinkingLevel) {
         let opts: [String: JSONValue] = ["model": .string(model), "agentId": .string(agentId), "thinkingLevel": .string(thinking.rawValue)]
         Task {
@@ -260,14 +260,13 @@ final class AppModel {
                 // The draft calls often fail for the same reason the send did. Until a write is
                 // confirmed, the text stays here and the chat restores it through its own draft,
                 // whose writes retry.
+                // A draft that already holds a follow-up typed during the turn keeps it: the chat
+                // puts the message in front of it instead of dropping the only copy.
                 var kept: String? = message
-                if let current = try? await c.call("drafts/get", ["scope": scope]) {
-                    if (current["text"]?.string ?? "").isEmpty, (current["attachments"]?.array ?? []).isEmpty {
-                        if (try? await c.call("drafts/update", ["scope": scope, "text": .string(message)])) != nil { kept = nil }
-                    } else {
-                        // The draft already holds something, so the message does not go there.
-                        kept = nil
-                    }
+                if let current = try? await c.call("drafts/get", ["scope": scope]),
+                   (current["text"]?.string ?? "").isEmpty, (current["attachments"]?.array ?? []).isEmpty,
+                   (try? await c.call("drafts/update", ["scope": scope, "text": .string(message)])) != nil {
+                    kept = nil
                 }
                 unsentFirstMessages[id] = UnsentFirstMessage(reason: error.localizedDescription, text: kept)
             }

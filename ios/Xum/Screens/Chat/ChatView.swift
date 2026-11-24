@@ -72,6 +72,8 @@ struct ChatView: View {
         // A chat opened right after create or fork gets its metadata later, and the first send
         // saves its agent and settings after that.
         .onChange(of: savedSettings) { if !settingsEdited { seedSettings() } }
+        // The project's review base needs its path, which late metadata brings too.
+        .onChange(of: workspace?.projectPath) { info?.projectPath = workspace?.projectPath }
         // Opening a chat does not answer it: rescan so a question or plan stays in the Inbox.
         .onDisappear { if let list = model.list { Task { await list.scan(workspaceId) } } }
         // Regular width (iPhone Duo inner display): the tool detail is a persistent side panel
